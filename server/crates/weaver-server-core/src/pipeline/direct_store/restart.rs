@@ -73,6 +73,53 @@ use crate::jobs::model::JobSpec;
 use crate::jobs::service::segments_covered_by_floor;
 use crate::pipeline::Pipeline;
 
+/// The durable per-volume facts a restart rebuilds a set's layout from.
+///
+/// One row per (job, set, volume) of `active_rar_volume_facts`, whose column is
+/// an opaque blob — which is what lets a second container family join it with
+/// no migration and no invalidation of anything already written.
+///
+/// # The untagged fallback is the compatibility guarantee
+///
+/// Rows written before this envelope existed are a bare `RarVolumeFacts` map,
+/// and they belong to sets that are mid-download in a shipped release. Decoding
+/// tries the tagged form first and falls back to the bare one, so those rows
+/// restore exactly as they did — a new tag on the wire would otherwise turn
+/// every in-flight direct set into a redownload on the upgrade.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DirectVolumeFacts {
+    Rar(Box<unrar_rs::RarVolumeFacts>),
+    SevenZip(Box<SevenZipVolumeFacts>),
+}
+
+/// What one volume of a 7z set contributes to the restored layout.
+///
+/// A 7z container states its map once, at the tail, so exactly one volume's row
+/// carries `container` and every row carries the one thing that is genuinely
+/// per volume: the length the wire declared for it. Both halves are needed —
+/// the map gives container offsets, and only the lengths turn those into the
+/// (volume, offset) pairs everything downstream is expressed in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SevenZipVolumeFacts {
+    pub(crate) declared_len: u64,
+    pub(crate) container: Option<super::router::sevenz::SevenZipContainerFacts>,
+}
+
+impl DirectVolumeFacts {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        rmp_serde::to_vec_named(self)
+    }
+
+    pub(crate) fn decode(blob: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        match rmp_serde::from_slice::<Self>(blob) {
+            Ok(facts) => Ok(facts),
+            Err(tagged) => rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(blob)
+                .map(|facts| Self::Rar(Box::new(facts)))
+                .map_err(|_| tagged),
+        }
+    }
+}
+
 /// Why a checkpoint row was refused. Every variant means the same thing for the
 /// set: **no coverage**, redownload from zero, and delete the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +161,12 @@ pub(crate) enum CoverageRejection {
     /// classified.
     UnclassifiableVolume {
         volume_index: u32,
+    },
+    /// A volume the row still claims already has bytes in a conventional
+    /// file: a demotion's per-volume handback was interrupted before the row
+    /// retired. Two images of one volume are never reconciled.
+    ConventionalBytes {
+        file_index: u32,
     },
 }
 
@@ -161,6 +214,10 @@ impl std::fmt::Display for CoverageRejection {
             Self::ProbeFailed { error } => write!(
                 formatter,
                 "direct-store destination probe did not complete: {error}"
+            ),
+            Self::ConventionalBytes { file_index } => write!(
+                formatter,
+                "direct-store checkpoint claims NZB file {file_index}, which already has conventional bytes on disk"
             ),
             Self::UnclassifiableVolume { volume_index } => write!(
                 formatter,
@@ -466,6 +523,52 @@ pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
     outcome
 }
 
+/// Whether a finalized set's installation marker still describes this spec and
+/// this staging root.
+///
+/// Metadata only, like every other restart probe: the members were verified
+/// before they were committed, and what a restart can lose is the file, not its
+/// bytes. A probe that cannot complete is a refusal, for the same reason
+/// [`CoverageRejection::ProbeFailed`] is.
+async fn installed_set_still_present(
+    plan: &DirectSetPlan,
+    blob: &[u8],
+) -> Result<super::snapshot::InstalledSet, String> {
+    let marker = super::snapshot::decode_installed(blob).map_err(|error| error.to_string())?;
+    let volumes: Vec<(u32, u32)> = plan
+        .volumes
+        .iter()
+        .map(|(volume, file)| (*volume, *file))
+        .collect();
+    if marker.volumes != volumes {
+        return Err("the set's volumes no longer match the marker".to_string());
+    }
+    if marker.members.is_empty() {
+        return Err("the marker names no committed member".to_string());
+    }
+    for member in &marker.members {
+        let path = plan.destination_path(&member.relative_path);
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() && metadata.len() == member.len => {}
+            Ok(metadata) => {
+                return Err(format!(
+                    "committed member {} is {} bytes, expected {}",
+                    member.relative_path,
+                    metadata.len(),
+                    member.len
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "committed member {} could not be probed: {error}",
+                    member.relative_path
+                ));
+            }
+        }
+    }
+    Ok(marker)
+}
+
 /// Per-NZB-file refetch floors derived from a checkpoint.
 ///
 /// Everything above a floor is redownloaded. Actual refetch can exceed the
@@ -571,6 +674,10 @@ pub(crate) struct DirectRestore {
     /// set exactly like legacy floors.
     pub(crate) skip: HashSet<SegmentId>,
     pub(crate) file_progress: HashMap<u32, u64>,
+    /// Sets whose installation marker was accepted: each is already in
+    /// [`Self::sets`], finalized, and carries the names its finalization
+    /// recorded as extracted, which only the live job state can hold.
+    pub(crate) installed: Vec<(String, Vec<String>)>,
     pub(crate) accepted: usize,
     pub(crate) rejected: usize,
     pub(crate) ignored: usize,
@@ -666,6 +773,66 @@ impl Pipeline {
                 HashMap::new()
             }
         };
+        // A finalized set leaves an installation marker where its coverage row
+        // was. It is not coverage and `restore_job` would refuse it as a bad
+        // magic, so it is judged on its own terms here: a marker whose set is
+        // still admitted under the same volumes, and whose every committed
+        // member is still in the staging root at its exact length, brings the
+        // set back finalized instead of fresh. Anything else is deleted, and the
+        // set redownloads as it would have with no marker at all.
+        let (marker_rows, rows): (HashMap<String, Vec<u8>>, HashMap<String, Vec<u8>>) = rows
+            .into_iter()
+            .partition(|(_, blob)| super::snapshot::is_installed_marker(blob));
+        let mut installed: HashMap<String, super::snapshot::InstalledSet> = HashMap::new();
+        let mut rejected_markers = 0usize;
+        let ignored_markers = if gate.is_enabled() {
+            0
+        } else {
+            marker_rows.len()
+        };
+        if gate.is_enabled() {
+            let mut marker_rows: Vec<(String, Vec<u8>)> = marker_rows.into_iter().collect();
+            marker_rows.sort();
+            for (set_name, blob) in marker_rows {
+                let verdict = match admitted.iter().find(|plan| plan.set_name == set_name) {
+                    Some(plan) => installed_set_still_present(plan, &blob).await,
+                    None => Err("the set is not admitted from this spec".to_string()),
+                };
+                match verdict {
+                    Ok(marker) => {
+                        installed.insert(set_name, marker);
+                    }
+                    Err(reason) => {
+                        rejected_markers += 1;
+                        crate::runtime::perf_probe::record_owned(
+                            "direct_store.restart.rejected".to_string(),
+                            std::time::Duration::from_nanos(1),
+                        );
+                        tracing::info!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            %reason,
+                            "direct-store installation marker refused at restore; the set \
+                             redownloads"
+                        );
+                        if let Err(error) = self
+                            .db_blocking({
+                                let set_name = set_name.clone();
+                                move |db| db.delete_direct_coverage(job_id, &set_name)
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                %error,
+                                "failed to delete a refused direct-store installation marker"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // Nothing to validate and nothing admitted still leaves the sweep to
         // run: a job that used to route and no longer does (the gate went off,
         // the spec changed) is exactly the job whose working directory holds
@@ -684,6 +851,9 @@ impl Pipeline {
         let mut restored: HashMap<String, DirectSet> = HashMap::new();
         let mut expected: HashMap<String, ExpectedSet> = HashMap::new();
         for plan in &admitted {
+            if installed.contains_key(&plan.set_name) {
+                continue;
+            }
             let set_name = plan.set_name.clone();
             let mut set = DirectSet::new(job_id, plan.clone());
             self.direct_store.apply_ceilings(&mut set);
@@ -718,7 +888,45 @@ impl Pipeline {
         }
 
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        let outcome = restore_job(gate, job_id, &roots, rows, &expected, &mut persist).await;
+        let mut outcome = restore_job(gate, job_id, &roots, rows, &expected, &mut persist).await;
+        // A row is only as trustworthy as the invariant it was written under:
+        // a volume binds while none of its bytes live in a conventional file.
+        // A demotion's handback breaks that on purpose, one volume at a time —
+        // each rebuilt volume gets a conventional floor or a completed-file
+        // row the moment the sweep finishes it, while the set's one coverage
+        // row stands until the sweep finishes them all. A crash inside that
+        // window leaves a row that still claims volumes the conventional path
+        // now owns. Refused whole, never reconciled: the volumes with
+        // conventional bytes keep them, and the rest redownload, which is what
+        // the demotion was about to cost anyway.
+        for plan in &admitted {
+            if !outcome.accepted.contains_key(&plan.set_name) {
+                continue;
+            }
+            let Some(file_index) = plan.files.keys().copied().find(|file_index| {
+                conventional_floors
+                    .get(file_index)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+            }) else {
+                continue;
+            };
+            outcome.accepted.remove(&plan.set_name);
+            restored.remove(&plan.set_name);
+            if let Err(error) = persist.delete(job_id, &plan.set_name) {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    set_name = %plan.set_name,
+                    error = %error,
+                    "failed to delete a direct-store coverage row refused for conventional bytes"
+                );
+            }
+            outcome.rejected.push((
+                plan.set_name.clone(),
+                CoverageRejection::ConventionalBytes { file_index },
+            ));
+        }
         for (set_name, rejection) in &outcome.rejected {
             crate::runtime::perf_probe::record_owned(
                 "direct_store.restart.rejected".to_string(),
@@ -733,9 +941,9 @@ impl Pipeline {
         }
 
         let mut result = DirectRestore {
-            accepted: outcome.accepted.len(),
-            rejected: outcome.rejected.len(),
-            ignored: outcome.ignored,
+            accepted: outcome.accepted.len() + installed.len(),
+            rejected: outcome.rejected.len() + rejected_markers,
+            ignored: outcome.ignored + ignored_markers,
             ..DirectRestore::default()
         };
 
@@ -784,6 +992,37 @@ impl Pipeline {
         // which is what makes the sweep below safe to run against it.
         let mut claimed: HashSet<PathBuf> = HashSet::new();
         for plan in &admitted {
+            // An installed set is done: every segment of its volumes is
+            // skipped and it comes back finalized, with no layout, because
+            // nothing will ever route into it again. Its committed members are
+            // not direct-store working files, so the sweep never considers
+            // them; its envelopes are, and are swept — a retained image is
+            // runtime-only and is not rebuilt, so a neighbour's repair meets
+            // this set the way it meets any finalized set that kept none.
+            if let Some(marker) = installed.remove(&plan.set_name) {
+                let complete: HashSet<u32> = plan.files.keys().copied().collect();
+                let floors: HashMap<u32, u64> =
+                    complete.iter().map(|file_index| (*file_index, 0)).collect();
+                let skip = coverage_skip_plan(job_id, spec, &floors, &complete);
+                for (file_index, floor) in skip.file_progress {
+                    let slot = result.file_progress.entry(file_index).or_insert(floor);
+                    *slot = (*slot).max(floor);
+                }
+                result.skip.extend(skip.skip);
+                let mut set = DirectSet::new(job_id, plan.clone());
+                set.mark_finalized();
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name = %plan.set_name,
+                    volumes = plan.volumes.len(),
+                    "direct-store set restored as installed from its finalization marker"
+                );
+                result
+                    .installed
+                    .push((plan.set_name.clone(), marker.extracted));
+                result.sets.push(set);
+                continue;
+            }
             let accepted = applied.get(&plan.set_name).cloned();
             let mut set = match (accepted.as_ref(), restored.remove(&plan.set_name)) {
                 (Some(_), Some(set)) => set,
@@ -917,11 +1156,33 @@ impl Pipeline {
         result
     }
 
+    /// Puts back the runtime record of every set restored as installed: its
+    /// name in `extracted_archives` and its members in the extracted-member
+    /// sets, exactly as its finalization left them.
+    ///
+    /// Called once the job's persisted extracted members are in place, because
+    /// that load replaces the job's entry wholesale.
+    pub(crate) fn reinstate_installed_direct_sets(
+        &mut self,
+        job_id: JobId,
+        installed: Vec<(String, Vec<String>)>,
+    ) {
+        for (set_name, extracted) in installed {
+            for name in extracted {
+                self.record_direct_extracted(job_id, name);
+            }
+            self.extracted_archives
+                .entry(job_id)
+                .or_default()
+                .insert(set_name);
+        }
+    }
+
     /// The cached facts for every set of a job, decoded and keyed by set name.
     async fn load_direct_volume_facts(
         &self,
         job_id: JobId,
-    ) -> HashMap<String, BTreeMap<u32, unrar_rs::RarVolumeFacts>> {
+    ) -> HashMap<String, BTreeMap<u32, DirectVolumeFacts>> {
         let rows = match self
             .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
             .await
@@ -936,10 +1197,10 @@ impl Pipeline {
                 return HashMap::new();
             }
         };
-        let mut decoded: HashMap<String, BTreeMap<u32, unrar_rs::RarVolumeFacts>> = HashMap::new();
+        let mut decoded: HashMap<String, BTreeMap<u32, DirectVolumeFacts>> = HashMap::new();
         for (set_name, volumes) in rows {
             for (volume_index, blob) in volumes {
-                match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
+                match DirectVolumeFacts::decode(&blob) {
                     Ok(facts) => {
                         decoded
                             .entry(set_name.clone())
@@ -1091,4 +1352,81 @@ fn sweep_orphan_direct_files_blocking(
         }
     }
     swept
+}
+
+#[cfg(test)]
+mod facts_envelope_tests {
+    use super::{DirectVolumeFacts, SevenZipVolumeFacts};
+
+    /// Rows written before the envelope existed are bare `RarVolumeFacts`
+    /// blobs, and there are live ones in shipped databases. Decoding has to
+    /// keep reading them as RAR, because the alternative is every in-flight
+    /// direct set on an upgraded install restarting from zero.
+    #[test]
+    fn a_bare_rar_blob_decodes_as_the_rar_arm() {
+        let facts = unrar_rs::RarVolumeFacts {
+            format: 5,
+            volume_number: Some(0),
+            more_volumes: true,
+            is_solid: false,
+            is_encrypted: false,
+            is_volume: true,
+            has_recovery_record: false,
+            is_locked: false,
+            has_authenticity_verification: false,
+            has_locator: false,
+            quick_open_offset: None,
+            headers_from_quick_open: false,
+            recovery_record_offset: None,
+            original_name: None,
+            original_name_raw: None,
+            original_creation_time_ns: None,
+            members: Vec::new(),
+            services: Vec::new(),
+        };
+        // Exactly what the old encoder wrote: the struct, untagged.
+        let blob = rmp_serde::to_vec_named(&facts).expect("the old encoding still encodes");
+        assert_eq!(
+            DirectVolumeFacts::decode(&blob).expect("a shipped row still decodes"),
+            DirectVolumeFacts::Rar(Box::new(facts))
+        );
+    }
+
+    /// And the envelope round-trips both arms, so a row written now is read
+    /// back as what it is rather than falling through to the RAR fallback.
+    #[test]
+    fn the_envelope_round_trips_both_arms() {
+        for facts in [
+            DirectVolumeFacts::SevenZip(Box::new(SevenZipVolumeFacts {
+                declared_len: 4096,
+                container: None,
+            })),
+            DirectVolumeFacts::Rar(Box::new(unrar_rs::RarVolumeFacts {
+                format: 5,
+                volume_number: Some(1),
+                more_volumes: false,
+                is_solid: false,
+                is_encrypted: false,
+                is_volume: true,
+                has_recovery_record: false,
+                is_locked: false,
+                has_authenticity_verification: false,
+                has_locator: false,
+                quick_open_offset: None,
+                headers_from_quick_open: false,
+                recovery_record_offset: None,
+                original_name: None,
+                original_name_raw: None,
+                original_creation_time_ns: None,
+                members: Vec::new(),
+                services: Vec::new(),
+            })),
+        ] {
+            let blob = facts.encode().expect("the envelope encodes");
+            assert_eq!(
+                DirectVolumeFacts::decode(&blob).expect("the envelope decodes"),
+                facts
+            );
+        }
+    }
 }

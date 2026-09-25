@@ -49,18 +49,23 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 
+use bytes::Bytes;
+
 use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MappedSlice, MemberEligibility, RarVolumeFacts,
     StoredLayoutBuilder, StoredLayoutError,
 };
 
 use super::ByteRanges;
-use super::plan::DirectSetPlan;
+use super::plan::{DirectSetPlan, SetFormat};
+use super::restart::{DirectVolumeFacts, SevenZipVolumeFacts};
 use super::sparse::SparseMarking;
 use crypt::{
     AES_BLOCK, CryptRefusal, HeaderCryptRefusal, HeaderKeyRing, KeyRing, MemberCrypt, block_ceil,
     block_floor,
 };
+use layout::SetLayout;
+use sevenz::SevenZipRefusal;
 
 pub(crate) mod crypt;
 
@@ -71,6 +76,11 @@ pub(crate) mod crypt;
 /// [`super::accountant::HoldsAccountant`] every set charges to, whose limit
 /// follows the host's memory.
 pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The longest staged residue that is copied out of its decoder buffer
+/// unconditionally once its article has drained, so a sliver never keeps a
+/// pool slot pinned. See [`DirectSetRouter::release_article_views`].
+pub(crate) const HOLD_VIEW_COPY_LIMIT_BYTES: u64 = 64 * 1024;
 
 /// The **explicit** scratch ceiling, counted against the disk acceptance target
 /// rather than derived from RAM the way the oracle's auto 4×-RAM rule is.
@@ -380,6 +390,8 @@ pub(crate) enum DemotionReason {
     /// hands everything to the conventional path, whose extractor orders
     /// volumes by reading them.
     IdentityVolumeMismatch,
+    /// A 7z container the layout will not read. See [`SevenZipRefusal`].
+    SevenZip(SevenZipRefusal),
 }
 
 /// The ineligibility reasons this module distinguishes in metrics. The
@@ -573,6 +585,11 @@ impl DemotionReason {
             // that volume; one whose headers contradict its binding has a
             // layout describing a different file.
             Self::IdentityRosterUnfillable | Self::IdentityVolumeMismatch => VolumeDemand::Real,
+            // Every 7z refusal is "there is no layout", either because the end
+            // header named a container this cannot route or because the
+            // volumes' geometry does not close. With no layout there is no
+            // overlay, so the conventional path needs the volumes themselves.
+            Self::SevenZip(_) => VolumeDemand::Real,
         }
     }
 
@@ -649,6 +666,7 @@ impl DemotionReason {
             Self::FinalizationFailed => "finalization_failed",
             Self::IdentityRosterUnfillable => "identity_roster_unfillable",
             Self::IdentityVolumeMismatch => "identity_volume_mismatch",
+            Self::SevenZip(refusal) => refusal.metric(),
         }
     }
 }
@@ -688,12 +706,18 @@ pub(crate) struct RoutedSpan {
     /// barrier keys source floors by this pair.
     pub(crate) volume_index: u32,
     pub(crate) source_offset: u64,
-    pub(crate) bytes: Vec<u8>,
+    /// The run's payload, in order, as refcounted views of whatever produced
+    /// it — the decoder's own buffers for a staged article, one read buffer for
+    /// a paged chunk. Never concatenated: the writer hands the pieces straight
+    /// to a vectored write.
+    pub(crate) bytes: Vec<Bytes>,
 }
 
 impl RoutedSpan {
     pub(crate) fn len(&self) -> u64 {
-        self.bytes.len() as u64
+        self.bytes.iter().fold(0u64, |total, piece| {
+            total.saturating_add(piece.len() as u64)
+        })
     }
 }
 
@@ -912,8 +936,21 @@ impl CrcRuns {
 /// into a fresh file rather than rewriting the one the reader is on.
 #[derive(Debug, Clone)]
 enum StagedChunk {
-    Memory(std::sync::Arc<[u8]>),
-    Scratch { offset: u64, len: u64 },
+    /// A refcounted view of the decoder's own buffer. Several chunks can share
+    /// one backing allocation — a staged article splits at every missing
+    /// interval — and each keeps it alive until the last of them drops.
+    Memory {
+        bytes: Bytes,
+        /// The length of the allocation `bytes` keeps alive: the decoder piece
+        /// it was cut from, or zero once it has been copied out and owns
+        /// exactly its own bytes. `Bytes` does not expose this, so it is
+        /// recorded where the view is cut. See [`pins_too_much`].
+        backing: u64,
+    },
+    Scratch {
+        offset: u64,
+        len: u64,
+    },
 }
 
 /// One region of the holds scratch that is still read from, and the staging
@@ -928,32 +965,89 @@ struct LiveScratchExtent {
 impl StagedChunk {
     fn len(&self) -> u64 {
         match self {
-            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Memory { bytes, .. } => bytes.len() as u64,
             Self::Scratch { len, .. } => *len,
         }
     }
 
     /// RAM cost, which is what the holds budget bounds. A paged chunk is zero
     /// here and is counted against the scratch ceiling instead.
+    ///
+    /// **A range-length budget, deliberately.** A `Memory` chunk is a view, so
+    /// its range is what it answers for, not what it pins: two views of one
+    /// decoded article charge their two ranges, and the sum can never exceed
+    /// the buffer they share. What it can *under*state is a small retained view
+    /// of a large decoder buffer, which keeps the whole buffer alive. Charging
+    /// the backing instead would count a buffer once per view of it. Paging
+    /// drops the view, which frees the buffer exactly when it was the last
+    /// one, and the budget keeps meaning what it meant before views existed.
+    /// What keeps the understatement bounded is [`pins_too_much`], applied
+    /// by [`VolumeStaging::copy_out_views`] once an article has drained and by
+    /// [`VolumeStaging::trim`] whenever it cuts a view down: a view that
+    /// outlives its article is never shorter than half the allocation it
+    /// keeps alive, so what the holds pin is at most twice what they charge.
     fn resident_len(&self) -> u64 {
         match self {
-            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Memory { bytes, .. } => bytes.len() as u64,
             Self::Scratch { .. } => 0,
         }
     }
 
     /// The sub-chunk covering `[from, from + len)` of this chunk.
+    ///
+    /// A cut of a view still pins the whole allocation, and the only callers
+    /// cut away what drained or was overwritten and keep the rest, which
+    /// outlives the article [`VolumeStaging::copy_out_views`] checked it
+    /// against — so the remnant faces [`pins_too_much`] here.
     fn slice_of(&self, from: u64, len: u64) -> Self {
         match self {
-            Self::Memory(bytes) => Self::Memory(std::sync::Arc::from(
-                &bytes[from as usize..(from + len) as usize],
-            )),
+            Self::Memory { bytes, backing } => {
+                let mut cut = Self::Memory {
+                    bytes: bytes.slice(from as usize..(from + len) as usize),
+                    backing: *backing,
+                };
+                cut.release(false);
+                cut
+            }
             Self::Scratch { offset, .. } => Self::Scratch {
                 offset: offset.saturating_add(from),
                 len,
             },
         }
     }
+
+    /// Replaces a view [`pins_too_much`] rules out with an owned copy of its
+    /// bytes. Returns the bytes copied.
+    fn release(&mut self, every: bool) -> u64 {
+        match self {
+            Self::Memory { bytes, backing }
+                if pins_too_much(bytes.len() as u64, *backing, every) =>
+            {
+                *bytes = Bytes::copy_from_slice(bytes);
+                *backing = 0;
+                bytes.len() as u64
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Whether a staged view of `len` bytes over an allocation of `backing` bytes
+/// should be copied out rather than kept once its article has drained.
+///
+/// Short residues always leave — a cipher tail or header run should not keep
+/// a decoder buffer alive for a few bytes — and so does any view shorter than
+/// half its backing, since the holds budget charges the view's length and the
+/// allocation behind it is what stays resident. A view covering most of its
+/// piece, which is what an article held whole for an earlier one looks like,
+/// keeps its zero-copy path. `every` copies regardless, for a scarce pool. A
+/// chunk that already owns its bytes (`backing == 0`) is never copied again.
+///
+/// A short view is copied even when it spans its whole piece: a pooled
+/// article's piece is only as long as the article, while the slot behind it is
+/// a whole pool buffer, and the copy is what hands that slot back.
+fn pins_too_much(len: u64, backing: u64, every: bool) -> bool {
+    backing != 0 && (every || len <= HOLD_VIEW_COPY_LIMIT_BYTES || backing > len.saturating_mul(2))
 }
 
 /// Positioned read, so a shared handle needs no seek and no exclusive access.
@@ -1515,16 +1609,49 @@ impl SparseImage {
         }
     }
 
+    /// One image over **several volumes concatenated**, each one's staged runs
+    /// shifted to the container offset its volume begins at.
+    ///
+    /// The 7z shape: a `-v` split is a byte split of one container, so its
+    /// header walk is a walk of the concatenation and not of any one volume.
+    /// Runs are taken from staging alone — the bytes a volume has staged and
+    /// not yet routed — which is exactly the population a container whose
+    /// layout is still unknown holds: nothing routes before the end header
+    /// parses, so every arrived byte is here.
+    fn over_volumes(
+        volumes: &[(u64, &BTreeMap<u64, StagedChunk>)],
+        scratch: Option<std::sync::Arc<std::fs::File>>,
+    ) -> Self {
+        let mut runs: Vec<(u64, ImageRun)> = volumes
+            .iter()
+            .flat_map(|(base, chunks)| {
+                chunks
+                    .iter()
+                    .map(move |(offset, chunk)| (base + offset, ImageRun::Staged(chunk.clone())))
+            })
+            .collect();
+        runs.sort_unstable_by_key(|(start, _)| *start);
+        Self {
+            runs,
+            scratch,
+            envelope: None,
+            position: 0,
+        }
+    }
+
     /// Test constructor: a purely RAM-resident image.
     #[cfg(test)]
-    pub(super) fn from_chunks(chunks: &BTreeMap<u64, std::sync::Arc<[u8]>>) -> Self {
+    pub(super) fn from_chunks(chunks: &BTreeMap<u64, Bytes>) -> Self {
         Self {
             runs: chunks
                 .iter()
                 .map(|(offset, bytes)| {
                     (
                         *offset,
-                        ImageRun::Staged(StagedChunk::Memory(std::sync::Arc::clone(bytes))),
+                        ImageRun::Staged(StagedChunk::Memory {
+                            bytes: bytes.clone(),
+                            backing: bytes.len() as u64,
+                        }),
                     )
                 })
                 .collect(),
@@ -1552,7 +1679,7 @@ impl Read for SparseImage {
         }
         let taken = (run.len() - inside).min(out.len() as u64) as usize;
         match run {
-            ImageRun::Staged(StagedChunk::Memory(bytes)) => {
+            ImageRun::Staged(StagedChunk::Memory { bytes, .. }) => {
                 out[..taken].copy_from_slice(&bytes[inside as usize..inside as usize + taken]);
             }
             // Paged out: read back exactly what the walk asked for, which for a
@@ -1620,7 +1747,7 @@ impl Seek for SparseImage {
 /// staging. The first shape read every rewrite span whole into an owned `Vec`
 /// and let `stage_repaired` copy it, so a repair peaked at twice the repaired
 /// bytes with nothing bounding either term.
-pub(crate) type RepairedChunk = (u64, std::sync::Arc<[u8]>);
+pub(crate) type RepairedChunk = (u64, Bytes);
 
 /// Per-volume staging: the bytes the router still needs, and what it has
 /// already placed.
@@ -1765,16 +1892,36 @@ impl VolumeStaging {
 
     /// Stores the parts of `[offset, offset + len)` that are neither routed nor
     /// already pending, and marks them pending. Returns the newly staged bytes.
-    fn stage(&mut self, offset: u64, data: &[u8]) -> u64 {
+    ///
+    /// `pieces` is the article as the decoder produced it, in order, and nothing
+    /// here copies a byte of it: each retained fragment becomes a refcount bump
+    /// on the piece it falls in. A fragment that straddles two pieces becomes
+    /// two chunks — chunks are keyed by start offset and must not overlap, and
+    /// adjacent ones are ordinary, since `pending` coalesces ranges and every
+    /// reader walks the map by offset rather than assuming one chunk per call.
+    fn stage(&mut self, offset: u64, pieces: &[Bytes]) -> u64 {
+        let total = pieces.iter().map(|piece| piece.len() as u64).sum();
         let mut staged = 0u64;
-        for (start, end) in self.routed.missing(offset, data.len() as u64) {
+        for (start, end) in self.routed.missing(offset, total) {
             for (start, end) in self.pending.missing(start, end - start) {
-                let from = (start - offset) as usize;
-                let to = (end - offset) as usize;
-                self.chunks.insert(
-                    start,
-                    StagedChunk::Memory(std::sync::Arc::from(&data[from..to])),
-                );
+                let mut piece_start = offset;
+                for piece in pieces {
+                    let piece_end = piece_start.saturating_add(piece.len() as u64);
+                    let from = start.max(piece_start);
+                    let to = end.min(piece_end);
+                    if from < to {
+                        self.chunks.insert(
+                            from,
+                            StagedChunk::Memory {
+                                bytes: piece.slice(
+                                    (from - piece_start) as usize..(to - piece_start) as usize,
+                                ),
+                                backing: piece.len() as u64,
+                            },
+                        );
+                    }
+                    piece_start = piece_end;
+                }
                 self.pending.insert(start, end - start);
                 staged = staged.saturating_add(end - start);
             }
@@ -1790,7 +1937,7 @@ impl VolumeStaging {
     /// where the same physical range must be routed twice, because the bytes
     /// changed, so it goes through here instead and is marked in
     /// [`Self::repaired`] for the drain.
-    fn stage_repaired(&mut self, offset: u64, data: std::sync::Arc<[u8]>) {
+    fn stage_repaired(&mut self, offset: u64, data: Bytes) {
         self.force_stage(offset, data, true);
     }
 
@@ -1808,16 +1955,16 @@ impl VolumeStaging {
     /// repaired ones in a single drained run — since [`Self::stage`] refuses a
     /// routed range outright. See
     /// `a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary`.
-    fn stage_lead_in(&mut self, offset: u64, data: std::sync::Arc<[u8]>) {
+    fn stage_lead_in(&mut self, offset: u64, data: Bytes) {
         self.force_stage(offset, data, false);
     }
 
     #[cfg(test)]
-    fn stage_duplicate(&mut self, offset: u64, data: std::sync::Arc<[u8]>) {
+    fn stage_duplicate(&mut self, offset: u64, data: Bytes) {
         self.force_stage(offset, data, false);
     }
 
-    fn force_stage(&mut self, offset: u64, data: std::sync::Arc<[u8]>, repaired: bool) {
+    fn force_stage(&mut self, offset: u64, data: Bytes, repaired: bool) {
         let len = data.len() as u64;
         if len == 0 {
             return;
@@ -1845,7 +1992,14 @@ impl VolumeStaging {
                     .insert(end, chunk.slice_of(end - start, chunk_end - end));
             }
         }
-        self.chunks.insert(offset, StagedChunk::Memory(data));
+        let backing = data.len() as u64;
+        self.chunks.insert(
+            offset,
+            StagedChunk::Memory {
+                bytes: data,
+                backing,
+            },
+        );
         self.routed = subtract(&self.routed, offset, len);
         self.pending.insert(offset, len);
         if repaired {
@@ -1889,14 +2043,18 @@ impl VolumeStaging {
         })
     }
 
-    /// Copies `[offset, offset + len)` out of the staged chunks. `None` when
-    /// the range is not wholly staged, which the drain never asks for.
+    /// `[offset, offset + len)` as an ordered list of views over the staged
+    /// chunks. `None` when the range is not wholly staged, which the drain never
+    /// asks for.
     ///
-    /// A paged chunk costs **one positioned read** per drained run, which is the
+    /// Nothing is concatenated: a RAM-resident chunk contributes a refcount bump
+    /// on the decoder's buffer, and the writer takes the pieces as they are. A
+    /// paged chunk costs **one positioned read** per drained run — which is the
     /// whole reason scratch regions are write-once: the offset was handed out
-    /// when the bytes were paged and nothing can have moved them since.
-    fn slice(&self, offset: u64, len: u64, scratch: &HoldsScratch) -> Option<Vec<u8>> {
-        let mut out = Vec::with_capacity(len as usize);
+    /// when the bytes were paged and nothing can have moved them since — and
+    /// that read's buffer becomes one piece of its own.
+    fn slice(&self, offset: u64, len: u64, scratch: &HoldsScratch) -> Option<Vec<Bytes>> {
+        let mut out = Vec::new();
         let mut cursor = offset;
         let end = offset.saturating_add(len);
         while cursor < end {
@@ -1911,18 +2069,57 @@ impl VolumeStaging {
             }
             let take = (chunk.len() - inside).min(end - cursor);
             match &chunk {
-                StagedChunk::Memory(bytes) => {
-                    out.extend_from_slice(&bytes[inside as usize..(inside + take) as usize]);
+                StagedChunk::Memory { bytes, .. } => {
+                    out.push(bytes.slice(inside as usize..(inside + take) as usize));
                 }
                 StagedChunk::Scratch {
                     offset: scratch_offset,
                     ..
                 } => {
                     let bytes = scratch.read(scratch_offset.saturating_add(inside), take)?;
-                    out.extend_from_slice(&bytes);
+                    out.push(Bytes::from(bytes));
                 }
             }
             cursor = cursor.saturating_add(take);
+        }
+        Some(out)
+    }
+
+    /// Whether `[offset, offset + len)` is wholly staged, without reading a
+    /// byte of it.
+    ///
+    /// The blocked-run gate's question. [`Self::slice`] answers it too, but
+    /// only by materializing the range — and for a paged chunk that is a
+    /// positioned read as well. The gate runs on every drain of a held run, so
+    /// it gets the walk without the bytes.
+    fn holds(&self, offset: u64, len: u64) -> bool {
+        let mut cursor = offset;
+        let end = offset.saturating_add(len);
+        while cursor < end {
+            let Some((start, chunk)) = self.chunks.range(..=cursor).next_back() else {
+                return false;
+            };
+            let inside = cursor - start;
+            if inside >= chunk.len() {
+                return false;
+            }
+            cursor = cursor.saturating_add((chunk.len() - inside).min(end - cursor));
+        }
+        true
+    }
+
+    /// [`Self::slice`] flattened into one owned buffer, for the callers that
+    /// need a contiguous range rather than a run of writes — the cipher
+    /// assembly, which decrypts in place, and the readers that hash a range.
+    /// Every other caller takes the pieces.
+    fn slice_contiguous(&self, offset: u64, len: u64, scratch: &HoldsScratch) -> Option<Vec<u8>> {
+        let pieces = self.slice(offset, len, scratch)?;
+        if let [only] = pieces.as_slice() {
+            return Some(only.to_vec());
+        }
+        let mut out = Vec::with_capacity(len as usize);
+        for piece in pieces {
+            out.extend_from_slice(&piece);
         }
         Some(out)
     }
@@ -1946,6 +2143,35 @@ impl VolumeStaging {
                     .insert(start, chunk.slice_of(start - offset, end - start));
             }
         }
+    }
+
+    /// Replaces the RAM-resident chunks inside `[offset, offset + len)` that
+    /// [`pins_too_much`] rules out with owned copies, and returns how many
+    /// bytes were copied.
+    ///
+    /// A chunk staged by [`Self::stage`] is a view of the decoder's buffer,
+    /// and while the view lives the pool slot behind it cannot be reused. For
+    /// a run that drains in the same call that is the point — the write reads
+    /// the slot directly. For what the drain leaves behind it is a liability:
+    /// a fifteen-byte cipher tail, a header run the parser keeps, or a hold
+    /// waiting on an article that has not arrived, each keeps a whole slot
+    /// out of the pool for as long as it stays staged, and the holds budget
+    /// — which counts range length, see [`StagedChunk::resident_len`] —
+    /// cannot see it. Copying a short residue is cheaper than the buffer it
+    /// frees, and so is copying a view that covers less than half of its
+    /// buffer; a view covering most of it keeps the zero-copy path. Copying
+    /// every hold is what holds cost before views existed, and is worth it
+    /// exactly when the pool is running dry — the caller asks with `every`.
+    fn copy_out_views(&mut self, offset: u64, len: u64, every: bool) -> u64 {
+        let end = offset.saturating_add(len);
+        let mut copied = 0u64;
+        for (start, chunk) in self.chunks.range_mut(..end) {
+            if start.saturating_add(chunk.len()) <= offset {
+                continue;
+            }
+            copied = copied.saturating_add(chunk.release(every));
+        }
+        copied
     }
 
     /// Whether `[offset, offset + len)` was force-staged by a repair, so the
@@ -1998,7 +2224,7 @@ impl VolumeStaging {
             .chunks
             .iter()
             .filter_map(|(offset, chunk)| match chunk {
-                StagedChunk::Memory(bytes) => Some((*offset, bytes.len() as u64)),
+                StagedChunk::Memory { bytes, .. } => Some((*offset, bytes.len() as u64)),
                 StagedChunk::Scratch { .. } => None,
             })
             .collect();
@@ -2086,7 +2312,39 @@ pub(crate) struct DirectSetRouter {
     /// pays the whole demotion cost for nothing. The layout is empty until the
     /// first parse succeeds, so binding it there costs a branch and rebinds
     /// nothing.
-    layout: Option<StoredLayoutBuilder>,
+    /// For a 7z set the same field carries the same meaning with a different
+    /// shape: the container states its whole map once, in an end header at the
+    /// tail, so this is `None` until that header parses and complete the moment
+    /// it does.
+    layout: Option<SetLayout>,
+    /// Each volume's decoded length, as the wire declared it.
+    ///
+    /// Empty and unread for a RAR set: RAR volumes are self-describing
+    /// front-to-back, so nothing there needs to know how long a volume is. A
+    /// 7z split is a pure byte split of one container, which makes the volume
+    /// lengths the only thing that can turn a container offset into a (volume,
+    /// offset) pair — the coordinates every part, every span and every
+    /// envelope byte is expressed in. Declared by the yEnc header of any one of
+    /// a volume's articles, so a volume states its length long before it
+    /// finishes arriving.
+    declared_volume_sizes: BTreeMap<u32, u64>,
+    /// What the container's signature header said about where its end header
+    /// lives. 7z only, and read once.
+    sevenz_start: Option<sevenz::StartHeader>,
+    /// The geometry the layout was resolved against, kept so that every
+    /// volume's decoded length can be checked against it as the volume
+    /// completes. That check is the authoritative one — a yEnc `size=` is a
+    /// hint, and what decodes is the fact.
+    sevenz_geometry: Option<sevenz::ContainerGeometry>,
+    /// What each volume actually decoded to, recorded as it completed.
+    ///
+    /// A volume can finish arriving before the map is read — the tail it lives
+    /// in may be the last thing to land — so the check cannot only run forwards
+    /// from the geometry. These are what the geometry is held against the
+    /// moment it exists.
+    sevenz_decoded_volume_lengths: BTreeMap<u32, u64>,
+    /// The container map a 7z parse produced, kept for the restart cache.
+    sevenz_facts: Option<sevenz::SevenZipContainerFacts>,
     /// The newest accepted header facts per volume.
     ///
     /// [`StoredLayoutBuilder::add_volume`] refuses a re-add whose facts differ,
@@ -2226,6 +2484,14 @@ pub(crate) struct DirectSetRouter {
     /// set that held from one that never had to.
     #[cfg(test)]
     blocks_held: u64,
+    /// Cipher bytes the encrypted write path has pulled out of staging into a
+    /// contiguous buffer. Every one of them is a copy, and a copy made for a
+    /// run that then turns out to be undecryptable is a copy thrown away, so
+    /// this is the number that says whether the path resolves a run before it
+    /// materializes it. Shared-reference interior mutability because the read
+    /// happens on `&self`.
+    #[cfg(test)]
+    staged_copy_bytes: std::sync::atomic::AtomicU64,
     /// How many Quick Open cross-check walks this set has run, so a test can
     /// prove a cache the library never adopted does not cost a second parse.
     #[cfg(test)]
@@ -2299,10 +2565,7 @@ impl std::fmt::Debug for DirectSetRouter {
             .debug_struct("DirectSetRouter")
             .field("set_name", &self.plan.set_name)
             .field("volumes", &self.plan.volumes.len())
-            .field(
-                "format",
-                &self.layout.as_ref().map(|layout| layout.format()),
-            )
+            .field("format", &self.layout.as_ref().map(SetLayout::label))
             .field("members", &self.members.len())
             .field("demoted", &self.demoted)
             .finish()
@@ -2327,6 +2590,11 @@ impl DirectSetRouter {
             scratch: HoldsScratch::new(plan.holds_scratch_path(), HOLDS_SCRATCH_CEILING_BYTES),
             plan,
             layout: None,
+            declared_volume_sizes: BTreeMap::new(),
+            sevenz_start: None,
+            sevenz_geometry: None,
+            sevenz_decoded_volume_lengths: BTreeMap::new(),
+            sevenz_facts: None,
             volume_facts: BTreeMap::new(),
             dirty_facts: std::collections::BTreeSet::new(),
             staging: BTreeMap::new(),
@@ -2351,6 +2619,8 @@ impl DirectSetRouter {
             member_ciphers_builds: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             blocks_held: 0,
+            #[cfg(test)]
+            staged_copy_bytes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             quick_open_walks: 0,
             #[cfg(test)]
@@ -2484,10 +2754,31 @@ impl DirectSetRouter {
         self.blocks_held
     }
 
+    /// Cipher bytes copied out of staging by the encrypted write path so far.
+    /// Test-only; see the field.
+    #[cfg(test)]
+    pub(crate) fn staged_copy_bytes(&self) -> u64 {
+        self.staged_copy_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Quick Open cross-check walks run so far. Test-only; see the field.
     #[cfg(test)]
     pub(crate) fn quick_open_walks(&self) -> u64 {
         self.quick_open_walks
+    }
+
+    /// Cipher bytes every encrypted member of this set has run the write-side
+    /// transform over, repeats included. One pass over a member's cipher
+    /// stream plus its edge blocks is the whole cost the write path may have;
+    /// anything more is the transform re-doing work. Test-only.
+    #[cfg(test)]
+    pub(crate) fn decrypted_bytes(&self) -> u64 {
+        self.members
+            .values()
+            .filter_map(|member| member.crypt.as_ref())
+            .map(MemberCrypt::decrypted_bytes)
+            .sum()
     }
 
     /// Header walks over a staged image run so far. Test-only; see the field.
@@ -2893,7 +3184,7 @@ impl DirectSetRouter {
                 .get(&volume_index)
                 .and_then(|staging| staging.chunks.get(&offset))
             {
-                Some(StagedChunk::Memory(bytes)) => std::sync::Arc::clone(bytes),
+                Some(StagedChunk::Memory { bytes, .. }) => bytes.clone(),
                 _ => continue,
             };
             let resident_bytes = self.resident_bytes();
@@ -3017,7 +3308,7 @@ impl DirectSetRouter {
                             volume_index: *volume_index,
                             chunk_offset: *chunk_offset,
                         }),
-                        StagedChunk::Memory(_) => None,
+                        StagedChunk::Memory { .. } => None,
                     })
             })
             .collect();
@@ -3177,7 +3468,7 @@ impl DirectSetRouter {
         repaired: bool,
     ) {
         let staging = self.staging.entry(volume_index).or_default();
-        let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(data);
+        let bytes: Bytes = Bytes::copy_from_slice(data);
         if repaired {
             staging.stage_repaired(offset, bytes);
         } else {
@@ -3189,10 +3480,29 @@ impl DirectSetRouter {
     /// volume's first, undamaged pass without a parseable RAR image.
     #[cfg(test)]
     pub(crate) fn stage_for_test(&mut self, volume_index: u32, offset: u64, data: &[u8]) {
+        self.stage_pieces_for_test(volume_index, offset, &[Bytes::copy_from_slice(data)]);
+    }
+
+    /// Test hook: [`Self::stage_for_test`] with the article already split into
+    /// the pieces the decoder would have produced.
+    #[cfg(test)]
+    pub(crate) fn stage_pieces_for_test(
+        &mut self,
+        volume_index: u32,
+        offset: u64,
+        pieces: &[Bytes],
+    ) {
         self.staging
             .entry(volume_index)
             .or_default()
-            .stage(offset, data);
+            .stage(offset, pieces);
+    }
+
+    /// Test hook: page RAM-resident holds out to scratch, the way a breach of
+    /// the budget does inside [`Self::route`].
+    #[cfg(test)]
+    pub(crate) fn page_holds_for_test(&mut self) -> Result<(), DemotionReason> {
+        self.page_holds_to_scratch()
     }
 
     /// Test hook: one drain, with no parse in front of it.
@@ -3206,10 +3516,50 @@ impl DirectSetRouter {
 
     /// The layout's members, or nothing while the format is still unknown.
     fn layout_members(&self) -> &[unrar_rs::StoredMember] {
+        self.layout.as_ref().map(SetLayout::members).unwrap_or(&[])
+    }
+
+    /// Every name the layout will put in the output directory: the routed
+    /// members, plus a 7z container's dataless entries.
+    ///
+    /// The second half is why this exists at all. A 7z archive records an empty
+    /// file and a directory as a header with no stream anywhere in the
+    /// container, so neither is a member and neither can be: there is nothing
+    /// to route. Finalization still creates them, which means they claim
+    /// destinations — and a destination-collision rule that cannot see them
+    /// would let an empty `notes.txt` be created over a routed member's
+    /// verified bytes.
+    fn layout_destination_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .layout_members()
+            .iter()
+            .map(|member| member.name.clone())
+            .collect();
+        if let Some(sevenz) = self.layout.as_ref().and_then(SetLayout::sevenz) {
+            names.extend(sevenz.dataless().iter().map(|entry| entry.name.clone()));
+        }
+        names
+    }
+
+    /// Whether this set's container family records a whole-member checksum
+    /// only when the writer chose to.
+    ///
+    /// RAR always states one, so its absence is a malformation and the layout
+    /// says so. 7z records checksums per sub-stream and an archive written
+    /// without them is ordinary, so the same absence has to mean something
+    /// else — see the checksum-free arm of [`Self::try_verify_member`].
+    fn member_checksums_are_optional(&self) -> bool {
+        self.plan.format == SetFormat::SevenZip
+    }
+
+    /// A 7z container's dataless entries, in header order. Empty for a RAR set
+    /// and for a 7z one whose header has not parsed yet.
+    pub(crate) fn dataless_entries(&self) -> Vec<sevenz::SevenZipDatalessEntry> {
         self.layout
             .as_ref()
-            .map(StoredLayoutBuilder::members)
-            .unwrap_or(&[])
+            .and_then(SetLayout::sevenz)
+            .map(|layout| layout.dataless().to_vec())
+            .unwrap_or_default()
     }
 
     /// [`StoredLayoutBuilder::map_physical_range`], answering "no destination
@@ -3360,8 +3710,15 @@ impl DirectSetRouter {
 }
 
 mod encrypted;
+mod layout;
 mod restart;
 mod routing;
+pub(crate) mod sevenz;
+
+pub(crate) use routing::HeaderProbe;
+
+#[cfg(test)]
+pub(super) use routing::crc32_over_pieces;
 
 /// Whether one ineligible member's **shape** is one the member tolerance can
 /// carry to finalization, where it is stream-extracted from the virtual

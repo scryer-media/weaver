@@ -15,7 +15,7 @@ const fr: LocaleDictionary = {
   "applicationUpgrade.upToDate": "Weaver v{{version}} est à jour.",
   "applicationUpgrade.available": "Weaver v{{version}} est disponible.",
   "applicationUpgrade.install": "Installer la v{{version}}",
-  "applicationUpgrade.notEligible": "Cette installation est gérée ailleurs, Weaver ne peut donc pas se mettre à jour lui-même ({{reason}}).",
+  "applicationUpgrade.notEligible": "Weaver ne peut pas mettre à jour cette installation depuis l’application ({{reason}}).",
   "applicationUpgrade.failed": "La mise à jour vers la v{{version}} a échoué : {{error}}",
   "applicationUpgrade.completed": "Mis à jour vers la v{{version}}.",
   "applicationUpgrade.phase.checking": "Vérification de la version…",

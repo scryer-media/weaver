@@ -17,9 +17,9 @@ weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
 async-trait = "0.1"
 # The in-application upgrade core: manifest validation, installation
 # classification, download, verification, extraction, promotion, rollback, the
-# durable journal and the Windows helper handoff. Pinned to a signed tag rather
+# durable journal and the Windows helper handoff. Pinned to a signed commit rather
 # than a branch, because everything in it is release-critical.
-application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.0" }
+application-updater = { git = "https://github.com/scryer-media/application-updater", rev = "ea4195c47e61d91566e201717a0fef51a5ba39b4" }
 # The signer-policy types, plus the Sigstore trust-root refresh Weaver primes at
 # startup. `verification` is named explicitly rather than left to feature
 # unification through `application-updater`.
@@ -118,7 +118,7 @@ criterion = "0.8"
 # The manifest-fetch-order tests drive the shared fetch against a local server
 # with signature verification stubbed. `test-seams` is a dev-dependency feature
 # on purpose: the shipped binary must never be able to skip verification.
-application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.0", features = ["test-seams"] }
+application-updater = { git = "https://github.com/scryer-media/application-updater", rev = "ea4195c47e61d91566e201717a0fef51a5ba39b4", features = ["test-seams"] }
 # `UpgradeManifestFetchOverrides::asset_base` is a `url::Url`; already in the
 # graph through reqwest, named here only so the test can build one.
 url = "2"

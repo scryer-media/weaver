@@ -222,7 +222,7 @@ func startStandardManagedWeaver(preserveState bool) error {
 	}()
 
 	setEnv("WEAVER_URL", weaverURL)
-	waitForGraphQL(graphqlURL(weaverURL), 30*time.Second)
+	waitForGraphQL(graphqlURL(weaverURL), managedWeaverExitProbe)
 	return nil
 }
 
@@ -341,6 +341,65 @@ func stopManagedWeaverAfterProfileCollection() {
 		_ = waitForPIDExit(pid, 5*time.Second)
 	}
 	_ = os.Remove(localWeaverPIDPath())
+}
+
+// managedWeaverExitProbe reports the exit of the live managed weaver, with the
+// tail of its log.
+func managedWeaverExitProbe() (bool, string) {
+	dead, err := managedWeaverDied()
+	if !dead {
+		return false, ""
+	}
+	return true, fmt.Sprintf("exit: %v; log tail:\n%s", err, managedWeaverDeathReport())
+}
+
+// childExitWatch owns the one Wait on a started child, so a readiness wait can
+// observe its exit and the code that stops it can wait on the same result.
+type childExitWatch struct {
+	done    chan struct{}
+	err     error
+	logPath string
+}
+
+func watchChildExit(cmd *exec.Cmd, logPath string) *childExitWatch {
+	watch := &childExitWatch{done: make(chan struct{}), logPath: logPath}
+	go func() {
+		watch.err = cmd.Wait()
+		close(watch.done)
+	}()
+	return watch
+}
+
+// Wait blocks until the child has exited and returns its Wait error.
+func (w *childExitWatch) Wait() error {
+	<-w.done
+	return w.err
+}
+
+// Probe is the watch as a childExitProbe.
+func (w *childExitWatch) Probe() (bool, string) {
+	select {
+	case <-w.done:
+	default:
+		return false, ""
+	}
+	status := "exit status 0"
+	if w.err != nil {
+		status = w.err.Error()
+	}
+	return true, fmt.Sprintf("%s; output tail:\n%s", status, strings.Join(tailFileLines(w.logPath, 15), "\n"))
+}
+
+// stopWatchedChild interrupts a watched child and waits for it, killing it if
+// it has not exited within timeout.
+func stopWatchedChild(cmd *exec.Cmd, watch *childExitWatch, timeout time.Duration) {
+	_ = cmd.Process.Signal(os.Interrupt)
+	select {
+	case <-watch.done:
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		<-watch.done
+	}
 }
 
 func stopManagedWeaverCommand(cmd *exec.Cmd, timeout time.Duration) {

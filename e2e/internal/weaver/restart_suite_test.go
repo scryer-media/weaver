@@ -56,6 +56,77 @@ func TestRestartCasesIncludeDirectStorePar2AliasRegression(t *testing.T) {
 	t.Fatalf("restart suite does not include %s", caseName)
 }
 
+func TestRestartCasesIncludeConventional7zDamagedBlockRepair(t *testing.T) {
+	const caseName = "conventional_7z_damaged_block_repairs_once"
+	for _, tc := range restartCases() {
+		if tc.Name != caseName {
+			continue
+		}
+		if len(tc.Slugs) != 1 || tc.Slugs[0] != conventional7zRepairSlug {
+			t.Fatalf("%s has unexpected fixtures: %v", caseName, tc.Slugs)
+		}
+		if tc.Run == nil {
+			t.Fatalf("%s has no flow", caseName)
+		}
+		for _, slug := range restartFixtureSlugs {
+			if slug == conventional7zRepairSlug {
+				return
+			}
+		}
+		t.Fatalf("%s is not seeded for the restart suite", conventional7zRepairSlug)
+	}
+	t.Fatalf("restart suite does not include %s", caseName)
+}
+
+// Log lines in the shape weaver writes them, for a job that settled on the
+// strong-decode claim and then hit a damaged block in extraction.
+func conventional7zRepairLogLines(jobID int, extractionError string, failed bool) string {
+	lines := []string{
+		fmt.Sprintf("2026-01-01T00:00:01Z  INFO weaver_server_core::pipeline::completion::finalize::check::completion: skipping authoritative PAR2 verify for clean exhausted strong-decode job job_id=%d", jobID),
+		fmt.Sprintf("2026-01-01T00:00:02Z  WARN weaver_server_core::pipeline::extraction::rar::scheduler: set extraction failed job_id=%d set_name=archive.7z error=%s", jobID, extractionError),
+	}
+	if failed {
+		lines = append(lines, fmt.Sprintf("2026-01-01T00:00:03Z ERROR weaver_server_core::pipeline::health: job failed job_id=%d reason=%s", jobID, extractionError))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func TestReadConventional7zRepairLog(t *testing.T) {
+	const dataError = `7z block data error: BlockDecode { block_index: 0, packed_offset: 32, kind: Io, message: "Io(Custom { kind: InvalidData, error: \"Error during PPMd decoding\" }, \"\")" }`
+	const terminalError = `7z extraction failed: BlockDecode { block_index: 0, packed_offset: 32, kind: Io, message: "Io(Custom { kind: InvalidData, error: \"Error during PPMd decoding\" }, \"\")" }`
+
+	repaired := readConventional7zRepairLog(conventional7zRepairLogLines(28, dataError, false), 28)
+	if !repaired.SkippedAuthoritativeVerify || !repaired.DataErrorAfterSkip || repaired.Failed {
+		t.Fatalf("a recoverable data error after the skip reads as the repair path: %+v", repaired)
+	}
+
+	// The shape the contract rules out: the error worded as terminal, and
+	// the job failed on it.
+	ended := readConventional7zRepairLog(conventional7zRepairLogLines(28, terminalError, true), 28)
+	if !ended.SkippedAuthoritativeVerify || ended.DataErrorAfterSkip || !ended.Failed {
+		t.Fatalf("a terminal error and a failed job read as such: %+v", ended)
+	}
+
+	// Another job's lines, including one whose ID shares a prefix, say
+	// nothing about this one.
+	other := readConventional7zRepairLog(
+		conventional7zRepairLogLines(280, terminalError, true)+conventional7zRepairLogLines(2, dataError, false),
+		28,
+	)
+	if other != (conventional7zRepairLog{}) {
+		t.Fatalf("other jobs' lines leaked into the reading: %+v", other)
+	}
+
+	// A data error with no skip before it is not the settled-clean shape.
+	unsettled := readConventional7zRepairLog(
+		fmt.Sprintf("x WARN set extraction failed job_id=28 set_name=archive.7z error=%s\n", dataError),
+		28,
+	)
+	if unsettled.DataErrorAfterSkip {
+		t.Fatalf("a data error without the skip before it was read as after it: %+v", unsettled)
+	}
+}
+
 func TestCapturePar2AliasStateReportsSplitOwnershipAndMissingVolumes(t *testing.T) {
 	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
 	root := t.TempDir()

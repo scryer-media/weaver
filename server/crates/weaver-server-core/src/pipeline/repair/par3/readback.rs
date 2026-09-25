@@ -10,7 +10,7 @@ const MAX_GAP_PATH_BYTES: usize = 8192;
 const MAX_EDGES: usize = 4096;
 const EDGE_RESERVATION: usize = MAX_EDGES * 256;
 
-type CipherEdge = (u32, u64, Arc<[u8]>);
+type CipherEdge = (u32, u64, bytes::Bytes);
 
 pub(super) struct EdgeRead {
     target: usize,
@@ -247,9 +247,11 @@ impl Installation {
                     return Err(EngineError::SourceChanged(read.source));
                 }
             }
-            self.targets[read.target]
-                .edges
-                .push((read.volume, read.offset, Arc::from(bytes)));
+            self.targets[read.target].edges.push((
+                read.volume,
+                read.offset,
+                bytes::Bytes::from(bytes),
+            ));
         }
         self.preflight_failed = false;
         let target = &self.targets[self.current];

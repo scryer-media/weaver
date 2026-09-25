@@ -71,6 +71,33 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         }
     }
 
+    /// Start the sequential drain past a prefix that is already on disk.
+    ///
+    /// A file resumed after a restart never refetches its leading parts, so a
+    /// cursor left at zero would wait forever for bytes that will not arrive
+    /// and nothing would ever drain in order. `cursor` is where the resumed
+    /// prefix ends, which only the first part that still has to be fetched can
+    /// say, so this is called once that part decodes rather than at creation.
+    ///
+    /// The cursor only ever moves forward, and anything already queued below
+    /// the new one covers bytes the file already holds, so it is handed back
+    /// as a duplicate arrival rather than left to stall the ordered map.
+    pub fn resume_at(&mut self, cursor: u64) {
+        if cursor <= self.write_cursor {
+            return;
+        }
+        while let Some((&offset, _)) = self.pending.first_key_value() {
+            if offset >= cursor {
+                break;
+            }
+            let (offset, entry) = self.pending.pop_first().expect("peeked entry");
+            if let PendingChunk::Buffered(buf) = entry {
+                self.redundant.push((offset, buf));
+            }
+        }
+        self.write_cursor = cursor;
+    }
+
     /// Insert a decoded segment into the buffer.
     ///
     /// A segment whose range the buffer already released for writing — it sits
@@ -87,6 +114,21 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
             return;
         }
         self.pending.insert(offset, PendingChunk::Buffered(data));
+    }
+
+    /// Insert a segment the caller already knows is a duplicate of one that
+    /// was written, so it is handed back for an idempotent rewrite instead of
+    /// taking a place in the ordered map.
+    ///
+    /// The cursor cannot make that call on its own. A buffer is dropped once
+    /// its file completes, so a duplicate that arrives afterwards meets a fresh
+    /// buffer whose cursor is back at zero: every offset but the first is
+    /// *above* it, and [`insert`](Self::insert) would park it waiting for
+    /// neighbours that were written long ago and are never coming again.
+    pub fn insert_duplicate(&mut self, offset: u64, data: T) {
+        self.buffered_bytes += data.len_bytes();
+        self.buffered_segments += 1;
+        self.redundant.push((offset, data));
     }
 
     /// Drain any contiguous segments that are now ready for sequential writing.

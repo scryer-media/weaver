@@ -164,27 +164,40 @@ struct ActiveState {
 /// ordinary contention.
 const PROCESS_MEMORY_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
 
-/// The part of the process memory limit an optional ceiling allowance never
-/// takes: a thirty-second of the limit, at least 256 MiB, and never more than a
-/// quarter of it.
+/// The part of the process memory limit an optional allowance, such as a
+/// chase's room to widen, never takes: a thirty-second of the limit, at least
+/// 256 MiB, and never more than a quarter of it.
 ///
 /// Retained admissions (a submitted NZB's scheduling metadata, repeated-article
 /// indexes) reserve without waiting and fail outright when the budget is full.
-/// A ceiling grants whatever retained state leaves, so without a carve-out a
-/// conventional 7z extraction fills the budget to the limit and every
-/// submission made during it is rejected.
+/// Without a carve-out, optional allowances fill the budget to the limit and
+/// every submission made meanwhile is rejected.
 fn ceiling_headroom_bytes(limit: u64) -> u64 {
     (limit / 32).max(256 * MIB).min(limit / 4)
+}
+
+/// What a decoder admission asks the process for.
+#[derive(Debug, Clone, Copy)]
+enum DecoderRequest {
+    /// A measured need: exactly these bytes, waited for until they fit.
+    Exact(u64),
+    /// As much as fits up to `ceiling` beside every job's retained state and
+    /// outside the retained headroom, and at least `floor`, which is waited
+    /// for like an exact need. For a decoder whose need is unknown or larger
+    /// than can be measured against the ceiling: retained state is held for
+    /// a job's lifetime, so a request for the whole ceiling that waited for
+    /// it to clear would wait for as long as any other job is queued.
+    UpToCeiling { ceiling: u64, floor: u64 },
 }
 
 /// Shared reservations for scheduling state, PAR2 packet metadata, and archive
 /// decoders in this pipeline. Normal extraction and direct chases use one pool.
 ///
 /// Retained allocations survive individual decoder operations. Their ownership
-/// separates intrinsic job limits from contention with peers. Whole-decoder
-/// ceiling admissions exclude all currently retained state. A chase on unavailable
-/// input yields under contention by unwinding its decoder and releasing its
-/// permit. These estimates do not cover allocations made by archive parsers
+/// separates intrinsic job limits from contention with peers. Optional
+/// allowances are taken without waiting and stay out of the headroom retained
+/// admissions need. A chase on unavailable input yields under contention by
+/// unwinding its decoder and releasing its permit. These estimates do not cover allocations made by archive parsers
 /// before their metadata is available for inspection.
 #[derive(Debug)]
 pub(crate) struct ProcessMemoryBudget {
@@ -194,6 +207,10 @@ pub(crate) struct ProcessMemoryBudget {
     retained: Arc<AtomicU64>,
     total_retained: Arc<AtomicU64>,
     waiting: Arc<AtomicU64>,
+    /// Yields asked of parked chases and not yet claimed by one. A waiter that
+    /// cannot fit posts one, so one waiter unwinds at most one parked chase
+    /// per release instead of every chase in the process.
+    yield_tickets: Arc<AtomicU64>,
     idle: Arc<Mutex<()>>,
     released: Arc<Condvar>,
     owners: Arc<Mutex<std::collections::HashMap<u64, std::sync::Weak<AtomicU64>>>>,
@@ -208,6 +225,7 @@ impl ProcessMemoryBudget {
             retained: Arc::new(AtomicU64::new(0)),
             total_retained: Arc::new(AtomicU64::new(0)),
             waiting: Arc::new(AtomicU64::new(0)),
+            yield_tickets: Arc::new(AtomicU64::new(0)),
             idle: Arc::new(Mutex::new(())),
             released: Arc::new(Condvar::new()),
             owners: Arc::default(),
@@ -234,6 +252,7 @@ impl ProcessMemoryBudget {
             retained,
             total_retained: Arc::clone(&self.total_retained),
             waiting: Arc::clone(&self.waiting),
+            yield_tickets: Arc::clone(&self.yield_tickets),
             idle: Arc::clone(&self.idle),
             released: Arc::clone(&self.released),
             owners: Arc::clone(&self.owners),
@@ -259,8 +278,47 @@ impl ProcessMemoryBudget {
         })
     }
 
+    /// Nonblocking decoder admission for memory a decode can do without.
+    ///
+    /// Never registers as a waiter, so asking cannot make a parked chase
+    /// yield, and never granted while anyone waits, so optional memory is not
+    /// taken from under a decode that needs it. Like any optional allowance it
+    /// stays out of the headroom kept for retained admissions.
+    pub(crate) fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<ProcessMemoryPermit> {
+        let _guard = self.idle.lock().expect("process memory state poisoned");
+        if self.has_waiters() {
+            return None;
+        }
+        let allowance_limit = self.limit.saturating_sub(self.ceiling_headroom);
+        if bytes > allowance_limit.saturating_sub(self.retained.load(Ordering::Acquire)) {
+            return None;
+        }
+        reserve_atomic(&self.reserved, bytes, allowance_limit).ok()?;
+        Some(ProcessMemoryPermit {
+            budget: Arc::clone(self),
+            bytes,
+            retained: false,
+        })
+    }
+
     pub(crate) fn has_waiters(&self) -> bool {
         self.waiting.load(Ordering::Acquire) != 0
+    }
+
+    /// Take one posted yield, if there is one. A parked chase that gets it
+    /// unwinds and releases its decoder for the waiter that posted it.
+    pub(crate) fn claim_yield(&self) -> bool {
+        self.yield_tickets
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |tickets| {
+                tickets.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    /// Give back a ticket this waiter posted. If a chase already claimed it,
+    /// this takes another waiter's instead, which only means fewer yields.
+    fn withdraw_yield(&self) {
+        let _ = self.claim_yield();
     }
 
     #[cfg(test)]
@@ -272,7 +330,7 @@ impl ProcessMemoryBudget {
     where
         F: FnMut() -> Result<(), String>,
     {
-        self.reserve_wait_kind(bytes, false, false, check_active)
+        self.reserve_wait_kind(bytes, false, check_active)
     }
 
     /// Blocking metadata workers may wait for decoders to release memory.
@@ -285,25 +343,59 @@ impl ProcessMemoryBudget {
     where
         F: FnMut() -> Result<(), String>,
     {
-        self.reserve_wait_kind(bytes, true, false, check_active)
+        self.reserve_wait_kind(bytes, true, check_active)
     }
 
     fn reserve_wait_kind<F>(
         self: &Arc<Self>,
         bytes: u64,
         retained: bool,
-        ceiling: bool,
+        check_active: F,
+    ) -> Result<ProcessMemoryPermit, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        self.reserve_wait_request(DecoderRequest::Exact(bytes), retained, check_active)
+    }
+
+    /// What `request` asks for now: an exact request its bytes, a ceiling
+    /// request whatever fits up to its ceiling beside every job's retained
+    /// state and outside the headroom, and never less than its floor.
+    ///
+    /// Recomputed under the admission lock on every pass, so retained state
+    /// published or released while the request waits is counted as it stands.
+    fn requested_bytes(&self, request: DecoderRequest) -> u64 {
+        match request {
+            DecoderRequest::Exact(bytes) => bytes,
+            DecoderRequest::UpToCeiling { ceiling, floor } => ceiling
+                .min(
+                    self.limit
+                        .saturating_sub(self.ceiling_headroom)
+                        .saturating_sub(self.total_retained.load(Ordering::Acquire)),
+                )
+                .max(floor),
+        }
+    }
+
+    fn reserve_wait_request<F>(
+        self: &Arc<Self>,
+        request: DecoderRequest,
+        retained: bool,
         mut check_active: F,
     ) -> Result<ProcessMemoryPermit, String>
     where
         F: FnMut() -> Result<(), String>,
     {
-        if ceiling && bytes == 0 {
-            return Err("WEAVER_RESOURCE_LIMIT[memory]: no decoder allowance remains".into());
-        }
-        if bytes > self.limit {
+        // What the request cannot do without. For a ceiling request only its
+        // floor: the rest is an allowance, and an allowance never makes a
+        // request impossible.
+        let required = match request {
+            DecoderRequest::Exact(bytes) => bytes,
+            DecoderRequest::UpToCeiling { floor, .. } => floor,
+        };
+        if required > self.limit {
             return Err(format!(
-                "decoder requires {bytes} bytes, process limit is {}",
+                "decoder requires {required} bytes, process limit is {}",
                 self.limit
             ));
         }
@@ -314,42 +406,35 @@ impl ProcessMemoryBudget {
                 self.0.fetch_sub(1, Ordering::AcqRel);
             }
         }
+        struct Ticket<'a>(&'a ProcessMemoryBudget);
+        impl Drop for Ticket<'_> {
+            fn drop(&mut self) {
+                self.0.withdraw_yield();
+            }
+        }
         let mut waiting = None;
+        let mut ticket = None;
         let mut wait_guard = self.idle.lock().expect("process memory state poisoned");
         let started = Instant::now();
         let mut announced = false;
         loop {
             check_active()?;
-            // A ceiling is an optional allowance, not a dictionary's measured
-            // requirement. Recompute it under the admission lock so metadata
-            // published since the budget was created cannot strand all waiters.
-            // Active decoder reservations still cause a wait, never a shrink.
-            // The headroom stays free for retained admissions, which cannot wait.
-            let allowance_limit = if ceiling {
-                self.limit.saturating_sub(self.ceiling_headroom)
-            } else {
-                self.limit
-            };
-            let granted = if ceiling {
-                bytes.min(
-                    allowance_limit.saturating_sub(self.total_retained.load(Ordering::Acquire)),
-                )
-            } else {
-                bytes
-            };
             // Only this owner's metadata makes the request intrinsically too
             // large. Other jobs can release their retained state while we wait.
-            let own_available =
-                allowance_limit.saturating_sub(self.retained.load(Ordering::Acquire));
-            if (ceiling && own_available == 0) || (!ceiling && bytes > own_available) {
+            let own_available = self
+                .limit
+                .saturating_sub(self.retained.load(Ordering::Acquire));
+            if required > own_available {
                 return Err("WEAVER_RESOURCE_LIMIT[memory]: decoder and retained job state exceed the process limit".to_string());
             }
-            if (granted != 0 || bytes == 0)
-                && reserve_atomic(&self.reserved, granted, self.limit).is_ok()
-            {
+            // A ceiling request shrinks to what retained state leaves rather
+            // than waiting for it: that state lives as long as its jobs do.
+            // Other decoders still make it wait, never shrink it; they end.
+            let bytes = self.requested_bytes(request);
+            if reserve_atomic(&self.reserved, bytes, self.limit).is_ok() {
                 if retained {
-                    self.retained.fetch_add(granted, Ordering::AcqRel);
-                    self.total_retained.fetch_add(granted, Ordering::AcqRel);
+                    self.retained.fetch_add(bytes, Ordering::AcqRel);
+                    self.total_retained.fetch_add(bytes, Ordering::AcqRel);
                 }
                 if announced {
                     info!(
@@ -360,13 +445,19 @@ impl ProcessMemoryBudget {
                 }
                 return Ok(ProcessMemoryPermit {
                     budget: Arc::clone(self),
-                    bytes: granted,
+                    bytes,
                     retained,
                 });
             }
             if waiting.is_none() {
                 self.waiting.fetch_add(1, Ordering::AcqRel);
                 waiting = Some(Waiting(&self.waiting));
+            }
+            // One yield per failed fit, not a broadcast: a parked chase that
+            // claims it unwinds and its release wakes this loop again.
+            if ticket.is_none() {
+                self.yield_tickets.fetch_add(1, Ordering::AcqRel);
+                ticket = Some(Ticket(self));
             }
             // This wait has no deadline, by design: the holder will finish. But
             // an extraction that reserves the whole process allowance and then
@@ -385,12 +476,24 @@ impl ProcessMemoryBudget {
                      another extraction is holding it"
                 );
             }
-            let (guard, _) = self
+            let (guard, timeout) = self
                 .released
                 .wait_timeout(wait_guard, Duration::from_millis(250))
                 .expect("process memory state poisoned");
             wait_guard = guard;
+            // Woken by a release, perhaps the yield this waiter asked for. If
+            // it still does not fit, the next pass posts a fresh ticket. A
+            // timeout leaves the ticket standing, so a chase still unwinding
+            // is not joined by a second one.
+            if !timeout.timed_out() {
+                ticket = None;
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn yield_tickets(&self) -> u64 {
+        self.yield_tickets.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -464,8 +567,9 @@ impl JobExtractionBudget {
             );
         }
         // Freeze the job's codec ceiling independently of temporary peer state.
-        // Exact dictionary admissions wait for peers; optional whole-ceiling
-        // admissions account for all retained state when the permit is granted.
+        // Measured decoder admissions wait for peers; a ceiling admission and
+        // optional allowances are sized from what retained state leaves when
+        // they are granted.
         let decoder_memory_limit = limits.max_memory_bytes.min(
             process_memory
                 .limit
@@ -559,28 +663,72 @@ impl JobExtractionBudget {
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<MemoryPermit, String> {
-        self.reserve_memory(bytes, false)
+        self.reserve_memory(DecoderRequest::Exact(bytes))
     }
 
-    /// Reserve an optional full-decoder allowance using current retained state.
-    /// Only ceiling-based callers may use this; measured dictionary requests
-    /// must use `reserve_memory_wait` and are never reduced.
-    pub(crate) fn reserve_memory_ceiling_wait(self: &Arc<Self>) -> Result<MemoryPermit, String> {
-        self.reserve_memory(self.max_memory_bytes(), true)
+    /// Reserve as much of this job's decoder ceiling as fits beside the
+    /// process's retained state, and never less than `floor`.
+    ///
+    /// For a decoder that cannot be sized, or whose measured need does not
+    /// fit the ceiling: it takes an allowance rather than a measurement, and
+    /// the permit's [`MemoryPermit::bytes`] is what it was granted, to be
+    /// handed to the decoder as its limit. Other jobs' retained state shrinks
+    /// the grant instead of being waited for, and the grant stays out of the
+    /// headroom, so a submission admitted while it is held still fits. Only
+    /// `floor`, and other decoders' reservations, are waited for.
+    pub(crate) fn reserve_memory_up_to_ceiling_wait(
+        self: &Arc<Self>,
+        floor: u64,
+    ) -> Result<MemoryPermit, String> {
+        self.reserve_memory(DecoderRequest::UpToCeiling {
+            ceiling: self.max_memory_bytes().max(floor),
+            floor,
+        })
     }
 
-    fn reserve_memory(self: &Arc<Self>, bytes: u64, ceiling: bool) -> Result<MemoryPermit, String> {
-        if bytes > self.limits.max_memory_bytes {
+    /// Reserve `bytes` now or not at all: no wait, and no waiter registered.
+    ///
+    /// For memory a decode can do without, such as the room to widen a chase
+    /// onto another thread. `None` when this job or the process has no room,
+    /// when anyone is waiting for memory, or when the job has stopped.
+    pub(crate) fn try_reserve_memory(self: &Arc<Self>, bytes: u64) -> Option<MemoryPermit> {
+        let _active = self
+            .active
+            .lock()
+            .expect("extraction active state poisoned");
+        self.check_active().ok()?;
+        reserve_atomic(&self.memory_reserved, bytes, self.limits.max_memory_bytes).ok()?;
+        let Some(process_memory) = self.process_memory.try_reserve(bytes) else {
+            self.memory_reserved.fetch_sub(bytes, Ordering::AcqRel);
+            self.idle.notify_all();
+            return None;
+        };
+        Some(MemoryPermit {
+            budget: Arc::clone(self),
+            _process_memory: process_memory,
+            bytes,
+        })
+    }
+
+    fn reserve_memory(self: &Arc<Self>, request: DecoderRequest) -> Result<MemoryPermit, String> {
+        let (required, bytes) = match request {
+            DecoderRequest::Exact(bytes) => (bytes, bytes),
+            // The job stage holds the whole ceiling until the process stage
+            // says how much of it was granted, then gives back the rest.
+            DecoderRequest::UpToCeiling { ceiling, floor } => (floor, ceiling),
+        };
+        if required > self.limits.max_memory_bytes {
             return Err(self
                 .reject(
                     ExtractionRejectionReason::Memory,
                     format!(
-                        "decoder requires {bytes} bytes, limit is {}",
+                        "decoder requires {required} bytes, limit is {}",
                         self.limits.max_memory_bytes
                     ),
                 )
                 .to_string());
         }
+        let bytes = bytes.min(self.limits.max_memory_bytes);
 
         let mut wait_guard = self
             .active
@@ -598,9 +746,16 @@ impl JobExtractionBudget {
                         "job decoder memory granted after waiting"
                     );
                 }
+                let process_request = match request {
+                    DecoderRequest::Exact(_) => DecoderRequest::Exact(bytes),
+                    DecoderRequest::UpToCeiling { floor, .. } => DecoderRequest::UpToCeiling {
+                        ceiling: bytes,
+                        floor,
+                    },
+                };
                 let process_memory = self
                     .process_memory
-                    .reserve_wait_kind(bytes, false, ceiling, || {
+                    .reserve_wait_request(process_request, false, || {
                         self.check_active().map_err(|error| error.to_string())
                     })
                     .map_err(|error| {
@@ -610,8 +765,11 @@ impl JobExtractionBudget {
                             .to_string()
                     })?;
                 let granted = process_memory.bytes;
-                self.memory_reserved
-                    .fetch_sub(bytes - granted, Ordering::AcqRel);
+                if granted < bytes {
+                    self.memory_reserved
+                        .fetch_sub(bytes - granted, Ordering::AcqRel);
+                    self.idle.notify_all();
+                }
                 return Ok(MemoryPermit {
                     budget: Arc::clone(self),
                     _process_memory: process_memory,
@@ -979,6 +1137,13 @@ pub(crate) struct MemoryPermit {
     budget: Arc<JobExtractionBudget>,
     _process_memory: ProcessMemoryPermit,
     bytes: u64,
+}
+
+impl MemoryPermit {
+    /// Decoder bytes this permit holds.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl Drop for MemoryPermit {
@@ -1864,52 +2029,82 @@ mod tests {
         );
         assert_eq!(pool.reserved_bytes(), 0);
         assert!(!pool.has_waiters());
+        assert_eq!(pool.yield_tickets(), 0);
     }
 
+    /// One waiter is one yield: of two parked chases, the one that claims the
+    /// waiter's ticket unwinds and the other stays parked on its download.
     #[test]
-    fn ceiling_admission_rechecks_metadata_growth_without_waiting_on_peer_completion() {
-        let pool = Arc::new(ProcessMemoryBudget::new(64 * MIB));
-        let root = tempfile::tempdir().unwrap();
-        let budget = JobExtractionBudget::new_with_process_memory(
-            limits(),
-            pool.for_job(1),
-            root.path().into(),
-            1,
-            0,
-            0,
-            PipelineMetrics::new(),
-        )
-        .unwrap();
-        assert_eq!(budget.max_memory_bytes(), 64 * MIB);
-        // Both this job and its peers publish more metadata after the decoder
-        // budget was created. None needs to finish before extraction can start.
-        let own = pool.for_job(1).try_reserve_retained(4 * MIB).unwrap();
-        let peer = pool.for_job(2).try_reserve_retained(8 * MIB).unwrap();
-        let permit = budget.reserve_memory_ceiling_wait().unwrap();
-        // 64 MiB less the 16 MiB headroom, less the 12 MiB now retained.
-        assert_eq!(permit.bytes, 36 * MIB);
-        assert_eq!(pool.reserved_bytes(), 48 * MIB);
-        assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 36 * MIB);
-        assert!(!pool.has_waiters());
-        drop(permit);
-        assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 0);
-        drop((own, peer));
-        assert_eq!(pool.total_retained.load(Ordering::Acquire), 0);
+    fn one_waiter_unwinds_exactly_one_of_two_parked_chases() {
+        use crate::pipeline::direct_unpack::coverage::SetCoverage;
+
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let mut chases = Vec::new();
+        for _ in 0..2 {
+            let coverage = Arc::new(SetCoverage::new(1));
+            coverage.yield_to_memory_pressure(Arc::clone(&pool));
+            let permit = pool.reserve_wait(512, || Ok(())).unwrap();
+            let chase_coverage = Arc::clone(&coverage);
+            let chase = std::thread::spawn(move || {
+                let _permit = permit;
+                chase_coverage.resolve_position(0, 0)
+            });
+            chases.push((coverage, chase));
+        }
+        let decoder = pool
+            .reserve_wait(512, || Ok(()))
+            .expect("one chase's release is enough for the waiter");
+        assert_eq!(pool.yield_tickets(), 0, "the granted waiter left no ticket");
+        assert!(!pool.claim_yield());
+
+        let mut outcomes = Vec::new();
+        for (coverage, chase) in chases {
+            coverage.abort("test teardown");
+            outcomes.push(chase.join().unwrap().unwrap_err().to_string());
+        }
+        let yielded = outcomes
+            .iter()
+            .filter(|outcome| outcome.contains("memory pressure"))
+            .count();
+        assert_eq!(yielded, 1, "exactly one chase yields: {outcomes:?}");
+        drop(decoder);
         assert_eq!(pool.reserved_bytes(), 0);
     }
 
-    /// A held ceiling must leave room for retained admissions, which reserve
-    /// without waiting: an NZB submitted while a conventional 7z extraction
-    /// runs is admitted, not rejected with a resource limit.
+    /// A waiter that is granted before any chase takes its ticket withdraws
+    /// it, so no chase unwinds afterwards for a wait that is already over.
     #[test]
-    fn ceiling_allowance_leaves_headroom_for_retained_admissions() {
+    fn waiter_granted_before_any_claim_leaves_no_yield() {
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let holder = pool.reserve_wait(1024, || Ok(())).unwrap();
+        let waiter_pool = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || waiter_pool.reserve_wait(1024, || Ok(())));
+        while pool.yield_tickets() == 0 {
+            std::thread::yield_now();
+        }
+        drop(holder);
+        let decoder = waiter.join().unwrap().unwrap();
+        assert_eq!(pool.yield_tickets(), 0);
+        assert!(
+            !pool.claim_yield(),
+            "no ticket is left for a chase to claim"
+        );
+        drop(decoder);
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    /// Optional memory is taken now or not at all: granted from free room,
+    /// refused without waiting when the job or the process has none, never
+    /// taken from the headroom retained admissions rely on, and never taken
+    /// while another decode waits.
+    #[test]
+    fn try_reserve_memory_takes_free_room_without_waiting() {
         assert_eq!(ceiling_headroom_bytes(64 * GIB), 2 * GIB);
         assert_eq!(ceiling_headroom_bytes(4 * GIB), 256 * MIB);
         assert_eq!(ceiling_headroom_bytes(64 * MIB), 16 * MIB);
 
         let pool = Arc::new(ProcessMemoryBudget::new(64 * MIB));
         let root = tempfile::tempdir().unwrap();
-        let existing = pool.for_job(2).try_reserve_retained(4 * MIB).unwrap();
         let budget = JobExtractionBudget::new_with_process_memory(
             limits(),
             pool.for_job(1),
@@ -1920,7 +2115,101 @@ mod tests {
             PipelineMetrics::new(),
         )
         .unwrap();
-        let ceiling = budget.reserve_memory_ceiling_wait().unwrap();
+        let retained = pool.for_job(2).try_reserve_retained(8 * MIB).unwrap();
+
+        // 64 MiB less the 16 MiB headroom holds 40 MiB beside the 8 retained.
+        let first = budget.try_reserve_memory(32 * MIB).expect("free room");
+        let second = budget.try_reserve_memory(8 * MIB).expect("free room");
+        assert!(
+            budget.try_reserve_memory(1).is_none(),
+            "the headroom is not optional room"
+        );
+        assert!(
+            !pool.has_waiters(),
+            "a refused try never registers a waiter"
+        );
+        assert_eq!(pool.yield_tickets(), 0);
+        assert_eq!(budget.memory_reserved_bytes(), 40 * MIB);
+        let submitted = pool
+            .for_job(3)
+            .try_reserve_retained(16 * MIB)
+            .expect("retained admissions keep their headroom");
+        drop((first, second, submitted));
+        assert_eq!(budget.memory_reserved_bytes(), 0);
+        assert_eq!(pool.reserved_bytes(), 8 * MIB);
+
+        // A decode waiting for memory comes before optional room: 8 MiB is
+        // free beside the holder, but not for the taking while it waits.
+        let holder = pool.reserve_wait(32 * MIB, || Ok(())).unwrap();
+        let waiter_pool = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || waiter_pool.reserve_wait(32 * MIB, || Ok(())));
+        while pool.yield_tickets() == 0 {
+            std::thread::yield_now();
+        }
+        assert!(
+            budget.try_reserve_memory(MIB).is_none(),
+            "optional room is refused while a decode waits"
+        );
+        drop(holder);
+        let decoder = waiter.join().unwrap().unwrap();
+        drop((decoder, retained));
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert_eq!(budget.memory_reserved_bytes(), 0);
+    }
+
+    fn ceiling_test_budget(
+        pool: &Arc<ProcessMemoryBudget>,
+        job: u64,
+        root: &tempfile::TempDir,
+    ) -> Arc<JobExtractionBudget> {
+        JobExtractionBudget::new_with_process_memory(
+            limits(),
+            pool.for_job(job),
+            root.path().into(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap()
+    }
+
+    /// Retained state published after the job's ceiling was frozen, by this
+    /// job or a peer, shrinks a ceiling admission instead of failing it or
+    /// making it wait for a peer to finish.
+    #[test]
+    fn ceiling_admission_rechecks_metadata_growth_without_waiting_on_peer_completion() {
+        let pool = Arc::new(ProcessMemoryBudget::new(64 * MIB));
+        let root = tempfile::tempdir().unwrap();
+        let budget = ceiling_test_budget(&pool, 1, &root);
+        assert_eq!(budget.max_memory_bytes(), 64 * MIB);
+        let own = pool.for_job(1).try_reserve_retained(4 * MIB).unwrap();
+        let peer = pool.for_job(2).try_reserve_retained(8 * MIB).unwrap();
+
+        let permit = budget.reserve_memory_up_to_ceiling_wait(MIB).unwrap();
+        // 64 MiB less the 16 MiB headroom, less the 12 MiB now retained.
+        assert_eq!(permit.bytes(), 36 * MIB);
+        assert_eq!(pool.reserved_bytes(), 48 * MIB);
+        assert_eq!(budget.memory_reserved_bytes(), 36 * MIB);
+        assert!(!pool.has_waiters());
+        assert_eq!(pool.yield_tickets(), 0);
+        drop(permit);
+        assert_eq!(budget.memory_reserved_bytes(), 0);
+        drop((own, peer));
+        assert_eq!(pool.total_retained.load(Ordering::Acquire), 0);
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    /// A held ceiling leaves room for retained admissions, which reserve
+    /// without waiting: an NZB submitted while a conventional 7z extraction
+    /// runs is admitted, not rejected with a resource limit.
+    #[test]
+    fn ceiling_allowance_leaves_headroom_for_retained_admissions() {
+        let pool = Arc::new(ProcessMemoryBudget::new(64 * MIB));
+        let root = tempfile::tempdir().unwrap();
+        let existing = pool.for_job(2).try_reserve_retained(4 * MIB).unwrap();
+        let budget = ceiling_test_budget(&pool, 1, &root);
+        let ceiling = budget.reserve_memory_up_to_ceiling_wait(MIB).unwrap();
 
         // A submission's metadata and a repeated-article index, both admitted
         // while the ceiling is held.
@@ -1933,7 +2222,7 @@ mod tests {
             .try_reserve_retained(8 * MIB)
             .expect("retained state must be admitted while a ceiling is held");
         // 64 MiB less the 16 MiB headroom, less the 4 MiB retained at grant.
-        assert_eq!(ceiling.bytes, 44 * MIB);
+        assert_eq!(ceiling.bytes(), 44 * MIB);
         let retained_total = 4 * MIB + 64 * 1024 + 8 * MIB;
         assert_eq!(pool.reserved_bytes(), 44 * MIB + retained_total);
 
@@ -1941,6 +2230,37 @@ mod tests {
         assert_eq!(pool.reserved_bytes(), retained_total);
         drop((existing, submitted, index));
         assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    /// A ceiling admission's floor is a measured need: when retained state
+    /// leaves less than it, the floor is waited for exactly as a measured
+    /// request would be, and granted whole once it fits.
+    #[test]
+    fn ceiling_admission_waits_only_for_its_floor() {
+        let pool = Arc::new(ProcessMemoryBudget::new(64 * MIB));
+        let root = tempfile::tempdir().unwrap();
+        let budget = ceiling_test_budget(&pool, 1, &root);
+        // 64 MiB less the 16 MiB headroom leaves 8 MiB beside 40 retained;
+        // the floor is 24 MiB, and 24 more fits the limit only without the
+        // peer.
+        let peer = pool.for_job(2).try_reserve_retained(40 * MIB).unwrap();
+        let other = pool.for_job(3).try_reserve_retained(20 * MIB).unwrap();
+        let waiter_budget = Arc::clone(&budget);
+        let waiter =
+            std::thread::spawn(move || waiter_budget.reserve_memory_up_to_ceiling_wait(24 * MIB));
+        while pool.yield_tickets() == 0 {
+            std::thread::yield_now();
+        }
+        assert!(pool.has_waiters());
+        drop(peer);
+        let permit = waiter.join().unwrap().unwrap();
+        // With 20 MiB retained, 28 MiB fits outside the headroom.
+        assert_eq!(permit.bytes(), 28 * MIB);
+        assert_eq!(budget.memory_reserved_bytes(), 28 * MIB);
+        assert_eq!(pool.yield_tickets(), 0);
+        drop((permit, other));
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert_eq!(budget.memory_reserved_bytes(), 0);
     }
 
     #[test]
@@ -1963,13 +2283,19 @@ mod tests {
                 }
             })
         });
-        while !pool.has_waiters() {
+        // A waiter posts its yield ticket after it registers as waiting.
+        while pool.yield_tickets() == 0 {
             std::thread::yield_now();
         }
         assert!(pool.has_waiters());
         cancelled.store(true, Ordering::Release);
         assert_eq!(waiter.join().unwrap().unwrap_err(), "cancelled");
         assert!(!pool.has_waiters());
+        assert_eq!(
+            pool.yield_tickets(),
+            0,
+            "a finished waiter leaves no ticket"
+        );
         assert_eq!(pool.reserved_bytes(), 1000);
         drop((metadata, peer));
         assert_eq!(pool.reserved_bytes(), 0);
@@ -1984,7 +2310,8 @@ mod tests {
         let own = pool.for_job(2).try_reserve_retained(100).unwrap();
         let owner = pool.for_job(2);
         let waiter = std::thread::spawn(move || owner.reserve_wait(800, || Ok(())));
-        while !pool.has_waiters() {
+        // A waiter posts its yield ticket after it registers as waiting.
+        while pool.yield_tickets() == 0 {
             std::thread::yield_now();
         }
         assert!(
@@ -1995,6 +2322,11 @@ mod tests {
         let decoder = waiter.join().unwrap().unwrap();
         assert_eq!(pool.reserved_bytes(), 900);
         assert!(!pool.has_waiters());
+        assert_eq!(
+            pool.yield_tickets(),
+            0,
+            "a finished waiter leaves no ticket"
+        );
         drop(decoder);
         assert!(
             pool.for_job(2)
@@ -2025,13 +2357,19 @@ mod tests {
                 }
             })
         });
-        while !pool.has_waiters() {
+        // A waiter posts its yield ticket after it registers as waiting.
+        while pool.yield_tickets() == 0 {
             std::thread::yield_now();
         }
         assert!(pool.has_waiters());
         cancellation.cancel();
         assert!(worker.join().unwrap().is_err());
         assert!(!pool.has_waiters());
+        assert_eq!(
+            pool.yield_tickets(),
+            0,
+            "a finished waiter leaves no ticket"
+        );
         assert_eq!(pool.reserved_bytes(), 1024);
         assert_eq!(pool.retained.load(Ordering::Acquire), 0);
         drop(holder);

@@ -91,23 +91,23 @@ impl Pipeline {
         // fire-and-forget task: two rapid runtime transitions for the same job
         // (last-write-wins columns: run_state / paused_resume_* / status) must
         // land in enqueue order, or a restored job could resume stale state.
-        if let Err(error) = self
-            .db
-            .try_queue_write("set_active_job_runtime", move |db| {
-                db.set_active_job_runtime(
-                    job_id,
-                    &status,
-                    Some(&download_state),
-                    Some(&post_state),
-                    Some(&run_state),
-                    error.as_deref(),
-                    queued_repair_at_epoch_ms,
-                    queued_extract_at_epoch_ms,
-                    paused_resume_status.as_deref(),
-                    paused_resume_download_state.as_deref(),
-                    paused_resume_post_state.as_deref(),
-                )
-            })
+        if let Err(error) =
+            self.db
+                .try_queue_job_write(job_id, "set_active_job_runtime", move |db| {
+                    db.set_active_job_runtime(
+                        job_id,
+                        &status,
+                        Some(&download_state),
+                        Some(&post_state),
+                        Some(&run_state),
+                        error.as_deref(),
+                        queued_repair_at_epoch_ms,
+                        queued_extract_at_epoch_ms,
+                        paused_resume_status.as_deref(),
+                        paused_resume_download_state.as_deref(),
+                        paused_resume_post_state.as_deref(),
+                    )
+                })
         {
             tracing::error!(
                 error = %error,
@@ -894,6 +894,55 @@ impl Pipeline {
                 removed,
                 total = recovery_files.len(),
                 "deleted recovery files"
+            );
+        }
+    }
+
+    /// Remove the volume images of container sets whose members were installed
+    /// straight from the wire.
+    ///
+    /// Such a set never writes its volumes, so there is normally nothing here.
+    /// A repair that rebuilt a volume is the exception: it lands the rebuilt
+    /// image at the volume's own name so the set can route it, and once the set
+    /// is finalized the image is spent. A job with only installed sets never
+    /// reaches the extraction cleanup that removes archive parts, so without
+    /// this the rebuilt volume would be released next to the members it
+    /// carried.
+    pub(super) async fn cleanup_installed_direct_set_volumes(&self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let cleanup_dir = state.working_dir.clone();
+        let volume_files: Vec<String> = state
+            .assembly
+            .files()
+            .filter(|f| {
+                matches!(
+                    self.classified_role_for_file(job_id, f),
+                    weaver_model::files::FileRole::SevenZipArchive
+                        | weaver_model::files::FileRole::SevenZipSplit { .. }
+                ) && self.direct_set_already_installed(job_id, f)
+            })
+            .map(|f| self.current_filename_for_file(job_id, f))
+            .collect();
+
+        let mut removed = 0u32;
+        for filename in &volume_files {
+            let path = cleanup_dir.join(filename);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(file = %path.display(), error = %e, "failed to delete installed set volume");
+                }
+            }
+        }
+        if removed > 0 {
+            info!(
+                job_id = job_id.0,
+                removed,
+                total = volume_files.len(),
+                "deleted installed set volumes"
             );
         }
     }

@@ -577,6 +577,22 @@ pub struct HealthDeferral {
     pub deferrals: u64,
 }
 
+/// Fingerprints of the periodic checkpoint lines a job has already announced.
+///
+/// The completion checkpoint is re-entered on a timer for as long as a job is
+/// waiting, and a waiting job re-enters it with the same answer every time.
+/// Holding the last announced content lets the announcement follow the state
+/// rather than the timer: a line whose fingerprint is unchanged has nothing to
+/// add and drops to the diagnostic level. They live in the job's state, so a
+/// job leaving the pipeline takes them with it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AnnouncedCheckpoints {
+    /// The RAR completion checkpoint's whole payload, bar its timestamp.
+    pub rar_completion: Option<u64>,
+    /// Which demoted direct-store file is holding PAR2 settlement up, and why.
+    pub demoted_materialization: Option<u64>,
+}
+
 /// Internal state for a running job.
 pub struct JobState {
     pub job_id: JobId,
@@ -648,6 +664,9 @@ pub struct JobState {
     /// The health-failure deferral currently in force, if any, and how many
     /// times it has deferred since it began.
     pub health_deferral: HealthDeferral,
+    /// What the recurring checkpoint lines last announced for this job, so a
+    /// repeat with nothing new to say is not announced again.
+    pub announced_checkpoints: AnnouncedCheckpoints,
     /// Probe activation counter used to rotate sampled segments across rounds.
     pub health_probe_round: u32,
     /// How many files had already lost a segment when the last probe round was
@@ -698,6 +717,17 @@ pub struct JobState {
     /// `fetch_add` through this already-resolved pointer. `None` only while a
     /// test builds a bare state; the accounting site simply skips then.
     pub category_bytes: Option<Arc<AtomicU64>>,
+    /// Password candidates derived from the job's persisted NZB (its
+    /// `<meta type="password">` and the `{{password}}` file-name convention),
+    /// in harvest order and without the spec's explicit password.
+    ///
+    /// Filled when the job enters the pipeline, or by the first harvest that
+    /// reads the job's row; a row with no NZB fills it with an empty list. The
+    /// NZB never changes under a live job, so once filled the harvest reads
+    /// this instead of reloading and re-parsing the NZB on every archive file.
+    /// Left unset when the NZB could not be read or parsed, which keeps a
+    /// transient failure retryable.
+    pub nzb_password_candidates: std::sync::OnceLock<Vec<ArchivePasswordCandidate>>,
 }
 
 impl JobState {

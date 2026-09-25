@@ -1451,6 +1451,176 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
 
 /// The last holds failure mode: the scratch file cannot be opened at all.
 #[tokio::test]
+async fn a_restart_inside_a_handback_window_refuses_the_row_and_keeps_the_rebuilt_volume() {
+    // The per-volume handback writes a rebuilt volume's completed-file row
+    // while the set's coverage row is still standing for its siblings. A crash
+    // in that window must not resume the set as direct over a volume the
+    // conventional path now owns: the row is refused, the rebuilt volume keeps
+    // its bytes, and the rest of the set redownloads.
+    let member_name = "Silver.Horizon.S01E28.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41063);
+    let (mut pipeline, working_dir, _) =
+        demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+            &temp_dir,
+            job_id,
+            &volumes,
+            DemotionReason::HoldsBudgetExceeded,
+            true,
+            |_, _| {},
+        )
+        .await;
+
+    // The sweep's first message: volume 0, whole. Its handback records it
+    // complete; the coverage row stays.
+    let done = pipeline
+        .direct_demotion_done_rx
+        .recv()
+        .await
+        .expect("the demotion completion channel should stay open");
+    assert!(matches!(
+        &done.progress,
+        crate::pipeline::DirectDemotionProgress::Volume(outcome) if outcome.volume_index == 0
+    ));
+    pipeline.handle_direct_demotion_done(done).await;
+    assert!(
+        !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "non-vacuity: the row must still be standing when the crash hits"
+    );
+    let (persisted_progress, persisted_complete) =
+        pipeline.db.load_active_file_runtime(job_id).unwrap();
+    assert!(
+        persisted_complete.contains(&0),
+        "non-vacuity: the rebuilt volume's completed-file row is durable"
+    );
+    let file_progress = persisted_progress;
+    let complete_files = persisted_complete
+        .into_iter()
+        .map(|file_index| NzbFileId { job_id, file_index })
+        .collect();
+    drop(pipeline);
+
+    let (mut restarted, _, _) = new_direct_pipeline(&temp_dir).await;
+    restarted.direct_store.set_gate(DirectStoreGate::Enabled);
+    restarted
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: direct_store_job_spec("Silver Horizon", &volumes),
+            complete_files,
+            file_progress,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        restarted
+            .db
+            .load_direct_coverage(job_id)
+            .unwrap()
+            .is_empty(),
+        "the row that still claimed a volume with conventional bytes is refused and deleted"
+    );
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "the rebuilt volume keeps its bytes"
+    );
+    assert_eq!(
+        peek_queued_segments(&mut restarted, job_id),
+        vec![(1, 0), (1, 1), (2, 0), (2, 1)],
+        "the rebuilt volume is not fetched again; the siblings the row was still \
+         claiming are"
+    );
+    assert!(
+        !direct_partial(&temp_dir, job_id, member_name).exists(),
+        "the refused set's routed output is swept"
+    );
+}
+
+/// A handback whose sweep could not verify the volume's first article but did
+/// verify a later one leaves conventional bytes that no floor records — the
+/// floor is a contiguous prefix, and there is none. The restore could not
+/// refuse the set's row on anything, so the handback retires it itself.
+#[tokio::test]
+async fn a_handback_with_no_floor_under_its_swept_bytes_retires_the_row() {
+    let member_name = "Silver.Horizon.S01E29.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41163);
+    let (mut pipeline, working_dir, _) =
+        demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+            &temp_dir,
+            job_id,
+            &volumes,
+            DemotionReason::HoldsBudgetExceeded,
+            true,
+            |pipeline, _| {
+                // Volume 0's headers live in its envelope; a flipped first
+                // byte fails its first article's part-CRC, and only that one.
+                let envelope = pipeline
+                    .direct_store
+                    .set(job_id, 0)
+                    .unwrap()
+                    .plan()
+                    .envelope_path(0);
+                let mut bytes = std::fs::read(&envelope).unwrap();
+                bytes[0] ^= 0xff;
+                std::fs::write(&envelope, bytes).unwrap();
+            },
+        )
+        .await;
+
+    let done = pipeline
+        .direct_demotion_done_rx
+        .recv()
+        .await
+        .expect("the demotion completion channel should stay open");
+    let crate::pipeline::DirectDemotionProgress::Volume(outcome) = &done.progress else {
+        panic!("the sweep's first message is a volume");
+    };
+    assert_eq!(outcome.volume_index, 0);
+    assert_eq!(
+        outcome.contiguous, 0,
+        "non-vacuity: the first article was refused, so there is no floor"
+    );
+    assert!(
+        !outcome.verified.is_empty(),
+        "non-vacuity: a later article of the volume was swept and checked"
+    );
+    assert!(
+        !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "non-vacuity: the row is standing when the handback begins"
+    );
+    pipeline.handle_direct_demotion_done(done).await;
+
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "a row standing over a volume whose conventional bytes nothing records is retired"
+    );
+    assert!(
+        working_dir.join(&volumes[0].0).exists(),
+        "the volume's swept bytes stay on disk for the conventional path"
+    );
+}
+
+#[tokio::test]
 async fn a_scratch_io_failure_demotes_the_set() {
     let member_name = "Silver.Horizon.S01E36.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();
@@ -2070,6 +2240,90 @@ async fn an_absent_closing_volume_is_confirmed_from_its_own_repaired_image() {
     );
 }
 
+/// The same two absences under PAR3 instead of PAR2: a whole middle volume
+/// nobody posted, and the closing one. The set holds no byte of either, so
+/// the recovery set has to create the volume at the length its descriptions
+/// state and the re-route has to confirm it from the repaired image — the
+/// PAR3 readback path, which is not the PAR2 overlay's.
+async fn a_wholly_absent_rar_volume_under_par3(job_id: JobId, absent: u32) -> Par3RepairOutcome {
+    let member_name = "Silver.Horizon.S01E33.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 211) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 5);
+    let carriers = par3_carriers_over(&volumes, PAR2_SLICE_BYTES, 12);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, 2);
+    let outcome =
+        run_direct_set_with_par3(job_id, spec, &volumes, 2, Some(absent), &carriers).await;
+    assert!(
+        matches!(outcome.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        outcome.status,
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.member(member_name).as_deref(),
+        Some(payload.as_slice()),
+        "the member must be published whole from bytes the repair supplied; sets = {}",
+        outcome.shapes()
+    );
+    assert!(
+        !outcome.volume_file_seen,
+        "no source volume may appear under its own name; sets = {}",
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.repair_scratch_left, 0,
+        "the repair scratch is deleted once its spans are routed"
+    );
+    let published: Vec<String> = std::fs::read_dir(&outcome.output_root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| outcome.output_root.join(filename).exists()),
+        "the repaired volume is the set's, not a deliverable; published = {published:?}\nsets: {}",
+        outcome.shapes()
+    );
+    outcome
+}
+
+#[tokio::test]
+async fn a_wholly_absent_volume_is_repaired_in_place_by_par3() {
+    let outcome = a_wholly_absent_rar_volume_under_par3(JobId(41222), 2).await;
+    assert!(
+        !outcome.demoted(),
+        "a volume nobody posted is repairable in place under PAR3 too; sets = {}",
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.finalized,
+        1,
+        "the set must commit its own partials; sets = {}",
+        outcome.shapes()
+    );
+}
+
+#[tokio::test]
+async fn an_absent_closing_volume_is_repaired_in_place_by_par3() {
+    let outcome = a_wholly_absent_rar_volume_under_par3(JobId(41223), 4).await;
+    assert!(
+        !outcome.demoted(),
+        "the closing volume's repaired image must confirm the set; sets = {}",
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.finalized,
+        1,
+        "the set must finalize on it; sets = {}",
+        outcome.shapes()
+    );
+}
+
 #[tokio::test]
 async fn a_part_checksum_mismatch_waits_for_par2_instead_of_demoting() {
     // 128 bytes of a volume's member payload flipped under a yEnc CRC that
@@ -2517,5 +2771,253 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
         direct_scratch_left(&working_dir),
         0,
         "no scratch, for the same reason"
+    );
+}
+
+/// Three stored volumes and one trailing file that does not arrive before the
+/// restart. The trailing file is what keeps the job downloading once the set
+/// has finalized — the window a restart has to survive — rather than letting it
+/// complete and publish the member out of staging before the process goes down.
+fn installed_set_fixture(member_name: &str, payload: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut files = single_member_store_set(member_name, payload, 3);
+    files.push((
+        "Silver.Horizon.nfo".to_string(),
+        b"Silver Horizon release notes".to_vec(),
+    ));
+    files
+}
+
+/// A set that finalized while its job was still downloading is done, not new.
+/// The restart must bring it back installed, refetch none of its volumes, and
+/// still let the job finish exactly as an uninterrupted run does.
+#[tokio::test]
+async fn a_restart_after_finalization_restores_the_set_as_installed() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E31.mkv";
+    let payload: Vec<u8> = (0..6000u32).map(|index| (index % 239) as u8).collect();
+    let files = installed_set_fixture(member_name, &payload);
+    let volumes = &files[..3];
+    let trailing = 3u32;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41170);
+    let working_dir = direct_store_before_restart(
+        &temp_dir,
+        job_id,
+        &files,
+        &in_order_arrivals(volumes.len()),
+        ARTICLES,
+    )
+    .await;
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &files,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the restored job must carry its direct set");
+    assert!(
+        set.is_finalized(),
+        "a set that finalized before the restart must come back finalized, not fresh"
+    );
+    let set_name = set.set_name().to_string();
+    assert!(
+        pipeline
+            .extracted_archives
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains(&set_name)),
+        "a restored installed set must still count as extracted"
+    );
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert_eq!(
+        queued,
+        vec![(trailing, 0), (trailing, 1)],
+        "only the trailing file may be fetched; an installed set's volumes must not be"
+    );
+
+    for (file_index, segment_number) in queued {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &files,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+    pipeline.check_job_completion(job_id).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let complete_dir = temp_dir.path().join("complete");
+    let (restarted_member, restarted_location) =
+        member_after_gate(&complete_dir, &working_dir, member_name);
+    let restarted_status = job_status_for_assert(&pipeline, job_id);
+    assert!(
+        no_volume_file(&working_dir, volumes),
+        "an installed set must never materialize a source volume"
+    );
+    drop(pipeline);
+
+    let uninterrupted = run_direct_store_gate(
+        DirectStoreGate::Enabled,
+        JobId(41171),
+        member_name,
+        &files,
+        &in_order_arrivals(files.len()),
+    )
+    .await;
+    assert_eq!(
+        restarted_member.as_deref(),
+        Some(payload.as_slice()),
+        "the member committed before the restart must be the job's output"
+    );
+    assert_eq!(
+        (restarted_location, &restarted_status),
+        (uninterrupted.member_location, &uninterrupted.status),
+        "a job restarted after its set finalized must finish as an uninterrupted one"
+    );
+}
+
+/// The marker is a claim about the staging root, and a claim restart can check.
+/// A member gone while the process was down refuses it, and the set
+/// redownloads as it would have with no marker at all.
+#[tokio::test]
+async fn an_installation_marker_whose_member_vanished_redownloads_the_set() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E32.mkv";
+    let payload: Vec<u8> = (0..6000u32).map(|index| (index % 233) as u8).collect();
+    let files = installed_set_fixture(member_name, &payload);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41172);
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &files, &in_order_arrivals(3), ARTICLES)
+            .await;
+    let staging = temp_dir
+        .path()
+        .join("complete")
+        .join(".weaver-staging")
+        .join(job_id.0.to_string());
+    std::fs::remove_file(staging.join(member_name))
+        .expect("the finalized member must be in the staging root before the restart");
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &files,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_finalized()),
+        "a refused marker must leave the set fresh"
+    );
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "a refused marker must be deleted"
+    );
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert_eq!(
+        queued,
+        in_order_arrivals(files.len()),
+        "a set whose marker was refused must refetch every article"
+    );
+}
+
+/// Finalization leaves the set's installation marker in its coverage row, and
+/// the process keeps demanding barriers after that — on shutdown, on pause,
+/// and whenever another set of the job finalizes. None of them may turn the
+/// marker back into a coverage snapshot, which would claim nothing and send
+/// the restart back to fetching every volume.
+#[tokio::test]
+async fn a_barrier_demanded_after_finalization_keeps_the_set_installed() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E32.mkv";
+    let payload: Vec<u8> = (0..6000u32).map(|index| (index % 233) as u8).collect();
+    let files = installed_set_fixture(member_name, &payload);
+    let volumes = &files[..3];
+    let trailing = 3u32;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41173);
+    let working_dir = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        let spec = direct_store_job_spec_with_articles("Silver Horizon", &files, ARTICLES);
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                &files,
+                file_index,
+                segment_number,
+                ARTICLES,
+            )
+            .await;
+        }
+        assert!(
+            pipeline
+                .direct_store
+                .set(job_id, 0)
+                .is_some_and(|set| set.is_finalized()),
+            "every volume arrived, so the set finalizes before the barriers below"
+        );
+        for demand in [
+            BarrierDemand::Finalization,
+            BarrierDemand::PhaseChange,
+            BarrierDemand::Pause,
+            BarrierDemand::Shutdown,
+        ] {
+            // Per job, as a scoped pause and a sibling set's phase change or
+            // finalization demand it: the all-jobs sweep skips a job with no
+            // live set, which is exactly what hid this.
+            pipeline.demand_direct_store_barriers(job_id, demand).await;
+        }
+        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        assert!(
+            !rows.is_empty()
+                && rows
+                    .values()
+                    .all(|blob| crate::pipeline::direct_store::snapshot::is_installed_marker(blob)),
+            "the set's row must still be its installation marker after every demand"
+        );
+        working_dir
+    };
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &files,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.is_finalized()),
+        "the set must come back installed"
+    );
+    assert_eq!(
+        peek_queued_segments(&mut pipeline, job_id),
+        vec![(trailing, 0), (trailing, 1)],
+        "only the trailing file may be fetched"
     );
 }

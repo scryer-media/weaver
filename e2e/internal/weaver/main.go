@@ -88,6 +88,37 @@ type ScenarioRuntimeAssertions struct {
 	DirectUnpack        *ScenarioDirectUnpackAssertion        `json:"directUnpack,omitempty"`
 	QueueLiveness       *ScenarioQueueLivenessAssertion       `json:"queueLiveness,omitempty"`
 	HealthProbe         *ScenarioHealthProbeAssertion         `json:"healthProbe,omitempty"`
+	Log                 *ScenarioLogAssertion                 `json:"log,omitempty"`
+}
+
+// ScenarioLogAssertion pins what weaver said about a job in its own log. The
+// outcome and the events see what a job did; they never see how loudly it
+// said so, and a job that announces the same checkpoint on every timer tick
+// until it finishes is one that completes with the right bytes and a log
+// nobody can read.
+type ScenarioLogAssertion struct {
+	Lines []ScenarioLogLineAssertion `json:"lines"`
+}
+
+// ScenarioLogLineAssertion is one message's contract. A line matches when it
+// carries this job's id, contains Message, and — when Level is set — was
+// emitted at that level.
+type ScenarioLogLineAssertion struct {
+	// Message is a substring of the line, matched after the level and target.
+	Message string `json:"message"`
+	// Level narrows the match to one level token (INFO, WARN, ...). Empty
+	// matches every level.
+	Level string `json:"level,omitempty"`
+	// MinCount demands at least this many matching lines.
+	MinCount int `json:"minCount,omitempty"`
+	// MaxCount, when set, caps the matching lines.
+	MaxCount *int `json:"maxCount,omitempty"`
+	// ForbidConsecutiveRepeats fails the job when two matching lines in a row
+	// carry the same payload — everything after the timestamp. A checkpoint
+	// announced only when its content moves can repeat an earlier payload
+	// after the state moved away and back; it can never say the same thing
+	// twice running.
+	ForbidConsecutiveRepeats bool `json:"forbidConsecutiveRepeats,omitempty"`
 }
 
 // ScenarioHealthProbeAssertion pins how the health probe behaved on a job that
@@ -203,6 +234,13 @@ func (s *Scenario) healthProbeAssertion() *ScenarioHealthProbeAssertion {
 		return nil
 	}
 	return s.RuntimeAssertions.HealthProbe
+}
+
+func (s *Scenario) logAssertion() *ScenarioLogAssertion {
+	if s == nil || s.RuntimeAssertions == nil {
+		return nil
+	}
+	return s.RuntimeAssertions.Log
 }
 
 type runtimePortState struct {
@@ -1193,6 +1231,11 @@ var canonicalFixtureSlugs = []string{
 	"direct-store-par2-withheld-volume",
 	"direct-store-post-repair-queue-liveness",
 	"direct-store-quick-open",
+	// A demoted set whose handed-back volume can never finish: its holes are
+	// articles every server answers 430 for. The set has to settle as damaged
+	// and reach the PAR2 verdict instead of resting in Downloading behind a
+	// materialization nothing can complete.
+	"direct-store-demoted-dead-volume-settles",
 	"direct-store-rar4",
 	"direct-store-rar4-encrypted",
 	"direct-store-rar4-encrypted-par2-repair",
@@ -1205,6 +1248,13 @@ var canonicalFixtureSlugs = []string{
 	"gzip-corrupted",
 	"gzip-single",
 	"health-failure",
+	// Dead postings — every article gone — have to fail in the first round
+	// trips, not after every article has been asked for one at a time. One
+	// fixture is judged on its leading articles; the other has too few files
+	// for that and falls to the health verdict, which must not wait on
+	// recovery volumes that are just as dead.
+	"dead-post-first-articles-missing",
+	"dead-post-recovery-unobtainable",
 	"large-segments",
 	"mixed-archive",
 	"nested-3deep",
@@ -1392,6 +1442,7 @@ var chaosSeedFixtureSlugs = append(
 
 var restartFixtureSlugs = []string{
 	"direct-store-par2-alias-restart",
+	"direct-unpack-repair-unvouched",
 	"direct-unpack-restart",
 	"par2-heavy-damage",
 	"par2-heavy-damage-a",

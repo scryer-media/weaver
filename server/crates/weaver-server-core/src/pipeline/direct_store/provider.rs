@@ -81,6 +81,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
 use unrar_rs::{ReadSeek, VolumeProvider, VolumeProviderError};
 
 use super::ByteRanges;
@@ -112,7 +113,7 @@ pub(crate) struct HeldRun {
 #[derive(Debug, Clone)]
 enum HeldSource {
     /// `len` bytes at `offset` inside the router's own staged buffer.
-    Memory { bytes: Arc<[u8]>, offset: u64 },
+    Memory { bytes: Bytes, offset: u64 },
     /// `len` bytes at `offset` inside the pinned scratch image.
     Scratch {
         pin: Arc<HoldsScratchPin>,
@@ -121,7 +122,7 @@ enum HeldSource {
 }
 
 impl HeldRun {
-    pub(crate) fn memory(start: u64, bytes: Arc<[u8]>, offset: u64, len: u64) -> Self {
+    pub(crate) fn memory(start: u64, bytes: Bytes, offset: u64, len: u64) -> Self {
         debug_assert!(offset.saturating_add(len) <= bytes.len() as u64);
         Self {
             start,
@@ -342,7 +343,7 @@ impl VirtualVolume {
 
     /// Even a short range can pin a whole allocation. Callers must lease the
     /// allocation, not just the readable length, while any image retains it.
-    pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Arc<[u8]>> {
+    pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Bytes> {
         self.held.iter().filter_map(|run| match &run.source {
             HeldSource::Memory { bytes, .. } => Some(bytes),
             HeldSource::Scratch { .. } => None,
@@ -871,7 +872,9 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
     }
 
     /// The plaintext behind `[from, to)` of a member's cipher stream: its
-    /// partial below `unpacked_size`, the retained tail padding above it.
+    /// partial below `unpacked_size` — with a retained edge block standing in
+    /// for a straddling block's share the partial does not hold yet — and the
+    /// retained tail padding above it.
     ///
     /// Refuses — as a hole, because "refetch this" is what it means — whenever a
     /// byte of that range is not really there. The coverage test is the load
@@ -906,17 +909,25 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         }
         let on_disk = to.min(facts.unpacked_size());
         if on_disk > from {
-            let mut read = 0usize;
-            let want = (on_disk - from) as usize;
-            while read < want {
-                match self.read_member_plain(
+            // The partial answers for what it holds, and a retained edge block
+            // for a straddling block's share that has not reached it yet — a
+            // gap the coverage test above has already vouched is inside one.
+            let mut at = from;
+            let gaps = facts.missing_plaintext(from, on_disk);
+            for (gap_start, gap_end) in gaps.into_iter().chain(std::iter::once((on_disk, on_disk)))
+            {
+                self.read_member_plain_exact(
                     member_id,
-                    from + read as u64,
-                    &mut plain[read..want],
-                )? {
-                    0 => return Err(self.refuse()),
-                    progress => read += progress,
+                    at,
+                    &mut plain[(at - from) as usize..(gap_start - from) as usize],
+                )?;
+                if !facts.edge_plaintext_into(
+                    gap_start,
+                    &mut plain[(gap_start - from) as usize..(gap_end - from) as usize],
+                ) {
+                    return Err(self.refuse());
                 }
+                at = gap_end;
             }
         }
         if to > facts.unpacked_size() {
@@ -932,6 +943,24 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
                 return Err(self.refuse());
             }
             plain[at..at + take].copy_from_slice(&tail[..take]);
+        }
+        Ok(())
+    }
+
+    /// Fills `plain` from the member's partial starting at `offset`, or refuses
+    /// when the partial ends first.
+    fn read_member_plain_exact(
+        &mut self,
+        member_id: u32,
+        offset: u64,
+        plain: &mut [u8],
+    ) -> std::io::Result<()> {
+        let mut read = 0usize;
+        while read < plain.len() {
+            match self.read_member_plain(member_id, offset + read as u64, &mut plain[read..])? {
+                0 => return Err(self.refuse()),
+                progress => read += progress,
+            }
         }
         Ok(())
     }

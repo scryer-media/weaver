@@ -332,15 +332,15 @@ fn native_repair_reads_virtual_sources_and_materializes_only_the_damaged_file() 
     let root = tempfile::tempdir().unwrap();
     let mut job = Par3Job::default();
     for (index, (name, bytes)) in inputs().into_iter().enumerate() {
-        let bytes: Arc<[u8]> = bytes.into();
+        let bytes = bytes::Bytes::from(bytes);
         let len = bytes.len() as u64;
         let held = if index == 0 {
             vec![
-                HeldRun::memory(0, Arc::clone(&bytes), 0, 2000),
-                HeldRun::memory(4000, Arc::clone(&bytes), 4000, 1000),
+                HeldRun::memory(0, bytes.clone(), 0, 2000),
+                HeldRun::memory(4000, bytes.clone(), 4000, 1000),
             ]
         } else {
-            vec![HeldRun::memory(0, Arc::clone(&bytes), 0, len)]
+            vec![HeldRun::memory(0, bytes.clone(), 0, len)]
         };
         let volume = VirtualVolume {
             volume_index: index as u32,

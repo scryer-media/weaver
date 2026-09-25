@@ -24,7 +24,7 @@ fn real_world_payload_is_not_charged_to_metadata_and_shared_images_pay_once() {
         metadata: 4096,
         payload: 32 << 20,
     });
-    let bytes: Arc<[u8]> = vec![7; 24 << 20].into();
+    let bytes = bytes::Bytes::from(vec![7; 24 << 20]);
     let first = budgets.retain(&bytes).unwrap();
     let reader = budgets.retain(&bytes).unwrap();
     assert!(Arc::ptr_eq(&first, &reader));
@@ -44,9 +44,9 @@ fn failed_admission_releases_partial_leases_and_replacements_do_not_accumulate()
         metadata: 4096,
         payload: 128,
     });
-    let bytes: Arc<[u8]> = vec![1; 100].into();
+    let bytes = bytes::Bytes::from(vec![1; 100]);
     let first = budgets.retain(&bytes).unwrap();
-    let second: Arc<[u8]> = vec![2; 100].into();
+    let second = bytes::Bytes::from(vec![2; 100]);
     assert_eq!(
         budgets.retain(&second).as_ref().err().and_then(limit_label),
         Some("PAR3 retained payload")
@@ -68,7 +68,7 @@ fn concurrent_jobs_share_a_single_live_allocation_lease() {
         metadata: 4096,
         payload: 1024,
     });
-    let bytes: Arc<[u8]> = vec![1; 1024].into();
+    let bytes = bytes::Bytes::from(vec![1; 1024]);
     let barrier = std::sync::Barrier::new(8);
     std::thread::scope(|scope| {
         for _ in 0..8 {

@@ -3264,6 +3264,288 @@ async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_b
     }
 }
 
+/// What a 7z extraction reports for a block whose packed bytes did not decode.
+fn sevenz_corrupted_block_error() -> String {
+    format!(
+        "{}BlockDecode {{ block_index: 0, packed_offset: 32, kind: Corrupted, message: \"data error\" }}",
+        crate::pipeline::completion::finalize::extract::SEVENZ_BLOCK_DATA_ERROR_PREFIX
+    )
+}
+
+/// A split 7z job with every part posted and its recovery set loaded, walked
+/// through its completion checks until its conventional extraction is in
+/// flight. The checks settle the set clean on the strong-decode claim without
+/// an authoritative pass, which is the state a job's extraction starts from.
+/// `damaged` names a part whose posted bytes differ from what the recovery set
+/// describes.
+async fn strong_decode_verified_split_7z(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    damaged: Option<usize>,
+) -> (PathBuf, Vec<(String, Vec<u8>)>) {
+    let set_name = "generated_split_store_plain.7z";
+    let parts = sevenz_fixture_bytes(set_name);
+    assert_eq!(parts.len(), 7, "fixture has seven parts");
+    let index_filename = "silver_horizon.par2";
+    let recovery_filename = "silver_horizon.vol00+03.par2";
+    let slice_size = 65_536;
+    let described: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let par2_bytes = build_test_par2_index_for_files(&described, slice_size);
+    let recovery_bytes = vec![0xAA; 64];
+
+    let mut posted = parts.clone();
+    if let Some(index) = damaged {
+        let bytes = &mut posted[index].1;
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xFF;
+    }
+    let mut files = posted.clone();
+    files.push((index_filename.to_string(), par2_bytes.clone()));
+    files.push((recovery_filename.to_string(), recovery_bytes.clone()));
+    let working_dir = insert_active_job(
+        pipeline,
+        job_id,
+        rar_job_spec("Silver Horizon Damaged Block", &files),
+    )
+    .await;
+    for (file_index, (filename, bytes)) in posted.iter().enumerate() {
+        write_and_complete_file(pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    let index_file = posted.len() as u32;
+    let recovery_file = index_file + 1;
+    write_and_complete_file(pipeline, job_id, index_file, index_filename, &par2_bytes).await;
+    write_and_complete_file(
+        pipeline,
+        job_id,
+        recovery_file,
+        recovery_filename,
+        &recovery_bytes,
+    )
+    .await;
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        build_repairable_par2_set_for_files(&described, slice_size, 3),
+        &[
+            (index_file, index_filename, 0, false),
+            (recovery_file, recovery_filename, 3, true),
+        ],
+    );
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    let mut events = pipeline.event_tx.subscribe();
+    pipeline.schedule_job_completion_check(job_id);
+    loop {
+        settle_par2_analysis_work(pipeline).await;
+        if pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| !sets.is_empty())
+        {
+            break;
+        }
+        let queued = pipeline
+            .pending_completion_checks
+            .pop_front()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the completion checks start the extraction: {}",
+                    debug_job_state(pipeline, job_id)
+                )
+            });
+        pipeline.check_job_completion(queued).await;
+    }
+    assert!(
+        pipeline.par2_verified.contains(&job_id),
+        "the set is settled before its extraction starts"
+    );
+    assert_eq!(
+        drain_job_verification_started(&mut events, job_id),
+        0,
+        "settled on the strong-decode claim, not by a verification pass"
+    );
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0);
+    assert!(!pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id));
+    (working_dir, parts)
+}
+
+/// Runs what the job queues until it has an extraction result to hand back,
+/// or has nothing left queued. No deadline: a step that never comes is the
+/// test runner's to bound.
+async fn next_7z_extraction_or_rest(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+) -> Option<ExtractionDone> {
+    loop {
+        settle_par2_analysis_work(pipeline).await;
+        if pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| !sets.is_empty())
+        {
+            return Some(next_extraction_done(pipeline).await);
+        }
+        if matches!(
+            job_status_for_assert(pipeline, job_id),
+            Some(JobStatus::Failed { .. } | JobStatus::Complete)
+        ) {
+            return None;
+        }
+        let queued = pipeline.pending_completion_checks.pop_front()?;
+        pipeline.check_job_completion(queued).await;
+    }
+}
+
+/// A clean strong-decode verdict is a claim that extraction would prove the
+/// bytes. When the conventional extraction then fails on a damaged block with
+/// every part present, the claim is contradicted: the verdict reopens, the
+/// authoritative pass finds the damage, one repair rebuilds the part, and the
+/// set extracts from the repaired bytes.
+#[tokio::test]
+async fn a_strong_decode_verified_7z_whose_extraction_hits_a_damaged_block_is_repaired_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30295);
+    let set_name = "generated_split_store_plain.7z";
+    let damaged = 3;
+    let (working_dir, parts) =
+        strong_decode_verified_split_7z(&mut pipeline, job_id, Some(damaged)).await;
+    let (damaged_name, original) = parts[damaged].clone();
+
+    let first = next_extraction_done(&mut pipeline).await;
+    match &first {
+        ExtractionDone::FullSet {
+            set_name: extracted,
+            result: Err(error),
+            ..
+        } => {
+            assert_eq!(extracted, set_name);
+            assert!(
+                Pipeline::is_recoverable_full_set_extraction_error(error),
+                "the damaged block reads as a data error: {error}"
+            );
+        }
+        _ => panic!("expected the damaged set's full-set extraction to fail"),
+    }
+    pipeline.handle_extraction_done(first).await;
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "a damaged block is for the recovery data to rule on: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    let done = next_7z_extraction_or_rest(&mut pipeline, job_id)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the repaired set is extracted again: {}",
+                debug_job_state(&pipeline, job_id)
+            )
+        });
+    assert_eq!(
+        pipeline.par2_repairer_execute_calls, 1,
+        "the reopened verdict routes the job to one repair"
+    );
+    assert_eq!(
+        std::fs::read(working_dir.join(&damaged_name)).unwrap(),
+        original,
+        "the repair rebuilt the damaged part byte for byte"
+    );
+    match &done {
+        ExtractionDone::FullSet { result, .. } => {
+            let outcome = result.as_ref().expect("the repaired set extracts");
+            assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        }
+        _ => panic!("expected a full-set extraction of the repaired 7z"),
+    }
+    pipeline.handle_extraction_done(done).await;
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1, "and only one");
+}
+
+/// The reopen is bounded. A set the authoritative pass finds clean while its
+/// extraction keeps failing on a data error gets one retry, and then the job
+/// fails naming that, rather than reopening the verdict again and again.
+#[tokio::test]
+async fn a_7z_data_error_the_recovery_data_finds_clean_fails_after_one_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30296);
+    let _ = strong_decode_verified_split_7z(&mut pipeline, job_id, None).await;
+    let _ = drain_job_verification_started(&mut events, job_id);
+
+    let mut failures = 0;
+    let mut next = Some(next_extraction_done(&mut pipeline).await);
+    while let Some(done) = next.take() {
+        // Whatever the extraction really produced, it reports the same data
+        // error: the shape of a defect repair cannot reach.
+        let done = match done {
+            ExtractionDone::FullSet {
+                job_id, set_name, ..
+            } => ExtractionDone::FullSet {
+                job_id,
+                set_name,
+                result: Err(sevenz_corrupted_block_error()),
+            },
+            _ => panic!("expected a full-set 7z extraction"),
+        };
+        failures += 1;
+        assert!(failures <= 2, "the verdict kept reopening");
+        pipeline.handle_extraction_done(done).await;
+        next = next_7z_extraction_or_rest(&mut pipeline, job_id).await;
+    }
+
+    assert_eq!(failures, 2, "one retry after the clean verdict");
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0, "nothing to repair");
+    assert!(
+        drain_job_verification_started(&mut events, job_id) <= 2,
+        "one authoritative pass per failure at most"
+    );
+    match job_status_for_assert(&pipeline, job_id) {
+        Some(JobStatus::Failed { error, .. }) => assert!(
+            error.contains("clean PAR2 verification but extraction still failing after retry"),
+            "{error}"
+        ),
+        other => panic!(
+            "expected the job to fail, got {other:?}: {}",
+            debug_job_state(&pipeline, job_id)
+        ),
+    }
+}
+
+/// A 7z data error is one a repair can change; a method this build cannot
+/// decode and a missing or wrong password are not, and still end the job.
+#[test]
+fn only_7z_data_errors_are_recoverable_full_set_failures() {
+    let prefix = crate::pipeline::completion::finalize::extract::SEVENZ_BLOCK_DATA_ERROR_PREFIX;
+    assert!(Pipeline::is_recoverable_full_set_extraction_error(
+        &sevenz_corrupted_block_error()
+    ));
+    assert!(Pipeline::is_recoverable_full_set_extraction_error(
+        &format!(
+            "{prefix}BlockDecode {{ block_index: 1, packed_offset: 64, kind: Io, message: \"unexpected end of file\" }}"
+        )
+    ));
+    for terminal in [
+        "7z extraction failed: BlockDecode { block_index: 0, packed_offset: 32, kind: UnsupportedMethod, message: \"UnsupportedCompressionMethod(\\\"ARM64\\\")\" }",
+        "7z extraction failed: BlockDecode { block_index: 0, packed_offset: 32, kind: Password, message: \"PasswordRequired\" }",
+    ] {
+        assert!(
+            !Pipeline::is_recoverable_full_set_extraction_error(terminal),
+            "{terminal}"
+        );
+    }
+}
+
 /// Two file members that sanitize to one destination are refused at open, and
 /// that refusal has to end the job — not send it round again.
 ///

@@ -114,6 +114,17 @@ fn health_milli(total: u64, failed_bytes: u64) -> u32 {
         .unwrap_or(1000) as u32
 }
 
+/// Password candidates carried by a persisted NZB: its `<meta
+/// type="password">` and the `{{password}}` convention in its file name, in
+/// harvest order. The spec's explicit password is not included.
+pub(crate) fn persisted_nzb_password_candidates(
+    nzb_path: &std::path::Path,
+    nzb_zstd: &[u8],
+) -> Result<Vec<ArchivePasswordCandidate>, crate::ingest::PersistedNzbError> {
+    let nzb = crate::ingest::parse_persisted_nzb_bytes(nzb_zstd)?;
+    Ok(crate::ingest::nzb_password_candidates(&nzb, nzb_path, None))
+}
+
 impl Pipeline {
     pub(super) fn archive_password_candidates_for_job(
         &self,
@@ -137,37 +148,23 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> (Vec<ArchivePasswordCandidate>, bool) {
-        let spec_password = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.spec.password.as_deref());
-        let mut harvested = true;
-        let mut candidates = match self.db.load_active_job_persisted_nzb(job_id) {
-            Ok(Some((nzb_path, Some(nzb_zstd)))) => {
-                match crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd) {
-                    Ok(nzb) => crate::ingest::nzb_password_candidates(&nzb, &nzb_path, None),
-                    Err(error) => {
-                        warn!(
-                            job_id = job_id.0,
-                            error = %error,
-                            "failed to parse persisted NZB for password candidates"
-                        );
-                        harvested = false;
-                        Vec::new()
+        let state = self.jobs.get(&job_id);
+        let spec_password = state.and_then(|state| state.spec.password.as_deref());
+        let (mut candidates, harvested) =
+            match state.and_then(|state| state.nzb_password_candidates.get()) {
+                Some(cached) => (cached.clone(), true),
+                None => {
+                    let (candidates, harvested) = self.load_nzb_password_candidates(job_id);
+                    // A job in the pipeline already has its row, and nothing
+                    // adds NZB bytes to a row later, so a missing row or NZB
+                    // stays missing and its empty list is remembered too. A
+                    // failed read or parse is not, so it is retried.
+                    if harvested && let Some(state) = state {
+                        let _ = state.nzb_password_candidates.set(candidates.clone());
                     }
+                    (candidates, harvested)
                 }
-            }
-            Ok(_) => Vec::new(),
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load persisted NZB for password candidates"
-                );
-                harvested = false;
-                Vec::new()
-            }
-        };
+            };
 
         if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password)
             && !candidates
@@ -181,6 +178,35 @@ impl Pipeline {
         }
 
         (candidates, harvested)
+    }
+
+    /// The NZB half of the harvest, read from the database: the candidates,
+    /// and whether the read and parse succeeded (`harvested`).
+    fn load_nzb_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
+        match self.db.load_active_job_persisted_nzb(job_id) {
+            Ok(Some((nzb_path, Some(nzb_zstd)))) => {
+                match persisted_nzb_password_candidates(&nzb_path, &nzb_zstd) {
+                    Ok(candidates) => (candidates, true),
+                    Err(error) => {
+                        warn!(
+                            job_id = job_id.0,
+                            error = %error,
+                            "failed to parse persisted NZB for password candidates"
+                        );
+                        (Vec::new(), false)
+                    }
+                }
+            }
+            Ok(_) => (Vec::new(), true),
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load persisted NZB for password candidates"
+                );
+                (Vec::new(), false)
+            }
+        }
     }
 
     pub(super) fn primary_archive_password_for_job(&self, job_id: JobId) -> Option<String> {
@@ -972,6 +998,15 @@ pub(super) struct Par2FileRuntime {
     /// read back short, and then takes more articles before stranding again has
     /// more on disk than the first read saw.
     pub(super) salvaged_at_received_bytes: Option<u64>,
+    /// A read-back of this volume has already been reported as failed.
+    ///
+    /// A read that cannot be parsed leaves no `salvaged_at_received_bytes`
+    /// mark — deliberately, so the next articles to land bring the volume back
+    /// for another look rather than writing it off. The gate is re-entered on
+    /// a timer, though, so the same unparseable volume is looked at again and
+    /// again with nothing having changed. The attempt still repeats; only its
+    /// report is latched to the first one.
+    pub(super) readback_failure_reported: bool,
     /// How many validated recovery blocks this file contributed to each set it
     /// carries packets for.
     ///
@@ -1247,22 +1282,43 @@ pub(super) struct DirectDemotionWork {
     pub(super) submitted_at: std::time::Instant,
     /// The reconciliation's half of the snapshot — the volume targets, their
     /// article geometry, and the articles the decode seam took ownership of at
-    /// the demotion instant. Owned by the ticket and moved out with it when it
-    /// lands.
+    /// the demotion instant. Owned by the ticket; the per-volume handbacks
+    /// consume it target by target, and the finish takes what is left.
     pub(super) plan: direct_store::wiring::DemotedSweepPlan,
+    /// How many of the plan's targets the sweep has reported and the actor
+    /// has handed back, in target order.
+    pub(super) handed_back: usize,
+    /// File indices of the volumes already handed back to the conventional
+    /// path. A file named here is no longer sweep-owned: its articles are
+    /// dispatched, written and completed like any other file's, even though
+    /// the ticket stays open until the sweep has finished its siblings.
+    pub(super) released: HashSet<u32>,
+    /// The running account of the handback, totalled for the ticket's final
+    /// log line and metrics.
+    pub(super) summary: direct_store::wiring::ReconstructionSummary,
 }
 
+/// One message from a demotion sweep to the actor.
+///
+/// Streamed per volume rather than batched, because the sweep is bounded only
+/// by the archive and every volume it has not finished is held out of
+/// dispatch: a batch would hold the whole set — on a large archive over a slow
+/// working directory, the whole job — for the entire sweep. Each volume's
+/// floor, rows and requeue land as its outcome arrives; the set's coverage row,
+/// which is one row for the set, is retired by the finish.
 pub(super) struct DirectDemotionWorkDone {
     pub(super) job_id: JobId,
     pub(super) work_id: u64,
     pub(super) set_index: usize,
-    /// One outcome per volume, in the order the plan's targets name them.
-    ///
-    /// Carried as one batch rather than streamed per volume: the volumes are
-    /// judged independently inside the sweep, but the durable bookkeeping is
-    /// not independent — the set's coverage row may only be retired once
-    /// *every* volume's floor is committed, and there is one row for the set.
-    pub(super) rebuilt: Vec<direct_store::reconstruct::ReconstructedVolume>,
+    pub(super) progress: DirectDemotionProgress,
+}
+
+pub(super) enum DirectDemotionProgress {
+    /// The next volume, in the order the plan's targets name them.
+    Volume(direct_store::reconstruct::ReconstructedVolume),
+    /// The sweep returned. `panicked` means some targets never got an outcome;
+    /// each of those is handed back as a volume that kept nothing.
+    Finished { panicked: bool },
 }
 
 /// The pre-repair verdict and the repair's own write set, carried across a
@@ -1901,9 +1957,9 @@ impl Default for CompletedFileChecksumState {
 }
 
 pub(super) enum DecodedChunk {
-    Contiguous(Box<[u8]>),
+    Contiguous(Bytes),
     Batches {
-        chunks: Vec<Box<[u8]>>,
+        chunks: Vec<Bytes>,
         len: usize,
     },
     Shared(Arc<download::repeated::SharedArticle>),
@@ -1957,6 +2013,42 @@ impl DecodedChunk {
         }
     }
 
+    /// This chunk's payload as refcounted views of the decoder's own buffers,
+    /// in order. No byte is copied: every piece either shares the decoded
+    /// allocation or borrows the pool slot, which stays out of the pool until
+    /// the last view drops.
+    ///
+    /// The direct-store router keeps these for the life of a hold, so the
+    /// article's buffer is the only copy of its bytes anywhere between the
+    /// decode and the write syscall.
+    pub(super) fn pieces(&self) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        self.push_pieces(&mut out);
+        out
+    }
+
+    fn push_pieces(&self, out: &mut Vec<Bytes>) {
+        match self {
+            Self::Contiguous(bytes) => {
+                if !bytes.is_empty() {
+                    out.push(bytes.clone());
+                }
+            }
+            // `from_owner` keeps the handle — and therefore the slot — alive for
+            // as long as any view of it lives, which is exactly the lifetime the
+            // router needs and the pool already understands.
+            Self::Pooled(buffer) => {
+                if !buffer.is_empty() {
+                    out.push(Bytes::from_owner(buffer.clone()));
+                }
+            }
+            Self::Shared(body) => body.data.push_pieces(out),
+            Self::Batches { chunks, .. } => {
+                out.extend(chunks.iter().filter(|chunk| !chunk.is_empty()).cloned());
+            }
+        }
+    }
+
     /// Appends this chunk's slices, in order, for a vectored write that
     /// covers several contiguous chunks with one syscall.
     pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
@@ -1983,15 +2075,21 @@ impl Pipeline {
 
 impl From<Vec<u8>> for DecodedChunk {
     fn from(value: Vec<u8>) -> Self {
-        Self::Contiguous(value.into_boxed_slice())
+        Self::Contiguous(Bytes::from(value))
     }
 }
 
 impl From<Vec<Box<[u8]>>> for DecodedChunk {
-    fn from(mut chunks: Vec<Box<[u8]>>) -> Self {
-        chunks.retain(|chunk| !chunk.is_empty());
+    fn from(chunks: Vec<Box<[u8]>>) -> Self {
+        // `Bytes::from(Box<[u8]>)` adopts the allocation, so the decoder's
+        // batches reach the writer and the router without being copied once.
+        let mut chunks: Vec<Bytes> = chunks
+            .into_iter()
+            .filter(|chunk| !chunk.is_empty())
+            .map(Bytes::from)
+            .collect();
         match chunks.len() {
-            0 => Self::Contiguous(Vec::new().into_boxed_slice()),
+            0 => Self::Contiguous(Bytes::new()),
             1 => Self::Contiguous(chunks.pop().expect("single chunk")),
             _ => {
                 let len = chunks.iter().map(|chunk| chunk.len()).sum();
@@ -2031,6 +2129,11 @@ pub(super) struct BufferedDecodedSegment {
     pub(super) data: DecodedChunk,
     pub(super) part_crc: u32,
     pub(super) part_crc_verified: bool,
+    /// The whole-file length this article's yEnc header declares. Carried so
+    /// a segment parked in the write buffer still states its file's length
+    /// when it is replayed later, which is the only thing a byte-split
+    /// container needs before it can place anything.
+    pub(super) declared_file_len: u64,
     pub(super) yenc_name: String,
     /// Block-aligned CRC32 segments carried from the decoder to the evidence
     /// collector, which runs after the bytes are durable.

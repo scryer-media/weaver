@@ -481,6 +481,9 @@ impl Pipeline {
                     work_id,
                     submitted_at: Instant::now(),
                     plan,
+                    handed_back: 0,
+                    released: HashSet::new(),
+                    summary: ReconstructionSummary::default(),
                 },
             );
         info!(
@@ -497,50 +500,70 @@ impl Pipeline {
             .as_mut()
             .and_then(|runtime| runtime.take_spill_disk(job_id));
         tokio::spawn(async move {
-            let rebuilt = tokio::task::spawn_blocking(move || {
+            let volume_tx = done_tx.clone();
+            let swept = tokio::task::spawn_blocking(move || {
                 let _disk_reservation = disk_reservation;
-                crate::pipeline::direct_store::reconstruct::reconstruct_volumes(
-                    &provider, &plans, sparse,
-                )
+                // One message per volume, the moment the sweep is done with
+                // it. A send that fails means the actor is gone, and with it
+                // every ticket this could have matched.
+                crate::pipeline::direct_store::reconstruct::reconstruct_volumes_each(
+                    &provider,
+                    &plans,
+                    sparse,
+                    |outcome| {
+                        let _ = volume_tx.blocking_send(DirectDemotionWorkDone {
+                            job_id,
+                            work_id,
+                            set_index,
+                            progress: DirectDemotionProgress::Volume(outcome),
+                        });
+                    },
+                );
             })
-            .await
-            // A panicked sweep leaves no outcomes at all, which the
-            // reconciliation reads as "every volume kept nothing" — the same
-            // handback a set whose destinations all failed gets, refetch
+            .await;
+            // A panicked sweep leaves the volumes it never reached without an
+            // outcome, which the finish reads as "kept nothing" — the same
+            // handback a volume whose destination failed gets, refetch
             // included. Dropping the ticket instead would wedge the job behind
             // a completion gate nothing ever clears.
-            .unwrap_or_else(|error| {
-                warn!(
-                    job_id = job_id.0,
-                    work_id,
-                    set_index,
-                    error = %error,
-                    "a direct demotion reconstruction sweep panicked; refetching the set's volumes"
-                );
-                Vec::new()
-            });
+            let panicked = match swept {
+                Ok(()) => false,
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        work_id,
+                        set_index,
+                        error = %error,
+                        "a direct demotion reconstruction sweep panicked; refetching the volumes it did not finish"
+                    );
+                    true
+                }
+            };
             let _ = done_tx
                 .send(DirectDemotionWorkDone {
                     job_id,
                     work_id,
                     set_index,
-                    rebuilt,
+                    progress: DirectDemotionProgress::Finished { panicked },
                 })
                 .await;
         });
     }
 
-    /// The demotion sweep's ticket, on the pipeline task.
+    /// One message from the demotion sweep, on the pipeline task.
     ///
-    /// Applies the durable half of the handback and re-enters the completion
-    /// seam the demotion could not reach while the sweep was outstanding. A
-    /// ticket whose job was torn down, or whose set demoted again behind it, is
-    /// discarded by the fence.
+    /// A volume's outcome hands that volume back at once — its floor and rows,
+    /// its requeue, its parked writes — and releases it to dispatch while the
+    /// sweep goes on with its siblings. The finish applies what is one-per-set:
+    /// the coverage row's retirement, the routed outputs' deletion, and the
+    /// completion replay the demotion could not reach while the sweep was
+    /// outstanding. A message whose job was torn down, or whose set demoted
+    /// again behind it, is discarded by the fence.
     pub(in crate::pipeline) async fn handle_direct_demotion_done(
         &mut self,
         done: DirectDemotionWorkDone,
     ) {
-        let Some(sets) = self.direct_demotion_in_flight.get_mut(&done.job_id) else {
+        let Some(sets) = self.direct_demotion_in_flight.get(&done.job_id) else {
             return;
         };
         let matches = sets
@@ -555,21 +578,181 @@ impl Pipeline {
             );
             return;
         }
-        let work = sets.remove(&done.set_index).expect("just matched");
+        if !self.jobs.contains_key(&done.job_id) {
+            self.forget_direct_demotion_work(done.job_id);
+            return;
+        }
+        match done.progress {
+            DirectDemotionProgress::Volume(outcome) => {
+                self.hand_back_next_reconstructed_volume(done.job_id, done.set_index, outcome)
+                    .await;
+            }
+            DirectDemotionProgress::Finished { panicked } => {
+                self.finish_demoted_set_reconstruction(done.job_id, done.set_index, panicked)
+                    .await;
+            }
+        }
+    }
+
+    /// Hands the ticket's next target back to the conventional path with the
+    /// outcome the sweep reported for it, and releases the volume to dispatch.
+    ///
+    /// The release comes first, deliberately: the requeue below writes the
+    /// articles that were parked for this volume, and the write seam refuses a
+    /// file the sweep still owns.
+    async fn hand_back_next_reconstructed_volume(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        outcome: super::super::reconstruct::ReconstructedVolume,
+    ) {
+        let Some(work) = self
+            .direct_demotion_in_flight
+            .get_mut(&job_id)
+            .and_then(|sets| sets.get_mut(&set_index))
+        else {
+            return;
+        };
+        let position = work.handed_back;
+        let Some(target) = work.plan.targets.get(position).cloned() else {
+            debug!(
+                job_id = job_id.0,
+                work_id = work.work_id,
+                set_index,
+                "discarding a demotion sweep outcome past the last target"
+            );
+            return;
+        };
+        let (volume_index, file_index, _, _) = &target;
+        debug_assert_eq!(outcome.volume_index, *volume_index);
+        let extents = work
+            .plan
+            .extents_by_volume
+            .remove(volume_index)
+            .unwrap_or_default();
+        let handoffs = work.plan.handoffs.clone();
+        let set_name = work.plan.set_name.clone();
+        work.handed_back += 1;
+        work.released.insert(*file_index);
+
+        let handback = self
+            .hand_back_reconstructed_volume(
+                job_id, set_index, &target, extents, &handoffs, &outcome,
+            )
+            .await;
+
+        if let Some(failure) = &outcome.failure {
+            crate::runtime::perf_probe::record_owned(
+                format!("direct_store.demote_refetch.{}", failure.metric()),
+                std::time::Duration::from_nanos(1),
+            );
+            warn!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                volume_index,
+                failure = %failure,
+                "a demoted volume could not be reconstructed in full; refetching the \
+                 articles it could not vouch for"
+            );
+        }
+        if let Some(work) = self
+            .direct_demotion_in_flight
+            .get_mut(&job_id)
+            .and_then(|sets| sets.get_mut(&set_index))
+        {
+            let summary = &mut work.summary;
+            summary.materialized += usize::from(handback.materialized);
+            if let Some(failure) = outcome.failure {
+                summary.refetched.push((*volume_index, failure));
+            }
+            summary.retained_bytes = summary
+                .retained_bytes
+                .saturating_add(handback.retained_bytes);
+            summary.refetched_bytes = summary
+                .refetched_bytes
+                .saturating_add(handback.refetched_bytes);
+        }
+        // The volume's articles are dispatchable again, and the ones that
+        // were parked for it are written: both are reasons for the dispatcher
+        // to look, and neither is something it would otherwise notice.
+        let file_id = NzbFileId {
+            job_id,
+            file_index: *file_index,
+        };
+        self.relieve_handed_back_write_backlog(&[file_id]).await;
+    }
+
+    /// The set-wide tail of a sweep: whatever volumes the sweep never reported
+    /// are handed back as having kept nothing, then the coverage row retires,
+    /// the routed outputs go, and the completion seam is re-entered.
+    async fn finish_demoted_set_reconstruction(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        panicked: bool,
+    ) {
+        loop {
+            let Some(work) = self
+                .direct_demotion_in_flight
+                .get(&job_id)
+                .and_then(|sets| sets.get(&set_index))
+            else {
+                return;
+            };
+            let Some((volume_index, _, _, _)) = work.plan.targets.get(work.handed_back) else {
+                break;
+            };
+            if !panicked {
+                warn!(
+                    job_id = job_id.0,
+                    work_id = work.work_id,
+                    set_index,
+                    volume_index,
+                    "the demotion sweep finished without reporting a volume; refetching it"
+                );
+            }
+            let outcome = super::super::reconstruct::ReconstructedVolume {
+                volume_index: *volume_index,
+                contiguous: 0,
+                verified: crate::pipeline::direct_store::ByteRanges::new(),
+                complete: false,
+                md5: None,
+                failure: Some(ReconstructionFailure::SweepUnreported {
+                    volume_index: *volume_index,
+                }),
+            };
+            self.hand_back_next_reconstructed_volume(job_id, set_index, outcome)
+                .await;
+        }
+
+        let Some(sets) = self.direct_demotion_in_flight.get_mut(&job_id) else {
+            return;
+        };
+        let Some(work) = sets.remove(&set_index) else {
+            return;
+        };
         if sets.is_empty() {
-            self.direct_demotion_in_flight.remove(&done.job_id);
+            self.direct_demotion_in_flight.remove(&job_id);
         }
         let elapsed = work.submitted_at.elapsed();
         crate::runtime::perf_probe::record("direct_store.demote.sweep", elapsed);
-        if !self.jobs.contains_key(&done.job_id) {
-            return;
+        let work_id = work.work_id;
+        let set_name = work.plan.set_name.clone();
+        let volume_files = work.plan.volume_files.clone();
+        let summary = work.summary;
+
+        // The one-per-set half of the durable bookkeeping. Every volume's
+        // floor is committed by now — each handback awaited its own flush —
+        // so the coverage row has nothing left to vouch for, and the routed
+        // outputs it described have no reader left once the sweep returned.
+        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index)
+            && let Err(error) = set.retire(&mut persist)
+        {
+            warn!(job_id = job_id.0, error = %error, "failed to retire a reconstructed direct-store checkpoint");
         }
-        let plan = work.plan;
-        let set_name = plan.set_name.clone();
-        let volume_files = plan.volume_files.clone();
-        let summary = self
-            .apply_demoted_set_reconstruction(done.job_id, done.set_index, plan, &done.rebuilt)
-            .await;
+        self.delete_direct_outputs(job_id, set_index).await;
+
         crate::runtime::perf_probe::record(
             "direct_store.demoted.reconstructed",
             std::time::Duration::from_nanos(1),
@@ -583,23 +766,6 @@ impl Pipeline {
             "direct_store.demote.materialized_volumes",
             volumes as u64,
         );
-        // One bucket per volume that refused a run, under the same metric names
-        // the whole-set fallback used — so the reason breakdown reads the same
-        // as before while the *count* is now volumes rather than sets.
-        for (volume_index, failure) in &summary.refetched {
-            crate::runtime::perf_probe::record_owned(
-                format!("direct_store.demote_refetch.{}", failure.metric()),
-                std::time::Duration::from_nanos(1),
-            );
-            warn!(
-                job_id = done.job_id.0,
-                set_name = %set_name,
-                volume_index,
-                failure = %failure,
-                "a demoted volume could not be reconstructed in full; refetching the \
-                 articles it could not vouch for"
-            );
-        }
         if !summary.refetched.is_empty() {
             crate::runtime::perf_probe::record_value(
                 "direct_store.demote.refetched_volumes",
@@ -619,9 +785,9 @@ impl Pipeline {
             summary.refetched_bytes,
         );
         info!(
-            job_id = done.job_id.0,
+            job_id = job_id.0,
             set_name = %set_name,
-            work_id = done.work_id,
+            work_id,
             elapsed_ms = elapsed.as_millis() as u64,
             volumes,
             refetched = summary.refetched.len(),
@@ -629,10 +795,10 @@ impl Pipeline {
             refetched_bytes = summary.refetched_bytes,
             "direct-store set materialized from its own routed bytes"
         );
-        self.finish_demoted_set_handback(done.job_id, volume_files.clone())
+        self.finish_demoted_set_handback(job_id, volume_files.clone())
             .await;
         self.relieve_handed_back_write_backlog(&volume_files).await;
-        self.schedule_job_completion_check(done.job_id);
+        self.schedule_job_completion_check(job_id);
     }
 
     /// Forgets a job's outstanding demotion sweeps. The detached workers keep
@@ -642,77 +808,82 @@ impl Pipeline {
         self.direct_demotion_in_flight.remove(&job_id);
     }
 
-    /// The durable half of the reconstruction path, on the pipeline task.
+    /// The durable half of one volume's reconstruction, on the pipeline task.
     ///
-    /// Mutates durable state in this order: legacy floors and completed-file
-    /// rows, then the coverage row, then the direct outputs.
-    pub(super) async fn apply_demoted_set_reconstruction(
+    /// Mutates durable state in this order: the legacy floor or completed-file
+    /// row, awaited, then the assembly and the queue. The set's coverage row
+    /// stays until the finish — it is one row for the set — which leaves a
+    /// window where a volume has a conventional floor under a live row; the
+    /// restore refuses such a row outright, so a crash in the window costs the
+    /// set's unfinished volumes a refetch and never trusts two images of one
+    /// volume at once. A volume whose swept bytes no floor can record retires
+    /// the row itself, since the restore would have nothing to refuse it on.
+    pub(super) async fn hand_back_reconstructed_volume(
         &mut self,
         job_id: JobId,
         set_index: usize,
-        plan: DemotedSweepPlan,
-        rebuilt: &[super::super::reconstruct::ReconstructedVolume],
-    ) -> ReconstructionSummary {
-        let DemotedSweepPlan {
-            targets,
-            mut extents_by_volume,
-            handoffs,
-            ..
-        } = plan;
-        let mut materialized = 0usize;
-        // Volumes the sweep could not rebuild in full, each with the first
-        // reason it refused. A refusal is no longer a write-off: the volume
-        // keeps every run the sweep verified, and only the articles that
-        // `verified` does not back are refetched. A volume whose *destination*
-        // failed comes back with an empty `verified`, so the same code path
-        // gives it the full-refetch treatment — `mark_file_incomplete`
-        // included — that a refused volume used to get unconditionally.
-        let mut refetched: Vec<(u32, ReconstructionFailure)> = Vec::new();
-        let mut retained_bytes = 0u64;
-        let mut refetched_bytes = 0u64;
-        let mut keep: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (outcome, (volume_index, file_index, filename, plan)) in
-            rebuilt.iter().zip(targets.iter())
-        {
-            debug_assert_eq!(outcome.volume_index, *volume_index);
-            let file_id = NzbFileId {
-                job_id,
-                file_index: *file_index,
-            };
-            let extents = extents_by_volume.remove(volume_index).unwrap_or_default();
-            if let Some(failure) = &outcome.failure {
-                refetched.push((*volume_index, failure.clone()));
-            }
-            // `outcome.verified`, never `plan.covered`: the plan states what the
-            // coverage map claimed, and only the sweep knows which of that it
-            // actually wrote and checked. They agree for a volume that swept end
-            // to end and diverge for one that refused a run, which is precisely
-            // when keeping an article the sweep skipped would leave a hole
-            // nothing ever fetches.
-            let (on_disk, floor) = crate::pipeline::direct_store::reconstruct::segments_on_disk(
-                &extents,
-                &outcome.verified,
-                outcome.contiguous,
-            );
-            // The byte account of this volume's handback, article by article,
-            // over the articles the coverage map claimed. Kept ones are the
-            // bytes the demotion no longer pays for twice; the rest were routed
-            // once and come off the wire again.
-            for (segment_number, (offset, len)) in &extents {
-                if !plan.covered.missing(*offset, *len).is_empty() {
-                    continue;
-                }
-                match on_disk.contains(segment_number) {
-                    true => retained_bytes = retained_bytes.saturating_add(*len),
-                    false => refetched_bytes = refetched_bytes.saturating_add(*len),
-                }
-            }
-            keep.insert(*file_index, on_disk);
-            if outcome.contiguous == 0 {
+        target: &(u32, u32, String, VolumeReconstruction),
+        extents: std::collections::BTreeMap<u32, (u64, u64)>,
+        handoffs: &HashSet<SegmentId>,
+        outcome: &super::super::reconstruct::ReconstructedVolume,
+    ) -> VolumeHandback {
+        let (volume_index, file_index, filename, plan) = target;
+        let file_id = NzbFileId {
+            job_id,
+            file_index: *file_index,
+        };
+        let mut handback = VolumeHandback::default();
+        // `outcome.verified`, never `plan.covered`: the plan states what the
+        // coverage map claimed, and only the sweep knows which of that it
+        // actually wrote and checked. They agree for a volume that swept end
+        // to end and diverge for one that refused a run, which is precisely
+        // when keeping an article the sweep skipped would leave a hole
+        // nothing ever fetches.
+        let (on_disk, floor) = crate::pipeline::direct_store::reconstruct::segments_on_disk(
+            &extents,
+            &outcome.verified,
+            outcome.contiguous,
+        );
+        // The byte account of this volume's handback, article by article,
+        // over the articles the coverage map claimed. Kept ones are the
+        // bytes the demotion no longer pays for twice; the rest were routed
+        // once and come off the wire again.
+        for (segment_number, (offset, len)) in &extents {
+            if !plan.covered.missing(*offset, *len).is_empty() {
                 continue;
             }
-            materialized += 1;
-
+            match on_disk.contains(segment_number) {
+                true => handback.retained_bytes = handback.retained_bytes.saturating_add(*len),
+                false => handback.refetched_bytes = handback.refetched_bytes.saturating_add(*len),
+            }
+        }
+        // Bytes the sweep left in the conventional file that neither a floor
+        // nor a completed-file row will account for: verified ranges above a
+        // prefix it could not verify. The restore weighs a live coverage row
+        // against those two records only, so from here the set's row claims a
+        // volume whose conventional image nothing durable knows about. It is
+        // retired now rather than at the finish; a crash in between then
+        // costs the unfinished volumes the refetch the restore's refusal
+        // would have, instead of trusting two images of one volume.
+        let unrecorded_bytes = !on_disk.is_empty()
+            && floor == 0
+            && !(outcome.complete && outcome.contiguous >= plan.len);
+        if unrecorded_bytes {
+            let mut persist = DatabaseCoveragePersist::new(self.db.clone());
+            if let Some(set) = self.direct_store.set_mut(job_id, set_index)
+                && let Err(error) = set.retire(&mut persist)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    file_index,
+                    error = %error,
+                    "failed to retire a direct-store checkpoint under a volume with unrecorded conventional bytes"
+                );
+            }
+        }
+        let keep: HashMap<u32, Vec<u32>> = HashMap::from([(*file_index, on_disk)]);
+        if outcome.contiguous != 0 {
+            handback.materialized = true;
             self.pending_file_progress.remove(&file_id);
             self.persisted_file_progress.remove(&file_id);
             if outcome.complete && outcome.contiguous >= plan.len {
@@ -740,40 +911,37 @@ impl Pipeline {
                 // `segments_covered_by_floor` read back at restart.
                 self.pending_file_progress.insert(file_id, floor);
             }
-        }
-        // Awaited, not fire-and-forget: the coverage row is retired immediately
-        // below, so until these floors are committed the job has no durable
-        // account of the volumes at all.
-        if let Err(error) = self
-            .flush_file_progress_batch_awaited("direct_store.demote.reconstructed_floors")
-            .await
-        {
-            warn!(job_id = job_id.0, error = %error, "failed to persist reconstructed volume floors");
-        }
-
-        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        if let Some(set) = self.direct_store.set_mut(job_id, set_index)
-            && let Err(error) = set.retire(&mut persist)
-        {
-            warn!(job_id = job_id.0, error = %error, "failed to retire a reconstructed direct-store checkpoint");
-        }
-        self.delete_direct_outputs(job_id, set_index).await;
-        self.requeue_after_reconstruction(job_id, set_index, &keep, &handoffs)
-            .await;
-        for (outcome, (_, file_index, _, plan)) in rebuilt.iter().zip(targets.iter()) {
-            if outcome.complete && outcome.contiguous >= plan.len {
-                self.direct_store.settle_materialized_file(NzbFileId {
-                    job_id,
-                    file_index: *file_index,
-                });
+            // Awaited, not fire-and-forget: the volume is about to be
+            // dispatched and written conventionally, and until this floor is
+            // committed the job has no durable account of it that a restore
+            // could weigh against the row still standing for the set.
+            if let Err(error) = self
+                .flush_file_progress_batch_awaited("direct_store.demote.reconstructed_floors")
+                .await
+            {
+                warn!(job_id = job_id.0, error = %error, "failed to persist reconstructed volume floors");
             }
         }
-        ReconstructionSummary {
-            materialized,
-            refetched,
-            retained_bytes,
-            refetched_bytes,
+        self.requeue_after_reconstruction(
+            job_id,
+            set_index,
+            &[(*volume_index, *file_index)],
+            &keep,
+            handoffs,
+        )
+        .await;
+        // Only a volume the sweep wrote end to end leaves the materialization
+        // account here. One with holes stays in it on purpose: the account is
+        // what gives its missing articles a single rescue lineage if they ever
+        // lose the queue entries the reconciliation above just gave them, and
+        // settling here would take that away. What the account must never do is
+        // wait without end, and that is the backstop's job — once nothing in
+        // the job's pipeline can move, a pending file's holes are damage and
+        // are booked as such.
+        if outcome.complete && outcome.contiguous >= plan.len {
+            self.direct_store.settle_materialized_file(file_id);
         }
+        handback
     }
 
     /// The last-resort demotion: retire routed storage and requeue every
@@ -849,22 +1017,20 @@ impl Pipeline {
     ///
     /// A file with nothing kept takes the full refetch treatment, including
     /// `mark_file_incomplete`: there is no reconstructed state to protect.
+    ///
+    /// `volume_files` names the `(volume_index, file_index)` pairs to hand
+    /// back: one volume per call from the streaming sweep.
     pub(super) async fn requeue_after_reconstruction(
         &mut self,
         job_id: JobId,
         set_index: usize,
+        volume_files: &[(u32, u32)],
         keep: &HashMap<u32, Vec<u32>>,
         handoffs: &HashSet<SegmentId>,
     ) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
-        let volume_files: Vec<(u32, u32)> = set
-            .plan()
-            .volumes
-            .iter()
-            .map(|(volume_index, file_index)| (*volume_index, *file_index))
-            .collect();
         let extents: HashMap<u32, std::collections::BTreeMap<u32, (u64, u64)>> = volume_files
             .iter()
             .map(|(volume_index, file_index)| (*file_index, set.segment_extents(*volume_index)))
@@ -892,7 +1058,7 @@ impl Pipeline {
             state.recovery_queue.extend_segment_ids(&mut queued);
 
             let mut lost_bytes = 0u64;
-            for (_, file_index) in &volume_files {
+            for (_, file_index) in volume_files {
                 let file_id = NzbFileId {
                     job_id,
                     file_index: *file_index,
@@ -1000,6 +1166,12 @@ impl Pipeline {
                     // passing through the conventional writer. Seed its sparse
                     // markers so a later missing article bridges the cursor;
                     // only the contiguous floor is persisted across restart.
+                    // No resumed-prefix positioning here, and none is owed: the
+                    // rebuild above resets the assembly, which drops any
+                    // resumed prefix, and a routed volume never had one — its
+                    // coverage lives in the direct checkpoint, not in a
+                    // contiguous file floor. The markers seeded below are this
+                    // buffer's whole account of what is already on disk.
                     let write_buf = self
                         .write_buffers
                         .entry(file_id)
@@ -1183,4 +1355,13 @@ impl Pipeline {
             self.enqueue_download_work(item);
         }
     }
+}
+
+/// What one volume's handback contributed to the ticket's account.
+#[derive(Default)]
+pub(super) struct VolumeHandback {
+    /// The sweep rebuilt a verified contiguous prefix of this volume.
+    pub(super) materialized: bool,
+    pub(super) retained_bytes: u64,
+    pub(super) refetched_bytes: u64,
 }

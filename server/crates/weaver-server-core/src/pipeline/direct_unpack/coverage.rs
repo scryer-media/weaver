@@ -175,7 +175,8 @@ impl SetCoverage {
     }
 
     /// A codec parked with a live dictionary must unwind before giving its
-    /// memory back. Under contention the chase yields to ordinary extraction;
+    /// memory back. Under contention a parked chase claims a waiter's yield
+    /// ticket and yields to it, one chase per ticket;
     /// finalization retries from the original archive under a fresh permit.
     /// Reads with available coverage do not consult the memory pool.
     pub(crate) fn yield_to_memory_pressure(
@@ -790,10 +791,12 @@ impl SetCoverage {
         self.parks.fetch_add(1, Ordering::Relaxed);
         if let Some(memory) = self.memory.get() {
             let mut state = state;
-            if memory.has_waiters() {
-                state.aborted.get_or_insert_with(|| {
-                    "direct unpack yielded its decoder to process memory pressure".to_string()
-                });
+            // One waiter's ticket unwinds one parked chase, not all of them;
+            // a chase already aborted leaves the ticket for another.
+            if state.aborted.is_none() && memory.claim_yield() {
+                state.aborted = Some(
+                    "direct unpack yielded its decoder to process memory pressure".to_string(),
+                );
                 self.advanced.notify_all();
                 return state;
             }

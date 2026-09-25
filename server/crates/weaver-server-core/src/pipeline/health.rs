@@ -74,6 +74,23 @@ impl ProbeTally {
     }
 }
 
+/// What a job could still get hold of to repair itself with.
+#[derive(Debug, Clone, Copy, Default)]
+struct ObtainableRecovery {
+    /// Whether any recovery is reachable at all.
+    obtainable: bool,
+    /// The most damage the reachable recovery could cover, when that is
+    /// knowable, and `None` while it is not.
+    ///
+    /// It is knowable once a set has been parsed: its blocks and its slice size
+    /// are facts. Before that there is only a filename's claim, and the
+    /// critical-health line is already derived from exactly that claim — capping
+    /// on it a second time would refuse every deferral this gate exists to make,
+    /// because a job is below critical only once its damage has already passed
+    /// what its filenames advertise.
+    ceiling: Option<u64>,
+}
+
 impl Pipeline {
     fn health_tracked_bytes(total_bytes: u64, par2_bytes: u64) -> u64 {
         total_bytes.saturating_sub(par2_bytes)
@@ -171,6 +188,79 @@ impl Pipeline {
             .div_ceil(slice_size)
             .saturating_add(damaged_files);
         Some(blocks.min(u64::from(u32::MAX)) as u32)
+    }
+
+    /// Whether this job's declared recovery is still *obtainable*, and how many
+    /// bytes of it there could be.
+    ///
+    /// Two sources, both of them things the pipeline has observed rather than
+    /// read off a filename:
+    ///
+    /// * a served recovery set — blocks its volumes can supply, at the set's
+    ///   own slice size, counting only volumes with an article delivered or
+    ///   still able to arrive;
+    /// * discovery candidates that are still live: no verdict yet, and at least
+    ///   one article that could still arrive. Nothing is known about their
+    ///   contents, so they contribute their declared article bytes.
+    ///
+    /// Neither is the NZB's static PAR2 byte count, which is what a posting
+    /// whose every recovery volume is already dead still reports in full.
+    fn obtainable_recovery(&self, job_id: JobId) -> ObtainableRecovery {
+        let served = self.par2_served_set_id(job_id).map(|set_id| {
+            let slice_size = self
+                .par2_set_for(job_id, set_id)
+                .map_or(0, |set| set.slice_size);
+            u64::from(self.obtainable_recovery_block_capacity(job_id, set_id))
+                .saturating_mul(slice_size)
+        });
+        let candidates = self.par2_metadata_candidate_indices(job_id);
+        if served.is_none() && candidates.is_empty() {
+            // Nothing served and no recovery file to ask about: this says
+            // nothing either way, so the declared count stands as it did.
+            return ObtainableRecovery {
+                obtainable: true,
+                ceiling: None,
+            };
+        }
+        let live_candidates = candidates
+            .into_iter()
+            .filter(|(file_index, _, _)| self.par2_discovery_candidate_is_live(job_id, *file_index))
+            .map(|(_, _, bytes)| bytes)
+            .fold(0u64, u64::saturating_add);
+        ObtainableRecovery {
+            obtainable: served.is_some_and(|bytes| bytes > 0) || live_candidates > 0,
+            ceiling: served.map(|bytes| bytes.saturating_add(live_candidates)),
+        }
+    }
+
+    /// Whether a discovery candidate could still produce metadata.
+    ///
+    /// A candidate that has reached a verdict has nothing left to give, and one
+    /// whose every article has reached a terminal state can never reach one.
+    fn par2_discovery_candidate_is_live(&self, job_id: JobId, file_index: u32) -> bool {
+        if self
+            .par2_discovery_state_for_candidate(job_id, file_index)
+            .candidate_probe_is_terminal()
+        {
+            return false;
+        }
+        let file_id = NzbFileId { job_id, file_index };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(file) = state.spec.files.get(file_index as usize) else {
+            return false;
+        };
+        let assembly = state.assembly.file(file_id);
+        file.segments.iter().any(|segment| {
+            self.par2_discovery_article_may_arrive(
+                SegmentId {
+                    file_id,
+                    segment_number: segment.ordinal,
+                },
+                assembly.is_some_and(|file| file.has_segment(segment.ordinal)),
+            )
+        })
     }
 
     /// Whether a loaded recovery set already answers the question a probe would
@@ -418,29 +508,66 @@ impl Pipeline {
         }
 
         if health <= critical && par2_bytes > 0 {
-            let entered = self.note_health_deferral(job_id, HealthDeferralKind::Par2Recovery);
-            if entered {
-                info!(
-                    job_id = job_id.0,
-                    health_pct = health as f64 / 10.0,
-                    critical_pct = critical as f64 / 10.0,
-                    failed_bytes,
-                    total_bytes = total,
-                    par2_bytes,
-                    "deferring health failure to PAR2 recovery evaluation"
-                );
-            } else {
-                debug!(
-                    job_id = job_id.0,
-                    health_pct = health as f64 / 10.0,
-                    critical_pct = critical as f64 / 10.0,
-                    failed_bytes,
-                    total_bytes = total,
-                    par2_bytes,
-                    "deferring health failure to PAR2 recovery evaluation"
-                );
+            // `par2_bytes` is the NZB's declared recovery size, fixed at job
+            // creation from the filenames. It says a posting *advertised*
+            // recovery, never that any of it can still be had — and a posting
+            // whose every recovery volume is already dead advertises exactly
+            // what an intact one does. Deferring on the advertisement alone is
+            // what let a release nobody uploaded hold its lanes for as long as
+            // it took to prove each of its articles missing one at a time.
+            //
+            // Two conditions replace it. Recovery has to be *obtainable*: a
+            // served set, or a discovery candidate that could still answer.
+            // And the deferral is capped — past the point where the damage
+            // exceeds every recovery byte this job could ever obtain, waiting
+            // for that recovery cannot change the verdict.
+            let recovery = self.obtainable_recovery(job_id);
+            if recovery.obtainable
+                && recovery
+                    .ceiling
+                    .is_none_or(|ceiling| failed_bytes <= ceiling)
+            {
+                let entered = self.note_health_deferral(job_id, HealthDeferralKind::Par2Recovery);
+                if entered {
+                    info!(
+                        job_id = job_id.0,
+                        health_pct = health as f64 / 10.0,
+                        critical_pct = critical as f64 / 10.0,
+                        failed_bytes,
+                        total_bytes = total,
+                        par2_bytes,
+                        obtainable_recovery_bytes = recovery.ceiling,
+                        "deferring health failure to PAR2 recovery evaluation"
+                    );
+                } else {
+                    debug!(
+                        job_id = job_id.0,
+                        health_pct = health as f64 / 10.0,
+                        critical_pct = critical as f64 / 10.0,
+                        failed_bytes,
+                        total_bytes = total,
+                        par2_bytes,
+                        obtainable_recovery_bytes = recovery.ceiling,
+                        "deferring health failure to PAR2 recovery evaluation"
+                    );
+                }
+                self.schedule_job_completion_check(job_id);
+                return;
             }
-            self.schedule_job_completion_check(job_id);
+            self.clear_health_deferral(job_id);
+            warn!(
+                job_id = job_id.0,
+                health_pct = health as f64 / 10.0,
+                critical_pct = critical as f64 / 10.0,
+                failed_bytes,
+                total_bytes = total,
+                par2_bytes,
+                obtainable_recovery_bytes = recovery.ceiling,
+                obtainable_recovery = recovery.obtainable,
+                "aborting job: health below critical threshold"
+            );
+            let error = self.health_abort_error(job_id, health, critical);
+            self.fail_job(job_id, error);
             return;
         }
 
@@ -488,12 +615,37 @@ impl Pipeline {
                 total_bytes = total,
                 "aborting job: health below critical threshold"
             );
-            let error = format!(
-                "health {:.1}% below critical {:.1}%",
-                health as f64 / 10.0,
-                critical as f64 / 10.0
-            );
+            let error = self.health_abort_error(job_id, health, critical);
             self.fail_job(job_id, error);
+        }
+    }
+
+    /// The terminal error for a job the health arithmetic is failing.
+    ///
+    /// The health figure says how many bytes are gone; the first-article
+    /// sample, when it has already seen enough, says why — the post itself is
+    /// gone. A sample still waiting on some of its articles can be certain
+    /// before it is complete, and then its diagnosis is the one the job fails
+    /// with, worded exactly as the complete sample would word it. The health
+    /// figure is logged beside it. Short of that, the health error stands.
+    fn health_abort_error(&self, job_id: JobId, health: u32, critical: u32) -> String {
+        let health_error = format!(
+            "health {:.1}% below critical {:.1}%",
+            health as f64 / 10.0,
+            critical as f64 / 10.0
+        );
+        match self.first_article_verdict(job_id) {
+            Some((missing, total)) => {
+                warn!(
+                    job_id = job_id.0,
+                    missing,
+                    total,
+                    health = %health_error,
+                    "health abort attributed to the first-article sample"
+                );
+                Self::first_article_verdict_error(missing, total)
+            }
+            None => health_error,
         }
     }
 
@@ -735,6 +887,174 @@ impl Pipeline {
             deferrals = ended.deferrals,
             "health failure deferral ended"
         );
+    }
+
+    /// The smallest number of files a first-article verdict is worth taking.
+    ///
+    /// One article per file is a sample, and a sample of a handful of files
+    /// says very little: a two-file post whose first file is missing is an
+    /// ordinary damaged post, not a dead one.
+    const FIRST_ARTICLE_GATE_MIN_FILES: usize = 10;
+
+    /// How much of the sample has to be missing before the post is called dead,
+    /// in hundredths. Short of this the ordinary health path rules, because a
+    /// post with real recovery data behind it can survive a great deal.
+    const FIRST_ARTICLE_GATE_MISSING_PCT: usize = 80;
+
+    /// One article of a file has reached its verdict — delivered, or answered
+    /// for by every server. When it is that file's first article, the sample
+    /// is read again: it may now be able to answer.
+    pub(in crate::pipeline) fn note_first_article_settled(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        if !self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.download_queue.is_first_article(segment_id))
+        {
+            return;
+        }
+        self.evaluate_first_article_gate(job_id);
+    }
+
+    /// Reads the first-article sample as soon as it can answer.
+    ///
+    /// A post whose every file answers "no such article" on the very first
+    /// article of each of them is not a post that is going to complete, and
+    /// nothing later in the pipeline can learn that any sooner: the recovery
+    /// arithmetic needs a recovery set that this post cannot supply either.
+    /// Failing here costs one article per file and no lane of its own.
+    ///
+    /// The sample counts files, not bytes. When the files it rules missing are
+    /// small beside the recovery the job can still obtain, the post is damaged
+    /// rather than dead, and the ordinary health path rules instead.
+    fn evaluate_first_article_gate(&mut self, job_id: JobId) {
+        if let Some((missing, total)) = self.first_article_verdict(job_id) {
+            if self.first_article_losses_recoverable(job_id) {
+                return;
+            }
+            self.fail_job(job_id, Self::first_article_verdict_error(missing, total));
+        }
+    }
+
+    /// Whether the recovery this job can still obtain covers every file whose
+    /// sampled first article is ruled missing, taking each of those files as
+    /// wholly lost.
+    ///
+    /// The cover is the served set's obtainable capacity when one is known,
+    /// and otherwise the recovery the posting declares, which is also what the
+    /// critical-health line is drawn from.
+    ///
+    /// Once a set is parsed the comparison is in its own units, because the
+    /// two sides otherwise disagree: the capacity is decoded slices, while a
+    /// file's declared size is yEnc-encoded, about 3% larger — enough to fail
+    /// a post whose losses the set covers exactly. Each lost file costs the
+    /// whole slices of the length the set describes for it, which is what the
+    /// repair will spend; a file the set does not describe falls back to its
+    /// declared size. That charge is generous rather than exact — the served
+    /// set cannot repair such a file at all — and it is the same charge the
+    /// byte comparison has always made for a file another set protects.
+    fn first_article_losses_recoverable(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let lost_files: Vec<NzbFileId> = state
+            .download_queue
+            .first_articles()
+            .filter(|segment_id| {
+                matches!(
+                    self.segment_terminal_states.get(segment_id),
+                    Some(SegmentTerminalState::Missing)
+                )
+            })
+            .filter(|segment_id| {
+                state
+                    .assembly
+                    .file(segment_id.file_id)
+                    .is_some_and(|file| !file.has_segment(segment_id.segment_number))
+            })
+            .map(|segment_id| segment_id.file_id)
+            .collect();
+        let declared_bytes = |file_id: NzbFileId| {
+            state
+                .assembly
+                .file(file_id)
+                .map_or(0, |file| file.total_bytes())
+        };
+        let recovery = self.obtainable_recovery(job_id);
+        if !recovery.obtainable {
+            return false;
+        }
+        let served = self.par2_served_set_id(job_id).and_then(|set_id| {
+            let slice_size = self.par2_set_for(job_id, set_id)?.slice_size;
+            (slice_size > 0).then_some((set_id, slice_size))
+        });
+        match (recovery.ceiling, served) {
+            (Some(ceiling), Some((set_id, slice_size))) => {
+                let needed_slices = lost_files
+                    .iter()
+                    .map(|file_id| {
+                        self.resolve_par2_file_binding_in_set(*file_id, set_id)
+                            .map_or_else(
+                                || declared_bytes(*file_id),
+                                |binding| binding.described_length,
+                            )
+                            .div_ceil(slice_size)
+                    })
+                    .fold(0u64, u64::saturating_add);
+                needed_slices <= ceiling / slice_size
+            }
+            (ceiling, _) => {
+                let lost_bytes = lost_files
+                    .iter()
+                    .map(|file_id| declared_bytes(*file_id))
+                    .fold(0u64, u64::saturating_add);
+                lost_bytes <= ceiling.unwrap_or(state.par2_bytes)
+            }
+        }
+    }
+
+    /// The sample's verdict, once it is certain: `Some((missing, total))` when
+    /// the articles already ruled missing reach the failure share of the whole
+    /// sample, `None` otherwise.
+    ///
+    /// Only a ruling of missing counts toward the share, and an article still
+    /// outstanding can only add to it or leave it where it is, so a sample
+    /// that reaches the share with articles outstanding has the verdict the
+    /// complete sample would have. A sample short of the share says nothing
+    /// yet, complete or not.
+    fn first_article_verdict(&self, job_id: JobId) -> Option<(usize, usize)> {
+        let state = self.jobs.get(&job_id)?;
+        let total = state.download_queue.first_articles().count();
+        if total < Self::FIRST_ARTICLE_GATE_MIN_FILES {
+            return None;
+        }
+        let missing = state
+            .download_queue
+            .first_articles()
+            .filter(|segment_id| {
+                // A delivered article is not missing, whatever a late
+                // failure for it may have booked.
+                !state
+                    .assembly
+                    .file(segment_id.file_id)
+                    .is_some_and(|file| file.has_segment(segment_id.segment_number))
+                    // The article was put to every server and none of them
+                    // had it. Any other verdict is about this article, not
+                    // about the post.
+                    && matches!(
+                        self.segment_terminal_states.get(segment_id),
+                        Some(SegmentTerminalState::Missing)
+                    )
+            })
+            .count();
+        (missing * 100 >= total * Self::FIRST_ARTICLE_GATE_MISSING_PCT).then_some((missing, total))
+    }
+
+    fn first_article_verdict_error(missing: usize, total: usize) -> String {
+        format!(
+            "aborted: {missing} of {total} first articles are missing, \
+             the post cannot complete"
+        )
     }
 
     /// Mark a job as failed and purge its queued segments.
@@ -1026,7 +1346,7 @@ impl Pipeline {
         // that wanted a connection of its own had to take a permit off an idle
         // lane and then pay a full cold dial for it. Asking the lane to run
         // the STAT batch on the socket it is already holding costs neither.
-        let owned_lane_probe = self.owned_download_lane_pool.probe_handle();
+        let owned_lane_probe = self.owned_download_lane_pool.probe_handle(job_id.0);
 
         info!(
             job_id = job_id.0,

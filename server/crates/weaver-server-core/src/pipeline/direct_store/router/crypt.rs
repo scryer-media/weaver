@@ -101,7 +101,7 @@ use std::collections::BTreeMap;
 
 use unrar_rs::{
     EncryptedStore, KdfCache, MemberCipherKey, MemberKeying, PasswordCheck, RarResult,
-    check_member_password, convert_crc32_to_mac, derive_rar5_material,
+    check_member_password, convert_crc32_to_mac,
 };
 
 use super::CrcRuns;
@@ -427,6 +427,23 @@ impl HeaderKeyRing {
         self.refusal.expect("just inserted")
     }
 
+    /// The offered candidates, in offer order, for a reader that does its own
+    /// proving.
+    ///
+    /// The one exception to "values never leave this type", and it is narrow:
+    /// RAR has a plaintext check record this ring can prove a candidate against
+    /// before anything is decrypted, so [`Self::resolve`] hands back the one
+    /// that verified. A 7z end header has no such record — the only check is
+    /// the reader's own, inside the encrypted block — so the candidates have to
+    /// reach the reader for it to answer at all. Nothing may persist or log
+    /// these; see the type docs.
+    pub(crate) fn candidates(&self) -> Vec<&str> {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.value.as_str())
+            .collect()
+    }
+
     /// Which sources were offered, for a refusal log line. Values never leave
     /// this type.
     pub(crate) fn offered_sources(&self) -> Vec<&'static str> {
@@ -720,8 +737,13 @@ impl KeyRing {
                     PasswordCheck::Wrong => return Err(self.refuse(CryptRefusal::WrongPassword)),
                     PasswordCheck::Verified | PasswordCheck::Unverifiable => {}
                 }
+                // Through the cache, not the free function: the check above
+                // has just derived this very tuple, so a direct derivation
+                // would run the whole PBKDF2 a second time for a value the
+                // cache is already holding.
                 let Ok(mut material) =
-                    derive_rar5_material(password, &facts.salt, facts.kdf_count_lg2)
+                    self.cache
+                        .derive_material_rar5(password, &facts.salt, facts.kdf_count_lg2)
                 else {
                     // A KDF count the crate refuses. `check_member_password`
                     // reports the same tuple as `Unverifiable` rather than
@@ -919,6 +941,18 @@ pub(crate) struct MemberCipher {
     /// filesystem answers with zeros, and CBC would turn those zeros into
     /// well-formed cipher for every block from there to the member's end.
     covered: ByteRanges,
+    /// Plaintext of cipher blocks the write side has decrypted whole but only
+    /// part of which has reached the partial — [`MemberCrypt::edge_plain`] at
+    /// the moment the facts were taken.
+    ///
+    /// A block straddling two source volumes is decrypted by whichever side
+    /// resolves it first, and that side emits only its own bytes. While the
+    /// other side's share is still held, the partial has a gap inside the
+    /// block, yet the posted bytes of the side that was emitted are fully
+    /// determined: re-encrypting the block needs its whole plaintext, and this
+    /// is where the missing share of it is. At most one block per edge of a
+    /// run, so at most a few blocks per member.
+    edge_plain: BTreeMap<u64, [u8; 16]>,
 }
 
 impl std::fmt::Debug for MemberCipher {
@@ -931,6 +965,7 @@ impl std::fmt::Debug for MemberCipher {
             .field("cipher_size", &self.cipher_size)
             .field("tail_retained", &self.tail_plain.is_some())
             .field("checkpoints", &self.checkpoints.len())
+            .field("edge_blocks", &self.edge_plain.len())
             .finish_non_exhaustive()
     }
 }
@@ -952,6 +987,7 @@ impl MemberCipher {
             .saturating_add(self.checkpoints.len().saturating_mul(96))
             .saturating_add(self.covered.ranges().len().saturating_mul(32))
             .saturating_add(self.tail_plain.as_ref().map_or(0, Vec::capacity))
+            .saturating_add(self.edge_plain.len().saturating_mul(64))
     }
 
     pub(crate) fn unpacked_size(&self) -> u64 {
@@ -1000,14 +1036,65 @@ impl MemberCipher {
         }
     }
 
-    /// Whether every byte of `[start, end)` really is in the member's partial.
+    /// Whether the plaintext of every byte of `[start, end)` is in hand: in the
+    /// member's partial, or — for a byte the partial does not hold yet — in a
+    /// retained edge block.
     ///
     /// Clamped at `unpacked_size`, because the coverage map stops there: the
     /// padding is not destination bytes and is vouched for by
     /// [`Self::tail_plain`] instead.
     pub(crate) fn plaintext_present(&self, start: u64, end: u64) -> bool {
+        self.missing_plaintext(start, end)
+            .into_iter()
+            .all(|(gap_start, gap_end)| self.edge_blocks_cover(gap_start, gap_end))
+    }
+
+    /// The sub-ranges of `[start, end)` the member's partial does not hold,
+    /// clamped at `unpacked_size`, in order.
+    pub(crate) fn missing_plaintext(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         let end = end.min(self.unpacked_size);
-        end <= start || self.covered.missing(start, end - start).is_empty()
+        if end <= start {
+            return Vec::new();
+        }
+        self.covered.missing(start, end - start)
+    }
+
+    fn edge_blocks_cover(&self, start: u64, end: u64) -> bool {
+        let mut block = block_floor(start);
+        while block < end {
+            if !self.edge_plain.contains_key(&block) {
+                return false;
+            }
+            block = block.saturating_add(AES_BLOCK);
+        }
+        true
+    }
+
+    /// Fills `plain`, the plaintext of `[start, start + plain.len())`, from the
+    /// retained edge blocks. Returns `false`, leaving `plain` partly written,
+    /// when a byte of it lies in a block that was not retained.
+    ///
+    /// Meant for a range [`Self::missing_plaintext`] reported: the edge blocks
+    /// answer only for bytes the partial does not hold.
+    pub(crate) fn edge_plaintext_into(&self, start: u64, plain: &mut [u8]) -> bool {
+        let end = start.saturating_add(plain.len() as u64);
+        let mut at = start;
+        while at < end {
+            let block = block_floor(at);
+            let stop = end.min(block.saturating_add(AES_BLOCK));
+            let Some(bytes) = self.edge_plain.get(&block) else {
+                return false;
+            };
+            plain[(at - start) as usize..(stop - start) as usize]
+                .copy_from_slice(&bytes[(at - block) as usize..(stop - block) as usize]);
+            at = stop;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_edge_block(&self, block_start: u64) -> bool {
+        self.edge_plain.contains_key(&block_start)
     }
 
     /// CBC-encrypts `buffer` **in place** — a whole number of blocks whose
@@ -1082,6 +1169,13 @@ pub(crate) struct MemberCrypt {
     /// Cipher ranges this process has decrypted. Only the run *ends* are read —
     /// they are what a checkpoint is allowed to sit at.
     decrypted: ByteRanges,
+    /// Every cipher byte this member has run the transform over, counted
+    /// rather than covered: [`Self::decrypted`] says *which* bytes are
+    /// plaintext now, and only a running total can say a byte was decrypted
+    /// twice. Read by the router's accounting tests, which hold the write
+    /// path to one pass over the member.
+    #[cfg(test)]
+    decrypted_bytes: u64,
     /// Cipher ranges whose plaintext has been emitted to a destination (or, for
     /// the padding, retained). An edge block leaves `edge_plain` when this
     /// covers all of it.
@@ -1109,6 +1203,15 @@ pub(crate) struct MemberCrypt {
     /// answering it off a zero-filled buffer would let a member verify against
     /// padding it never saw.
     tail_filled: u16,
+    /// The cipher offset of a CBC predecessor block a held run is waiting on.
+    ///
+    /// A run behind a gap cannot be decrypted until the sixteen bytes before it
+    /// arrive, and until then every drain of the set would re-attempt it. The
+    /// drain asks this first and skips the run while the answer still stands,
+    /// which is what keeps one missing article from costing a pass over the
+    /// whole run behind it on every article that lands anywhere in the set.
+    /// Cleared the moment a run at or past it decrypts.
+    blocked_predecessor: Option<u64>,
 }
 
 impl std::fmt::Debug for MemberCrypt {
@@ -1151,11 +1254,31 @@ impl MemberCrypt {
             edge_plain: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             decrypted: ByteRanges::new(),
+            #[cfg(test)]
+            decrypted_bytes: 0,
             emitted: ByteRanges::new(),
             plain_runs: CrcRuns::default(),
             tail_plain: Vec::new(),
             tail_filled: 0,
+            blocked_predecessor: None,
         }
+    }
+
+    /// Records that a run could not be decrypted because the cipher block
+    /// starting at `offset` is not here. See the field.
+    pub(crate) fn note_blocked_predecessor(&mut self, offset: u64) {
+        self.blocked_predecessor = Some(offset);
+    }
+
+    /// Forgets the marker: a run has decrypted, so whatever it was waiting on
+    /// arrived.
+    pub(crate) fn clear_blocked_predecessor(&mut self) {
+        self.blocked_predecessor = None;
+    }
+
+    /// The cipher offset a held run is waiting on, if one is. See the field.
+    pub(crate) fn blocked_predecessor(&self) -> Option<u64> {
+        self.blocked_predecessor
     }
 
     /// The all-ones mask for `tail_padding` bytes. `tail_padding` is `0..16` by
@@ -1198,6 +1321,12 @@ impl MemberCrypt {
     #[cfg(test)]
     pub(crate) fn tail_plain(&self) -> &[u8] {
         &self.tail_plain
+    }
+
+    /// Cipher bytes this member has decrypted, counting repeats.
+    #[cfg(test)]
+    pub(crate) fn decrypted_bytes(&self) -> u64 {
+        self.decrypted_bytes
     }
 
     /// The CBC predecessor of the block starting at `block_start`: the member's
@@ -1260,6 +1389,10 @@ impl MemberCrypt {
         }
         if self.keys.key.decrypt_range(preceding, cipher).is_err() {
             return false;
+        }
+        #[cfg(test)]
+        {
+            self.decrypted_bytes = self.decrypted_bytes.saturating_add(len);
         }
         self.decrypted.insert(start, len);
         self.checkpoints.insert(start + len, trailing);
@@ -1494,6 +1627,7 @@ impl MemberCrypt {
                 .then(|| self.tail_plain[..usize::from(self.tail_padding)].to_vec()),
             checkpoints: self.checkpoints.clone(),
             covered: covered.clone(),
+            edge_plain: self.edge_plain.clone(),
         })
     }
 
@@ -1577,7 +1711,7 @@ impl MemberCrypt {
 
 #[cfg(test)]
 mod tests {
-    use unrar_rs::RarVolumeMemberEncryptionFacts;
+    use unrar_rs::{RarVolumeMemberEncryptionFacts, derive_rar5_material};
 
     use super::*;
 

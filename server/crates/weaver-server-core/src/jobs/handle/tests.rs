@@ -286,6 +286,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         health_probing: false,
                         health_deferral: Default::default(),
                         health_probe_round: 0,
+                        announced_checkpoints: Default::default(),
                         health_probe_failing_files: 0,
                         health_failing_files: std::collections::HashSet::new(),
                         early_recovery_requested_blocks: 0,
@@ -298,6 +299,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
                         category_bytes: None,
+                        nzb_password_candidates: Default::default(),
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -445,6 +447,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         health_probing: false,
                         health_deferral: Default::default(),
                         health_probe_round: 0,
+                        announced_checkpoints: Default::default(),
                         health_probe_failing_files: 0,
                         health_failing_files: std::collections::HashSet::new(),
                         early_recovery_requested_blocks: 0,
@@ -457,6 +460,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
                         category_bytes: None,
+                        nzb_password_candidates: Default::default(),
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));

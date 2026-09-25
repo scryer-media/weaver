@@ -742,13 +742,22 @@ impl Pipeline {
         let db = self.db.clone();
         let semantic_materialization_generation = options.semantic_materialization_generation;
         let semantic_promotion_generation = options.semantic_promotion_generation;
-        let persisted = tokio::task::spawn_blocking(move || {
-            db.materialize_active_job_with_file_identities(
+        let (persisted, nzb_password_candidates) = tokio::task::spawn_blocking(move || {
+            let persisted = db.materialize_active_job_with_file_identities(
                 &active_job,
                 &initial_file_identities,
                 semantic_materialization_generation,
                 semantic_promotion_generation,
+            );
+            // Derived here, once, from the bytes just persisted, so no archive
+            // file has to reload and re-parse the NZB to learn them. A parse
+            // failure leaves the harvest to read the row itself, as before.
+            let nzb_password_candidates = crate::pipeline::persisted_nzb_password_candidates(
+                &active_job.nzb_path,
+                &active_job.nzb_zstd,
             )
+            .ok();
+            (persisted, nzb_password_candidates)
         })
         .await
         .map_err(|error| {
@@ -839,6 +848,7 @@ impl Pipeline {
             health_probing: false,
             health_deferral: Default::default(),
             health_probe_round: 0,
+            announced_checkpoints: Default::default(),
             health_probe_failing_files: 0,
             health_failing_files: std::collections::HashSet::new(),
             early_recovery_requested_blocks: 0,
@@ -851,6 +861,9 @@ impl Pipeline {
             recovery_queue,
             staging_dir: None,
             category_bytes: Some(category_bytes),
+            nzb_password_candidates: nzb_password_candidates
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
         };
         state.refresh_runtime_lanes_from_status();
         self.install_repeated_articles(&state)?;
@@ -874,6 +887,20 @@ impl Pipeline {
         Ok(())
     }
 
+    /// How many of a job's payload files lead with their first article.
+    /// Recovery volumes are never sampled, so they do not count toward it:
+    /// counted by file index, a post that lists its recovery first would
+    /// sample few payload files or none, and the gate could never run.
+    ///
+    /// The wave exists to sample the post, not to reshape the job. A bounded
+    /// number of leading files answers "is this post still on the server" as
+    /// well as every file would, and every extra file in the wave costs the
+    /// direct store: the head of a later volume arrives long before the
+    /// sequential frontier reaches it, so it sits in a hold for the whole
+    /// stretch of volumes ahead of it. Thirty-two holds is a sample; a hold
+    /// per volume of a large set is a second copy of the download.
+    const FIRST_ARTICLE_SAMPLE_FILES: usize = 32;
+
     pub(crate) fn build_job_assembly(
         job_id: JobId,
         spec: &JobSpec,
@@ -886,6 +913,7 @@ impl Pipeline {
         let mut has_par3_index = false;
         let mut par2_files: Vec<(u32, u64)> = Vec::new();
         let mut par3_files: Vec<(u32, u64)> = Vec::new();
+        let mut sampled_files = 0usize;
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_id = NzbFileId {
@@ -919,12 +947,6 @@ impl Pipeline {
                     par3_files.push((file_index as u32, total));
                 }
             }
-
-            let target_queue = if is_recovery {
-                &mut recovery_queue
-            } else {
-                &mut download_queue
-            };
 
             // An unclassifiable file's head segment jumps the data queue: the
             // offset-zero article carries the archive signature and the whole
@@ -971,6 +993,23 @@ impl Pipeline {
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
             .flatten();
 
+            // Every file's lowest ordinal is its first article, and first
+            // articles lead the payload: one article per file is the cheapest
+            // sample of whether the post is still on the server at all, and
+            // sampling every file beats reading one file's worth of articles
+            // before anything else is asked for.
+            //
+            // Recovery volumes stay out of the sample. Their articles are
+            // parked until something promotes them, so they cannot answer in
+            // the first round trips, and a sample that waits on an article
+            // nothing has asked for is a sample that never completes.
+            let first_segment = (!is_recovery && sampled_files < Self::FIRST_ARTICLE_SAMPLE_FILES)
+                .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
+                .flatten();
+            if first_segment.is_some() {
+                sampled_files += 1;
+            }
+
             // One shared group list per file; every segment's work item holds
             // a reference to it rather than its own copy.
             let groups: std::sync::Arc<[String]> =
@@ -980,15 +1019,24 @@ impl Pipeline {
                     file_id,
                     segment_number: seg.ordinal,
                 };
+                let is_first_article = first_segment == Some(seg.ordinal);
                 let priority =
                     if head_segment == Some(seg.ordinal) || tail_segment == Some(seg.ordinal) {
                         2
                     } else {
                         priority
                     };
+                if is_first_article {
+                    download_queue.note_first_article(segment_id);
+                }
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
                 } else {
+                    let target_queue = if is_recovery {
+                        &mut recovery_queue
+                    } else {
+                        &mut download_queue
+                    };
                     target_queue.push(DownloadWork {
                         segment_id,
                         message_id: MessageId::new(&seg.message_id),
@@ -1193,6 +1241,7 @@ impl Pipeline {
                 health_probing: false,
                 health_deferral: Default::default(),
                 health_probe_round: 0,
+                announced_checkpoints: Default::default(),
                 health_probe_failing_files: 0,
                 health_failing_files: std::collections::HashSet::new(),
                 early_recovery_requested_blocks: 0,
@@ -1205,6 +1254,7 @@ impl Pipeline {
                 recovery_queue,
                 staging_dir: None,
                 category_bytes: Some(category_bytes),
+                nzb_password_candidates: Default::default(),
             };
             state.refresh_runtime_lanes_from_status();
             self.install_repeated_articles(&state)?;
@@ -1595,6 +1645,7 @@ impl Pipeline {
             health_probing: false,
             health_deferral: Default::default(),
             health_probe_round: 0,
+            announced_checkpoints: Default::default(),
             health_probe_failing_files: 0,
             health_failing_files: HashSet::new(),
             early_recovery_requested_blocks: 0,
@@ -1607,6 +1658,7 @@ impl Pipeline {
             recovery_queue: DownloadQueue::new(),
             staging_dir: None,
             category_bytes: None,
+            nzb_password_candidates: Default::default(),
         };
         let message = state.failure_error.clone().unwrap();
         let queued_repair = state.queued_repair_at_epoch_ms;
@@ -1887,6 +1939,17 @@ impl Pipeline {
         let server_attribution = self
             .db_blocking(move |db| db.load_active_server_attribution(job_id))
             .await?;
+        // One read and parse of the persisted NZB per restored job, off the
+        // pipeline thread, instead of one per archive file. Anything short of
+        // a parsed NZB leaves the harvest to read the row itself, as before.
+        let nzb_password_candidates = self
+            .db_blocking(move |db| match db.load_active_job_persisted_nzb(job_id) {
+                Ok(Some((nzb_path, Some(nzb_zstd)))) => {
+                    crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd).ok()
+                }
+                _ => None,
+            })
+            .await;
 
         let _ = self.event_tx.send(PipelineEvent::JobCreated {
             job_id,
@@ -1987,6 +2050,7 @@ impl Pipeline {
             health_probing: false,
             health_deferral: Default::default(),
             health_probe_round: 0,
+            announced_checkpoints: Default::default(),
             health_probe_failing_files: 0,
             health_failing_files: std::collections::HashSet::new(),
             early_recovery_requested_blocks: 0,
@@ -1999,6 +2063,9 @@ impl Pipeline {
             recovery_queue,
             staging_dir: restored_staging_dir,
             category_bytes: Some(category_bytes),
+            nzb_password_candidates: nzb_password_candidates
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
         };
         state.refresh_runtime_lanes_from_status();
         self.install_repeated_articles(&state)?;
@@ -2013,6 +2080,7 @@ impl Pipeline {
         let direct_rejected = direct_restore.rejected;
         let direct_ignored = direct_restore.ignored;
         let direct_swept = direct_restore.swept;
+        let direct_installed = direct_restore.installed;
         self.direct_store.install_restored(job_id, direct_sets);
         self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);
@@ -2031,6 +2099,10 @@ impl Pipeline {
         if !extracted_members.is_empty() {
             self.extracted_members.insert(job_id, extracted_members);
         }
+        // After the persisted members, which replace the job's entry: a set
+        // restored as installed finalized in the previous run and recorded its
+        // members only in memory.
+        self.reinstate_installed_direct_sets(job_id, direct_installed);
         match self.db.load_active_job_normalization_retried(job_id) {
             Ok(true) => {
                 self.normalization_retried.insert(job_id);

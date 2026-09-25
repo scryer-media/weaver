@@ -939,6 +939,7 @@ async fn fail_job_clears_write_backlog_accounting() {
         data: DecodedChunk::from(vec![3u8; 4096]),
         part_crc: par2_rs::checksum::crc32(&vec![3u8; 4096]),
         part_crc_verified: true,
+        declared_file_len: 0,
         yenc_name: "stalled.bin".to_string(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),
@@ -2545,6 +2546,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
         data: DecodedChunk::from(buffered_payload.to_vec()),
         part_crc: par2_rs::checksum::crc32(&buffered_payload),
         part_crc_verified: true,
+        declared_file_len: 0,
         yenc_name: "episode.bin".to_string(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),
@@ -2678,6 +2680,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
         data: DecodedChunk::from(original_payload[64..].to_vec()),
         part_crc: par2_rs::checksum::crc32(&original_payload[64..]),
         part_crc_verified: true,
+        declared_file_len: 0,
         yenc_name: payload_filename.to_string(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),
@@ -2801,6 +2804,158 @@ async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
             .await
             .unwrap();
     assert_eq!(stored_hash, expected_hash);
+}
+
+/// Overwrites the job's persisted NZB with bytes that cannot be parsed, so a
+/// harvest that still returns the NZB's candidates provably did not read it.
+async fn corrupt_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId) {
+    set_persisted_nzb(temp_dir, job_id, Some(vec![0xFFu8; 64])).await;
+}
+
+async fn set_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId, nzb_zstd: Option<Vec<u8>>) {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(temp_dir.path().join("weaver.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    let updated = sqlx::query("UPDATE active_jobs SET nzb_zstd = ? WHERE job_id = ?")
+        .bind(nzb_zstd)
+        .bind(job_id.0 as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    pool.close().await;
+}
+
+fn nzb_half_candidates() -> Vec<ArchivePasswordCandidate> {
+    vec![
+        ArchivePasswordCandidate::new(ArchivePasswordSource::NzbMeta, "meta-key".to_string()),
+        ArchivePasswordCandidate::new(
+            ArchivePasswordSource::FilenameConvention,
+            "harbour-key".to_string(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn add_job_keeps_nzb_password_candidates_so_the_harvest_never_rereads_the_nzb() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30037);
+    let mut spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    spec.password = Some("spec-key".to_string());
+    pipeline
+        .add_job(
+            job_id,
+            spec,
+            PathBuf::from("Silver Horizon {{harbour-key}}.nzb"),
+            sample_nzb_zstd_with_password("meta-key"),
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    // Before any archive file completes: the persisted NZB is now unreadable,
+    // so every candidate below came from what admission derived.
+    corrupt_persisted_nzb(&temp_dir, job_id).await;
+
+    let mut expected = nzb_half_candidates();
+    expected.insert(
+        0,
+        ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, "spec-key".to_string()),
+    );
+    for _ in 0..2 {
+        let (candidates, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+        assert!(harvested);
+        assert!(candidates == expected);
+    }
+}
+
+#[tokio::test]
+async fn the_first_harvest_parses_the_persisted_nzb_and_later_ones_read_memory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30038);
+    let spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    // Hand-built state, as a job that entered without the NZB in hand: the
+    // first harvest has to read the row.
+    insert_active_job_with_persisted_nzb_named(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("meta-key"),
+        Some("Silver Horizon {{harbour-key}}.nzb"),
+    )
+    .await;
+
+    let (first, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    assert!(harvested);
+    assert!(first == nzb_half_candidates());
+
+    corrupt_persisted_nzb(&temp_dir, job_id).await;
+
+    let (second, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    assert!(
+        harvested,
+        "a later harvest must not read the persisted NZB again"
+    );
+    assert!(second == nzb_half_candidates());
+}
+
+#[tokio::test]
+async fn a_harvest_that_finds_no_persisted_nzb_remembers_the_empty_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30040);
+    let spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    insert_active_job_with_persisted_nzb_named(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("meta-key"),
+        Some("Silver Horizon {{harbour-key}}.nzb"),
+    )
+    .await;
+    set_persisted_nzb(&temp_dir, job_id, None).await;
+
+    let (first, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    assert!(harvested);
+    assert!(first.is_empty());
+
+    // Bytes that appear afterwards are not read: the first harvest's answer
+    // stands for the rest of the job.
+    set_persisted_nzb(
+        &temp_dir,
+        job_id,
+        Some(sample_nzb_zstd_with_password("meta-key")),
+    )
+    .await;
+    let (second, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    assert!(harvested);
+    assert!(
+        second.is_empty(),
+        "a later harvest must not read the persisted NZB again"
+    );
+}
+
+#[tokio::test]
+async fn a_harvest_whose_nzb_failed_to_parse_reads_the_row_again() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30039);
+    let spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, vec![0xFFu8; 64]).await;
+
+    for _ in 0..2 {
+        let (candidates, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+        assert!(!harvested, "a parse failure is never remembered");
+        assert!(candidates.is_empty());
+    }
 }
 
 #[tokio::test]

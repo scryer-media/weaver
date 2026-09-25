@@ -30,7 +30,14 @@ impl Pipeline {
         true
     }
 
-    fn is_recoverable_full_set_extraction_error(error: &str) -> bool {
+    /// Whether a full-set extraction failed on its archive's bytes, which a
+    /// repair can still change, rather than on something no repair reaches.
+    pub(in crate::pipeline) fn is_recoverable_full_set_extraction_error(error: &str) -> bool {
+        if error.starts_with(
+            crate::pipeline::completion::finalize::extract::SEVENZ_BLOCK_DATA_ERROR_PREFIX,
+        ) {
+            return true;
+        }
         let lower = error.to_ascii_lowercase();
         lower.contains("checksum") || lower.contains("crc mismatch")
     }

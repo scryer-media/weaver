@@ -1110,12 +1110,28 @@ impl Pipeline {
                 return;
             }
             Ok(Err(error)) => {
-                warn!(
-                    job_id = job_id.0,
-                    filename = %filename,
-                    error = %error,
-                    "failed to read back a PAR2 recovery volume that cannot complete"
-                );
+                let first_report = {
+                    let runtime = self.ensure_par2_runtime(job_id);
+                    let entry = runtime.files.entry(file_index).or_default();
+                    let first = !entry.readback_failure_reported;
+                    entry.readback_failure_reported = true;
+                    first
+                };
+                if first_report {
+                    warn!(
+                        job_id = job_id.0,
+                        filename = %filename,
+                        error = %error,
+                        "failed to read back a PAR2 recovery volume that cannot complete"
+                    );
+                } else {
+                    debug!(
+                        job_id = job_id.0,
+                        filename = %filename,
+                        error = %error,
+                        "failed to read back a PAR2 recovery volume that cannot complete"
+                    );
+                }
                 return;
             }
             Err(error) => {
@@ -1219,6 +1235,9 @@ impl Pipeline {
         {
             entry.salvaged = false;
             entry.salvaged_at_received_bytes = None;
+            // The volume is downloading again, so the next read-back looks at
+            // different bytes and its verdict is worth reporting afresh.
+            entry.readback_failure_reported = false;
         }
     }
 }

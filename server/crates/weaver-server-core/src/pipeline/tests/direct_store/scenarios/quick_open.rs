@@ -1954,6 +1954,7 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
             data: DecodedChunk::from(bytes.to_vec()),
             part_crc: checksum::crc32(bytes),
             part_crc_verified: true,
+            declared_file_len: 0,
             yenc_name: name.to_string(),
             checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             segments: Vec::new(),
@@ -2122,6 +2123,130 @@ async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
         !direct_partial(&temp_dir, job_id, member_name).exists(),
         "with the routed output deleted behind it"
     );
+}
+
+/// Receives the sweep's next message for `job_id` and hands it to the actor,
+/// returning which volume it reported, or `None` for the finish.
+async fn hand_back_next_swept_volume(pipeline: &mut Pipeline) -> Option<u32> {
+    let done = pipeline
+        .direct_demotion_done_rx
+        .recv()
+        .await
+        .expect("the demotion completion channel should stay open");
+    let reported = match &done.progress {
+        crate::pipeline::DirectDemotionProgress::Volume(outcome) => Some(outcome.volume_index),
+        crate::pipeline::DirectDemotionProgress::Finished { .. } => None,
+    };
+    pipeline.handle_direct_demotion_done(done).await;
+    reported
+}
+
+#[tokio::test]
+async fn a_volume_the_sweep_has_finished_goes_back_into_dispatch_before_its_siblings() {
+    // The sweep is bounded only by the archive, and over a slow working
+    // directory a large set takes minutes. Every volume it has not finished is
+    // held out of dispatch — its articles could only be parked — but a volume
+    // it *has* finished is an ordinary file from that moment, and holding it
+    // until the last sibling lands idles the whole job for the whole sweep.
+    let member_name = "Silver.Horizon.S01E27.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41062);
+    let (mut pipeline, working_dir, _) =
+        demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+            &temp_dir,
+            job_id,
+            &volumes,
+            DemotionReason::HoldsBudgetExceeded,
+            true,
+            |_, _| {},
+        )
+        .await;
+    let file = |file_index: u32| NzbFileId { job_id, file_index };
+
+    assert_eq!(
+        pipeline.demotion_sweep_held_file_indices(job_id),
+        Some(vec![0, 1, 2]),
+        "before the sweep reports anything, every volume of the set is held"
+    );
+    assert!(
+        !pipeline.job_has_dispatchable_work_for_test(job_id),
+        "and the job — whose queue is nothing but those volumes — has nothing to hand out"
+    );
+
+    assert_eq!(hand_back_next_swept_volume(&mut pipeline).await, Some(0));
+    assert_eq!(
+        pipeline.demotion_sweep_held_file_indices(job_id),
+        Some(vec![1, 2]),
+        "the volume the sweep finished is released while its siblings stay held"
+    );
+    assert!(
+        !pipeline.demotion_sweep_owns_file(file(0)),
+        "and it is no longer sweep-owned, so its writes and its completion hook run"
+    );
+    assert!(pipeline.demotion_sweep_owns_file(file(1)));
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "the released volume is on disk byte for byte"
+    );
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(file(0))
+            .unwrap()
+            .is_complete(),
+        "and complete in the assembly"
+    );
+    assert!(
+        direct_partial(&temp_dir, job_id, member_name).exists(),
+        "the routed output the sweep is still reading from is not deleted for one volume"
+    );
+    assert!(
+        !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "nor is the set's coverage row retired: it is one row for the set"
+    );
+    assert!(
+        !pipeline.job_has_dispatchable_work_for_test(job_id),
+        "volume 0 was whole, so releasing it hands out nothing on its own"
+    );
+
+    assert_eq!(hand_back_next_swept_volume(&mut pipeline).await, Some(1));
+    assert_eq!(
+        pipeline.demotion_sweep_held_file_indices(job_id),
+        Some(vec![2])
+    );
+    assert!(
+        pipeline.job_has_dispatchable_work_for_test(job_id),
+        "volume 1 was half covered: its handback requeues the half the sweep could not \
+         vouch for, and that article is dispatchable while volume 2 is still being swept"
+    );
+    assert!(
+        pipeline
+            .direct_demotion_in_flight
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains_key(&0)),
+        "with the ticket still open for the sibling"
+    );
+
+    assert_eq!(hand_back_next_swept_volume(&mut pipeline).await, Some(2));
+    assert_eq!(hand_back_next_swept_volume(&mut pipeline).await, None);
+    assert!(
+        pipeline.direct_demotion_in_flight.is_empty(),
+        "the finish retires the ticket"
+    );
+    assert!(
+        !direct_partial(&temp_dir, job_id, member_name).exists(),
+        "deletes the routed output"
+    );
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "and retires the coverage row"
+    );
+    assert_eq!(pipeline.demotion_sweep_held_file_indices(job_id), None);
 }
 
 #[tokio::test]
@@ -2624,7 +2749,7 @@ async fn a_malformed_chain_demotion_leaves_a_partial_crc_atom_provisional() {
                     destination_offset: start as u64,
                     volume_index: 1,
                     source_offset: start as u64,
-                    bytes: vec![0xA5; partial_len],
+                    bytes: vec![bytes::Bytes::from(vec![0xA5; partial_len])],
                 }],
                 std::time::Instant::now(),
             );
@@ -4435,5 +4560,76 @@ async fn damaged_article_waits_for_reconstruction_before_writing_and_retrying() 
     assert_eq!(
         std::fs::read(working_dir.join(&volumes[1].0)).unwrap(),
         bytes
+    );
+}
+
+/// Once nothing in a job's pipeline can move, a demoted volume that is still
+/// waiting is waiting for nothing.
+///
+/// The gate only ever asked *who owns this article*, never *can that owner
+/// still finish*. An owner that had been dropped — a retry whose carrier is
+/// gone, a handoff whose article never came back — therefore held the whole
+/// recovery set behind it, and the job sat in `Downloading` with every counter
+/// at zero until it was cancelled. With no sweep in flight, nothing queued, no
+/// download, decode, retry or released result outstanding, the missing
+/// articles are holes, and holes are what the recovery pass exists to read.
+#[tokio::test]
+async fn a_demoted_volume_owned_by_nothing_that_can_finish_is_settled_as_damaged() {
+    let member_name = "Copper.Meridian.S02E04.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41041);
+    let (mut pipeline, working_dir, _) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |_, working_dir| {
+            let envelope = working_dir.join("silver.horizon.f0.vol00000.envelope");
+            assert!(envelope.exists(), "the envelope must exist to be deleted");
+            std::fs::remove_file(&envelope).unwrap();
+        })
+        .await;
+    let _ = working_dir;
+
+    let missing = queued_segments(&mut pipeline, job_id);
+    assert!(
+        !missing.is_empty(),
+        "precondition: the refused volume has articles to account for"
+    );
+    let missing_ids = missing
+        .iter()
+        .map(|(file_index, segment_number)| SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: *file_index,
+            },
+            segment_number: *segment_number,
+        })
+        .collect::<Vec<_>>();
+
+    // A retry whose carrier is gone: the per-segment book still names an owner
+    // while the job's own counters say nothing is outstanding.
+    for segment_id in &missing_ids {
+        pipeline.pending_retries_by_segment.insert(*segment_id, 1);
+    }
+    let pending_before = pipeline.direct_store.pending_materialization_files(job_id);
+    assert_eq!(
+        pending_before,
+        volumes.len(),
+        "precondition: every demoted volume is still in the materialization account"
+    );
+
+    let set_id = par2_rs::RecoverySetId::from_bytes([41; 16]);
+    assert!(
+        pipeline.demoted_materializations_ready_for_par2(job_id, set_id),
+        "an owner that cannot finish must not hold the recovery set"
+    );
+    assert_eq!(
+        pipeline.direct_store.pending_materialization_files(job_id),
+        0,
+        "every demoted volume leaves the materialization account"
+    );
+    assert!(
+        pipeline.demoted_materializations_ready_for_par2(job_id, set_id),
+        "and the release is stable: nothing re-enters the account"
     );
 }

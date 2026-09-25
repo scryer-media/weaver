@@ -50,7 +50,8 @@ use tracing::{debug, info, warn};
 use super::barrier::{BarrierDemand, BarrierDrain, DatabaseCoveragePersist, DestinationSync};
 use super::plan::{DirectSetPlan, IdentityPlanFacts};
 use super::reconstruct::{ReconstructionFailure, VolumeReconstruction};
-use super::router::{DemotionReason, DirectDestination, RoutedSpan};
+use super::router::sevenz::SevenZipRefusal;
+use super::router::{DemotionReason, DirectDestination, HeaderProbe, RoutedSpan};
 use super::set::DirectSet;
 use super::sparse::SparseMarking;
 use super::{DirectStoreGate, DirectStoreSettings};
@@ -60,7 +61,7 @@ use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::pipeline::diagnostics::DirectSetCounts;
 use crate::pipeline::{
-    BufferedDecodedSegment, DecodedChunk, DirectDemotionWork, DirectDemotionWorkDone,
+    BufferedDecodedSegment, DirectDemotionProgress, DirectDemotionWork, DirectDemotionWorkDone,
     DirectPostRepairCarry, DirectPostRepairWork, DirectPostRepairWorkDone, DirectToleratedWork,
     DirectToleratedWorkDone, Pipeline,
 };
@@ -662,7 +663,7 @@ impl DestinationSync for PreSyncedDestinations {
 /// what actually says how much the demotion cost, because a volume count cannot
 /// tell a whole volume off the wire from one missing article.
 #[derive(Debug, Default)]
-struct ReconstructionSummary {
+pub(crate) struct ReconstructionSummary {
     /// Volumes that came out of the sweep with a verified contiguous prefix.
     materialized: usize,
     /// Volumes the sweep could not rebuild in full, and the first reason each
@@ -1531,6 +1532,7 @@ impl Pipeline {
             .map(|roster| roster.volumes.len() as u32)?;
         let plan = DirectSetPlan {
             set_name: set_name.clone(),
+            format: crate::pipeline::direct_store::plan::SetFormat::Rar,
             volumes: BTreeMap::from([(volume_index, file_index)]),
             files: HashMap::from([(file_index, volume_index)]),
             identity: Some(IdentityPlanFacts {
@@ -1890,6 +1892,7 @@ impl Pipeline {
             let password = state.spec.password.clone();
             let plan = DirectSetPlan {
                 set_name: format!("obfuscated-set.f{file_index}"),
+                format: crate::pipeline::direct_store::plan::SetFormat::Rar,
                 volumes: BTreeMap::from([(volume_number, file_index)]),
                 files: HashMap::from([(file_index, volume_number)]),
                 identity: Some(IdentityPlanFacts {
@@ -1943,6 +1946,7 @@ impl Pipeline {
         let password = state.spec.password.clone();
         let plan = DirectSetPlan {
             set_name: format!("obfuscated-archive.f{file_index}"),
+            format: crate::pipeline::direct_store::plan::SetFormat::Rar,
             volumes: BTreeMap::from([(0, file_index)]),
             files: HashMap::from([(file_index, 0)]),
             identity: Some(IdentityPlanFacts {
@@ -2004,8 +2008,15 @@ impl Pipeline {
             for (offset, segment) in parked {
                 let segment_number = segment.segment_id.segment_number;
                 let decoded_size = segment.decoded_size;
+                let declared_file_len = segment.declared_file_len;
                 match self
-                    .handle_direct_decode_success(set_index, volume_index, segment, offset)
+                    .handle_direct_decode_success(
+                        set_index,
+                        volume_index,
+                        segment,
+                        offset,
+                        declared_file_len,
+                    )
                     .await
                 {
                     DirectRouteOutcome::Routed => {
@@ -2026,13 +2037,9 @@ impl Pipeline {
                         {
                             file.record_placement(segment_number, offset, decoded_size);
                         }
-                        let max_pending = self.write_buf_max_pending;
-                        let buffer = self
-                            .write_buffers
-                            .entry(file_id)
-                            .or_insert_with(|| WriteReorderBuffer::new(max_pending));
                         let len = segment.len_bytes();
-                        buffer.insert(offset, segment);
+                        self.write_buffer_for_article(file_id, segment_number, offset)
+                            .insert(offset, segment);
                         self.note_write_buffered(len, 1);
                     }
                 }
@@ -2313,6 +2320,105 @@ impl Pipeline {
         }
     }
 
+    /// Ends the wait of a container set whose map will never be read.
+    ///
+    /// A 7z set resolves its layout from two ends — volume zero's front, which
+    /// states the part size and carries the start header, and the tail, which
+    /// carries the map. Whichever of those is missing, the symptom is one and
+    /// the same: a parse that is not settled, with no article left anywhere in
+    /// the set that could settle it. The probe planner asks for nothing it
+    /// cannot get, so the gate stays shut with no request outstanding to
+    /// reopen it. On a set large enough to reach them the holds ceilings would
+    /// eventually end it; on a small one nothing would, and the job would sit
+    /// at its last article forever.
+    ///
+    /// Judged for the whole set rather than per volume, because that is the
+    /// shape of the question: nothing outstanding anywhere means nothing can
+    /// change the parse, whether what is missing is volume zero, a volume in
+    /// the middle or the tail.
+    ///
+    /// The verdict is the demotion the set would have reached the slow way. Its
+    /// volumes materialize and the conventional path takes them, which is also
+    /// where the missing articles become a repair the recovery set can answer.
+    ///
+    /// Judged against the same evidence the probe planner admits on, and one
+    /// conservative addition: a released lane result is attributable only to
+    /// the job, so while any is outstanding nothing is called unreachable — the
+    /// article it answers may be the one that would have settled the parse.
+    pub(crate) async fn demote_direct_sets_with_an_unreadable_map(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if self
+            .pending_released_download_result_bytes_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            != 0
+        {
+            return;
+        }
+        let stranded: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                set.plan().format == super::plan::SetFormat::SevenZip
+                    && !set.is_demoted()
+                    && !set.is_finalized()
+                    && matches!(set.header_probe(), HeaderProbe::Container { .. })
+            })
+            .filter(|(_, set)| {
+                set.plan().volumes.values().all(|file_index| {
+                    let file_id = NzbFileId {
+                        job_id,
+                        file_index: *file_index,
+                    };
+                    let queued = state.download_queue.queued_count_for_file(file_id) != 0;
+                    let retrying = self
+                        .pending_retries_by_segment
+                        .iter()
+                        .any(|(id, count)| id.file_id == file_id && *count != 0);
+                    let downloading = self
+                        .active_downloads_by_file
+                        .get(&file_id)
+                        .is_some_and(|count| *count != 0);
+                    let decoding = self
+                        .active_decodes_by_file
+                        .get(&file_id)
+                        .is_some_and(|count| *count != 0);
+                    let reserved = self
+                        .rate_limit_reservations
+                        .keys()
+                        .any(|segment| segment.file_id == file_id);
+                    let awaiting_decode = self
+                        .active_decode_bytes
+                        .keys()
+                        .any(|segment| segment.file_id == file_id)
+                        || self
+                            .pending_decode
+                            .iter()
+                            .any(|work| work.segment_id.file_id == file_id);
+                    !(queued || retrying || downloading || decoding || reserved || awaiting_decode)
+                })
+            })
+            .map(|(set_index, _)| set_index)
+            .collect();
+        for set_index in stranded {
+            warn!(
+                job_id = job_id.0,
+                set_index, "a container map will never be read"
+            );
+            self.demote_direct_set(
+                job_id,
+                set_index,
+                DemotionReason::SevenZip(SevenZipRefusal::UnreadableMap),
+            )
+            .await;
+        }
+    }
+
     /// Re-reads the job's password into every set still willing to take one.
     ///
     /// The reason this exists at all: **weaver does support setting a password
@@ -2554,10 +2660,4 @@ fn read_restart_seeded_runs(
         checksums.push(hasher.finalize() as u32);
     }
     Ok(checksums)
-}
-
-fn contiguous_bytes(data: &DecodedChunk) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len_bytes());
-    data.for_each_slice(|slice| out.extend_from_slice(slice));
-    out
 }

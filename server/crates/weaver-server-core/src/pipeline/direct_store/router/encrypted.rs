@@ -4,6 +4,61 @@
 
 use super::*;
 
+/// One decrypted run of an encrypted member, ready to route.
+///
+/// The ciphertext is deliberately absent. Layer 1 hashes cipher bytes and the
+/// envelope keeps the tail padding's ciphertext, and both are taken here, at
+/// construction, so nothing downstream needs the buffer the transform is about
+/// to overwrite. A span's plaintext can then live in the very buffer staging
+/// produced, which is what keeps an encrypted member's per-article cost at the
+/// one allocation and the one pass a plain member already pays.
+struct DecryptedPiece {
+    /// Member-logical (== cipher) offset of the run's first byte.
+    start: u64,
+    /// Layer 1's value over the run's ciphertext.
+    cipher_crc: u32,
+    /// The run's length in both byte spaces; plaintext is the same size.
+    cipher_len: u64,
+    /// Ciphertext of the bytes at or past the declared size — the tail
+    /// padding, under one AES block, and empty for every other run.
+    padding_cipher: Vec<u8>,
+    /// The run's plaintext, and the span's buffer once the gates have read it.
+    plain: Vec<u8>,
+}
+
+impl DecryptedPiece {
+    /// A run whose plaintext was resolved elsewhere — an edge block held by
+    /// the member's retained plaintext, at most one AES block wide.
+    fn new(start: u64, cipher: &[u8], plain: Vec<u8>, unpacked_size: u64) -> Self {
+        debug_assert_eq!(cipher.len(), plain.len());
+        Self {
+            start,
+            cipher_crc: par2_rs::checksum::crc32(cipher),
+            cipher_len: cipher.len() as u64,
+            padding_cipher: padding_cipher(start, cipher, unpacked_size),
+            plain,
+        }
+    }
+
+    /// A run still holding its ciphertext, for a caller that will decrypt
+    /// [`Self::plain`] in place.
+    fn from_cipher(start: u64, cipher: Vec<u8>, unpacked_size: u64) -> Self {
+        Self {
+            start,
+            cipher_crc: par2_rs::checksum::crc32(&cipher),
+            cipher_len: cipher.len() as u64,
+            padding_cipher: padding_cipher(start, &cipher, unpacked_size),
+            plain: cipher,
+        }
+    }
+}
+
+/// The ciphertext of `cipher`'s bytes at or past `unpacked_size`.
+fn padding_cipher(start: u64, cipher: &[u8], unpacked_size: u64) -> Vec<u8> {
+    let destination_len = unpacked_size.saturating_sub(start).min(cipher.len() as u64) as usize;
+    cipher[destination_len..].to_vec()
+}
+
 impl DirectSetRouter {
     // ---- Encrypted members: decrypt at write -------------------------------
 
@@ -109,48 +164,85 @@ impl DirectSetRouter {
             && head_block != Some(block_floor(slice_end)))
         .then(|| block_floor(slice_end));
 
-        // `(cipher offset, cipher bytes, plaintext bytes)`, ascending.
-        let mut pieces: Vec<(u64, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut pieces: Vec<DecryptedPiece> = Vec::new();
         let mut held = false;
 
         for edge in [head_block, tail_block].into_iter().flatten() {
             let from = logical_offset.max(edge);
             let to = slice_end.min(edge.saturating_add(AES_BLOCK));
-            let block = self.encrypted_block_plain(member_id, edge);
-            let cipher =
-                self.staged_bytes_at(volume_index, cursor + (from - logical_offset), to - from);
-            match (block, cipher) {
-                (Some(block), Some(cipher)) => {
-                    let plain = block[(from - edge) as usize..(to - edge) as usize].to_vec();
-                    pieces.push((from, cipher, plain));
-                }
-                _ => held = true,
-            }
+            // The block's plaintext first: an edge block whose other half has
+            // not arrived is a hold, and pulling this span's share of it out of
+            // staging before knowing that is a copy made only to be dropped.
+            let Some(block) = self.encrypted_block_plain(member_id, edge) else {
+                held = true;
+                continue;
+            };
+            let Some(cipher) =
+                self.staged_bytes_at(volume_index, cursor + (from - logical_offset), to - from)
+            else {
+                held = true;
+                continue;
+            };
+            let plain = block[(from - edge) as usize..(to - edge) as usize].to_vec();
+            pieces.push(DecryptedPiece::new(from, &cipher, plain, unpacked_size));
         }
 
         if mid_start < mid_end {
-            let preceding = self.member_preceding_block(member_id, mid_start);
-            let cipher = self.staged_bytes_at(
-                volume_index,
-                cursor + (mid_start - logical_offset),
-                mid_end - mid_start,
-            );
-            match (preceding, cipher) {
-                (Some(preceding), Some(cipher)) => {
-                    let mut plain = cipher.clone();
-                    let decrypted = self
+            // The CBC predecessor before anything else, always. It is a
+            // checkpoint lookup or a sixteen-byte read, while the run behind it
+            // is up to a whole volume; deciding the hold after materializing
+            // the run would copy megabytes out of staging only to throw the
+            // copy away, and would do it again on the next drain, and the next,
+            // for as long as the gap in front of the run lasts.
+            match self.member_preceding_block(member_id, mid_start) {
+                None => {
+                    if let Some(crypt) = self
                         .member_mut(member_id)
                         .and_then(|member| member.crypt.as_mut())
-                        .is_some_and(|crypt| {
-                            crypt.decrypt_range(mid_start, &preceding, &mut plain)
-                        });
-                    if decrypted {
-                        pieces.push((mid_start, cipher, plain));
-                    } else {
-                        held = true;
+                    {
+                        crypt.note_blocked_predecessor(mid_start.saturating_sub(AES_BLOCK));
+                    }
+                    held = true;
+                }
+                Some(preceding) => {
+                    match self.staged_bytes_at(
+                        volume_index,
+                        cursor + (mid_start - logical_offset),
+                        mid_end - mid_start,
+                    ) {
+                        None => held = true,
+                        Some(cipher) => {
+                            // Everything the ciphertext is still needed for is
+                            // taken before the transform, so the aligned middle
+                            // — all but a few bytes of a normal span —
+                            // decrypts **in place** in the buffer staging just
+                            // handed over. Keeping a second copy for the gates
+                            // would allocate and touch the whole span a second
+                            // time, on every article of every encrypted member.
+                            let mut piece =
+                                DecryptedPiece::from_cipher(mid_start, cipher, unpacked_size);
+                            let decrypted = self
+                                .member_mut(member_id)
+                                .and_then(|member| member.crypt.as_mut())
+                                .is_some_and(|crypt| {
+                                    let decrypted = crypt.decrypt_range(
+                                        mid_start,
+                                        &preceding,
+                                        &mut piece.plain,
+                                    );
+                                    if decrypted {
+                                        crypt.clear_blocked_predecessor();
+                                    }
+                                    decrypted
+                                });
+                            if decrypted {
+                                pieces.push(piece);
+                            } else {
+                                held = true;
+                            }
+                        }
                     }
                 }
-                _ => held = true,
             }
         }
 
@@ -168,10 +260,16 @@ impl DirectSetRouter {
                 std::time::Duration::from_nanos(1),
             );
         }
-        pieces.sort_by_key(|(start, _, _)| *start);
-        for (start, cipher, plain) in pieces {
+        pieces.sort_by_key(|piece| piece.start);
+        for piece in pieces {
+            let DecryptedPiece {
+                start,
+                cipher_crc,
+                cipher_len: piece_len,
+                padding_cipher,
+                plain,
+            } = piece;
             let physical = cursor + (start - logical_offset);
-            let piece_len = cipher.len() as u64;
             // Everything at or past the declared size is tail padding: real
             // cipher, never a destination byte.
             let destination_len = unpacked_size.saturating_sub(start).min(piece_len);
@@ -179,11 +277,16 @@ impl DirectSetRouter {
                 member_id,
                 volume_index,
                 start,
-                &cipher,
+                cipher_crc,
+                piece_len,
                 &plain,
                 unpacked_size,
                 replace,
             )?;
+            // The decrypt already produced this buffer; adopting it is what
+            // keeps the encrypted path's one unavoidable pass — the decryption
+            // itself — from becoming two.
+            let plain = Bytes::from(plain);
             if destination_len > 0 {
                 self.record_routed_extent(
                     volume_index,
@@ -199,7 +302,7 @@ impl DirectSetRouter {
                     destination_offset: start,
                     volume_index,
                     source_offset: physical,
-                    bytes: plain[..destination_len as usize].to_vec(),
+                    bytes: vec![plain.slice(..destination_len as usize)],
                 });
             }
             // The tail padding's **source** bytes. Their plaintext is never a
@@ -216,7 +319,7 @@ impl DirectSetRouter {
                     destination_offset: physical + destination_len,
                     volume_index,
                     source_offset: physical + destination_len,
-                    bytes: cipher[destination_len as usize..].to_vec(),
+                    bytes: vec![Bytes::from(padding_cipher)],
                 });
             }
             routed.push((physical, piece_len));
@@ -279,6 +382,105 @@ impl DirectSetRouter {
         self.member_cipher(member_id, previous, AES_BLOCK)?
             .try_into()
             .ok()
+    }
+
+    /// Whether this slice of an encrypted member is still waiting on a CBC
+    /// predecessor that has not arrived.
+    ///
+    /// The drain of a set runs over every staged volume on every article that
+    /// lands, so a run sitting behind a gap would otherwise be re-resolved —
+    /// and, before the ordering fix above, re-copied — once per arrival
+    /// anywhere in the set. The question is asked of *this* run and no other:
+    /// a member can have one run blocked and another perfectly routable, and a
+    /// repaired span landing past a gap is exactly that case.
+    ///
+    /// The member-wide marker is only a short-circuit, so a set with no gap at
+    /// all pays nothing for this. The check behind it is a checkpoint lookup
+    /// and a staged-range membership test, and reads no bytes.
+    pub(super) fn encrypted_slice_is_blocked(
+        &self,
+        member_index: usize,
+        logical_offset: u64,
+        len: u64,
+    ) -> bool {
+        let Some(member_id) = self.member_id_for_layout(member_index) else {
+            return false;
+        };
+        let blocked = self
+            .members
+            .get(&member_id)
+            .and_then(|member| member.crypt.as_ref())
+            .and_then(MemberCrypt::blocked_predecessor)
+            .is_some();
+        if !blocked {
+            return false;
+        }
+        // Only the aligned middle is held for a predecessor; a slice with none
+        // carries edge blocks alone, which resolve against their own retained
+        // plaintext.
+        let mid_start = block_ceil(logical_offset);
+        let mid_end = block_floor(logical_offset.saturating_add(len));
+        mid_start < mid_end && !self.member_preceding_block_is_available(member_id, mid_start)
+    }
+
+    /// [`Self::member_preceding_block`]'s question without its answer: whether
+    /// the sixteen cipher bytes before `block_start` are in hand, decided
+    /// without copying them.
+    fn member_preceding_block_is_available(&self, member_id: u32, block_start: u64) -> bool {
+        if self
+            .members
+            .get(&member_id)
+            .and_then(|member| member.crypt.as_ref())
+            .and_then(|crypt| crypt.preceding_block(block_start))
+            .is_some()
+        {
+            return true;
+        }
+        let Some(previous) = block_start.checked_sub(AES_BLOCK) else {
+            return false;
+        };
+        self.member_cipher_is_staged(member_id, previous, AES_BLOCK)
+    }
+
+    /// [`Self::member_cipher`]'s walk over the part table, asking each source
+    /// volume whether it holds the bytes instead of taking them.
+    fn member_cipher_is_staged(&self, member_id: u32, logical_offset: u64, len: u64) -> bool {
+        let Some(member) = self
+            .layout_index_for_member(member_id)
+            .and_then(|index| self.layout_members().get(index))
+        else {
+            return false;
+        };
+        let Some(end) = logical_offset.checked_add(len) else {
+            return false;
+        };
+        let mut cursor = logical_offset;
+        while cursor < end {
+            let mut located = None;
+            for part in &member.parts {
+                let Some(start) = part.logical_offset else {
+                    continue;
+                };
+                let part_end = start.saturating_add(part.data_size);
+                if cursor >= start && cursor < part_end {
+                    located = Some((part.volume, part.data_offset + (cursor - start), part_end));
+                    break;
+                }
+            }
+            let Some((volume, physical, part_end)) = located else {
+                return false;
+            };
+            let take = (part_end - cursor).min(end - cursor);
+            let staged = self
+                .staging
+                .get(&volume)
+                .is_some_and(|staging| staging.holds(physical, take));
+            if !staged {
+                return false;
+            }
+            cursor += take;
+        }
+        true
     }
 
     /// CBC neighbours for complete replacement images, including part bytes
@@ -387,9 +589,16 @@ impl DirectSetRouter {
         if len == 0 {
             return Some(Vec::new());
         }
-        self.staging
+        let bytes = self
+            .staging
             .get(&volume_index)
-            .and_then(|staging| staging.slice(offset, len, &self.scratch))
+            .and_then(|staging| staging.slice_contiguous(offset, len, &self.scratch));
+        #[cfg(test)]
+        if let Some(bytes) = bytes.as_ref() {
+            self.staged_copy_bytes
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        bytes
     }
 
     /// Feeds one decrypted run into the integrity gates.
@@ -411,12 +620,13 @@ impl DirectSetRouter {
         member_id: u32,
         volume_index: u32,
         cipher_offset: u64,
-        cipher: &[u8],
+        cipher_crc: u32,
+        cipher_len: u64,
         plain: &[u8],
         unpacked_size: u64,
         replace: bool,
     ) -> Result<(), DemotionReason> {
-        let len = cipher.len() as u64;
+        let len = cipher_len;
         if len == 0 {
             return Ok(());
         }
@@ -443,7 +653,6 @@ impl DirectSetRouter {
         }
         crypt.retain_tail_padding(unpacked_size, cipher_offset, plain);
         let destination_len = unpacked_size.saturating_sub(cipher_offset).min(len);
-        let cipher_crc = par2_rs::checksum::crc32(cipher);
         let part_relative = cipher_offset.saturating_sub(part_logical_offset);
         if destination_len > 0 {
             let plain_crc = par2_rs::checksum::crc32(&plain[..destination_len as usize]);
@@ -650,8 +859,50 @@ impl DirectSetRouter {
             return Ok(());
         }
         let Some(expected) = layout_member.data_crc32 else {
-            // The chain closed with no whole-member CRC32, which the layout
-            // reports as `Ineligible`; `check_eligibility` owns that demotion.
+            // Two different situations share this arm, and the layout's own
+            // classification separates them.
+            //
+            // For RAR, a chain that closes with no whole-member CRC32 is
+            // `Ineligible`, and `check_eligibility` owns that demotion — so
+            // returning here leaves the member unverified for a set that is
+            // already on its way out.
+            //
+            // For 7z it is an ordinary archive. Checksums there are per
+            // sub-stream and optional, and an archive written without them is
+            // not malformed; the layout classifies such a member
+            // `DirectEligible` because the coder gate has already established
+            // that its packed bytes are its output bytes. What stands in for
+            // the composed CRC32 is the only other evidence there is: full
+            // coverage of the declared size, and — when the job posts a
+            // recovery set — that set's verdict, which the finalization gate
+            // waits for before any member is published.
+            if !self.member_checksums_are_optional() {
+                return Ok(());
+            }
+            let unpacked_size = layout_member.unpacked_size.unwrap_or(0);
+            let covered = self
+                .members
+                .get(&member_id)
+                .is_some_and(|member| member.covered.contiguous_from_zero() >= unpacked_size);
+            if !covered {
+                return Ok(());
+            }
+            if let Some(member) = self.member_mut(member_id) {
+                member.verified = true;
+            }
+            crate::runtime::perf_probe::record(
+                "direct_store.sevenz.member_unchecked",
+                std::time::Duration::from_nanos(1),
+            );
+            if !self.par2_available {
+                // Nothing will ever vouch for these bytes beyond the wire's own
+                // yEnc CRC32s. Worth counting: it is the one shape where direct
+                // routing publishes a member on transport evidence alone.
+                crate::runtime::perf_probe::record(
+                    "direct_store.sevenz.set_unchecked_no_par2",
+                    std::time::Duration::from_nanos(1),
+                );
+            }
             return Ok(());
         };
         let part_lengths: Vec<u64> = layout_member

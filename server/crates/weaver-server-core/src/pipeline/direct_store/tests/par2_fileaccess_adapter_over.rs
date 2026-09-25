@@ -10,6 +10,7 @@
 //! Snapshot schema 4: the crypt row
 //! The member tolerance's kind gate
 //! What a demoted set's consumers need under it
+//! A cipher block straddling a held neighbour
 
 use super::*;
 
@@ -1131,7 +1132,7 @@ fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() 
         .drain_for_test(0)
         .expect("the straddling drain routes");
     assert_eq!(
-        spans.iter().map(|span| span.bytes.len()).sum::<usize>(),
+        spans.iter().map(|span| span.len()).sum::<u64>(),
         300,
         "both halves must still reach the member's partial — the bug was never \
          about the bytes, only about what the composition then claims about them"
@@ -1194,7 +1195,7 @@ fn bounded_stale_gap_reads_make_progress_without_a_whole_plan() {
     router
         .route_repaired_batch(
             0,
-            &[(64 + 200, Arc::from(&repaired[200..]))],
+            &[(64 + 200, bytes::Bytes::copy_from_slice(&repaired[200..]))],
             &[],
             false,
             true,
@@ -1237,7 +1238,13 @@ fn unread_stale_gap_cannot_release_a_replacement_transaction() {
     router.drain_for_test(0).unwrap();
     router.begin_repair_transaction(vec![0]).unwrap();
     router
-        .route_repaired_batch(0, &[(264, Arc::from(&bytes[200..]))], &[], false, true)
+        .route_repaired_batch(
+            0,
+            &[(264, bytes::Bytes::copy_from_slice(&bytes[200..]))],
+            &[],
+            false,
+            true,
+        )
         .unwrap();
     assert!(router.has_stale_gaps());
     assert_eq!(
@@ -2198,5 +2205,86 @@ fn every_demotion_reason_states_what_its_consumers_need() {
     assert_eq!(
         total, 45,
         "a demotion reason was added or retired; classify it above and update this count"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A cipher block straddling a held neighbour
+// ---------------------------------------------------------------------------
+
+/// A one-member volume claiming `[claimed_from, len)`, over a partial that holds
+/// the member's plaintext everywhere except `[hole_start, hole_end)`, which
+/// reads back as zeros the way a sparse partial does.
+fn straddling_volume(
+    dir: &Path,
+    plain: &[u8],
+    facts: crate::pipeline::direct_store::router::crypt::MemberCipher,
+    hole: (usize, usize),
+    claimed_from: u64,
+) -> crate::pipeline::direct_store::provider::VirtualVolume {
+    let mut partial_bytes = plain.to_vec();
+    partial_bytes[hole.0..hole.1].fill(0);
+    let mut volume = cipher_volume(dir, &partial_bytes, facts, plain.len() as u64);
+    let mut covered = ByteRanges::new();
+    covered.insert(claimed_from, plain.len() as u64 - claimed_from);
+    volume.covered = covered;
+    volume
+}
+
+#[test]
+fn a_block_straddling_a_held_neighbour_re_encrypts_from_the_carried_plaintext() {
+    // A block whose leading bytes belong to a volume that is held and whose
+    // trailing bytes this volume placed. The drain that resolved it kept its
+    // plaintext, because the held share never reaches the partial; serving the
+    // placed share in posted space means re-encrypting the whole block, so the
+    // overlay has to take the held share from that plaintext.
+    let dir = tempfile::tempdir().unwrap();
+    let (posted, plain, mut crypt, _) = encrypted_member_facts(3000, 256);
+    let block = 1024usize;
+    let boundary = block + 5;
+    let mut partial_coverage = ByteRanges::new();
+    partial_coverage.insert(0, block as u64);
+    partial_coverage.insert(boundary as u64, (plain.len() - boundary) as u64);
+
+    let read_from_boundary = |facts: crate::pipeline::direct_store::router::crypt::MemberCipher| {
+        let provider = super::super::provider::HybridVolumeProvider::new(vec![straddling_volume(
+            dir.path(),
+            &plain,
+            facts,
+            (block, boundary),
+            boundary as u64,
+        )]);
+        let mut reader = provider.open(0).expect("registered");
+        std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(boundary as u64)).unwrap();
+        let mut got = vec![0u8; 64];
+        std::io::Read::read_exact(&mut reader, &mut got).map(|()| got)
+    };
+
+    // Non-vacuity: with nothing carried, the placed share is refused rather
+    // than re-encrypted over the zeros the partial reads back in the gap.
+    let without = crypt
+        .cipher_facts(plain.len() as u64, &partial_coverage)
+        .expect("a sized member has read-side facts");
+    assert!(!without.plaintext_present(block as u64, (block + 16) as u64));
+    assert!(
+        read_from_boundary(without).is_err(),
+        "a block whose held share is in neither the partial nor a carried block \
+         must refuse"
+    );
+
+    crypt.retain_edge(
+        block as u64,
+        plain[block..block + 16].try_into().expect("one block"),
+    );
+    let with = crypt
+        .cipher_facts(plain.len() as u64, &partial_coverage)
+        .expect("a sized member has read-side facts");
+    assert!(with.has_edge_block(block as u64));
+    assert!(with.plaintext_present(block as u64, (block + 16) as u64));
+    assert_eq!(
+        read_from_boundary(with).expect("the placed share must read"),
+        posted[boundary..boundary + 64],
+        "the placed share must be the posted cipher, re-encrypted from the \
+         carried plaintext rather than from the zeros in the gap"
     );
 }

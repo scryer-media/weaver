@@ -27,21 +27,49 @@ impl DirectSetRouter {
     /// a fact costs a redownload of that set on the next restart, never a wrong
     /// restore, because the checkpoint's plan digest is computed from the same
     /// facts and a missing one cannot reproduce it.
-    pub(crate) fn take_dirty_facts(&mut self) -> Vec<(u32, RarVolumeFacts)> {
+    pub(crate) fn take_dirty_facts(&mut self) -> Vec<(u32, DirectVolumeFacts)> {
         let dirty = std::mem::take(&mut self.dirty_facts);
+        if self.plan.format == SetFormat::SevenZip {
+            // The container map goes on volume zero's row and the per-volume
+            // lengths on every row. Which row carries the map is arbitrary —
+            // it describes the whole concatenation — and volume zero is the one
+            // row a set that has any volumes at all is guaranteed to have.
+            return dirty
+                .into_iter()
+                .filter_map(|volume_index| {
+                    let declared_len = self.declared_volume_sizes.get(&volume_index).copied()?;
+                    Some((
+                        volume_index,
+                        DirectVolumeFacts::SevenZip(Box::new(SevenZipVolumeFacts {
+                            declared_len,
+                            container: (volume_index == 0)
+                                .then(|| self.sevenz_facts.clone())
+                                .flatten(),
+                        })),
+                    ))
+                })
+                .collect();
+        }
         dirty
             .into_iter()
             .filter_map(|volume_index| {
-                self.volume_facts
-                    .get(&volume_index)
-                    .map(|facts| (volume_index, facts.clone()))
+                self.volume_facts.get(&volume_index).map(|facts| {
+                    (
+                        volume_index,
+                        DirectVolumeFacts::Rar(Box::new(facts.clone())),
+                    )
+                })
             })
             .collect()
     }
 
     /// Puts a volume back in the dirty set after a failed cache write.
     pub(crate) fn remark_dirty_fact(&mut self, volume_index: u32) {
-        if self.volume_facts.contains_key(&volume_index) {
+        let have = match self.plan.format {
+            SetFormat::Rar => self.volume_facts.contains_key(&volume_index),
+            SetFormat::SevenZip => self.declared_volume_sizes.contains_key(&volume_index),
+        };
+        if have {
             self.dirty_facts.insert(volume_index);
         }
     }
@@ -56,9 +84,18 @@ impl DirectSetRouter {
     /// than after its first refetched article.
     pub(crate) fn restore_layout(
         &mut self,
-        facts: &BTreeMap<u32, RarVolumeFacts>,
+        facts: &BTreeMap<u32, DirectVolumeFacts>,
     ) -> Result<(), DemotionReason> {
+        if self.plan.format == SetFormat::SevenZip {
+            return self.restore_sevenz_layout(facts);
+        }
         for (volume_index, volume_facts) in facts {
+            let DirectVolumeFacts::Rar(volume_facts) = volume_facts else {
+                // A 7z row under a RAR plan: the job's spec and the cache
+                // describe different archives, which is the same evidence
+                // disagreement a conflicting re-parse is.
+                return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+            };
             if !self.plan.volumes.contains_key(volume_index) {
                 // The row names a volume this job no longer plans. Refusing is
                 // the same stance the checkpoint reader takes on an unknown set.
@@ -69,12 +106,13 @@ impl DirectSetRouter {
                 if !matches!(format, ArchiveFormat::Rar4 | ArchiveFormat::Rar5) {
                     return Err(self.fail(DemotionReason::UnsupportedFormat));
                 }
-                self.layout = Some(StoredLayoutBuilder::new(format));
+                self.layout = Some(SetLayout::Rar(StoredLayoutBuilder::new(format)));
             }
             let added = self
                 .layout
                 .as_mut()
-                .expect("the layout was bound above")
+                .and_then(SetLayout::rar_mut)
+                .expect("the RAR layout was bound above")
                 .add_volume(*volume_index, volume_facts);
             match added {
                 Ok(()) => {}
@@ -86,7 +124,7 @@ impl DirectSetRouter {
                 }
             }
             self.volume_facts
-                .insert(*volume_index, volume_facts.clone());
+                .insert(*volume_index, (**volume_facts).clone());
             self.member_order_stale = true;
         }
         if self.layout.is_none() {
@@ -95,6 +133,55 @@ impl DirectSetRouter {
         self.sync_members()?;
         self.check_eligibility()?;
         Ok(())
+    }
+
+    /// Rebuilds a 7z set's layout from its cached container map.
+    ///
+    /// There is no re-parse here and there deliberately is not one: the header
+    /// bytes sit below the published floors, so they are never refetched, and
+    /// re-reading them out of the envelopes would make restart depend on a file
+    /// whose bytes a demotion is free to have taken away. The map the live
+    /// parse produced is cached instead, and this re-resolves it against the
+    /// same volume lengths it was resolved against before — which are cached on
+    /// the same rows, so the two halves cannot drift apart.
+    fn restore_sevenz_layout(
+        &mut self,
+        facts: &BTreeMap<u32, DirectVolumeFacts>,
+    ) -> Result<(), DemotionReason> {
+        let mut container = None;
+        for (volume_index, volume_facts) in facts {
+            let DirectVolumeFacts::SevenZip(volume_facts) = volume_facts else {
+                return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+            };
+            if !self.plan.volumes.contains_key(volume_index) {
+                return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+            }
+            self.declared_volume_sizes
+                .insert(*volume_index, volume_facts.declared_len);
+            if let Some(cached) = volume_facts.container.clone()
+                && container.replace(cached).is_some()
+            {
+                // Two rows claiming to describe the whole container. One
+                // writer put the map on one row, so this is not a shape this
+                // subsystem ever produced.
+                return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+            }
+        }
+        let Some(container) = container else {
+            // Lengths but no map: the set was cached before its end header
+            // arrived. Nothing to restore, and the ordinary parse runs again
+            // over the refetched tail.
+            return Ok(());
+        };
+        // The geometry is the part size and the total, and both come back off
+        // these rows: volume zero's cached length is the one, the map's own
+        // cached total is the other. A set missing either restores nothing
+        // rather than a layout whose boundaries are guesses, and parses again
+        // over its refetched front and tail.
+        if !self.declared_volume_sizes.contains_key(&0) || container.total == 0 {
+            return Ok(());
+        }
+        self.adopt_container_facts(container)
     }
 
     /// Seeds one member's coverage from a checkpoint's destination claim.
@@ -172,13 +259,21 @@ impl DirectSetRouter {
         decoded_len: Option<u64>,
     ) {
         let source_complete = decoded_len.is_some();
-        let confirmed = restored_volume_is_confirmed(
-            covered,
-            decoded_len,
-            self.volume_facts
-                .get(&volume_index)
-                .is_some_and(|facts| facts.more_volumes),
-        );
+        // A container has one map for every volume, so a restored layout is
+        // the confirmation — there is no per-volume walk that could have
+        // stopped short, and the derivation below reads facts a 7z set does
+        // not keep. A set whose map did not come back has no layout, and its
+        // volumes stay unconfirmed until the refetched tail parses.
+        let confirmed = match self.plan.format {
+            SetFormat::SevenZip => self.layout.is_some(),
+            SetFormat::Rar => restored_volume_is_confirmed(
+                covered,
+                decoded_len,
+                self.volume_facts
+                    .get(&volume_index)
+                    .is_some_and(|facts| facts.more_volumes),
+            ),
+        };
         let tail_base = self
             .volume_facts
             .get(&volume_index)
@@ -347,8 +442,17 @@ impl DirectSetRouter {
     /// The volumes the router holds parsed facts for — the volumes whose bytes
     /// it can classify. The restore seam validates a checkpoint's claims
     /// against this.
+    ///
+    /// What "facts" means is per format, and it is the same split
+    /// [`Self::remark_dirty_fact`] makes: a RAR volume's facts are its own
+    /// parsed headers, while a container volume's are the declared length that
+    /// places it in the concatenation — the map itself is one container-wide
+    /// fact and says nothing about which volumes have been seen.
     pub(crate) fn fact_volumes(&self) -> std::collections::HashSet<u32> {
-        self.volume_facts.keys().copied().collect()
+        match self.plan.format {
+            SetFormat::Rar => self.volume_facts.keys().copied().collect(),
+            SetFormat::SevenZip => self.declared_volume_sizes.keys().copied().collect(),
+        }
     }
 
     /// Whether any member is still carrying restart-seeded, unverified coverage.
@@ -810,8 +914,8 @@ impl DirectSetRouter {
                 let inside = start - chunk_start;
                 let len = end - start;
                 let run = match chunk {
-                    StagedChunk::Memory(bytes) => {
-                        HeldRun::memory(start, std::sync::Arc::clone(bytes), inside, len)
+                    StagedChunk::Memory { bytes, .. } => {
+                        HeldRun::memory(start, bytes.clone(), inside, len)
                     }
                     StagedChunk::Scratch { offset, .. } => {
                         // A scratch chunk with no image to pin cannot happen —

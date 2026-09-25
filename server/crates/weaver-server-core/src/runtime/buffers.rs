@@ -264,6 +264,16 @@ impl BufferPool {
         }
     }
 
+    /// Whether a tier is close to running out: a quarter or less of its
+    /// slots are free. Readers that can trade a copy for a slot — the direct
+    /// store copying a hold out of the decoder buffer it arrived in — do so
+    /// when this is true, so that slots pinned by long-lived holds come back
+    /// before decoding falls through to fresh allocations.
+    pub fn is_scarce(&self, tier: BufferTier) -> bool {
+        let tp = self.tier_pool(tier);
+        self.available(tier).saturating_mul(4) <= tp.total
+    }
+
     /// Number of available (not in use) buffers for a tier.
     pub fn available(&self, tier: BufferTier) -> usize {
         let tp = self.tier_pool(tier);
@@ -369,6 +379,19 @@ impl BufferHandle {
     /// The tier this buffer belongs to.
     pub fn tier(&self) -> BufferTier {
         self.inner.tier
+    }
+}
+
+/// Lets a decoded slot be handed out as a refcounted byte view without a copy:
+/// the view owns a clone of this handle, so the slot returns to the pool when
+/// the last view of it drops rather than when the decoder is finished.
+///
+/// The valid length is fixed before the handle leaves the decoder — the only
+/// writer is the sole owner, which `as_mut_slice` enforces — so every call here
+/// answers the same bytes.
+impl AsRef<[u8]> for BufferHandle {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 

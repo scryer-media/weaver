@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -175,6 +176,8 @@ func waitForWeaverPostgresReady(timeout time.Duration) error {
 }
 
 func resetWeaverPostgresDatabase() error {
+	// A fresh schema starts a fresh phase: nothing may carry a connection over.
+	closeSharedWeaverPostgresDB()
 	db, err := openWeaverPostgresDB()
 	if err != nil {
 		return err
@@ -207,10 +210,58 @@ func weaverStateDBAvailable(sqlitePath string) (bool, error) {
 	return true, nil
 }
 
+// sharedWeaverPostgres is the one pool every state assertion in this process
+// reads the weaver Postgres database through. Each connection costs a TLS
+// handshake, so opening a pool per assertion paid that handshake on nearly
+// every query. A phase runs in its own process, so this is one pool per phase.
+var sharedWeaverPostgres struct {
+	sync.Mutex
+	url string
+	db  *sql.DB
+}
+
+func sharedWeaverPostgresDB() (*sql.DB, error) {
+	postgresURL := weaverPostgresURL()
+	sharedWeaverPostgres.Lock()
+	defer sharedWeaverPostgres.Unlock()
+	if sharedWeaverPostgres.db != nil && sharedWeaverPostgres.url == postgresURL {
+		return sharedWeaverPostgres.db, nil
+	}
+	if sharedWeaverPostgres.db != nil {
+		_ = sharedWeaverPostgres.db.Close()
+		sharedWeaverPostgres.db = nil
+	}
+	db, err := sql.Open("postgres", postgresURL)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(10 * time.Minute)
+	sharedWeaverPostgres.url = postgresURL
+	sharedWeaverPostgres.db = db
+	return db, nil
+}
+
+// closeSharedWeaverPostgresDB drops the shared pool, so the next state query
+// connects afresh.
+func closeSharedWeaverPostgresDB() {
+	sharedWeaverPostgres.Lock()
+	defer sharedWeaverPostgres.Unlock()
+	if sharedWeaverPostgres.db != nil {
+		_ = sharedWeaverPostgres.db.Close()
+		sharedWeaverPostgres.db = nil
+		sharedWeaverPostgres.url = ""
+	}
+}
+
+// openWeaverStateDB opens the weaver state database for one assertion. Release
+// it with closeWeaverStateDB: a Postgres handle is the shared pool and stays
+// open, while a SQLite handle is the caller's own.
 func openWeaverStateDB(sqlitePath string) (*sql.DB, weaverDatastore, error) {
 	datastore := currentWeaverDatastore()
 	if datastore == weaverDatastorePostgres {
-		db, err := openWeaverPostgresDB()
+		db, err := sharedWeaverPostgresDB()
 		return db, datastore, err
 	}
 	db, err := sql.Open("sqlite", sqlitePath)
@@ -219,6 +270,13 @@ func openWeaverStateDB(sqlitePath string) (*sql.DB, weaverDatastore, error) {
 	}
 	db.SetMaxOpenConns(1)
 	return db, datastore, nil
+}
+
+func closeWeaverStateDB(db *sql.DB, datastore weaverDatastore) {
+	if db == nil || datastore == weaverDatastorePostgres {
+		return
+	}
+	_ = db.Close()
 }
 
 func rebindWeaverSQL(datastore weaverDatastore, query string) string {

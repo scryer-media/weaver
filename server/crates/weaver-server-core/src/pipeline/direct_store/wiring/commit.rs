@@ -1,6 +1,7 @@
 //! Direct-store writes and finalization, including mixed-member chase handoff.
 
 use super::*;
+use crate::pipeline::direct_store::barrier::CoveragePersist;
 
 fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedExtraction, String> {
     let mut result = ToleratedExtraction::default();
@@ -27,15 +28,98 @@ fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedE
     Ok(result)
 }
 
+/// One of an archive's recorded times, in Windows FILETIME ticks.
+fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const EPOCH_OFFSET_SECONDS: i64 = 11_644_473_600;
+    let seconds = (filetime_ticks / TICKS_PER_SECOND) as i64 - EPOCH_OFFSET_SECONDS;
+    let nanos = ((filetime_ticks % TICKS_PER_SECOND) * 100) as u32;
+    filetime::FileTime::from_unix_time(seconds, nanos)
+}
+
+/// An archive's recorded times put on an entry weaver has just created.
+///
+/// The pair the conventional extractor restores: the modification time, which
+/// every writer records, and the access time when the header carries one.
+/// Neither is invented — an entry whose header states no modification time
+/// keeps the time of its creation here, exactly as it does there. Best effort:
+/// the entry exists either way, and a filesystem that refuses a time still
+/// holds the right bytes.
+/// The installation marker a finalized set leaves in place of its coverage row.
+///
+/// `None` when there is nothing to re-check at restore. A set with no committed
+/// byte-bearing member would be trusted on the marker's word alone, and a path
+/// that is not UTF-8 or not under the staging root cannot be recorded in the
+/// form restore probes. Either way the set redownloads after a restart, which
+/// is what it did before the marker existed.
+fn installed_marker(
+    plan: &DirectSetPlan,
+    members: &[(String, u64, PathBuf, PathBuf)],
+    extracted: Vec<String>,
+) -> Option<Vec<u8>> {
+    use crate::pipeline::direct_store::snapshot::{
+        InstalledMember, InstalledSet, encode_installed,
+    };
+
+    if members.is_empty() {
+        return None;
+    }
+    // Keyed by path, later entries replacing earlier ones: the commit walks
+    // members in archive order and two whose names sanitize to one destination
+    // overwrite each other, so the last one's length is the one on disk.
+    let mut committed: BTreeMap<String, u64> = BTreeMap::new();
+    for (_, len, _, destination) in members {
+        let relative = destination.strip_prefix(&plan.destination_dir).ok()?;
+        committed.insert(relative.to_str()?.to_string(), *len);
+    }
+    let members = committed
+        .into_iter()
+        .map(|(relative_path, len)| InstalledMember { relative_path, len })
+        .collect();
+    let installed = InstalledSet {
+        volumes: plan
+            .volumes
+            .iter()
+            .map(|(volume, file)| (*volume, *file))
+            .collect(),
+        members,
+        extracted,
+    };
+    encode_installed(&installed).ok()
+}
+
+fn apply_archive_times(path: &std::path::Path, modified: Option<u64>, accessed: Option<u64>) {
+    let Some(modified) = modified.map(archive_filetime) else {
+        return;
+    };
+    match accessed.map(archive_filetime) {
+        Some(accessed) => {
+            let _ = filetime::set_file_times(path, accessed, modified);
+        }
+        None => {
+            let _ = filetime::set_file_mtime(path, modified);
+        }
+    }
+}
+
 impl Pipeline {
     /// The routing seam. Replaces the conventional write for one decoded
     /// segment of a direct source volume.
+    ///
+    /// `declared_volume_len` is the total length this article's yEnc header
+    /// states for its file. It is carried in rather than derived here because
+    /// only the decoder sees it, and it is the one fact a 7z set cannot do
+    /// without: the volumes are a byte split of one container, so their
+    /// lengths are what turn a container offset into the (volume, offset) pair
+    /// everything else is expressed in — and a volume declares its length on
+    /// its *first* article, long before it finishes arriving.
     pub(crate) async fn handle_direct_decode_success(
         &mut self,
         set_index: usize,
         volume_index: u32,
         segment: BufferedDecodedSegment,
         file_offset: u64,
+        declared_volume_len: u64,
     ) -> DirectRouteOutcome {
         let segment_id = segment.segment_id;
         let file_id = segment_id.file_id;
@@ -43,10 +127,32 @@ impl Pipeline {
         let decoded_size = segment.decoded_size;
         let part_crc = segment.part_crc;
         // The dual-CRC grid's half of the article, carried past routing to the
-        // commit seam. `contiguous_bytes` gives the router a contiguous view
-        // while the original decoded buffer stays owned here for fallback.
+        // commit seam. The router is handed refcounted views of the decoder's
+        // own buffers rather than a flattened copy, and `segment` keeps its
+        // decoded data intact for the conventional fallback on demotion.
         let part_crc_verified = segment.part_crc_verified;
-        let bytes = contiguous_bytes(&segment.data);
+        let pieces = segment.data.pieces();
+        // Read before the set is borrowed: whether the tier this article's
+        // buffer came from can spare a slot to whatever the router keeps.
+        let pool_scarce = self
+            .buffers
+            .is_scarce(crate::runtime::buffers::BufferTier::for_size(
+                decoded_size as usize,
+            ));
+
+        // Before the route, because routing is what parses: a container whose
+        // volume zero has just declared its length may become readable in this
+        // very call.
+        let declared = match self.direct_store.set_mut(job_id, set_index) {
+            Some(set) => set.note_declared_volume_size(volume_index, declared_volume_len),
+            None => return DirectRouteOutcome::Conventional(segment),
+        };
+        if let Err(reason) = declared {
+            drop(pieces);
+            self.demote_direct_set_with_handoff(job_id, set_index, reason, Some(segment_id))
+                .await;
+            return DirectRouteOutcome::Conventional(segment);
+        }
 
         let routed = {
             let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
@@ -62,7 +168,25 @@ impl Pipeline {
                 file_offset,
                 u64::from(decoded_size),
             );
-            set.route(volume_index, file_offset, &bytes)
+            let routed = set.route(volume_index, file_offset, &pieces);
+            if routed.is_ok() {
+                // What the drain left staged — a held tail, a header run the
+                // parser keeps — must not keep the decoder's buffer alive for
+                // a fraction of it: short residues and views of less than
+                // half their piece leave it now, all of them when the pool is
+                // scarce.
+                let copied = set.release_article_views(
+                    volume_index,
+                    file_offset,
+                    u64::from(decoded_size),
+                    pool_scarce,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.holds.copied_out_bytes",
+                    copied,
+                );
+            }
+            routed
         };
         let spans = match routed {
             Ok(spans) => spans,
@@ -86,7 +210,7 @@ impl Pipeline {
             return DirectRouteOutcome::Conventional(segment);
         }
 
-        drop(bytes);
+        drop(pieces);
 
         self.commit_direct_segment(
             segment_id,
@@ -105,7 +229,8 @@ impl Pipeline {
     }
 
     /// Writes every destination a batch of routed spans touches, then records
-    /// them as coverage. `false` means the set demoted and the caller must stop.
+    /// them as coverage. `false` means the set demoted or the job failed, and
+    /// the caller must stop.
     ///
     /// The record only happens once **all** the writes returned: partial failure
     /// leaves orphan bytes, and the coverage map is the truth, not the bytes.
@@ -143,10 +268,33 @@ impl Pipeline {
                 .await;
                 false
             }
+            DirectPlacementError::Write(error) if destination_refused(&error) => {
+                // A refusal the destination itself makes — no space, no
+                // permission, a read-only filesystem, a path component that is
+                // a file — fails the job, as a disk write that fails during
+                // download does. Demoting would refetch every volume of the set
+                // only for the conventional extractor to write into the same
+                // place and meet the same refusal.
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "the destination refused a direct-store write; failing the job"
+                );
+                self.fail_job(
+                    job_id,
+                    format!(
+                        "direct-store destination write failed for job {}: {error}",
+                        job_id.0
+                    ),
+                );
+                false
+            }
             DirectPlacementError::Write(error) => {
-                // A destination write failure is a demotion, not a job failure: the
-                // conventional path writes the same bytes to a different file, and
-                // only if *that* also fails is the job genuinely unfinishable.
+                // Any other write failure is a demotion, not a job failure: the
+                // conventional path writes the same bytes to a different file —
+                // a volume, not an envelope or a member partial whose name only
+                // direct store derives — and only if *that* also fails is the
+                // job genuinely unfinishable.
                 warn!(
                     job_id = job_id.0,
                     error = %error,
@@ -203,7 +351,7 @@ impl Pipeline {
         // `record_value` is a no-op unless the profiler is on.
         let (member_bytes, envelope_bytes) =
             spans.iter().fold((0u64, 0u64), |(member, envelope), span| {
-                let len = span.bytes.len() as u64;
+                let len = span.len();
                 match span.destination {
                     DirectDestination::Member { .. } => (member + len, envelope),
                     DirectDestination::Envelope { .. } => (member, envelope + len),
@@ -244,7 +392,7 @@ impl Pipeline {
         }
         let set_name = set.set_name().to_string();
         for (volume_index, facts) in dirty {
-            let encoded = match rmp_serde::to_vec_named(&facts) {
+            let encoded = match facts.encode() {
                 Ok(encoded) => encoded,
                 Err(error) => {
                     warn!(
@@ -414,7 +562,7 @@ impl Pipeline {
             .map(|(member_id, _, partial)| (member_id, partial.to_string()))
             .collect();
 
-        let mut grouped: HashMap<PathBuf, Vec<(u64, Vec<u8>)>> = HashMap::new();
+        let mut grouped: HashMap<PathBuf, Vec<(u64, Vec<bytes::Bytes>)>> = HashMap::new();
         for span in spans {
             // The two roots part company here, and this is the seam the whole
             // split exists for: member payload is written straight into the
@@ -437,6 +585,8 @@ impl Pipeline {
             grouped
                 .entry(path)
                 .or_default()
+                // Refcount bumps, not payload: the views the router handed out
+                // are what reaches the write syscall.
                 .push((span.destination_offset, span.bytes.clone()));
         }
         let mut batches: crate::pipeline::orchestrator::DirectWriteBatches =
@@ -489,7 +639,11 @@ impl Pipeline {
     /// extracted one through exactly the same root
     /// (`Pipeline::resolve_job_input_path` tries the working dir and then the
     /// staging dir, and only the second can match a direct member).
-    pub(super) fn record_direct_extracted(&mut self, job_id: JobId, name: String) {
+    pub(in crate::pipeline::direct_store) fn record_direct_extracted(
+        &mut self,
+        job_id: JobId,
+        name: String,
+    ) {
         let name = DirectSetPlan::destination_relative_name(&name).unwrap_or(name);
         self.direct_store
             .direct_extracted_members
@@ -555,10 +709,16 @@ impl Pipeline {
                     error = %error,
                     "failed to create a direct-store destination directory"
                 );
-                // Left unprepared on purpose: the write below fails and demotes,
-                // and a later attempt retries the directory rather than trusting
-                // a failure it never saw succeed. Not a sparse refusal — the
-                // write error path already distinguishes it.
+                // A refusal is reported here, where its kind is the same on
+                // every platform: the open below would see a file standing in
+                // the path as `NotADirectory` on unix but `NotFound` on Windows.
+                if destination_refused(&error) {
+                    return Err(DirectPlacementError::Write(error));
+                }
+                // Anything else is left unprepared on purpose: the write below
+                // fails and demotes, and a later attempt retries the directory
+                // rather than trusting a failure it never saw succeed. Not a
+                // sparse refusal — the write error path already distinguishes it.
                 continue;
             }
             let created = {
@@ -658,6 +818,10 @@ impl Pipeline {
             }
         };
         let (file_complete, was_duplicate) = commit;
+        // Delivery is a verdict on this article too, and the sample that
+        // decides whether the post is there at all is only complete once every
+        // first article has one.
+        self.note_first_article_settled(segment_id);
         if was_duplicate {
             // A duplicate must not advance CRC composition, coverage or
             // progress twice. Counted because a run where this is *never* zero
@@ -854,6 +1018,17 @@ impl Pipeline {
         if self.direct_store.sets_for(job_id).is_empty() {
             return;
         }
+        // A job something else failed earlier in the same pass — a repair, a
+        // health verdict — has no output to publish, and its sets go with its
+        // purge. With post-processing scripts configured it outlives the
+        // failure until they finish, so it can still reach here.
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| matches!(state.status, crate::JobStatus::Failed { .. }))
+        {
+            return;
+        }
         // The gate re-arm, and deliberately **before** the PAR2 wait: the
         // re-read is about the member gates, not about verification, and
         // running it at the download/verify boundary means a par2-bearing set
@@ -921,6 +1096,17 @@ impl Pipeline {
             .collect();
         for set_index in ready {
             self.finalize_direct_set(job_id, set_index).await;
+            // A finalization the destination refused has failed the job. Its
+            // other sets are not committed after it: a failed job's output is
+            // not published, and with post-processing scripts configured the
+            // job outlives this call until they finish.
+            if self
+                .jobs
+                .get(&job_id)
+                .is_none_or(|state| matches!(state.status, crate::JobStatus::Failed { .. }))
+            {
+                return;
+            }
         }
         // The last set of a job finalizing is one of the two moments the answer
         // to "can anything still read a retained image" changes.
@@ -994,7 +1180,9 @@ impl Pipeline {
     }
 
     /// Demands a barrier for every live set of a job — pause, shutdown, phase
-    /// change, demotion and finalization all go through here.
+    /// change, demotion and finalization all go through here. A finalized set
+    /// is not live: its row is the installation marker, which a barrier
+    /// would overwrite (see [`DirectSet::run_barrier`]).
     pub(crate) async fn demand_direct_store_barriers(
         &mut self,
         job_id: JobId,
@@ -1005,7 +1193,7 @@ impl Pipeline {
             .sets_for(job_id)
             .iter()
             .enumerate()
-            .filter(|(_, set)| !set.is_demoted())
+            .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
             .map(|(index, _)| index)
             .collect();
         for set_index in indices {
@@ -1178,9 +1366,13 @@ impl Pipeline {
         // compares `plan().member_output_path` against the tolerated
         // destinations, which is derived from the layout and not from the
         // filesystem. It still has to run before the envelopes are deleted.
+        // Every name this finalization records as extracted, in the order it
+        // records them, for the installation marker written below.
+        let mut recorded: Vec<String> = Vec::new();
         let tolerated_directories = match self.extract_tolerated_members(job_id, set_index).await {
             Ok(Some(extracted)) => {
                 for name in extracted.members {
+                    recorded.push(name.clone());
                     self.record_direct_extracted(job_id, name);
                 }
                 extracted.directories
@@ -1210,28 +1402,36 @@ impl Pipeline {
         // A failure here leaves the set neither committed nor abandoned: its
         // partials still hold every verified byte, but nothing downstream will
         // ever look at them again, so the job would sit in `Extracting`
-        // forever. Demote instead — the volumes are refetched and the ordinary
-        // extractor produces the same member (nit).
+        // forever. It fails the job instead, as a disk write that fails during
+        // download does. Demoting would refetch every volume of the set only for
+        // the conventional extractor to meet the same refusal at the same
+        // destination.
+        //
+        // The one exception is a member whose partial is gone. That is lost
+        // data, not a refusal, and refetching the set is the only way back to
+        // it — so it alone demotes.
         //
         // A failure **part way through the loop** leaves the members before it
-        // already renamed to their destinations, and the demotion then deletes
-        // the partials of the ones after it and refetches every volume of the
-        // set. The already-committed members are overwritten by the extractor
-        // with byte-identical content, so the outcome is correct and the cost is
-        // one wasted extraction of the members that had already landed.
-        // Reviewed and accepted: unwinding the renames would mean moving
-        // finished output back into scratch paths on a path that is already the
-        // unhappy one, and the alternative — staging every rename and
-        // committing them together — needs a directory-level atomic swap the
-        // filesystem does not offer.
+        // already at their destinations. They stay there: unwinding the renames
+        // would mean moving finished output back into scratch paths on a path
+        // that is already the unhappy one, and staging every rename to commit
+        // them together needs a directory-level atomic swap the filesystem does
+        // not offer.
         for (name, unpacked_size, partial, destination) in &members {
             crate::pipeline::release_cached_write_handle(partial);
             if let Some(parent) = destination.parent()
                 && let Err(error) = tokio::fs::create_dir_all(parent).await
             {
-                warn!(job_id = job_id.0, error = %error, "failed to create direct-store destination directory; demoting the set");
-                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed)
-                    .await;
+                warn!(
+                    job_id = job_id.0,
+                    member = %name,
+                    error = %error,
+                    "failed to create direct-store destination directory; failing the job"
+                );
+                self.fail_job(
+                    job_id,
+                    format!("failed to create the directory for {name} from {set_name}: {error}"),
+                );
                 return;
             }
             // A zero-length stored member never had a byte routed for it, so it
@@ -1247,17 +1447,104 @@ impl Pipeline {
                 other => other,
             };
             if let Err(error) = committed {
+                if *unpacked_size > 0 && !tokio::fs::try_exists(partial).await.unwrap_or(true) {
+                    warn!(
+                        job_id = job_id.0,
+                        member = %name,
+                        error = %error,
+                        "a direct-store member's partial is gone; demoting the set"
+                    );
+                    self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed)
+                        .await;
+                    return;
+                }
                 warn!(
                     job_id = job_id.0,
                     member = %name,
                     error = %error,
-                    "failed to commit a direct-store member to its destination; demoting the set"
+                    "failed to commit a direct-store member to its destination; failing the job"
                 );
-                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed)
-                    .await;
+                self.fail_job(
+                    job_id,
+                    format!("failed to write {name} from {set_name}: {error}"),
+                );
                 return;
             }
+            recorded.push(name.clone());
             self.record_direct_extracted(job_id, name.clone());
+        }
+
+        // Entries the container declares but stores no bytes for: empty files
+        // and directories. They never route, because routing is a map from
+        // container offsets to member bytes and these own none, so nothing
+        // upstream has created them — but the archive names them and the
+        // conventional extractor produces them, so finalization does too.
+        //
+        // Directories first, then the empty files inside them, then the
+        // directories' recorded times: creating a file bumps its parent's
+        // mtime, so a time applied before the files it holds would not survive.
+        // A refusal fails the job. The entry is part of the archive's output:
+        // skipping it would record the set as extracted and finish the job
+        // without it, and nothing later compares the output against what the
+        // archive declares. Demoting would not help either — the refusal is the
+        // destination filesystem's, not the set's bytes', so the conventional
+        // extractor would meet the same refusal after refetching every volume.
+        // A disk write that fails during download fails the job the same way.
+        let dataless = self
+            .direct_store
+            .set(job_id, set_index)
+            .map(|set| {
+                set.router
+                    .dataless_entries()
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let destination = set.plan().member_output_path(&entry.name).ok()?;
+                        Some((entry, destination))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut dataless_directories = Vec::new();
+        for (entry, destination) in &dataless {
+            let created = if entry.is_directory {
+                tokio::fs::create_dir_all(destination).await
+            } else {
+                match destination.parent() {
+                    Some(parent) => tokio::fs::create_dir_all(parent).await,
+                    None => Ok(()),
+                }
+                .and(tokio::fs::File::create(destination).await.map(drop))
+            };
+            if let Err(error) = created {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    entry = %entry.name,
+                    error = %error,
+                    "failed to create a direct-store entry the archive stores no bytes for; \
+                     failing the job"
+                );
+                self.fail_job(
+                    job_id,
+                    format!(
+                        "failed to create archive entry {} from {set_name}: {error}",
+                        entry.name
+                    ),
+                );
+                return;
+            }
+            if entry.is_directory {
+                dataless_directories.push((entry, destination));
+            } else {
+                apply_archive_times(destination, entry.modified, entry.accessed);
+                recorded.push(entry.name.clone());
+                self.record_direct_extracted(job_id, entry.name.clone());
+            }
+        }
+        for (entry, destination) in dataless_directories {
+            apply_archive_times(destination, entry.modified, entry.accessed);
+            recorded.push(entry.name.clone());
+            self.record_direct_extracted(job_id, entry.name.clone());
         }
 
         // The archive's directory metadata, restored **last**. Every rename
@@ -1318,10 +1605,30 @@ impl Pipeline {
         }
 
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        if let Some(set) = self.direct_store.set_mut(job_id, set_index)
-            && let Err(error) = set.retire(&mut persist)
-        {
-            warn!(job_id = job_id.0, error = %error, "failed to retire a direct-store checkpoint");
+        let installed = self
+            .direct_store
+            .set(job_id, set_index)
+            .and_then(|set| installed_marker(set.plan(), &members, recorded));
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            if let Err(error) = set.retire(&mut persist) {
+                warn!(job_id = job_id.0, error = %error, "failed to retire a direct-store checkpoint");
+            }
+            // The coverage row is gone, and with it the only durable sign that
+            // this set exists at all. Without a marker in its place, a restart
+            // before the job is archived installs the set fresh and refetches
+            // every volume of output already committed above. A failed write
+            // costs exactly that redownload, which is the most it can cost.
+            if let Some(blob) = installed
+                && let Err(error) = persist.write(job_id, &set_name, &blob)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to record a finalized direct set as installed; a restart before \
+                     the job completes redownloads it"
+                );
+            }
         }
         // The other end of the direct phase, and the same rule the demotion
         // applies: the commit above renamed the member partials to their
@@ -1961,6 +2268,25 @@ impl Pipeline {
         self.finalize_ready_direct_sets(done.job_id).await;
         self.schedule_job_completion_check(done.job_id);
     }
+}
+
+/// Whether a failed destination write is the filesystem refusing the location
+/// itself, which the conventional path writes into as well — as opposed to a
+/// failure tied to a name only direct store derives, such as an envelope or a
+/// member partial the filesystem finds too long.
+///
+/// `AlreadyExists` is what creating a directory reports, on every platform,
+/// when a file stands where the directory belongs. Destination opens create
+/// or reuse, so they never report it themselves.
+fn destination_refused(error: &std::io::Error) -> bool {
+    crate::operations::is_out_of_space(error)
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::ReadOnlyFilesystem
+                | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::AlreadyExists
+        )
 }
 
 #[cfg(test)]

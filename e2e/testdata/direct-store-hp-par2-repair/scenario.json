@@ -14,5 +14,8 @@
   "deleteSubjectContains": [
     "archive.part2.rar"
   ],
-  "deleteSubjectTailArticles": 3
+  "deleteSubjectTailArticles": 3,
+  "runtimeAssertions": {
+    "directStore": {}
+  }
 }

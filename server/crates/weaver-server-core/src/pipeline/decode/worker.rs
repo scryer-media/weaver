@@ -24,6 +24,9 @@ enum OutOfOrderPersistReason {
     GlobalWriteBacklog,
     QuiescentFlush,
     DirectUnpack,
+    /// A demoted volume handed back to the conventional path, whose buffer is
+    /// emptied outright rather than to a threshold.
+    HandedBackVolume,
 }
 
 impl OutOfOrderPersistReason {
@@ -33,6 +36,7 @@ impl OutOfOrderPersistReason {
             Self::GlobalWriteBacklog => "download.write_buffer.out_of_order.global_write_backlog",
             Self::QuiescentFlush => "download.write_buffer.out_of_order.quiescent_flush",
             Self::DirectUnpack => "download.write_buffer.out_of_order.direct_unpack",
+            Self::HandedBackVolume => "download.write_buffer.out_of_order.handed_back_volume",
         }
     }
 }
@@ -1898,6 +1902,7 @@ impl Pipeline {
                     data,
                     part_crc,
                     part_crc_verified: false,
+                    declared_file_len: yenc_layout.file_size,
                     yenc_name,
                     checkpoint_plan,
                     segments,
@@ -1917,9 +1922,7 @@ impl Pipeline {
                 if self.demotion_sweep_owns_file(file_id) {
                     // The existing sweep handback drains these bytes only
                     // after reconstruction has stopped owning the file.
-                    self.write_buffers
-                        .entry(file_id)
-                        .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending))
+                    self.write_buffer_for_article(file_id, segment_id.segment_number, file_offset)
                         .insert(file_offset, segment);
                 } else if let Err(error) = self
                     .persist_out_of_order_segments(
@@ -2043,6 +2046,7 @@ impl Pipeline {
                 data,
                 part_crc,
                 part_crc_verified,
+                declared_file_len: yenc_layout.file_size,
                 yenc_name,
                 checkpoint_plan,
                 segments,
@@ -2139,6 +2143,7 @@ impl Pipeline {
                             volume_index,
                             buffered_segment,
                             file_offset,
+                            yenc_layout.file_size,
                         )
                         .await;
                     match outcome {
@@ -2205,14 +2210,27 @@ impl Pipeline {
             // handback seeds its extents into this buffer and drains it, which
             // is the order the inline sweep used to guarantee by construction.
             let sweep_outstanding = self.demotion_sweep_owns_file(file_id);
+            // A duplicate of an article the assembly already committed is
+            // rewritten in place, never sequenced: its file may have completed
+            // and dropped its buffer, and a fresh buffer's cursor would hold
+            // it behind neighbours that are already on disk — with the job's
+            // completion gate waiting on the buffered bytes for as long as
+            // they sit there.
+            let already_committed = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .is_some_and(|file| file.has_segment(segment_id.segment_number));
             let ready = {
                 let _cpu_scope =
                     crate::runtime::perf_probe::cpu_scope("download.write_buffer.insert_drain");
-                let write_buf = self
-                    .write_buffers
-                    .entry(file_id)
-                    .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending));
-                write_buf.insert(file_offset, buffered_segment);
+                let write_buf =
+                    self.write_buffer_for_article(file_id, segment_id.segment_number, file_offset);
+                if already_committed {
+                    write_buf.insert_duplicate(file_offset, buffered_segment);
+                } else {
+                    write_buf.insert(file_offset, buffered_segment);
+                }
                 if sweep_outstanding {
                     (Vec::new(), 0)
                 } else {
@@ -3234,6 +3252,46 @@ impl Pipeline {
         }
     }
 
+    /// Empty a file's write buffer outright, whatever its pending thresholds
+    /// say.
+    ///
+    /// The threshold drains exist to bound memory while a file is still
+    /// arriving, and they deliberately leave a small buffer alone. A volume a
+    /// demotion sweep has just handed back is not still arriving on that path:
+    /// what it accepted and did not persist is bytes no durable floor accounts
+    /// for, and a file resting in "accepted but not durable" is exactly what
+    /// leaves the materialization gate holding an owner nothing clears. So its
+    /// buffer is emptied, not trimmed.
+    async fn drain_file_write_buffer(
+        &mut self,
+        file_id: NzbFileId,
+    ) -> Result<(), SegmentWriteError> {
+        // Same hold as every other flush: the sweep owns the image while it
+        // runs, and committing over it would complete the assembly against
+        // bytes the sweep is still rewriting.
+        if self.demotion_sweep_owns_file(file_id) {
+            return Ok(());
+        }
+        loop {
+            let batch = {
+                let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
+                    return Ok(());
+                };
+                write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
+            };
+            if batch.is_empty() {
+                self.remove_empty_write_buffer(file_id);
+                return Ok(());
+            }
+            self.persist_out_of_order_segments(
+                file_id,
+                batch,
+                OutOfOrderPersistReason::HandedBackVolume,
+            )
+            .await?;
+        }
+    }
+
     async fn relieve_global_write_backlog(&mut self) -> Result<(), SegmentWriteError> {
         self.relieve_global_write_backlog_to(self.write_backlog_budget_bytes)
             .await
@@ -3273,7 +3331,7 @@ impl Pipeline {
     /// on their queued work lifts here too, so dispatch is owed a pass.
     pub(crate) async fn relieve_handed_back_write_backlog(&mut self, volume_files: &[NzbFileId]) {
         for file_id in volume_files {
-            if let Err(error) = self.enforce_file_write_backlog(*file_id).await {
+            if let Err(error) = self.drain_file_write_buffer(*file_id).await {
                 self.fail_job_for_disk_write(
                     error,
                     "failed to relieve a handed-back volume's write backlog",
@@ -3425,6 +3483,42 @@ impl Pipeline {
         Ok(())
     }
 
+    /// The file's write reorder buffer, created on demand and positioned for
+    /// the article about to be inserted.
+    ///
+    /// Every insert goes through here for one reason: a file that resumed
+    /// after a restart already holds its leading parts on disk and never
+    /// fetches them again, so a buffer whose cursor started at zero would
+    /// never release anything in order. Its bytes would only ever reach disk
+    /// through backlog eviction, whose out-of-order writes record no contiguous
+    /// coverage — and the contiguous coverage is what the file's durable floor,
+    /// and with it the restart guard's lead, is made of. The offset where the
+    /// resumed prefix ends is knowable only from the part that directly follows
+    /// it, so the buffer adopts that part's offset the first time it decodes.
+    pub(in crate::pipeline) fn write_buffer_for_article(
+        &mut self,
+        file_id: NzbFileId,
+        segment_number: u32,
+        file_offset: u64,
+    ) -> &mut WriteReorderBuffer<BufferedDecodedSegment> {
+        let resume_cursor = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .and_then(crate::jobs::assembly::FileAssembly::resume_anchor_ordinal)
+            .filter(|anchor| *anchor == segment_number)
+            .map(|_| file_offset);
+        let max_pending = self.write_buf_max_pending;
+        let write_buf = self
+            .write_buffers
+            .entry(file_id)
+            .or_insert_with(|| WriteReorderBuffer::new(max_pending));
+        if let Some(cursor) = resume_cursor {
+            write_buf.resume_at(cursor);
+        }
+        write_buf
+    }
+
     fn remove_empty_write_buffer(&mut self, file_id: NzbFileId) {
         let should_remove = self
             .write_buffers
@@ -3510,6 +3604,7 @@ impl Pipeline {
             data,
             part_crc,
             part_crc_verified,
+            declared_file_len: _,
             yenc_name,
             checkpoint_plan,
             segments,
@@ -3554,6 +3649,10 @@ impl Pipeline {
                 if replaced_damage {
                     self.clear_replaced_damage_failure(segment_id);
                 }
+                // Delivery is a verdict on this article too, and the sample
+                // that decides whether the post is there at all is only
+                // complete once every first article has one.
+                self.note_first_article_settled(segment_id);
                 if !was_duplicate {
                     self.metrics
                         .bytes_committed

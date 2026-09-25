@@ -820,6 +820,7 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         ("granted", snapshot.download_lane_refill_granted_total),
         ("parked", snapshot.download_lane_refill_parked_total),
         ("deferred", snapshot.download_lane_refill_deferred_total),
+        ("saturated", snapshot.download_lane_refill_saturated_total),
     ] {
         out.sample(&f::LANE_REFILLS, &[("result", result)], value);
     }

@@ -671,3 +671,25 @@ fn parked_promoted_recovery_is_not_pending_until_reapplied() {
 
     assert!(!state.has_pending_work());
 }
+
+/// The checkpoint line names a set's suspect volumes. A set with hundreds of
+/// them printed hundreds of indexes on every pass; the operator reads the
+/// shape, not the list, so the line carries a count and the runs behind it.
+#[test]
+fn a_suspect_volume_list_is_summarized_as_runs() {
+    assert_eq!(summarize_volume_index_ranges(&[]), "");
+    assert_eq!(summarize_volume_index_ranges(&[7]), "7");
+    assert_eq!(summarize_volume_index_ranges(&[1, 2, 3]), "1-3");
+    assert_eq!(
+        summarize_volume_index_ranges(&[1, 2, 3, 5, 8, 9]),
+        "1-3,5,8-9"
+    );
+    let every_volume = (0..200_u32).collect::<Vec<_>>();
+    assert_eq!(summarize_volume_index_ranges(&every_volume), "0-199");
+    // A list with more runs than the line has room for keeps its head and
+    // says how much it left out, instead of growing without bound.
+    let scattered = (0..40_u32).map(|index| index * 2).collect::<Vec<_>>();
+    let summary = summarize_volume_index_ranges(&scattered);
+    assert!(summary.starts_with("0,2,4,6"), "summary = {summary}");
+    assert!(summary.len() < 40, "summary = {summary}");
+}

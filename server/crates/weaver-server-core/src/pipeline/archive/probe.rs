@@ -335,6 +335,39 @@ impl Pipeline {
         }
     }
 
+    /// Whether this archive file is a source volume of a finalized **7z**
+    /// direct set — one that has already put its members where the extractor
+    /// would have put them.
+    ///
+    /// A direct set never enters the archive topology: its volumes are never
+    /// written, so nothing ever probes one, and the completion hook that is
+    /// the topology's only writer returns early for them. Once the set has
+    /// finalized there is also nothing left to extract — the members are at
+    /// their destinations and the set is already in `extracted_archives`. So
+    /// counting its volumes as archives still waiting for a topology would
+    /// leave the job blocked on a description that will never be built, of
+    /// work that is already done.
+    ///
+    /// **RAR sets are excluded deliberately, in both states.** A job whose
+    /// archives are all RAR never reaches this readiness check at all — the
+    /// completion gate sends it to the RAR check instead — so a RAR direct set
+    /// has never needed the clause; and a mixed job's RAR sets reach it on a
+    /// path that has been answering for them since before there was a 7z
+    /// layout. Narrowing to the format that needs it is what keeps this from
+    /// being a change to how a RAR set completes.
+    pub(in crate::pipeline) fn direct_set_already_installed(
+        &self,
+        job_id: JobId,
+        file: &crate::jobs::assembly::FileAssembly,
+    ) -> bool {
+        let file_index = file.file_id().file_index;
+        self.direct_store.sets_for(job_id).iter().any(|set| {
+            set.plan().format == crate::pipeline::direct_store::plan::SetFormat::SevenZip
+                && set.is_finalized()
+                && set.plan().volume_for_file(file_index).is_some()
+        })
+    }
+
     pub(crate) fn extraction_readiness_for_job(&self, job_id: JobId) -> ExtractionReadiness {
         let Some(state) = self.jobs.get(&job_id) else {
             return ExtractionReadiness::NotApplicable;
@@ -347,7 +380,7 @@ impl Pipeline {
                     FileRole::RarVolume { .. }
                         | FileRole::SevenZipArchive
                         | FileRole::SevenZipSplit { .. }
-                )
+                ) && !self.direct_set_already_installed(job_id, file)
             });
             if has_archive {
                 return ExtractionReadiness::Blocked {
@@ -364,15 +397,18 @@ impl Pipeline {
                 .all(|file| match self.classified_role_for_file(job_id, file) {
                     FileRole::RarVolume { .. }
                     | FileRole::SevenZipArchive
-                    | FileRole::SevenZipSplit { .. } => state
-                        .assembly
-                        .archive_topologies()
-                        .values()
-                        .any(|topology| {
-                            topology
-                                .volume_map
-                                .contains_key(&self.current_filename_for_file(job_id, file))
-                        }),
+                    | FileRole::SevenZipSplit { .. } => {
+                        self.direct_set_already_installed(job_id, file)
+                            || state
+                                .assembly
+                                .archive_topologies()
+                                .values()
+                                .any(|topology| {
+                                    topology
+                                        .volume_map
+                                        .contains_key(&self.current_filename_for_file(job_id, file))
+                                })
+                    }
                     _ => true,
                 });
         if !all_archive_files_covered {

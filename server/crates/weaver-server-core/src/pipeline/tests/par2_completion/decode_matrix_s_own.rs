@@ -307,6 +307,7 @@ async fn retained_promoted_recovery_buffer_does_not_report_active_fetch() {
         data: DecodedChunk::from(bytes.clone()),
         part_crc: par2_rs::checksum::crc32(&bytes),
         part_crc_verified: true,
+        declared_file_len: 0,
         yenc_name: "silver-horizon.par2".to_string(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),
@@ -1177,6 +1178,50 @@ async fn a_failed_full_carrier_scan_preserves_prefix_discovery_and_restart_reope
     assert!(
         !restored.par2_metadata_discovery_closed(job_id),
         "restart must re-open non-durable discovery instead of trusting stale exhaustion"
+    );
+}
+
+/// A candidate whose only article is missing everywhere closes discovery.
+///
+/// A discovery probe was only ever retired when the article had been recorded
+/// as an unavailable promoted recovery article, which is a narrower ledger than
+/// the terminal one: an article retired during the ordinary download pass never
+/// reaches it. The probe therefore stayed "still coming" for the rest of the
+/// job's life, discovery never closed, and the job waited on articles that had
+/// already been answered for.
+#[tokio::test]
+async fn metadata_candidates_missing_on_every_server_close_discovery() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30944);
+    let (_, first_segment, second_segment) =
+        metadata_promotion_job(&mut pipeline, job_id, "Metadata Candidates All Missing").await;
+
+    // Both candidates were answered for during the ordinary download pass,
+    // before anything asked them for metadata.
+    pipeline.book_failed_segment(first_segment);
+    pipeline.book_failed_segment(second_segment);
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![first_segment]
+    );
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    let _ = drain_promoted_segments(&mut pipeline, job_id);
+
+    assert!(
+        !pipeline.promote_par2_metadata(job_id),
+        "nothing is left to bootstrap metadata from"
+    );
+    assert!(
+        drain_promoted_segments(&mut pipeline, job_id).is_empty(),
+        "and nothing is enqueued again"
+    );
+    assert!(
+        pipeline.par2_metadata_discovery_closed(job_id),
+        "discovery must close once every candidate article is terminal"
     );
 }
 

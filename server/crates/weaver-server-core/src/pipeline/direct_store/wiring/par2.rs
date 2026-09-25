@@ -4,6 +4,61 @@
 
 use super::*;
 
+/// Why a job's demoted direct set is still holding the PAR2 verdict up.
+///
+/// Every variant names one file of one set and what is still owed on it, so a
+/// job resting in `Downloading` behind this gate can be read from the log
+/// instead of inferred from the absence of anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DemotedMaterializationBlock {
+    /// Every article is in, but the completing commit has not settled the file
+    /// yet: its buffer flush, handle release and row are still owed.
+    AwaitingSettle { set_index: usize, file_index: u32 },
+    /// Something in the pipeline still owns an article of this file.
+    Owned {
+        set_index: usize,
+        file_index: u32,
+        owner: &'static str,
+    },
+    /// Articles the sweep could not vouch for went back on the wire and have
+    /// not reached a terminal state yet.
+    Rescued {
+        set_index: usize,
+        file_index: u32,
+        segments: usize,
+    },
+}
+
+impl DemotedMaterializationBlock {
+    pub(crate) fn set_index(self) -> usize {
+        match self {
+            Self::AwaitingSettle { set_index, .. }
+            | Self::Owned { set_index, .. }
+            | Self::Rescued { set_index, .. } => set_index,
+        }
+    }
+
+    pub(crate) fn file_index(self) -> u32 {
+        match self {
+            Self::AwaitingSettle { file_index, .. }
+            | Self::Owned { file_index, .. }
+            | Self::Rescued { file_index, .. } => file_index,
+        }
+    }
+
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Self::AwaitingSettle { .. } => {
+                "every article is in but the completing commit has not settled the file".to_string()
+            }
+            Self::Owned { owner, .. } => format!("an article is still owned by {owner}"),
+            Self::Rescued { segments, .. } => {
+                format!("{segments} article(s) went back on the wire and have no verdict yet")
+            }
+        }
+    }
+}
+
 impl Pipeline {
     /// Take any set claiming this file off the direct path, because its
     /// articles arrived uuencoded.
@@ -88,14 +143,23 @@ impl Pipeline {
     /// must not have the file classified, probed or entered into the archive
     /// topology over an image the sweep has not finished; the handback replays
     /// the completion hook for every volume once the ticket lands.
+    ///
+    /// A volume the sweep has finished and the actor has handed back is not
+    /// owned any more, ticket or no ticket: the sweep never returns to a
+    /// volume once its outcome is reported, and the handback has seeded and
+    /// drained everything that was parked for it.
     pub(crate) fn demotion_sweep_owns_file(&self, file_id: NzbFileId) -> bool {
         self.direct_demotion_in_flight
             .get(&file_id.job_id)
             .is_some_and(|sets| {
-                sets.keys().any(|set_index| {
-                    self.direct_store
-                        .set(file_id.job_id, *set_index)
-                        .is_some_and(|set| set.plan().volume_for_file(file_id.file_index).is_some())
+                sets.iter().any(|(set_index, work)| {
+                    !work.released.contains(&file_id.file_index)
+                        && self
+                            .direct_store
+                            .set(file_id.job_id, *set_index)
+                            .is_some_and(|set| {
+                                set.plan().volume_for_file(file_id.file_index).is_some()
+                            })
                 })
             })
     }
@@ -108,7 +172,10 @@ impl Pipeline {
     /// spill it, since a flush would commit over the image the sweep is
     /// still rebuilding. Fetching more of them while the sweep runs only
     /// grows that parked backlog toward the write-pressure latch, which then
-    /// stops every other file too. Dispatch skips them until the handback.
+    /// stops every other file too. Dispatch skips them until *their* handback:
+    /// the sweep reports one volume at a time, and a volume it has finished
+    /// goes back into dispatch while the rest are still being rebuilt, so a
+    /// long sweep over a slow working directory never idles the whole job.
     pub(crate) fn demotion_sweep_held_file_indices(&self, job_id: JobId) -> Option<Vec<u32>> {
         let sets = self.direct_demotion_in_flight.get(&job_id)?;
         let held: Vec<u32> = sets
@@ -118,6 +185,7 @@ impl Pipeline {
                     .volume_files
                     .iter()
                     .map(|file_id| file_id.file_index)
+                    .filter(|file_index| !work.released.contains(file_index))
             })
             .collect();
         (!held.is_empty()).then_some(held)
@@ -367,21 +435,62 @@ impl Pipeline {
     /// The one ownership gate between direct demotion and every PAR2 verdict.
     /// A pending file leaves through the durable conventional completion seam,
     /// or once every article it still lacks is terminally unavailable.
+    #[cfg(test)]
     pub(crate) fn demoted_materializations_ready_for_par2(
         &mut self,
         job_id: JobId,
         recovery_set_id: par2_rs::RecoverySetId,
     ) -> bool {
+        self.demoted_materialization_block_for_par2(job_id, recovery_set_id)
+            .is_none()
+    }
+
+    /// Whether anything at all could still move this job's download pipeline.
+    ///
+    /// The question the materialization backstop asks: with no sweep running,
+    /// nothing queued on either queue, nothing in flight, nothing retrying,
+    /// nothing parked and no buffered bytes, there is no event left that could
+    /// ever clear a pending file. Waiting for one is then waiting for nothing.
+    fn job_download_pipeline_is_idle(&self, job_id: JobId) -> bool {
+        !self.job_has_pending_download_pipeline_work(job_id)
+            && self
+                .direct_demotion_in_flight
+                .get(&job_id)
+                .is_none_or(|sweeps| sweeps.is_empty())
+            && self.jobs.get(&job_id).is_none_or(|state| {
+                state.recovery_queue.is_empty() && state.held_segments.is_empty()
+            })
+            && !self
+                .server_quota_parked
+                .iter()
+                .any(|segment_id| segment_id.file_id.job_id == job_id)
+    }
+
+    /// The gate above, with the reason it refused.
+    ///
+    /// `None` is ready. Otherwise the first block found, which is what the
+    /// completion checkpoint names: a gate that can only say "not yet" leaves
+    /// the operator with a job sitting in `Downloading` and no line saying
+    /// which file it is sitting on.
+    pub(crate) fn demoted_materialization_block_for_par2(
+        &mut self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) -> Option<DemotedMaterializationBlock> {
         let pending = self.direct_store.pending_materializations(job_id);
         if pending.is_empty() {
-            return true;
+            return None;
         }
         if !self.jobs.contains_key(&job_id) {
             self.direct_store.clear_pending_materializations(job_id);
-            return true;
+            return None;
         }
 
-        let mut ready = true;
+        // Read once for the whole pass: nothing inside it can start work, so
+        // the answer cannot change between files.
+        let pipeline_idle = self.job_download_pipeline_is_idle(job_id);
+
+        let mut block: Option<DemotedMaterializationBlock> = None;
         for (set_index, pending) in pending {
             let applicability = self.direct_store.set(job_id, set_index).map(|set| {
                 let mut unresolved = false;
@@ -409,7 +518,7 @@ impl Pipeline {
             }
 
             for file_id in pending.files {
-                let Some((missing, file_has_owner)) = self.jobs.get(&job_id).and_then(|state| {
+                let Some((missing, file_owner)) = self.jobs.get(&job_id).and_then(|state| {
                     let file = state.spec.files.get(file_id.file_index as usize)?;
                     let assembly = state.assembly.file(file_id)?;
                     let mut owned = HashSet::new();
@@ -446,23 +555,34 @@ impl Pipeline {
                             )
                         })
                         .collect::<Vec<_>>();
-                    let file_has_owner = self
+                    let file_owner = if self
                         .active_downloads_by_file
                         .get(&file_id)
                         .is_some_and(|count| *count > 0)
-                        || self
-                            .active_decodes_by_file
-                            .get(&file_id)
-                            .is_some_and(|count| *count > 0)
-                        || self
-                            .write_buffers
-                            .get(&file_id)
-                            .is_some_and(|buffer| !buffer.is_empty())
-                        || self
-                            .pending_released_download_results_by_job
-                            .get(&job_id)
-                            .is_some_and(|count| *count > 0);
-                    Some((missing, file_has_owner))
+                    {
+                        Some("download in flight")
+                    } else if self
+                        .active_decodes_by_file
+                        .get(&file_id)
+                        .is_some_and(|count| *count > 0)
+                    {
+                        Some("decode in flight")
+                    } else if self
+                        .write_buffers
+                        .get(&file_id)
+                        .is_some_and(|buffer| !buffer.is_empty())
+                    {
+                        Some("buffered writes")
+                    } else if self
+                        .pending_released_download_results_by_job
+                        .get(&job_id)
+                        .is_some_and(|count| *count > 0)
+                    {
+                        Some("released download results")
+                    } else {
+                        None
+                    };
+                    Some((missing, file_owner))
                 }) else {
                     self.direct_store.settle_materialized_file(file_id);
                     continue;
@@ -470,8 +590,20 @@ impl Pipeline {
 
                 // No missing article does not mean durable yet: the completing
                 // commit still owes its buffer flush, handle release and row.
+                //
+                // Unless nothing in the job's pipeline can move. Then no commit
+                // is coming, and waiting for one is waiting for nothing — the
+                // shape that left a job sitting in `Downloading` for hours with
+                // every counter at zero.
                 if missing.is_empty() {
-                    ready = false;
+                    if pipeline_idle {
+                        self.direct_store.settle_materialized_file(file_id);
+                    } else {
+                        block.get_or_insert(DemotedMaterializationBlock::AwaitingSettle {
+                            set_index,
+                            file_index: file_id.file_index,
+                        });
+                    }
                     continue;
                 }
                 if missing
@@ -482,18 +614,47 @@ impl Pipeline {
                     continue;
                 }
 
-                let has_owner = file_has_owner
-                    || pending
-                        .handoffs
-                        .iter()
-                        .any(|segment_id| segment_id.file_id == file_id)
-                    || missing.iter().any(|(segment_id, _, queued)| {
-                        *queued
-                            || self.pending_retries_by_segment.contains_key(segment_id)
-                            || self.server_quota_parked.contains(segment_id)
+                let owner = file_owner
+                    .or_else(|| {
+                        pending
+                            .handoffs
+                            .iter()
+                            .any(|segment_id| segment_id.file_id == file_id)
+                            .then_some("demotion handoff")
+                    })
+                    .or_else(|| {
+                        missing.iter().find_map(|(segment_id, _, queued)| {
+                            if *queued {
+                                Some("queued for download")
+                            } else if self.pending_retries_by_segment.contains_key(segment_id) {
+                                Some("retry pending")
+                            } else if self.server_quota_parked.contains(segment_id) {
+                                Some("parked on a server quota")
+                            } else {
+                                None
+                            }
+                        })
                     });
-                if has_owner {
-                    ready = false;
+                if let Some(owner) = owner {
+                    // The same backstop. With the whole pipeline idle the only
+                    // owner that can still be claimed here is a handoff whose
+                    // article never came back to release it — an owner that
+                    // cannot finish. Its articles are holes, and holes are what
+                    // the recovery pass exists to read.
+                    if pipeline_idle {
+                        for (segment_id, _, _) in &missing {
+                            if !self.segment_terminal_states.contains_key(segment_id) {
+                                self.book_failed_segment(*segment_id);
+                            }
+                        }
+                        self.direct_store.settle_materialized_file(file_id);
+                    } else {
+                        block.get_or_insert(DemotedMaterializationBlock::Owned {
+                            set_index,
+                            file_index: file_id.file_index,
+                            owner,
+                        });
+                    }
                     continue;
                 }
 
@@ -515,9 +676,16 @@ impl Pipeline {
                         rescued.push(work);
                     }
                 }
+                let rescued_count = rescued.len();
                 for work in rescued {
                     self.enqueue_download_work(work);
-                    ready = false;
+                }
+                if rescued_count > 0 {
+                    block.get_or_insert(DemotedMaterializationBlock::Rescued {
+                        set_index,
+                        file_index: file_id.file_index,
+                        segments: rescued_count,
+                    });
                 }
                 if missing_ids
                     .iter()
@@ -525,11 +693,15 @@ impl Pipeline {
                 {
                     self.direct_store.settle_materialized_file(file_id);
                 } else {
-                    ready = false;
+                    block.get_or_insert(DemotedMaterializationBlock::Rescued {
+                        set_index,
+                        file_index: file_id.file_index,
+                        segments: rescued_count,
+                    });
                 }
             }
         }
-        ready
+        block
     }
 
     /// Demotes every live direct set of `job_id` holding a source volume that
@@ -1955,12 +2127,16 @@ impl Pipeline {
                     // change the caller has to act on exactly as a repair is:
                     // its volumes are materializing, so the job's next move is a
                     // fresh pass over them, not another lap of the verdict that
-                    // sent it here.
+                    // sent it here. A write the destination refused fails the
+                    // job instead, which ends the job's moves altogether.
                     let already_demoted = self
                         .direct_store
                         .set(job_id, set_index)
                         .is_some_and(DirectSet::is_demoted);
-                    return if repaired_any || already_demoted {
+                    let job_failed = self.jobs.get(&job_id).is_none_or(|state| {
+                        matches!(state.status, crate::JobStatus::Failed { .. })
+                    });
+                    return if repaired_any || already_demoted || job_failed {
                         DirectRepairAnswer::Acted
                     } else {
                         DirectRepairAnswer::Declined
@@ -2525,7 +2701,7 @@ impl Pipeline {
                     .iter()
                     .flat_map(|span| span.chunks.iter().cloned())
                     .collect();
-                let mut lead_in: Vec<(u32, u64, std::sync::Arc<[u8]>)> = spans
+                let mut lead_in: Vec<(u32, u64, bytes::Bytes)> = spans
                     .iter()
                     .flat_map(|span| [span.lead_in.clone(), span.lead_out.clone()])
                     .flatten()
@@ -2578,7 +2754,7 @@ impl Pipeline {
         set_index: usize,
         volume_index: u32,
         lengths: &std::collections::BTreeMap<u32, u64>,
-    ) -> Vec<(u32, u64, std::sync::Arc<[u8]>)> {
+    ) -> Vec<(u32, u64, bytes::Bytes)> {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Vec::new();
         };
@@ -2599,7 +2775,7 @@ impl Pipeline {
             if std::io::Read::read_exact(&mut reader, &mut bytes).is_err() {
                 continue;
             }
-            edges.push((volume, offset, std::sync::Arc::from(bytes.as_slice())));
+            edges.push((volume, offset, bytes::Bytes::from(bytes)));
         }
         edges
     }

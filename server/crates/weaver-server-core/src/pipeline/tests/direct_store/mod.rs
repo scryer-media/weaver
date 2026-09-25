@@ -6,7 +6,7 @@
 
 use super::*;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::pipeline::direct_store::DirectStoreGate;
 use crate::pipeline::direct_store::router::{DemotionReason, VolumeDemand};
@@ -490,7 +490,9 @@ async fn submit_volume_article_indexed_of(
 ) {
     let (filename, bytes) = &volumes[ordinal as usize];
     let (start, end) = article_extent(bytes.len(), segment_number, articles);
-    submit_decoded_segment(
+    // The article states the volume's real length, as a posted `=ybegin`
+    // does; the spec's `bytes` may be the larger encoded size.
+    submit_decoded_segment_declaring(
         pipeline,
         NzbFileId { job_id, file_index },
         segment_number,
@@ -498,6 +500,9 @@ async fn submit_volume_article_indexed_of(
         &bytes[start..end],
         filename,
         None,
+        true,
+        None,
+        bytes.len() as u64,
     )
     .await;
 }
@@ -1401,6 +1406,29 @@ async fn demote_mid_download_leaving_the_sweep_outstanding(
     reason: DemotionReason,
     before_demotion: impl FnOnce(&mut Pipeline, &std::path::Path),
 ) -> (Pipeline, std::path::PathBuf, u64) {
+    demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+        temp_dir,
+        job_id,
+        volumes,
+        reason,
+        false,
+        before_demotion,
+    )
+    .await
+}
+
+/// [`demote_mid_download_leaving_the_sweep_outstanding`] with the set's
+/// coverage checkpointed before the demotion when `checkpoint` is set — so the
+/// row the sweep's finish retires, and a crash inside the handback would leave
+/// standing, actually exists.
+async fn demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    reason: DemotionReason,
+    checkpoint: bool,
+    before_demotion: impl FnOnce(&mut Pipeline, &std::path::Path),
+) -> (Pipeline, std::path::PathBuf, u64) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     let spec = direct_store_job_spec("Silver Horizon", volumes);
@@ -1441,6 +1469,15 @@ async fn demote_mid_download_leaving_the_sweep_outstanding(
         "volume 0's bytes were routed before the demotion"
     );
 
+    if checkpoint {
+        pipeline
+            .demand_direct_store_barriers(job_id, BarrierDemand::PhaseChange)
+            .await;
+        assert!(
+            !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+            "non-vacuity: the set must have checkpointed before the demotion"
+        );
+    }
     before_demotion(&mut pipeline, &working_dir);
     pipeline.demote_direct_set(job_id, 0, reason).await;
     (pipeline, working_dir, OTHER_FILE_BYTES)
@@ -2676,6 +2713,268 @@ fn repairable_par2_index(volumes: &[(String, Vec<u8>)], recovery_blocks: usize) 
     build_test_par2_with_recovery(&described, PAR2_SLICE_BYTES, recovery_blocks)
 }
 
+/// PAR3 carriers authored over `volumes`, named the way a poster's would be:
+/// the index and the recovery volumes of one set, `(filename, bytes)`.
+///
+/// Authored rather than checked in because every direct-store fixture is built
+/// in the test that uses it, and a carrier over bytes that are not the ones
+/// posted protects nothing.
+fn par3_carriers_over(
+    volumes: &[(String, Vec<u8>)],
+    block_size: u64,
+    recovery_blocks: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let scratch = tempfile::tempdir().unwrap();
+    let protected = scratch.path().join("protected");
+    std::fs::create_dir_all(&protected).unwrap();
+    let mut names = Vec::with_capacity(volumes.len());
+    for (filename, bytes) in volumes {
+        std::fs::write(protected.join(filename), bytes).unwrap();
+        names.push(PathBuf::from(filename));
+    }
+    let report = par3_rs::create(
+        &par3_rs::InputSpec::new(&protected, &names),
+        &scratch.path().join("silver.horizon"),
+        &par3_rs::CreateOptions::default()
+            .with_block_size(block_size)
+            .with_recovery(par3_rs::RecoveryAmount::Blocks(recovery_blocks as u64)),
+    )
+    .expect("a PAR3 set over the fixture volumes");
+    report
+        .files_written
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Appends `files` to the spec as single-article NZB files, each stated at its
+/// yEnc-encoded size, and returns their file indices in order.
+fn append_single_article_files(spec: &mut JobSpec, files: &[(String, Vec<u8>)]) -> Vec<u32> {
+    files
+        .iter()
+        .map(|(filename, bytes)| {
+            let file_index = spec.files.len() as u32;
+            let declared = yenc_declared_bytes(bytes.len() as u32);
+            spec.total_bytes += u64::from(declared);
+            spec.files.push(FileSpec {
+                role: FileRole::from_filename(filename),
+                filename: filename.clone(),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: declared,
+                    message_id: format!("direct-recovery-{file_index}@example.com"),
+                }],
+            });
+            file_index
+        })
+        .collect()
+}
+
+/// Settles every PAR3 work unit a worker currently owns for the job, the way
+/// the select loop would between two completion checks.
+///
+/// Only work a worker holds is waited for. A direct set's PAR3 work can also
+/// be parked on a spill or on a dispatch that the next completion check has
+/// to make, and waiting on the channel for those would wait forever.
+async fn settle_par3_work(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline
+        .par3_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.has_worker_in_flight(job_id))
+    {
+        let done = pipeline.repair_work_done_rx.recv().await.unwrap();
+        pipeline.handle_repair_work_done(done).await;
+    }
+}
+
+/// What a direct set protected by PAR3 reached.
+#[derive(Debug)]
+struct Par3RepairOutcome {
+    status: Option<JobStatus>,
+    /// Every set shape observed, in order — a demotion shows up as `Demoted`
+    /// even when the set later finalized or was pruned.
+    sets: Vec<String>,
+    volume_file_seen: bool,
+    repair_scratch_left: usize,
+    materialized: usize,
+    finalized: usize,
+    output_root: PathBuf,
+    working_dir: PathBuf,
+    /// Keeps the job's directories alive for the assertions.
+    _temp_dir: tempfile::TempDir,
+}
+
+impl Par3RepairOutcome {
+    fn shapes(&self) -> String {
+        self.sets.join("\n")
+    }
+
+    fn demoted(&self) -> bool {
+        self.sets.iter().any(|shape| shape.contains("Demoted"))
+    }
+
+    /// A published member's bytes, wherever the job left them.
+    fn member(&self, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.output_root.join(name))
+            .ok()
+            .or_else(|| std::fs::read(self.working_dir.join(name)).ok())
+    }
+}
+
+/// Drives a direct set whose recovery is a PAR3 set authored over its volumes,
+/// with every article of `absent_ordinal` never arriving, to whatever the job
+/// reaches.
+///
+/// `spec` describes the volumes as NZB files `0..volumes.len()`; the carriers
+/// are appended after them. Articles the pipeline asks for again — a header
+/// probe, a refetch after demotion — are answered from `volumes` for every
+/// volume but the absent one, the way a server that still holds them would.
+async fn run_direct_set_with_par3(
+    job_id: JobId,
+    mut spec: JobSpec,
+    volumes: &[(String, Vec<u8>)],
+    articles: usize,
+    absent_ordinal: Option<u32>,
+    carriers: &[(String, Vec<u8>)],
+) -> Par3RepairOutcome {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+
+    let carrier_indices = append_single_article_files(&mut spec, carriers);
+    let job_name = spec.name.clone();
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut sets = Vec::new();
+    let observe = |pipeline: &Pipeline, sets: &mut Vec<String>| {
+        let current = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+        if current != "[]" && sets.last() != Some(&current) {
+            sets.push(current);
+        }
+    };
+    let volume_count = volumes.len() as u32;
+    let mut volume_file_seen = false;
+    for ordinal in 0..volume_count {
+        if absent_ordinal == Some(ordinal) {
+            continue;
+        }
+        for segment_number in 0..articles as u32 {
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                volumes,
+                ordinal,
+                segment_number,
+                articles,
+            )
+            .await;
+            observe(&pipeline, &mut sets);
+        }
+        volume_file_seen |= volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists());
+    }
+    for (offset, (filename, bytes)) in carriers.iter().enumerate() {
+        submit_decoded_segment_declaring(
+            &mut pipeline,
+            NzbFileId {
+                job_id,
+                file_index: carrier_indices[offset],
+            },
+            0,
+            0,
+            bytes,
+            filename,
+            None,
+            true,
+            None,
+            bytes.len() as u64,
+        )
+        .await;
+        settle_par3_work(&mut pipeline, job_id).await;
+        observe(&pipeline, &mut sets);
+    }
+
+    // The harness delivers articles without leasing them, and the absent
+    // volume's are never coming with no server to say so. Re-leased every turn
+    // so the pipeline can see the queue as exhausted; whatever it asks for again
+    // is answered from the volumes the wire still holds.
+    let lease_the_queue = |pipeline: &mut Pipeline| -> Vec<(u32, u32)> {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.recovery_queue = crate::DownloadQueue::new();
+        state
+            .download_queue
+            .drain_all()
+            .into_iter()
+            .filter(|work| work.segment_id.file_id.file_index < volume_count)
+            .map(|work| {
+                (
+                    work.segment_id.file_id.file_index,
+                    work.segment_id.segment_number,
+                )
+            })
+            .collect()
+    };
+    lease_the_queue(&mut pipeline);
+    for _ in 0..48 {
+        if matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ) {
+            break;
+        }
+        for (ordinal, segment_number) in lease_the_queue(&mut pipeline) {
+            if absent_ordinal == Some(ordinal) {
+                continue;
+            }
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                volumes,
+                ordinal,
+                segment_number,
+                articles,
+            )
+            .await;
+        }
+        drain_rar_refreshes(&mut pipeline).await;
+        pipeline.check_job_completion(job_id).await;
+        settle_par3_work(&mut pipeline, job_id).await;
+        observe(&pipeline, &mut sets);
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        settle_inflight_moves(&mut pipeline).await;
+        observe(&pipeline, &mut sets);
+        if let Some(done) = next_owed_extraction(&mut pipeline, job_id).await {
+            pipeline.handle_extraction_done(done).await;
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+            settle_inflight_moves(&mut pipeline).await;
+        }
+        volume_file_seen |= volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists());
+        observe(&pipeline, &mut sets);
+    }
+
+    Par3RepairOutcome {
+        status: job_status_for_assert(&pipeline, job_id),
+        sets,
+        volume_file_seen,
+        repair_scratch_left: direct_scratch_left(&working_dir),
+        materialized: pipeline.direct_store.repair_materialized_volumes,
+        finalized: pipeline.direct_store.finalized_sets,
+        output_root: complete_dir.join(crate::jobs::working_dir::sanitize_dirname(&job_name)),
+        working_dir,
+        _temp_dir: temp_dir,
+    }
+}
+
 /// What one repairable-damage gate produced.
 #[derive(Debug)]
 struct RepairGateOutcome {
@@ -3353,6 +3652,68 @@ async fn direct_job_with_one_finalized_neighbour(
         "and exactly one must still be live and damaged; got {sets}"
     );
     working_dir
+}
+
+/// A job something failed earlier in the same completion pass — a repair, a
+/// health verdict — commits none of its ready direct sets: a failed job's
+/// output is not published, and with post-processing scripts configured the
+/// job is still present when the pass reaches its sets.
+#[tokio::test]
+async fn a_failed_job_does_not_finalize_its_ready_direct_sets() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41_175);
+    let payload: Vec<u8> = (0..24_000u32).map(|index| (index % 239) as u8).collect();
+    let volumes = single_member_store_set("Silver.Horizon.S01E01.mkv", &payload, 2);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.ready_to_finalize() && !set.is_finalized()),
+        "non-vacuity: the set must be ready and waiting on its PAR2 verdict; got {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+
+    set_job_status_for_test(
+        &mut pipeline,
+        job_id,
+        JobStatus::Failed {
+            error: "a repair failed the job".to_string(),
+        },
+    );
+    pipeline.par2_verified.insert(job_id);
+    pipeline.finalize_ready_direct_sets(job_id).await;
+
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .all(|set| !set.is_finalized()),
+        "a failed job's sets must not be committed; got {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
 }
 
 /// [`par2_bearing_job_spec`] with a chosen article count per volume, so a

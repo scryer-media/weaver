@@ -297,9 +297,12 @@ impl Pipeline {
                     // Ordered writer queue, not fire-and-forget: category/metadata
                     // are last-write-wins columns, so two quick UpdateJob calls
                     // must persist in order to avoid a stale restored value.
-                    if let Err(e) = self.db.try_queue_write("update_active_job", move |db| {
-                        db.update_active_job(job_id, &update)
-                    }) {
+                    if let Err(e) =
+                        self.db
+                            .try_queue_job_write(job_id, "update_active_job", move |db| {
+                                db.update_active_job(job_id, &update)
+                            })
+                    {
                         error!(error = %e, "failed to queue UpdateJob write");
                     }
                     self.publish_snapshot();

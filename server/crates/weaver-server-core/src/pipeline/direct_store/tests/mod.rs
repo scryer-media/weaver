@@ -408,6 +408,7 @@ fn direct_active_job() -> crate::ActiveJob {
 fn envelope_plan() -> DirectSetPlan {
     DirectSetPlan {
         set_name: "Silver.Horizon.S01E05".to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         files: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         identity: None,
@@ -877,7 +878,20 @@ fn member_facts(
     }
 }
 
+/// Cached facts for one RAR volume, in the envelope restore reads them from.
 fn volume_facts(
+    volume_number: u32,
+    more_volumes: bool,
+    members: Vec<unrar_rs::RarVolumeMemberFacts>,
+) -> crate::pipeline::direct_store::restart::DirectVolumeFacts {
+    crate::pipeline::direct_store::restart::DirectVolumeFacts::Rar(Box::new(rar_volume_facts(
+        volume_number,
+        more_volumes,
+        members,
+    )))
+}
+
+fn rar_volume_facts(
     volume_number: u32,
     more_volumes: bool,
     members: Vec<unrar_rs::RarVolumeMemberFacts>,
@@ -915,6 +929,7 @@ const REARM_MEMBER: &str = "Silver.Horizon.S01E04.mkv";
 fn rearm_router() -> DirectSetRouter {
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         files: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         identity: None,
@@ -1024,6 +1039,7 @@ const HOLE_SLICE_SIZE: u64 = 64;
 fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
@@ -1114,6 +1130,7 @@ fn encrypted_crypt_router_partial(
 
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
@@ -1158,7 +1175,606 @@ fn encrypted_crypt_router_partial(
     (router, cipher)
 }
 
+/// The write path's cost account: one pass over the member's cipher stream,
+/// whatever shape the articles arrive in.
+///
+/// The transform is the one thing an encrypted member pays that a plain one
+/// does not, so the way it silently becomes expensive is by running twice over
+/// bytes it has already resolved — a straddling block re-derived by both of
+/// its halves, a held span re-decrypted when it is finally released. Neither
+/// changes a single output byte, which is why this is asked of an accounting
+/// counter and not of the member's contents.
+///
+/// The articles are deliberately not block-aligned, so every boundary in the
+/// run is a straddling cipher block with one half in each article.
+#[test]
+fn the_write_transform_decrypts_each_cipher_byte_once() {
+    const HEADER: u64 = 1024;
+    const ARTICLE: usize = 7_000;
+    let plain: Vec<u8> = (0..300_000u32).map(|index| (index % 251) as u8).collect();
+    let (mut router, cipher) = encrypted_crypt_router_partial(&plain, HEADER, 0);
+
+    let mut routed_plain = 0u64;
+    let mut offset = 0usize;
+    while offset < cipher.len() {
+        let take = ARTICLE.min(cipher.len() - offset);
+        router.stage_for_test(0, HEADER + offset as u64, &cipher[offset..offset + take]);
+        for span in router
+            .drain_for_test(0)
+            .expect("the encrypted drain routes")
+        {
+            if matches!(
+                span.destination,
+                crate::pipeline::direct_store::router::DirectDestination::Member { .. }
+            ) {
+                routed_plain += span.len();
+            }
+        }
+        offset += take;
+    }
+
+    assert_eq!(
+        routed_plain,
+        plain.len() as u64,
+        "every member byte routes exactly once"
+    );
+    assert_eq!(
+        router.decrypted_bytes(),
+        cipher.len() as u64,
+        "the transform ran over the member's cipher stream once and no more"
+    );
+}
+
+/// Stages one encrypted member out of order and reports what the write path
+/// copied out of staging.
+///
+/// `order` names the spans of each window in arrival order, so a window whose
+/// first span arrives last leaves every span behind it waiting on a CBC
+/// predecessor that is not here. The drain runs after every arrival, which is
+/// what the set's own routing does: one gap must not cost a pass over the run
+/// behind it per article landing anywhere in the set.
+fn encrypted_out_of_order_copy_bytes(windows: usize, order: &[usize]) -> (u64, u64, u64) {
+    const HEADER: u64 = 1021;
+    let spans = order.len();
+    let plain: Vec<u8> = (0..299_993u32).map(|index| (index % 251) as u8).collect();
+    let (mut router, cipher) = encrypted_crypt_router_partial(&plain, HEADER, 0);
+    let span_len = cipher.len() / (windows * spans);
+
+    let mut routed_plain = 0u64;
+    for window in 0..windows {
+        let window_start = window * spans * span_len;
+        for position in order {
+            let from = window_start + position * span_len;
+            let to = if window + 1 == windows && position + 1 == spans {
+                cipher.len()
+            } else {
+                from + span_len
+            };
+            router.stage_for_test(0, HEADER + from as u64, &cipher[from..to]);
+            for span in router
+                .drain_for_test(0)
+                .expect("the encrypted drain routes")
+            {
+                if matches!(
+                    span.destination,
+                    crate::pipeline::direct_store::router::DirectDestination::Member { .. }
+                ) {
+                    routed_plain += span.len();
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        routed_plain,
+        plain.len() as u64,
+        "every member byte routes exactly once"
+    );
+    (
+        router.staged_copy_bytes(),
+        cipher.len() as u64,
+        spans as u64 * windows as u64,
+    )
+}
+
+/// The write path resolves a run before it materializes it.
+///
+/// A held run is one whose CBC predecessor has not arrived. Nothing about it
+/// can be routed, so every byte pulled out of staging on its behalf is a copy
+/// made and thrown away — and the drain of a set revisits every staged volume
+/// on every article, so a run that is copied before it is resolved is copied
+/// again on each arrival, for as long as the gap in front of it lasts. That
+/// turns one missing article into a pass over the whole run behind it per
+/// article received.
+///
+/// Counted rather than timed: the routed bytes are identical either way, which
+/// is exactly why only an accounting counter can tell the two apart. The
+/// allowance is a cipher block per edge of each span — the genuinely small
+/// reads that assemble a straddling block — and the articles are deliberately
+/// unaligned, so every boundary in the run is such a block.
+#[test]
+fn a_held_encrypted_run_is_not_copied_out_of_staging() {
+    let (copied, cipher_len, spans) =
+        encrypted_out_of_order_copy_bytes(6, &[1, 2, 3, 4, 5, 6, 7, 0]);
+    let allowance = cipher_len + 64 * spans;
+    assert!(
+        copied <= allowance,
+        "the write path copied {copied} bytes for a {cipher_len}-byte member; one pass plus an \
+         edge block per span is {allowance}"
+    );
+}
+
+/// The same, with the gap held open while a long run piles up behind it.
+///
+/// Twenty-four spans arrive before the one that unblocks them, so a path that
+/// re-copies the pending run on every arrival pays the whole triangle rather
+/// than the member.
+#[test]
+fn a_long_run_behind_one_gap_is_not_recopied_per_arrival() {
+    let order: Vec<usize> = (1..25).chain(std::iter::once(0)).collect();
+    let (copied, cipher_len, spans) = encrypted_out_of_order_copy_bytes(1, &order);
+    let allowance = cipher_len + 64 * spans;
+    assert!(
+        copied <= allowance,
+        "the write path copied {copied} bytes for a {cipher_len}-byte member; one pass plus an \
+         edge block per span is {allowance}"
+    );
+}
+
 mod par2_fileaccess_adapter_over;
 mod par3_source_access;
 mod recording_test_doubles;
 mod repair_transactions;
+
+/// [`straddle_router`] against a real working directory, so the set's holds
+/// scratch can be created.
+fn straddle_router_in(dir: &Path, member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
+    let plan = DirectSetPlan {
+        set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
+        volumes: [(0u32, 0u32)].into_iter().collect(),
+        files: [(0u32, 0u32)].into_iter().collect(),
+        identity: None,
+        working_dir: dir.to_path_buf(),
+        destination_dir: dir.join("staging"),
+    };
+    let mut router = DirectSetRouter::new(plan);
+    let facts = std::collections::BTreeMap::from([(
+        0u32,
+        volume_facts(0, false, {
+            let mut only = member_facts(
+                STRADDLE_MEMBER,
+                header_bytes,
+                member.len() as u64,
+                member.len() as u64,
+            );
+            only.data_crc32 = Some(par2_rs::checksum::crc32(member));
+            vec![only]
+        }),
+    )]);
+    router.restore_layout(&facts).expect("the facts rebuild");
+    let member_id = router
+        .member_partials()
+        .first()
+        .map(|(member_id, _, _)| *member_id)
+        .expect("the member was adopted");
+    (router, member_id)
+}
+
+/// The bytes a routed span carries, joined — what the vectored write puts on
+/// disk, in the order it puts it there.
+fn span_bytes(span: &super::router::RoutedSpan) -> Vec<u8> {
+    span.bytes.iter().flat_map(|piece| piece.to_vec()).collect()
+}
+
+const TOUCH_MEMBER_BYTES: usize = 400;
+
+const TOUCH_HEADER_BYTES: u64 = 64;
+
+/// One volume image whose member starts at [`TOUCH_HEADER_BYTES`].
+fn touch_once_image() -> Vec<u8> {
+    (0..TOUCH_HEADER_BYTES as usize + TOUCH_MEMBER_BYTES)
+        .map(|index| ((index * 31 + 7) % 251) as u8)
+        .collect()
+}
+
+#[test]
+fn a_run_drained_across_three_staged_pieces_is_byte_exact_and_composes_identically() {
+    let image = touch_once_image();
+    let member = &image[TOUCH_HEADER_BYTES as usize..];
+    let (mut router, member_id) = straddle_router(member, TOUCH_HEADER_BYTES);
+
+    // Three pieces, the way a batched decode hands the article over. The first
+    // boundary falls *inside* the first piece — the member starts at 64 and the
+    // piece runs to 150 — so the drained run starts mid-piece and then straddles
+    // the other two.
+    let pieces: Vec<bytes::Bytes> = [0usize..150, 150..300, 300..image.len()]
+        .into_iter()
+        .map(|range| bytes::Bytes::copy_from_slice(&image[range]))
+        .collect();
+    router.stage_pieces_for_test(0, 0, &pieces);
+    let spans = router.drain_for_test(0).expect("the drain routes");
+
+    let member_span = spans
+        .iter()
+        .find(|span| {
+            matches!(span.destination, super::router::DirectDestination::Member { member_id: id } if id == member_id)
+        })
+        .expect("the member run drained");
+    assert_eq!(
+        member_span.bytes.len(),
+        3,
+        "the run spans three staged pieces and is handed over as three views"
+    );
+    assert_eq!(member_span.len(), TOUCH_MEMBER_BYTES as u64);
+    assert_eq!(span_bytes(member_span), member);
+    assert_eq!(
+        super::router::crc32_over_pieces(&member_span.bytes),
+        par2_rs::checksum::crc32(member),
+        "composing over the pieces must give the value a single slice gives"
+    );
+    assert!(
+        router.all_members_verified(),
+        "the member's own gate composes over the same pieces"
+    );
+}
+
+#[test]
+fn a_paged_piece_inside_a_run_reads_back_as_one_piece_and_the_bytes_are_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = touch_once_image();
+    let member = &image[TOUCH_HEADER_BYTES as usize..];
+    let (mut router, member_id) = straddle_router_in(dir.path(), member, TOUCH_HEADER_BYTES);
+
+    // Sized so exactly the middle piece pages: the budget leaves room for the
+    // two 100-byte views and not for the 200-byte one between them.
+    let pieces: Vec<bytes::Bytes> = [0usize..100, 100..300, 300..400]
+        .into_iter()
+        .map(|range| bytes::Bytes::copy_from_slice(&member[range]))
+        .collect();
+    router.stage_pieces_for_test(0, TOUCH_HEADER_BYTES, &pieces);
+    router.set_holds_budget(200);
+    router
+        .page_holds_for_test()
+        .expect("the middle piece pages");
+
+    let spans = router.drain_for_test(0).expect("the drain routes");
+    let member_span = spans
+        .iter()
+        .find(|span| {
+            matches!(span.destination, super::router::DirectDestination::Member { member_id: id } if id == member_id)
+        })
+        .expect("the member run drained");
+    assert_eq!(
+        member_span.bytes.len(),
+        3,
+        "a paged chunk costs one positioned read and becomes one piece of its own"
+    );
+    assert_eq!(member_span.bytes[1].len(), 200);
+    assert_eq!(span_bytes(member_span), member);
+    assert!(router.all_members_verified());
+}
+
+#[test]
+fn a_routed_span_reports_the_length_of_every_piece_it_carries() {
+    let span = super::router::RoutedSpan {
+        destination: super::router::DirectDestination::Envelope { volume_index: 3 },
+        destination_offset: 512,
+        volume_index: 3,
+        source_offset: 512,
+        bytes: vec![
+            bytes::Bytes::from_static(b"first"),
+            bytes::Bytes::new(),
+            bytes::Bytes::from_static(b"second-piece"),
+        ],
+    };
+    assert_eq!(span.len(), 17);
+    assert_eq!(
+        span.len(),
+        span_bytes(&span).len() as u64,
+        "the reported length is the length of what is written"
+    );
+}
+
+/// A router with a plan and no layout: everything staged into it is a hold,
+/// because nothing can be mapped until a header parse binds the layout.
+fn layoutless_router() -> DirectSetRouter {
+    DirectSetRouter::new(DirectSetPlan {
+        set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
+        volumes: [(0u32, 0u32)].into_iter().collect(),
+        files: [(0u32, 0u32)].into_iter().collect(),
+        identity: None,
+        working_dir: std::path::PathBuf::from("/nonexistent"),
+        destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
+    })
+}
+
+/// One pooled article of `len` bytes from a pool with a single small slot,
+/// handed over the way the routing seam hands it: as a view of the slot.
+fn pooled_article(
+    len: usize,
+) -> (
+    std::sync::Arc<crate::runtime::buffers::BufferPool>,
+    Vec<bytes::Bytes>,
+) {
+    use crate::runtime::buffers::{BufferPool, BufferPoolConfig, BufferTier};
+    let pool = BufferPool::new(BufferPoolConfig {
+        small_count: 1,
+        medium_count: 0,
+        large_count: 0,
+    });
+    let mut handle = pool
+        .try_acquire(BufferTier::Small)
+        .expect("the slot is free");
+    let payload: Vec<u8> = (0..len as u32).map(|index| (index % 251) as u8).collect();
+    handle.as_mut_slice().expect("sole owner")[..len].copy_from_slice(&payload);
+    handle.set_len(len);
+    let pieces = crate::pipeline::DecodedChunk::Pooled(handle).pieces();
+    (pool, pieces)
+}
+
+#[test]
+fn a_short_hold_is_copied_out_of_its_slot_once_the_article_has_drained() {
+    let (pool, pieces) = pooled_article(4096);
+    let mut router = layoutless_router();
+    router.stage_pieces_for_test(0, 0, &pieces);
+    assert!(
+        router
+            .drain_for_test(0)
+            .expect("nothing to route")
+            .is_empty(),
+        "with no layout the article is held whole"
+    );
+    drop(pieces);
+    assert_eq!(
+        pool.metrics().small_in_use,
+        1,
+        "the held view keeps the slot out of the pool"
+    );
+
+    let copied = router.release_article_views(0, 0, 4096, false);
+    assert_eq!(
+        copied, 4096,
+        "a residue under the limit is copied unconditionally"
+    );
+    assert_eq!(
+        pool.metrics().small_in_use,
+        0,
+        "the copy released the slot while the hold stays staged"
+    );
+    assert_eq!(
+        router.release_article_views(0, 0, 4096, true),
+        0,
+        "a hold already copied out owns its bytes and is not copied again"
+    );
+}
+
+#[test]
+fn a_long_hold_keeps_its_view_unless_the_pool_is_scarce() {
+    const LEN: usize = 128 * 1024;
+    let (pool, pieces) = pooled_article(LEN);
+    let mut router = layoutless_router();
+    router.stage_pieces_for_test(0, 0, &pieces);
+    assert!(
+        router
+            .drain_for_test(0)
+            .expect("nothing to route")
+            .is_empty()
+    );
+    drop(pieces);
+
+    assert_eq!(
+        router.release_article_views(0, 0, LEN as u64, false),
+        0,
+        "a hold longer than the limit keeps its view while the pool has slots to spare"
+    );
+    assert_eq!(pool.metrics().small_in_use, 1);
+
+    assert_eq!(
+        router.release_article_views(0, 0, LEN as u64, true),
+        LEN as u64,
+        "a scarce pool buys its slot back with the copy holds always cost before views"
+    );
+    assert_eq!(pool.metrics().small_in_use, 0);
+    assert!(
+        !pool.is_scarce(crate::runtime::buffers::BufferTier::Small),
+        "the returned slot is the whole pool, so it is no longer scarce"
+    );
+}
+
+/// A decoder batch as the inline decode produces it: an allocation of its own,
+/// adopted by `Bytes` without a copy.
+fn decoder_batch(len: usize) -> bytes::Bytes {
+    let payload: Vec<u8> = (0..len as u32).map(|index| (index % 251) as u8).collect();
+    bytes::Bytes::from(payload.into_boxed_slice())
+}
+
+/// The holds budget charges a view its own length, so a view kept past its
+/// article must cover most of the batch it keeps alive. One that covers less
+/// than half leaves it, whatever its length and whatever the pool's state.
+#[test]
+fn a_hold_covering_less_than_half_its_batch_is_copied_out() {
+    const BATCH: usize = 512 * 1024;
+    const ALREADY_STAGED: usize = 412 * 1024;
+    let mut router = layoutless_router();
+    // An earlier copy of the range's head, so the batch contributes only its
+    // last 100 KiB — longer than the short-residue limit.
+    router.stage_pieces_for_test(0, 0, &[decoder_batch(ALREADY_STAGED)]);
+    let batch = decoder_batch(BATCH);
+    router.stage_pieces_for_test(0, 0, std::slice::from_ref(&batch));
+    assert!(!batch.is_unique(), "the staged tail is a view of the batch");
+
+    assert_eq!(
+        router.release_article_views(0, 0, BATCH as u64, false),
+        (BATCH - ALREADY_STAGED) as u64,
+        "only the view of a fifth of its batch is copied; the whole-piece hold keeps its bytes"
+    );
+    assert!(
+        batch.is_unique(),
+        "nothing staged keeps the batch alive once its sliver is copied"
+    );
+}
+
+#[test]
+fn a_hold_covering_most_of_its_batch_keeps_its_view() {
+    const BATCH: usize = 512 * 1024;
+    const ALREADY_STAGED: usize = 100 * 1024;
+    let mut router = layoutless_router();
+    router.stage_pieces_for_test(0, 0, &[decoder_batch(ALREADY_STAGED)]);
+    let batch = decoder_batch(BATCH);
+    router.stage_pieces_for_test(0, 0, std::slice::from_ref(&batch));
+
+    assert_eq!(
+        router.release_article_views(0, 0, BATCH as u64, false),
+        0,
+        "a view of most of its batch pins at most twice what it charges, so it stays zero-copy"
+    );
+    assert!(!batch.is_unique(), "the kept view still shares the batch");
+}
+
+/// A view kept whole when its article drained can be cut down later, by the
+/// drain trimming routed bytes or by a repair overwriting part of it. The cut
+/// still pins the whole batch, so it faces the same rule.
+#[test]
+fn cutting_a_kept_view_down_to_a_sliver_copies_the_sliver_out() {
+    const BATCH: usize = 512 * 1024;
+    const OVERWRITTEN: usize = 400 * 1024;
+    let mut router = layoutless_router();
+    let batch = decoder_batch(BATCH);
+    router.stage_pieces_for_test(0, 0, std::slice::from_ref(&batch));
+    assert_eq!(
+        router.release_article_views(0, 0, BATCH as u64, false),
+        0,
+        "the whole batch is held, so the view is kept"
+    );
+    assert!(!batch.is_unique());
+
+    router.force_stage_for_test(0, 0, &vec![0u8; OVERWRITTEN], true);
+    assert!(
+        batch.is_unique(),
+        "the 112 KiB left of the view was copied when it was cut from the 512 KiB batch"
+    );
+}
+
+#[test]
+fn copying_a_hold_out_only_touches_the_article_it_was_asked_about() {
+    let (pool, pieces) = pooled_article(4096);
+    let mut router = layoutless_router();
+    router.stage_pieces_for_test(0, 0, &pieces);
+    // A second, unrelated hold further along the volume.
+    router.stage_pieces_for_test(0, 1 << 20, &[bytes::Bytes::from_static(b"elsewhere")]);
+    assert!(
+        router
+            .drain_for_test(0)
+            .expect("nothing to route")
+            .is_empty()
+    );
+    drop(pieces);
+
+    assert_eq!(
+        router.release_article_views(0, 1 << 20, 9, true),
+        9,
+        "only the chunks inside the asked-for range are copied"
+    );
+    assert_eq!(
+        pool.metrics().small_in_use,
+        1,
+        "the other article's slot is untouched"
+    );
+    assert_eq!(router.release_article_views(0, 0, 4096, false), 4096);
+    assert_eq!(pool.metrics().small_in_use, 0);
+}
+
+#[test]
+fn a_pool_is_scarce_at_a_quarter_free_and_not_above_it() {
+    use crate::runtime::buffers::{BufferPool, BufferPoolConfig, BufferTier};
+    let pool = BufferPool::new(BufferPoolConfig {
+        small_count: 8,
+        medium_count: 0,
+        large_count: 0,
+    });
+    let mut held = Vec::new();
+    while pool.available(BufferTier::Small) > 2 {
+        assert!(!pool.is_scarce(BufferTier::Small));
+        held.push(pool.try_acquire(BufferTier::Small).expect("a slot is free"));
+    }
+    assert!(
+        pool.is_scarce(BufferTier::Small),
+        "two of eight free is a quarter"
+    );
+    held.pop();
+    assert!(
+        !pool.is_scarce(BufferTier::Small),
+        "three of eight free is not"
+    );
+}
+
+#[tokio::test]
+async fn every_decoded_chunk_shape_hands_over_its_payload_without_copying_it() {
+    use crate::pipeline::DecodedChunk;
+    use crate::runtime::buffers::{BufferPool, BufferPoolConfig, BufferTier};
+
+    let contiguous = DecodedChunk::from(b"one contiguous article".to_vec());
+    let pieces = contiguous.pieces();
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(pieces[0].as_ref(), b"one contiguous article");
+    let DecodedChunk::Contiguous(held) = &contiguous else {
+        panic!("a single buffer stays contiguous");
+    };
+    assert_eq!(
+        pieces[0].as_ptr(),
+        held.as_ptr(),
+        "the piece is the decoded buffer, not a copy of it"
+    );
+
+    let boxes: Vec<Box<[u8]>> = vec![
+        b"alpha".to_vec().into_boxed_slice(),
+        b"bravo-batch".to_vec().into_boxed_slice(),
+        b"charlie".to_vec().into_boxed_slice(),
+    ];
+    let expected: Vec<*const u8> = boxes.iter().map(|chunk| chunk.as_ptr()).collect();
+    let batched = DecodedChunk::from(boxes);
+    let pieces = batched.pieces();
+    assert_eq!(pieces.len(), 3);
+    let actual: Vec<*const u8> = pieces.iter().map(|piece| piece.as_ptr()).collect();
+    assert_eq!(
+        actual, expected,
+        "each batch reaches the router as the very allocation the decoder produced"
+    );
+    assert_eq!(
+        pieces
+            .iter()
+            .flat_map(|piece| piece.to_vec())
+            .collect::<Vec<u8>>(),
+        b"alphabravo-batchcharlie".to_vec()
+    );
+
+    let pool = BufferPool::new(BufferPoolConfig {
+        small_count: 1,
+        medium_count: 0,
+        large_count: 0,
+    });
+    let mut handle = pool.acquire(BufferTier::Small).await;
+    let payload: Vec<u8> = (0..4096u32).map(|index| (index % 251) as u8).collect();
+    handle.as_mut_slice().expect("sole owner")[..payload.len()].copy_from_slice(&payload);
+    handle.set_len(payload.len());
+    let slot = handle.as_slice().as_ptr();
+    let pooled = DecodedChunk::Pooled(handle);
+    let pieces = pooled.pieces();
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(pieces[0].len(), payload.len());
+    assert_eq!(
+        pieces[0].as_ptr(),
+        slot,
+        "a pooled article is handed over as a view of its slot"
+    );
+    assert_eq!(pieces[0].as_ref(), payload.as_slice());
+
+    // The slot stays out of the pool while a view of it lives, and comes back
+    // when the last one drops.
+    drop(pooled);
+    assert_eq!(pool.metrics().small_in_use, 1);
+    drop(pieces);
+    assert_eq!(pool.metrics().small_in_use, 0);
+}

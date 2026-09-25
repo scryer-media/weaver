@@ -910,7 +910,7 @@ enum CleanPar2IntegrityGate {
     StrongDecode,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Hash)]
 struct PromotedRecoveryPipelineState {
     download_queue_len: usize,
     download_queue_has_recovery: bool,
@@ -1587,9 +1587,53 @@ fn placement_plan_from_verification(
     }
 }
 
+/// How much of a set's per-volume detail a phase summary spells out.
+///
+/// The announced checkpoint carries one summary per set, and the suspect
+/// index list is the part that grows with the set: a sixty-volume set whose
+/// every volume is suspect renders sixty indexes that say nothing the count
+/// does not. [`RarSetPhaseDetail::Counted`] collapses it to a count and the
+/// contiguous runs it covers; [`RarSetPhaseDetail::Full`] keeps the list for
+/// the diagnostic level, where the individual index is what is being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RarSetPhaseDetail {
+    Counted,
+    Full,
+}
+
+/// Contiguous runs of a sorted index list, rendered as `1-40,42,58-60`.
+///
+/// Capped: past a handful of runs the shape is no longer what a summary line
+/// is for, and the count beside it already carries the size.
+fn summarize_volume_index_ranges(sorted: &[u32]) -> String {
+    const MAX_RANGES: usize = 4;
+    let mut rendered: Vec<String> = Vec::new();
+    let mut index = 0usize;
+    while index < sorted.len() {
+        let start = sorted[index];
+        let mut end = start;
+        while index + 1 < sorted.len() && sorted[index + 1] == end.saturating_add(1) {
+            index += 1;
+            end = sorted[index];
+        }
+        index += 1;
+        if rendered.len() == MAX_RANGES {
+            rendered.push("…".to_string());
+            break;
+        }
+        if start == end {
+            rendered.push(start.to_string());
+        } else {
+            rendered.push(format!("{start}-{end}"));
+        }
+    }
+    rendered.join(",")
+}
+
 fn summarize_rar_set_phase(
     set_name: &str,
     set_state: &crate::pipeline::archive::rar_state::RarSetState,
+    detail: RarSetPhaseDetail,
 ) -> String {
     let phase = set_state
         .plan
@@ -1628,14 +1672,64 @@ fn summarize_rar_set_phase(
         .copied()
         .collect::<Vec<_>>();
     suspect_volumes.sort_unstable();
+    let suspect = match detail {
+        RarSetPhaseDetail::Full => format!("{suspect_volumes:?}"),
+        RarSetPhaseDetail::Counted => {
+            let known_volumes = set_state.volume_files.len().max(set_state.facts.len());
+            if suspect_volumes.is_empty() {
+                format!("0 of {known_volumes}")
+            } else {
+                format!(
+                    "{} of {known_volumes} [{}]",
+                    suspect_volumes.len(),
+                    summarize_volume_index_ranges(&suspect_volumes)
+                )
+            }
+        }
+    };
 
     format!(
-        "{set_name}: phase={phase:?} workers={} ready={ready_members:?} waiting={waiting_on_volumes:?} inflight={in_flight_members:?} suspect={suspect_volumes:?}",
+        "{set_name}: phase={phase:?} workers={} ready={ready_members:?} waiting={waiting_on_volumes:?} inflight={in_flight_members:?} suspect={suspect}",
         set_state.active_workers,
     )
 }
 
 impl Pipeline {
+    /// Whether the RAR completion checkpoint has something new to say.
+    ///
+    /// True the first time a job reaches the checkpoint and whenever its
+    /// content has moved since the last announcement; false while a waiting
+    /// job re-enters the checkpoint with the same answer. A job the pipeline
+    /// no longer holds is announced, so a caller can never lose a line to a
+    /// missing record.
+    fn note_rar_completion_checkpoint(&mut self, job_id: JobId, fingerprint: u64) -> bool {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return true;
+        };
+        if state.announced_checkpoints.rar_completion == Some(fingerprint) {
+            return false;
+        }
+        state.announced_checkpoints.rar_completion = Some(fingerprint);
+        true
+    }
+
+    /// Whether the reason a demoted direct set is holding PAR2 settlement up
+    /// has changed since it was last named.
+    pub(in crate::pipeline) fn note_demoted_materialization_block(
+        &mut self,
+        job_id: JobId,
+        fingerprint: u64,
+    ) -> bool {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return true;
+        };
+        if state.announced_checkpoints.demoted_materialization == Some(fingerprint) {
+            return false;
+        }
+        state.announced_checkpoints.demoted_materialization = Some(fingerprint);
+        true
+    }
+
     fn current_rar_set_names_for_job(&self, job_id: JobId) -> HashSet<String> {
         let Some(state) = self.jobs.get(&job_id) else {
             return HashSet::new();
@@ -1857,23 +1951,75 @@ impl Pipeline {
                 topology.archive_type == crate::jobs::assembly::ArchiveType::SevenZip
             })
             .any(|(set_name, topology)| {
-                let numbered: HashSet<u32> = topology.volume_map.values().copied().collect();
-                let interior_hole = topology.expected_volume_count.is_some_and(|expected| {
-                    (0..expected).any(|volume| !numbered.contains(&volume))
-                });
-                if interior_hole {
-                    return true;
-                }
-                served_set.is_some_and(|par2_set| {
-                    !Self::absent_described_sevenz_parts(
-                        &state.working_dir,
-                        set_name,
-                        topology,
-                        par2_set,
-                    )
-                    .is_empty()
-                })
+                Self::sevenz_set_has_absent_volumes(
+                    &state.working_dir,
+                    set_name,
+                    topology,
+                    served_set.map(|set| &**set),
+                )
             })
+    }
+
+    /// Whether a full 7z set of this job failed to extract with every one of
+    /// its parts present.
+    ///
+    /// A clean strong-decode verdict is a claim about the archive *type*: that
+    /// extracting it would prove its bytes. A 7z set that then fails on its
+    /// bytes, with nothing missing, is that proof failing, and the verdict it
+    /// settled on is stale. Only the recovery data can say which bytes are
+    /// wrong and rebuild them. A set short of a part is the absent-volume
+    /// reading's, not this one's.
+    ///
+    /// Keyed on the set name, which is what a failed full-set extraction
+    /// records as its failed member.
+    pub(crate) fn job_has_failed_sevenz_set_with_all_volumes(&self, job_id: JobId) -> bool {
+        let Some(failed) = self.failed_extractions.get(&job_id) else {
+            return false;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let served_set = self
+            .par2_served_set_id(job_id)
+            .and_then(|set_id| self.par2_set_for(job_id, set_id));
+        state
+            .assembly
+            .archive_topologies()
+            .iter()
+            .filter(|(set_name, topology)| {
+                topology.archive_type == crate::jobs::assembly::ArchiveType::SevenZip
+                    && failed.contains(set_name.as_str())
+            })
+            .any(|(set_name, topology)| {
+                !Self::sevenz_set_has_absent_volumes(
+                    &state.working_dir,
+                    set_name,
+                    topology,
+                    served_set.map(|set| &**set),
+                )
+            })
+    }
+
+    /// One 7z set's half of [`Self::job_has_sevenz_set_waiting_for_absent_volumes`]:
+    /// a gap in its numbering, or a part the recovery set describes that
+    /// neither the topology nor the working directory has.
+    fn sevenz_set_has_absent_volumes(
+        working_dir: &Path,
+        set_name: &str,
+        topology: &crate::jobs::assembly::ArchiveTopology,
+        served_set: Option<&par2_rs::Par2FileSet>,
+    ) -> bool {
+        let numbered: HashSet<u32> = topology.volume_map.values().copied().collect();
+        let interior_hole = topology
+            .expected_volume_count
+            .is_some_and(|expected| (0..expected).any(|volume| !numbered.contains(&volume)));
+        if interior_hole {
+            return true;
+        }
+        served_set.is_some_and(|par2_set| {
+            !Self::absent_described_sevenz_parts(working_dir, set_name, topology, par2_set)
+                .is_empty()
+        })
     }
 
     /// The parts of one split 7z set that the recovery set describes, the

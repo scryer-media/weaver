@@ -626,9 +626,11 @@ fn spawn_test_scheduler(
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
                         category_bytes: None,
+                        nzb_password_candidates: Default::default(),
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
                         server_attribution: Default::default(),
+                        announced_checkpoints: Default::default(),
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -780,9 +782,11 @@ fn spawn_test_scheduler(
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
                         category_bytes: None,
+                        nzb_password_candidates: Default::default(),
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
                         server_attribution: Default::default(),
+                        announced_checkpoints: Default::default(),
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));

@@ -21,11 +21,19 @@ func TestDirectDemotionReasonStripsAnsi(t *testing.T) {
 // demotion from a corrupt-on-purpose fixture is the product working, the same
 // demotion from a healthy set is the failure this check exists to catch.
 func TestDirectDemotionAttribution(t *testing.T) {
-	if !jobIsAllowedToDemoteOnDamage("E2E Test RAR4 Corrupted") {
+	corrupt := &Scenario{Slug: "rar4-corrupted", ExpectedOutcome: "extraction_failure"}
+	if !scenarioAllowsDamageDemotion(corrupt, "member_checksum_mismatch") {
 		t.Fatal("a deliberately corrupt fixture must be allowed to demote on damage")
 	}
-	if jobIsAllowedToDemoteOnDamage("Silver Horizon — S01E01") {
+	healthy := &Scenario{Slug: "rar5-direct-clean", ExpectedOutcome: "success"}
+	if scenarioAllowsDamageDemotion(healthy, "member_checksum_mismatch") {
 		t.Fatal("a healthy direct fixture must not be exempt")
+	}
+	if scenarioAllowsDamageDemotion(nil, "member_checksum_mismatch") {
+		t.Fatal("a job no scenario was submitted as must not be exempt")
+	}
+	if scenarioAllowsDamageDemotion(corrupt, "member_compressed") {
+		t.Fatal("only damage reasons are exempt")
 	}
 	if !isDamageDemotion("member_checksum_mismatch") || isDamageDemotion("member_compressed") {
 		t.Fatal("damage classification is wrong")
@@ -40,6 +48,33 @@ func TestDirectDemotionAttribution(t *testing.T) {
 		if !byDesignDirectRefusals[reason] {
 			t.Fatalf("%s is a refused destination, not a carry failure", reason)
 		}
+	}
+}
+
+// A scenario that pins direct-store behaviour owns its demotions: a damaged
+// post it expects to be repaired in place is not excused by its outcome, and
+// only the demotion it names is allowed.
+func TestDirectStoreScenarioOwnsItsDemotions(t *testing.T) {
+	inPlace := &Scenario{
+		Slug:              "direct-store-sealed-repair",
+		ExpectedOutcome:   "repair_then_success",
+		RuntimeAssertions: &ScenarioRuntimeAssertions{DirectStore: &ScenarioDirectStoreAssertion{}},
+	}
+	if scenarioAllowsDamageDemotion(inPlace, "par2_damaged") {
+		t.Fatal("an in-place repair scenario must not be excused a demotion it does not declare")
+	}
+	declared := &Scenario{
+		Slug:            "direct-store-dead-volume",
+		ExpectedOutcome: "repair_failure",
+		RuntimeAssertions: &ScenarioRuntimeAssertions{DirectStore: &ScenarioDirectStoreAssertion{
+			ExpectedDemotionReason: "par2_damaged",
+		}},
+	}
+	if !scenarioAllowsDamageDemotion(declared, "par2_damaged") {
+		t.Fatal("the declared demotion must be allowed")
+	}
+	if scenarioAllowsDamageDemotion(declared, "member_checksum_mismatch") {
+		t.Fatal("only the declared demotion is allowed")
 	}
 }
 
@@ -58,11 +93,30 @@ func TestCollidingDestinationsIsNotAnUnexpectedDemotion(t *testing.T) {
 	}
 }
 
-func TestDirectStoreJobNamesParsesColouredLog(t *testing.T) {
-	line := "INFO \x1b[2mweaver_server_core::ingest\x1b[0m: submitted NZB job " +
-		"\x1b[3mjob_id\x1b[0m\x1b[2m=\x1b[0m10047 \x1b[3mname\x1b[0m\x1b[2m=\x1b[0mE2E Test RAR4 Corrupted category=\"2000\""
-	names := directStoreJobNames(line)
-	if names["10047"] != "E2E Test RAR4 Corrupted" {
-		t.Fatalf("job name = %q", names["10047"])
+// Demotions are attributed by job id to the scenario submitted as that job, and
+// reported by slug, whatever the job came to be called in weaver's own log.
+func TestUnexpectedDirectDemotionsAttributesBySlug(t *testing.T) {
+	jobs := []testJob{
+		{slug: "rar4-corrupted", jobID: 10047, scenario: &Scenario{Slug: "rar4-corrupted", ExpectedOutcome: "extraction_failure"}},
+		{slug: "rar5-direct-clean", jobID: 10048, scenario: &Scenario{Slug: "rar5-direct-clean", ExpectedOutcome: "success"}},
+		{slug: "never-submitted", scenario: &Scenario{Slug: "never-submitted", ExpectedOutcome: "success"}},
+	}
+	log := "WARN direct-store set demoted \x1b[3mjob_id\x1b[0m\x1b[2m=\x1b[0m10047 " +
+		"\x1b[3mreason\x1b[0m\x1b[2m=\x1b[0m\"member_checksum_mismatch\"\n" +
+		`WARN direct-store set demoted job_id=10048 reason="member_checksum_mismatch"` + "\n" +
+		`WARN direct-store set demoted job_id=10048 reason="member_compressed"` + "\n" +
+		`WARN direct-store set demoted job_id=10099 reason="par2_damaged"` + "\n"
+	got := unexpectedDirectDemotions(log, submittedScenariosByJobID(jobs))
+	want := []string{
+		"member_checksum_mismatch (job rar5-direct-clean) x1",
+		"par2_damaged (job id 10099) x1",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %q, want %q", got, want)
+		}
 	}
 }

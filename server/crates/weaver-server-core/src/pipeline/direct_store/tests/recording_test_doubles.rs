@@ -2100,11 +2100,11 @@ fn crc_runs_refuse_every_shape_of_overlap() {
 fn a_sparse_image_reads_across_run_boundaries_and_stops_at_every_hole() {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut chunks: std::collections::BTreeMap<u64, std::sync::Arc<[u8]>> =
+    let mut chunks: std::collections::BTreeMap<u64, bytes::Bytes> =
         std::collections::BTreeMap::new();
-    chunks.insert(0u64, std::sync::Arc::from(&[1u8, 2, 3, 4][..]));
-    chunks.insert(4u64, std::sync::Arc::from(&[5u8, 6][..]));
-    chunks.insert(16u64, std::sync::Arc::from(&[9u8, 9, 9][..]));
+    chunks.insert(0u64, bytes::Bytes::from_static(&[1u8, 2, 3, 4]));
+    chunks.insert(4u64, bytes::Bytes::from_static(&[5u8, 6]));
+    chunks.insert(16u64, bytes::Bytes::from_static(&[9u8, 9, 9]));
     let mut image = SparseImage::from_chunks(&chunks);
 
     // Adjacent runs are still separate runs: a read stops at the boundary and
@@ -2257,6 +2257,7 @@ fn two_sets_of_one_job_never_share_a_derived_path() {
     let first = envelope_plan();
     let mut second = DirectSetPlan {
         set_name: "Silver.Horizon/S01E05".to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         files: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         identity: None,
@@ -2467,6 +2468,7 @@ fn destination_names_stay_inside_the_filename_ceiling_with_their_suffix() {
     let long = "S".repeat(400);
     let plan = DirectSetPlan {
         set_name: long.clone(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         files: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         identity: None,
@@ -2562,7 +2564,13 @@ fn repair_batch_checkpoint(corrupt: bool) {
 
     let spans = set
         .router
-        .route_repaired_batch(0, &[(64, Arc::from(&image[..200]))], &[], false, false)
+        .route_repaired_batch(
+            0,
+            &[(64, bytes::Bytes::copy_from_slice(&image[..200]))],
+            &[],
+            false,
+            false,
+        )
         .unwrap();
     set.record_writes(&spans, Instant::now());
     let operations = recorder.ops();
@@ -2578,9 +2586,9 @@ fn repair_batch_checkpoint(corrupt: bool) {
     if corrupt {
         tail[0] ^= 1;
     }
-    let result = set
-        .router
-        .route_repaired_batch(0, &[(264, Arc::from(tail))], &[], false, true);
+    let result =
+        set.router
+            .route_repaired_batch(0, &[(264, bytes::Bytes::from(tail))], &[], false, true);
     if corrupt {
         assert!(result.is_err());
         assert!(set.router.repair_batch_in_progress());
@@ -2629,7 +2637,7 @@ fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
     covered.insert(0, 100);
     covered.insert(140, total - 140);
     let mut fixture = provider_fixture(covered.clone());
-    let held: Arc<[u8]> = Arc::from(&fixture.conventional[100..140]);
+    let held = bytes::Bytes::copy_from_slice(&fixture.conventional[100..140]);
     fixture.volume.held = Arc::new(vec![super::super::provider::HeldRun::memory(
         100, held, 0, 40,
     )]);

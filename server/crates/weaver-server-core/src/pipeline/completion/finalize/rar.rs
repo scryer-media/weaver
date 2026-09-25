@@ -1903,6 +1903,21 @@ impl Pipeline {
         if !retry_members.is_empty() {
             self.clear_persisted_extracted_members(job_id).await;
         }
+        // A finalized direct set's row is its installation marker, which
+        // vouches for exactly the members withdrawn above: left standing, a
+        // restart during the retry would re-record them and skip the refetch.
+        // Any other row for a retried set describes bytes about to be
+        // deleted, so it goes too.
+        for set_name in &retry_sets {
+            if let Err(error) = self.db.delete_direct_coverage(job_id, set_name) {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to drop a retried set's direct-store row before source retry"
+                );
+            }
+        }
 
         for set_name in &retry_sets {
             self.clear_archive_set_for_source_retry(job_id, set_name);

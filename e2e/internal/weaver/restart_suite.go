@@ -267,6 +267,12 @@ func restartCases() []restartCase {
 			Timeout:     8 * time.Minute,
 			Run:         runDirectStorePar2AliasClaimantCompletesAfterRestart,
 		},
+		{
+			Name:        "conventional_7z_damaged_block_repairs_once",
+			Description: "A split 7z settled clean on the strong-decode claim whose conventional extraction hits a damaged block is repaired once and completes",
+			Slugs:       []string{conventional7zRepairSlug},
+			Run:         runConventional7zDamagedBlockRepairsOnce,
+		},
 	}
 }
 
@@ -1054,7 +1060,7 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 	if err != nil {
 		return snapshot, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	rows, err := db.Query(rebindWeaverSQL(datastore, `
 		SELECT job_id, status, COALESCE(download_state, ''), COALESCE(post_state, ''), COALESCE(run_state, ''),
@@ -1323,7 +1329,7 @@ func insertActiveExtractedMembers(dbPath string, members []restartExtractedMembe
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -1348,12 +1354,54 @@ func insertActiveExtractedMembers(dbPath string, members []restartExtractedMembe
 	return tx.Commit()
 }
 
+// jobArchived reports whether the job's history row exists. The archive that
+// writes it deletes the job's active rows in the same transaction, so once it
+// exists the active side is gone too — whatever GraphQL, which answers from
+// memory, reported before that commit reached the datastore.
+func jobArchived(dbPath string, jobID int) (bool, error) {
+	db, datastore, err := openWeaverStateDB(dbPath)
+	if err != nil {
+		return false, err
+	}
+	defer closeWeaverStateDB(db, datastore)
+
+	var count int
+	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT COUNT(*) FROM job_history WHERE job_id = ?`), jobID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// waitForJobArchived polls until the job's archive has committed. A terminal
+// status seen through GraphQL precedes it; anything that reads the job's
+// active rows or its history row after a terminal wait waits for this first.
+// It has no deadline of its own: the phase runner's bound ends a wait that
+// never resolves.
+func waitForJobArchived(dbPath string, jobID int) error {
+	return awaitJobArchived(func() (bool, error) { return jobArchived(dbPath, jobID) }, func() {
+		time.Sleep(2 * time.Second)
+	})
+}
+
+func awaitJobArchived(archived func() (bool, error), pause func()) error {
+	for {
+		done, err := archived()
+		if err != nil {
+			return fmt.Errorf("read job archive state: %w", err)
+		}
+		if done {
+			return nil
+		}
+		pause()
+	}
+}
+
 func countActiveExtractedMembers(dbPath string, jobID int) (int, error) {
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	var count int
 	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT COUNT(*) FROM active_extracted WHERE job_id = ?`), jobID).Scan(&count); err != nil {
@@ -1368,7 +1416,7 @@ func capturePar2AliasState(dbPath string, jobID int) (restartPar2AliasState, err
 	if err != nil {
 		return state, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	rows, err := db.Query(rebindWeaverSQL(datastore, `
 		SELECT current_filename,
@@ -1466,7 +1514,7 @@ func jobEventKinds(dbPath string, jobID int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	rows, err := db.Query(rebindWeaverSQL(datastore, `SELECT kind FROM job_events WHERE job_id = ? ORDER BY id`), jobID)
 	if err != nil {
@@ -1504,7 +1552,7 @@ func forceActiveJobRuntimeStates(dbPath string, states map[int]forcedActiveRunti
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -1716,11 +1764,20 @@ func restartJobStatusFromDB(dbPath string, jobID int) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	var status string
 	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT status FROM active_jobs WHERE job_id = ?`), jobID).Scan(&status); err == nil {
-		return normalizeRestartDBStatus(status), true
+		// Weaver writes a terminal status to the active row before the
+		// archive moves the job to job_history, as a separate write. Treating
+		// that row as terminal lets a caller check the active tables before
+		// the archive has emptied them, so the job only counts as terminal
+		// once its history row exists.
+		normalized := normalizeRestartDBStatus(status)
+		if normalized == "COMPLETE" || normalized == "FAILED" {
+			return "ARCHIVING", true
+		}
+		return normalized, true
 	}
 	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT status FROM job_history WHERE job_id = ?`), jobID).Scan(&status); err == nil {
 		return normalizeRestartDBStatus(status), true
@@ -2737,6 +2794,9 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 	if err != nil {
 		return restartCaseResult{}, err
 	}
+	if err := waitForJobArchived(dbPath, jobID); err != nil {
+		return restartCaseResult{}, err
+	}
 	postCount, err := countActiveExtractedMembers(dbPath, jobID)
 	if err != nil {
 		return restartCaseResult{}, fmt.Errorf("count stale active_extracted rows after restart: %w", err)
@@ -2920,6 +2980,9 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 	if err != nil {
 		return restartCaseResult{}, fmt.Errorf("PAR2 alias claimant did not leave the completion loop after restart: %w", err)
 	}
+	if err := waitForJobArchived(dbPath, jobID); err != nil {
+		return restartCaseResult{}, err
+	}
 	_, _, metrics, err := ctx.captureEvidence("post_restart", "")
 	if err != nil {
 		return restartCaseResult{}, err
@@ -2944,5 +3007,108 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 		false,
 		"",
 		fmt.Sprintf("PAR2 alias restart failed (final=%s refetched articles %d bodies %d retirement_loops=%d digest=%s)", statuses[jobID], refetchedIDs, refetchedBodies, retirementLoops, digestFailure),
+	), nil
+}
+
+// conventional7zRepairSlug is a six-volume PPMd split 7z with one damaged
+// volume and PAR2 recovery that covers it. Its parity slices are straddled by
+// every article, so no in-stream block verdict exists and nothing names the
+// damage before extraction: the completion check settles the set clean on the
+// strong-decode claim, and the conventional decode is what finds the damage.
+const conventional7zRepairSlug = "direct-unpack-repair-unvouched"
+
+// conventional7zRepairLog is what one job's log says about the path it took
+// through a damaged block found by extraction.
+type conventional7zRepairLog struct {
+	// SkippedAuthoritativeVerify: the set was settled clean on the
+	// strong-decode claim, without an authoritative PAR2 pass.
+	SkippedAuthoritativeVerify bool
+	// DataErrorAfterSkip: a full-set extraction then failed with an error
+	// worded as a block data error, the wording that keeps the set for the
+	// recovery data instead of ending the job.
+	DataErrorAfterSkip bool
+	// Failed: the job was failed.
+	Failed bool
+}
+
+func readConventional7zRepairLog(logText string, jobID int) conventional7zRepairLog {
+	job := fmt.Sprintf(" job_id=%d ", jobID)
+	var shape conventional7zRepairLog
+	for _, line := range strings.Split(stripANSIEscapeSequences(logText), "\n") {
+		if !strings.Contains(line+" ", job) {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "skipping authoritative PAR2 verify for clean exhausted strong-decode job"):
+			shape.SkippedAuthoritativeVerify = true
+		case strings.Contains(line, "set extraction failed") &&
+			strings.Contains(line, "error=7z block data error: "):
+			if shape.SkippedAuthoritativeVerify {
+				shape.DataErrorAfterSkip = true
+			}
+		case strings.Contains(line, " job failed"+job):
+			shape.Failed = true
+		}
+	}
+	return shape
+}
+
+// runConventional7zDamagedBlockRepairsOnce drives the conventional path with
+// the chase off, so the set reaches extraction the way a set the chase could
+// not take does. The contract: the strong-decode skip settles the set, the
+// extraction's block data error reopens the verdict, one repair rebuilds the
+// volume, and the job completes with the expected output, never failing.
+func runConventional7zDamagedBlockRepairsOnce(ctx *restartCaseContext) (restartCaseResult, error) {
+	if err := ctx.startWeaverWithOptions("", 8, restartClassicExtractEnv); err != nil {
+		return restartCaseResult{}, err
+	}
+	jobID, err := ctx.submitSlug(conventional7zRepairSlug)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	dbPath := filepath.Join(ctx.CaseDir, "weaver.db")
+	if err := waitForJobArchived(dbPath, jobID); err != nil {
+		return restartCaseResult{}, err
+	}
+	digestErr := assertOutputBLAKE3(dbPath, jobID, ctx.Scenarios[conventional7zRepairSlug].ExpectedOutputBLAKE3)
+	events, eventsErr := jobEventKinds(dbPath, jobID)
+	repairs := 0
+	for _, kind := range events {
+		if kind == "RepairComplete" {
+			repairs++
+		}
+	}
+	logData, _ := os.ReadFile(ctx.caseLogPath)
+	shape := readConventional7zRepairLog(string(logData), jobID)
+
+	pass := statuses[jobID] == "COMPLETE" &&
+		digestErr == nil &&
+		eventsErr == nil &&
+		repairs == 1 &&
+		shape.SkippedAuthoritativeVerify &&
+		shape.DataErrorAfterSkip &&
+		!shape.Failed
+	digestFailure := ""
+	if digestErr != nil {
+		digestFailure = digestErr.Error()
+	}
+	eventsFailure := ""
+	if eventsErr != nil {
+		eventsFailure = eventsErr.Error()
+	}
+	return classifyRestartResult(
+		ctx.Profile,
+		pass,
+		"strong-decode settled 7z set repaired once after its extraction hit a damaged block, and completed",
+		false,
+		"",
+		fmt.Sprintf(
+			"conventional 7z damaged-block case failed (final=%s repairs=%d log=%+v digest=%s events=%s)",
+			statuses[jobID], repairs, shape, digestFailure, eventsFailure,
+		),
 	), nil
 }
