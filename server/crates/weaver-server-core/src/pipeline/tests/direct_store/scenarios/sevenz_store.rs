@@ -458,6 +458,31 @@ async fn run_sevenz_gate_awaiting(
     wanted: &[&str],
     awaited: Option<&str>,
 ) -> SevenZipOutcome {
+    run_sevenz_gate_prepared(
+        job_id,
+        volumes,
+        declared,
+        arrivals,
+        wanted,
+        awaited,
+        |_, _| {},
+    )
+    .await
+}
+
+/// [`run_sevenz_gate_awaiting`] with `prepare` run just before the last
+/// arrival — once the set is planned, and before it can finalize — so a test
+/// can arrange the filesystem finalization will meet.
+async fn run_sevenz_gate_prepared(
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    declared: &BTreeMap<u32, u64>,
+    arrivals: &[(u32, u32)],
+    wanted: &[&str],
+    awaited: Option<&str>,
+    prepare: impl FnOnce(&Pipeline, JobId),
+) -> SevenZipOutcome {
+    let mut prepare = Some(prepare);
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -470,7 +495,12 @@ async fn run_sevenz_gate_awaiting(
     // a container can be refused on the very article that states its geometry,
     // and the set it is refused on is gone by the end of the loop.
     let mut witness = SetWitness::default();
-    for (file_index, segment_number) in arrivals {
+    for (arrival, (file_index, segment_number)) in arrivals.iter().enumerate() {
+        if arrival + 1 == arrivals.len()
+            && let Some(prepare) = prepare.take()
+        {
+            prepare(&pipeline, job_id);
+        }
         match declared.get(file_index) {
             Some(stated) => {
                 submit_volume_article_declaring(
@@ -750,6 +780,58 @@ async fn sevenz_store_creates_entries_the_archive_stores_no_bytes_for() {
             .flatten(),
         Some(Vec::new()),
         "the archive's empty file must exist\nsets: {}",
+        outcome.sets
+    );
+}
+
+/// An entry the archive declares must be produced or the set must not count as
+/// extracted. A dataless entry whose creation fails — here its parent path is
+/// already a regular file — fails the job rather than finishing it without the
+/// entry. It does not demote: the refusal is the destination's, and refetching
+/// the set for the conventional extractor would only meet it again.
+#[tokio::test]
+async fn sevenz_store_fails_the_job_when_a_dataless_entry_cannot_be_created() {
+    let member = payload(19, 20_000);
+    let archive = build_7z(
+        &[
+            Entry::file(MEMBER, member),
+            Entry::empty_file("Subs/Silver.Horizon.S01E01.idx"),
+        ],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, 2);
+    let outcome = run_sevenz_gate_prepared(
+        JobId(9_611),
+        &volumes,
+        &BTreeMap::new(),
+        &in_order_arrivals(volumes.len()),
+        &[],
+        None,
+        |pipeline, job_id| {
+            let blocker = pipeline
+                .direct_store
+                .set(job_id, 0)
+                .expect("the set is planned before its last article")
+                .plan()
+                .member_output_path("Subs")
+                .expect("a plain relative name");
+            std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+            std::fs::write(&blocker, b"not a directory").unwrap();
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            &outcome.status,
+            Some(JobStatus::Failed { error }) if error.contains("Subs/Silver.Horizon.S01E01.idx")
+        ),
+        "an entry that cannot be created must fail the job\nsets: {}",
+        outcome.sets
+    );
+    assert!(
+        !outcome.sets.contains("Demoted"),
+        "a destination refusal must not refetch the set\nsets: {}",
         outcome.sets
     );
 }

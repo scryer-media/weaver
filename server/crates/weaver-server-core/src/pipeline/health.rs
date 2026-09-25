@@ -943,11 +943,19 @@ impl Pipeline {
     /// The cover is the served set's obtainable capacity when one is known,
     /// and otherwise the recovery the posting declares, which is also what the
     /// critical-health line is drawn from.
+    ///
+    /// Once a set is parsed the comparison is in its own units, because the
+    /// two sides otherwise disagree: the capacity is decoded slices, while a
+    /// file's declared size is yEnc-encoded, about 3% larger — enough to fail
+    /// a post whose losses the set covers exactly. Each lost file costs the
+    /// whole slices of the length the set describes for it, which is what the
+    /// repair will spend; a file the set does not describe falls back to its
+    /// declared size.
     fn first_article_losses_recoverable(&self, job_id: JobId) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
         };
-        let lost_bytes = state
+        let lost_files: Vec<NzbFileId> = state
             .download_queue
             .first_articles()
             .filter(|segment_id| {
@@ -956,16 +964,51 @@ impl Pipeline {
                     Some(SegmentTerminalState::Missing)
                 )
             })
-            .filter_map(|segment_id| {
+            .filter(|segment_id| {
                 state
                     .assembly
                     .file(segment_id.file_id)
-                    .filter(|file| !file.has_segment(segment_id.segment_number))
+                    .is_some_and(|file| !file.has_segment(segment_id.segment_number))
             })
-            .map(|file| file.total_bytes())
-            .fold(0u64, u64::saturating_add);
+            .map(|segment_id| segment_id.file_id)
+            .collect();
+        let declared_bytes = |file_id: NzbFileId| {
+            state
+                .assembly
+                .file(file_id)
+                .map_or(0, |file| file.total_bytes())
+        };
         let recovery = self.obtainable_recovery(job_id);
-        recovery.obtainable && lost_bytes <= recovery.ceiling.unwrap_or(state.par2_bytes)
+        if !recovery.obtainable {
+            return false;
+        }
+        let served = self.par2_served_set_id(job_id).and_then(|set_id| {
+            let slice_size = self.par2_set_for(job_id, set_id)?.slice_size;
+            (slice_size > 0).then_some((set_id, slice_size))
+        });
+        match (recovery.ceiling, served) {
+            (Some(ceiling), Some((set_id, slice_size))) => {
+                let needed_slices = lost_files
+                    .iter()
+                    .map(|file_id| {
+                        self.resolve_par2_file_binding_in_set(*file_id, set_id)
+                            .map_or_else(
+                                || declared_bytes(*file_id),
+                                |binding| binding.described_length,
+                            )
+                            .div_ceil(slice_size)
+                    })
+                    .fold(0u64, u64::saturating_add);
+                needed_slices <= ceiling / slice_size
+            }
+            (ceiling, _) => {
+                let lost_bytes = lost_files
+                    .iter()
+                    .map(|file_id| declared_bytes(*file_id))
+                    .fold(0u64, u64::saturating_add);
+                lost_bytes <= ceiling.unwrap_or(state.par2_bytes)
+            }
+        }
     }
 
     /// The sample's verdict, once it is certain: `Some((missing, total))` when

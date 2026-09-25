@@ -1410,10 +1410,13 @@ impl Pipeline {
         // Directories first, then the empty files inside them, then the
         // directories' recorded times: creating a file bumps its parent's
         // mtime, so a time applied before the files it holds would not survive.
-        // A refusal is a warning rather than a demotion for the same reason the
-        // directory metadata below is: every byte-bearing member is already
-        // committed to its destination, and throwing the set away to redownload
-        // it for an empty file would cost far more than the entry is worth.
+        // A refusal fails the job. The entry is part of the archive's output:
+        // skipping it would record the set as extracted and finish the job
+        // without it, and nothing later compares the output against what the
+        // archive declares. Demoting would not help either — the refusal is the
+        // destination filesystem's, not the set's bytes', so the conventional
+        // extractor would meet the same refusal after refetching every volume.
+        // A disk write that fails during download fails the job the same way.
         let dataless = self
             .direct_store
             .set(job_id, set_index)
@@ -1445,9 +1448,17 @@ impl Pipeline {
                     set_name = %set_name,
                     entry = %entry.name,
                     error = %error,
-                    "failed to create a direct-store entry the archive stores no bytes for"
+                    "failed to create a direct-store entry the archive stores no bytes for; \
+                     failing the job"
                 );
-                continue;
+                self.fail_job(
+                    job_id,
+                    format!(
+                        "failed to create archive entry {} from {set_name}: {error}",
+                        entry.name
+                    ),
+                );
+                return;
             }
             if entry.is_directory {
                 dataless_directories.push((entry, destination));

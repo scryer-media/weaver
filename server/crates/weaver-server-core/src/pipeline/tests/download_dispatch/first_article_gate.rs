@@ -525,3 +525,117 @@ async fn missing_files_beyond_the_recovery_still_fail_on_the_sample() {
         "aborted: 10 of 12 first articles are missing, the post cannot complete"
     );
 }
+
+/// A parsed recovery set measures both sides in its own slices. The NZB's
+/// declared sizes are yEnc-encoded and run a few percent above the decoded
+/// bytes the set describes, so ten files lost outright can overrun the
+/// capacity in declared bytes while fitting it exactly in slices.
+#[tokio::test]
+async fn a_parsed_set_weighs_missing_files_in_its_own_slices() {
+    const DECLARED: u64 = 512;
+    const DESCRIBED: u64 = 480;
+    const RECOVERY_BLOCKS: u32 = 10;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41710);
+    // Ten one-article files and two of sixteen, as in the byte-counted case,
+    // so the ordinary health arithmetic has a job large enough to survive
+    // the losses and only the gate is on trial.
+    let mut payload = vec![1u32; 10];
+    payload.extend([16, 16]);
+    let spec = job_spec_with_recovery("Covered In Slices", &payload, 16);
+    let recovery_index = spec.files.len() as u32 - 1;
+    let recovery_name = spec.files[recovery_index as usize].filename.clone();
+    let mut descriptions = HashMap::new();
+    let mut recovery_file_ids = Vec::new();
+    for (index, file) in spec.files.iter().take(12).enumerate() {
+        let mut raw_id = [0u8; 16];
+        raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
+        let file_id = par2_rs::FileId::from_bytes(raw_id);
+        recovery_file_ids.push(file_id);
+        descriptions.insert(
+            file_id,
+            par2_rs::FileDescription {
+                file_id,
+                hash_full: [index as u8; 16],
+                hash_16k: [index as u8; 16],
+                length: file.segments.len() as u64 * DESCRIBED,
+                par2_name: file.filename.clone(),
+                filename: file.filename.clone(),
+            },
+        );
+    }
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        Par2FileSet {
+            recovery_set_id: par2_rs::RecoverySetId::from_bytes([41; 16]),
+            slice_size: DESCRIBED,
+            recovery_file_ids,
+            non_recovery_file_ids: Vec::new(),
+            files: descriptions,
+            slice_checksums: HashMap::new(),
+            recovery_slices: std::collections::BTreeMap::new(),
+            creator: None,
+        },
+        &[(recovery_index, &recovery_name, RECOVERY_BLOCKS, false)],
+    );
+    let sample = sample_in_file_order(&pipeline, job_id);
+    assert_eq!(sample.len(), 12);
+
+    for segment_id in sample.iter().take(10) {
+        pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
+    }
+
+    assert!(
+        10 * DECLARED > u64::from(RECOVERY_BLOCKS) * DESCRIBED,
+        "the fixture must overrun the capacity in declared bytes"
+    );
+    assert!(
+        job_failed(&pipeline, job_id).is_none(),
+        "ten lost files of one slice each fit ten obtainable slices exactly"
+    );
+}
+
+/// Recovery volumes are never sampled, and a post that lists them first must
+/// not have them use up the sample's window: every payload file behind them
+/// still leads with its first article, and the gate still rules.
+#[tokio::test]
+async fn recovery_volumes_listed_first_do_not_crowd_payload_out_of_the_sample() {
+    const RECOVERY_VOLUMES: usize = 32;
+    const PAYLOAD_FILES: usize = 12;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41711);
+    let mut spec = multi_file_job_spec("Recovery Up Front", PAYLOAD_FILES, 8);
+    let recovery: Vec<FileSpec> = (0..RECOVERY_VOLUMES)
+        .map(|volume| FileSpec {
+            filename: format!("copper-meridian.vol{volume:02}+01.par2"),
+            role: FileRole::Par2 {
+                is_index: false,
+                recovery_block_count: 1,
+            },
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![segment_spec! {
+                number: 0,
+                bytes: 512u32,
+                message_id: format!("copper-par2-{volume}@example.com"),
+            }],
+        })
+        .collect();
+    spec.total_bytes += (RECOVERY_VOLUMES as u64) * 512;
+    spec.files.splice(0..0, recovery);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let sample = sample_in_file_order(&pipeline, job_id);
+    assert_eq!(
+        sample
+            .iter()
+            .map(|segment_id| segment_id.file_id.file_index as usize)
+            .collect::<Vec<_>>(),
+        (RECOVERY_VOLUMES..RECOVERY_VOLUMES + PAYLOAD_FILES).collect::<Vec<_>>(),
+        "every payload file is sampled, and no recovery volume is"
+    );
+}

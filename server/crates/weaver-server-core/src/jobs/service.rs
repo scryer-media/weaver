@@ -887,7 +887,10 @@ impl Pipeline {
         Ok(())
     }
 
-    /// How many of a job's files lead with their first article.
+    /// How many of a job's payload files lead with their first article.
+    /// Recovery volumes are never sampled, so they do not count toward it:
+    /// counted by file index, a post that lists its recovery first would
+    /// sample few payload files or none, and the gate could never run.
     ///
     /// The wave exists to sample the post, not to reshape the job. A bounded
     /// number of leading files answers "is this post still on the server" as
@@ -910,6 +913,7 @@ impl Pipeline {
         let mut has_par3_index = false;
         let mut par2_files: Vec<(u32, u64)> = Vec::new();
         let mut par3_files: Vec<(u32, u64)> = Vec::new();
+        let mut sampled_files = 0usize;
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_id = NzbFileId {
@@ -999,9 +1003,12 @@ impl Pipeline {
             // parked until something promotes them, so they cannot answer in
             // the first round trips, and a sample that waits on an article
             // nothing has asked for is a sample that never completes.
-            let first_segment = (!is_recovery && file_index < Self::FIRST_ARTICLE_SAMPLE_FILES)
+            let first_segment = (!is_recovery && sampled_files < Self::FIRST_ARTICLE_SAMPLE_FILES)
                 .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
                 .flatten();
+            if first_segment.is_some() {
+                sampled_files += 1;
+            }
 
             // One shared group list per file; every segment's work item holds
             // a reference to it rather than its own copy.
