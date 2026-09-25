@@ -229,7 +229,8 @@ impl Pipeline {
     }
 
     /// Writes every destination a batch of routed spans touches, then records
-    /// them as coverage. `false` means the set demoted and the caller must stop.
+    /// them as coverage. `false` means the set demoted or the job failed, and
+    /// the caller must stop.
     ///
     /// The record only happens once **all** the writes returned: partial failure
     /// leaves orphan bytes, and the coverage map is the truth, not the bytes.
@@ -708,10 +709,16 @@ impl Pipeline {
                     error = %error,
                     "failed to create a direct-store destination directory"
                 );
-                // Left unprepared on purpose: the write below fails and demotes,
-                // and a later attempt retries the directory rather than trusting
-                // a failure it never saw succeed. Not a sparse refusal — the
-                // write error path already distinguishes it.
+                // A refusal is reported here, where its kind is the same on
+                // every platform: the open below would see a file standing in
+                // the path as `NotADirectory` on unix but `NotFound` on Windows.
+                if destination_refused(&error) {
+                    return Err(DirectPlacementError::Write(error));
+                }
+                // Anything else is left unprepared on purpose: the write below
+                // fails and demotes, and a later attempt retries the directory
+                // rather than trusting a failure it never saw succeed. Not a
+                // sparse refusal — the write error path already distinguishes it.
                 continue;
             }
             let created = {
@@ -2267,6 +2274,10 @@ impl Pipeline {
 /// itself, which the conventional path writes into as well — as opposed to a
 /// failure tied to a name only direct store derives, such as an envelope or a
 /// member partial the filesystem finds too long.
+///
+/// `AlreadyExists` is what creating a directory reports, on every platform,
+/// when a file stands where the directory belongs. Destination opens create
+/// or reuse, so they never report it themselves.
 fn destination_refused(error: &std::io::Error) -> bool {
     crate::operations::is_out_of_space(error)
         || matches!(
@@ -2274,6 +2285,7 @@ fn destination_refused(error: &std::io::Error) -> bool {
             std::io::ErrorKind::PermissionDenied
                 | std::io::ErrorKind::ReadOnlyFilesystem
                 | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::AlreadyExists
         )
 }
 

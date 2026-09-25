@@ -911,8 +911,13 @@ async fn sevenz_store_fails_the_job_when_a_member_directory_is_refused() {
         },
     )
     .await;
+    // Reported by the directory's creation, whose "already exists" reads the
+    // same on every platform, not by the member's open, which does not.
     assert!(
-        matches!(&outcome.status, Some(JobStatus::Failed { .. })),
+        matches!(
+            &outcome.status,
+            Some(JobStatus::Failed { error }) if error.contains("exists")
+        ),
         "a refused member directory must fail the job\nsets: {}",
         outcome.sets
     );

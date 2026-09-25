@@ -2127,12 +2127,16 @@ impl Pipeline {
                     // change the caller has to act on exactly as a repair is:
                     // its volumes are materializing, so the job's next move is a
                     // fresh pass over them, not another lap of the verdict that
-                    // sent it here.
+                    // sent it here. A write the destination refused fails the
+                    // job instead, which ends the job's moves altogether.
                     let already_demoted = self
                         .direct_store
                         .set(job_id, set_index)
                         .is_some_and(DirectSet::is_demoted);
-                    return if repaired_any || already_demoted {
+                    let job_failed = self.jobs.get(&job_id).is_none_or(|state| {
+                        matches!(state.status, crate::JobStatus::Failed { .. })
+                    });
+                    return if repaired_any || already_demoted || job_failed {
                         DirectRepairAnswer::Acted
                     } else {
                         DirectRepairAnswer::Declined
