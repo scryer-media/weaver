@@ -43,6 +43,17 @@ Everything below is new since 0.13.3.
   are copied out of pool slots so a few retained bytes no longer pin a whole
   buffer, and a run waiting on a missing cipher block is skipped instead of
   re-attempted on every arrival.
+- **A destination that refuses a write fails the job instead of refetching
+  it.** When the direct store's destination refuses a routed write, a
+  member, or an empty entry, the job fails the way any other disk write
+  failure does. Causes are: no space or quota, no permission, a read-only
+  filesystem, or a file where a directory belongs. It used to demote the
+  set, which refetched every volume only for conventional extraction to
+  meet the same refusal.
+- **Finished direct sets survive a restart.** A finalized set leaves an
+  installation marker, and on restart a set whose members are still in
+  place at their recorded lengths is restored as finished, so none of its
+  volumes is fetched again.
 
 ## What changed
 
@@ -54,6 +65,12 @@ Everything below is new since 0.13.3.
 - Health aborts attributed to the first-article sample report the missing
   and total counts, and the verdict is decided as soon as the missing share
   crosses the gate.
+- The first-article gate stands down when the files it rules missing, taken
+  as wholly lost, fit inside the recovery the job can still obtain. Losses
+  in a parsed set are counted in that set's own PAR2 slices rather than as
+  encoded bytes. Recovery volumes no longer count against the sample's file
+  budget, so a post that lists its PAR2 volumes first still samples its
+  payload.
 - The below-critical deferral requires recovery the pipeline has actually
   observed and caps tolerated damage at that ceiling. PAR2 metadata
   discovery closes when a candidate article was retired during the ordinary
@@ -77,6 +94,26 @@ Everything below is new since 0.13.3.
 - A 7z set whose volume can never state its length, because every article
   of it is terminally unavailable, is demoted under its own refusal instead
   of waiting forever.
+- A 7z volume that states its length, or finishes decoding, before volume
+  zero's front arrives is checked once the geometry is known. A truncated
+  last volume is refused on its length whatever order the volumes land in,
+  instead of holding the set until every article is in and then demoting
+  it as an unreadable map.
+- A 7z container of only directories and empty files is declined up front
+  as `7z_nothing_to_route` and extracted conventionally.
+- A destination refusal while routing, committing a member, or creating an
+  empty file or directory fails the job. Other write failures still demote,
+  as does a member whose partial is gone, since that is lost data and the
+  refetch is how it comes back. Once a job has failed, finalization stops
+  committing its other sets.
+- A finalized set records an installation marker in its coverage row. On
+  restart, a marker whose members are still in place at their recorded
+  lengths restores the set as finalized and extracted. A marker whose
+  members are gone is deleted and the set downloads fresh. Barriers skip
+  finalized sets, and a source retry drops the retried sets' coverage rows.
+- A demotion handback that leaves verified conventional bytes with no floor
+  or completed-file row retires the set's coverage row at once, so a
+  restart cannot resume the set over them.
 - Header-encrypted containers are opened against the job's whole password
   harvest in harvest order, after one attempt with no key.
 - A restart-seeded volume length goes through the router when the volume
@@ -97,9 +134,12 @@ Everything below is new since 0.13.3.
   buffer is drained to completion.
 - Decoded payloads reach disk without a user-space copy; the encrypted path
   keeps one contiguous materialization for decryption and adopts its output.
-- Residues up to 64 KiB are copied out of their pool slot after an article
-  routes, and every residue is copied when the article's tier has a quarter
-  or fewer of its slots free.
+- A held view is copied out of its decoder buffer when it is 64 KiB or
+  shorter or covers less than half of the buffer. Every view is copied
+  when its article's pool tier has a quarter or fewer of its slots free,
+  or when the article is not in a pool slot. A whole held article keeps
+  the zero-copy path. Holds pin at most twice what the budget charges, and
+  copied bytes are reported as `direct_store.holds.copied_out_bytes`.
 - An RAR5 key is derived once per tuple through the shared KDF cache.
 
 ### Extraction and repair
@@ -112,6 +152,9 @@ Everything below is new since 0.13.3.
   awaiting a topology, so a 7z-only job whose set had already installed its
   members no longer re-arms its completion check forever.
 - PAR3 rebuilds wholly missing RAR and 7z volumes in place.
+- A 7z decode whose memory need cannot be measured within the ceiling
+  reserves what fits beside every job's retained state, instead of waiting
+  for the whole ceiling behind any other queued job.
 - lzma-turbo 0.6.0 and sevenz-turbo 0.26.0: the parallel LZMA2 reader sizes
   its read-ahead from the stream, spends a memory limit on decoding before
   reading ahead, and decodes incompressible runs narrow.
@@ -125,8 +168,9 @@ Everything below is new since 0.13.3.
   instead of one at a time. Writes for one job still apply in submission
   order, a job's archive runs after every earlier write for that job, flush
   and shutdown drain wait for everything queued before them, and the lanes
-  are bounded so a slow database applies backpressure. SQLite keeps its
-  single writer.
+  are bounded so a slow database applies backpressure. A lane is forgotten
+  once its last write finishes, so the lane table no longer grows by one
+  entry per job. SQLite keeps its single writer.
 
 ### Logging
 
