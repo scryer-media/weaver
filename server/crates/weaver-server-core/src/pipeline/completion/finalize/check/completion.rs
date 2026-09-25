@@ -427,6 +427,15 @@ impl Pipeline {
         // once per completion check, because this is where the job's PAR2 state
         // is settled; `mark_par2_verified` covers the verdict case.
         self.finalize_ready_direct_sets(job_id).await;
+        // A finalization the destination refused fails the job from inside
+        // that pass, and nothing below may judge a failed job.
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| matches!(state.status, JobStatus::Failed { .. }))
+        {
+            return;
+        }
         // A tolerated extraction detached from that pass. Its set is
         // byte-complete and gate-passed but not committed — neither finalized
         // nor a conventional archive — and nothing below may judge the job

@@ -1042,6 +1042,10 @@ impl StagedChunk {
 /// piece, which is what an article held whole for an earlier one looks like,
 /// keeps its zero-copy path. `every` copies regardless, for a scarce pool. A
 /// chunk that already owns its bytes (`backing == 0`) is never copied again.
+///
+/// A short view is copied even when it spans its whole piece: a pooled
+/// article's piece is only as long as the article, while the slot behind it is
+/// a whole pool buffer, and the copy is what hands that slot back.
 fn pins_too_much(len: u64, backing: u64, every: bool) -> bool {
     backing != 0 && (every || len <= HOLD_VIEW_COPY_LIMIT_BYTES || backing > len.saturating_mul(2))
 }

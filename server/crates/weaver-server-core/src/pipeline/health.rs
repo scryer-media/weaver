@@ -950,7 +950,9 @@ impl Pipeline {
     /// a post whose losses the set covers exactly. Each lost file costs the
     /// whole slices of the length the set describes for it, which is what the
     /// repair will spend; a file the set does not describe falls back to its
-    /// declared size.
+    /// declared size. That charge is generous rather than exact — the served
+    /// set cannot repair such a file at all — and it is the same charge the
+    /// byte comparison has always made for a file another set protects.
     fn first_article_losses_recoverable(&self, job_id: JobId) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;

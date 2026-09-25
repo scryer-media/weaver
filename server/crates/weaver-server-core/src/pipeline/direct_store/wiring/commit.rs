@@ -1055,6 +1055,17 @@ impl Pipeline {
             .collect();
         for set_index in ready {
             self.finalize_direct_set(job_id, set_index).await;
+            // A finalization the destination refused has failed the job. Its
+            // other sets are not committed after it: a failed job's output is
+            // not published, and with post-processing scripts configured the
+            // job outlives this call until they finish.
+            if self
+                .jobs
+                .get(&job_id)
+                .is_none_or(|state| matches!(state.status, crate::JobStatus::Failed { .. }))
+            {
+                return;
+            }
         }
         // The last set of a job finalizing is one of the two moments the answer
         // to "can anything still read a retained image" changes.
@@ -1350,28 +1361,36 @@ impl Pipeline {
         // A failure here leaves the set neither committed nor abandoned: its
         // partials still hold every verified byte, but nothing downstream will
         // ever look at them again, so the job would sit in `Extracting`
-        // forever. Demote instead — the volumes are refetched and the ordinary
-        // extractor produces the same member (nit).
+        // forever. It fails the job instead, as a disk write that fails during
+        // download does. Demoting would refetch every volume of the set only for
+        // the conventional extractor to meet the same refusal at the same
+        // destination.
+        //
+        // The one exception is a member whose partial is gone. That is lost
+        // data, not a refusal, and refetching the set is the only way back to
+        // it — so it alone demotes.
         //
         // A failure **part way through the loop** leaves the members before it
-        // already renamed to their destinations, and the demotion then deletes
-        // the partials of the ones after it and refetches every volume of the
-        // set. The already-committed members are overwritten by the extractor
-        // with byte-identical content, so the outcome is correct and the cost is
-        // one wasted extraction of the members that had already landed.
-        // Reviewed and accepted: unwinding the renames would mean moving
-        // finished output back into scratch paths on a path that is already the
-        // unhappy one, and the alternative — staging every rename and
-        // committing them together — needs a directory-level atomic swap the
-        // filesystem does not offer.
+        // already at their destinations. They stay there: unwinding the renames
+        // would mean moving finished output back into scratch paths on a path
+        // that is already the unhappy one, and staging every rename to commit
+        // them together needs a directory-level atomic swap the filesystem does
+        // not offer.
         for (name, unpacked_size, partial, destination) in &members {
             crate::pipeline::release_cached_write_handle(partial);
             if let Some(parent) = destination.parent()
                 && let Err(error) = tokio::fs::create_dir_all(parent).await
             {
-                warn!(job_id = job_id.0, error = %error, "failed to create direct-store destination directory; demoting the set");
-                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed)
-                    .await;
+                warn!(
+                    job_id = job_id.0,
+                    member = %name,
+                    error = %error,
+                    "failed to create direct-store destination directory; failing the job"
+                );
+                self.fail_job(
+                    job_id,
+                    format!("failed to create the directory for {name} from {set_name}: {error}"),
+                );
                 return;
             }
             // A zero-length stored member never had a byte routed for it, so it
@@ -1387,14 +1406,27 @@ impl Pipeline {
                 other => other,
             };
             if let Err(error) = committed {
+                if *unpacked_size > 0 && !tokio::fs::try_exists(partial).await.unwrap_or(true) {
+                    warn!(
+                        job_id = job_id.0,
+                        member = %name,
+                        error = %error,
+                        "a direct-store member's partial is gone; demoting the set"
+                    );
+                    self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed)
+                        .await;
+                    return;
+                }
                 warn!(
                     job_id = job_id.0,
                     member = %name,
                     error = %error,
-                    "failed to commit a direct-store member to its destination; demoting the set"
+                    "failed to commit a direct-store member to its destination; failing the job"
                 );
-                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed)
-                    .await;
+                self.fail_job(
+                    job_id,
+                    format!("failed to write {name} from {set_name}: {error}"),
+                );
                 return;
             }
             recorded.push(name.clone());
