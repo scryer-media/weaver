@@ -3654,6 +3654,68 @@ async fn direct_job_with_one_finalized_neighbour(
     working_dir
 }
 
+/// A job something failed earlier in the same completion pass — a repair, a
+/// health verdict — commits none of its ready direct sets: a failed job's
+/// output is not published, and with post-processing scripts configured the
+/// job is still present when the pass reaches its sets.
+#[tokio::test]
+async fn a_failed_job_does_not_finalize_its_ready_direct_sets() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41_175);
+    let payload: Vec<u8> = (0..24_000u32).map(|index| (index % 239) as u8).collect();
+    let volumes = single_member_store_set("Silver.Horizon.S01E01.mkv", &payload, 2);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.ready_to_finalize() && !set.is_finalized()),
+        "non-vacuity: the set must be ready and waiting on its PAR2 verdict; got {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+
+    set_job_status_for_test(
+        &mut pipeline,
+        job_id,
+        JobStatus::Failed {
+            error: "a repair failed the job".to_string(),
+        },
+    );
+    pipeline.par2_verified.insert(job_id);
+    pipeline.finalize_ready_direct_sets(job_id).await;
+
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .all(|set| !set.is_finalized()),
+        "a failed job's sets must not be committed; got {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+}
+
 /// [`par2_bearing_job_spec`] with a chosen article count per volume, so a
 /// fixture can lose a *middle* article and leave an interior hole rather than a
 /// truncated tail.

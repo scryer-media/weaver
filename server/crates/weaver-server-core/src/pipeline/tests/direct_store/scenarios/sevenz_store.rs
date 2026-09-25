@@ -878,6 +878,51 @@ async fn sevenz_store_fails_the_job_when_the_destination_refuses_a_member() {
     );
 }
 
+/// A member whose directory the destination refuses — here a regular file
+/// stands where the directory belongs — fails the job on its first routed
+/// write. Demoting would refetch the set only for the conventional extractor to
+/// meet the same file in the same place.
+#[tokio::test]
+async fn sevenz_store_fails_the_job_when_a_member_directory_is_refused() {
+    let member = payload(22, 20_000);
+    let archive = build_7z(
+        &[Entry::file("Extras/Silver.Horizon.S01E01.dat", member)],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, 2);
+    let outcome = run_sevenz_gate_prepared(
+        JobId(9_613),
+        &volumes,
+        &BTreeMap::new(),
+        &in_order_arrivals(volumes.len()),
+        &[],
+        None,
+        |pipeline, job_id| {
+            let blocker = pipeline
+                .direct_store
+                .set(job_id, 0)
+                .expect("the set is planned before its last article")
+                .plan()
+                .member_output_path("Extras")
+                .expect("a plain relative name");
+            std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+            std::fs::write(&blocker, b"not a directory").unwrap();
+        },
+    )
+    .await;
+    assert!(
+        matches!(&outcome.status, Some(JobStatus::Failed { .. })),
+        "a refused member directory must fail the job\nsets: {}",
+        outcome.sets
+    );
+    assert!(
+        !outcome.sets.contains("Demoted"),
+        "a destination refusal must not refetch the set\nsets: {}",
+        outcome.sets
+    );
+}
+
 /// An archive of nothing but empty files and the directories they sit in has
 /// no member to route and none to verify, so a set could never finalize on
 /// it. The route is declined on the map, which hands the archive to the

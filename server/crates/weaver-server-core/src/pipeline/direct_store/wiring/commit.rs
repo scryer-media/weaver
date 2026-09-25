@@ -267,10 +267,33 @@ impl Pipeline {
                 .await;
                 false
             }
+            DirectPlacementError::Write(error) if destination_refused(&error) => {
+                // A refusal the destination itself makes — no space, no
+                // permission, a read-only filesystem, a path component that is
+                // a file — fails the job, as a disk write that fails during
+                // download does. Demoting would refetch every volume of the set
+                // only for the conventional extractor to write into the same
+                // place and meet the same refusal.
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "the destination refused a direct-store write; failing the job"
+                );
+                self.fail_job(
+                    job_id,
+                    format!(
+                        "direct-store destination write failed for job {}: {error}",
+                        job_id.0
+                    ),
+                );
+                false
+            }
             DirectPlacementError::Write(error) => {
-                // A destination write failure is a demotion, not a job failure: the
-                // conventional path writes the same bytes to a different file, and
-                // only if *that* also fails is the job genuinely unfinishable.
+                // Any other write failure is a demotion, not a job failure: the
+                // conventional path writes the same bytes to a different file —
+                // a volume, not an envelope or a member partial whose name only
+                // direct store derives — and only if *that* also fails is the
+                // job genuinely unfinishable.
                 warn!(
                     job_id = job_id.0,
                     error = %error,
@@ -986,6 +1009,17 @@ impl Pipeline {
     /// volume, and the verification that clears a par2-bearing job.
     pub(crate) async fn finalize_ready_direct_sets(&mut self, job_id: JobId) {
         if self.direct_store.sets_for(job_id).is_empty() {
+            return;
+        }
+        // A job something else failed earlier in the same pass — a repair, a
+        // health verdict — has no output to publish, and its sets go with its
+        // purge. With post-processing scripts configured it outlives the
+        // failure until they finish, so it can still reach here.
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| matches!(state.status, crate::JobStatus::Failed { .. }))
+        {
             return;
         }
         // The gate re-arm, and deliberately **before** the PAR2 wait: the
@@ -2227,6 +2261,20 @@ impl Pipeline {
         self.finalize_ready_direct_sets(done.job_id).await;
         self.schedule_job_completion_check(done.job_id);
     }
+}
+
+/// Whether a failed destination write is the filesystem refusing the location
+/// itself, which the conventional path writes into as well — as opposed to a
+/// failure tied to a name only direct store derives, such as an envelope or a
+/// member partial the filesystem finds too long.
+fn destination_refused(error: &std::io::Error) -> bool {
+    crate::operations::is_out_of_space(error)
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::ReadOnlyFilesystem
+                | std::io::ErrorKind::NotADirectory
+        )
 }
 
 #[cfg(test)]
