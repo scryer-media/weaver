@@ -651,10 +651,10 @@ impl DirectSet {
         volume_index: u32,
         source_offset: u64,
         len: u64,
-        copy_every_hold: bool,
+        pool_scarce: bool,
     ) -> u64 {
         self.router
-            .release_article_views(volume_index, source_offset, len, copy_every_hold)
+            .release_article_views(volume_index, source_offset, len, pool_scarce)
     }
 
     /// Records the length one volume's yEnc headers declare. See
@@ -1021,6 +1021,13 @@ impl DirectSet {
         // A repair deleted the old checkpoint before changing destinations.
         // Do not recreate it from a mixture of old and replacement bytes.
         if self.router.repair_batch_in_progress() {
+            return None;
+        }
+        // Finalization retired the checkpoint and left the set's installation
+        // marker in its row. A snapshot now would claim nothing — every
+        // member is committed and the barrier is empty — and overwrite the
+        // marker with it, so a restart would refetch the whole set.
+        if self.is_finalized() {
             return None;
         }
         // Level the barrier with the router before it builds a snapshot: the

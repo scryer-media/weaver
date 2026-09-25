@@ -1545,8 +1545,8 @@ fn a_short_hold_is_copied_out_of_its_slot_once_the_article_has_drained() {
     );
     assert_eq!(
         router.release_article_views(0, 0, 4096, true),
-        4096,
-        "an owned chunk cannot be told from a view, so it is copied again — harmless, and rare"
+        0,
+        "a hold already copied out owns its bytes and is not copied again"
     );
 }
 
@@ -1583,32 +1583,78 @@ fn a_long_hold_keeps_its_view_unless_the_pool_is_scarce() {
     );
 }
 
-/// Only a pool slot is bounded by the pool. An article decoded into batches or
-/// one allocation of its own is pinned by nothing but its views, so the seam
-/// copies every hold out of it whatever the pool's state.
+/// A decoder batch as the inline decode produces it: an allocation of its own,
+/// adopted by `Bytes` without a copy.
+fn decoder_batch(len: usize) -> bytes::Bytes {
+    let payload: Vec<u8> = (0..len as u32).map(|index| (index % 251) as u8).collect();
+    bytes::Bytes::from(payload.into_boxed_slice())
+}
+
+/// The holds budget charges a view its own length, so a view kept past its
+/// article must cover most of the batch it keeps alive. One that covers less
+/// than half leaves it, whatever its length and whatever the pool's state.
 #[test]
-fn only_an_article_in_a_pool_slot_counts_as_pooled() {
-    use crate::pipeline::DecodedChunk;
-    use crate::runtime::buffers::{BufferPool, BufferPoolConfig, BufferTier};
-    let pool = BufferPool::new(BufferPoolConfig {
-        small_count: 1,
-        medium_count: 0,
-        large_count: 0,
-    });
-    let mut handle = pool
-        .try_acquire(BufferTier::Small)
-        .expect("the slot is free");
-    handle.set_len(16);
-    assert!(DecodedChunk::Pooled(handle).is_pooled());
-    assert!(
-        !DecodedChunk::Batches {
-            chunks: vec![bytes::Bytes::from(vec![7u8; 512 * 1024])],
-            len: 512 * 1024,
-        }
-        .is_pooled(),
-        "a decoder batch is its own allocation, which the pool does not bound"
+fn a_hold_covering_less_than_half_its_batch_is_copied_out() {
+    const BATCH: usize = 512 * 1024;
+    const ALREADY_STAGED: usize = 412 * 1024;
+    let mut router = layoutless_router();
+    // An earlier copy of the range's head, so the batch contributes only its
+    // last 100 KiB — longer than the short-residue limit.
+    router.stage_pieces_for_test(0, 0, &[decoder_batch(ALREADY_STAGED)]);
+    let batch = decoder_batch(BATCH);
+    router.stage_pieces_for_test(0, 0, std::slice::from_ref(&batch));
+    assert!(!batch.is_unique(), "the staged tail is a view of the batch");
+
+    assert_eq!(
+        router.release_article_views(0, 0, BATCH as u64, false),
+        (BATCH - ALREADY_STAGED) as u64,
+        "only the view of a fifth of its batch is copied; the whole-piece hold keeps its bytes"
     );
-    assert!(!DecodedChunk::Contiguous(bytes::Bytes::from(vec![7u8; 4096])).is_pooled());
+    assert!(
+        batch.is_unique(),
+        "nothing staged keeps the batch alive once its sliver is copied"
+    );
+}
+
+#[test]
+fn a_hold_covering_most_of_its_batch_keeps_its_view() {
+    const BATCH: usize = 512 * 1024;
+    const ALREADY_STAGED: usize = 100 * 1024;
+    let mut router = layoutless_router();
+    router.stage_pieces_for_test(0, 0, &[decoder_batch(ALREADY_STAGED)]);
+    let batch = decoder_batch(BATCH);
+    router.stage_pieces_for_test(0, 0, std::slice::from_ref(&batch));
+
+    assert_eq!(
+        router.release_article_views(0, 0, BATCH as u64, false),
+        0,
+        "a view of most of its batch pins at most twice what it charges, so it stays zero-copy"
+    );
+    assert!(!batch.is_unique(), "the kept view still shares the batch");
+}
+
+/// A view kept whole when its article drained can be cut down later, by the
+/// drain trimming routed bytes or by a repair overwriting part of it. The cut
+/// still pins the whole batch, so it faces the same rule.
+#[test]
+fn cutting_a_kept_view_down_to_a_sliver_copies_the_sliver_out() {
+    const BATCH: usize = 512 * 1024;
+    const OVERWRITTEN: usize = 400 * 1024;
+    let mut router = layoutless_router();
+    let batch = decoder_batch(BATCH);
+    router.stage_pieces_for_test(0, 0, std::slice::from_ref(&batch));
+    assert_eq!(
+        router.release_article_views(0, 0, BATCH as u64, false),
+        0,
+        "the whole batch is held, so the view is kept"
+    );
+    assert!(!batch.is_unique());
+
+    router.force_stage_for_test(0, 0, &vec![0u8; OVERWRITTEN], true);
+    assert!(
+        batch.is_unique(),
+        "the 112 KiB left of the view was copied when it was cut from the 512 KiB batch"
+    );
 }
 
 #[test]

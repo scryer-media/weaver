@@ -914,7 +914,7 @@ impl DirectSetRouter {
                 let inside = start - chunk_start;
                 let len = end - start;
                 let run = match chunk {
-                    StagedChunk::Memory(bytes) => {
+                    StagedChunk::Memory { bytes, .. } => {
                         HeldRun::memory(start, bytes.clone(), inside, len)
                     }
                     StagedChunk::Scratch { offset, .. } => {

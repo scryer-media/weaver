@@ -384,3 +384,106 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
 
     Ok(())
 }
+
+/// `W`eaver `D`irect `S`tore `I`nstalled.
+///
+/// The second thing a coverage row can hold. A set that finalizes has no
+/// coverage left to checkpoint — its partials are renamed to their
+/// destinations and its envelopes are gone — but a restart before the job is
+/// archived still has to know the set is **done**, not new: without that it
+/// rediscovers the set from the spec, finds no row, and installs it fresh,
+/// refetching every volume of output that is already sitting in the staging
+/// root. If those articles have since expired, the job fails with its output
+/// finished.
+///
+/// A separate magic rather than a coverage-snapshot schema bump, so a binary
+/// that predates it refuses the row as a bad magic and redownloads the set —
+/// which is exactly what that binary did before the marker existed.
+pub(crate) const INSTALLED_MAGIC: [u8; 4] = *b"WDSI";
+
+/// Decoding accepts exactly this version, the same rule as the snapshot's.
+pub(crate) const INSTALLED_SCHEMA_VERSION: u16 = 1;
+
+/// One committed member, as restore re-checks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InstalledMember {
+    /// Relative to the job's staging root, where finalization renamed it.
+    pub(crate) relative_path: String,
+    /// Its exact length. A committed member is finished output, so unlike a
+    /// coverage claim a longer file is as wrong as a shorter one.
+    pub(crate) len: u64,
+}
+
+/// A finalized set's durable proof of installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InstalledSet {
+    /// Volume index to NZB file index, sorted by volume. Restore requires the
+    /// rediscovered plan to map the same files, because those are the files
+    /// whose segments the marker lets it skip.
+    pub(crate) volumes: Vec<(u32, u32)>,
+    /// The byte-bearing members the commit renamed into place.
+    pub(crate) members: Vec<InstalledMember>,
+    /// Every name finalization recorded as extracted — stored, tolerated and
+    /// dataless alike — so a restored job judges its completion against the
+    /// same set of names the finalizing run did.
+    pub(crate) extracted: Vec<String>,
+}
+
+pub(crate) fn is_installed_marker(blob: &[u8]) -> bool {
+    blob.len() >= INSTALLED_MAGIC.len() && blob[..INSTALLED_MAGIC.len()] == INSTALLED_MAGIC
+}
+
+pub(crate) fn encode_installed(installed: &InstalledSet) -> Result<Vec<u8>, SnapshotError> {
+    let mut normalized = installed.clone();
+    normalized.volumes.sort_unstable();
+    normalized
+        .members
+        .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    normalized.extracted.sort_unstable();
+    normalized.extracted.dedup();
+    let body = rmp_serde::to_vec(&normalized)
+        .map_err(|error| SnapshotError::Malformed(error.to_string()))?;
+    let mut blob = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
+    blob.extend_from_slice(&INSTALLED_MAGIC);
+    blob.extend_from_slice(&INSTALLED_SCHEMA_VERSION.to_le_bytes());
+    blob.extend_from_slice(&body);
+    Ok(blob)
+}
+
+/// Decodes one installation marker, total in the same way [`decode`] is.
+pub(crate) fn decode_installed(blob: &[u8]) -> Result<InstalledSet, SnapshotError> {
+    if blob.len() < FRAME_HEADER_LEN {
+        return Err(SnapshotError::Truncated { len: blob.len() });
+    }
+    if !is_installed_marker(blob) {
+        return Err(SnapshotError::BadMagic);
+    }
+    let version = u16::from_le_bytes([blob[4], blob[5]]);
+    if version != INSTALLED_SCHEMA_VERSION {
+        return Err(SnapshotError::UnsupportedVersion {
+            found: version,
+            supported: INSTALLED_SCHEMA_VERSION,
+        });
+    }
+    let body = &blob[FRAME_HEADER_LEN..];
+    let mut deserializer = rmp_serde::Deserializer::new(std::io::Cursor::new(body));
+    let installed = InstalledSet::deserialize(&mut deserializer)
+        .map_err(|error| SnapshotError::Malformed(error.to_string()))?;
+    let consumed = deserializer.position();
+    if consumed != body.len() as u64 {
+        return Err(SnapshotError::Malformed(format!(
+            "{} trailing bytes after the installation marker",
+            body.len() as u64 - consumed
+        )));
+    }
+    // Restore joins these onto the staging root and probes them, so they are
+    // held to the same rule as a coverage claim's path.
+    for member in &installed.members {
+        if let Err(error) = validate_sanitized_rar_member_path(&member.relative_path) {
+            return Err(SnapshotError::Malformed(format!(
+                "installed member has an unsafe path ({error})"
+            )));
+        }
+    }
+    Ok(installed)
+}

@@ -939,7 +939,14 @@ enum StagedChunk {
     /// A refcounted view of the decoder's own buffer. Several chunks can share
     /// one backing allocation — a staged article splits at every missing
     /// interval — and each keeps it alive until the last of them drops.
-    Memory(Bytes),
+    Memory {
+        bytes: Bytes,
+        /// The length of the allocation `bytes` keeps alive: the decoder piece
+        /// it was cut from, or zero once it has been copied out and owns
+        /// exactly its own bytes. `Bytes` does not expose this, so it is
+        /// recorded where the view is cut. See [`pins_too_much`].
+        backing: u64,
+    },
     Scratch {
         offset: u64,
         len: u64,
@@ -958,7 +965,7 @@ struct LiveScratchExtent {
 impl StagedChunk {
     fn len(&self) -> u64 {
         match self {
-            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Memory { bytes, .. } => bytes.len() as u64,
             Self::Scratch { len, .. } => *len,
         }
     }
@@ -970,34 +977,73 @@ impl StagedChunk {
     /// its range is what it answers for, not what it pins: two views of one
     /// decoded article charge their two ranges, and the sum can never exceed
     /// the buffer they share. What it can *under*state is a small retained view
-    /// of a large pool slot, which keeps the whole slot out of the pool. The
-    /// alternative — charging backing identity — is not available: `Bytes` does
-    /// not expose the allocation behind a view, so any such figure would be a
-    /// guess dressed as a measurement. Paging drops the view, which frees the
-    /// slot exactly when it was the last one, and the budget keeps meaning what
-    /// it meant before views existed. What keeps the understatement bounded is
-    /// [`VolumeStaging::copy_out_views`]: a short residue is copied out of its
-    /// slot as soon as its article has drained, and every residue is when the
-    /// pool is scarce or the article was not decoded into a pool slot, so a
-    /// view never outlives its article unless the slot it pins is one the
-    /// pool can spare.
+    /// of a large decoder buffer, which keeps the whole buffer alive. Charging
+    /// the backing instead would count a buffer once per view of it. Paging
+    /// drops the view, which frees the buffer exactly when it was the last
+    /// one, and the budget keeps meaning what it meant before views existed.
+    /// What keeps the understatement bounded is [`pins_too_much`], applied
+    /// by [`VolumeStaging::copy_out_views`] once an article has drained and by
+    /// [`VolumeStaging::trim`] whenever it cuts a view down: a view that
+    /// outlives its article is never shorter than half the allocation it
+    /// keeps alive, so what the holds pin is at most twice what they charge.
     fn resident_len(&self) -> u64 {
         match self {
-            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Memory { bytes, .. } => bytes.len() as u64,
             Self::Scratch { .. } => 0,
         }
     }
 
     /// The sub-chunk covering `[from, from + len)` of this chunk.
+    ///
+    /// A cut of a view still pins the whole allocation, and the only callers
+    /// cut away what drained or was overwritten and keep the rest, which
+    /// outlives the article [`VolumeStaging::copy_out_views`] checked it
+    /// against — so the remnant faces [`pins_too_much`] here.
     fn slice_of(&self, from: u64, len: u64) -> Self {
         match self {
-            Self::Memory(bytes) => Self::Memory(bytes.slice(from as usize..(from + len) as usize)),
+            Self::Memory { bytes, backing } => {
+                let mut cut = Self::Memory {
+                    bytes: bytes.slice(from as usize..(from + len) as usize),
+                    backing: *backing,
+                };
+                cut.release(false);
+                cut
+            }
             Self::Scratch { offset, .. } => Self::Scratch {
                 offset: offset.saturating_add(from),
                 len,
             },
         }
     }
+
+    /// Replaces a view [`pins_too_much`] rules out with an owned copy of its
+    /// bytes. Returns the bytes copied.
+    fn release(&mut self, every: bool) -> u64 {
+        match self {
+            Self::Memory { bytes, backing }
+                if pins_too_much(bytes.len() as u64, *backing, every) =>
+            {
+                *bytes = Bytes::copy_from_slice(bytes);
+                *backing = 0;
+                bytes.len() as u64
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Whether a staged view of `len` bytes over an allocation of `backing` bytes
+/// should be copied out rather than kept once its article has drained.
+///
+/// Short residues always leave — a cipher tail or header run should not keep
+/// a decoder buffer alive for a few bytes — and so does any view shorter than
+/// half its backing, since the holds budget charges the view's length and the
+/// allocation behind it is what stays resident. A view covering most of its
+/// piece, which is what an article held whole for an earlier one looks like,
+/// keeps its zero-copy path. `every` copies regardless, for a scarce pool. A
+/// chunk that already owns its bytes (`backing == 0`) is never copied again.
+fn pins_too_much(len: u64, backing: u64, every: bool) -> bool {
+    backing != 0 && (every || len <= HOLD_VIEW_COPY_LIMIT_BYTES || backing > len.saturating_mul(2))
 }
 
 /// Positioned read, so a shared handle needs no seek and no exclusive access.
@@ -1598,7 +1644,10 @@ impl SparseImage {
                 .map(|(offset, bytes)| {
                     (
                         *offset,
-                        ImageRun::Staged(StagedChunk::Memory(bytes.clone())),
+                        ImageRun::Staged(StagedChunk::Memory {
+                            bytes: bytes.clone(),
+                            backing: bytes.len() as u64,
+                        }),
                     )
                 })
                 .collect(),
@@ -1626,7 +1675,7 @@ impl Read for SparseImage {
         }
         let taken = (run.len() - inside).min(out.len() as u64) as usize;
         match run {
-            ImageRun::Staged(StagedChunk::Memory(bytes)) => {
+            ImageRun::Staged(StagedChunk::Memory { bytes, .. }) => {
                 out[..taken].copy_from_slice(&bytes[inside as usize..inside as usize + taken]);
             }
             // Paged out: read back exactly what the walk asked for, which for a
@@ -1859,11 +1908,12 @@ impl VolumeStaging {
                     if from < to {
                         self.chunks.insert(
                             from,
-                            StagedChunk::Memory(
-                                piece.slice(
+                            StagedChunk::Memory {
+                                bytes: piece.slice(
                                     (from - piece_start) as usize..(to - piece_start) as usize,
                                 ),
-                            ),
+                                backing: piece.len() as u64,
+                            },
                         );
                     }
                     piece_start = piece_end;
@@ -1938,7 +1988,14 @@ impl VolumeStaging {
                     .insert(end, chunk.slice_of(end - start, chunk_end - end));
             }
         }
-        self.chunks.insert(offset, StagedChunk::Memory(data));
+        let backing = data.len() as u64;
+        self.chunks.insert(
+            offset,
+            StagedChunk::Memory {
+                bytes: data,
+                backing,
+            },
+        );
         self.routed = subtract(&self.routed, offset, len);
         self.pending.insert(offset, len);
         if repaired {
@@ -2008,7 +2065,7 @@ impl VolumeStaging {
             }
             let take = (chunk.len() - inside).min(end - cursor);
             match &chunk {
-                StagedChunk::Memory(bytes) => {
+                StagedChunk::Memory { bytes, .. } => {
                     out.push(bytes.slice(inside as usize..(inside + take) as usize));
                 }
                 StagedChunk::Scratch {
@@ -2085,8 +2142,8 @@ impl VolumeStaging {
     }
 
     /// Replaces the RAM-resident chunks inside `[offset, offset + len)` that
-    /// are no longer than `up_to` bytes with owned copies, and returns how
-    /// many bytes were copied.
+    /// [`pins_too_much`] rules out with owned copies, and returns how many
+    /// bytes were copied.
     ///
     /// A chunk staged by [`Self::stage`] is a view of the decoder's buffer,
     /// and while the view lives the pool slot behind it cannot be reused. For
@@ -2096,27 +2153,19 @@ impl VolumeStaging {
     /// waiting on an article that has not arrived, each keeps a whole slot
     /// out of the pool for as long as it stays staged, and the holds budget
     /// — which counts range length, see [`StagedChunk::resident_len`] —
-    /// cannot see it. Copying a short residue is cheaper than the slot it
-    /// frees; copying a long one is what every hold cost before views
-    /// existed, and is worth it exactly when the pool is running dry. The
-    /// caller says which by choosing `up_to`.
-    fn copy_out_views(&mut self, offset: u64, len: u64, up_to: u64) -> u64 {
+    /// cannot see it. Copying a short residue is cheaper than the buffer it
+    /// frees, and so is copying a view that covers less than half of its
+    /// buffer; a view covering most of it keeps the zero-copy path. Copying
+    /// every hold is what holds cost before views existed, and is worth it
+    /// exactly when the pool is running dry — the caller asks with `every`.
+    fn copy_out_views(&mut self, offset: u64, len: u64, every: bool) -> u64 {
         let end = offset.saturating_add(len);
-        let targets: Vec<u64> = self
-            .chunks
-            .range(..end)
-            .filter(|(start, chunk)| {
-                start.saturating_add(chunk.len()) > offset
-                    && matches!(chunk, StagedChunk::Memory(bytes) if (bytes.len() as u64) <= up_to)
-            })
-            .map(|(start, _)| *start)
-            .collect();
         let mut copied = 0u64;
-        for start in targets {
-            if let Some(StagedChunk::Memory(bytes)) = self.chunks.get_mut(&start) {
-                copied = copied.saturating_add(bytes.len() as u64);
-                *bytes = Bytes::copy_from_slice(bytes);
+        for (start, chunk) in self.chunks.range_mut(..end) {
+            if start.saturating_add(chunk.len()) <= offset {
+                continue;
             }
+            copied = copied.saturating_add(chunk.release(every));
         }
         copied
     }
@@ -2171,7 +2220,7 @@ impl VolumeStaging {
             .chunks
             .iter()
             .filter_map(|(offset, chunk)| match chunk {
-                StagedChunk::Memory(bytes) => Some((*offset, bytes.len() as u64)),
+                StagedChunk::Memory { bytes, .. } => Some((*offset, bytes.len() as u64)),
                 StagedChunk::Scratch { .. } => None,
             })
             .collect();
@@ -3131,7 +3180,7 @@ impl DirectSetRouter {
                 .get(&volume_index)
                 .and_then(|staging| staging.chunks.get(&offset))
             {
-                Some(StagedChunk::Memory(bytes)) => bytes.clone(),
+                Some(StagedChunk::Memory { bytes, .. }) => bytes.clone(),
                 _ => continue,
             };
             let resident_bytes = self.resident_bytes();
@@ -3255,7 +3304,7 @@ impl DirectSetRouter {
                             volume_index: *volume_index,
                             chunk_offset: *chunk_offset,
                         }),
-                        StagedChunk::Memory(_) => None,
+                        StagedChunk::Memory { .. } => None,
                     })
             })
             .collect();

@@ -523,6 +523,52 @@ pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
     outcome
 }
 
+/// Whether a finalized set's installation marker still describes this spec and
+/// this staging root.
+///
+/// Metadata only, like every other restart probe: the members were verified
+/// before they were committed, and what a restart can lose is the file, not its
+/// bytes. A probe that cannot complete is a refusal, for the same reason
+/// [`CoverageRejection::ProbeFailed`] is.
+async fn installed_set_still_present(
+    plan: &DirectSetPlan,
+    blob: &[u8],
+) -> Result<super::snapshot::InstalledSet, String> {
+    let marker = super::snapshot::decode_installed(blob).map_err(|error| error.to_string())?;
+    let volumes: Vec<(u32, u32)> = plan
+        .volumes
+        .iter()
+        .map(|(volume, file)| (*volume, *file))
+        .collect();
+    if marker.volumes != volumes {
+        return Err("the set's volumes no longer match the marker".to_string());
+    }
+    if marker.members.is_empty() {
+        return Err("the marker names no committed member".to_string());
+    }
+    for member in &marker.members {
+        let path = plan.destination_path(&member.relative_path);
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() && metadata.len() == member.len => {}
+            Ok(metadata) => {
+                return Err(format!(
+                    "committed member {} is {} bytes, expected {}",
+                    member.relative_path,
+                    metadata.len(),
+                    member.len
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "committed member {} could not be probed: {error}",
+                    member.relative_path
+                ));
+            }
+        }
+    }
+    Ok(marker)
+}
+
 /// Per-NZB-file refetch floors derived from a checkpoint.
 ///
 /// Everything above a floor is redownloaded. Actual refetch can exceed the
@@ -628,6 +674,10 @@ pub(crate) struct DirectRestore {
     /// set exactly like legacy floors.
     pub(crate) skip: HashSet<SegmentId>,
     pub(crate) file_progress: HashMap<u32, u64>,
+    /// Sets whose installation marker was accepted: each is already in
+    /// [`Self::sets`], finalized, and carries the names its finalization
+    /// recorded as extracted, which only the live job state can hold.
+    pub(crate) installed: Vec<(String, Vec<String>)>,
     pub(crate) accepted: usize,
     pub(crate) rejected: usize,
     pub(crate) ignored: usize,
@@ -723,6 +773,66 @@ impl Pipeline {
                 HashMap::new()
             }
         };
+        // A finalized set leaves an installation marker where its coverage row
+        // was. It is not coverage and `restore_job` would refuse it as a bad
+        // magic, so it is judged on its own terms here: a marker whose set is
+        // still admitted under the same volumes, and whose every committed
+        // member is still in the staging root at its exact length, brings the
+        // set back finalized instead of fresh. Anything else is deleted, and the
+        // set redownloads as it would have with no marker at all.
+        let (marker_rows, rows): (HashMap<String, Vec<u8>>, HashMap<String, Vec<u8>>) = rows
+            .into_iter()
+            .partition(|(_, blob)| super::snapshot::is_installed_marker(blob));
+        let mut installed: HashMap<String, super::snapshot::InstalledSet> = HashMap::new();
+        let mut rejected_markers = 0usize;
+        let ignored_markers = if gate.is_enabled() {
+            0
+        } else {
+            marker_rows.len()
+        };
+        if gate.is_enabled() {
+            let mut marker_rows: Vec<(String, Vec<u8>)> = marker_rows.into_iter().collect();
+            marker_rows.sort();
+            for (set_name, blob) in marker_rows {
+                let verdict = match admitted.iter().find(|plan| plan.set_name == set_name) {
+                    Some(plan) => installed_set_still_present(plan, &blob).await,
+                    None => Err("the set is not admitted from this spec".to_string()),
+                };
+                match verdict {
+                    Ok(marker) => {
+                        installed.insert(set_name, marker);
+                    }
+                    Err(reason) => {
+                        rejected_markers += 1;
+                        crate::runtime::perf_probe::record_owned(
+                            "direct_store.restart.rejected".to_string(),
+                            std::time::Duration::from_nanos(1),
+                        );
+                        tracing::info!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            %reason,
+                            "direct-store installation marker refused at restore; the set \
+                             redownloads"
+                        );
+                        if let Err(error) = self
+                            .db_blocking({
+                                let set_name = set_name.clone();
+                                move |db| db.delete_direct_coverage(job_id, &set_name)
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                %error,
+                                "failed to delete a refused direct-store installation marker"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // Nothing to validate and nothing admitted still leaves the sweep to
         // run: a job that used to route and no longer does (the gate went off,
         // the spec changed) is exactly the job whose working directory holds
@@ -741,6 +851,9 @@ impl Pipeline {
         let mut restored: HashMap<String, DirectSet> = HashMap::new();
         let mut expected: HashMap<String, ExpectedSet> = HashMap::new();
         for plan in &admitted {
+            if installed.contains_key(&plan.set_name) {
+                continue;
+            }
             let set_name = plan.set_name.clone();
             let mut set = DirectSet::new(job_id, plan.clone());
             self.direct_store.apply_ceilings(&mut set);
@@ -828,9 +941,9 @@ impl Pipeline {
         }
 
         let mut result = DirectRestore {
-            accepted: outcome.accepted.len(),
-            rejected: outcome.rejected.len(),
-            ignored: outcome.ignored,
+            accepted: outcome.accepted.len() + installed.len(),
+            rejected: outcome.rejected.len() + rejected_markers,
+            ignored: outcome.ignored + ignored_markers,
             ..DirectRestore::default()
         };
 
@@ -879,6 +992,37 @@ impl Pipeline {
         // which is what makes the sweep below safe to run against it.
         let mut claimed: HashSet<PathBuf> = HashSet::new();
         for plan in &admitted {
+            // An installed set is done: every segment of its volumes is
+            // skipped and it comes back finalized, with no layout, because
+            // nothing will ever route into it again. Its committed members are
+            // not direct-store working files, so the sweep never considers
+            // them; its envelopes are, and are swept — a retained image is
+            // runtime-only and is not rebuilt, so a neighbour's repair meets
+            // this set the way it meets any finalized set that kept none.
+            if let Some(marker) = installed.remove(&plan.set_name) {
+                let complete: HashSet<u32> = plan.files.keys().copied().collect();
+                let floors: HashMap<u32, u64> =
+                    complete.iter().map(|file_index| (*file_index, 0)).collect();
+                let skip = coverage_skip_plan(job_id, spec, &floors, &complete);
+                for (file_index, floor) in skip.file_progress {
+                    let slot = result.file_progress.entry(file_index).or_insert(floor);
+                    *slot = (*slot).max(floor);
+                }
+                result.skip.extend(skip.skip);
+                let mut set = DirectSet::new(job_id, plan.clone());
+                set.mark_finalized();
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name = %plan.set_name,
+                    volumes = plan.volumes.len(),
+                    "direct-store set restored as installed from its finalization marker"
+                );
+                result
+                    .installed
+                    .push((plan.set_name.clone(), marker.extracted));
+                result.sets.push(set);
+                continue;
+            }
             let accepted = applied.get(&plan.set_name).cloned();
             let mut set = match (accepted.as_ref(), restored.remove(&plan.set_name)) {
                 (Some(_), Some(set)) => set,
@@ -1010,6 +1154,28 @@ impl Pipeline {
             result.skip.len() as u64,
         );
         result
+    }
+
+    /// Puts back the runtime record of every set restored as installed: its
+    /// name in `extracted_archives` and its members in the extracted-member
+    /// sets, exactly as its finalization left them.
+    ///
+    /// Called once the job's persisted extracted members are in place, because
+    /// that load replaces the job's entry wholesale.
+    pub(crate) fn reinstate_installed_direct_sets(
+        &mut self,
+        job_id: JobId,
+        installed: Vec<(String, Vec<String>)>,
+    ) {
+        for (set_name, extracted) in installed {
+            for name in extracted {
+                self.record_direct_extracted(job_id, name);
+            }
+            self.extracted_archives
+                .entry(job_id)
+                .or_default()
+                .insert(set_name);
+        }
     }
 
     /// The cached facts for every set of a job, decoded and keyed by set name.

@@ -2073,6 +2073,7 @@ impl Pipeline {
         let direct_rejected = direct_restore.rejected;
         let direct_ignored = direct_restore.ignored;
         let direct_swept = direct_restore.swept;
+        let direct_installed = direct_restore.installed;
         self.direct_store.install_restored(job_id, direct_sets);
         self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);
@@ -2091,6 +2092,10 @@ impl Pipeline {
         if !extracted_members.is_empty() {
             self.extracted_members.insert(job_id, extracted_members);
         }
+        // After the persisted members, which replace the job's entry: a set
+        // restored as installed finalized in the previous run and recorded its
+        // members only in memory.
+        self.reinstate_installed_direct_sets(job_id, direct_installed);
         match self.db.load_active_job_normalization_retried(job_id) {
             Ok(true) => {
                 self.normalization_retried.insert(job_id);

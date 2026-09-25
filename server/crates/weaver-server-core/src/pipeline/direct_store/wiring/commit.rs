@@ -1,6 +1,7 @@
 //! Direct-store writes and finalization, including mixed-member chase handoff.
 
 use super::*;
+use crate::pipeline::direct_store::barrier::CoveragePersist;
 
 fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedExtraction, String> {
     let mut result = ToleratedExtraction::default();
@@ -44,6 +45,49 @@ fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
 /// keeps the time of its creation here, exactly as it does there. Best effort:
 /// the entry exists either way, and a filesystem that refuses a time still
 /// holds the right bytes.
+/// The installation marker a finalized set leaves in place of its coverage row.
+///
+/// `None` when there is nothing to re-check at restore. A set with no committed
+/// byte-bearing member would be trusted on the marker's word alone, and a path
+/// that is not UTF-8 or not under the staging root cannot be recorded in the
+/// form restore probes. Either way the set redownloads after a restart, which
+/// is what it did before the marker existed.
+fn installed_marker(
+    plan: &DirectSetPlan,
+    members: &[(String, u64, PathBuf, PathBuf)],
+    extracted: Vec<String>,
+) -> Option<Vec<u8>> {
+    use crate::pipeline::direct_store::snapshot::{
+        InstalledMember, InstalledSet, encode_installed,
+    };
+
+    if members.is_empty() {
+        return None;
+    }
+    // Keyed by path, later entries replacing earlier ones: the commit walks
+    // members in archive order and two whose names sanitize to one destination
+    // overwrite each other, so the last one's length is the one on disk.
+    let mut committed: BTreeMap<String, u64> = BTreeMap::new();
+    for (_, len, _, destination) in members {
+        let relative = destination.strip_prefix(&plan.destination_dir).ok()?;
+        committed.insert(relative.to_str()?.to_string(), *len);
+    }
+    let members = committed
+        .into_iter()
+        .map(|(relative_path, len)| InstalledMember { relative_path, len })
+        .collect();
+    let installed = InstalledSet {
+        volumes: plan
+            .volumes
+            .iter()
+            .map(|(volume, file)| (*volume, *file))
+            .collect(),
+        members,
+        extracted,
+    };
+    encode_installed(&installed).ok()
+}
+
 fn apply_archive_times(path: &std::path::Path, modified: Option<u64>, accessed: Option<u64>) {
     let Some(modified) = modified.map(archive_filetime) else {
         return;
@@ -88,19 +132,13 @@ impl Pipeline {
         // decoded data intact for the conventional fallback on demotion.
         let part_crc_verified = segment.part_crc_verified;
         let pieces = segment.data.pieces();
-        // Read before the set is borrowed: whether whatever the router keeps
-        // of this article has to leave the article's buffer now. A pool slot
-        // is bounded by the pool, so a long hold keeps its view unless the
-        // tier is scarce. A buffer decoded for this article alone is bounded
-        // by nothing but the views of it, and a view charges the holds budget
-        // for its own range rather than the allocation it pins, so every
-        // hold leaves it.
-        let copy_every_hold = !segment.data.is_pooled()
-            || self
-                .buffers
-                .is_scarce(crate::runtime::buffers::BufferTier::for_size(
-                    decoded_size as usize,
-                ));
+        // Read before the set is borrowed: whether the tier this article's
+        // buffer came from can spare a slot to whatever the router keeps.
+        let pool_scarce = self
+            .buffers
+            .is_scarce(crate::runtime::buffers::BufferTier::for_size(
+                decoded_size as usize,
+            ));
 
         // Before the route, because routing is what parses: a container whose
         // volume zero has just declared its length may become readable in this
@@ -133,14 +171,19 @@ impl Pipeline {
             let routed = set.route(volume_index, file_offset, &pieces);
             if routed.is_ok() {
                 // What the drain left staged — a held tail, a header run the
-                // parser keeps — must not keep the decoder's buffer alive:
-                // short residues leave it now, all of them when the pool is
-                // scarce or the buffer is not the pool's.
-                set.release_article_views(
+                // parser keeps — must not keep the decoder's buffer alive for
+                // a fraction of it: short residues and views of less than
+                // half their piece leave it now, all of them when the pool is
+                // scarce.
+                let copied = set.release_article_views(
                     volume_index,
                     file_offset,
                     u64::from(decoded_size),
-                    copy_every_hold,
+                    pool_scarce,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.holds.copied_out_bytes",
+                    copied,
                 );
             }
             routed
@@ -572,7 +615,11 @@ impl Pipeline {
     /// extracted one through exactly the same root
     /// (`Pipeline::resolve_job_input_path` tries the working dir and then the
     /// staging dir, and only the second can match a direct member).
-    pub(super) fn record_direct_extracted(&mut self, job_id: JobId, name: String) {
+    pub(in crate::pipeline::direct_store) fn record_direct_extracted(
+        &mut self,
+        job_id: JobId,
+        name: String,
+    ) {
         let name = DirectSetPlan::destination_relative_name(&name).unwrap_or(name);
         self.direct_store
             .direct_extracted_members
@@ -1081,7 +1128,9 @@ impl Pipeline {
     }
 
     /// Demands a barrier for every live set of a job — pause, shutdown, phase
-    /// change, demotion and finalization all go through here.
+    /// change, demotion and finalization all go through here. A finalized set
+    /// is not live: its row is the installation marker, which a barrier
+    /// would overwrite (see [`DirectSet::run_barrier`]).
     pub(crate) async fn demand_direct_store_barriers(
         &mut self,
         job_id: JobId,
@@ -1092,7 +1141,7 @@ impl Pipeline {
             .sets_for(job_id)
             .iter()
             .enumerate()
-            .filter(|(_, set)| !set.is_demoted())
+            .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
             .map(|(index, _)| index)
             .collect();
         for set_index in indices {
@@ -1265,9 +1314,13 @@ impl Pipeline {
         // compares `plan().member_output_path` against the tolerated
         // destinations, which is derived from the layout and not from the
         // filesystem. It still has to run before the envelopes are deleted.
+        // Every name this finalization records as extracted, in the order it
+        // records them, for the installation marker written below.
+        let mut recorded: Vec<String> = Vec::new();
         let tolerated_directories = match self.extract_tolerated_members(job_id, set_index).await {
             Ok(Some(extracted)) => {
                 for name in extracted.members {
+                    recorded.push(name.clone());
                     self.record_direct_extracted(job_id, name);
                 }
                 extracted.directories
@@ -1344,6 +1397,7 @@ impl Pipeline {
                     .await;
                 return;
             }
+            recorded.push(name.clone());
             self.record_direct_extracted(job_id, name.clone());
         }
 
@@ -1399,11 +1453,13 @@ impl Pipeline {
                 dataless_directories.push((entry, destination));
             } else {
                 apply_archive_times(destination, entry.modified, entry.accessed);
+                recorded.push(entry.name.clone());
                 self.record_direct_extracted(job_id, entry.name.clone());
             }
         }
         for (entry, destination) in dataless_directories {
             apply_archive_times(destination, entry.modified, entry.accessed);
+            recorded.push(entry.name.clone());
             self.record_direct_extracted(job_id, entry.name.clone());
         }
 
@@ -1465,10 +1521,30 @@ impl Pipeline {
         }
 
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        if let Some(set) = self.direct_store.set_mut(job_id, set_index)
-            && let Err(error) = set.retire(&mut persist)
-        {
-            warn!(job_id = job_id.0, error = %error, "failed to retire a direct-store checkpoint");
+        let installed = self
+            .direct_store
+            .set(job_id, set_index)
+            .and_then(|set| installed_marker(set.plan(), &members, recorded));
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            if let Err(error) = set.retire(&mut persist) {
+                warn!(job_id = job_id.0, error = %error, "failed to retire a direct-store checkpoint");
+            }
+            // The coverage row is gone, and with it the only durable sign that
+            // this set exists at all. Without a marker in its place, a restart
+            // before the job is archived installs the set fresh and refetches
+            // every volume of output already committed above. A failed write
+            // costs exactly that redownload, which is the most it can cost.
+            if let Some(blob) = installed
+                && let Err(error) = persist.write(job_id, &set_name, &blob)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to record a finalized direct set as installed; a restart before \
+                     the job completes redownloads it"
+                );
+            }
         }
         // The other end of the direct phase, and the same rule the demotion
         // applies: the commit above renamed the member partials to their
