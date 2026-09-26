@@ -163,11 +163,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
       - name: Check formatting
@@ -181,10 +181,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: cargo-audit
       - name: Run cargo audit
@@ -205,7 +205,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -213,14 +213,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
       - name: Install sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.18.0
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -258,7 +258,7 @@ jobs:
         run: |
           git lfs install --local
           git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -281,7 +281,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.18.0
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -290,10 +290,10 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: nextest
       - name: Download embedded web artifact
@@ -368,7 +368,7 @@ jobs:
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -394,7 +394,7 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           key: clippy-windows-x86_64
@@ -433,7 +433,7 @@ jobs:
         run: |
           git lfs install --local
           git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install NASM
@@ -458,11 +458,11 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           key: test-windows-x86_64
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: nextest
       - name: Download embedded web artifact
@@ -481,10 +481,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
       - name: Run ARM-specific yEnc crate tests (NEON)
@@ -529,14 +529,14 @@ jobs:
         run: |
           git lfs install --local
           git lfs pull --include="$WEAVER_LFS_SDE_INCLUDE" --exclude=""
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
       - name: Install Intel SDE
@@ -650,12 +650,12 @@ jobs:
             rustflags: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -691,7 +691,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -700,7 +700,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools mold nasm
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -709,7 +709,7 @@ jobs:
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.18.0
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -786,7 +786,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -795,7 +795,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools mold
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -804,7 +804,7 @@ jobs:
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.18.0
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -879,14 +879,14 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add x86_64-apple-darwin
       - name: Install NASM
         run: brew install nasm
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -895,7 +895,7 @@ jobs:
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.18.0
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1098,11 +1098,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
       # was built out of.
@@ -1146,12 +1146,12 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -1160,7 +1160,7 @@ jobs:
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.18.0
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1364,11 +1364,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
       # was built out of.
@@ -1420,7 +1420,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -1442,7 +1442,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.18.0
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1473,7 +1473,7 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -1821,7 +1821,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -1843,7 +1843,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
-          version: v0.17.0
+          version: v0.18.0
       - name: Configure trusted tag sccache
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         uses: ./.github/actions/configure-sccache-r2
@@ -1860,7 +1860,7 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -2203,8 +2203,8 @@ jobs:
           path: artifacts
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -2229,7 +2229,7 @@ jobs:
             type=raw,value=${{ steps.pr_rc_tags.outputs.moving_tag }}
             type=raw,value=${{ steps.pr_rc_tags.outputs.commit_tag }}
       - name: Build and push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: docker-ctx
           file: docker/weaver.Dockerfile
@@ -2276,8 +2276,8 @@ jobs:
           path: artifacts
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -2308,7 +2308,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       - name: Build and push base image
         id: build_base
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: docker-ctx
           file: docker/weaver.Dockerfile
@@ -2491,7 +2491,7 @@ jobs:
       # verify <file> -R <repo>` works for the packages a desktop user
       # downloads by hand.
       - name: Attest installer release artifacts
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             artifacts/weaver-windows-*.zip
@@ -2949,7 +2949,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -3018,11 +3018,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       - name: Generate archive SBOMs and SLSA subject list
         run: |
           set -euo pipefail
