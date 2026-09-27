@@ -679,6 +679,7 @@ mod tests {
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
             data_dir: "/tmp/weaver".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,

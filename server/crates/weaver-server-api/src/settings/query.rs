@@ -29,6 +29,32 @@ impl SettingsQuery {
             .await,
         )
     }
+    /// The hardware profile in force, and the profiles this machine can
+    /// honour. Judged against the live probe, so a container that was given
+    /// more memory since startup is offered what it has now.
+    #[graphql(guard = "AdminGuard")]
+    async fn hardware_profile(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::types::HardwareProfileSettings> {
+        let config = ctx.data::<SharedConfig>()?;
+        let system = ctx.data::<crate::context::SystemRuntimeContext>()?;
+        let probe = system
+            .profile
+            .read()
+            .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
+            .clone();
+
+        let selected = with_timed_config_read(config, "settings.query.hardwareProfile", |cfg| {
+            cfg.hardware_profile
+        })
+        .await;
+
+        Ok(crate::settings::types::HardwareProfileSettings::resolve(
+            selected, &probe,
+        ))
+    }
+
     /// Whether first-run setup is still owed to this install.
     #[graphql(guard = "AdminGuard")]
     async fn first_run_setup(

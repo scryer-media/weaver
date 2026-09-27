@@ -375,6 +375,7 @@ mod tests {
     fn empty_config() -> Config {
         Config {
             data_dir: String::new(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,

@@ -369,6 +369,7 @@ mod tests {
     fn shared_config(watch_folder: WatchFolderConfig) -> SharedConfig {
         Arc::new(tokio::sync::RwLock::new(Config {
             data_dir: "/tmp/weaver".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,

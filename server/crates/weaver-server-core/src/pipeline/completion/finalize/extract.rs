@@ -161,6 +161,8 @@ pub(in crate::pipeline) enum SevenZipDecodeMemory {
     ReservedForFixedThreads {
         /// `next_header_size` from the signature header.
         end_header_bytes: u64,
+        /// Hardware-profile limit for optional, unmeasured decoder allowance.
+        allowance_cap: u64,
     },
     /// The chase: one thread at the download frontier, so output starts
     /// before the block has finished downloading, and more threads only while
@@ -291,6 +293,19 @@ impl SevenZipDecodeReservation {
         match self {
             Self::Measured(bytes) => budget.reserve_memory_wait(bytes),
             Self::UpToCeiling { floor } => budget.reserve_memory_up_to_ceiling_wait(floor),
+        }
+    }
+
+    fn reserve_capped(
+        self,
+        budget: &Arc<JobExtractionBudget>,
+        cap: u64,
+    ) -> Result<MemoryPermit, String> {
+        match self {
+            Self::Measured(bytes) => budget.reserve_memory_wait(bytes),
+            Self::UpToCeiling { floor } => {
+                budget.reserve_memory_up_to_ceiling_wait_capped(floor, cap)
+            }
         }
     }
 }
@@ -801,7 +816,9 @@ where
     let job_id = *job_id;
 
     let end_header_bytes = match decode_memory {
-        SevenZipDecodeMemory::ReservedForFixedThreads { end_header_bytes }
+        SevenZipDecodeMemory::ReservedForFixedThreads {
+            end_header_bytes, ..
+        }
         | SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => *end_header_bytes,
     };
 
@@ -881,7 +898,12 @@ where
     // Held from here to the end of the decode, parks included. A chase parked
     // mid-block has its dictionary genuinely allocated, so the permit stays;
     // what makes that harmless is its size — a dictionary, not a ceiling.
-    let decode_permit = decode_reservation.reserve(budget)?;
+    let decode_permit = match decode_memory {
+        SevenZipDecodeMemory::ReservedForFixedThreads { allowance_cap, .. } => {
+            decode_reservation.reserve_capped(budget, *allowance_cap)?
+        }
+        SevenZipDecodeMemory::ReservedPerPass { .. } => decode_reservation.reserve(budget)?,
+    };
     let decode_granted = decode_permit.bytes();
 
     let mut extracted_members = Vec::new();
@@ -2679,6 +2701,9 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let sevenz_decode_threads =
             u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
+        // Read when the extraction is admitted, so a hardware profile chosen
+        // since the last job took its allowance applies to this one.
+        let sevenz_decode_memory = self.shared_state.sevenz_decode_memory_bytes();
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
 
         // Whatever the chase left behind. Taken here, on the orchestrator, but
@@ -2736,6 +2761,7 @@ impl Pipeline {
                         phase_counters,
                         decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
                             end_header_bytes,
+                            allowance_cap: sevenz_decode_memory,
                         },
                         decode_threads: sevenz_decode_threads,
                     };

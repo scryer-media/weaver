@@ -124,6 +124,7 @@ mod tests {
     fn resolve_reads_the_config_table() {
         let mut config = Config {
             data_dir: "/tmp/weaver-direct-unpack".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,

@@ -2,6 +2,7 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::hardware_profile::{HardwareProfile, ProfileTuning};
 use crate::runtime::system_profile::SystemProfile;
 
 /// IOPS threshold for "fast" storage (SSD/NVMe). Above this, disk is not the
@@ -27,6 +28,8 @@ pub struct RuntimeTuner {
     max_concurrent_extractions_override: Option<usize>,
     /// Total connections across all configured servers (hard ceiling).
     total_connections: usize,
+    /// The chosen hardware profile's limits.
+    tuning: ProfileTuning,
 }
 
 impl RuntimeTuner {
@@ -37,25 +40,28 @@ impl RuntimeTuner {
         Self::with_connection_limit(profile, usize::MAX)
     }
 
-    /// Create with an explicit connection limit (from config).
+    /// Create with an explicit connection limit (from config), under the
+    /// profile this machine is recommended.
     pub fn with_connection_limit(profile: SystemProfile, total_connections: usize) -> Self {
-        let cores = profile.cpu.physical_cores.max(1);
+        let tuning = HardwareProfile::recommended(&profile).tuning(&profile);
+        Self::with_profile_tuning(profile, total_connections, tuning)
+    }
+
+    /// Create with an explicit connection limit and an explicitly chosen
+    /// hardware profile's limits.
+    pub fn with_profile_tuning(
+        profile: SystemProfile,
+        total_connections: usize,
+        tuning: ProfileTuning,
+    ) -> Self {
         let max_concurrent_extractions_override = parse_max_concurrent_extractions_override(
             env::var(MAX_CONCURRENT_EXTRACTIONS_ENV).ok().as_deref(),
         );
 
-        // Every configured connection is a download connection. Memory
-        // pressure changes where decoded bytes go (the write backlog spills
-        // to disk), never how many articles are requested: a connection
-        // count that ratchets down on pressure turns a transient backlog
-        // into a lasting speed loss that only a restart undoes.
-        let max_concurrent_downloads = total_connections;
-        let extract_threads = (cores / 2).max(1);
-
         let current = TunedParameters {
-            max_concurrent_downloads,
-            decode_thread_count: cores,
-            extract_thread_count: extract_threads,
+            max_concurrent_downloads: profile_download_limit(total_connections, &tuning),
+            decode_thread_count: tuning.decode_threads.max(1),
+            extract_thread_count: tuning.extract_threads.max(1),
         };
 
         Self {
@@ -63,6 +69,7 @@ impl RuntimeTuner {
             current,
             max_concurrent_extractions_override,
             total_connections,
+            tuning,
         }
     }
 
@@ -79,10 +86,10 @@ impl RuntimeTuner {
         &self.current
     }
 
-    /// Upper limit for max_concurrent_downloads based on system profile
-    /// and configured connection count.
+    /// Upper limit for max_concurrent_downloads based on the configured
+    /// connection count and the chosen profile's cap.
     fn max_downloads_limit(&self) -> usize {
-        self.total_connections
+        profile_download_limit(self.total_connections, &self.tuning)
     }
 
     /// Update the connection limit (e.g. after adding/removing a server) and
@@ -123,6 +130,26 @@ impl RuntimeTuner {
                 1
             }
         }
+    }
+}
+
+/// Downloads that may be in flight at once.
+///
+/// Every configured connection is a download connection. Memory pressure
+/// changes where decoded bytes go (the write backlog spills to disk), never
+/// how many articles are requested: a connection count that ratchets down on
+/// pressure turns a transient backlog into a lasting speed loss that only a
+/// restart undoes.
+///
+/// A profile's cap is not that. It is a startup value the operator chose along
+/// with the profile — live per-job memory scales with the number of downloads
+/// in flight, so a machine that asked for the smallest footprint gets fewer of
+/// them — and it never moves in response to pressure. Only the efficient
+/// profile sets one.
+fn profile_download_limit(total_connections: usize, tuning: &ProfileTuning) -> usize {
+    match tuning.max_concurrent_downloads_cap {
+        Some(cap) => total_connections.min(cap),
+        None => total_connections,
     }
 }
 

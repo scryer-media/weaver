@@ -4,8 +4,112 @@ use weaver_server_core::bandwidth::{
     IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday,
 };
 use weaver_server_core::jobs::DuplicatePolicy;
+use weaver_server_core::runtime::HardwareProfile;
+use weaver_server_core::runtime::system_profile::SystemProfile;
 
 use crate::jobs::types::DuplicateActionGql;
+
+/// How hard Weaver leans on the machine it runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum HardwareProfileGql {
+    Efficient,
+    Balanced,
+    Performance,
+}
+
+impl From<HardwareProfile> for HardwareProfileGql {
+    fn from(value: HardwareProfile) -> Self {
+        match value {
+            HardwareProfile::Efficient => Self::Efficient,
+            HardwareProfile::Balanced => Self::Balanced,
+            HardwareProfile::Performance => Self::Performance,
+        }
+    }
+}
+
+impl From<HardwareProfileGql> for HardwareProfile {
+    fn from(value: HardwareProfileGql) -> Self {
+        match value {
+            HardwareProfileGql::Efficient => Self::Efficient,
+            HardwareProfileGql::Balanced => Self::Balanced,
+            HardwareProfileGql::Performance => Self::Performance,
+        }
+    }
+}
+
+/// What the machine this Weaver runs on can actually use, after any container
+/// limit. The numbers the profile requirements are judged against.
+#[derive(Debug, Clone, Copy, SimpleObject)]
+pub struct DetectedHardware {
+    pub memory_bytes: u64,
+    pub cores: u32,
+}
+
+/// What one profile would do on this machine, so an interface can say what a
+/// card means without keeping its own copy of the numbers.
+#[derive(Debug, Clone, Copy, SimpleObject)]
+pub struct HardwareProfileOption {
+    pub profile: HardwareProfileGql,
+    /// Memory one 7z extraction may hold while decoding.
+    pub sevenz_decode_memory_bytes: u64,
+    /// Articles decoded at once.
+    pub decode_threads: u32,
+    /// Threads shared by extraction, repair and post-processing.
+    pub extract_threads: u32,
+    /// Downloads in flight at once, or null when the configured connection
+    /// count is the only limit.
+    pub max_concurrent_downloads: Option<u32>,
+}
+
+impl HardwareProfileOption {
+    fn resolve(profile: HardwareProfile, probe: &SystemProfile) -> Self {
+        let tuning = profile.tuning(probe);
+        Self {
+            profile: profile.into(),
+            sevenz_decode_memory_bytes: tuning.sevenz_decode_memory_bytes,
+            decode_threads: tuning.decode_threads as u32,
+            extract_threads: tuning.extract_threads as u32,
+            max_concurrent_downloads: tuning.max_concurrent_downloads_cap.map(|cap| cap as u32),
+        }
+    }
+}
+
+/// The hardware-profile choice, and everything needed to present it: an
+/// interface with one available profile has nothing to ask and hides the
+/// question entirely.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct HardwareProfileSettings {
+    /// The operator's choice, or null when they have never made one and the
+    /// recommendation is standing in.
+    pub selected: Option<HardwareProfileGql>,
+    /// The most capable profile this machine can honour.
+    pub recommended: HardwareProfileGql,
+    /// Every profile this machine can honour, least demanding first.
+    pub available: Vec<HardwareProfileGql>,
+    /// What each available profile would do here, in the same order.
+    pub options: Vec<HardwareProfileOption>,
+    pub detected: DetectedHardware,
+}
+
+impl HardwareProfileSettings {
+    /// The whole answer, resolved against one probe of the machine.
+    pub(crate) fn resolve(selected: Option<HardwareProfile>, probe: &SystemProfile) -> Self {
+        let available = HardwareProfile::available(probe);
+        Self {
+            selected: selected.map(Into::into),
+            recommended: HardwareProfile::recommended(probe).into(),
+            options: available
+                .iter()
+                .map(|profile| HardwareProfileOption::resolve(*profile, probe))
+                .collect(),
+            available: available.into_iter().map(Into::into).collect(),
+            detected: DetectedHardware {
+                memory_bytes: HardwareProfile::effective_memory_bytes(probe),
+                cores: HardwareProfile::effective_cores(probe) as u32,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct GeneralSettings {

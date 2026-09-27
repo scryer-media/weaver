@@ -84,6 +84,7 @@ pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 pub use runtime::affinity::{
     install_tokio_worker_affinity, pin_current_thread_for_hot_download_path,
 };
+pub use runtime::hardware_profile::{HardwareProfile, ProfileTuning};
 pub use runtime::tuning::{RuntimeTuner, TunedParameters};
 
 /// Allocation counter for the tests that assert a hot path allocates nothing.

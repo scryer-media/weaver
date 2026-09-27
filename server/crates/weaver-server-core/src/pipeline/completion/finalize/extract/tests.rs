@@ -878,7 +878,10 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
         password: sevenz_turbo::Password::empty(),
         event_tx,
         phase_counters: Arc::new(PhaseCounters::default()),
-        decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads { end_header_bytes },
+        decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
+            end_header_bytes,
+            allowance_cap: u64::MAX,
+        },
         decode_threads: 1,
     };
     let outcome = extract_7z_stream(&context, || {
@@ -958,9 +961,61 @@ fn conventional_7z_context(
         phase_counters: Arc::new(PhaseCounters::default()),
         decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
             end_header_bytes: sevenz_end_header_bytes(archive),
+            allowance_cap: u64::MAX,
         },
         decode_threads,
     }
+}
+
+#[test]
+fn profile_caps_optional_7z_allowance_without_reducing_required_memory() {
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    let (_root, budget) = test_extraction_security_with_memory(temp.path(), 64 * MIB);
+    for (request, expected) in [
+        (
+            SevenZipDecodeReservation::UpToCeiling { floor: MIB },
+            16 * MIB,
+        ),
+        (
+            SevenZipDecodeReservation::UpToCeiling { floor: 24 * MIB },
+            24 * MIB,
+        ),
+        (SevenZipDecodeReservation::Measured(24 * MIB), 24 * MIB),
+    ] {
+        let permit = request.reserve_capped(&budget, 16 * MIB).unwrap();
+        assert_eq!(permit.bytes(), expected);
+        drop(permit);
+        assert_eq!(budget.memory_reserved_bytes(), 0);
+    }
+}
+
+#[test]
+fn conventional_7z_measured_dictionary_may_exceed_profile_allowance() {
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    let archive = sevenz_archive_with_dictionary(32 * 1024 * 1024, &[("episode.txt", b"content")]);
+    let (root, budget) = test_extraction_security_with_memory(temp.path(), 128 * MIB);
+    let mut context = conventional_7z_context(temp.path(), root, Arc::clone(&budget), &archive, 1);
+    context.decode_memory = SevenZipDecodeMemory::ReservedForFixedThreads {
+        end_header_bytes: sevenz_end_header_bytes(&archive),
+        allowance_cap: 16 * MIB,
+    };
+    let reservations = std::sync::Mutex::new(Vec::new());
+    extract_7z_stream(&context, || {
+        reservations
+            .lock()
+            .unwrap()
+            .push(budget.memory_reserved_bytes());
+        Ok(Cursor::new(archive.clone()))
+    })
+    .unwrap();
+    assert!(reservations.lock().unwrap()[1] >= 32 * MIB);
+    assert_eq!(
+        fs::read(temp.path().join("episode.txt")).unwrap(),
+        b"content"
+    );
+    assert_eq!(budget.memory_reserved_bytes(), 0);
 }
 
 /// An encoded end header decodes under the reader's limits, which reach the

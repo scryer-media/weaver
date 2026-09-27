@@ -60,8 +60,8 @@ impl Pipeline {
         let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
         let decode_backlog_budget_bytes =
             compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
-        let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
         let (
+            hardware_profile,
             initial_bandwidth_policy,
             ip_replacement_trial_extra_connections,
             direct_store_settings,
@@ -70,6 +70,12 @@ impl Pipeline {
         ) = {
             let cfg = config.read().await;
             (
+                // An install that never chose one — every upgraded install —
+                // runs the profile this machine is recommended. A saved choice
+                // the machine can no longer honour falls back the same way.
+                cfg.hardware_profile
+                    .filter(|chosen| chosen.unmet_requirement(&profile).is_none())
+                    .unwrap_or_else(|| crate::runtime::HardwareProfile::recommended(&profile)),
                 cfg.isp_bandwidth_cap.clone(),
                 cfg.ip_replacement_trial_extra_connections(),
                 // Config, with `WEAVER_RAR_DIRECT_STORE`
@@ -89,9 +95,16 @@ impl Pipeline {
                 Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
+        let profile_tuning = hardware_profile.tuning(&profile);
+        let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
+        shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
         metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
         info!(
+            hardware_profile = hardware_profile.as_str(),
             max_downloads = tuner.params().max_concurrent_downloads,
+            decode_threads = tuner.params().decode_thread_count,
+            extract_threads = tuner.params().extract_thread_count,
+            sevenz_decode_memory_mb = profile_tuning.sevenz_decode_memory_bytes / (1024 * 1024),
             decode_backlog_budget_mb = decode_backlog_budget_bytes / (1024 * 1024),
             write_backlog_budget_mb = write_backlog_budget_bytes / (1024 * 1024),
             total_connections,
@@ -129,7 +142,10 @@ impl Pipeline {
         {
             warn!(path = %uu_spool_root.display(), error = %error, "failed to clear the stale UU spool");
         }
-        let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
+        let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
+            &complete_dir,
+            profile_tuning.extraction_memory_bytes,
+        )?);
         let process_memory_budget =
             Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
 

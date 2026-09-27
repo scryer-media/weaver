@@ -214,6 +214,7 @@ impl TestHarness {
             direct_store: None,
             direct_unpack: None,
             delivery_naming: None,
+            hardware_profile: None,
             metrics: Default::default(),
             config_path: None,
         };

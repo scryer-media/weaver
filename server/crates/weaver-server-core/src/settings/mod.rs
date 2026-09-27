@@ -10,3 +10,4 @@ pub use model::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
     DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SharedConfig,
 };
+pub use service::HARDWARE_PROFILE_SETTING;

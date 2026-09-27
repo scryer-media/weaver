@@ -97,6 +97,7 @@ impl TestHarness {
         let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
         let config: SharedConfig = Arc::new(RwLock::new(Config {
             data_dir: data_dir.display().to_string(),
+            hardware_profile: None,
             intermediate_dir: Some(intermediate_dir.display().to_string()),
             complete_dir: Some(complete_dir.display().to_string()),
             buffer_pool: None,
@@ -471,6 +472,7 @@ async fn new_direct_pipeline_at_roots(
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let config: SharedConfig = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
+        hardware_profile: None,
         intermediate_dir: Some(intermediate_dir.display().to_string()),
         complete_dir: Some(complete_dir.display().to_string()),
         buffer_pool: None,

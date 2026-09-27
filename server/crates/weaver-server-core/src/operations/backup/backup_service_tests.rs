@@ -170,6 +170,7 @@ fn sample_server(id: u32) -> crate::servers::ServerConfig {
 fn sample_config() -> Config {
     Config {
         data_dir: "/old/data".into(),
+        hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
         complete_dir: Some("/old/data/complete".into()),
         buffer_pool: None,
@@ -1171,6 +1172,7 @@ async fn restore_requires_category_remap_for_external_paths() {
     target_db
         .save_config(&Config {
             data_dir: "/bootstrap".into(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
@@ -1196,6 +1198,7 @@ async fn restore_requires_category_remap_for_external_paths() {
         target_db.clone(),
         Config {
             data_dir: "/bootstrap".into(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,

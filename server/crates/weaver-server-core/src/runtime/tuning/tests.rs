@@ -68,6 +68,25 @@ fn initial_params_hdd() {
 }
 
 #[test]
+fn the_efficient_profile_caps_downloads_without_reducing_a_smaller_pool() {
+    use crate::runtime::hardware_profile::HardwareProfile;
+
+    let profile = ssd_profile(8);
+    let tuning = HardwareProfile::Efficient.tuning(&profile);
+    let mut tuner = RuntimeTuner::with_profile_tuning(profile, TEST_CONNECTIONS, tuning);
+    let p = tuner.params();
+    assert_eq!(p.max_concurrent_downloads, 10);
+    assert_eq!(p.decode_thread_count, 2);
+    assert_eq!(p.extract_thread_count, 4);
+
+    // A connection pool smaller than the cap is still the binding limit.
+    tuner.set_connection_limit(4);
+    assert_eq!(tuner.params().max_concurrent_downloads, 4);
+    tuner.set_connection_limit(40);
+    assert_eq!(tuner.params().max_concurrent_downloads, 10);
+}
+
+#[test]
 fn parse_max_concurrent_extractions_override_accepts_positive_values() {
     assert_eq!(
         parse_max_concurrent_extractions_override(Some("1")),

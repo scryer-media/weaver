@@ -224,6 +224,7 @@ mod tests {
 
         let config: SharedConfig = Arc::new(RwLock::new(Config {
             data_dir: "/tmp/weaver-runtime-reload-test".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
@@ -260,6 +261,7 @@ mod tests {
     async fn missing_policy_registry_preserves_prior_generation() {
         let config: SharedConfig = Arc::new(RwLock::new(Config {
             data_dir: "/tmp/weaver-runtime-reload-missing-policy-test".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
