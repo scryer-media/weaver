@@ -583,6 +583,17 @@ pub struct NntpRuntimeActivation {
     pub configured_connections: usize,
 }
 
+/// What deleting one history record left behind.
+///
+/// The record itself is always gone when this is returned. A working
+/// directory whose ownership marker names the job but no longer matches the
+/// directory is not removed — nothing proves it is still the job's — and is
+/// listed here so the caller can say so.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryDeleteOutcome {
+    pub left_in_place: Vec<std::path::PathBuf>,
+}
+
 pub enum SchedulerCommand {
     /// Submit a new job.
     AddJob {
@@ -708,7 +719,7 @@ pub enum SchedulerCommand {
     DeleteHistory {
         job_id: JobId,
         delete_files: bool,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
+        reply: oneshot::Sender<Result<HistoryDeleteOutcome, SchedulerError>>,
     },
     /// Delete all completed/failed/cancelled jobs from history.
     DeleteAllHistory {
@@ -1017,7 +1028,7 @@ impl SchedulerHandle {
         &self,
         job_id: JobId,
         delete_files: bool,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<HistoryDeleteOutcome, SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::DeleteHistory {

@@ -16,6 +16,17 @@ use weaver_server_core::{
     HistoryDeleteOperationRow, SchedulerError, SchedulerHandle,
 };
 
+/// How long one target waits for the pipeline to answer its history delete.
+///
+/// The pipeline actor answers deletes between its other work, so a slow
+/// answer is normal; no answer at all is not. Without a bound, a pipeline
+/// that never replies leaves the whole operation claimed forever and every
+/// target in it showing as in progress. Past this the target is failed as
+/// unanswered and the operation finalises, so the rows can be retried.
+const HISTORY_DELETE_REPLY_DEADLINE: Duration = Duration::from_secs(300);
+
+const PIPELINE_DID_NOT_ANSWER: &str = "pipeline did not answer the history delete";
+
 #[derive(Clone)]
 pub(crate) struct HistoryDeleteManager {
     db: Database,
@@ -201,23 +212,44 @@ impl HistoryDeleteManager {
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
 
-            let result = self
-                .handle
-                .delete_history(
+            let result = tokio::time::timeout(
+                HISTORY_DELETE_REPLY_DEADLINE,
+                self.handle.delete_history(
                     weaver_server_core::JobId(target.target_id),
                     target.delete_files,
-                )
-                .await;
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    operation_id = target.operation_id,
+                    job_id = target.target_id,
+                    deadline_secs = HISTORY_DELETE_REPLY_DEADLINE.as_secs(),
+                    "{PIPELINE_DID_NOT_ANSWER}; failing the target"
+                );
+                Err(SchedulerError::Internal(
+                    PIPELINE_DID_NOT_ANSWER.to_string(),
+                ))
+            });
 
-            match result {
-                Ok(()) | Err(SchedulerError::JobNotFound(_)) => {
+            let outcome = match result {
+                Ok(outcome) => Ok(outcome),
+                Err(SchedulerError::JobNotFound(_)) => Ok(Default::default()),
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(outcome) => {
+                    // The record is gone either way; a directory whose marker
+                    // stopped matching it was left on disk, and the target says
+                    // which rather than claiming a clean delete.
+                    let note = left_in_place_note(&outcome);
                     let db = self.db.clone();
                     tokio::task::spawn_blocking(move || {
                         db.mark_history_delete_target_state(
                             target.operation_id,
                             target.target_id,
                             AsyncOperationTargetState::Completed,
-                            None,
+                            note.as_deref(),
                         )
                     })
                     .await
@@ -263,6 +295,21 @@ impl HistoryDeleteManager {
 
         Ok(())
     }
+}
+
+fn left_in_place_note(outcome: &weaver_server_core::HistoryDeleteOutcome) -> Option<String> {
+    if outcome.left_in_place.is_empty() {
+        return None;
+    }
+    let dirs: Vec<String> = outcome
+        .left_in_place
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect();
+    Some(format!(
+        "record deleted; working directory left in place: {}",
+        dirs.join(", ")
+    ))
 }
 
 fn dedupe_ids(ids: &[u64]) -> Vec<u64> {
@@ -415,7 +462,7 @@ mod tests {
                 .expect("recorded output directory");
             std::fs::remove_dir_all(output_dir).unwrap();
             db_for_scheduler.delete_job_history(job_id.0).unwrap();
-            reply.send(Ok(())).unwrap();
+            reply.send(Ok(Default::default())).unwrap();
         });
         let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
 
@@ -427,6 +474,51 @@ mod tests {
         assert_eq!(
             db.list_history_delete_operations(false).unwrap()[0].state,
             weaver_server_core::AsyncOperationState::Completed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_that_never_answers_fails_the_target_and_finalises() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&history(9)).unwrap();
+        let operation_id = db
+            .insert_history_delete_operation(&[9], false, false)
+            .unwrap();
+        let operation = db.next_history_delete_operation().unwrap().unwrap();
+
+        // The command is buffered and held, never answered: its reply sender
+        // stays alive in `command_rx`, so the only way out is the deadline.
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (event_tx, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            command_tx,
+            event_tx,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
+
+        manager.process_operation(operation).await.unwrap();
+
+        let Ok(weaver_server_core::SchedulerCommand::DeleteHistory { job_id, .. }) =
+            command_rx.try_recv()
+        else {
+            panic!("the delete must have reached the scheduler");
+        };
+        assert_eq!(job_id.0, 9);
+        // The message is the deadline's own, not "channel closed": the target
+        // failed because nothing answered, not because the reply was dropped.
+        let state = db.list_history_delete_row_states(&[9]).unwrap();
+        assert_eq!(state[&9].state, AsyncOperationTargetState::Failed);
+        assert_eq!(
+            state[&9].error_message.as_deref(),
+            Some(PIPELINE_DID_NOT_ANSWER)
+        );
+        let summaries = db.list_history_delete_operations(false).unwrap();
+        assert_eq!(summaries[0].id, operation_id);
+        assert_eq!(
+            summaries[0].state,
+            weaver_server_core::AsyncOperationState::CompletedWithErrors,
+            "an unanswered target must not leave the operation claimed"
         );
     }
 }

@@ -2329,7 +2329,7 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                 set_job_parameter(ctx, job_id, "nzbget.dupe_mode", &request.param).await
             }
             "historydelete" | "historyfinaldelete" => {
-                ctx.handle.delete_history(job_id, false).await
+                ctx.handle.delete_history(job_id, false).await.map(|_| ())
             }
             "historyreturn" | "historyredownload" => ctx.handle.redownload_job(job_id).await,
             "historyprocess" => ctx.handle.reprocess_job(job_id).await,
@@ -2356,7 +2356,7 @@ async fn group_final_delete(
     job_id: JobId,
 ) -> Result<(), SchedulerError> {
     ctx.handle.cancel_job(job_id).await?;
-    ctx.handle.delete_history(job_id, false).await
+    ctx.handle.delete_history(job_id, false).await.map(|_| ())
 }
 
 /// GroupMoveTop / GroupMoveBottom / GroupMoveOffset. The move delta arrives in

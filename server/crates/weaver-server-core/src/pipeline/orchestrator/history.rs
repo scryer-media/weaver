@@ -2,6 +2,37 @@ use std::collections::HashSet;
 
 use super::*;
 
+/// The working directories a history delete will remove, and the ones it will
+/// leave on disk because their ownership marker no longer matches them.
+#[derive(Debug, Default)]
+pub(crate) struct HistoryCleanupDirs {
+    pub(crate) owned: BTreeSet<(JobId, PathBuf)>,
+    pub(crate) left_in_place: Vec<PathBuf>,
+}
+
+impl HistoryCleanupDirs {
+    async fn admit(
+        &mut self,
+        intermediate_dir: &std::path::Path,
+        job_id: JobId,
+        path: PathBuf,
+    ) -> Result<(), crate::SchedulerError> {
+        match crate::jobs::working_dir::prepare_history_working_dir(intermediate_dir, &path, job_id)
+            .await?
+        {
+            crate::jobs::working_dir::HistoryWorkingDir::Owned => {
+                self.owned.insert((job_id, path));
+            }
+            crate::jobs::working_dir::HistoryWorkingDir::LeftInPlace => {
+                if !self.left_in_place.contains(&path) {
+                    self.left_in_place.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Pipeline {
     fn cleanupable_history_output_dir(&self, output_dir: &std::path::Path) -> Option<PathBuf> {
         output_dir
@@ -18,19 +49,13 @@ impl Pipeline {
     pub(crate) async fn history_cleanup_dirs_for_job(
         &self,
         job_id: JobId,
-    ) -> Result<BTreeSet<(JobId, PathBuf)>, crate::SchedulerError> {
-        let mut dirs = BTreeSet::new();
+    ) -> Result<HistoryCleanupDirs, crate::SchedulerError> {
+        let mut dirs = HistoryCleanupDirs::default();
         if let Some(state) = self.jobs.get(&job_id)
             && is_terminal_status(&state.status)
             && let Some(path) = self.cleanupable_history_output_dir(&state.working_dir)
         {
-            crate::jobs::working_dir::prepare_history_working_dir(
-                &self.intermediate_dir,
-                &path,
-                job_id,
-            )
-            .await?;
-            dirs.insert((job_id, path));
+            dirs.admit(&self.intermediate_dir, job_id, path).await?;
         }
 
         let db = self.db.clone();
@@ -50,13 +75,7 @@ impl Pipeline {
             && let Some(path) =
                 self.cleanupable_history_output_dir(std::path::Path::new(&output_dir))
         {
-            crate::jobs::working_dir::prepare_history_working_dir(
-                &self.intermediate_dir,
-                &path,
-                job_id,
-            )
-            .await?;
-            dirs.insert((job_id, path));
+            dirs.admit(&self.intermediate_dir, job_id, path).await?;
         }
 
         Ok(dirs)
@@ -64,19 +83,13 @@ impl Pipeline {
 
     pub(crate) async fn all_history_cleanup_dirs(
         &self,
-    ) -> Result<BTreeSet<(JobId, PathBuf)>, crate::SchedulerError> {
-        let mut dirs = BTreeSet::new();
+    ) -> Result<HistoryCleanupDirs, crate::SchedulerError> {
+        let mut dirs = HistoryCleanupDirs::default();
         for (job_id, state) in &self.jobs {
             if is_terminal_status(&state.status)
                 && let Some(path) = self.cleanupable_history_output_dir(&state.working_dir)
             {
-                crate::jobs::working_dir::prepare_history_working_dir(
-                    &self.intermediate_dir,
-                    &path,
-                    *job_id,
-                )
-                .await?;
-                dirs.insert((*job_id, path));
+                dirs.admit(&self.intermediate_dir, *job_id, path).await?;
             }
         }
 
@@ -94,24 +107,23 @@ impl Pipeline {
                 && let Some(path) =
                     self.cleanupable_history_output_dir(std::path::Path::new(&output_dir))
             {
-                crate::jobs::working_dir::prepare_history_working_dir(
-                    &self.intermediate_dir,
-                    &path,
-                    JobId(row.job_id),
-                )
-                .await?;
-                dirs.insert((JobId(row.job_id), path));
+                dirs.admit(&self.intermediate_dir, JobId(row.job_id), path)
+                    .await?;
             }
         }
 
         Ok(dirs)
     }
 
+    /// Removes every owned directory in `dirs`, and returns every directory
+    /// left on disk — the ones `dirs` already set aside plus any whose marker
+    /// stopped matching between the two looks.
     pub(crate) async fn cleanup_history_intermediate_dirs(
         &self,
-        dirs: &BTreeSet<(JobId, PathBuf)>,
-    ) -> Result<(), crate::SchedulerError> {
-        for (job_id, dir) in dirs {
+        dirs: &HistoryCleanupDirs,
+    ) -> Result<Vec<PathBuf>, crate::SchedulerError> {
+        let mut left_in_place = dirs.left_in_place.clone();
+        for (job_id, dir) in &dirs.owned {
             // Failed jobs never pass through the finalize close, so drop any
             // cached write handles before their dirs (and paths) are freed
             // for reuse.
@@ -125,8 +137,11 @@ impl Pipeline {
             .await
             .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?;
             match removal {
-                Ok(()) => {
+                Ok(crate::jobs::working_dir::HistoryWorkingDir::Owned) => {
                     info!(dir = %dir.display(), "removed historical intermediate directory");
+                }
+                Ok(crate::jobs::working_dir::HistoryWorkingDir::LeftInPlace) => {
+                    left_in_place.push(dir.clone());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -141,7 +156,7 @@ impl Pipeline {
             }
         }
 
-        Ok(())
+        Ok(left_in_place)
     }
 
     pub(crate) async fn output_dir_for_job(&self, job_id: JobId) -> Option<PathBuf> {
