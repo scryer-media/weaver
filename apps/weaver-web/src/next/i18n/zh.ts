@@ -616,8 +616,6 @@ export const nextZh: LocaleDictionary = {
   "next.general.propagationDelay": "传播延迟",
   "next.general.propagationDelayHelp": "新 NZB 开始前先等待这么久,确保所有文章都已到达服务器。",
   "next.general.seconds": "秒",
-  "next.general.trialConnection": "地址试用期间的额外连接",
-  "next.general.trialConnectionHelp": "为 weaver 仍在评估的服务商地址额外打开一个连接。",
   "next.general.srrdb": "SRRDB 发布查询",
   "next.general.srrdbHelp": "对于混淆的归档成员,只将其 CRC32 校验和发送到公共 SRRDB 索引,以恢复发布名称。",
   "next.general.storage": "存储",

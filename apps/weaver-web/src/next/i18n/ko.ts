@@ -616,8 +616,6 @@ export const nextKo: LocaleDictionary = {
   "next.general.propagationDelay": "전파 대기 시간",
   "next.general.propagationDelayHelp": "모든 기사가 서버에 도달하도록 새 NZB의 시작을 이 시간만큼 보류합니다.",
   "next.general.seconds": "초",
-  "next.general.trialConnection": "주소 시험 중 추가 연결",
-  "next.general.trialConnectionHelp": "weaver가 아직 평가 중인 공급자 주소에 연결을 하나 더 엽니다.",
   "next.general.srrdb": "SRRDB 릴리스 조회",
   "next.general.srrdbHelp": "난독화된 아카이브 멤버의 경우 CRC32 체크섬만 공개 SRRDB 색인에 보내 릴리스 이름을 복원합니다.",
   "next.general.storage": "저장소",

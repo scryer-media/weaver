@@ -622,8 +622,6 @@ export const nextEn: LocaleDictionary = {
   "next.general.propagationDelay": "Propagation delay",
   "next.general.propagationDelayHelp": "Hold a new NZB this long before starting, so every article has reached the servers.",
   "next.general.seconds": "seconds",
-  "next.general.trialConnection": "Extra connection while an address is on trial",
-  "next.general.trialConnectionHelp": "Open one additional connection to a provider address weaver is still assessing.",
   "next.general.srrdb": "SRRDB release lookup",
   "next.general.srrdbHelp": "For obfuscated archive members, send only their CRC32 checksum to the public SRRDB index to recover a release name.",
   "next.general.storage": "Storage",

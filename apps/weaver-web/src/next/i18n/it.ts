@@ -616,8 +616,6 @@ export const nextIt: LocaleDictionary = {
   "next.general.propagationDelay": "Ritardo di propagazione",
   "next.general.propagationDelayHelp": "Trattenere un nuovo NZB per questo tempo prima di iniziare, così che ogni articolo abbia raggiunto i server.",
   "next.general.seconds": "secondi",
-  "next.general.trialConnection": "Connessione extra mentre un indirizzo è in prova",
-  "next.general.trialConnectionHelp": "Aprire una connessione aggiuntiva verso un indirizzo del provider che weaver sta ancora valutando.",
   "next.general.srrdb": "Ricerca release su SRRDB",
   "next.general.srrdbHelp": "Per i membri di archivio offuscati, inviare solo il loro checksum CRC32 all'indice pubblico SRRDB per recuperare il nome della release.",
   "next.general.storage": "Archiviazione",

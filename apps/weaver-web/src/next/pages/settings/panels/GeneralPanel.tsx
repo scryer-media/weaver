@@ -46,7 +46,6 @@ interface GeneralSettings {
   cleanupAfterExtract: boolean;
   maxRetries: number;
   propagationDelaySecs: number;
-  ipReplacementTrialExtraConnections: number;
   enableSrrdbLookup: boolean;
   duplicatePolicy: DuplicatePolicy;
 }
@@ -138,7 +137,6 @@ export function GeneralPanel() {
           cleanupAfterExtract: values.cleanupAfterExtract,
           maxRetries: values.maxRetries,
           propagationDelaySecs: values.propagationDelaySecs,
-          ipReplacementTrialExtraConnections: values.ipReplacementTrialExtraConnections,
           enableSrrdbLookup: values.enableSrrdbLookup,
           duplicatePolicy: values.duplicatePolicy,
         },
@@ -219,18 +217,6 @@ export function GeneralPanel() {
                 step: 60,
                 onChange: (next) => draft.set({ propagationDelaySecs: next }),
                 suffix: t("next.general.seconds"),
-              },
-            },
-            {
-              id: "ipReplacement",
-              label: t("next.general.trialConnection"),
-              help: t("next.general.trialConnectionHelp"),
-              keywords: "ip replacement trial connections",
-              control: {
-                kind: "toggle",
-                value: values.ipReplacementTrialExtraConnections > 0,
-                onChange: (next) =>
-                  draft.set({ ipReplacementTrialExtraConnections: next ? 1 : 0 }),
               },
             },
             {

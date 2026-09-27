@@ -616,8 +616,6 @@ export const nextDe: LocaleDictionary = {
   "next.general.propagationDelay": "Verbreitungsverzögerung",
   "next.general.propagationDelayHelp": "Eine neue NZB so lange zurückhalten, bis jeder Artikel die Server erreicht hat.",
   "next.general.seconds": "Sekunden",
-  "next.general.trialConnection": "Zusätzliche Verbindung, solange eine Adresse getestet wird",
-  "next.general.trialConnectionHelp": "Eine weitere Verbindung zu einer Anbieteradresse öffnen, die weaver noch bewertet.",
   "next.general.srrdb": "SRRDB-Release-Suche",
   "next.general.srrdbHelp": "Für verschleierte Archivteile nur deren CRC32-Prüfsumme an den öffentlichen SRRDB-Index senden, um einen Release-Namen zu ermitteln.",
   "next.general.storage": "Speicher",

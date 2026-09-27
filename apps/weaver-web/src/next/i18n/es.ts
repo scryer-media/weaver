@@ -616,8 +616,6 @@ export const nextEs: LocaleDictionary = {
   "next.general.propagationDelay": "Retraso de propagación",
   "next.general.propagationDelayHelp": "Retener un NZB nuevo este tiempo antes de empezar, para que todos los artículos lleguen a los servidores.",
   "next.general.seconds": "segundos",
-  "next.general.trialConnection": "Conexión extra mientras se prueba una dirección",
-  "next.general.trialConnectionHelp": "Abrir una conexión adicional a una dirección del proveedor que weaver aún está evaluando.",
   "next.general.srrdb": "Búsqueda de publicaciones en SRRDB",
   "next.general.srrdbHelp": "Para miembros de archivo ofuscados, enviar solo su suma CRC32 al índice público de SRRDB para recuperar el nombre de la publicación.",
   "next.general.storage": "Almacenamiento",

@@ -616,8 +616,6 @@ export const nextJa: LocaleDictionary = {
   "next.general.propagationDelay": "伝播待ち時間",
   "next.general.propagationDelayHelp": "すべての記事がサーバーに届くよう、新しい NZB の開始をこの時間だけ保留します。",
   "next.general.seconds": "秒",
-  "next.general.trialConnection": "アドレス試用中の追加接続",
-  "next.general.trialConnectionHelp": "weaver がまだ評価中のプロバイダーアドレスへ、接続を 1 本追加で開きます。",
   "next.general.srrdb": "SRRDB リリース検索",
   "next.general.srrdbHelp": "難読化されたアーカイブメンバーについて、CRC32 チェックサムだけを公開 SRRDB インデックスに送り、リリース名を復元します。",
   "next.general.storage": "ストレージ",
