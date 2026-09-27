@@ -220,10 +220,6 @@ fn config_roundtrip() {
     assert_eq!(delivery_naming.enable_srrdb_lookup, Some(true));
 }
 
-/// An install that never touched direct unpack loads no table at all, which is
-/// "every default" — and must not be confused with a table that explicitly says
-/// `false`, since the resolved gate is off either way but the config surface is
-/// not.
 #[test]
 fn loading_the_config_removes_settings_no_release_reads() {
     let db = Database::open_in_memory().unwrap();
@@ -243,6 +239,10 @@ fn loading_the_config_removes_settings_no_release_reads() {
     );
 }
 
+/// An install that never touched direct unpack loads no table at all, which is
+/// "every default" — and must not be confused with a table that explicitly says
+/// `false`, since the resolved gate is off either way but the config surface is
+/// not.
 #[test]
 fn an_unconfigured_direct_unpack_loads_as_absent() {
     let db = Database::open_in_memory().unwrap();
