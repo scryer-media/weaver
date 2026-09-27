@@ -327,7 +327,7 @@ impl Pipeline {
             && let Some(owner) = self.download_lane_owners.get_mut(&result.lane_id)
         {
             owner.connection = false;
-            if owner.outstanding.is_empty() && !owner.ip_replacement {
+            if owner.outstanding.is_empty() {
                 self.download_lane_owners.remove(&result.lane_id);
             }
         }
@@ -560,9 +560,6 @@ impl Pipeline {
                 crate::runtime::perf_probe::cpu_scope("download.process_done.pre_match");
             let excluded_servers = result.exclude_servers;
             let source_server_idx = result.source_server_idx;
-            if result.origin != DownloadResultOrigin::IpReplacementTrial {
-                self.observe_ip_rtt_attempts(&result.attempts);
-            }
 
             let is_recovery = result.origin.is_recovery();
             // Per-server counters are indexed by the runtime `server_idx` of
@@ -782,28 +779,6 @@ impl Pipeline {
                         error = %failure.message,
                         "NNTP BODY fetch failed"
                     );
-                }
-                if result.origin == DownloadResultOrigin::IpReplacementTrial
-                    && !matches!(
-                        failure.kind,
-                        DownloadFailureKind::ArticleNotFound
-                            | DownloadFailureKind::Auth
-                            | DownloadFailureKind::ContentOrProtocol
-                    )
-                {
-                    if self.restore_download_result_work_without_retry(
-                        result.segment_id,
-                        result.retry_count,
-                        excluded_servers,
-                    ) {
-                        debug!(
-                            segment = %result.segment_id,
-                            error = %failure.message,
-                            "restored IP replacement trial work without consuming retry budget"
-                        );
-                    }
-                    self.maybe_finish_download_pass(job_id);
-                    return;
                 }
                 if failure.kind == DownloadFailureKind::ServerQuota {
                     let mut retry_after = failure.retry_after;

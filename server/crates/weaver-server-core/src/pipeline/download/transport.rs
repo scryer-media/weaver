@@ -162,8 +162,6 @@ pub(crate) enum LaneParkReason {
     NoWork,
     Pressure,
     ProbeYield,
-    IpReplacementRetired,
-    ProofFailure,
     Capacity,
     ServerQuota,
     Error,

@@ -348,8 +348,6 @@ pub struct PipelineMetrics {
     pub download_lane_parks_no_work_total: AtomicU64,
     pub download_lane_parks_pressure_total: AtomicU64,
     pub download_lane_parks_probe_yield_total: AtomicU64,
-    pub download_lane_parks_ip_replacement_retired_total: AtomicU64,
-    pub download_lane_parks_proof_failure_total: AtomicU64,
     pub download_lane_parks_error_total: AtomicU64,
     pub download_lane_lease_items_total: AtomicU64,
     pub download_lane_refill_granted_total: AtomicU64,
@@ -361,18 +359,6 @@ pub struct PipelineMetrics {
     pub download_pipeline_proof_pass_total: AtomicU64,
     pub download_pipeline_cooldown_total: AtomicU64,
     pub download_pipeline_replay_items_total: AtomicU64,
-    pub ip_replacement_trial_extra_connections: AtomicUsize,
-    pub ip_replacement_burst_active: AtomicUsize,
-    pub ip_replacement_over_max_connections: AtomicUsize,
-    pub ip_rtt_ewma_entries: AtomicUsize,
-    pub ip_rtt_ewma_slowest_ms: AtomicU64,
-    pub ip_replacement_trials_started_total: AtomicU64,
-    pub ip_replacement_trials_rejected_total: AtomicU64,
-    pub ip_replacement_trials_accepted_total: AtomicU64,
-    pub ip_replacement_trials_blocked_total: AtomicU64,
-    pub ip_replacement_trials_acquire_failed_total: AtomicU64,
-    pub ip_replacement_trials_same_ip_rejected_total: AtomicU64,
-    pub ip_replacement_old_connections_retired_total: AtomicU64,
 
     // Counts
     pub segments_downloaded: AtomicU64,
@@ -492,8 +478,6 @@ impl PipelineMetrics {
             download_lane_parks_no_work_total: AtomicU64::new(0),
             download_lane_parks_pressure_total: AtomicU64::new(0),
             download_lane_parks_probe_yield_total: AtomicU64::new(0),
-            download_lane_parks_ip_replacement_retired_total: AtomicU64::new(0),
-            download_lane_parks_proof_failure_total: AtomicU64::new(0),
             download_lane_parks_error_total: AtomicU64::new(0),
             download_lane_lease_items_total: AtomicU64::new(0),
             download_lane_refill_granted_total: AtomicU64::new(0),
@@ -505,18 +489,6 @@ impl PipelineMetrics {
             download_pipeline_proof_pass_total: AtomicU64::new(0),
             download_pipeline_cooldown_total: AtomicU64::new(0),
             download_pipeline_replay_items_total: AtomicU64::new(0),
-            ip_replacement_trial_extra_connections: AtomicUsize::new(0),
-            ip_replacement_burst_active: AtomicUsize::new(0),
-            ip_replacement_over_max_connections: AtomicUsize::new(0),
-            ip_rtt_ewma_entries: AtomicUsize::new(0),
-            ip_rtt_ewma_slowest_ms: AtomicU64::new(0),
-            ip_replacement_trials_started_total: AtomicU64::new(0),
-            ip_replacement_trials_rejected_total: AtomicU64::new(0),
-            ip_replacement_trials_accepted_total: AtomicU64::new(0),
-            ip_replacement_trials_blocked_total: AtomicU64::new(0),
-            ip_replacement_trials_acquire_failed_total: AtomicU64::new(0),
-            ip_replacement_trials_same_ip_rejected_total: AtomicU64::new(0),
-            ip_replacement_old_connections_retired_total: AtomicU64::new(0),
             segments_downloaded: AtomicU64::new(0),
             segments_decoded: AtomicU64::new(0),
             segments_committed: AtomicU64::new(0),
@@ -585,58 +557,15 @@ impl PipelineMetrics {
         std::array::from_fn(|index| self.extraction_rejections[index].load(Ordering::Relaxed))
     }
 
-    pub fn set_ip_replacement_trial_extra_connections(&self, value: u8) {
-        self.ip_replacement_trial_extra_connections
-            .store(value as usize, Ordering::Relaxed);
-    }
 
-    pub fn set_ip_replacement_burst_active(&self, active: bool) {
-        self.ip_replacement_burst_active
-            .store(usize::from(active), Ordering::Relaxed);
-        self.ip_replacement_over_max_connections
-            .store(usize::from(active), Ordering::Relaxed);
-    }
 
-    pub fn set_ip_rtt_ewma_summary(&self, entries: usize, slowest_ms: u64) {
-        self.ip_rtt_ewma_entries.store(entries, Ordering::Relaxed);
-        self.ip_rtt_ewma_slowest_ms
-            .store(slowest_ms, Ordering::Relaxed);
-    }
 
-    pub fn note_ip_replacement_trial_started(&self) {
-        self.ip_replacement_trials_started_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
 
-    pub fn note_ip_replacement_trial_rejected(&self) {
-        self.ip_replacement_trials_rejected_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
 
-    pub fn note_ip_replacement_trial_accepted(&self) {
-        self.ip_replacement_trials_accepted_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
 
-    pub fn note_ip_replacement_trial_blocked(&self) {
-        self.ip_replacement_trials_blocked_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
 
-    pub fn note_ip_replacement_trial_acquire_failed(&self) {
-        self.ip_replacement_trials_acquire_failed_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
 
-    pub fn note_ip_replacement_trial_same_ip_rejected(&self) {
-        self.ip_replacement_trials_same_ip_rejected_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
 
-    pub fn note_ip_replacement_old_connection_retired(&self) {
-        self.ip_replacement_old_connections_retired_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
 
     pub fn note_decode_work_queued(&self, raw_bytes: u64) {
         self.decode_pending.fetch_add(1, Ordering::Relaxed);
@@ -783,12 +712,6 @@ impl PipelineMetrics {
             download_lane_parks_probe_yield_total: self
                 .download_lane_parks_probe_yield_total
                 .load(Ordering::Relaxed),
-            download_lane_parks_ip_replacement_retired_total: self
-                .download_lane_parks_ip_replacement_retired_total
-                .load(Ordering::Relaxed),
-            download_lane_parks_proof_failure_total: self
-                .download_lane_parks_proof_failure_total
-                .load(Ordering::Relaxed),
             download_lane_parks_error_total: self
                 .download_lane_parks_error_total
                 .load(Ordering::Relaxed),
@@ -821,37 +744,6 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_pipeline_replay_items_total: self
                 .download_pipeline_replay_items_total
-                .load(Ordering::Relaxed),
-            ip_replacement_trial_extra_connections: self
-                .ip_replacement_trial_extra_connections
-                .load(Ordering::Relaxed),
-            ip_replacement_burst_active: self.ip_replacement_burst_active.load(Ordering::Relaxed)
-                != 0,
-            ip_replacement_over_max_connections: self
-                .ip_replacement_over_max_connections
-                .load(Ordering::Relaxed),
-            ip_rtt_ewma_entries: self.ip_rtt_ewma_entries.load(Ordering::Relaxed),
-            ip_rtt_ewma_slowest_ms: self.ip_rtt_ewma_slowest_ms.load(Ordering::Relaxed),
-            ip_replacement_trials_started_total: self
-                .ip_replacement_trials_started_total
-                .load(Ordering::Relaxed),
-            ip_replacement_trials_rejected_total: self
-                .ip_replacement_trials_rejected_total
-                .load(Ordering::Relaxed),
-            ip_replacement_trials_accepted_total: self
-                .ip_replacement_trials_accepted_total
-                .load(Ordering::Relaxed),
-            ip_replacement_trials_blocked_total: self
-                .ip_replacement_trials_blocked_total
-                .load(Ordering::Relaxed),
-            ip_replacement_trials_acquire_failed_total: self
-                .ip_replacement_trials_acquire_failed_total
-                .load(Ordering::Relaxed),
-            ip_replacement_trials_same_ip_rejected_total: self
-                .ip_replacement_trials_same_ip_rejected_total
-                .load(Ordering::Relaxed),
-            ip_replacement_old_connections_retired_total: self
-                .ip_replacement_old_connections_retired_total
                 .load(Ordering::Relaxed),
             segments_downloaded,
             segments_decoded: self.segments_decoded.load(Ordering::Relaxed),
@@ -978,8 +870,6 @@ pub struct MetricsSnapshot {
     pub download_lane_parks_no_work_total: u64,
     pub download_lane_parks_pressure_total: u64,
     pub download_lane_parks_probe_yield_total: u64,
-    pub download_lane_parks_ip_replacement_retired_total: u64,
-    pub download_lane_parks_proof_failure_total: u64,
     pub download_lane_parks_error_total: u64,
     pub download_lane_lease_items_total: u64,
     pub download_lane_refill_granted_total: u64,
@@ -991,18 +881,6 @@ pub struct MetricsSnapshot {
     pub download_pipeline_proof_pass_total: u64,
     pub download_pipeline_cooldown_total: u64,
     pub download_pipeline_replay_items_total: u64,
-    pub ip_replacement_trial_extra_connections: usize,
-    pub ip_replacement_burst_active: bool,
-    pub ip_replacement_over_max_connections: usize,
-    pub ip_rtt_ewma_entries: usize,
-    pub ip_rtt_ewma_slowest_ms: u64,
-    pub ip_replacement_trials_started_total: u64,
-    pub ip_replacement_trials_rejected_total: u64,
-    pub ip_replacement_trials_accepted_total: u64,
-    pub ip_replacement_trials_blocked_total: u64,
-    pub ip_replacement_trials_acquire_failed_total: u64,
-    pub ip_replacement_trials_same_ip_rejected_total: u64,
-    pub ip_replacement_old_connections_retired_total: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,

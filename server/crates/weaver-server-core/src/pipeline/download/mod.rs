@@ -10,10 +10,7 @@ pub(crate) mod transport;
 mod worker;
 
 #[cfg(test)]
-pub(in crate::pipeline) use worker::{
-    is_ip_replacement_policy_stop, lane_acquire_failure_for_work,
-    should_neutrally_park_ip_replacement,
-};
+pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;
 
 pub(super) use worker::HeldDownloadRefill;
 pub(crate) use worker::JobLogThrottle;

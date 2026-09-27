@@ -6,7 +6,6 @@ use weaver_nntp::client::FetchAttemptOutcome;
 mod completion;
 mod direct_store;
 mod eligibility;
-mod ip_replacement;
 mod lanes;
 mod leases;
 mod metrics;
@@ -15,10 +14,6 @@ mod pressure;
 mod refill;
 mod spawn;
 
-#[cfg(test)]
-pub(in crate::pipeline) use ip_replacement::{
-    is_ip_replacement_policy_stop, should_neutrally_park_ip_replacement,
-};
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
@@ -146,15 +141,6 @@ impl JobLogThrottle {
 /// opens, long enough that ordinary refill gaps between batches say nothing.
 const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
 const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
-const IP_REPLACEMENT_MIN_OLD_SAMPLES: u16 = 16;
-const IP_REPLACEMENT_MIN_OLD_AGE: Duration = Duration::from_secs(30);
-const IP_REPLACEMENT_BASELINE_MIN_SAMPLES: u16 = 8;
-const IP_REPLACEMENT_BASELINE_RECENT: Duration = Duration::from_secs(10 * 60);
-const IP_REPLACEMENT_OLD_SLOWER_RATIO: f64 = 1.25;
-const IP_REPLACEMENT_OLD_SLOWER_MS: f64 = 75.0;
-const IP_REPLACEMENT_TRIAL_SAMPLES: usize = 4;
-const IP_REPLACEMENT_CANDIDATE_BETTER_RATIO: f64 = 0.85;
-const IP_REPLACEMENT_CANDIDATE_BETTER_MS: f64 = 40.0;
 const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
@@ -693,10 +679,10 @@ impl Pipeline {
         }
 
         let eligible_count = eligible.len();
-        let Some(hot_job_id) = eligible.first().copied() else {
+        if eligible.is_empty() {
             self.update_queue_metrics();
             return;
-        };
+        }
         let active_connections_before_dispatch = self.active_download_connections;
         let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
         let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
@@ -721,7 +707,6 @@ impl Pipeline {
         }
         self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);
-        self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();
     }
 }

@@ -72,14 +72,6 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_probe_yield_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::IpReplacementRetired => self
-                .metrics
-                .download_lane_parks_ip_replacement_retired_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::ProofFailure => self
-                .metrics
-                .download_lane_parks_proof_failure_total
-                .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::Capacity | LaneParkReason::ServerQuota => 0,
             LaneParkReason::Error => self
                 .metrics
@@ -789,7 +781,6 @@ impl Pipeline {
             completion_critical: lease.completion_critical,
             reason: LaneParkReason::Error,
             release_connection_slot: true,
-            release_ip_replacement_burst: false,
         });
     }
 
@@ -839,7 +830,6 @@ impl Pipeline {
                         completion_critical,
                         reason: LaneParkReason::Capacity,
                         release_connection_slot: true,
-                        release_ip_replacement_burst: false,
                     });
                     return;
                 }
@@ -929,7 +919,6 @@ impl Pipeline {
                         LaneParkReason::Error
                     },
                     release_connection_slot: true,
-                    release_ip_replacement_burst: false,
                 });
             }
             OwnedDownloadLaneEvent::BatchComplete {
@@ -1130,7 +1119,6 @@ impl Pipeline {
             parked.mode = owner.mode;
             parked.completion_critical = owner.completion_critical;
             parked.release_connection_slot = std::mem::take(&mut owner.connection);
-            parked.release_ip_replacement_burst = std::mem::take(&mut owner.ip_replacement);
             if owner.outstanding.is_empty() {
                 self.download_lane_owners.remove(&parked.lane_id);
             }
@@ -1174,10 +1162,6 @@ impl Pipeline {
                     }
                 }
             }
-        }
-        if parked.release_ip_replacement_burst {
-            self.ip_replacement_burst_active = false;
-            self.metrics.set_ip_replacement_burst_active(false);
         }
         self.publish_active_stage_metrics();
     }

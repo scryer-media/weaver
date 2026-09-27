@@ -63,7 +63,6 @@ impl Pipeline {
         let (
             hardware_profile,
             initial_bandwidth_policy,
-            ip_replacement_trial_extra_connections,
             direct_store_settings,
             direct_unpack_settings,
             propagation_delay,
@@ -77,7 +76,6 @@ impl Pipeline {
                     .filter(|chosen| chosen.unmet_requirement(&profile).is_none())
                     .unwrap_or_else(|| crate::runtime::HardwareProfile::recommended(&profile)),
                 cfg.isp_bandwidth_cap.clone(),
-                cfg.ip_replacement_trial_extra_connections(),
                 // Config, with `WEAVER_RAR_DIRECT_STORE`
                 // overriding it. Resolved once here and held for the life of
                 // the pipeline — a set admitted under an enabled gate must not
@@ -98,7 +96,6 @@ impl Pipeline {
         let profile_tuning = hardware_profile.tuning(&profile);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
-        metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
         info!(
             hardware_profile = hardware_profile.as_str(),
             max_downloads = tuner.params().max_concurrent_downloads,
@@ -153,7 +150,6 @@ impl Pipeline {
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
         let (download_lane_parked_tx, download_lane_parked_rx) = mpsc::channel(256);
         let (owned_download_lane_event_tx, owned_download_lane_event_rx) = mpsc::channel(128);
-        let (ip_replacement_trial_tx, ip_replacement_trial_rx) = mpsc::channel(16);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
@@ -227,10 +223,6 @@ impl Pipeline {
             held_download_refills: Vec::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
-            ip_replacement_trial_extra_connections,
-            ip_rtt_ewma: HashMap::new(),
-            ip_replacement_retired_ips: HashSet::new(),
-            ip_replacement_burst_active: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             pending_released_download_results_by_job: HashMap::new(),
@@ -341,8 +333,6 @@ impl Pipeline {
             owned_download_lane_event_tx,
             owned_download_lane_event_rx,
             owned_download_lane_pool,
-            ip_replacement_trial_tx,
-            ip_replacement_trial_rx,
             decode_done_tx,
             decode_done_rx,
             retry_tx,
@@ -1019,9 +1009,6 @@ impl Pipeline {
                             &mut pending_download_results,
                         );
                     }
-                    Some(event) = self.ip_replacement_trial_rx.recv() => {
-                        self.handle_ip_replacement_trial_event(event);
-                    }
                     Some(result) = self.decode_done_rx.recv() => {
                         crate::runtime::perf_probe::record(
                             "download.decode.done_rx.received",
@@ -1396,14 +1383,6 @@ impl Pipeline {
         loop {
             match self.download_lane_parked_rx.try_recv() {
                 Ok(parked) => self.handle_download_lane_parked(parked),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        loop {
-            match self.ip_replacement_trial_rx.try_recv() {
-                Ok(event) => self.handle_ip_replacement_trial_event(event),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }

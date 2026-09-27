@@ -184,7 +184,6 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     render_pipeline_totals(&mut out, snapshot);
     render_queues(&mut out, snapshot);
     render_lanes(&mut out, snapshot);
-    render_ip_replacement(&mut out, snapshot);
 
     for &(origin, status, count) in duplicate_admission {
         out.sample(
@@ -798,14 +797,6 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
             "probe_yield",
             snapshot.download_lane_parks_probe_yield_total,
         ),
-        (
-            "ip_replacement_retired",
-            snapshot.download_lane_parks_ip_replacement_retired_total,
-        ),
-        (
-            "proof_failure",
-            snapshot.download_lane_parks_proof_failure_total,
-        ),
         ("error", snapshot.download_lane_parks_error_total),
     ] {
         out.sample(&f::LANE_PARKS, &[("reason", reason)], value);
@@ -855,52 +846,6 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &f::BODY_REPLAY_ITEMS,
         &[],
         snapshot.download_pipeline_replay_items_total,
-    );
-}
-
-fn render_ip_replacement(out: &mut Encoder, snapshot: &MetricsSnapshot) {
-    out.sample(
-        &f::IP_TRIAL_EXTRA_CONNECTIONS,
-        &[],
-        snapshot.ip_replacement_trial_extra_connections,
-    );
-    out.sample(
-        &f::IP_BURST_ACTIVE,
-        &[],
-        u64::from(snapshot.ip_replacement_burst_active),
-    );
-    out.sample(
-        &f::IP_OVER_MAX_CONNECTIONS,
-        &[],
-        snapshot.ip_replacement_over_max_connections,
-    );
-    out.sample(&f::IP_RTT_ENTRIES, &[], snapshot.ip_rtt_ewma_entries);
-    out.sample(&f::IP_RTT_SLOWEST_MS, &[], snapshot.ip_rtt_ewma_slowest_ms);
-    out.sample_f64(
-        &f::IP_RTT_SLOWEST_SECONDS,
-        &[],
-        snapshot.ip_rtt_ewma_slowest_ms as f64 / 1000.0,
-    );
-    for (outcome, value) in [
-        ("started", snapshot.ip_replacement_trials_started_total),
-        ("rejected", snapshot.ip_replacement_trials_rejected_total),
-        ("accepted", snapshot.ip_replacement_trials_accepted_total),
-        ("blocked", snapshot.ip_replacement_trials_blocked_total),
-        (
-            "acquire_failed",
-            snapshot.ip_replacement_trials_acquire_failed_total,
-        ),
-        (
-            "same_ip_rejected",
-            snapshot.ip_replacement_trials_same_ip_rejected_total,
-        ),
-    ] {
-        out.sample(&f::IP_TRIALS, &[("outcome", outcome)], value);
-    }
-    out.sample(
-        &f::IP_OLD_CONNECTIONS_RETIRED,
-        &[],
-        snapshot.ip_replacement_old_connections_retired_total,
     );
 }
 
