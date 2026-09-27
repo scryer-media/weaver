@@ -48,7 +48,6 @@ fn refill_request_on(
         lane_id,
         runtime_generation: 0,
         server_idx,
-        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         response_tx,
@@ -67,7 +66,6 @@ fn book_connected_lane(pipeline: &mut Pipeline, job_id: JobId, completion_critic
             completion_critical,
             server_idx: Some(0),
             connection: true,
-            ip_replacement: false,
             outstanding: HashMap::new(),
         },
     );
@@ -240,7 +238,6 @@ async fn a_parked_lane_wakes_dispatch_without_a_loop_turn() {
         completion_critical: false,
         reason: LaneParkReason::NoWork,
         release_connection_slot: true,
-        release_ip_replacement_burst: false,
     });
 
     assert!(
@@ -260,7 +257,6 @@ async fn a_parked_lane_wakes_dispatch_without_a_loop_turn() {
         completion_critical: false,
         reason: LaneParkReason::NoWork,
         release_connection_slot: false,
-        release_ip_replacement_burst: false,
     });
     assert!(!pipeline.take_download_dispatch_wake());
 }

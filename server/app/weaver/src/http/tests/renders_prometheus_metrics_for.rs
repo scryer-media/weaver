@@ -63,9 +63,6 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(
         rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"probe_yield\"} 37")
     );
-    assert!(
-        rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"proof_failure\"} 41")
-    );
     assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"error\"} 42"));
     assert!(rendered.contains("weaver_pipeline_download_lane_lease_items_total 43"));
     assert!(
@@ -87,9 +84,6 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     );
     assert!(rendered.contains("weaver_pipeline_body_proof_events_total{event=\"cooldown\"} 49"));
     assert!(rendered.contains("weaver_pipeline_body_replay_items_total 50"));
-    assert!(rendered.contains("weaver_ip_replacement_trials_total{outcome=\"accepted\"} 53"));
-    assert!(!rendered.contains("weaver_ip_replacement_trials_total{outcome=\"old_retired\"}"));
-    assert!(rendered.contains("weaver_ip_replacement_old_connections_retired_total 55"));
     assert!(
         rendered.contains("weaver_pipeline_download_failures_total{kind=\"article_not_found\"} 24")
     );
@@ -120,20 +114,10 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_download_pressure_stall_seconds_total 1.5"));
     assert!(rendered.contains("weaver_pipeline_disk_write_latency_microseconds 16"));
     assert!(rendered.contains("weaver_pipeline_disk_write_latency_seconds 0.000016"));
-    assert!(rendered.contains("weaver_ip_rtt_ewma_slowest_ms 123"));
-    assert!(rendered.contains("weaver_ip_rtt_ewma_slowest_seconds 0.123"));
     assert!(rendered.contains("weaver_pipeline_download_lanes 3"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_mebibytes_per_second 23.5"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_bytes_per_second 24641536"));
     assert!(rendered.contains("weaver_pipeline_scheduled_speed_limit_bytes_per_second 4096"));
-
-    // The literal-\n bug hid these entirely; the exposition validator now
-    // rejects the shape that caused it, but pin the samples too.
-    assert!(rendered.contains("# TYPE weaver_ip_replacement_trials_total counter\n"));
-    assert!(rendered.contains("weaver_ip_replacement_trials_total{outcome=\"started\"} 51"));
-    assert!(rendered.contains("weaver_ip_replacement_trial_extra_connections 1"));
-    assert!(rendered.contains("weaver_ip_replacement_burst_active 1"));
-    assert!(rendered.contains("weaver_ip_rtt_ewma_entries 2"));
 
     // Deprecated families announce their replacement in HELP.
     assert!(rendered.contains("(deprecated: use weaver_pipeline_decode_rate_bytes_per_second)"));
@@ -261,8 +245,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_lane_parks_no_work_total: 0,
         download_lane_parks_pressure_total: 0,
         download_lane_parks_probe_yield_total: 0,
-        download_lane_parks_ip_replacement_retired_total: 0,
-        download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
         download_lane_lease_items_total: 0,
         download_lane_refill_granted_total: 0,
@@ -274,18 +256,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_pipeline_proof_pass_total: 0,
         download_pipeline_cooldown_total: 0,
         download_pipeline_replay_items_total: 0,
-        ip_replacement_trial_extra_connections: 0,
-        ip_replacement_burst_active: false,
-        ip_replacement_over_max_connections: 0,
-        ip_rtt_ewma_entries: 0,
-        ip_rtt_ewma_slowest_ms: 0,
-        ip_replacement_trials_started_total: 0,
-        ip_replacement_trials_rejected_total: 0,
-        ip_replacement_trials_accepted_total: 0,
-        ip_replacement_trials_blocked_total: 0,
-        ip_replacement_trials_acquire_failed_total: 0,
-        ip_replacement_trials_same_ip_rejected_total: 0,
-        ip_replacement_old_connections_retired_total: 0,
         segments_downloaded: 0,
         segments_decoded: 0,
         segments_committed: 0,
@@ -588,8 +558,6 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "no_work",
             "pressure",
             "probe_yield",
-            "ip_replacement_retired",
-            "proof_failure",
             "error",
         ],
     );
@@ -626,19 +594,6 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "transient",
             "auth",
             "permanent",
-        ],
-    );
-    assert_label_set(
-        &rendered,
-        "weaver_ip_replacement_trials_total",
-        "outcome",
-        &[
-            "started",
-            "rejected",
-            "accepted",
-            "blocked",
-            "acquire_failed",
-            "same_ip_rejected",
         ],
     );
     assert_label_set(

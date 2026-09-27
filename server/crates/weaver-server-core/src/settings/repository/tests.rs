@@ -126,7 +126,6 @@ fn config_roundtrip() {
         max_download_speed: Some(1_000_000),
         isp_bandwidth_cap: None,
         propagation_delay_secs: None,
-        ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(false),
         watch_folder: crate::watch_folder::WatchFolderConfig {
             mode: crate::watch_folder::WatchFolderMode::Polling,
@@ -225,6 +224,25 @@ fn config_roundtrip() {
 /// "every default" — and must not be confused with a table that explicitly says
 /// `false`, since the resolved gate is off either way but the config surface is
 /// not.
+#[test]
+fn loading_the_config_removes_settings_no_release_reads() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting("data_dir", "/tmp/weaver").unwrap();
+    for key in crate::settings::service::RETIRED_SETTING_KEYS {
+        db.set_setting(key, "1").unwrap();
+    }
+
+    db.load_config().unwrap();
+
+    for key in crate::settings::service::RETIRED_SETTING_KEYS {
+        assert_eq!(db.get_setting(key).unwrap(), None, "{key} survived a load");
+    }
+    assert_eq!(
+        db.get_setting("data_dir").unwrap(),
+        Some("/tmp/weaver".to_string())
+    );
+}
+
 #[test]
 fn an_unconfigured_direct_unpack_loads_as_absent() {
     let db = Database::open_in_memory().unwrap();

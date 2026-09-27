@@ -2668,7 +2668,6 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
         lane_id: 0,
         runtime_generation: 0,
         server_idx: 0,
-        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         response_tx,

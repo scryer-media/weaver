@@ -208,7 +208,6 @@ impl TestHarness {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,
@@ -692,9 +691,6 @@ fn spawn_test_scheduler(
                 }
                 SchedulerCommand::SetPropagationDelay { reply, .. }
                 | SchedulerCommand::SetSpeedLimit { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
