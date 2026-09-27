@@ -89,6 +89,7 @@ impl DirectSetRouter {
         if self.plan.format == SetFormat::SevenZip {
             return self.restore_sevenz_layout(facts);
         }
+        self.rekey_restored_header_encryption(facts)?;
         for (volume_index, volume_facts) in facts {
             let DirectVolumeFacts::Rar(volume_facts) = volume_facts else {
                 // A 7z row under a RAR plan: the job's spec and the cache
@@ -132,6 +133,51 @@ impl DirectSetRouter {
         }
         self.sync_members()?;
         self.check_eligibility()?;
+        Ok(())
+    }
+
+    /// Re-proves a restored `-hp` set's archive key before its members are
+    /// re-admitted.
+    ///
+    /// A `-hp` set's file key is the archive key: the live parse proves one of
+    /// the job's candidates against the archive's type-4 check record and binds
+    /// it into the file ring. The key is never persisted and the cached facts
+    /// do not carry the record, so without this the rebuild re-admits the
+    /// encrypted members against whatever the spec alone holds — nothing, when
+    /// the password came from the NZB, or an operator's losing guess — and the
+    /// set refuses its checkpoint and downloads every volume again.
+    ///
+    /// The record sits at the front of the volume, in bytes routing wrote to
+    /// the volume's envelope, so it is read from there. A volume whose envelope
+    /// cannot be read leaves the spec's password in place, which is exactly the
+    /// rebuild that ran before; the live parse proves the key on the next
+    /// volume it reads. Needs the job's candidates offered first.
+    fn rekey_restored_header_encryption(
+        &mut self,
+        facts: &BTreeMap<u32, DirectVolumeFacts>,
+    ) -> Result<(), DemotionReason> {
+        if !self.header_crypt.wants_password() {
+            return Ok(());
+        }
+        let header_encrypted = facts.iter().find_map(|(volume_index, volume_facts)| {
+            matches!(volume_facts, DirectVolumeFacts::Rar(facts) if facts.is_encrypted)
+                .then_some(*volume_index)
+        });
+        let Some(volume_index) = header_encrypted else {
+            return Ok(());
+        };
+        let Ok(envelope) = std::fs::File::open(self.plan.envelope_path(volume_index)) else {
+            return Ok(());
+        };
+        let encryption = match unrar_rs::RarArchive::parse_volume_header_encryption(envelope) {
+            Ok(unrar_rs::RarVolumeHeaderEncryption::None) | Err(_) => return Ok(()),
+            Ok(encryption) => encryption,
+        };
+        let verified = match self.header_crypt.resolve(&encryption) {
+            Ok(password) => password.to_string(),
+            Err(refusal) => return Err(self.refuse_header_encrypted(refusal)),
+        };
+        self.crypt.set_password(Some(&verified));
         Ok(())
     }
 
