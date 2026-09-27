@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -8,9 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Mutex, Semaphore};
 
-/// The idle list and the retired-IP set are guarded synchronously.
+/// The idle list is guarded synchronously.
 ///
-/// Nothing awaits while holding either, and a dropped [`PooledConnection`]
+/// Nothing awaits while holding it, and a dropped [`PooledConnection`]
 /// must be able to put its socket back on the idle list *before* it releases
 /// the permit it was holding. Deferring the return to a spawned task released
 /// the permit first, so an acquire that fired in between found the list empty
@@ -114,7 +114,6 @@ pub struct NntpPool {
     /// would be a log flood; a silent one is what made the condition invisible.
     blocking_connect_warn_after: Vec<AtomicU64>,
     blocking_connect_failures_since_warning: Vec<AtomicU64>,
-    retired_ips: Arc<SyncMutex<HashSet<(usize, IpAddr)>>>,
     connect_cursors: Vec<AtomicUsize>,
     // Cold connection admission only; established BODY lanes never touch it.
     auth_admission: Vec<AuthAdmission>,
@@ -436,7 +435,6 @@ impl NntpPool {
             over_limit_episodes,
             blocking_connect_warn_after,
             blocking_connect_failures_since_warning,
-            retired_ips: Arc::new(SyncMutex::new(HashSet::new())),
             connect_cursors,
             auth_admission: (0..server_count)
                 .map(|_| AuthAdmission {
@@ -450,13 +448,6 @@ impl NntpPool {
 
     fn next_connect_offset(&self, idx: usize) -> usize {
         self.connect_cursors[idx].fetch_add(1, Ordering::Relaxed)
-    }
-
-    async fn retired_ips_for_server(&self, idx: usize) -> Vec<IpAddr> {
-        lock_recovering(&self.retired_ips)
-            .iter()
-            .filter_map(|(server_idx, ip)| (*server_idx == idx).then_some(*ip))
-            .collect()
     }
 
     async fn connect_server_excluding(
@@ -495,14 +486,10 @@ impl NntpPool {
         excluded_ips: &[IpAddr],
         initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
-        let mut exclusions = self.retired_ips_for_server(idx).await;
-        exclusions.extend(excluded_ips.iter().copied());
-        exclusions.sort_unstable();
-        exclusions.dedup();
         let offset = self.next_connect_offset(idx);
         let mut connection = NntpConnection::connect_with_ip_policy_for_group(
             &self.configs[idx],
-            &exclusions,
+            excluded_ips,
             offset,
             initial_group,
         )
@@ -567,7 +554,6 @@ impl NntpPool {
     pub(crate) async fn acquire_extra_before_deadline(
         &self,
         server: ServerId,
-        excluded_ips: &[IpAddr],
         initial_group: Option<&str>,
         deadline: &mut tokio::time::Instant,
     ) -> Result<PooledConnection> {
@@ -575,7 +561,7 @@ impl NntpPool {
             return Err(NntpError::PoolShutdown);
         }
         self.configs.get(server.0).ok_or(NntpError::PoolExhausted)?;
-        self.acquire_fresh_with_permit(server.0, None, excluded_ips, initial_group, Some(deadline))
+        self.acquire_fresh_with_permit(server.0, None, initial_group, Some(deadline))
             .await
     }
 
@@ -610,27 +596,6 @@ impl NntpPool {
 
     /// Acquire an explicit over-max connection from a specific server.
     pub async fn acquire_extra(&self, server: ServerId) -> Result<PooledConnection> {
-        self.acquire_extra_excluding(server, &[]).await
-    }
-
-    /// Acquire an explicit over-max connection, excluding specific remote IPs.
-    pub async fn acquire_extra_excluding(
-        &self,
-        server: ServerId,
-        excluded_ips: &[IpAddr],
-    ) -> Result<PooledConnection> {
-        self.acquire_extra_excluding_for_group(server, excluded_ips, None)
-            .await
-    }
-
-    /// Over-max acquire whose fresh connection selects `initial_group` in
-    /// its session-setup write on a pipelining server.
-    pub async fn acquire_extra_excluding_for_group(
-        &self,
-        server: ServerId,
-        excluded_ips: &[IpAddr],
-        initial_group: Option<&str>,
-    ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
@@ -639,8 +604,7 @@ impl NntpPool {
         if idx >= self.pools.len() {
             return Err(NntpError::PoolExhausted);
         }
-        self.acquire_fresh_with_permit(idx, None, excluded_ips, initial_group, None)
-            .await
+        self.acquire_fresh_with_permit(idx, None, None, None).await
     }
 
     /// Internal: acquire a connection using an already-obtained permit.
@@ -786,7 +750,6 @@ impl NntpPool {
         Ok(PooledConnection {
             conn: Some(conn),
             pool: self.pools[idx].clone(),
-            retired_ips: self.retired_ips.clone(),
             server_idx: idx,
             return_to_pool: permit.is_some(),
             shutdown: self.shutdown.clone(),
@@ -798,7 +761,6 @@ impl NntpPool {
         &self,
         idx: usize,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
-        excluded_ips: &[IpAddr],
         initial_group: Option<&str>,
         deadline: Option<&mut tokio::time::Instant>,
     ) -> Result<PooledConnection> {
@@ -825,7 +787,7 @@ impl NntpPool {
         }
 
         debug!(server = idx, "creating fresh over-max connection");
-        // An IP replacement is never a transport-recovery probe.
+        // An over-max connection is never a transport-recovery probe.
         let health_lease = self.recovery_gates[idx]
             .admit(false)
             .ok_or(NntpError::PoolExhausted)?;
@@ -833,7 +795,7 @@ impl NntpPool {
             .try_acquire_replacement()
             .ok_or(NntpError::PoolExhausted)?;
         let started = tokio::time::Instant::now();
-        let connect = self.connect_server_excluding(idx, excluded_ips, initial_group);
+        let connect = self.connect_server_excluding(idx, &[], initial_group);
         let connected = if self.configs[idx].proxy.is_some() {
             let result = connect.await;
             if let Some(deadline) = deadline {
@@ -864,7 +826,6 @@ impl NntpPool {
         Ok(PooledConnection {
             conn: Some(conn),
             pool: self.pools[idx].clone(),
-            retired_ips: self.retired_ips.clone(),
             server_idx: idx,
             return_to_pool: permit.is_some(),
             shutdown: self.shutdown.clone(),
@@ -1443,15 +1404,7 @@ impl NntpPool {
         if idx >= self.configs.len() {
             return Err(NntpError::PoolExhausted);
         }
-        let mut exclusions = Vec::new();
-        if let Ok(retired) = self.retired_ips.try_lock() {
-            exclusions.extend(
-                retired
-                    .iter()
-                    .filter_map(|(server_idx, ip)| (*server_idx == idx).then_some(*ip)),
-            );
-        }
-        exclusions.extend(excluded_ips.iter().copied());
+        let mut exclusions = excluded_ips.to_vec();
         exclusions.sort_unstable();
         exclusions.dedup();
         let offset = self.next_connect_offset(idx);
@@ -1496,17 +1449,6 @@ impl NntpPool {
         self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits())
     }
 
-    pub async fn retire_ip(&self, server: ServerId, ip: IpAddr) {
-        let idx = server.0;
-        if idx >= self.pools.len() {
-            return;
-        }
-        lock_recovering(&self.retired_ips).insert((idx, ip));
-        lock_recovering(&self.pools[idx])
-            .idle
-            .retain(|conn| conn.remote_ip() != Some(ip));
-    }
-
     /// Take a healthy idle connection, evicting stale/poisoned ones.
     fn take_healthy_idle(&self, pool: &mut ServerPool) -> Option<NntpConnection> {
         while let Some(conn) = pool.idle.pop_front() {
@@ -1534,7 +1476,6 @@ impl NntpPool {
 pub struct PooledConnection {
     conn: Option<NntpConnection>,
     pool: Arc<SyncMutex<ServerPool>>,
-    retired_ips: Arc<SyncMutex<HashSet<(usize, IpAddr)>>>,
     server_idx: usize,
     return_to_pool: bool,
     shutdown: CancellationToken,
@@ -1596,18 +1537,11 @@ impl Drop for PooledConnection {
             let poisoned = conn.is_poisoned();
             let return_to_pool = self.return_to_pool;
 
-            let retired = healthy
-                && return_to_pool
-                && conn.remote_ip().is_some_and(|ip| {
-                    lock_recovering(&self.retired_ips).contains(&(server_idx, ip))
-                });
             let mut pool = lock_recovering(&self.pool);
             pool.active_count = pool.active_count.saturating_sub(1);
             if healthy && return_to_pool {
                 if self.shutdown.is_cancelled() {
                     trace!(server = server_idx, "dropped connection from shutdown pool");
-                } else if retired {
-                    trace!(server = server_idx, "dropped retired-ip connection");
                 } else {
                     if let Some(slot) = &conn.socket_slot {
                         let owner = Arc::downgrade(&self.pool);

@@ -1062,8 +1062,7 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
     ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, false, &[])
-            .await
+        self.acquire_body_lane_inner(server, groups, false).await
     }
 
     pub async fn acquire_extra_body_lane(
@@ -1071,18 +1070,7 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
     ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, true, &[])
-            .await
-    }
-
-    pub async fn acquire_extra_body_lane_excluding(
-        &self,
-        server: ServerId,
-        groups: &[String],
-        excluded_ips: &[IpAddr],
-    ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, true, excluded_ips)
-            .await
+        self.acquire_body_lane_inner(server, groups, true).await
     }
 
     async fn acquire_body_lane_inner(
@@ -1090,7 +1078,6 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
         extra: bool,
-        excluded_ips: &[IpAddr],
     ) -> Result<BodyLaneLease> {
         let mut deadline = TokioInstant::now() + self.soft_timeout;
         // A BODY lane fetches by message-id, which RFC 3977 answers with no
@@ -1102,7 +1089,7 @@ impl NntpClient {
         let initial_group = groups.first().map(String::as_str);
         let mut conn = if extra {
             self.pool
-                .acquire_extra_before_deadline(server, excluded_ips, initial_group, &mut deadline)
+                .acquire_extra_before_deadline(server, initial_group, &mut deadline)
                 .await
         } else {
             self.pool
@@ -2358,10 +2345,6 @@ impl NntpClient {
     /// Access the underlying connection pool.
     pub fn pool(&self) -> &Arc<NntpPool> {
         &self.pool
-    }
-
-    pub async fn retire_server_ip(&self, server: ServerId, ip: IpAddr) {
-        self.pool.retire_ip(server, ip).await;
     }
 
     pub fn try_acquire_blocking_body_lane(
