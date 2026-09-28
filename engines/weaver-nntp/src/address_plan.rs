@@ -57,9 +57,9 @@ pub const ADDRESS_REPLAN_INTERVAL: Duration = Duration::from_mins(10);
 
 /// How long after a race in which no address answered, with nothing pinned,
 /// connects dial the known candidates one after another instead of racing.
-/// A race dials every candidate on its own thread, each held for up to
+/// A race dials each candidate on its own thread, each held for up to
 /// [`ADDRESS_ATTEMPT_LIMIT`]; against a server that is down, racing on every
-/// reconnect attempt would keep that many threads blocked for nothing. A
+/// reconnect attempt would keep those threads blocked for nothing. A
 /// minute is long enough to absorb a reconnect loop and short enough that a
 /// server coming back is raced, and pinned, soon after.
 pub const FAILED_RACE_HOLDOFF: Duration = Duration::from_mins(1);
@@ -73,8 +73,9 @@ pub const ADDRESS_ATTEMPT_LIMIT: Duration = Duration::from_secs(15);
 /// is raced again on the next connect, however young it is.
 pub const SUSPECT_AFTER_FAILURES: u32 = 2;
 
-/// Most addresses one race dials. Each gets its own thread for the length of
-/// one connect.
+/// Most addresses a race dials at once. Each gets its own thread for the
+/// length of one connect, and a server with more addresses than this is raced
+/// in batches of this many, in the order they resolved.
 const MAX_RACE_CANDIDATES: usize = 16;
 
 /// Weight of a new sample in the per-address averages.
@@ -579,67 +580,55 @@ impl AddressPlan {
             return Err(error);
         }
 
-        let (tx, rx) = mpsc::channel();
         let mut last_error = None;
-        for &addr in candidates.iter().take(MAX_RACE_CANDIDATES) {
-            let tx = tx.clone();
-            let dialer = Arc::clone(dialer);
-            let plan = Arc::clone(self);
-            let spawned = std::thread::Builder::new()
-                .name("nntp-address-race".into())
-                .spawn(move || {
-                    let started = Instant::now();
-                    let result = dialer.dial(addr);
-                    let elapsed = started.elapsed();
-                    match &result {
-                        Ok(_) => plan.record_connect(addr, Some(elapsed)),
-                        // Only slow. Whether that counts against the address
-                        // depends on whether anything won, which the race
-                        // decides below.
-                        Err(error) if is_slow(error) => {}
-                        Err(_) => plan.record_connect(addr, None),
-                    }
-                    // A loser's stream is dropped here once the winner has
-                    // stopped listening, which closes it.
-                    let _ = tx.send((addr, result, elapsed));
-                });
-            if let Err(error) = spawned {
-                last_error = Some(error);
-            }
-        }
-        drop(tx);
-
         let mut slow = Vec::new();
-        for (addr, result, elapsed) in rx {
-            match result {
-                Ok(stream) => {
-                    // Addresses that timed out lost to this one; they are
-                    // not booked as failures.
-                    ticket.finish(Ok(addr), Some(elapsed), resolved);
-                    return Ok((stream, addr));
-                }
-                Err(error) => {
-                    if is_slow(&error) {
-                        slow.push(addr);
-                    }
+        // One batch at a time bounds the threads a race holds, and the next
+        // batch is dialled only once every address of this one has answered
+        // without connecting.
+        for batch in candidates.chunks(MAX_RACE_CANDIDATES) {
+            let (tx, rx) = mpsc::channel();
+            for &addr in batch {
+                let tx = tx.clone();
+                let dialer = Arc::clone(dialer);
+                let plan = Arc::clone(self);
+                let spawned = std::thread::Builder::new()
+                    .name("nntp-address-race".into())
+                    .spawn(move || {
+                        let started = Instant::now();
+                        let result = dialer.dial(addr);
+                        let elapsed = started.elapsed();
+                        match &result {
+                            Ok(_) => plan.record_connect(addr, Some(elapsed)),
+                            // Only slow. Whether that counts against the
+                            // address depends on whether anything won, which
+                            // the race decides below.
+                            Err(error) if is_slow(error) => {}
+                            Err(_) => plan.record_connect(addr, None),
+                        }
+                        // A loser's stream is dropped here once the winner has
+                        // stopped listening, which closes it.
+                        let _ = tx.send((addr, result, elapsed));
+                    });
+                if let Err(error) = spawned {
                     last_error = Some(error);
                 }
             }
-        }
-        // Keep the thread count bounded, but let this connect try every
-        // address the resolver returned before declaring the race lost.
-        for &addr in candidates.iter().skip(MAX_RACE_CANDIDATES) {
-            let started = Instant::now();
-            match dialer.dial(addr) {
-                Ok(stream) => {
-                    let elapsed = started.elapsed();
-                    self.record_connect(addr, Some(elapsed));
-                    ticket.finish(Ok(addr), Some(elapsed), resolved);
-                    return Ok((stream, addr));
-                }
-                Err(error) => {
-                    self.record_connect(addr, None);
-                    last_error = Some(error);
+            drop(tx);
+
+            for (addr, result, elapsed) in rx {
+                match result {
+                    Ok(stream) => {
+                        // Addresses that timed out lost to this one; they are
+                        // not booked as failures.
+                        ticket.finish(Ok(addr), Some(elapsed), resolved);
+                        return Ok((stream, addr));
+                    }
+                    Err(error) => {
+                        if is_slow(&error) {
+                            slow.push(addr);
+                        }
+                        last_error = Some(error);
+                    }
                 }
             }
         }
