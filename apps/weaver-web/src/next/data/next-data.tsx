@@ -72,6 +72,8 @@ export interface ProviderHealth {
   failureCount: number;
   consecutiveFailures: number;
   prematureDeaths: number;
+  /** The resolved address new connections dial, once a race has picked one. */
+  pinnedAddress: string | null;
 }
 
 interface ProviderHoldoff {

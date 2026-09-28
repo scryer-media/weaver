@@ -6,7 +6,6 @@ use weaver_nntp::client::FetchAttemptOutcome;
 mod completion;
 mod direct_store;
 mod eligibility;
-mod ip_replacement;
 mod lanes;
 mod leases;
 mod metrics;
@@ -15,10 +14,6 @@ mod pressure;
 mod refill;
 mod spawn;
 
-#[cfg(test)]
-pub(in crate::pipeline) use ip_replacement::{
-    is_ip_replacement_policy_stop, should_neutrally_park_ip_replacement,
-};
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
@@ -80,10 +75,21 @@ const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
 /// unreadable from the log. Each job gets its own window here, and whatever a
 /// closed window swallowed is counted and reported by the next line that gets
 /// through it.
-#[derive(Debug, Default)]
-pub(crate) struct JobLogThrottle {
-    windows: HashMap<JobId, JobLogWindow>,
+#[derive(Debug)]
+pub(crate) struct KeyedLogThrottle<K> {
+    windows: HashMap<K, JobLogWindow>,
 }
+
+impl<K> Default for KeyedLogThrottle<K> {
+    fn default() -> Self {
+        Self {
+            windows: HashMap::new(),
+        }
+    }
+}
+
+/// The per-job window every job-scoped throttle uses.
+pub(crate) type JobLogThrottle = KeyedLogThrottle<JobId>;
 
 #[derive(Debug, Clone, Copy)]
 struct JobLogWindow {
@@ -91,14 +97,14 @@ struct JobLogWindow {
     suppressed: u64,
 }
 
-impl JobLogThrottle {
-    /// Whether this job may log now, and how many of its emissions the closed
+impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
+    /// Whether this key may log now, and how many of its emissions the closed
     /// window swallowed since the last one that got through.
-    pub(crate) fn admit(&mut self, job_id: JobId, interval: Duration) -> Option<u64> {
+    pub(crate) fn admit(&mut self, job_id: K, interval: Duration) -> Option<u64> {
         self.admit_at(job_id, interval, Instant::now())
     }
 
-    fn admit_at(&mut self, job_id: JobId, interval: Duration, now: Instant) -> Option<u64> {
+    fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
         match self.windows.get_mut(&job_id) {
             Some(window) if now.duration_since(window.emitted_at) < interval => {
                 window.suppressed = window.suppressed.saturating_add(1);
@@ -136,7 +142,7 @@ impl JobLogThrottle {
     }
 
     #[cfg(test)]
-    pub(crate) fn last_emitted_at(&self, job_id: JobId) -> Option<Instant> {
+    pub(crate) fn last_emitted_at(&self, job_id: K) -> Option<Instant> {
         self.windows.get(&job_id).map(|window| window.emitted_at)
     }
 }
@@ -146,15 +152,6 @@ impl JobLogThrottle {
 /// opens, long enough that ordinary refill gaps between batches say nothing.
 const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
 const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
-const IP_REPLACEMENT_MIN_OLD_SAMPLES: u16 = 16;
-const IP_REPLACEMENT_MIN_OLD_AGE: Duration = Duration::from_secs(30);
-const IP_REPLACEMENT_BASELINE_MIN_SAMPLES: u16 = 8;
-const IP_REPLACEMENT_BASELINE_RECENT: Duration = Duration::from_secs(10 * 60);
-const IP_REPLACEMENT_OLD_SLOWER_RATIO: f64 = 1.25;
-const IP_REPLACEMENT_OLD_SLOWER_MS: f64 = 75.0;
-const IP_REPLACEMENT_TRIAL_SAMPLES: usize = 4;
-const IP_REPLACEMENT_CANDIDATE_BETTER_RATIO: f64 = 0.85;
-const IP_REPLACEMENT_CANDIDATE_BETTER_MS: f64 = 40.0;
 const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
@@ -431,7 +428,7 @@ impl Pipeline {
                 .map(|state| state.spec.total_bytes)
                 .unwrap_or(0);
             let tuner_max = self.tuner.params().max_concurrent_downloads;
-            info!(
+            debug!(
                 job_id = job_id.0,
                 total_bytes = total,
                 configured_server_count = self.nntp.pool().server_count(),
@@ -633,6 +630,39 @@ impl Pipeline {
                             status_allows_dispatch,
                             "dispatch idle: job not eligible by status"
                         );
+                    } else if parked_recovery_only && !status_allows_dispatch {
+                        // Recovery parked behind a phase that dispatches
+                        // nothing — moving the output, say — is waiting for
+                        // that phase, not stalled. The phase ends it.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch idle: parked recovery behind a non-dispatching phase"
+                        );
+                    } else if !status_allows_dispatch
+                        || (s.download_queue.is_empty() && s.recovery_queue.is_empty())
+                    {
+                        // A job with nothing queued to fetch — its download is
+                        // done and it is verifying, extracting or moving its
+                        // output, or its last articles are still settling — is
+                        // not waiting on dispatch, and neither is a phase that
+                        // dispatches nothing. Only queued work that dispatch
+                        // will not hand out is a stall.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch idle: nothing for dispatch to hand out"
+                        );
                     } else {
                         ineligible_jobs.push((
                             *jid,
@@ -673,6 +703,7 @@ impl Pipeline {
                     suppressed_since_last,
                     "dispatch stall: job not eligible"
                 );
+                crate::runtime::job_debug_ring::dump(job_id.0, "dispatch stall: job not eligible");
             }
             for job_id in drained_parked_recovery_jobs {
                 self.schedule_job_completion_check_if_download_pipeline_drained(
@@ -693,10 +724,10 @@ impl Pipeline {
         }
 
         let eligible_count = eligible.len();
-        let Some(hot_job_id) = eligible.first().copied() else {
+        if eligible.is_empty() {
             self.update_queue_metrics();
             return;
-        };
+        }
         let active_connections_before_dispatch = self.active_download_connections;
         let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
         let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
@@ -721,7 +752,6 @@ impl Pipeline {
         }
         self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);
-        self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();
     }
 }

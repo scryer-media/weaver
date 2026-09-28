@@ -23,6 +23,7 @@ use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use weaver_yenc::CheckpointPlan;
 
+use crate::address_plan::AddressRoute;
 use crate::client::{
     BodyLaneMode, BodyLaneTraceMeta, DecodedBody, DecodedBodyCpu, DecodedBodyError, DecodedBodyIo,
     DecodedBodyTrace, FetchAttemptOutcome, FetchAttemptTrace, ProbeBatchResult,
@@ -178,6 +179,12 @@ pub struct BlockingBodyLane {
     /// Status-line-to-terminator wait: what the article itself cost on the
     /// wire, independent of how far away the server is.
     transfer_ewma: Option<Duration>,
+    /// Successful responses this connection has produced. The first one is
+    /// cold: see [`Self::take_response_sample`].
+    responses_completed: u64,
+    /// What the latest successful response measured, until the caller takes
+    /// it.
+    last_sample: ResponseSample,
     soft_timeout: Duration,
     /// Outstanding pipelined BODY commands, when the caller drives the lane
     /// request-by-request instead of batch-by-batch.
@@ -233,8 +240,7 @@ impl BlockingBodyLane {
         stable_server_id: StableServerId,
         transfer_control: Option<Arc<ServerTransferControl>>,
         config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
+        route: Option<&AddressRoute>,
         groups: &[String],
         soft_timeout: Duration,
         permit: BlockingConnectionPermit,
@@ -249,10 +255,9 @@ impl BlockingBodyLane {
         }
         // On a pipelining server the first candidate group rides in the
         // session-setup write; `select_group` then short-circuits on it.
-        let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
+        let mut conn = BlockingNntpConnection::connect_for_group(
             config,
-            excluded_ips,
-            address_offset,
+            route,
             groups.first().map(String::as_str),
         )?;
         conn.set_transfer_control(transfer_control);
@@ -272,6 +277,8 @@ impl BlockingBodyLane {
                 mode: BodyLaneMode::Sequential,
                 latency_ewma: None,
                 transfer_ewma: None,
+                responses_completed: 0,
+                last_sample: ResponseSample::default(),
                 soft_timeout,
                 ring: BodyRing::default(),
                 _permit: permit,
@@ -292,6 +299,8 @@ impl BlockingBodyLane {
                         mode: BodyLaneMode::Sequential,
                         latency_ewma: None,
                         transfer_ewma: None,
+                        responses_completed: 0,
+                        last_sample: ResponseSample::default(),
                         soft_timeout,
                         ring: BodyRing::default(),
                         idle_since: std::sync::Mutex::new(None),
@@ -315,6 +324,8 @@ impl BlockingBodyLane {
                 mode: BodyLaneMode::Sequential,
                 latency_ewma: None,
                 transfer_ewma: None,
+                responses_completed: 0,
+                last_sample: ResponseSample::default(),
                 soft_timeout,
                 ring: BodyRing::default(),
                 idle_since: std::sync::Mutex::new(None),
@@ -517,8 +528,7 @@ impl BlockingBodyLane {
             // Nothing else was outstanding, so the status-line wait is a clean
             // latency sample.
             let latency = self.conn.take_response_line_wait().min(policy_elapsed);
-            self.observe_latency(latency);
-            self.observe_transfer(policy_elapsed.saturating_sub(latency));
+            self.book_response(Some(latency), policy_elapsed.saturating_sub(latency));
         }
         self.trace_item(message_id, policy_elapsed, result)
     }
@@ -617,10 +627,10 @@ impl BlockingBodyLane {
                 // Only the head of the batch was issued with nothing else in
                 // flight; later responses are already queued behind it, so
                 // their status-line wait says nothing about distance.
-                if idx == 0 {
-                    self.observe_latency(response_line_wait);
-                }
-                self.observe_transfer(policy_elapsed.saturating_sub(response_line_wait));
+                self.book_response(
+                    (idx == 0).then_some(response_line_wait),
+                    policy_elapsed.saturating_sub(response_line_wait),
+                );
             }
             if self.conn.poisoned
                 || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -809,10 +819,10 @@ impl BlockingBodyLane {
             // Only a request issued into an empty ring measures distance;
             // anything issued behind another article was queued behind its
             // payload and would read as near zero.
-            if request.issued_alone {
-                self.observe_latency(response_line_wait);
-            }
-            self.observe_transfer(policy_elapsed.saturating_sub(response_line_wait));
+            self.book_response(
+                request.issued_alone.then_some(response_line_wait),
+                policy_elapsed.saturating_sub(response_line_wait),
+            );
         }
         if self.conn.poisoned
             || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -989,14 +999,64 @@ impl BlockingBodyLane {
         }
     }
 
-    fn observe_latency(&mut self, sample: Duration) {
-        self.latency_ewma = Some(blend_ewma(self.latency_ewma, sample));
+    /// Book one successful response: its status-line wait when the request
+    /// went out alone, and the wire time of its article.
+    ///
+    /// The connection's first response is only recorded as the sample the
+    /// caller can take; it does not move the lane's averages. That response
+    /// carries costs no later one repeats — a session that still has to
+    /// re-authenticate or select a group answers its first BODY late, and a
+    /// socket still in slow start delivers its first article slowly — and on
+    /// a pipelined lane it is also the only request ever issued alone, so
+    /// without this rule the lane's idea of the server's distance would be
+    /// that one cold sample for as long as the connection lived.
+    fn book_response(&mut self, latency: Option<Duration>, transfer: Duration) {
+        let cold = self.responses_completed == 0;
+        let settled = self.responses_completed >= SETTLED_AFTER_RESPONSES;
+        self.responses_completed = self.responses_completed.saturating_add(1);
+        self.last_sample = ResponseSample {
+            latency,
+            cold,
+            settled,
+        };
+        if cold {
+            return;
+        }
+        if let Some(latency) = latency {
+            self.latency_ewma = Some(blend_ewma(self.latency_ewma, latency));
+        }
+        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, transfer));
     }
 
-    fn observe_transfer(&mut self, sample: Duration) {
-        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, sample));
+    /// What the latest successful response measured, taken once. A response
+    /// that failed leaves nothing to take.
+    pub fn take_response_sample(&mut self) -> ResponseSample {
+        std::mem::take(&mut self.last_sample)
     }
 }
+
+/// What one successful response on a lane measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResponseSample {
+    /// Command-to-status-line wait, present only when the request went out
+    /// with nothing else outstanding on the connection.
+    pub latency: Option<Duration>,
+    /// The response was the connection's first. Its timings include setup
+    /// costs no later response repeats, so it describes the connection's
+    /// start, not the link.
+    pub cold: bool,
+    /// The connection had already answered [`SETTLED_AFTER_RESPONSES`]
+    /// requests, so its congestion window has had the round trips it needs
+    /// to open and this response's wire rate is the address's, not the
+    /// socket's ramp. Implies `!cold`.
+    pub settled: bool,
+}
+
+/// Responses a connection answers before its wire rate is taken as the
+/// address's. The first response is cold; the next few are still read
+/// through a window that doubles each round trip, and on a link with a long
+/// round trip and large articles that ramp outlasts several of them.
+pub const SETTLED_AFTER_RESPONSES: u64 = 4;
 
 fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
     match current {
@@ -1017,38 +1077,29 @@ impl BlockingNntpConnection {
         std::mem::replace(&mut self.last_response_line_wait, Duration::ZERO)
     }
 
-    pub fn connect_with_ip_policy(
-        config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
-    ) -> Result<Self> {
-        Self::connect_with_ip_policy_for_group(config, excluded_ips, address_offset, None)
+    /// Connect to the first resolved address that answers.
+    pub fn connect(config: &ServerConfig) -> Result<Self> {
+        Self::connect_for_group(config, None, None)
     }
 
     /// Connect and, on a server known to pipeline, select `initial_group`
     /// inside the session-setup write. An unselectable group is not an
-    /// error here; the lane walks its candidate list afterwards.
-    pub fn connect_with_ip_policy_for_group(
+    /// error here; the lane walks its candidate list afterwards. A direct
+    /// connection dials the address `route`'s plan picks, or the first
+    /// resolved address that answers when there is no route.
+    pub fn connect_for_group(
         config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
+        route: Option<&AddressRoute>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
-        Self::connect_with_ip_policy_with_backend(
-            config,
-            excluded_ips,
-            address_offset,
-            None,
-            initial_group,
-        )
+        Self::connect_with_backend(config, route, None, initial_group)
     }
 
     /// `backend_override` bypasses env/platform backend selection; tests use
     /// it to exercise a specific TLS transport deterministically.
-    fn connect_with_ip_policy_with_backend(
+    fn connect_with_backend(
         config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
+        route: Option<&AddressRoute>,
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
@@ -1064,36 +1115,32 @@ impl BlockingNntpConnection {
                 backend_override,
                 initial_group,
                 Some(outcome),
+                None,
             );
         }
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
-        let addrs = resolve_addrs(&config.host, config.port, excluded_ips, address_offset)?;
-        let mut last_error = None;
-        for addr in addrs {
-            match TcpStream::connect_timeout(&addr, connect_timeout) {
-                Ok(tcp) => {
-                    tcp.set_nodelay(true).map_err(NntpError::Io)?;
-                    tcp.set_read_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
-                        .map_err(NntpError::Io)?;
-                    tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
-                        .map_err(NntpError::Io)?;
-                    let remote_addr = Some(tcp.peer_addr().unwrap_or(addr));
-                    return Self::from_tcp(
-                        config,
-                        tcp,
-                        remote_addr,
-                        backend_override,
-                        initial_group,
-                        None,
-                    );
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        Err(NntpError::Io(last_error.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no NNTP address resolved")
-        })))
+        let (tcp, addr) = match route {
+            Some(route) => route
+                .connect_tcp(&config.host, config.port, connect_timeout)
+                .map_err(NntpError::Io)?,
+            None => connect_first_answering(&config.host, config.port, connect_timeout)?,
+        };
+        tcp.set_nodelay(true).map_err(NntpError::Io)?;
+        tcp.set_read_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
+            .map_err(NntpError::Io)?;
+        tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
+            .map_err(NntpError::Io)?;
+        let remote_addr = Some(tcp.peer_addr().unwrap_or(addr));
+        let setup = route.map(|route| route.watch_setup(addr));
+        Self::from_tcp(
+            config,
+            tcp,
+            remote_addr,
+            backend_override,
+            initial_group,
+            None,
+            setup,
+        )
     }
 
     /// The TLS backend that carries this server's bytes on an owned lane.
@@ -1160,6 +1207,7 @@ impl BlockingNntpConnection {
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
         route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+        mut setup: Option<crate::address_plan::SetupWatch>,
     ) -> Result<Self> {
         let tcp = tcp.into();
         let route_socket = config
@@ -1208,6 +1256,12 @@ impl BlockingNntpConnection {
 
         let greeting = conn.read_response()?;
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received blocking NNTP greeting");
+        let upgrades = config.starttls && matches!(conn.transport, BlockingTransport::Plain(_));
+        if (!upgrades || !matches!(greeting.code.raw(), 200 | 201))
+            && let Some(setup) = setup.take()
+        {
+            setup.reached_server();
+        }
         match greeting.code.raw() {
             200 | 201 => {}
             400 => return Err(NntpError::ServiceUnavailable),
@@ -1244,6 +1298,9 @@ impl BlockingNntpConnection {
             conn.codec = NntpCodec::new();
             conn.read_buf.clear();
             debug!(host = %config.host, "blocking STARTTLS upgrade complete");
+            if let Some(setup) = setup.take() {
+                setup.reached_server();
+            }
         }
 
         // Session setup: authentication and nothing else, unless this server
@@ -2942,25 +2999,22 @@ fn nntp_error_to_io(error: NntpError) -> io::Error {
     }
 }
 
-fn resolve_addrs(
+/// Connect to the first of `host`'s resolved addresses that answers.
+fn connect_first_answering(
     host: &str,
     port: u16,
-    excluded_ips: &[IpAddr],
-    address_offset: usize,
-) -> Result<Vec<SocketAddr>> {
-    let mut addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(NntpError::Io)?
-        .filter(|addr| !excluded_ips.contains(&addr.ip()))
-        .collect::<Vec<_>>();
-    if addrs.is_empty() {
-        return Err(NntpError::PoolExhausted);
+    timeout: Duration,
+) -> Result<(TcpStream, SocketAddr)> {
+    let mut last_error = None;
+    for addr in (host, port).to_socket_addrs().map_err(NntpError::Io)? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(tcp) => return Ok((tcp, addr)),
+            Err(error) => last_error = Some(error),
+        }
     }
-    if !addrs.is_empty() {
-        let offset = address_offset % addrs.len();
-        addrs.rotate_left(offset);
-    }
-    Ok(addrs)
+    Err(NntpError::Io(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no NNTP address resolved")
+    })))
 }
 
 fn decoded_body_from_article(article: FusedYencArticle) -> DecodedBody {

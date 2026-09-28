@@ -15,6 +15,8 @@ import (
 
 	"github.com/moby/patternmatcher"
 	"github.com/moby/patternmatcher/ignorefile"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // The builder stage checks weaver out at this path. Relative
@@ -494,14 +496,14 @@ func buildLocalWeaverImage(image string, weaverRoot string, plan weaverImagePlan
 }
 
 func newWeaverImageBuildCommand(image string, weaverRoot string, plan weaverImagePlan, fingerprint string) *exec.Cmd {
-	cmd := exec.Command("docker", plan.buildArgs("-", image, weaverRoot, fingerprint)...)
+	cmd := containerengine.Command(plan.buildArgs("-", image, weaverRoot, fingerprint)...)
 	cmd.Dir = e2eDir()
 	cmd.Stdin = strings.NewReader(plan.dockerfile())
 	return cmd
 }
 
 func dockerImageCreated(image string) string {
-	cmd := exec.Command("docker", "image", "inspect", "-f", "{{.Created}}", image)
+	cmd := containerengine.Command("image", "inspect", "-f", "{{.Created}}", image)
 	cmd.Dir = e2eDir()
 	out, err := cmd.Output()
 	if err != nil {
@@ -516,7 +518,7 @@ func dockerImageCreated(image string) string {
 
 func dockerImageLabel(image string, label string) string {
 	template := fmt.Sprintf("{{ index .Config.Labels %q }}", label)
-	cmd := exec.Command("docker", "image", "inspect", "-f", template, image)
+	cmd := containerengine.Command("image", "inspect", "-f", template, image)
 	cmd.Dir = e2eDir()
 	out, err := cmd.Output()
 	if err != nil {

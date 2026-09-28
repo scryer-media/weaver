@@ -1,6 +1,6 @@
 use crate::route_stream::RouteStream;
 use std::io::{self, Cursor, Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -27,6 +27,7 @@ use tokio_rustls::rustls::{
     Error as RustlsError, RootCertStore, SignatureScheme, SupportedCipherSuite,
 };
 
+use crate::address_plan::AddressRoute;
 use crate::error::NntpError;
 
 /// Keeps normal WebPKI verification intact while allowing one explicitly
@@ -1336,52 +1337,46 @@ fn set_keepalive(tcp: &TcpStream) {
     let _ = sock_ref.set_tcp_keepalive(&ka);
 }
 
-async fn resolve_connect_addrs(
+/// Open the TCP socket for a direct connection: to the address `route`'s plan
+/// picks when there is one, otherwise to the first resolved address that
+/// answers.
+pub(crate) async fn dial_direct(
     host: &str,
     port: u16,
-    excluded_ips: &[IpAddr],
-    address_offset: usize,
-) -> Result<Vec<SocketAddr>, NntpError> {
-    let addrs: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
-    filter_and_rotate_addrs(addrs, excluded_ips, address_offset).map_err(|_| {
-        NntpError::Io(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            format!("no resolved addresses for {host}:{port} after IP exclusions"),
-        ))
-    })
-}
-
-fn filter_and_rotate_addrs(
-    mut addrs: Vec<SocketAddr>,
-    excluded_ips: &[IpAddr],
-    address_offset: usize,
-) -> std::result::Result<Vec<SocketAddr>, ()> {
-    addrs.retain(|addr| !excluded_ips.contains(&addr.ip()));
-
-    if addrs.is_empty() {
-        return Err(());
-    }
-
-    let offset = address_offset % addrs.len();
-    addrs.rotate_left(offset);
-    Ok(addrs)
-}
-
-async fn connect_tcp_from_resolved(
-    addrs: &[SocketAddr],
+    route: Option<&AddressRoute>,
+    attempt_timeout: Duration,
 ) -> Result<(TcpStream, Option<SocketAddr>), NntpError> {
+    let tcp = match route {
+        Some(route) => {
+            let route = route.clone();
+            let host = host.to_string();
+            // The plan dials with blocking sockets so that one race serves
+            // both the async and the blocking connection paths.
+            let (tcp, _) = tokio::task::spawn_blocking(move || {
+                route.connect_tcp(&host, port, attempt_timeout)
+            })
+            .await
+            .map_err(|error| NntpError::Io(std::io::Error::other(error)))??;
+            tcp.set_nonblocking(true)?;
+            TcpStream::from_std(tcp)?
+        }
+        None => {
+            let addrs: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
+            connect_first_answering(&addrs).await?
+        }
+    };
+    let remote_addr = Some(tcp.peer_addr()?);
+    tcp.set_nodelay(true)?;
+    set_keepalive(&tcp);
+    Ok((tcp, remote_addr))
+}
+
+async fn connect_first_answering(addrs: &[SocketAddr]) -> Result<TcpStream, NntpError> {
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect(addr).await {
-            Ok(tcp) => {
-                let remote_addr = Some(tcp.peer_addr()?);
-                tcp.set_nodelay(true)?;
-                set_keepalive(&tcp);
-                return Ok((tcp, remote_addr));
-            }
-            Err(error) => {
-                last_error = Some(error);
-            }
+            Ok(tcp) => return Ok(tcp),
+            Err(error) => last_error = Some(error),
         }
     }
 
@@ -1511,8 +1506,10 @@ async fn inspect_certificate_inner(
     let tcp: RouteStream = if let Some(proxy) = proxy {
         proxy.dial(host, port).await?.0.into()
     } else {
-        let addrs = resolve_connect_addrs(host, port, &[], 0).await?;
-        connect_tcp_from_resolved(&addrs).await?.0.into()
+        dial_direct(host, port, None, Duration::from_secs(30))
+            .await?
+            .0
+            .into()
     };
 
     let _ = ManualTlsStream::connect(tcp, tls_config, server_name).await;
@@ -1544,29 +1541,28 @@ pub async fn connect_tls(
     port: u16,
     ca_cert_path: Option<&Path>,
 ) -> Result<NntpTransport, NntpError> {
-    connect_tls_with_ip_policy(
+    let (tcp, remote_addr) = dial_direct(host, port, None, Duration::from_secs(30)).await?;
+    connect_tls_over(
+        tcp,
+        remote_addr,
         host,
-        port,
         ca_cert_path,
         None,
         TlsCipherPreference::Auto,
-        &[],
-        0,
     )
     .await
 }
 
-pub async fn connect_tls_with_ip_policy(
+/// Run the implicit-TLS handshake on an already connected socket. `host` is
+/// the name the certificate is checked against.
+pub(crate) async fn connect_tls_over(
+    tcp: TcpStream,
+    remote_addr: Option<SocketAddr>,
     host: &str,
-    port: u16,
     ca_cert_path: Option<&Path>,
     adopted_name_mismatch_certificate_der: Option<&[u8]>,
     cipher_preference: TlsCipherPreference,
-    excluded_ips: &[IpAddr],
-    address_offset: usize,
 ) -> Result<NntpTransport, NntpError> {
-    let addrs = resolve_connect_addrs(host, port, excluded_ips, address_offset).await?;
-    let (tcp, remote_addr) = connect_tcp_from_resolved(&addrs).await?;
     let backend = if adopted_name_mismatch_certificate_der.is_some() {
         NntpTlsBackend::ManualRustls
     } else {
@@ -1600,17 +1596,7 @@ pub async fn connect_tls_with_ip_policy(
 
 /// Connect to a host with plain TCP (e.g. port 119).
 pub async fn connect_plain(host: &str, port: u16) -> Result<NntpTransport, NntpError> {
-    connect_plain_with_ip_policy(host, port, &[], 0).await
-}
-
-pub async fn connect_plain_with_ip_policy(
-    host: &str,
-    port: u16,
-    excluded_ips: &[IpAddr],
-    address_offset: usize,
-) -> Result<NntpTransport, NntpError> {
-    let addrs = resolve_connect_addrs(host, port, excluded_ips, address_offset).await?;
-    let (tcp, remote_addr) = connect_tcp_from_resolved(&addrs).await?;
+    let (tcp, remote_addr) = dial_direct(host, port, None, Duration::from_secs(30)).await?;
     Ok(NntpTransport::Plain {
         inner: tcp.into(),
         remote_addr,
@@ -2116,25 +2102,6 @@ mod tests {
             error.to_string().contains("unavailable on Windows"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn filter_and_rotate_addrs_excludes_ips_before_rotation() {
-        let a: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let b: SocketAddr = "127.0.0.2:443".parse().unwrap();
-        let c: SocketAddr = "127.0.0.3:443".parse().unwrap();
-
-        let ordered =
-            filter_and_rotate_addrs(vec![a, b, c], &[a.ip()], 1).expect("alternate addresses");
-
-        assert_eq!(ordered, vec![c, b]);
-    }
-
-    #[test]
-    fn filter_and_rotate_addrs_errors_when_all_ips_excluded() {
-        let a: SocketAddr = "127.0.0.1:443".parse().unwrap();
-
-        assert!(filter_and_rotate_addrs(vec![a], &[a.ip()], 0).is_err());
     }
 
     #[tokio::test]

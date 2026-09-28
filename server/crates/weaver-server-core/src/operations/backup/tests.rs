@@ -26,6 +26,7 @@ async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
 fn sample_config() -> Config {
     Config {
         data_dir: "/old/data".into(),
+        hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
         complete_dir: Some("/old/data/complete".into()),
         buffer_pool: None,
@@ -69,7 +70,6 @@ fn sample_config() -> Config {
         max_download_speed: Some(42),
         isp_bandwidth_cap: None,
         propagation_delay_secs: None,
-        ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),

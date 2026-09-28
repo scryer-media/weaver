@@ -10,11 +10,33 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tracing::info;
+use tracing::{debug, info};
 
 /// How often the heartbeat line is written. Long enough to be free at rest,
 /// short enough that the death window it brackets is useful.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Every beat is written at DEBUG; every this-many-th one, and the first, at
+/// INFO, so the default log keeps a coarse pulse without a line a minute.
+const HEARTBEAT_INFO_EVERY: u64 = 10;
+
+/// A beat whose resident set moved by more than this fraction since the last
+/// INFO beat is written at INFO too: memory climbing is exactly what the
+/// pulse is there to show.
+const HEARTBEAT_RSS_CHANGE_FOR_INFO: f64 = 0.25;
+
+/// Whether this beat is written at INFO rather than DEBUG.
+fn beat_is_info(beat: u64, rss: Option<u64>, last_info_rss: Option<u64>) -> bool {
+    if beat == 1 || beat.is_multiple_of(HEARTBEAT_INFO_EVERY) {
+        return true;
+    }
+    match (rss, last_info_rss) {
+        (Some(rss), Some(last)) if last > 0 => {
+            (rss.abs_diff(last) as f64 / last as f64) > HEARTBEAT_RSS_CHANGE_FOR_INFO
+        }
+        _ => false,
+    }
+}
 
 /// Highest resident set size any sample has seen, in bytes; zero until the
 /// first successful sample. A process-wide atomic rather than task state so
@@ -35,20 +57,32 @@ pub(crate) fn spawn_heartbeat_task() -> tokio::task::JoinHandle<()> {
         interval.tick().await;
 
         let mut beat: u64 = 0;
+        let mut last_info_rss = None;
         loop {
             interval.tick().await;
             beat += 1;
             let uptime_s = started.elapsed().as_secs();
             let rss = sample_and_record_rss();
-            match rss {
-                Some(rss_bytes) => info!(
-                    uptime_s,
-                    beat,
-                    rss_bytes,
-                    rss_peak_bytes = peak_rss_bytes(),
-                    "weaver heartbeat"
-                ),
-                None => info!(uptime_s, beat, rss_bytes = ?rss, "weaver heartbeat"),
+            let rss_peak_bytes = peak_rss_bytes();
+            let at_info = beat_is_info(beat, rss, last_info_rss);
+            if at_info {
+                last_info_rss = rss.or(last_info_rss);
+            }
+            match (at_info, rss) {
+                (true, Some(rss_bytes)) => {
+                    info!(
+                        uptime_s,
+                        beat, rss_bytes, rss_peak_bytes, "weaver heartbeat"
+                    )
+                }
+                (true, None) => info!(uptime_s, beat, rss_bytes = ?rss, "weaver heartbeat"),
+                (false, Some(rss_bytes)) => {
+                    debug!(
+                        uptime_s,
+                        beat, rss_bytes, rss_peak_bytes, "weaver heartbeat"
+                    )
+                }
+                (false, None) => debug!(uptime_s, beat, rss_bytes = ?rss, "weaver heartbeat"),
             }
         }
     })
@@ -140,6 +174,24 @@ fn resident_set_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_and_every_tenth_beat_are_info() {
+        let info_beats: Vec<u64> = (1..=30)
+            .filter(|beat| beat_is_info(*beat, Some(100), Some(100)))
+            .collect();
+
+        assert_eq!(info_beats, vec![1, 10, 20, 30]);
+    }
+
+    #[test]
+    fn a_resident_set_that_moved_a_quarter_is_info() {
+        assert!(beat_is_info(3, Some(126), Some(100)));
+        assert!(beat_is_info(3, Some(74), Some(100)));
+        assert!(!beat_is_info(3, Some(125), Some(100)));
+        assert!(!beat_is_info(3, None, Some(100)));
+        assert!(!beat_is_info(3, Some(100), None));
+    }
 
     #[test]
     fn resident_set_is_reported_on_this_platform() {

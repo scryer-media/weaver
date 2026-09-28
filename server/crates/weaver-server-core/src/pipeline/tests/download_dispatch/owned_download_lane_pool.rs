@@ -2090,7 +2090,8 @@ async fn stale_generation_success_does_not_update_new_lane_health() {
             server_idx: Some(0),
             mode: DownloadLaneMode::Pipelined { depth: 2 },
             supports_pipelining: true,
-            latency: Some(Duration::from_millis(5)),
+            latency_sample: Some(Duration::from_millis(5)),
+            cold: false,
             transfer: Some(Duration::from_millis(20)),
             payload_bytes: 7,
             policy_elapsed: Duration::from_millis(25),
@@ -3800,7 +3801,6 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
             completion_critical: false,
             server_idx: Some(0),
             connection: true,
-            ip_replacement: false,
             outstanding: HashMap::from([(
                 segment_id,
                 DownloadWork {

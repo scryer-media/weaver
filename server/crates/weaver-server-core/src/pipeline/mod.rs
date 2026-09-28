@@ -25,7 +25,6 @@ use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_bu
 use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_disk};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -278,7 +277,6 @@ pub(super) struct DownloadLaneOwner {
     /// scheduler where the lane lives. `None` until the first refill.
     server_idx: Option<usize>,
     connection: bool,
-    ip_replacement: bool,
     outstanding: HashMap<SegmentId, DownloadWork>,
 }
 
@@ -317,7 +315,6 @@ pub(super) struct DownloadLaneRefillRequest {
     pub(super) lane_id: u64,
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
-    pub(super) remote_ip: Option<IpAddr>,
     pub(super) supports_pipelining: bool,
     /// The mode the scheduler last **booked** this lane's depth gauge under —
     /// not necessarily the one it is running. A lane started on a lease mode
@@ -335,30 +332,6 @@ pub(super) struct DownloadLaneRefillResponse {
     pub(super) park_reason: LaneParkReason,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct IpReplacementCandidate {
-    pub(super) old_key: ServerIpKey,
-    pub(super) old_ewma_ms: f64,
-    pub(super) baseline_ms: f64,
-}
-
-pub(super) enum IpReplacementTrialEvent {
-    CandidateAcquired {
-        job_id: JobId,
-        candidate: IpReplacementCandidate,
-        candidate_ip: IpAddr,
-        lane: Box<weaver_nntp::BodyLaneLease>,
-    },
-    AcquireFailed,
-    SameIpRejected,
-    CandidateRejected,
-    CandidateAccepted {
-        lane_id: u64,
-        old_key: ServerIpKey,
-        samples: Vec<weaver_nntp::client::FetchAttemptTrace>,
-    },
-}
-
 pub(super) struct DownloadLaneParked {
     pub(super) lane_id: u64,
     pub(super) job_id: JobId,
@@ -366,7 +339,6 @@ pub(super) struct DownloadLaneParked {
     pub(super) completion_critical: bool,
     pub(super) reason: LaneParkReason,
     pub(super) release_connection_slot: bool,
-    pub(super) release_ip_replacement_burst: bool,
 }
 
 pub(super) enum OwnedDownloadLaneEvent {
@@ -393,7 +365,6 @@ pub(super) enum DownloadResultOrigin {
     Recovery,
     CompletionCriticalPrimary,
     CompletionCriticalRecovery,
-    IpReplacementTrial,
 }
 
 impl DownloadResultOrigin {
@@ -462,10 +433,16 @@ pub(super) struct DownloadLaneObservation {
     pub(super) server_idx: Option<usize>,
     pub(super) mode: DownloadLaneMode,
     pub(super) supports_pipelining: bool,
-    /// Command-to-status-line wait, present only when the lane could take an
-    /// unbiased sample (nothing else outstanding when the request went out).
-    pub(super) latency: Option<Duration>,
-    /// Status-line-to-terminator wait: what the article cost on the wire.
+    /// Command-to-status-line wait this one response measured, present only
+    /// when the lane could take an unbiased sample (nothing else outstanding
+    /// when the request went out).
+    pub(super) latency_sample: Option<Duration>,
+    /// This response was its connection's first. Its timings carry setup
+    /// costs no later response repeats, so the depth explorer keeps it out
+    /// of the link model and the rung comparison.
+    pub(super) cold: bool,
+    /// Status-line-to-terminator wait: what the article cost on the wire,
+    /// smoothed over the lane's warm responses.
     pub(super) transfer: Option<Duration>,
     /// Decoded payload of this one response, for the depth explorer's
     /// throughput window.
@@ -1040,6 +1017,9 @@ pub(super) struct Par2FileRuntime {
     /// Article ordinals already used for bounded prefix probing. Full-carrier
     /// escalation skips them because their decoded bytes are already retained.
     pub(super) discovery_probe_ordinals: HashSet<u32>,
+    /// Digest of the bytes the last completed metadata parse of this file
+    /// read. A re-finalisation that leaves the bytes unchanged skips the parse.
+    pub(super) metadata_parse_fingerprint: Option<[u8; 32]>,
 }
 
 /// What a job knows about one recovery set it has encountered.
@@ -2213,41 +2193,6 @@ impl DeferredFileHashChunk {
     }
 }
 
-const MAX_IP_RTT_EWMA_ENTRIES: usize = 64;
-const IP_RTT_EWMA_ALPHA: f64 = 0.20;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct ServerIpKey {
-    pub(super) server_idx: usize,
-    pub(super) ip: IpAddr,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct IpRttEwma {
-    pub(super) ewma_ms: f64,
-    pub(super) samples: u16,
-    pub(super) first_seen: Instant,
-    pub(super) last_seen: Instant,
-}
-
-impl IpRttEwma {
-    pub(super) fn new(now: Instant, elapsed: Duration) -> Self {
-        Self {
-            ewma_ms: elapsed.as_secs_f64() * 1000.0,
-            samples: 1,
-            first_seen: now,
-            last_seen: now,
-        }
-    }
-
-    pub(super) fn observe(&mut self, now: Instant, elapsed: Duration) {
-        let next_ms = elapsed.as_secs_f64() * 1000.0;
-        self.ewma_ms = (IP_RTT_EWMA_ALPHA * next_ms) + ((1.0 - IP_RTT_EWMA_ALPHA) * self.ewma_ms);
-        self.samples = self.samples.saturating_add(1);
-        self.last_seen = now;
-    }
-}
-
 /// The one way a segment can stop being outstanding without arriving.
 ///
 /// A segment reaches exactly one of these, exactly once, and the job's
@@ -2341,14 +2286,6 @@ pub struct Pipeline {
     /// so a dial now would be refused as over the limit and park the new pool
     /// — a healthy server — for the whole holdoff window.
     pub(super) nntp_handoff_draining: bool,
-    /// User-enabled over-max burst budget for latent-IP replacement trials.
-    pub(super) ip_replacement_trial_extra_connections: u8,
-    /// Bounded per-server/per-IP BODY RTT EWMA state.
-    pub(super) ip_rtt_ewma: HashMap<ServerIpKey, IpRttEwma>,
-    /// Old server/IP identities accepted for replacement; active lanes park at clean refill.
-    pub(super) ip_replacement_retired_ips: HashSet<ServerIpKey>,
-    /// Whether the single global over-max replacement burst is currently occupied.
-    pub(super) ip_replacement_burst_active: bool,
     /// Jobs currently inside an active article download pass.
     pub(super) active_download_passes: HashSet<JobId>,
     /// Jobs that still have decode/write pipeline work after network downloads finished.
@@ -2563,8 +2500,6 @@ pub struct Pipeline {
     pub(super) owned_download_lane_event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
     pub(super) owned_download_lane_event_rx: mpsc::Receiver<OwnedDownloadLaneEvent>,
     pub(super) owned_download_lane_pool: download::owned_lane::OwnedDownloadLanePool,
-    pub(super) ip_replacement_trial_tx: mpsc::Sender<IpReplacementTrialEvent>,
-    pub(super) ip_replacement_trial_rx: mpsc::Receiver<IpReplacementTrialEvent>,
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
     pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
     /// Channel through which due retries re-enter the pipeline loop.
@@ -2759,6 +2694,10 @@ pub struct Pipeline {
     /// warning. Every dispatch wake re-visits every job, so this one fires as
     /// fast as the actor is woken until the job leaves the phase it is in.
     pub(super) dispatch_ineligible_log_throttle: download::JobLogThrottle,
+    /// Rate limiter, per file, for the "an article arrived that the file
+    /// already holds" warning. Duplicates arrive in bursts when something
+    /// requeues work the assembly already has.
+    pub(super) duplicate_arrival_log_throttle: download::KeyedLogThrottle<NzbFileId>,
     /// Last time an owned blocking lane failed to be acquired at all, warned
     /// about or not. The under-cap report below is gated on it: lanes below
     /// their cap are only a fault when a lane actually failed to open.
@@ -2968,6 +2907,10 @@ pub struct Pipeline {
     /// completion check comes round again for as long as discovery is open,
     /// and the wait is news once.
     pub(super) par2_discovery_wait_logged: HashSet<JobId>,
+    /// Jobs that have reported a posted article name disagreeing with its
+    /// file. Obfuscated posts do this for every file; the job says so once and
+    /// each file's detail stays at debug.
+    pub(super) posted_name_disagreement_logged: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
     /// Split sets a recovery set has already answered for, keyed by set name,

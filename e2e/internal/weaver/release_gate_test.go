@@ -346,6 +346,15 @@ func TestWeaverCleanupUsesExactComposeProject(t *testing.T) {
 	}
 }
 
+func TestComposeRestartWaitsForAGracefulStop(t *testing.T) {
+	t.Setenv("E2E_PROJECT", "weaver-release-restart")
+	got := dockerComposeRestartArgs("weaver")
+	want := []string{"compose", "-p", "weaver-release-restart", "restart", "--timeout", "10", "weaver"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("restart args = %q, want %q", got, want)
+	}
+}
+
 func TestPreseededNntpComposeArgsUseTheNoVolumeOverride(t *testing.T) {
 	t.Setenv("E2E_PROJECT", "weaver-seeded-images")
 	t.Setenv(nntpSeedImageActiveEnv, "1")
@@ -609,4 +618,19 @@ func weaverE2ETestRoot(t *testing.T) string {
 		t.Fatal("resolve Weaver release test source path")
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+func TestCanonicalContainerImageIDAcceptsBothEngineForms(t *testing.T) {
+	const digest = "f4c407913e8dbce5f84672923e05df6d8ab6e5871bc9397bfda852ab4906059a"
+	for _, raw := range []string{"sha256:" + digest, digest} {
+		got, ok := canonicalContainerImageID(raw)
+		if !ok || got != "sha256:"+digest {
+			t.Fatalf("canonicalContainerImageID(%q) = %q, %v; want sha256:%s", raw, got, ok, digest)
+		}
+	}
+	for _, raw := range []string{"", "sha256:", "sha256:" + digest[:12], digest[:12], "sha512:" + digest, "sha256:" + strings.ToUpper(digest)} {
+		if got, ok := canonicalContainerImageID(raw); ok {
+			t.Fatalf("canonicalContainerImageID(%q) = %q, want rejection", raw, got)
+		}
+	}
 }

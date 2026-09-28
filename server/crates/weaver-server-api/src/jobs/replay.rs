@@ -516,6 +516,7 @@ mod tests {
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(Config {
             data_dir: "/tmp/weaver".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
@@ -526,7 +527,6 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,

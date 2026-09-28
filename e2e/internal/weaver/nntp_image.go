@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 const (
@@ -81,7 +83,7 @@ func dockerImageVersion(image string) string {
 	if strings.TrimSpace(image) == "" {
 		return ""
 	}
-	cmd := exec.Command("docker", "image", "inspect", "--format", `{{index .Config.Labels "org.opencontainers.image.version"}}`, image)
+	cmd := containerengine.Command("image", "inspect", "--format", `{{index .Config.Labels "org.opencontainers.image.version"}}`, image)
 	cmd.Dir = e2eDir()
 	output, err := cmd.Output()
 	if err != nil {
@@ -96,7 +98,7 @@ func dockerImageID(image string) string {
 	if strings.TrimSpace(image) == "" {
 		return ""
 	}
-	cmd := exec.Command("docker", "image", "inspect", "--format", "{{.Id}}", image)
+	cmd := containerengine.Command("image", "inspect", "--format", "{{.Id}}", image)
 	cmd.Dir = e2eDir()
 	output, err := cmd.Output()
 	if err != nil {
@@ -132,5 +134,18 @@ func weaverNNTPImageBuildCommand(image string) (*exec.Cmd, error) {
 	arguments = append(arguments, "--tag", image)
 	cmd := exec.Command("go", arguments...)
 	cmd.Dir = e2eDir()
+	// The e2e-nntp image builder shells out to a literal `docker`; under Podman
+	// it gets a shim so the image lands in Podman's store.
+	if engine := containerengine.Current(); engine.Kind == containerengine.Podman {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return nil, fmt.Errorf("locate user cache directory for the docker CLI shim: %w", err)
+		}
+		environ, err := engine.DockerCLIEnv(os.Environ(), filepath.Join(cacheDir, "weaver-e2e"))
+		if err != nil {
+			return nil, err
+		}
+		cmd.Env = environ
+	}
 	return cmd, nil
 }

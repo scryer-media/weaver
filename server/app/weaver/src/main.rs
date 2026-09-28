@@ -17,6 +17,7 @@ mod commands;
 mod crash_dump;
 mod heartbeat;
 mod http;
+mod job_debug_layer;
 mod logging;
 mod restart;
 mod shutdown;
@@ -210,17 +211,31 @@ async fn async_main() {
             ),
         });
     }
+    // `from_default_env()` alone resolves to ERROR-only when RUST_LOG is
+    // unset, which left a default install with effectively no operational
+    // logging. INFO is the floor now; RUST_LOG still overrides it wholesale.
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    let startup_directives = env_filter.to_string();
+    // The filter sits behind a reload handle so an operator can widen it
+    // while the process runs. It filters the output layers only, not the
+    // registry as a whole, so a layer with its own filter still sees events
+    // this one drops.
+    let (env_filter, env_filter_handle) = tracing_subscriber::reload::Layer::new(env_filter);
     tracing_subscriber::registry()
-        .with(layers)
-        // `from_default_env()` alone resolves to ERROR-only when RUST_LOG is
-        // unset, which left a default install with effectively no operational
-        // logging. INFO is the floor now; RUST_LOG still overrides it wholesale.
-        .with(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
+        .with(layers.with_filter(env_filter))
+        .with(job_debug_layer::layer())
         .init();
+    weaver_server_core::runtime::log_filter::install(
+        startup_directives,
+        Box::new(move |directives| {
+            let filter = EnvFilter::try_new(directives).map_err(|error| error.to_string())?;
+            env_filter_handle
+                .reload(filter)
+                .map_err(|error| error.to_string())
+        }),
+    );
     install_panic_hook();
     // After the subscriber, so the filter's own log line has somewhere to go,
     // and after the log file path is resolved, so the dump lands beside it.

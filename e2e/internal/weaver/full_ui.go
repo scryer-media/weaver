@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 type fullPhaseContext struct {
@@ -213,6 +215,11 @@ type fullRunManifest struct {
 	StartedAt time.Time           `json:"started_at"`
 	TempRoot  string              `json:"temp_root"`
 	Phases    []fullRunPhaseEntry `json:"phases"`
+	// KeepStacks records E2E_KEEP_STACKS: the stacks were left up on purpose
+	// and stay up while the bundle is retained.
+	KeepStacks bool `json:"keep_stacks,omitempty"`
+	// StacksReleased records that the owner tore every stack down cleanly.
+	StacksReleased bool `json:"stacks_released,omitempty"`
 }
 
 type fullRunPhaseEntry struct {
@@ -816,7 +823,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	dashboard := newFullDashboard(options.dashboardTitle, phaseNames, seedableCount)
 	defer dashboard.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
 	// Start both Weaver artifacts before touching NNTP. A corpus cache miss must
@@ -838,12 +845,12 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	}
 
 	if err := prepareFullPreseededRuntimes(ctx, tempRoot, phases, dashboard); err != nil {
-		cleanupErrors := cleanupFullPhaseContexts(phases, false)
+		cleanupErrors := releaseFullRunStacks(manifestPath, phases, false)
 		printFullSummary(options.summaryLabel, phases, nil, cleanupErrors, tempRoot, nil, true, true)
 		log.Fatalf("prepare pre-seeded full-suite runtimes: %v", err)
 	}
 	if err := writeFullRunManifest(manifestPath, tempRoot, phases); err != nil {
-		cleanupErrors := cleanupFullPhaseContexts(phases, false)
+		cleanupErrors := releaseFullRunStacks(manifestPath, phases, false)
 		printFullSummary(options.summaryLabel, phases, nil, cleanupErrors, tempRoot, nil, true, true)
 		log.Fatalf("update full-suite manifest after pre-seeding: %v", err)
 	}
@@ -866,7 +873,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 		dashboard.seed.Status = "fail"
 		dashboard.renderLocked()
 		dashboard.mu.Unlock()
-		cleanupErrors = cleanupFullPhaseContexts(phases, keepStacks)
+		cleanupErrors = releaseFullRunStacks(manifestPath, phases, keepStacks)
 		printFullSummary(options.summaryLabel, phases, nil, cleanupErrors, tempRoot, seedResults, true, true)
 		os.Exit(1)
 	}
@@ -881,7 +888,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 		failed = true
 	}
 
-	cleanupErrors = cleanupFullPhaseContexts(phases, keepStacks)
+	cleanupErrors = releaseFullRunStacks(manifestPath, phases, keepStacks)
 	printFullSummary(options.summaryLabel, phases, phaseResults, cleanupErrors, tempRoot, seedResults, false, true)
 	if failed {
 		os.Exit(1)
@@ -1114,6 +1121,26 @@ func newFullPreseedBootstrap(tempRoot, profile string, source *fullPhaseContext,
 	return bootstrap, nil
 }
 
+const (
+	defaultFullPhaseJobs = 4
+	// A full run's release gate shares the engine with the other phases, so
+	// it runs narrower than a standalone gate unless the operator sets a width.
+	fullRunReleaseGateJobs = 4
+)
+
+// fullPhaseJobs is how many phases of a full run execute at once, set with
+// E2E_FULL_PHASE_JOBS.
+func fullPhaseJobs(phaseCount int) int {
+	requested := envInt("E2E_FULL_PHASE_JOBS", defaultFullPhaseJobs)
+	if requested > phaseCount {
+		requested = phaseCount
+	}
+	if requested < 1 {
+		requested = 1
+	}
+	return requested
+}
+
 func runFullPipeline(
 	ctx context.Context,
 	phases []*fullPhaseContext,
@@ -1124,11 +1151,25 @@ func runFullPipeline(
 	seedResults := make(chan childRunResult, len(phases))
 	phaseResults := make(chan childRunResult, len(phases))
 
+	// Every phase brings up its own stack and drives it hard, so phases share
+	// a fixed number of slots instead of all starting together. A phase holds
+	// its slot from seeding through its own cleanup.
+	slots := make(chan struct{}, fullPhaseJobs(len(phases)))
+
 	var wg sync.WaitGroup
 	for _, phase := range phases {
 		wg.Add(1)
 		go func(phase *fullPhaseContext) {
 			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				canceledErr := fmt.Errorf("canceled before the phase started: %w", ctx.Err())
+				phaseResults <- recordPhaseSetupFailure(phase, phase.Command, time.Now(), canceledErr)
+				dashboard.markPhaseResult(phase.Name, "fail")
+				return
+			}
 			defer func() {
 				if !keepStacks {
 					if err := cleanupFullPhaseContext(phase); err != nil {
@@ -1255,6 +1296,7 @@ func runSelfWithEnv(ctx context.Context, phase *fullPhaseContext, command string
 	defer logFile.Close()
 
 	cmd := exec.CommandContext(ctx, exe, command)
+	configureFullPhaseCommandCancellation(cmd)
 	cmd.Dir = e2eDir()
 	cmd.Env = mergeChildEnv(os.Environ(), phase.env())
 
@@ -1302,6 +1344,27 @@ func runSelfWithEnv(ctx context.Context, phase *fullPhaseContext, command string
 		Duration: time.Since(start).Round(time.Second),
 		Err:      waitErr,
 	}
+}
+
+// fullPhaseCancelGrace bounds how long a canceled phase may spend tearing
+// itself down before it is killed. The release gate needs the longest: every
+// running flow gets its own finalizer, each bounded at one minute.
+const fullPhaseCancelGrace = 3 * time.Minute
+
+// configureFullPhaseCommandCancellation interrupts a canceled phase instead of
+// killing it. A killed release gate never runs its flow finalizers, so every
+// flow stack it had up outlived the run.
+func configureFullPhaseCommandCancellation(cmd *exec.Cmd) {
+	cmd.Cancel = func() error {
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			if errors.Is(err, os.ErrProcessDone) {
+				return err
+			}
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	cmd.WaitDelay = fullPhaseCancelGrace
 }
 
 func streamChildOutput(reader io.Reader, logFile *os.File, logMu *sync.Mutex, tail *lineTail, recorder *phaseRunRecorder, onEvent func(progressEvent), wg *sync.WaitGroup) {
@@ -1402,6 +1465,9 @@ func (p *fullPhaseContext) env() map[string]string {
 	}
 	if p.Command == "release-gate" {
 		env["E2E_WEAVER_RELEASE_GATE_ROOT"] = filepath.Join(p.RunDir, "release-gate")
+		if strings.TrimSpace(os.Getenv("E2E_WEAVER_RELEASE_GATE_JOBS")) == "" {
+			env["E2E_WEAVER_RELEASE_GATE_JOBS"] = strconv.Itoa(fullRunReleaseGateJobs)
+		}
 	}
 	if p.Command == "restart-all" {
 		env["E2E_SEED_RETRIES"] = "5"
@@ -1435,6 +1501,37 @@ func mergeChildEnv(base []string, overrides map[string]string) []string {
 	return merged
 }
 
+// releaseFullRunStacks tears the run's stacks down and, once every phase came
+// down cleanly, records that in the manifest so a later run's prune leaves the
+// retained bundle alone instead of tearing it down again.
+func releaseFullRunStacks(manifestPath string, phases []*fullPhaseContext, keepStacks bool) []error {
+	errs := cleanupFullPhaseContexts(phases, keepStacks)
+	if keepStacks || len(errs) > 0 {
+		return errs
+	}
+	if err := markFullRunStacksReleased(manifestPath); err != nil {
+		errs = append(errs, fmt.Errorf("record released stacks: %w", err))
+	}
+	return errs
+}
+
+func markFullRunStacksReleased(manifestPath string) error {
+	body, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return err
+	}
+	var manifest fullRunManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return err
+	}
+	manifest.StacksReleased = true
+	body, err = json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(manifestPath, body, 0o644)
+}
+
 func cleanupFullPhaseContexts(phases []*fullPhaseContext, keepStacks bool) []error {
 	if keepStacks {
 		return nil
@@ -1462,13 +1559,63 @@ func cleanupFullPhaseContext(phase *fullPhaseContext) error {
 	if err := stopManagedLocalWeaverForPhase(phase); err != nil {
 		errs = append(errs, fmt.Errorf("stop managed local weaver: %w", err))
 	}
-	cmd := exec.Command("docker", "compose", "-p", phase.Project, "down", "-v", "--remove-orphans")
+	cmd := containerengine.Command("compose", "-p", phase.Project, "down", "-v", "--remove-orphans")
 	cmd.Dir = e2eDir()
 	if err := runExternalCommand(cmd, "docker compose down"); err != nil {
 		errs = append(errs, err)
 	}
+	if err := teardownUnfinishedReleaseFlows(phase); err != nil {
+		errs = append(errs, err)
+	}
 	phase.Cleaned = true
 	return errors.Join(errs...)
+}
+
+// teardownUnfinishedReleaseFlows removes the stacks of release-gate flows that
+// never recorded a result. Each flow names its own Compose project, which the
+// phase's project does not cover, and a flow only records its result after its
+// finalizer ran; a gate that died mid-run leaves those flows at "running".
+func teardownUnfinishedReleaseFlows(phase *fullPhaseContext) error {
+	projects, errs := unfinishedReleaseFlowProjects(phase.RunDir)
+	for _, project := range projects {
+		if err := removeExactWeaverReleaseProjectContainers(project); err != nil {
+			errs = append(errs, err)
+		}
+		cmd := containerengine.Command("compose", "-p", project, "down", "-v", "--remove-orphans")
+		cmd.Dir = e2eDir()
+		if err := runExternalCommand(cmd, "docker compose down "+project); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func unfinishedReleaseFlowProjects(runDir string) ([]string, []error) {
+	if strings.TrimSpace(runDir) == "" {
+		return nil, nil
+	}
+	statuses, err := filepath.Glob(filepath.Join(runDir, "release-gate", "*", "*", "status.json"))
+	if err != nil {
+		return nil, []error{err}
+	}
+	var projects []string
+	var errs []error
+	for _, statusPath := range statuses {
+		body, err := os.ReadFile(statusPath)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		var status weaverReleasePhaseStatus
+		if err := json.Unmarshal(body, &status); err != nil {
+			errs = append(errs, fmt.Errorf("decode %s: %w", statusPath, err))
+			continue
+		}
+		if project := strings.TrimSpace(status.Project); status.Status == "running" && project != "" {
+			projects = append(projects, project)
+		}
+	}
+	return projects, errs
 }
 
 func printFullSummary(
@@ -1646,9 +1793,15 @@ func (r *phaseRunRecorder) flushLocked() error {
 }
 
 func capturePhaseDiagnostics(phase *fullPhaseContext) error {
+	// A later run's prune re-enters cleanup for a bundle whose owner died. Its
+	// stack may already be gone, so a second capture would replace the owner's
+	// evidence with an empty log.
+	if _, err := os.Stat(filepath.Join(phase.RootDir, "docker-compose.log")); err == nil {
+		return nil
+	}
 	var errs []error
 
-	logsCmd := exec.Command("docker", "compose", "-p", phase.Project, "logs", "--no-color", "--timestamps")
+	logsCmd := containerengine.Command("compose", "-p", phase.Project, "logs", "--no-color", "--timestamps")
 	logsCmd.Dir = e2eDir()
 	if output, err := logsCmd.CombinedOutput(); err == nil {
 		if writeErr := os.WriteFile(filepath.Join(phase.RootDir, "docker-compose.log"), output, 0o644); writeErr != nil {
@@ -1658,7 +1811,7 @@ func capturePhaseDiagnostics(phase *fullPhaseContext) error {
 		errs = append(errs, fmt.Errorf("docker compose logs: %w", err))
 	}
 
-	psCmd := exec.Command("docker", "compose", "-p", phase.Project, "ps", "-a")
+	psCmd := containerengine.Command("compose", "-p", phase.Project, "ps", "-a")
 	psCmd.Dir = e2eDir()
 	if output, err := psCmd.CombinedOutput(); err == nil {
 		if writeErr := os.WriteFile(filepath.Join(phase.RootDir, "docker-compose.ps.txt"), output, 0o644); writeErr != nil {
@@ -1704,10 +1857,11 @@ func loadRuntimePortStateFromFile(path string) (runtimePortState, error) {
 
 func writeFullRunManifest(path, tempRoot string, phases []*fullPhaseContext) error {
 	manifest := fullRunManifest{
-		OwnerPID:  os.Getpid(),
-		StartedAt: time.Now(),
-		TempRoot:  tempRoot,
-		Phases:    make([]fullRunPhaseEntry, 0, len(phases)),
+		OwnerPID:   os.Getpid(),
+		StartedAt:  time.Now(),
+		TempRoot:   tempRoot,
+		Phases:     make([]fullRunPhaseEntry, 0, len(phases)),
+		KeepStacks: envBool("E2E_KEEP_STACKS", false),
 	}
 	for _, phase := range phases {
 		manifest.Phases = append(manifest.Phases, fullRunPhaseEntry{
@@ -1732,6 +1886,7 @@ func cleanupAbandonedFullRuns() error {
 
 // Retain the newest three bundles, including the run that just wrote its
 // manifest. Live owners are protected even when they fall outside that window.
+// A dead owner's stacks come down whether or not its bundle is retained.
 func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*fullPhaseContext) error) error {
 	matches, err := filepath.Glob(filepath.Join(tempDir, "weaver-e2e-full-*", "full-run.json"))
 	if err != nil {
@@ -1764,11 +1919,22 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 	})
 	for index, candidate := range bundles {
 		manifest := candidate.manifest
-		if index < 3 || (manifest.OwnerPID > 0 && alive(manifest.OwnerPID)) {
+		if manifest.OwnerPID > 0 && alive(manifest.OwnerPID) {
 			continue
 		}
+		// Retention keeps a bundle's evidence, never its stacks: an owner
+		// that died before its own teardown left them running.
+		retained := index < 3
+		teardown := !manifest.StacksReleased && !(retained && manifest.KeepStacks)
+		if retained && !teardown {
+			continue
+		}
+		phases := manifest.Phases
+		if !teardown {
+			phases = nil
+		}
 		cleaned := true
-		for _, entry := range manifest.Phases {
+		for _, entry := range phases {
 			phase := &fullPhaseContext{
 				Name:             entry.Name,
 				Project:          entry.Project,
@@ -1781,7 +1947,13 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 				cleaned = false
 			}
 		}
-		if cleaned {
+		switch {
+		case !cleaned:
+		case retained:
+			if err := markFullRunStacksReleased(filepath.Join(candidate.path, "full-run.json")); err != nil {
+				errs = append(errs, err)
+			}
+		default:
 			if err := os.RemoveAll(candidate.path); err != nil {
 				errs = append(errs, err)
 			}

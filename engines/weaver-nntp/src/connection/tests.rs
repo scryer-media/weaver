@@ -859,14 +859,10 @@ async fn known_pipelining_servers_authenticate_then_get_the_group_in_one_write()
     .await;
     crate::server_caps::note_group_required("127.0.0.1", port);
 
-    let conn = NntpConnection::connect_with_ip_policy_for_group(
-        &pipelined_setup_config(port),
-        &[],
-        0,
-        Some("alt.test"),
-    )
-    .await
-    .unwrap();
+    let conn =
+        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.test"))
+            .await
+            .unwrap();
 
     assert!(conn.is_healthy());
     assert_eq!(conn.current_group(), Some("alt.test"));
@@ -888,14 +884,10 @@ async fn an_unproven_server_gets_no_mode_reader_and_no_group() {
     )
     .await;
 
-    let mut conn = NntpConnection::connect_with_ip_policy_for_group(
-        &pipelined_setup_config(port),
-        &[],
-        0,
-        Some("alt.test"),
-    )
-    .await
-    .unwrap();
+    let mut conn =
+        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.test"))
+            .await
+            .unwrap();
 
     assert_eq!(conn.current_group(), None);
     // The scripted server asserts the command it receives, so reaching a
@@ -924,14 +916,9 @@ async fn a_500_after_setup_surfaces_as_an_error_and_teaches_nothing() {
     )
     .await;
 
-    let mut conn = NntpConnection::connect_with_ip_policy_for_group(
-        &pipelined_setup_config(port),
-        &[],
-        0,
-        None,
-    )
-    .await
-    .unwrap();
+    let mut conn = NntpConnection::connect_for_group(&pipelined_setup_config(port), None, None)
+        .await
+        .unwrap();
 
     let error = conn.body_by_id("<first@example.com>").await.unwrap_err();
     assert!(
@@ -960,14 +947,10 @@ async fn a_412_after_setup_teaches_the_process_to_select_a_group() {
     )
     .await;
 
-    let mut conn = NntpConnection::connect_with_ip_policy_for_group(
-        &pipelined_setup_config(port),
-        &[],
-        0,
-        Some("alt.test"),
-    )
-    .await
-    .unwrap();
+    let mut conn =
+        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.test"))
+            .await
+            .unwrap();
     assert!(!conn.needs_group_prologue());
 
     let _ = conn.body_by_id("<first@example.com>").await;
@@ -992,14 +975,10 @@ async fn pipelined_setup_skips_the_password_after_281_on_user() {
     .await;
     crate::server_caps::note_group_required("127.0.0.1", port);
 
-    let conn = NntpConnection::connect_with_ip_policy_for_group(
-        &pipelined_setup_config(port),
-        &[],
-        0,
-        Some("alt.test"),
-    )
-    .await
-    .unwrap();
+    let conn =
+        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.test"))
+            .await
+            .unwrap();
 
     assert_eq!(conn.current_group(), Some("alt.test"));
     crate::server_caps::forget("127.0.0.1", port);
@@ -1040,14 +1019,10 @@ async fn pipelined_setup_leaves_a_missing_group_unselected() {
     )
     .await;
 
-    let conn = NntpConnection::connect_with_ip_policy_for_group(
-        &pipelined_setup_config(port),
-        &[],
-        0,
-        Some("alt.gone"),
-    )
-    .await
-    .unwrap();
+    let conn =
+        NntpConnection::connect_for_group(&pipelined_setup_config(port), None, Some("alt.gone"))
+            .await
+            .unwrap();
 
     assert!(conn.is_healthy());
     assert_eq!(conn.current_group(), None);

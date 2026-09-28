@@ -392,7 +392,7 @@ impl Pipeline {
             && self.promote_par2_metadata(job_id)
         {
             if self.par2_discovery_wait_logged.insert(job_id) {
-                info!(
+                debug!(
                     job_id = job_id.0,
                     "waiting for bounded PAR2 metadata discovery before finalization"
                 );
@@ -1180,10 +1180,16 @@ impl Pipeline {
                     .await
                 {
                     Ok(QuickPar2Outcome::Full(verification, placement_plan, evidence)) => {
-                        info!(
+                        debug!(
                             job_id = job_id.0,
                             "quick PAR2 verification passed for clean exhausted job"
                         );
+                        // The job's event log is where this verdict is kept;
+                        // the line above is detail.
+                        let _ = self.event_tx.send(PipelineEvent::JobVerificationComplete {
+                            job_id,
+                            passed: true,
+                        });
                         self.finish_clean_par2_verification(
                             job_id,
                             par2_set_id.expect("loaded PAR2 set has an active recovery-set ID"),

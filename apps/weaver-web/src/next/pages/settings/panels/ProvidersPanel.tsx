@@ -576,7 +576,6 @@ export function ProvidersPanel() {
             {
               id: "connections",
               label: t("next.providers.connections"),
-              help: t("next.providers.connectionsHelp"),
               control: {
                 kind: "number",
                 value: values.connections,

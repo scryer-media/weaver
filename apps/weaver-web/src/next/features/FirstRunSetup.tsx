@@ -7,9 +7,11 @@ import {
   CATEGORIES_QUERY,
   FINISH_FIRST_RUN_SETUP_MUTATION,
   FIRST_RUN_SETUP_QUERY,
+  HARDWARE_PROFILE_QUERY,
   PATH_STORAGE_QUERY,
   REMOVE_CATEGORY_MUTATION,
   SERVERS_QUERY,
+  SET_HARDWARE_PROFILE_MUTATION,
   SETTINGS_QUERY,
   SYSTEM_INFO_QUERY,
   TEST_CONNECTION_MUTATION,
@@ -23,10 +25,17 @@ import { Eyebrow, Square } from "../components/chrome";
 import { NumberField, PrimaryButton, SecondaryButton, TextField, Toggle } from "../components/controls";
 import { Icon } from "../components/icons";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { HardwareProfilePicker } from "../components/HardwareProfilePicker";
 import { LanguagePicker } from "../components/LanguagePicker";
 import { WorkingOverlay } from "../components/WorkingOverlay";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { formatHostnames, formatLatency } from "../data/format";
+import {
+  initialProfile,
+  offersProfileChoice,
+  type HardwareProfileName,
+  type HardwareProfileSettings,
+} from "../data/hardware-profiles";
 import { WV } from "../data/palette";
 import { PathField } from "./DirectoryBrowserDialog";
 
@@ -92,8 +101,20 @@ const NEW_PROVIDER: ProviderForm = {
   certificate: null,
 };
 
-type Step = "provider" | "folders" | "done";
-const STEPS: readonly Step[] = ["provider", "folders", "done"];
+type Step = "provider" | "folders" | "performance" | "done";
+
+/**
+ * The walk's steps, in order.
+ *
+ * Performance is only one of them on a machine with something to choose: a
+ * board that can honour a single profile is asked nothing and walks the three
+ * steps every install has always had.
+ */
+function stepsFor(offersProfile: boolean): readonly Step[] {
+  return offersProfile
+    ? ["provider", "folders", "performance", "done"]
+    : ["provider", "folders", "done"];
+}
 
 function normalizeHost(host: string): string {
   return host
@@ -155,6 +176,12 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
   const [finishError, setFinishError] = useState<string | null>(null);
   const [, beginSetup] = useMutation(BEGIN_FIRST_RUN_SETUP_MUTATION);
   const [, finishSetup] = useMutation(FINISH_FIRST_RUN_SETUP_MUTATION);
+  // Asked once, here rather than in the step: whether the machine has anything
+  // to choose decides how many steps the rail draws.
+  const [{ data: profileData }] = useQuery<{ hardwareProfile: HardwareProfileSettings }>({
+    query: HARDWARE_PROFILE_QUERY,
+    requestPolicy: "network-only",
+  });
   const began = useRef(false);
 
   // Adding the provider would otherwise end the owed walk on the next reload.
@@ -177,10 +204,12 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
     onDone();
   };
 
-  const index = STEPS.indexOf(step);
+  const steps = stepsFor(offersProfileChoice(profileData?.hardwareProfile));
+  const index = Math.max(steps.indexOf(step), 0);
   const labels: Record<Step, string> = {
     provider: t("next.firstRun.stepProvider"),
     folders: t("next.firstRun.stepFolders"),
+    performance: t("next.firstRun.stepPerformance"),
     done: t("next.firstRun.stepDone"),
   };
 
@@ -199,7 +228,7 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
             <div className="flex items-center gap-3">
               <Eyebrow className="min-w-0 truncate">{t("next.firstRun.title")}</Eyebrow>
               <span className="hidden flex-none font-wv-mono text-[11px] whitespace-nowrap text-wv-note sm:inline">
-                {t("next.firstRun.step", { step: index + 1, total: STEPS.length })}
+                {t("next.firstRun.step", { step: index + 1, total: steps.length })}
               </span>
               {step === "done" ? null : (
                 <button
@@ -212,8 +241,8 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
                 </button>
               )}
             </div>
-            <ol className="grid grid-cols-3 gap-1.5">
-              {STEPS.map((entry, position) => (
+            <ol className={cn("grid gap-1.5", steps.length === 4 ? "grid-cols-4" : "grid-cols-3")}>
+              {steps.map((entry, position) => (
                 <li
                   key={entry}
                   aria-current={entry === step ? "step" : undefined}
@@ -236,10 +265,19 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
           {step === "provider" ? (
             <ProviderStep onContinue={() => setStep("folders")} />
           ) : step === "folders" ? (
-            <FoldersStep onBack={() => setStep("provider")} onContinue={() => setStep("done")} />
+            <FoldersStep
+              onBack={() => setStep("provider")}
+              onContinue={() => setStep(steps.includes("performance") ? "performance" : "done")}
+            />
+          ) : step === "performance" ? (
+            <PerformanceStep
+              settings={profileData?.hardwareProfile ?? null}
+              onBack={() => setStep("folders")}
+              onContinue={() => setStep("done")}
+            />
           ) : (
             <DoneStep
-              onBack={() => setStep("folders")}
+              onBack={() => setStep(steps.includes("performance") ? "performance" : "folders")}
               onOpen={() => void finish()}
               finishing={finishing}
             />
@@ -556,7 +594,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
               </FormField>
             </div>
 
-            <FormField label={t("next.providers.connections")} help={t("next.providers.connectionsHelp")}>
+            <FormField label={t("next.providers.connections")}>
               <NumberField
                 label={t("next.providers.connections")}
                 value={form.connections}
@@ -969,6 +1007,83 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
           {t("next.categories.add")}
         </SecondaryButton>
       </div>
+    </StepBody>
+  );
+}
+
+/* --------------------------------------------------------- performance step */
+
+/**
+ * Picks how hard Weaver may lean on this machine.
+ *
+ * The recommendation is pre-selected, and Continue confirms it: an operator
+ * who skips the walk entirely leaves the choice unmade, which the daemon reads
+ * as "run what this machine is recommended" all the same.
+ */
+function PerformanceStep({
+  settings,
+  onBack,
+  onContinue,
+}: {
+  settings: HardwareProfileSettings | null;
+  onBack: () => void;
+  onContinue: () => void;
+}) {
+  const t = useTranslate();
+  const [, setProfile] = useMutation(SET_HARDWARE_PROFILE_MUTATION);
+  const [choice, setChoice] = useState<HardwareProfileName | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const selected = settings ? (choice ?? initialProfile(settings)) : null;
+
+  const save = async () => {
+    if (!selected) {
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    const result = await setProfile({ profile: selected });
+    setSaving(false);
+    if (result.error) {
+      setError(t("next.performance.saveFailed", { message: errorMessage(result.error) }));
+      return;
+    }
+    onContinue();
+  };
+
+  return (
+    <StepBody
+      title={t("next.performance.title")}
+      body={t("next.performance.body")}
+      footer={
+        <>
+          <SecondaryButton onClick={onBack} disabled={saving}>
+            {t("next.firstRun.back")}
+          </SecondaryButton>
+          <PrimaryButton
+            onClick={() => void save()}
+            disabled={selected === null || saving}
+            className="ml-auto"
+          >
+            {saving ? t("next.firstRun.saving") : t("next.firstRun.continue")}
+          </PrimaryButton>
+        </>
+      }
+    >
+      {settings === null || selected === null ? (
+        <div role="status" className="flex items-center gap-3">
+          <LoadingMark className="h-5" />
+        </div>
+      ) : (
+        <HardwareProfilePicker
+          settings={settings}
+          value={selected}
+          onChange={setChoice}
+          disabled={saving}
+        />
+      )}
+      {error ? <ErrorLine>{error}</ErrorLine> : null}
     </StepBody>
   );
 }

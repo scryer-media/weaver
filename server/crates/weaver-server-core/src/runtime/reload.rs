@@ -224,6 +224,7 @@ mod tests {
 
         let config: SharedConfig = Arc::new(RwLock::new(Config {
             data_dir: "/tmp/weaver-runtime-reload-test".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
@@ -234,7 +235,6 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
@@ -260,6 +260,7 @@ mod tests {
     async fn missing_policy_registry_preserves_prior_generation() {
         let config: SharedConfig = Arc::new(RwLock::new(Config {
             data_dir: "/tmp/weaver-runtime-reload-missing-policy-test".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
@@ -270,7 +271,6 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,

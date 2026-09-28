@@ -1,0 +1,309 @@
+package containerengine
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"sort"
+	"strings"
+)
+
+// ComposeLayout is what the overlay needs to know about the base Compose file.
+type ComposeLayout struct {
+	Services []string
+	// EnvironmentSecrets maps a top-level secret name to the variable it is
+	// sourced from (`secrets: <name>: environment: <VAR>`).
+	EnvironmentSecrets map[string]string
+	// PUIDOwnedVolumes are the top-level volumes declared with
+	// `x-e2e-owner: puid`: a service chowns their root to PUID:PGID and
+	// another service mounts them, so their root must stay owned that way.
+	PUIDOwnedVolumes []string
+	// BrowserServices are the services declared with `x-e2e-browser: true`:
+	// they run a browser whose in-flight requests the network must not
+	// interrupt.
+	BrowserServices []string
+}
+
+// puidOwnerExtension marks a top-level volume whose root belongs to
+// PUID:PGID. Compose ignores `x-` keys, so the mark changes nothing by itself.
+const puidOwnerExtension = "x-e2e-owner"
+
+// browserExtension marks a service that runs a browser. Compose ignores `x-`
+// keys, so the mark changes nothing by itself.
+const browserExtension = "x-e2e-browser"
+
+// ParseComposeLayout reads service names and environment-sourced secrets from
+// a Compose file. It understands only the block layout the harness's own
+// Compose file uses: two-space indentation, no flow mappings at the top level.
+func ParseComposeLayout(content []byte) ComposeLayout {
+	layout := ComposeLayout{EnvironmentSecrets: map[string]string{}}
+	section := ""
+	service := ""
+	secret := ""
+	volume := ""
+	scanner := bufio.NewScanner(bytes.NewReader(content))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		switch {
+		case indent == 0:
+			section = strings.TrimSuffix(strings.Fields(trimmed)[0], ":")
+			service = ""
+			secret = ""
+			volume = ""
+		case indent == 2 && strings.HasSuffix(trimmed, ":"):
+			name := strings.TrimSuffix(trimmed, ":")
+			switch section {
+			case "services":
+				layout.Services = append(layout.Services, name)
+				service = name
+			case "secrets":
+				secret = name
+			case "volumes":
+				volume = name
+			}
+		case indent == 4 && section == "services" && service != "":
+			if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(key) == browserExtension &&
+				strings.Trim(strings.TrimSpace(value), `"'`) == "true" {
+				layout.BrowserServices = append(layout.BrowserServices, service)
+			}
+		case indent == 4 && section == "volumes" && volume != "":
+			if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(key) == puidOwnerExtension &&
+				strings.Trim(strings.TrimSpace(value), `"'`) == "puid" {
+				layout.PUIDOwnedVolumes = append(layout.PUIDOwnedVolumes, volume)
+			}
+		case indent == 4 && section == "secrets" && secret != "":
+			if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(key) == "environment" {
+				layout.EnvironmentSecrets[secret] = strings.Trim(strings.TrimSpace(value), `"'`)
+			}
+		}
+	}
+	return layout
+}
+
+// OverlayFiles is a generated overlay and the files it references.
+type OverlayFiles struct {
+	// Compose is the overlay path, "" when the engine needs none.
+	Compose string
+	// Secrets are the secret files written for the overlay.
+	Secrets []string
+}
+
+// Remove deletes the generated secret files.
+func (files OverlayFiles) Remove() {
+	for _, path := range files.Secrets {
+		_ = os.Remove(path)
+	}
+}
+
+// OverlayYAML renders the Podman-only Compose overlay for layout. Secret
+// files are named by secretFiles (secret name -> absolute path). It returns ""
+// when nothing needs overriding.
+func (engine *Engine) OverlayYAML(layout ComposeLayout, secretFiles map[string]string) string {
+	if engine.Kind != Podman {
+		return ""
+	}
+	var body strings.Builder
+	var services strings.Builder
+	for _, service := range layout.Services {
+		var settings strings.Builder
+		if engine.SELinux {
+			// Repository files are bind-mounted into several services.
+			// Relabeling the checkout with :z would rewrite its SELinux
+			// context, so the containers run unconfined by labels instead.
+			settings.WriteString("    security_opt:\n      - label=disable\n")
+		}
+		if slices.Contains(layout.BrowserServices, service) {
+			// Podman leaves IPv6 enabled on a container's interface even on
+			// an IPv4-only network, so the interface starts with a tentative
+			// link-local address that turns permanent once duplicate address
+			// detection finishes, about a second after the container starts.
+			// Chromium reads that address change as a network change and
+			// aborts every in-flight request with ERR_NETWORK_CHANGED. With
+			// IPv6 off on the interface there is no address to change.
+			settings.WriteString("    sysctls:\n      net.ipv6.conf.eth0.disable_ipv6: \"1\"\n")
+		}
+		// Podman's default log driver writes container output to the system
+		// journal and reads it back through a library it loads on demand.
+		// When that load fails, every log read fails for the life of the API
+		// service, and the read scans a journal every container on the host
+		// shares. A per-container file has neither dependency.
+		settings.WriteString("    logging:\n      driver: k8s-file\n")
+		fmt.Fprintf(&services, "  %s:\n%s", service, settings.String())
+	}
+	if services.Len() > 0 {
+		body.WriteString("services:\n")
+		body.WriteString(services.String())
+	}
+	if engine.UsesPodmanCompose() && len(secretFiles) > 0 {
+		names := make([]string, 0, len(secretFiles))
+		for name := range secretFiles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		body.WriteString("secrets:\n")
+		for _, name := range names {
+			path, _ := json.Marshal(secretFiles[name])
+			fmt.Fprintf(&body, "  %s:\n    file: %s\n", name, path)
+		}
+	}
+	if len(layout.PUIDOwnedVolumes) > 0 {
+		// Podman hands an empty named volume to the owner of the mount point
+		// in every container that mounts it, until something is written into
+		// it. A root-owned mount point in a second service therefore undoes
+		// the owning service's chown and leaves the volume unwritable to
+		// PUID. Creating the volume with that owner pins its root instead;
+		// Docker never re-owns a volume, so it needs none of this.
+		body.WriteString("volumes:\n")
+		for _, volume := range layout.PUIDOwnedVolumes {
+			fmt.Fprintf(&body, "  %s:\n    driver_opts:\n      o: \"uid=${PUID:-1000},gid=${PGID:-1000}\"\n", volume)
+		}
+	}
+	if body.Len() == 0 {
+		return ""
+	}
+	return "# Generated by the e2e harness for Podman; do not edit.\n" + body.String()
+}
+
+// WriteOverlay generates the Podman overlay for baseFile into dir and returns
+// the written files. Docker never gets an overlay. Environment-sourced
+// secrets become 0600 files in dir when the provider is podman-compose, which
+// implements file secrets only.
+func (engine *Engine) WriteOverlay(dir, baseFile string, getenv func(string) string) (OverlayFiles, error) {
+	if engine.Kind != Podman {
+		return OverlayFiles{}, nil
+	}
+	content, err := os.ReadFile(baseFile)
+	if err != nil {
+		return OverlayFiles{}, fmt.Errorf("read Compose file: %w", err)
+	}
+	layout := ParseComposeLayout(content)
+	absoluteDir, err := filepath.Abs(dir)
+	if err != nil {
+		return OverlayFiles{}, err
+	}
+	var files OverlayFiles
+	secretFiles := map[string]string{}
+	if engine.UsesPodmanCompose() && len(layout.EnvironmentSecrets) > 0 {
+		if err := os.MkdirAll(absoluteDir, 0o700); err != nil {
+			return OverlayFiles{}, err
+		}
+		for name, variable := range layout.EnvironmentSecrets {
+			path := filepath.Join(absoluteDir, "secret-"+name)
+			if err := writeFileAtomic(path, []byte(getenv(variable)), 0o600); err != nil {
+				files.Remove()
+				return OverlayFiles{}, fmt.Errorf("write secret %s: %w", name, err)
+			}
+			files.Secrets = append(files.Secrets, path)
+			secretFiles[name] = path
+		}
+	}
+	yaml := engine.OverlayYAML(layout, secretFiles)
+	if yaml == "" {
+		return files, nil
+	}
+	if err := os.MkdirAll(absoluteDir, 0o700); err != nil {
+		files.Remove()
+		return OverlayFiles{}, err
+	}
+	files.Compose = filepath.Join(absoluteDir, "podman.compose.override.yml")
+	if err := writeFileAtomic(files.Compose, []byte(yaml), 0o644); err != nil {
+		files.Remove()
+		return OverlayFiles{}, fmt.Errorf("write Podman Compose overlay: %w", err)
+	}
+	return files, nil
+}
+
+// writeFileAtomic replaces path so a concurrent reader never sees a partial
+// file, and so a secret never exists with a wider mode than perm.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	name := temp.Name()
+	if err := temp.Chmod(perm); err != nil {
+		temp.Close()
+		os.Remove(name)
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return nil
+}
+
+// DockerCLIEnv returns an environment for an external tool that shells out to
+// a literal `docker`. For Podman it prepends a directory whose `docker` execs
+// Podman, so the tool's images land in Podman's store. For Docker it returns
+// environ unchanged.
+func (engine *Engine) DockerCLIEnv(environ []string, shimRoot string) ([]string, error) {
+	if engine.Kind != Podman || engine.Binary == "docker" {
+		return environ, nil
+	}
+	if runtime.GOOS == "windows" {
+		return nil, errors.New("the docker CLI shim for Podman is not supported on Windows; install podman-docker")
+	}
+	podman, err := exec.LookPath(engine.Binary)
+	if err != nil {
+		return nil, fmt.Errorf("locate %s: %w", engine.Binary, err)
+	}
+	if podman, err = filepath.Abs(podman); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(shimRoot, "docker-cli-shim")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	script := fmt.Sprintf("#!/bin/sh\nexec %s \"$@\"\n", shellQuote(podman))
+	if err := writeFileAtomic(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+		return nil, fmt.Errorf("write docker CLI shim: %w", err)
+	}
+	return prependPath(environ, dir), nil
+}
+
+func prependPath(environ []string, dir string) []string {
+	out := make([]string, 0, len(environ)+1)
+	found := false
+	for _, entry := range environ {
+		if value, ok := strings.CutPrefix(entry, "PATH="); ok {
+			found = true
+			if value == "" {
+				entry = "PATH=" + dir
+			} else {
+				entry = "PATH=" + dir + string(os.PathListSeparator) + value
+			}
+		}
+		out = append(out, entry)
+	}
+	if !found {
+		out = append(out, "PATH="+dir)
+	}
+	return out
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}

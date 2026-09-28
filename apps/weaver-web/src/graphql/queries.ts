@@ -429,7 +429,6 @@ const GENERAL_SETTINGS_FIELDS = `
     maxDownloadSpeed
     maxRetries
     propagationDelaySecs
-    ipReplacementTrialExtraConnections
     enableSrrdbLookup
     duplicatePolicy {
       strictActiveOrSuccess
@@ -927,6 +926,7 @@ export const SERVER_HEALTH_QUERY = gql`
       failureCount
       consecutiveFailures
       prematureDeaths
+      pinnedAddress
     }
   }
 `;
@@ -1147,6 +1147,24 @@ export const SERVICE_LOGS_QUERY = gql`
   }
 `;
 
+export const LOG_FILTER_QUERY = gql`
+  query LogFilter {
+    logFilter {
+      directives
+      defaultDirectives
+    }
+  }
+`;
+
+export const SET_LOG_FILTER_MUTATION = gql`
+  mutation SetLogFilter($directives: String!) {
+    setLogFilter(directives: $directives) {
+      directives
+      defaultDirectives
+    }
+  }
+`;
+
 export const SERVICE_LOG_LINES_SUBSCRIPTION = gql`
   subscription ServiceLogLines {
     serviceLogLines
@@ -1348,6 +1366,45 @@ export const UPDATE_SETTINGS_MUTATION = gql`
   }
   ${GENERAL_SETTINGS_FIELDS}
   ${ISP_BANDWIDTH_CAP_FIELDS}
+`;
+
+// --- Hardware profile ---
+
+const HARDWARE_PROFILE_FIELDS = gql`
+  fragment HardwareProfileFields on HardwareProfileSettings {
+    selected
+    recommended
+    available
+    options {
+      profile
+      sevenzDecodeMemoryBytes
+      decodeThreads
+      extractThreads
+      maxConcurrentDownloads
+    }
+    detected {
+      memoryBytes
+      cores
+    }
+  }
+`;
+
+export const HARDWARE_PROFILE_QUERY = gql`
+  query HardwareProfile {
+    hardwareProfile {
+      ...HardwareProfileFields
+    }
+  }
+  ${HARDWARE_PROFILE_FIELDS}
+`;
+
+export const SET_HARDWARE_PROFILE_MUTATION = gql`
+  mutation SetHardwareProfile($profile: HardwareProfileGql!) {
+    setHardwareProfile(profile: $profile) {
+      ...HardwareProfileFields
+    }
+  }
+  ${HARDWARE_PROFILE_FIELDS}
 `;
 
 // --- First-run setup ---

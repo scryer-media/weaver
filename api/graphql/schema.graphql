@@ -260,6 +260,15 @@ enum DeploymentEnvironmentGql {
 	CONTAINER
 }
 
+"""
+What the machine this Weaver runs on can actually use, after any container
+limit. The numbers the profile requirements are judged against.
+"""
+type DetectedHardware {
+	memoryBytes: Int!
+	cores: Int!
+}
+
 type DirectoryBrowseEntry {
 	name: String!
 	path: String!
@@ -513,7 +522,6 @@ type GeneralSettings {
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
-	ipReplacementTrialExtraConnections: Int!
 	enableSrrdbLookup: Boolean!
 	ispBandwidthCap: IspBandwidthCapSettings
 	watchFolder: WatchFolderSettings!
@@ -527,7 +535,6 @@ input GeneralSettingsInput {
 	maxDownloadSpeed: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
-	ipReplacementTrialExtraConnections: Int
 	enableSrrdbLookup: Boolean
 	ispBandwidthCap: IspBandwidthCapSettingsInput
 	watchFolder: WatchFolderSettingsInput
@@ -538,6 +545,66 @@ type GlobalQueueState {
 	isPaused: Boolean!
 	speedLimitBytesPerSec: Int!
 	downloadBlock: DownloadBlock!
+}
+
+"""
+How hard Weaver leans on the machine it runs on.
+"""
+enum HardwareProfileGql {
+	EFFICIENT
+	BALANCED
+	PERFORMANCE
+}
+
+"""
+What one profile would do on this machine, so an interface can say what a
+card means without keeping its own copy of the numbers.
+"""
+type HardwareProfileOption {
+	profile: HardwareProfileGql!
+	"""
+	Memory one 7z extraction may hold while decoding.
+	"""
+	sevenzDecodeMemoryBytes: Int!
+	"""
+	Articles decoded at once.
+	"""
+	decodeThreads: Int!
+	"""
+	Threads shared by extraction, repair and post-processing.
+	"""
+	extractThreads: Int!
+	"""
+	Downloads in flight at once, or null when the configured connection
+	count is the only limit.
+	"""
+	maxConcurrentDownloads: Int
+}
+
+"""
+The hardware-profile choice, and everything needed to present it: an
+interface with one available profile has nothing to ask and hides the
+question entirely.
+"""
+type HardwareProfileSettings {
+	"""
+	The operator's choice, or null when they have never made one and the
+	recommendation is standing in.
+	"""
+	selected: HardwareProfileGql
+	"""
+	The most capable profile this machine can honour.
+	"""
+	recommended: HardwareProfileGql!
+	"""
+	Every profile this machine can honour, least demanding first.
+	"""
+	available: [HardwareProfileGql!]!
+	"""
+	What each available profile would do here, in the same order.
+	"""
+	options: [HardwareProfileOption!]!
+	detected: DetectedHardware!
 }
 
 """
@@ -944,6 +1011,20 @@ type KernelSelectionInfo {
 	pinnedBy: String
 }
 
+"""
+The live log filter. Changes last until the process exits.
+"""
+type LogFilter {
+	"""
+	The `RUST_LOG`-style directives in force.
+	"""
+	directives: String!
+	"""
+	The directives the process started with; setting blank restores them.
+	"""
+	defaultDirectives: String!
+}
+
 type LoginStatusResult {
 	enabled: Boolean!
 	username: String
@@ -1037,7 +1118,6 @@ type Metrics {
 	downloadLanesParkingActive: Int!
 	downloadLanesRecoveringActive: Int!
 	downloadLaneParksNoWorkTotal: Int!
-	downloadLaneParksIpReplacementRetiredTotal: Int!
 	downloadLaneParksErrorTotal: Int!
 	downloadLaneLeaseItemsTotal: Int!
 	downloadLaneRefillGrantedTotal: Int!
@@ -1047,18 +1127,6 @@ type Metrics {
 	downloadPipelineProofPassTotal: Int!
 	downloadPipelineCooldownTotal: Int!
 	downloadPipelineReplayItemsTotal: Int!
-	ipReplacementTrialExtraConnections: Int!
-	ipReplacementBurstActive: Boolean!
-	ipReplacementOverMaxConnections: Int!
-	ipRttEwmaEntries: Int!
-	ipRttEwmaSlowestMs: Int!
-	ipReplacementTrialsStartedTotal: Int!
-	ipReplacementTrialsRejectedTotal: Int!
-	ipReplacementTrialsAcceptedTotal: Int!
-	ipReplacementTrialsBlockedTotal: Int!
-	ipReplacementTrialsAcquireFailedTotal: Int!
-	ipReplacementTrialsSameIpRejectedTotal: Int!
-	ipReplacementOldConnectionsRetiredTotal: Int!
 	segmentsDownloaded: Int!
 	segmentsDecoded: Int!
 	segmentsCommitted: Int!
@@ -1362,6 +1430,14 @@ type MutationRoot {
 	rerunPostProcessing(jobId: Int!): Boolean!
 	cancelJobPostProcessing(jobId: Int!): Boolean!
 	"""
+	Choose how hard Weaver leans on this machine.
+
+	A profile the machine cannot honour is refused by name rather than
+	quietly downgraded, so an operator who asked for more is told what the
+	hardware is short of.
+	"""
+	setHardwareProfile(profile: HardwareProfileGql!): HardwareProfileSettings!
+	"""
 	Update general settings.
 	"""
 	updateSettings(input: GeneralSettingsInput!): GeneralSettings!
@@ -1397,7 +1473,11 @@ type MutationRoot {
 
 	Admin-only, and the input has to echo the notice the UI displayed: the
 	server installs the release it already found, never one the caller names.
+	Replace the live log filter with `RUST_LOG`-style directives. Blank
+	restores the directives the process started with. Not persisted: a
+	restart comes back up on its startup filter.
 	"""
+	setLogFilter(directives: String!): LogFilter!
 	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
 }
 
@@ -1836,6 +1916,12 @@ type QueryRoot {
 	"""
 	settings: GeneralSettings!
 	"""
+	The hardware profile in force, and the profiles this machine can
+	honour. Judged against the live probe, so a container that was given
+	more memory since startup is offered what it has now.
+	"""
+	hardwareProfile: HardwareProfileSettings!
+	"""
 	Whether first-run setup is still owed to this install.
 	"""
 	firstRunSetup: FirstRunSetup!
@@ -1895,6 +1981,10 @@ type QueryRoot {
 	Return recent log lines from the in-memory ring buffer.
 	"""
 	serviceLogs(limit: Int! = 250): ServiceLogsPayload!
+	"""
+	The live log filter directives.
+	"""
+	logFilter: LogFilter!
 	"""
 	Get current pipeline metrics.
 	"""
@@ -2672,6 +2762,12 @@ type ServerHealth {
 	Connections that died before reaching a healthy age, recently.
 	"""
 	prematureDeaths: Int!
+	"""
+	The resolved address new connections to this server dial, once an
+	address race has picked one. Absent before the first connect and for
+	a server reached through a proxy.
+	"""
+	pinnedAddress: String
 }
 
 input ServerInput {

@@ -2,12 +2,22 @@ use crate::StateError;
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
 use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
+use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
     DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
+
+/// The key the chosen hardware profile is stored under. Absent until an
+/// operator picks one.
+pub const HARDWARE_PROFILE_SETTING: &str = "hardware_profile";
+
+/// Keys earlier releases stored that nothing reads any more. Loading the
+/// config removes them, so an old database or a restored backup does not
+/// carry a setting the product no longer has.
+pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &["ip_replacement_trial_extra_connections"];
 
 impl Database {
     /// Load a full `Config` from the settings and servers tables.
@@ -17,6 +27,11 @@ impl Database {
             .into_iter()
             .map(|SettingRecord { key, value }| (key, value))
             .collect();
+        for key in RETIRED_SETTING_KEYS {
+            if settings.contains_key(*key) {
+                self.delete_setting(key)?;
+            }
+        }
         let servers = self.list_servers()?;
         let categories = self.list_categories()?;
 
@@ -28,9 +43,6 @@ impl Database {
         let complete_dir = settings.get("complete_dir").cloned();
         let max_download_speed = settings
             .get("max_download_speed")
-            .and_then(|v| v.parse().ok());
-        let ip_replacement_trial_extra_connections = settings
-            .get("ip_replacement_trial_extra_connections")
             .and_then(|v| v.parse().ok());
         let propagation_delay_secs = settings
             .get("propagation_delay_secs")
@@ -238,6 +250,12 @@ impl Database {
             .unwrap_or(default_duplicate_policy.normalized_name),
         };
 
+        // Absent — and unparseable, from a hand-edited value — both mean "never
+        // chosen", which the runtime answers with the machine's recommendation.
+        let hardware_profile = settings
+            .get(HARDWARE_PROFILE_SETTING)
+            .and_then(|value| HardwareProfile::parse(value));
+
         let metrics = MetricsConfig {
             per_job_series: settings
                 .get("metrics.per_job_series")
@@ -256,13 +274,13 @@ impl Database {
             max_download_speed,
             cleanup_after_extract,
             isp_bandwidth_cap,
-            ip_replacement_trial_extra_connections,
             propagation_delay_secs,
             watch_folder,
             duplicate_policy,
             direct_store,
             direct_unpack,
             delivery_naming,
+            hardware_profile,
             metrics,
             config_path: None,
         })
@@ -285,9 +303,6 @@ impl Database {
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;
-        }
-        if let Some(extra) = config.ip_replacement_trial_extra_connections {
-            self.set_setting("ip_replacement_trial_extra_connections", &extra.to_string())?;
         }
         self.set_setting("watch_folder.mode", config.watch_folder.mode.as_str())?;
         match config.watch_folder.normalized_path() {
@@ -426,6 +441,12 @@ impl Database {
             if let Some(v) = retry.multiplier {
                 self.set_setting("retry.multiplier", &v.to_string())?;
             }
+        }
+
+        // Only a chosen profile is written: an absent key is what tells the
+        // settings page the recommendation has not been confirmed yet.
+        if let Some(profile) = config.hardware_profile {
+            self.set_setting(HARDWARE_PROFILE_SETTING, profile.as_str())?;
         }
 
         self.set_setting(

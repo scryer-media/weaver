@@ -21,6 +21,69 @@ pub(crate) struct SettingsMutation;
 
 #[Object]
 impl SettingsMutation {
+    /// Choose how hard Weaver leans on this machine.
+    ///
+    /// A profile the machine cannot honour is refused by name rather than
+    /// quietly downgraded, so an operator who asked for more is told what the
+    /// hardware is short of.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_hardware_profile(
+        &self,
+        ctx: &Context<'_>,
+        profile: crate::settings::types::HardwareProfileGql,
+    ) -> Result<crate::settings::types::HardwareProfileSettings> {
+        use weaver_server_core::runtime::HardwareProfile;
+        use weaver_server_core::settings::HARDWARE_PROFILE_SETTING;
+
+        let config = ctx.data::<SharedConfig>()?;
+        let db = ctx.data::<Database>()?;
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let system = ctx.data::<crate::context::SystemRuntimeContext>()?;
+        let _mutation_guard = SETTINGS_MUTATION_GUARD.lock().await;
+
+        let detected = system
+            .profile
+            .read()
+            .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
+            .clone();
+        let chosen: HardwareProfile = profile.into();
+        if let Some(requirement) = chosen.unmet_requirement(&detected) {
+            return Err(async_graphql::Error::new(requirement));
+        }
+
+        let persist = {
+            let db = db.clone();
+            let stored = chosen.as_str();
+            async move {
+                spawn_blocking_db(
+                    "settings.mutation.set_hardware_profile.persist",
+                    move || -> std::result::Result<(), weaver_server_core::StateError> {
+                        db.set_setting(HARDWARE_PROFILE_SETTING, stored)
+                    },
+                )
+                .await
+            }
+        };
+        persist_then_update_config(
+            config,
+            "settings.mutation.set_hardware_profile",
+            persist,
+            |cfg| {
+                cfg.hardware_profile = Some(chosen);
+            },
+        )
+        .await?;
+
+        // Memory limits reach the next job that starts; the thread pools were
+        // sized at startup and keep their size until the next one.
+        handle.set_sevenz_decode_memory_bytes(chosen.tuning(&detected).sevenz_decode_memory_bytes);
+
+        Ok(crate::settings::types::HardwareProfileSettings::resolve(
+            Some(chosen),
+            &detected,
+        ))
+    }
+
     /// Update general settings.
     #[graphql(guard = "AdminGuard")]
     async fn update_settings(
@@ -38,7 +101,6 @@ impl SettingsMutation {
         let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
-        let ip_replacement_trial_extra_connections = input.ip_replacement_trial_extra_connections;
         let enable_srrdb_lookup = input.enable_srrdb_lookup;
         let isp_bandwidth_cap = input.isp_bandwidth_cap.clone();
         let duplicate_policy_update = input.duplicate_policy.clone();
@@ -56,9 +118,6 @@ impl SettingsMutation {
             candidate.validate().map_err(async_graphql::Error::new)?;
         }
         let should_reconcile_watch_folder = watch_folder_update.is_some();
-        if ip_replacement_trial_extra_connections.unwrap_or(0) > 1 {
-            return Err("ip_replacement_trial_extra_connections must be 0 or 1".into());
-        }
         let should_update_paths =
             !normalized_intermediate_dir.is_undefined() || !normalized_complete_dir.is_undefined();
 
@@ -69,7 +128,6 @@ impl SettingsMutation {
             max_download_speed,
             max_retries,
             isp_bandwidth_cap.clone(),
-            ip_replacement_trial_extra_connections,
             watch_folder_update.clone(),
             duplicate_policy_update.clone(),
             enable_srrdb_lookup,
@@ -141,13 +199,7 @@ impl SettingsMutation {
                                 &cap.monthly_reset_day.to_string(),
                             )?;
                         }
-                        if let Some(v) = persist_input.6 {
-                            db.set_setting(
-                                "ip_replacement_trial_extra_connections",
-                                &v.to_string(),
-                            )?;
-                        }
-                        if let Some(ref watch) = persist_input.7 {
+                        if let Some(ref watch) = persist_input.6 {
                             if let Some(mode) = watch.mode {
                                 db.set_setting("watch_folder.mode", mode.as_str())?;
                             }
@@ -177,7 +229,7 @@ impl SettingsMutation {
                                 db.set_setting("watch_folder.scanning_paused", &value.to_string())?;
                             }
                         }
-                        if let Some(ref duplicate_policy) = persist_input.8 {
+                        if let Some(ref duplicate_policy) = persist_input.7 {
                             if let Some(value) = duplicate_policy.strict_active_or_success {
                                 db.set_setting(
                                     "duplicate_policy.strict_active_or_success",
@@ -216,10 +268,10 @@ impl SettingsMutation {
                                 )?;
                             }
                         }
-                        if let Some(seconds) = persist_input.10 {
+                        if let Some(seconds) = persist_input.9 {
                             db.set_setting("propagation_delay_secs", &seconds.to_string())?;
                         }
-                        if let Some(enabled) = persist_input.9 {
+                        if let Some(enabled) = persist_input.8 {
                             db.set_setting(
                                 "delivery_naming.enable_srrdb_lookup",
                                 &enabled.to_string(),
@@ -273,9 +325,6 @@ impl SettingsMutation {
                 if let Some(cap) = isp_bandwidth_cap {
                     cfg.isp_bandwidth_cap = Some(cap.into());
                 }
-                if let Some(extra) = ip_replacement_trial_extra_connections {
-                    cfg.ip_replacement_trial_extra_connections = Some(extra);
-                }
                 if let Some(enabled) = enable_srrdb_lookup {
                     cfg.delivery_naming
                         .get_or_insert_with(Default::default)
@@ -303,8 +352,6 @@ impl SettingsMutation {
                     max_download_speed: cfg.max_download_speed.unwrap_or(0),
                     propagation_delay_secs: cfg.propagation_delay_secs(),
                     max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
-                    ip_replacement_trial_extra_connections: cfg
-                        .ip_replacement_trial_extra_connections(),
                     enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
                     isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
                     watch_folder: (&cfg.watch_folder).into(),
@@ -324,11 +371,6 @@ impl SettingsMutation {
         }
         if let Some(cap) = input.isp_bandwidth_cap {
             let _ = handle.set_bandwidth_cap_policy(Some(cap.into())).await;
-        }
-        if let Some(extra) = ip_replacement_trial_extra_connections {
-            let _ = handle
-                .set_ip_replacement_trial_extra_connections(extra)
-                .await;
         }
 
         // Apply directory changes immediately so new jobs use them without restart.
@@ -615,6 +657,7 @@ mod tests {
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
             data_dir: "/tmp/weaver".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
@@ -625,7 +668,6 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,

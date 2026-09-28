@@ -332,15 +332,17 @@ export function Select<T extends string>({
   icon,
   className,
   menuClassName,
+  disabled = false,
 }: {
   value: T;
-  options: readonly { value: T; label: string }[];
+  options: readonly { value: T; label: string; icon?: ReactNode }[];
   onChange: (next: T) => void;
   label: string;
   /** Shown before the current choice, for a control without a visible label. */
   icon?: IconName;
   className?: string;
   menuClassName?: string;
+  disabled?: boolean;
 }) {
   const [placement, setPlacement] = useState<MenuPlacement | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -375,6 +377,7 @@ export function Select<T extends string>({
         ref={triggerRef}
         type="button"
         data-wv-menu-trigger=""
+        disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={label}
@@ -385,6 +388,7 @@ export function Select<T extends string>({
         )}
       >
         {icon ? <Icon name={icon} size={13} className="-mr-1 flex-none text-wv-muted" /> : null}
+        {current?.icon}
         <span className="min-w-0 flex-1 truncate text-left">{current?.label ?? value}</span>
         <Icon name="dropdown" size={13} className="flex-none text-wv-muted" />
       </button>
@@ -404,6 +408,7 @@ export function Select<T extends string>({
               setPlacement(null);
             }}
           >
+            {option.icon}
             <span className="truncate">{option.label}</span>
           </MenuItem>
         ))}

@@ -13,7 +13,9 @@ package weaver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,6 +30,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // Scenario is the JSON manifest for a pre-built test fixture.
@@ -286,6 +290,29 @@ func Run(args []string, programName string) {
 		os.Exit(1)
 	}
 
+	switch args[0] {
+	case "doctor":
+		if err := cmdDoctor(os.Stdout); err != nil {
+			os.Exit(1)
+		}
+		return
+	case "compose":
+		cleanup := mustActivateContainerEngine()
+		err := cmdCompose(args[1:])
+		cleanup()
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if !commandSkipsContainerPreflight(args[0]) {
+		defer mustActivateContainerEngine()()
+	}
+
 	if args[0] != "scenarios" && args[0] != "full" && args[0] != "release-gate" {
 		ensureRuntimePortEnv()
 	}
@@ -362,6 +389,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, `Usage: %s <command> [args]
 
 Commands:
+  doctor                Check the container engine and Compose provider this harness will use
+  compose <args>        Run "compose <args>" here through the resolved container engine
   seed <fixture-dir>    Post fixture via Nyuu, register NZB with indexer
   seed-all              Seed all fixtures from testdata/
   functional            Run functional full-suite phases with the dashboard
@@ -385,14 +414,16 @@ Commands:
   tls-test              Run the TLS NNTP suite
 
 Environment:
+  E2E_CONTAINER_ENGINE Container engine: docker|podman|auto (default: auto, Docker when its daemon answers)
   E2E_DIR              Path to the e2e repo root (auto-detected by default)
-  E2E_PROJECT          Docker Compose project name for this run (default: e2e)
+  E2E_PROJECT          Compose project name for this run (default: e2e)
   FIXTURES_DIR         Path to seeded fixtures (default: <repo>/fixtures)
   TESTDATA_DIR         Path to source fixtures (default: <repo>/testdata)
   E2E_RUNTIME_PORTS_FILE  Path to the runtime port state file
   E2E_RUN_DIR          Path to local temp state for managed weaver runs
   E2E_WEAVER_DATASTORE Weaver datastore for managed local runs: sqlite|postgres (default: sqlite)
-  E2E_WEAVER_RELEASE_GATE_JOBS Parallel product-flow workers (default: 8, max: 16)
+  E2E_WEAVER_RELEASE_GATE_JOBS Parallel product-flow workers (default: 8, or 4 inside a full run; max: 16)
+  E2E_FULL_PHASE_JOBS  Phases a full run executes at once (default: 4)
   E2E_WEAVER_RELEASE_GATE_ROOT Stable root for release-gate runs and latest pointer
   E2E_WEAVER_PLAYWRIGHT_IMAGE Weaver-only Playwright image override
   E2E_VERBOSE          Stream external command output instead of summarizing it
@@ -663,9 +694,28 @@ func isDockerHostPortBindCollision(err error) bool {
 	if err == nil {
 		return false
 	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "failed to bind host port") &&
-		strings.Contains(message, "address already in use")
+	return isHostPortBindCollisionMessage(err.Error(), containerengine.Current().Kind)
+}
+
+func isHostPortBindCollisionMessage(message string, kind containerengine.Kind) bool {
+	message = strings.ToLower(message)
+	if !strings.Contains(message, "address already in use") {
+		return false
+	}
+	if strings.Contains(message, "failed to bind host port") {
+		return true
+	}
+	if kind != containerengine.Podman {
+		return false
+	}
+	// Podman reports the same collision from its rootless port forwarder,
+	// from its own listener, or from its machine's port binding.
+	for _, marker := range []string{"rootlessport", "cannot listen on the tcp port", "cannot bind tcp port"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateRuntimePortState(state runtimePortState) error {
@@ -881,8 +931,7 @@ func dockerComposeArgs(args ...string) []string {
 }
 
 func dockerComposeServiceContainerID(service string) (string, error) {
-	args := dockerComposeArgs("ps", "-q", service)
-	cmd := exec.Command("docker", args...)
+	cmd := composeServiceContainersCommand(context.Background(), composeProject(), service, false, dockerComposeArgs("ps", "-q", service))
 	cmd.Dir = e2eDir()
 	out, err := cmd.Output()
 	if err != nil {
@@ -900,7 +949,7 @@ func inspectDockerHostPort(serviceName, containerPort string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	cmd := exec.Command("docker", "inspect", "-f", fmt.Sprintf("{{(index (index .NetworkSettings.Ports %q) 0).HostPort}}", containerPort), containerID)
+	cmd := containerengine.Command("inspect", "-f", fmt.Sprintf("{{(index (index .NetworkSettings.Ports %q) 0).HostPort}}", containerPort), containerID)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("inspect %s %s: %w", serviceName, containerPort, err)
@@ -995,7 +1044,7 @@ func dockerContainerRunning(service string) bool {
 	if err != nil {
 		return false
 	}
-	check := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", containerID)
+	check := containerengine.Command("inspect", "-f", "{{.State.Running}}", containerID)
 	out, err := check.Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }

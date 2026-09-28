@@ -9,11 +9,11 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 	"github.com/scryer-media/weaver/e2e/internal/fixturegen"
 	"sync"
 )
@@ -185,7 +185,7 @@ func restoreSeededNZBBundle(image, destination string) error {
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return fmt.Errorf("create shared NZB fixture directory: %w", err)
 	}
-	create := exec.Command("docker", "create", image)
+	create := containerengine.Command("create", image)
 	create.Dir = e2eDir()
 	containerID, err := create.Output()
 	if err != nil {
@@ -193,11 +193,11 @@ func restoreSeededNZBBundle(image, destination string) error {
 	}
 	id := strings.TrimSpace(string(containerID))
 	defer func() {
-		remove := exec.Command("docker", "rm", "-f", id)
+		remove := containerengine.Command("rm", "-f", id)
 		remove.Dir = e2eDir()
 		_ = runExternalCommand(remove, "remove pre-seeded NNTP fixture container")
 	}()
-	copy := exec.Command("docker", "cp", id+":"+nntpSeedFixtureRoot+"/.", destination)
+	copy := containerengine.Command("cp", id+":"+nntpSeedFixtureRoot+"/.", destination)
 	copy.Dir = e2eDir()
 	if err := runExternalCommand(copy, "restore pre-seeded NZB bundle"); err != nil {
 		return fmt.Errorf("restore pre-seeded NZB bundle: %w", err)
@@ -491,7 +491,7 @@ func nntpSeedBaseImage(envKey string) string {
 }
 
 func dockerComposeServiceContainerIDForProject(ctx context.Context, project, service string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", project, "ps", "-q", service)
+	cmd := composeServiceContainersCommand(ctx, project, service, false, []string{"compose", "-p", project, "ps", "-q", service})
 	cmd.Dir = e2eDir()
 	out, err := cmd.Output()
 	if err != nil {
@@ -509,7 +509,7 @@ func snapshotNntpData(ctx context.Context, containerID, contextDir string) error
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return fmt.Errorf("create NNTP data image context: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, "docker", "cp", containerID+":/data/articles/.", dest)
+	cmd := containerengine.CommandContext(ctx, "cp", containerID+":/data/articles/.", dest)
 	cmd.Dir = e2eDir()
 	if err := runExternalCommand(cmd, "snapshot seeded NNTP article store"); err != nil {
 		return err
@@ -518,7 +518,7 @@ func snapshotNntpData(ctx context.Context, containerID, contextDir string) error
 }
 
 func dockerContainerUsesDataMount(ctx context.Context, containerID string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{json .Mounts}}", containerID)
+	cmd := containerengine.CommandContext(ctx, "inspect", "--format", "{{json .Mounts}}", containerID)
 	cmd.Dir = e2eDir()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -540,15 +540,15 @@ func dockerContainerUsesDataMount(ctx context.Context, containerID string) (bool
 
 func stageSeededNZBsInContainer(ctx context.Context, containerID, contextDir string) error {
 	source := filepath.Join(contextDir, "e2e-seed-fixtures")
-	cmd := exec.CommandContext(ctx, "docker", "cp", source, containerID+":/")
+	cmd := containerengine.CommandContext(ctx, "cp", source, containerID+":/")
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "stage generated NZBs in seeded NNTP container")
 }
 
 func commitSeededNntpImage(ctx context.Context, containerID, tag string, set nntpSeedImageSet) error {
-	cmd := exec.CommandContext(
+	cmd := containerengine.CommandContext(
 		ctx,
-		"docker", "commit", "--pause=false",
+		"commit", "--pause=false",
 		"--change", fmt.Sprintf("LABEL %s=%s", nntpSeedImageLabel, set.Fingerprint),
 		"--change", fmt.Sprintf("LABEL org.scryer-media.weaver.e2e.seed-profile=%s", set.Profile),
 		containerID, tag,
@@ -584,9 +584,9 @@ func buildSeededNntpImage(ctx context.Context, baseImage, tag, contextDir string
 	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		return fmt.Errorf("write pre-seeded NNTP Dockerfile: %w", err)
 	}
-	cmd := exec.CommandContext(
+	cmd := containerengine.CommandContext(
 		ctx,
-		"docker", "build",
+		"build",
 		"--build-arg", "BASE_IMAGE="+baseImage,
 		"--tag", tag,
 		"--label", nntpSeedImageLabel+"="+set.Fingerprint,
@@ -600,7 +600,7 @@ func buildSeededNntpImage(ctx context.Context, baseImage, tag, contextDir string
 }
 
 func removeNntpSeedImage(ctx context.Context, tag string) error {
-	cmd := exec.CommandContext(ctx, "docker", "image", "rm", tag)
+	cmd := containerengine.CommandContext(ctx, "image", "rm", tag)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "remove incomplete pre-seeded NNTP image")
 }

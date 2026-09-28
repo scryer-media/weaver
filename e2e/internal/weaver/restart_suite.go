@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 type restartProfile string
@@ -518,7 +520,7 @@ func ensureRestartInfrastructure() {
 		services = append(services, "weaver-postgres")
 	}
 	args := append(dockerComposeArgs("up", "-d", "--build", "--quiet-pull"), services...)
-	cmd := exec.Command("docker", args...)
+	cmd := containerengine.Command(args...)
 	cmd.Dir = e2eDir()
 	if err := runExternalCommand(cmd, "docker compose up --build for restart suite"); err != nil {
 		log.Fatalf("start restart-suite infrastructure: %v", err)
@@ -1671,14 +1673,29 @@ func (ctx *restartCaseContext) submitSlugNTimes(slug string, count int) ([]int, 
 
 func (ctx *restartCaseContext) waitForFacade(jobID int, timeout time.Duration, predicate func(facadeItemSnapshot) bool) (facadeItemSnapshot, error) {
 	deadline := time.Now().Add(timeout)
+	var last facadeItemSnapshot
+	var lastErr error
 	for time.Now().Before(deadline) {
 		snapshot, err := fetchFacadeItemSnapshot(ctx.weaverURL, jobID)
 		if err == nil && predicate(snapshot) {
 			return snapshot, nil
 		}
+		last, lastErr = snapshot, err
 		time.Sleep(1 * time.Second)
 	}
-	return facadeItemSnapshot{}, fmt.Errorf("timeout waiting for facade snapshot for job %d", jobID)
+	return facadeItemSnapshot{}, facadeWaitTimeoutError(jobID, last, lastErr)
+}
+
+func facadeWaitTimeoutError(jobID int, last facadeItemSnapshot, lastErr error) error {
+	switch {
+	case lastErr != nil:
+		return fmt.Errorf("timeout waiting for facade snapshot for job %d (last error: %v)", jobID, lastErr)
+	case !last.Found:
+		return fmt.Errorf("timeout waiting for facade snapshot for job %d (last observed: not found)", jobID)
+	default:
+		return fmt.Errorf("timeout waiting for facade snapshot for job %d (last observed: state=%s in_queue=%t downloaded=%d/%d error=%q)",
+			jobID, last.Status, last.InQueue, last.DownloadedBytes, last.TotalBytes, last.Error)
+	}
 }
 
 func (ctx *restartCaseContext) observeFacade(jobID int, timeout time.Duration) (facadeItemSnapshot, bool, error) {
@@ -2450,19 +2467,41 @@ func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCase
 }
 
 func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResult, error) {
+	// The job downloads in well under a second, so polling cannot catch it
+	// mid-download. Refuse every BODY until the job has been observed in the
+	// state under test; the job then waits on the provider instead of racing
+	// the harness.
+	const articleGate = "greet_400=100,reauth_body=100"
+	var releaseArticleGate func() error
+	defer func() {
+		if releaseArticleGate != nil {
+			if err := releaseArticleGate(); err != nil {
+				log.Printf("warning: release primary NNTP article gate: %v", err)
+			}
+		}
+	}()
+	openArticleGate := func() error {
+		release := releaseArticleGate
+		releaseArticleGate = nil
+		return release()
+	}
+
 	if err := ctx.startWeaverWithOptions("", 1); err != nil {
+		return restartCaseResult{}, err
+	}
+	releaseArticleGate, err := holdNntpChaosOnServer(nntpHost(), nntpPort(), articleGate)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	_, err = ctx.waitForFacade(jobID, 3*time.Minute, func(snapshot facadeItemSnapshot) bool {
-		return snapshot.InQueue &&
-			snapshot.Status == "DOWNLOADING" &&
-			snapshot.DownloadedBytes >= 4*1024*1024
-	})
-	if err != nil {
+	// The job enters its download phase when its first segment is dispatched,
+	// which records DownloadStarted. The queue item cannot show this: with every
+	// BODY refused the job has no live download, so it reads QUEUED, and the
+	// transition is not persisted to the job row until it pauses.
+	if err := waitForJobEvents(filepath.Join(ctx.CaseDir, "weaver.db"), jobID, []string{"DownloadStarted"}, 3*time.Minute); err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := pauseQueueItemGraphQL(ctx.weaverURL, jobID); err != nil {
@@ -2472,6 +2511,9 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 		return jobStatusFromDB(snapshot, jobID) == "paused"
 	})
 	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := openArticleGate(); err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := ctx.killWeaverForRestart(); err != nil {
@@ -2501,6 +2543,12 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 
 	firstResumedDBStatus := ""
 	if restoredPaused {
+		// Hold the resumed job the same way, so the first status it takes
+		// cannot be overtaken by the job completing between two polls.
+		releaseArticleGate, err = holdNntpChaosOnServer(nntpHost(), nntpPort(), articleGate)
+		if err != nil {
+			return restartCaseResult{}, err
+		}
 		if err := resumeQueueItemGraphQL(ctx.weaverURL, jobID); err != nil {
 			return restartCaseResult{}, err
 		}
@@ -2516,6 +2564,9 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 			return restartCaseResult{}, err
 		}
 		writeRestartJSON(filepath.Join(ctx.CaseDir, "post_resume_db.json"), resumeSnapshot)
+		if err := openArticleGate(); err != nil {
+			return restartCaseResult{}, err
+		}
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if err != nil {
@@ -3035,7 +3086,7 @@ func readConventional7zRepairLog(logText string, jobID int) conventional7zRepair
 	job := fmt.Sprintf(" job_id=%d ", jobID)
 	var shape conventional7zRepairLog
 	for _, line := range strings.Split(stripANSIEscapeSequences(logText), "\n") {
-		if !strings.Contains(line+" ", job) {
+		if !strings.Contains(line+" ", job) || isWeaverDebugRingReplay(line) {
 			continue
 		}
 		switch {

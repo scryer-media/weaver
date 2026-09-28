@@ -483,7 +483,6 @@ impl Pipeline {
                     completion_critical: lease.completion_critical,
                     reason: LaneParkReason::NoWork,
                     release_connection_slot: true,
-                    release_ip_replacement_burst: false,
                 })
                 .await;
         });

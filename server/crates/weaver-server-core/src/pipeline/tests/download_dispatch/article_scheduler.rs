@@ -70,7 +70,6 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
             completion_critical: false,
             server_idx: Some(SERVER_A),
             connection: true,
-            ip_replacement: false,
             outstanding,
         },
     );

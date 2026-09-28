@@ -74,6 +74,15 @@ impl ProbeTally {
     }
 }
 
+/// One recovery set and what it could still repair.
+#[derive(Debug, Clone, Copy)]
+struct SetRecoveryCapacity {
+    set_id: par2_rs::RecoverySetId,
+    slice_size: u64,
+    /// The set's obtainable blocks, in bytes of its own slices.
+    capacity_bytes: u64,
+}
+
 /// What a job could still get hold of to repair itself with.
 #[derive(Debug, Clone, Copy, Default)]
 struct ObtainableRecovery {
@@ -190,15 +199,73 @@ impl Pipeline {
         Some(blocks.min(u64::from(u32::MAX)) as u32)
     }
 
+    /// Every recovery set this job could repair from — the parsed sets and
+    /// the served one — each with the bytes its obtainable blocks recover.
+    fn par2_set_recovery_capacities(&self, job_id: JobId) -> Vec<SetRecoveryCapacity> {
+        let mut set_ids = self.par2_servable_set_ids(job_id);
+        if let Some(served) = self.par2_served_set_id(job_id)
+            && !set_ids.contains(&served)
+        {
+            set_ids.push(served);
+        }
+        set_ids
+            .into_iter()
+            .map(|set_id| {
+                let slice_size = self
+                    .par2_set_for(job_id, set_id)
+                    .map_or(0, |set| set.slice_size);
+                SetRecoveryCapacity {
+                    set_id,
+                    slice_size,
+                    capacity_bytes: u64::from(
+                        self.obtainable_recovery_block_capacity(job_id, set_id),
+                    )
+                    .saturating_mul(slice_size),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the recovery sets can cover what each of them is asked for.
+    ///
+    /// Spare slices in one set cannot repair another set's files, so each
+    /// set's shortfall is counted on its own. What the live discovery
+    /// candidates hold is not yet known to belong to any set, so it may still
+    /// make up any of those shortfalls: `ceiling` less the sets' own capacity.
+    fn par2_sets_cover_needs(
+        sets: &[SetRecoveryCapacity],
+        needed_by_set: &std::collections::HashMap<par2_rs::RecoverySetId, u64>,
+        ceiling: u64,
+    ) -> bool {
+        let known_capacity = sets
+            .iter()
+            .map(|set| set.capacity_bytes)
+            .fold(0u64, u64::saturating_add);
+        let shortfall = sets
+            .iter()
+            .map(|set| {
+                needed_by_set
+                    .get(&set.set_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_sub(set.capacity_bytes)
+            })
+            .fold(0u64, u64::saturating_add);
+        shortfall <= ceiling.saturating_sub(known_capacity)
+    }
+
     /// Whether this job's declared recovery is still *obtainable*, and how many
     /// bytes of it there could be.
     ///
     /// Two sources, both of them things the pipeline has observed rather than
     /// read off a filename:
     ///
-    /// * a served recovery set — blocks its volumes can supply, at the set's
-    ///   own slice size, counting only volumes with an article delivered or
-    ///   still able to arrive;
+    /// * every parsed recovery set — blocks its volumes can supply, at the
+    ///   set's own slice size, counting only volumes with an article delivered
+    ///   or still able to arrive. Not the served set alone: completion repairs
+    ///   each set's files from that set, and a secondary set that has parsed
+    ///   is no longer a discovery candidate either, so leaving it out would
+    ///   drop its recovery from both sources;
     /// * discovery candidates that are still live: no verdict yet, and at least
     ///   one article that could still arrive. Nothing is known about their
     ///   contents, so they contribute their declared article bytes.
@@ -206,12 +273,11 @@ impl Pipeline {
     /// Neither is the NZB's static PAR2 byte count, which is what a posting
     /// whose every recovery volume is already dead still reports in full.
     fn obtainable_recovery(&self, job_id: JobId) -> ObtainableRecovery {
-        let served = self.par2_served_set_id(job_id).map(|set_id| {
-            let slice_size = self
-                .par2_set_for(job_id, set_id)
-                .map_or(0, |set| set.slice_size);
-            u64::from(self.obtainable_recovery_block_capacity(job_id, set_id))
-                .saturating_mul(slice_size)
+        let sets = self.par2_set_recovery_capacities(job_id);
+        let served = (!sets.is_empty()).then(|| {
+            sets.iter()
+                .map(|set| set.capacity_bytes)
+                .fold(0u64, u64::saturating_add)
         });
         let candidates = self.par2_metadata_candidate_indices(job_id);
         if served.is_none() && candidates.is_empty() {
@@ -421,6 +487,41 @@ impl Pipeline {
             < failed_bytes
     }
 
+    /// Known damaged files each require at least one slice from their own set.
+    /// A probe projection has no set attribution, so only booked failures can
+    /// prove that one set is already beyond repair.
+    fn known_health_losses_fit_recovery_sets(&self, job_id: JobId, ceiling: Option<u64>) -> bool {
+        let Some(ceiling) = ceiling else {
+            return true;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let sets = self.par2_set_recovery_capacities(job_id);
+        // This runs on every article lost while the failure is deferred. A
+        // set with a slice for every damaged file is covered whichever of
+        // them it describes, and that is known without matching any names.
+        let damaged_files = state.health_failing_files.len() as u64;
+        if sets
+            .iter()
+            .all(|set| damaged_files.saturating_mul(set.slice_size) <= set.capacity_bytes)
+        {
+            return true;
+        }
+        let mut needed_by_set = std::collections::HashMap::new();
+        for &file_index in &state.health_failing_files {
+            let file_id = NzbFileId { job_id, file_index };
+            if let Some(set) = sets.iter().find(|set| {
+                self.resolve_par2_file_binding_in_set(file_id, set.set_id)
+                    .is_some()
+            }) {
+                let needed = needed_by_set.entry(set.set_id).or_insert(0u64);
+                *needed = needed.saturating_add(set.slice_size);
+            }
+        }
+        Self::par2_sets_cover_needs(&sets, &needed_by_set, ceiling)
+    }
+
     /// Check job health and abort if below critical threshold.
     ///
     /// Health = (total_bytes - failed_bytes) / total_bytes × 1000.
@@ -526,6 +627,7 @@ impl Pipeline {
                 && recovery
                     .ceiling
                     .is_none_or(|ceiling| failed_bytes <= ceiling)
+                && self.known_health_losses_fit_recovery_sets(job_id, recovery.ceiling)
             {
                 let entered = self.note_health_deferral(job_id, HealthDeferralKind::Par2Recovery);
                 if entered {
@@ -940,19 +1042,20 @@ impl Pipeline {
     /// sampled first article is ruled missing, taking each of those files as
     /// wholly lost.
     ///
-    /// The cover is the served set's obtainable capacity when one is known,
-    /// and otherwise the recovery the posting declares, which is also what the
-    /// critical-health line is drawn from.
+    /// The cover is the obtainable capacity of every parsed set when one is
+    /// known, and otherwise the recovery the posting declares, which is also
+    /// what the critical-health line is drawn from.
     ///
-    /// Once a set is parsed the comparison is in its own units, because the
-    /// two sides otherwise disagree: the capacity is decoded slices, while a
+    /// Once a set is parsed the comparison is in slice units, because the two
+    /// sides otherwise disagree: the capacity is decoded slices, while a
     /// file's declared size is yEnc-encoded, about 3% larger — enough to fail
     /// a post whose losses the set covers exactly. Each lost file costs the
-    /// whole slices of the length the set describes for it, which is what the
-    /// repair will spend; a file the set does not describe falls back to its
-    /// declared size. That charge is generous rather than exact — the served
-    /// set cannot repair such a file at all — and it is the same charge the
-    /// byte comparison has always made for a file another set protects.
+    /// whole slices of the length the set that describes it gives, at that
+    /// set's slice size, which is what the repair will spend; a file no parsed
+    /// set describes costs its declared size in the served set's slices. That
+    /// charge is generous rather than exact — no set can repair such a file —
+    /// and it is the same charge the byte comparison has always made for a
+    /// file another set protects.
     fn first_article_losses_recoverable(&self, job_id: JobId) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
@@ -984,24 +1087,40 @@ impl Pipeline {
         if !recovery.obtainable {
             return false;
         }
-        let served = self.par2_served_set_id(job_id).and_then(|set_id| {
-            let slice_size = self.par2_set_for(job_id, set_id)?.slice_size;
-            (slice_size > 0).then_some((set_id, slice_size))
-        });
-        match (recovery.ceiling, served) {
-            (Some(ceiling), Some((set_id, slice_size))) => {
-                let needed_slices = lost_files
+        let served_slice_size = self
+            .par2_served_set_id(job_id)
+            .and_then(|set_id| self.par2_set_for(job_id, set_id))
+            .map(|set| set.slice_size)
+            .filter(|slice_size| *slice_size > 0);
+        match (recovery.ceiling, served_slice_size) {
+            (Some(ceiling), Some(served_slice_size)) => {
+                let sets = self.par2_set_recovery_capacities(job_id);
+                let whole_slices =
+                    |len: u64, slice_size: u64| len.div_ceil(slice_size).saturating_mul(slice_size);
+                let mut needed_by_set = std::collections::HashMap::new();
+                let needed_bytes = lost_files
                     .iter()
                     .map(|file_id| {
-                        self.resolve_par2_file_binding_in_set(*file_id, set_id)
-                            .map_or_else(
-                                || declared_bytes(*file_id),
-                                |binding| binding.described_length,
-                            )
-                            .div_ceil(slice_size)
+                        if let Some((set_id, needed)) = sets.iter().find_map(|set| {
+                            let binding =
+                                self.resolve_par2_file_binding_in_set(*file_id, set.set_id)?;
+                            (set.slice_size > 0).then(|| {
+                                (
+                                    set.set_id,
+                                    whole_slices(binding.described_length, set.slice_size),
+                                )
+                            })
+                        }) {
+                            let booked = needed_by_set.entry(set_id).or_insert(0u64);
+                            *booked = booked.saturating_add(needed);
+                            needed
+                        } else {
+                            whole_slices(declared_bytes(*file_id), served_slice_size)
+                        }
                     })
                     .fold(0u64, u64::saturating_add);
-                needed_slices <= ceiling / slice_size
+                needed_bytes <= ceiling
+                    && Self::par2_sets_cover_needs(&sets, &needed_by_set, ceiling)
             }
             (ceiling, _) => {
                 let lost_bytes = lost_files

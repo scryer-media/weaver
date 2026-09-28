@@ -2955,6 +2955,98 @@ async fn restart_replay_bootstraps_a_set_from_its_only_complete_volume() {
     assert_eq!(set.recovery_block_count(), 1);
 }
 
+#[tokio::test]
+async fn a_metadata_file_finalised_again_with_identical_bytes_is_parsed_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30817);
+    let payload_filename = "amber.lantern.bin";
+    let index_filename = "amber.lantern.par2";
+    let payload = b"amber lantern payload";
+    let index = build_test_par2_index(payload_filename, payload, 64);
+    let spec = JobSpec {
+        name: "Amber Lantern Refinalised Index".to_string(),
+        password: None,
+        total_bytes: (payload.len() + index.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: payload.len() as u32,
+                    message_id: "amber-lantern-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: index.len() as u32,
+                    message_id: "amber-lantern-index@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &index).await;
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    assert!(
+        served_set_describes(&pipeline, job_id, payload_filename),
+        "precondition: the first parse installs the set"
+    );
+
+    // Anything a parse writes onto the file's runtime entry works as a
+    // witness; the filename is rewritten by every parse that runs.
+    let witness = |pipeline: &Pipeline| {
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .files
+            .get(&1)
+            .unwrap()
+            .filename
+            .clone()
+    };
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .get_mut(&1)
+        .unwrap()
+        .filename = "untouched-since-first-parse".to_string();
+
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    assert_eq!(
+        witness(&pipeline),
+        "untouched-since-first-parse",
+        "identical bytes must not be parsed a second time"
+    );
+
+    // Different bytes are new evidence and are parsed.
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    let rewritten =
+        build_test_par2_index(payload_filename, b"amber lantern payload, rewritten", 64);
+    tokio::fs::write(working_dir.join(index_filename), &rewritten)
+        .await
+        .unwrap();
+    load_par2_index(&mut pipeline, job_id, 1).await;
+    assert_eq!(
+        witness(&pipeline),
+        index_filename,
+        "changed bytes must be parsed again"
+    );
+}
+
 #[test]
 fn retained_sessions_evict_the_oldest_unprotected_job_and_set_pair() {
     let job_id = JobId(30813);

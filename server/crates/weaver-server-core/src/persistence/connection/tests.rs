@@ -2586,6 +2586,7 @@ async fn postgres_runtime_smoke_when_configured() {
 
     let config = Config {
         data_dir: "/tmp/weaver-pg".to_string(),
+        hardware_profile: None,
         intermediate_dir: Some("/tmp/weaver-pg/intermediate".to_string()),
         complete_dir: Some("/tmp/weaver-pg/complete".to_string()),
         buffer_pool: Some(BufferPoolOverrides {
@@ -2641,7 +2642,6 @@ async fn postgres_runtime_smoke_when_configured() {
             monthly_reset_day: 7,
         }),
         propagation_delay_secs: Some(0),
-        ip_replacement_trial_extra_connections: Some(1),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,

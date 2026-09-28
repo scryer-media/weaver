@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // cmdChaosTest runs the full test suite cleanly first (baseline), then repeats
@@ -1069,7 +1071,7 @@ func cmdTlsTest() {
 		log.Fatalf("resolve NNTP container: %v", err)
 	}
 	_ = os.MkdirAll(filepath.Dir(caPath), 0o755)
-	extractCA := exec.Command("docker", "cp", containerID+":/certs/ca.pem", caPath)
+	extractCA := containerengine.Command("cp", containerID+":/certs/ca.pem", caPath)
 	if err := extractCA.Run(); err != nil {
 		log.Fatalf("failed to extract CA cert: %v", err)
 	}

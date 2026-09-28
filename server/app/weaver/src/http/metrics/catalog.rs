@@ -184,25 +184,6 @@ metric_families! {
     BODY_REPLAY_ITEMS = ("weaver_pipeline_body_replay_items_total", Counter, [],
         "BODY items returned unresolved after a lane reset or failure.");
 
-    // ---- latent-IP replacement -------------------------------------------
-    IP_TRIAL_EXTRA_CONNECTIONS = ("weaver_ip_replacement_trial_extra_connections", Gauge, [],
-        "Configured over-max IP replacement trial burst budget.");
-    IP_BURST_ACTIVE = ("weaver_ip_replacement_burst_active", Gauge, [],
-        "Whether an over-max IP replacement trial is active.");
-    IP_OVER_MAX_CONNECTIONS = ("weaver_ip_replacement_over_max_connections", Gauge, [],
-        "Current over-max IP replacement trial connections.");
-    IP_RTT_ENTRIES = ("weaver_ip_rtt_ewma_entries", Gauge, [],
-        "Number of tracked per-server/per-IP BODY RTT EWMAs.");
-    IP_RTT_SLOWEST_MS = ("weaver_ip_rtt_ewma_slowest_ms", Gauge, [],
-        "Slowest tracked per-IP BODY RTT EWMA in milliseconds.",
-        deprecated_by = "weaver_ip_rtt_ewma_slowest_seconds");
-    IP_RTT_SLOWEST_SECONDS = ("weaver_ip_rtt_ewma_slowest_seconds", Gauge, [],
-        "Slowest tracked per-IP BODY RTT EWMA.");
-    IP_TRIALS = ("weaver_ip_replacement_trials_total", Counter, ["outcome"],
-        "IP replacement trial outcomes.");
-    IP_OLD_CONNECTIONS_RETIRED = ("weaver_ip_replacement_old_connections_retired_total", Counter, [],
-        "Old-IP connections retired after accepted replacement trials.");
-
     // ---- observed limiter and stalls --------------------------------------
     OBSERVED_LIMITER = ("weaver_pipeline_download_observed_limiter", Gauge, ["limiter"],
         "Observed downloader limiter derived from pressure, queue, and server permits; exactly one limiter is 1.");
@@ -317,6 +298,15 @@ metric_families! {
         deprecated_by = "weaver_server_capacity_penalty_until_seconds");
     SERVER_CAPACITY_PENALTY_SECONDS = ("weaver_server_capacity_penalty_until_seconds", Gauge,
         ["server_id", "server"], "Provider over-limit holdoff deadline as a unix timestamp.");
+    SERVER_ADDRESS_INFO = ("weaver_server_address_info", Gauge,
+        ["server_id", "server", "address"],
+        "Resolved server addresses; 1 for the address new connections are pinned to, 0 for the rest.");
+    SERVER_ADDRESS_CONNECT_SECONDS = ("weaver_server_address_connect_seconds", Gauge,
+        ["server_id", "server", "address"], "Smoothed TCP connect time per resolved server address.");
+    SERVER_ADDRESS_RACES = ("weaver_server_address_races_total", Counter,
+        ["server_id", "server", "outcome"], "Address races run to pick the address new connections dial, by outcome.");
+    SERVER_ADDRESS_REPINS = ("weaver_server_address_repins_total", Counter,
+        ["server_id", "server", "reason"], "Changes of the pinned server address, by what decided them: the reason a race ran, or measured delivery.");
     SERVER_PREMATURE_DEATHS = ("weaver_server_premature_deaths", Gauge, ["server_id", "server"],
         "Recent connections that died before reaching 60s of age.");
     NNTP_RUNTIME_GENERATION = ("weaver_nntp_runtime_generation", Gauge, [],

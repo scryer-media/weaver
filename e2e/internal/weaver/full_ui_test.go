@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 func TestPruneFullRunBundles(t *testing.T) {
@@ -49,7 +50,8 @@ func TestPruneFullRunBundles(t *testing.T) {
 	if !errors.Is(err, cleanupErr) {
 		t.Fatalf("error = %v, want cleanup failure", err)
 	}
-	if strings.Join(cleaned, ",") != "z-old,cleanup-error" {
+	// Dead owners inside the retention window still lose their stacks.
+	if strings.Join(cleaned, ",") != "b-second,c-third,z-old,cleanup-error" {
 		t.Fatalf("unexpected cleanup: %v", cleaned)
 	}
 	for name, path := range paths {
@@ -61,6 +63,99 @@ func TestPruneFullRunBundles(t *testing.T) {
 		} else if err != nil || string(body) != name {
 			t.Fatalf("retained %s evidence changed: %q, %v", name, body, err)
 		}
+	}
+
+	// A retained bundle is torn down once; a failed cleanup is retried.
+	cleaned = nil
+	err = pruneFullRunBundles(root, func(pid int) bool { return pid == 1 || pid == 6 }, func(phase *fullPhaseContext) error {
+		cleaned = append(cleaned, phase.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("second prune: %v", err)
+	}
+	if strings.Join(cleaned, ",") != "cleanup-error" {
+		t.Fatalf("unexpected second cleanup: %v", cleaned)
+	}
+}
+
+func TestPruneFullRunBundlesKeepsRequestedStacksWhileRetained(t *testing.T) {
+	root := t.TempDir()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	manifests := []fullRunManifest{
+		{OwnerPID: 1, StartedAt: base.Add(4 * time.Hour), Phases: []fullRunPhaseEntry{{Name: "kept"}}, KeepStacks: true},
+		{OwnerPID: 2, StartedAt: base.Add(3 * time.Hour), Phases: []fullRunPhaseEntry{{Name: "released"}}, StacksReleased: true},
+		{OwnerPID: 3, StartedAt: base.Add(2 * time.Hour), Phases: []fullRunPhaseEntry{{Name: "third"}}, StacksReleased: true},
+		{OwnerPID: 4, StartedAt: base.Add(1 * time.Hour), Phases: []fullRunPhaseEntry{{Name: "old-kept"}}, KeepStacks: true},
+		{OwnerPID: 5, StartedAt: base, Phases: []fullRunPhaseEntry{{Name: "old-released"}}, StacksReleased: true},
+	}
+	paths := make(map[string]string)
+	for _, manifest := range manifests {
+		name := manifest.Phases[0].Name
+		path := filepath.Join(root, "weaver-e2e-full-"+name)
+		paths[name] = path
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "full-run.json"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var cleaned []string
+	err := pruneFullRunBundles(root, func(int) bool { return false }, func(phase *fullPhaseContext) error {
+		cleaned = append(cleaned, phase.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(cleaned, ",") != "old-kept" {
+		t.Fatalf("unexpected cleanup: %v", cleaned)
+	}
+	for name, path := range paths {
+		_, err := os.Stat(path)
+		if strings.HasPrefix(name, "old-") {
+			if !os.IsNotExist(err) {
+				t.Fatalf("%s bundle still exists: %v", name, err)
+			}
+		} else if err != nil {
+			t.Fatalf("%s bundle removed: %v", name, err)
+		}
+	}
+}
+
+func TestUnfinishedReleaseFlowProjects(t *testing.T) {
+	runDir := t.TempDir()
+	for slug, status := range map[string]weaverReleasePhaseStatus{
+		"running-flow": {Project: "weaver-e2e-1-running-flow", Status: "running"},
+		"passed-flow":  {Project: "weaver-e2e-2-passed-flow", Status: "passed"},
+		"failed-flow":  {Project: "weaver-e2e-3-failed-flow", Status: "failed"},
+	} {
+		dir := filepath.Join(runDir, "release-gate", "20260101-000000", slug)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(status)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "status.json"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projects, errs := unfinishedReleaseFlowProjects(runDir)
+	if len(errs) != 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	if strings.Join(projects, ",") != "weaver-e2e-1-running-flow" {
+		t.Fatalf("projects = %v", projects)
+	}
+	if projects, errs := unfinishedReleaseFlowProjects(""); len(projects) != 0 || len(errs) != 0 {
+		t.Fatalf("empty run dir = %v, %v", projects, errs)
 	}
 }
 
@@ -449,7 +544,7 @@ func TestPostgresFullPhaseEnvConfiguresWeaverDatastoreAndComposeDB(t *testing.T)
 }
 
 func TestDockerComposePublishesPostgresRuntimePort(t *testing.T) {
-	versionCmd := exec.Command("docker", "compose", "version")
+	versionCmd := containerengine.Command("compose", "version")
 	if output, err := versionCmd.CombinedOutput(); err != nil {
 		t.Skipf("docker compose unavailable: %v: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -474,7 +569,7 @@ type dockerComposePort struct {
 func dockerComposePostgresPorts(t *testing.T, overrides map[string]string) []dockerComposePort {
 	t.Helper()
 
-	cmd := exec.Command("docker", "compose", "config", "--format", "json")
+	cmd := containerengine.Command("compose", "config", "--format", "json")
 	cmd.Dir = e2eDir()
 	cmd.Env = composeTestEnv(overrides)
 	output, err := cmd.CombinedOutput()
@@ -847,5 +942,42 @@ func TestUnrecordedProfileFallsThroughToRecompute(t *testing.T) {
 	_, backup := env["E2E_NNTP2_IMAGE"]
 	if primary != backup {
 		t.Fatalf("image env must be set as a pair, got primary=%v backup=%v", primary, backup)
+	}
+}
+
+func TestFullPhaseJobsBoundsTheRequestedWidth(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		phaseCount int
+		want       int
+	}{
+		{name: "default", value: "", phaseCount: 8, want: defaultFullPhaseJobs},
+		{name: "fewer phases than the default", value: "", phaseCount: 2, want: 2},
+		{name: "operator width", value: "6", phaseCount: 8, want: 6},
+		{name: "width above the phase count", value: "20", phaseCount: 8, want: 8},
+		{name: "width below one", value: "0", phaseCount: 8, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("E2E_FULL_PHASE_JOBS", tt.value)
+			if got := fullPhaseJobs(tt.phaseCount); got != tt.want {
+				t.Fatalf("fullPhaseJobs(%d) = %d, want %d", tt.phaseCount, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFullRunNarrowsTheReleaseGateUnlessTheOperatorSetsAWidth(t *testing.T) {
+	phase := &fullPhaseContext{Name: "Release Gate", Command: "release-gate", RunDir: t.TempDir()}
+
+	t.Setenv("E2E_WEAVER_RELEASE_GATE_JOBS", "")
+	if got, want := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"], strconv.Itoa(fullRunReleaseGateJobs); got != want {
+		t.Fatalf("release-gate jobs = %q, want %q", got, want)
+	}
+
+	t.Setenv("E2E_WEAVER_RELEASE_GATE_JOBS", "12")
+	if got, ok := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"]; ok {
+		t.Fatalf("release-gate jobs = %q, want the operator's width left in place", got)
 	}
 }

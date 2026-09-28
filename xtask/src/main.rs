@@ -23,6 +23,7 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 use toml_edit::{DocumentMut, value};
 
+mod container_engine;
 mod monitor;
 mod par2_kit;
 mod perf;
@@ -1685,12 +1686,17 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
     }
 
     if args.linux_only || host_target != linux_target {
-        if command_available("docker")? {
-            println!("Running cargo clippy in Linux container: {linux_image}");
-            let mut command = ctx.command("docker");
+        let engine = container_engine::running_engine(&container_engine::HostProbe);
+        if let Ok(engine) = engine {
+            let linux_image = engine.image_reference(&linux_image);
+            println!(
+                "Running cargo clippy in Linux container on {}: {linux_image}",
+                engine.name()
+            );
+            let mut command = ctx.command(engine.binary());
+            command.args(["run", "--rm"]);
+            command.args(engine.bind_mount_run_args());
             command.args([
-                "run",
-                "--rm",
                 "--platform",
                 &linux_platform,
                 "-v",
@@ -1740,8 +1746,10 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
                 "warnings",
             ]);
             run_checked(&mut command)?;
-        } else {
-            bail!("cannot run Linux CI clippy locally; install Docker or musl-gcc");
+        } else if let Err(error) = engine {
+            bail!(
+                "cannot run Linux CI clippy locally: {error:#}; start Docker or Podman, or install musl-gcc"
+            );
         }
     }
 

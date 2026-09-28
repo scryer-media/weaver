@@ -861,6 +861,11 @@ impl Pipeline {
             } else {
                 (PROMOTED_RECOVERY_PRIORITY, true)
             };
+            let assembly = state.assembly.file(NzbFileId { job_id, file_index });
+            // A carrier promoted after some of its articles already arrived —
+            // a prefix probe, a duplicate, an earlier partial promotion — must
+            // not fetch those bytes again: each refetched article re-finalises
+            // a file the assembly already holds.
             let mut segments = file
                 .segments
                 .iter()
@@ -869,12 +874,13 @@ impl Pipeline {
                         file_id: NzbFileId { job_id, file_index },
                         segment_number: segment.ordinal,
                     };
-                    !unavailable.contains(&segment_id) && !already_probed.contains(&segment.ordinal)
+                    !unavailable.contains(&segment_id)
+                        && !already_probed.contains(&segment.ordinal)
+                        && assembly.is_none_or(|file| !file.has_segment(segment.ordinal))
                 })
                 .collect::<Vec<_>>();
             segments.sort_by_key(|segment| segment.ordinal);
             if prefix_only {
-                let assembly = state.assembly.file(NzbFileId { job_id, file_index });
                 // The capture can grow only from byte zero. If filtering left
                 // an article above the lowest missing ordinal, the hole below
                 // it is terminal and this optional carrier is exhausted.
@@ -952,7 +958,7 @@ impl Pipeline {
             file.discovery = Par2DiscoveryState::Exhausted { set_ids };
             return false;
         }
-        info!(
+        debug!(
             job_id = job_id.0,
             file_index,
             filename = %filename,
@@ -1089,7 +1095,9 @@ impl Pipeline {
             should_warn
         };
         if should_warn {
-            warn!(
+            // Routine for a posting whose recovery files carry no usable
+            // metadata. A repair or failure it leads to reports itself.
+            info!(
                 job_id = job_id.0,
                 exhausted_candidates = ?exhausted,
                 "PAR2 metadata discovery exhausted every declared candidate"

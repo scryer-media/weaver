@@ -365,3 +365,35 @@ func TestWaitForManagedWeaverGraphQLReadyFailsWhenProcessExits(t *testing.T) {
 		t.Fatalf("readiness error did not include process/log context: %v", err)
 	}
 }
+
+func TestFacadeWaitTimeoutErrorReportsLastObservation(t *testing.T) {
+	cases := []struct {
+		name    string
+		last    facadeItemSnapshot
+		lastErr error
+		want    string
+	}{
+		{
+			name:    "query error",
+			lastErr: errors.New("gql: boom"),
+			want:    "last error: gql: boom",
+		},
+		{
+			name: "not found",
+			want: "last observed: not found",
+		},
+		{
+			name: "observed state",
+			last: facadeItemSnapshot{Found: true, InQueue: true, Status: "QUEUED", TotalBytes: 10},
+			want: "state=QUEUED in_queue=true downloaded=0/10",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := facadeWaitTimeoutError(7, tc.last, tc.lastErr)
+			if !strings.Contains(err.Error(), "job 7") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("timeout error %q does not report %q", err, tc.want)
+			}
+		})
+	}
+}

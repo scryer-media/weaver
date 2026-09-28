@@ -482,23 +482,6 @@ impl Pipeline {
                 }
                 let _ = reply.send(());
             }
-            SchedulerCommand::SetIpReplacementTrialExtraConnections {
-                extra_connections,
-                reply,
-            } => {
-                self.ip_replacement_trial_extra_connections = extra_connections.min(1);
-                if self.ip_replacement_trial_extra_connections == 0 {
-                    self.ip_replacement_burst_active = false;
-                    self.ip_rtt_ewma.clear();
-                    self.ip_replacement_retired_ips.clear();
-                    self.metrics.set_ip_replacement_burst_active(false);
-                    self.metrics.set_ip_rtt_ewma_summary(0, 0);
-                }
-                self.metrics.set_ip_replacement_trial_extra_connections(
-                    self.ip_replacement_trial_extra_connections,
-                );
-                let _ = reply.send(());
-            }
             SchedulerCommand::SetBandwidthCapPolicy { policy, reply } => {
                 let result = self.apply_bandwidth_cap_policy(policy);
                 let _ = reply.send(result);
@@ -736,17 +719,17 @@ impl Pipeline {
                         return;
                     }
                 }
-                let cleanup_error = self
+                let cleanup = self
                     .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
-                    .await
-                    .err();
+                    .await;
                 self.cleanup_output_dir(output_dir.as_deref()).await;
                 if self.jobs.contains_key(&job_id) {
                     self.purge_terminal_job_runtime(job_id);
                 }
                 self.finished_jobs.retain(|job| job.job_id != job_id);
                 self.publish_snapshot();
-                let result = cleanup_error.map_or(Ok(()), Err);
+                let result =
+                    cleanup.map(|left_in_place| crate::HistoryDeleteOutcome { left_in_place });
                 let _ = reply.send(result);
             }
             SchedulerCommand::DeleteAllHistory {

@@ -2542,28 +2542,6 @@ async fn extra_body_lane_reports_remote_ip() {
 }
 
 #[tokio::test]
-async fn extra_body_lane_excluding_only_ip_fails_before_group_selection() {
-    let port = spawn_scripted_server(vec![]).await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![scripted_server(port, 0)],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(5),
-    });
-
-    let result = client
-        .acquire_extra_body_lane_excluding(
-            ServerId(0),
-            &[String::from("alt.binaries.test")],
-            &["127.0.0.1".parse().unwrap()],
-        )
-        .await;
-
-    assert!(result.is_err(), "excluded only IP should not connect");
-}
-
-#[tokio::test]
 async fn extra_body_lane_uses_fresh_connection_instead_of_idle_pool() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

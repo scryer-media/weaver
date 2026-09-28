@@ -170,7 +170,7 @@ function csvCell(value: string | number): string {
   return /["\n,]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-export function CompletedPage() {
+export function HistoryPage() {
   const t = useTranslate();
   const navigate = useNavigate();
   const statusLabel = useStatusLabel();
@@ -460,7 +460,7 @@ export function CompletedPage() {
 
   return (
     <NextShell
-      title={t("next.nav.completed")}
+      title={t("next.nav.history")}
       note={countLabel(t, "next.completed.kept", counts.all, { count: formatCount(counts.all) })}
       controls={
         <>

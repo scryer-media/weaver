@@ -330,3 +330,133 @@ async fn a_straddling_block_behind_a_held_volume_repairs_in_place_rar4_encryptio
     )
     .await;
 }
+
+/// The lost cohort's size in the job's retained PAR3 view, `None` while the
+/// runtime has no settled view to offer.
+fn par3_lost_blocks(pipeline: &Pipeline, job_id: JobId) -> Option<u64> {
+    let runtime = pipeline.par3_runtime.as_ref()?;
+    let mut views = runtime.assessments(job_id).peekable();
+    views.peek()?;
+    Some(
+        views
+            .flat_map(|(_, view)| view.requirements.iter())
+            .map(|requirement| requirement.lost)
+            .sum(),
+    )
+}
+
+/// Every article of the volume after the lost tail lands behind the cipher
+/// block that tail took with it, so each one is held and none is placed. A
+/// held article writes no destination, yet it is posted bytes the volume's
+/// PAR3 image serves. The image published before it landed must not stand:
+/// the last article to arrive, like every other, owes the volume a fresh
+/// publication, and the assessment over it counts that article's blocks as
+/// present rather than lost.
+#[tokio::test]
+async fn a_held_only_article_republishes_its_par3_image() {
+    const ARTICLES_EACH: usize = 11;
+    let member = "coral.meridian.s02e02.mkv";
+    let payload: Vec<u8> = (0..48_000u32).map(|index| (index % 241) as u8).collect();
+    let volumes = encrypted_store_set(member, &payload, 4, PASSWORD, Some(PASSWORD), true);
+    let carriers = par3_carriers_over(&volumes, PAR2_SLICE_BYTES, 64);
+    let index = carriers
+        .iter()
+        .position(|(filename, _)| !filename.contains(".vol"))
+        .expect("the PAR3 index");
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(52_300);
+    let mut spec = direct_store_job_spec_with_articles("Coral Meridian", &volumes, ARTICLES_EACH);
+    spec.password = Some(PASSWORD.to_owned());
+    let carrier_indices = append_single_article_files(&mut spec, &carriers);
+    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let (filename, bytes) = &carriers[index];
+    submit_decoded_segment_declaring(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: carrier_indices[index],
+        },
+        0,
+        0,
+        bytes,
+        filename,
+        None,
+        true,
+        None,
+        bytes.len() as u64,
+    )
+    .await;
+    settle_par3_work(&mut pipeline, job_id).await;
+
+    // Everything but the third volume, then the third volume's articles with
+    // two interior ones held back. The last arrival is one of them: it
+    // carries no header or end block the envelope would take, and it leaves
+    // the volume incomplete, so no placement anywhere follows it.
+    let mut arrivals: Vec<(u32, u32)> = [0u32, 1, 3, 2]
+        .into_iter()
+        .flat_map(|ordinal| (0..ARTICLES_EACH as u32).map(move |article| (ordinal, article)))
+        .filter(|arrival| !LOST.contains(arrival) && *arrival != (2, 2) && *arrival != (2, 5))
+        .collect();
+    arrivals.push((2, 5));
+    let (last, earlier) = arrivals.split_last().unwrap();
+    for &(ordinal, article) in earlier {
+        submit_volume_article_indexed_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            ordinal,
+            ordinal,
+            article,
+            ARTICLES_EACH,
+        )
+        .await;
+        pipeline.refresh_par3_sources(job_id).unwrap();
+        settle_par3_work(&mut pipeline, job_id).await;
+    }
+    let before = par3_lost_blocks(&pipeline, job_id).expect("a settled PAR3 view");
+    assert!(
+        !pipeline.par3_runtime.as_ref().unwrap().has_work(job_id),
+        "the runtime is idle over the published images before the last article"
+    );
+
+    let covered_before = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .unwrap()
+        .volume_coverage(last.0);
+    submit_volume_article_indexed_of(
+        &mut pipeline,
+        job_id,
+        &volumes,
+        last.0,
+        last.0,
+        last.1,
+        ARTICLES_EACH,
+    )
+    .await;
+    assert_eq!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .unwrap()
+            .volume_coverage(last.0),
+        covered_before,
+        "the last article is held, not placed"
+    );
+    assert!(
+        pipeline.par3_runtime.as_ref().unwrap().has_work(job_id),
+        "a held article owes its volume a fresh PAR3 publication"
+    );
+
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let after = par3_lost_blocks(&pipeline, job_id).expect("a settled PAR3 view");
+    assert!(
+        after < before,
+        "the held article's blocks must verify once republished (lost {before} -> {after})"
+    );
+}

@@ -1,6 +1,11 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
-import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
+import {
+  HARDWARE_PROFILE_QUERY,
+  SET_HARDWARE_PROFILE_MUTATION,
+  SETTINGS_QUERY,
+  UPDATE_SETTINGS_MUTATION,
+} from "@/graphql/queries";
 import { useLanguageSettings, useTranslate } from "@/lib/context/translate-context";
 import { AVAILABLE_LANGUAGES } from "@/lib/i18n";
 import {
@@ -10,7 +15,15 @@ import {
   type DuplicatePolicy,
 } from "@/features/duplicates/duplicate-policy";
 import { useUpdateCheck } from "@/features/updates/use-update-check";
-import { SecondaryButton } from "../../../components/controls";
+import { Leaf, Rocket, Scale } from "lucide-react";
+import {
+  initialProfile,
+  offersProfileChoice,
+  profileName,
+  type HardwareProfileName,
+  type HardwareProfileSettings,
+} from "../../../data/hardware-profiles";
+import { SecondaryButton, Select } from "../../../components/controls";
 import {
   SettingsBlocks,
   useDraft,
@@ -34,7 +47,6 @@ interface GeneralSettings {
   cleanupAfterExtract: boolean;
   maxRetries: number;
   propagationDelaySecs: number;
-  ipReplacementTrialExtraConnections: number;
   enableSrrdbLookup: boolean;
   duplicatePolicy: DuplicatePolicy;
 }
@@ -84,6 +96,10 @@ export function GeneralPanel() {
   const t = useTranslate();
   const { uiLanguage, setLanguagePreference } = useLanguageSettings();
   const [{ data, fetching }, reexecute] = useQuery<{ settings: GeneralSettings }>({ query: SETTINGS_QUERY });
+  const [{ data: profileData }] = useQuery<{ hardwareProfile: HardwareProfileSettings }>({
+    query: HARDWARE_PROFILE_QUERY,
+  });
+  const profileSettings = profileData?.hardwareProfile ?? null;
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -122,7 +138,6 @@ export function GeneralPanel() {
           cleanupAfterExtract: values.cleanupAfterExtract,
           maxRetries: values.maxRetries,
           propagationDelaySecs: values.propagationDelaySecs,
-          ipReplacementTrialExtraConnections: values.ipReplacementTrialExtraConnections,
           enableSrrdbLookup: values.enableSrrdbLookup,
           duplicatePolicy: values.duplicatePolicy,
         },
@@ -206,18 +221,6 @@ export function GeneralPanel() {
               },
             },
             {
-              id: "ipReplacement",
-              label: t("next.general.trialConnection"),
-              help: t("next.general.trialConnectionHelp"),
-              keywords: "ip replacement trial connections",
-              control: {
-                kind: "toggle",
-                value: values.ipReplacementTrialExtraConnections > 0,
-                onChange: (next) =>
-                  draft.set({ ipReplacementTrialExtraConnections: next ? 1 : 0 }),
-              },
-            },
-            {
               id: "srrdb",
               label: t("next.general.srrdb"),
               help: t("next.general.srrdbHelp"),
@@ -229,6 +232,16 @@ export function GeneralPanel() {
               },
             },
           ],
+        }
+      : null,
+    profileSettings && offersProfileChoice(profileSettings)
+      ? {
+          kind: "custom",
+          id: "performance",
+          title: t("next.performance.title"),
+          note: t("next.performance.body"),
+          searchText: "performance profile hardware memory threads efficient balanced",
+          body: <PerformanceProfile settings={profileSettings} />,
         }
       : null,
     values
@@ -317,16 +330,76 @@ export function GeneralPanel() {
   return <SettingsBlocks blocks={blocks} loading={fetching && !data} />;
 }
 
+/**
+ * The hardware profile, saved the moment a profile is picked.
+ *
+ * It is not part of the panel's draft: the daemon validates the pick against
+ * the machine it is running on, and a refusal belongs beside the select rather
+ * than in the top bar's Save.
+ */
+function PerformanceProfile({ settings }: { settings: HardwareProfileSettings }) {
+  const t = useTranslate();
+  const [state, setProfile] = useMutation(SET_HARDWARE_PROFILE_MUTATION);
+  const [chosen, setChosen] = useState<HardwareProfileName | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // The mutation answers with the whole setting, so a save is visible without
+  // asking the daemon again.
+  const saved = (state.data?.setHardwareProfile as HardwareProfileSettings | undefined) ?? settings;
+  const value = chosen ?? initialProfile(saved);
+
+  const pick = (next: HardwareProfileName) => {
+    setChosen(next);
+    setError(null);
+    void setProfile({ profile: next }).then((result) => {
+      if (result.error) {
+        setChosen(null);
+        setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      }
+    });
+  };
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6">
+      <span className="text-[13px] font-semibold text-wv-fg">{t("next.performance.profile")}</span>
+      <div className="ml-auto flex min-w-0 flex-col items-end gap-2">
+      <Select
+        label={t("next.performance.profile")}
+        options={saved.options.map((option) => {
+          const Icon = { EFFICIENT: Leaf, BALANCED: Scale, PERFORMANCE: Rocket }[option.profile];
+          return {
+            value: option.profile,
+            label: profileName(t, option.profile),
+            icon: <Icon aria-hidden="true" size={16} strokeWidth={1.5} className="flex-none text-wv-muted" />,
+          };
+        })}
+        value={value}
+        onChange={pick}
+        disabled={state.fetching}
+      />
+      {saved.selected === null ? (
+        <p className="text-[11.5px] text-wv-dim">{t("next.performance.notConfirmed")}</p>
+      ) : null}
+      {error ? (
+        <p role="alert" className="text-[12.5px] text-wv-error-text">
+          {error}
+        </p>
+      ) : null}
+      </div>
+    </div>
+  );
+}
+
 /** A button that asks the release checker to look now, and what it last found. */
 function UpdateCheck() {
   const t = useTranslate();
   const { busy, summary, failed, check } = useUpdateCheck();
   return (
-    <div className="flex min-w-0 flex-col items-start gap-2">
+    <div className="flex min-w-0 max-w-full flex-col items-end gap-2">
       <SecondaryButton icon="refresh" disabled={busy} onClick={check}>
         {t("next.general.checkNow")}
       </SecondaryButton>
-      <span role="status" className={failed ? "text-[12.5px] text-wv-error" : "text-[12.5px] text-wv-dim"}>
+      <span role="status" className={`max-w-full text-right text-[12.5px] whitespace-normal [overflow-wrap:anywhere] ${failed ? "text-wv-error" : "text-wv-dim"}`}>
         {summary}
       </span>
     </div>

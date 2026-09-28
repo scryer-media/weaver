@@ -18,6 +18,7 @@ const GIB: u64 = 1024 * MIB;
 const TIB: u64 = 1024 * GIB;
 const MIN_MEMORY_LIMIT: u64 = 64 * MIB;
 const MAX_MEMORY_LIMIT: u64 = 64 * GIB;
+const MAX_MEMORY_ENV: &str = "WEAVER_EXTRACTION_MAX_MEMORY_BYTES";
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,27 @@ pub(crate) struct ExtractionLimits {
 
 impl ExtractionLimits {
     pub(crate) fn from_env(complete_dir: &Path) -> Result<Self, String> {
+        Self::resolve(complete_dir, None)
+    }
+
+    /// The same limits with the memory ceiling the chosen hardware profile
+    /// decides. An explicit `WEAVER_EXTRACTION_MAX_MEMORY_BYTES` still wins,
+    /// and says so once, so an operator who pinned the ceiling is not left
+    /// wondering why the profile did nothing.
+    pub(crate) fn from_env_with_profile_ceiling(
+        complete_dir: &Path,
+        ceiling_bytes: u64,
+    ) -> Result<Self, String> {
+        if std::env::var(MAX_MEMORY_ENV).is_ok() {
+            info!(
+                variable = MAX_MEMORY_ENV,
+                "extraction memory ceiling is pinned by the environment; the hardware profile's ceiling is not used"
+            );
+        }
+        Self::resolve(complete_dir, Some(ceiling_bytes))
+    }
+
+    fn resolve(complete_dir: &Path, profile_ceiling_bytes: Option<u64>) -> Result<Self, String> {
         // The completed-download directory may not exist yet at startup; its
         // nearest existing ancestor answers for the filesystem the reserve is
         // derived from.
@@ -40,9 +62,15 @@ impl ExtractionLimits {
             .ok()
             .map(|space| space.total_bytes);
         let default_min_free = default_disk_reserve_bytes(total_filesystem_bytes);
-        let detected_memory = crate::runtime::system_probe::detect_total_memory_bytes()
-            .unwrap_or(2 * MAX_MEMORY_LIMIT);
-        let default_memory = (detected_memory / 2).clamp(MIN_MEMORY_LIMIT, MAX_MEMORY_LIMIT);
+        // Without a profile — the fallback path, which builds its own limits
+        // without the runtime's — half the machine's memory stands in.
+        let default_memory = profile_ceiling_bytes
+            .unwrap_or_else(|| {
+                crate::runtime::system_probe::detect_total_memory_bytes()
+                    .unwrap_or(2 * MAX_MEMORY_LIMIT)
+                    / 2
+            })
+            .clamp(MIN_MEMORY_LIMIT, MAX_MEMORY_LIMIT);
 
         Ok(Self {
             max_job_bytes: parse_positive_u64("WEAVER_EXTRACTION_MAX_JOB_BYTES", 2 * TIB)?,
@@ -54,10 +82,7 @@ impl ExtractionLimits {
                 "WEAVER_EXTRACTION_MIN_FREE_BYTES",
                 default_min_free,
             )?,
-            max_memory_bytes: parse_positive_u64(
-                "WEAVER_EXTRACTION_MAX_MEMORY_BYTES",
-                default_memory,
-            )?,
+            max_memory_bytes: parse_positive_u64(MAX_MEMORY_ENV, default_memory)?,
         })
     }
 }
@@ -680,8 +705,17 @@ impl JobExtractionBudget {
         self: &Arc<Self>,
         floor: u64,
     ) -> Result<MemoryPermit, String> {
+        self.reserve_memory_up_to_ceiling_wait_capped(floor, u64::MAX)
+    }
+
+    /// A profile caps optional allowance, never the decoder's required floor.
+    pub(crate) fn reserve_memory_up_to_ceiling_wait_capped(
+        self: &Arc<Self>,
+        floor: u64,
+        cap: u64,
+    ) -> Result<MemoryPermit, String> {
         self.reserve_memory(DecoderRequest::UpToCeiling {
-            ceiling: self.max_memory_bytes().max(floor),
+            ceiling: self.max_memory_bytes().min(cap.max(1)).max(floor),
             floor,
         })
     }

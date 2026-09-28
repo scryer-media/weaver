@@ -38,6 +38,7 @@
 //! # }
 //! ```
 
+mod address_plan;
 pub mod blocking;
 pub mod client;
 pub mod codec;
@@ -63,6 +64,9 @@ pub mod uu;
 mod test_support;
 
 // Re-export primary types for convenience.
+pub use address_plan::{
+    ADDRESS_REPLAN_INTERVAL, AddressPlanSnapshot, AddressRoute, AddressSnapshot, RaceReason,
+};
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{
     BodyLaneBatchStats, BodyLaneLease, BodyLaneMode, BodyServerSelection, DecodedBody,

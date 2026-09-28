@@ -317,7 +317,6 @@ release** — migrate dashboards and alerts now.
 | `weaver_post_processing_output_truncations` | `weaver_post_processing_output_truncations_total` | counters end in `_total` |
 | `weaver_pipeline_download_lanes_active_total` | `weaver_pipeline_download_lanes` | gauges do not end in `_total` |
 | `weaver_server_latency_ms` | `weaver_server_latency_seconds` | base units are seconds |
-| `weaver_ip_rtt_ewma_slowest_ms` | `weaver_ip_rtt_ewma_slowest_seconds` | base units are seconds |
 | `weaver_pipeline_disk_write_latency_microseconds` | `weaver_pipeline_disk_write_latency_seconds` | base units are seconds |
 | `weaver_server_capacity_penalty_until_epoch_ms` | `weaver_server_capacity_penalty_until_seconds` | timestamps are unix seconds |
 | `weaver_pipeline_decode_rate_mebibytes_per_second` | `weaver_pipeline_decode_rate_bytes_per_second` | base units are bytes |
@@ -416,14 +415,6 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_download_scheduler_idle_with_servable_total` | counter | — | Scheduler answered idle while a job still had a servable article on that server; always zero when the scheduler is correct. |
 | `weaver_pipeline_body_proof_events_total` | counter | `event` | BODY pipelining proof events. |
 | `weaver_pipeline_body_replay_items_total` | counter | — | BODY items returned unresolved after a lane reset or failure. |
-| `weaver_ip_replacement_trial_extra_connections` | gauge | — | Configured over-max IP replacement trial burst budget. |
-| `weaver_ip_replacement_burst_active` | gauge | — | Whether an over-max IP replacement trial is active. |
-| `weaver_ip_replacement_over_max_connections` | gauge | — | Current over-max IP replacement trial connections. |
-| `weaver_ip_rtt_ewma_entries` | gauge | — | Number of tracked per-server/per-IP BODY RTT EWMAs. |
-| `weaver_ip_rtt_ewma_slowest_ms` | gauge | — | Slowest tracked per-IP BODY RTT EWMA in milliseconds. **Deprecated — use `weaver_ip_rtt_ewma_slowest_seconds`.** |
-| `weaver_ip_rtt_ewma_slowest_seconds` | gauge | — | Slowest tracked per-IP BODY RTT EWMA. |
-| `weaver_ip_replacement_trials_total` | counter | `outcome` | IP replacement trial outcomes. |
-| `weaver_ip_replacement_old_connections_retired_total` | counter | — | Old-IP connections retired after accepted replacement trials. |
 | `weaver_pipeline_download_observed_limiter` | gauge | `limiter` | Observed downloader limiter derived from pressure, queue, and server permits; exactly one limiter is 1. |
 | `weaver_pipeline_download_pressure_stalls_total` | counter | — | Hard pressure stalls started. |
 | `weaver_pipeline_download_restart_durable_lead_blocked_total` | counter | — | Restart durable lead dispatch blocks. |
@@ -474,6 +465,10 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_server_connections_configured` | gauge | `server_id`, `server` | Operator-configured maximum connections per server. |
 | `weaver_server_capacity_penalty_until_epoch_ms` | gauge | `server_id`, `server` | Provider over-limit holdoff deadline in unix epoch milliseconds. **Deprecated — use `weaver_server_capacity_penalty_until_seconds`.** |
 | `weaver_server_capacity_penalty_until_seconds` | gauge | `server_id`, `server` | Provider over-limit holdoff deadline as a unix timestamp. |
+| `weaver_server_address_info` | gauge | `server_id`, `server`, `address` | Resolved server addresses; 1 for the address new connections are pinned to, 0 for the rest. |
+| `weaver_server_address_connect_seconds` | gauge | `server_id`, `server`, `address` | Smoothed TCP connect time per resolved server address. |
+| `weaver_server_address_races_total` | counter | `server_id`, `server`, `outcome` | Address races run to pick the address new connections dial, by outcome. |
+| `weaver_server_address_repins_total` | counter | `server_id`, `server`, `reason` | Changes of the pinned server address, by the reason the race ran. |
 | `weaver_server_premature_deaths` | gauge | `server_id`, `server` | Recent connections that died before reaching 60s of age. |
 | `weaver_nntp_runtime_generation` | gauge | — | Active NNTP runtime generation. |
 | `weaver_server_download_lifetime_bytes` | counter | `server_id`, `server` | Raw NNTP BODY bytes received per durable server. **Deprecated — use `weaver_server_download_bytes_total`.** |

@@ -1090,6 +1090,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let existing = Config {
             data_dir: "/db".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
@@ -1105,7 +1106,6 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,

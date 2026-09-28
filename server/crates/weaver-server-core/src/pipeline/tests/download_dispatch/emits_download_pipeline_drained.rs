@@ -2007,7 +2007,6 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
         lane_id: 0,
         runtime_generation: 0,
         server_idx: 0,
-        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         response_tx,

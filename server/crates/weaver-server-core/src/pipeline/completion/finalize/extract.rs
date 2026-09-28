@@ -161,13 +161,15 @@ pub(in crate::pipeline) enum SevenZipDecodeMemory {
     ReservedForFixedThreads {
         /// `next_header_size` from the signature header.
         end_header_bytes: u64,
+        /// Hardware-profile limit for optional, unmeasured decoder allowance.
+        allowance_cap: u64,
     },
     /// The chase: one thread at the download frontier, so output starts
     /// before the block has finished downloading, and more threads only while
     /// complete runs have arrived faster than that one thread decodes them.
     /// The decode pass reserves the decoders alone; each thread past the
     /// first is paid for when the chase widens onto it, only if the memory is
-    /// free then, and given back when it narrows.
+    /// free then, and held until the decode ends; see [`WideningRoom`].
     ReservedPerPass {
         /// `next_header_size` from the signature header — the end header the
         /// metadata pass buffers whole, and which the decode pass parses again.
@@ -180,8 +182,8 @@ pub(in crate::pipeline) enum SevenZipDecodeMemory {
 /// The end header itself is bounded against the ceiling before the chase is
 /// admitted. An *encoded* header is a packed stream of its own with a
 /// declared unpacked size the signature header does not carry, so this margin
-/// stands in for that decode; it is the same exposure the conventional path
-/// has under its ceiling permit, made explicit rather than removed.
+/// stands in for that decode. The conventional path, which never parks in
+/// this pass, is admitted up to the ceiling instead.
 pub(in crate::pipeline) const CHASE_HEADER_PASS_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
 /// Everything the chase's decode pass holds beyond the decoders and the end
 /// header: the gated reader's buffer, a member's output writer, the CRC
@@ -291,6 +293,19 @@ impl SevenZipDecodeReservation {
         match self {
             Self::Measured(bytes) => budget.reserve_memory_wait(bytes),
             Self::UpToCeiling { floor } => budget.reserve_memory_up_to_ceiling_wait(floor),
+        }
+    }
+
+    fn reserve_capped(
+        self,
+        budget: &Arc<JobExtractionBudget>,
+        cap: u64,
+    ) -> Result<MemoryPermit, String> {
+        match self {
+            Self::Measured(bytes) => budget.reserve_memory_wait(bytes),
+            Self::UpToCeiling { floor } => {
+                budget.reserve_memory_up_to_ceiling_wait_capped(floor, cap)
+            }
         }
     }
 }
@@ -436,7 +451,7 @@ pub(in crate::pipeline) enum SevenZipDecodeThreads {
 }
 
 /// The widening room an adaptive decode holds: one permit per thread past the
-/// first, so the decode is on exactly `held + 1` threads.
+/// first that it has ever widened onto, kept until the decode ends.
 ///
 /// Room is taken without waiting and without registering as a waiter. A chase
 /// that waited for room would hold its decoders while it did, and one that
@@ -446,6 +461,8 @@ pub(in crate::pipeline) enum SevenZipDecodeThreads {
 struct WideningRoom {
     budget: Arc<JobExtractionBudget>,
     held: Vec<MemoryPermit>,
+    /// Threads the decoder is set to, never more than the room paid for.
+    threads: u32,
 }
 
 impl WideningRoom {
@@ -453,21 +470,29 @@ impl WideningRoom {
         Self {
             budget,
             held: Vec::new(),
+            threads: 1,
         }
     }
 
-    /// Threads the decode is paid for.
+    /// Threads the decode is set to.
+    #[cfg(test)]
     fn threads(&self) -> u32 {
+        self.threads
+    }
+
+    /// Threads the held room pays for.
+    fn paid(&self) -> u32 {
         u32::try_from(self.held.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1)
     }
 
-    /// Take room for up to `target` threads, a thread at a time, stopping at
-    /// the first thread there is no room for. Returns the threads now paid
-    /// for, which is never more than `target` unless it already was.
+    /// Widen to up to `target` threads, reusing room already held before
+    /// taking more a thread at a time, and stopping at the first thread there
+    /// is no room for. Returns the threads the decode is now set to, which is
+    /// never more than `target` unless it already was.
     fn widen_to(&mut self, target: u32) -> u32 {
-        while self.threads() < target {
+        while self.paid() < target {
             match self
                 .budget
                 .try_reserve_memory(CHASE_WIDENING_BYTES_PER_THREAD)
@@ -476,20 +501,21 @@ impl WideningRoom {
                 None => break,
             }
         }
-        self.threads()
+        self.threads = self.threads.max(target.min(self.paid()));
+        self.threads
     }
 
-    /// Give back the room for every thread past `threads`.
+    /// Set the decode to `threads`, keeping the room for every thread it
+    /// narrows off.
     ///
-    /// The room goes back as soon as the narrower count is set, although the
-    /// decoder only applies it at its next run boundary, and nothing it
-    /// reports says when it has: its progress carries the requested ceiling,
-    /// and its spawned workers outlive a narrowing. So the run in progress can
-    /// decode on threads no longer paid for. That over-commit lasts one run
-    /// and stays within the reader's memory limit.
+    /// The decoder applies a narrower count only at its next run boundary,
+    /// nothing it reports says when it has, and its spawned workers outlive a
+    /// narrowing with their runs still in hand. Room given back here could be
+    /// reserved by another extraction while those workers still hold it, so
+    /// the process ceiling would no longer bound them. The room goes back when
+    /// the decode ends, and a later widening reuses it.
     fn narrow_to(&mut self, threads: u32) {
-        let keep = usize::try_from(threads.max(1) - 1).unwrap_or(usize::MAX);
-        self.held.truncate(keep);
+        self.threads = threads.clamp(1, self.paid());
     }
 }
 
@@ -647,8 +673,8 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
                     };
                     note_adaptive_backlog(job_id, progress.pending_runs);
                     let target = chase_decode_thread_target(progress.pending_runs, ceiling);
-                    // Widening is paid for before the decoder is told; the
-                    // decoder is narrowed before its room is given back.
+                    // Widening is paid for before the decoder is told, and
+                    // narrowing keeps its room until the walk ends.
                     let next = if target > applied {
                         room.widen_to(target)
                     } else {
@@ -790,21 +816,31 @@ where
     let job_id = *job_id;
 
     let end_header_bytes = match decode_memory {
-        SevenZipDecodeMemory::ReservedForFixedThreads { end_header_bytes }
+        SevenZipDecodeMemory::ReservedForFixedThreads {
+            end_header_bytes, ..
+        }
         | SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => *end_header_bytes,
     };
 
     // Metadata pass: every member's path and declared size is checked before
     // anything is created on disk.
     //
-    // Only a header-sized permit is held through this pass. On a chase's gated
+    // A chase holds only a header-sized permit through this pass: on its gated
     // reader the pass parks until the archive's tail arrives, and that park
-    // used to sit under the whole ceiling.
+    // used to sit under the whole ceiling. The conventional reader never parks,
+    // so it is admitted up to the ceiling, which is what an encoded header's
+    // decode may allocate under the reader's limits.
     let (known_total, decode_reservation) = {
-        let _header_permit = budget.reserve_memory_wait(chase_header_pass_memory_bytes(
-            end_header_bytes,
-            budget.max_memory_bytes(),
-        ))?;
+        let header_floor =
+            chase_header_pass_memory_bytes(end_header_bytes, budget.max_memory_bytes());
+        let _header_permit = match decode_memory {
+            SevenZipDecodeMemory::ReservedForFixedThreads { .. } => {
+                budget.reserve_memory_up_to_ceiling_wait(header_floor)?
+            }
+            SevenZipDecodeMemory::ReservedPerPass { .. } => {
+                budget.reserve_memory_wait(header_floor)?
+            }
+        };
         let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
         let archive_reader = sevenz_turbo::ArchiveReader::with_limits(
             reader,
@@ -862,7 +898,12 @@ where
     // Held from here to the end of the decode, parks included. A chase parked
     // mid-block has its dictionary genuinely allocated, so the permit stays;
     // what makes that harmless is its size — a dictionary, not a ceiling.
-    let decode_permit = decode_reservation.reserve(budget)?;
+    let decode_permit = match decode_memory {
+        SevenZipDecodeMemory::ReservedForFixedThreads { allowance_cap, .. } => {
+            decode_reservation.reserve_capped(budget, *allowance_cap)?
+        }
+        SevenZipDecodeMemory::ReservedPerPass { .. } => decode_reservation.reserve(budget)?,
+    };
     let decode_granted = decode_permit.bytes();
 
     let mut extracted_members = Vec::new();
@@ -2660,6 +2701,9 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let sevenz_decode_threads =
             u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
+        // Read when the extraction is admitted, so a hardware profile chosen
+        // since the last job took its allowance applies to this one.
+        let sevenz_decode_memory = self.shared_state.sevenz_decode_memory_bytes();
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
 
         // Whatever the chase left behind. Taken here, on the orchestrator, but
@@ -2717,6 +2761,7 @@ impl Pipeline {
                         phase_counters,
                         decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
                             end_header_bytes,
+                            allowance_cap: sevenz_decode_memory,
                         },
                         decode_threads: sevenz_decode_threads,
                     };

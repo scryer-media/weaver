@@ -566,6 +566,22 @@ async fn installed_set_still_present(
             }
         }
     }
+    for directory in &marker.directories {
+        let path = plan.destination_path(directory);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "installed directory {directory} is not a directory"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "installed directory {directory} could not be probed: {error}"
+                ));
+            }
+        }
+    }
     Ok(marker)
 }
 
@@ -850,6 +866,13 @@ impl Pipeline {
         // mismatch produces.
         let mut restored: HashMap<String, DirectSet> = HashMap::new();
         let mut expected: HashMap<String, ExpectedSet> = HashMap::new();
+        // The `-hp` gate's candidates, harvested once for the job and only when
+        // a set about to rebuild still wants one. The rebuild re-proves an `-hp`
+        // set's archive key — which is also its file key — against the
+        // archive's own check, and a ring with no candidates refuses under a
+        // sticky `NoPassword`: the whole set would redownload for a password
+        // the job was holding all along. `None` until the first set asks.
+        let mut header_candidates: Option<Vec<crate::jobs::model::ArchivePasswordCandidate>> = None;
         for plan in &admitted {
             if installed.contains_key(&plan.set_name) {
                 continue;
@@ -872,6 +895,15 @@ impl Pipeline {
             let volume_facts = facts.get(&set_name).cloned().unwrap_or_default();
             if volume_facts.is_empty() {
                 continue;
+            }
+            if set.router.wants_header_password() {
+                let harvest = header_candidates
+                    .get_or_insert_with(|| self.harvest_direct_header_passwords(job_id));
+                super::wiring::offer_direct_header_candidates(
+                    &mut set,
+                    spec.password.as_deref(),
+                    harvest,
+                );
             }
             if let Err(reason) = set.restore_layout(&volume_facts) {
                 tracing::info!(
@@ -1060,6 +1092,17 @@ impl Pipeline {
                     let mut set = DirectSet::new(job_id, plan.clone());
                     self.direct_store.apply_ceilings(&mut set);
                     set.router.set_password(spec.password.as_deref());
+                    // A harvest above has already been kept for the job, and
+                    // the live seam only offers a harvest when it runs; hand it
+                    // to this fresh set here instead. With no harvest yet, the
+                    // live seam runs it and offers it on the first article.
+                    if let Some(harvest) = header_candidates.as_deref() {
+                        super::wiring::offer_direct_header_candidates(
+                            &mut set,
+                            spec.password.as_deref(),
+                            harvest,
+                        );
+                    }
                     let par2_available = super::plan::spec_carries_par2(spec);
                     set.router.note_par2_available(par2_available);
                     set.router

@@ -948,7 +948,7 @@ impl Pipeline {
         let policy_source = DeliveryPolicySource::Persisted(self.db.clone());
 
         let move_done_tx = self.move_done_tx.clone();
-        info!(
+        debug!(
             job_id = job_id.0,
             dest = %dest.display(),
             "starting final move"
@@ -1023,7 +1023,7 @@ impl Pipeline {
                 let _ = self
                     .event_tx
                     .send(PipelineEvent::MoveToCompleteFinished { job_id });
-                info!(
+                debug!(
                     job_id = job_id.0,
                     moved = outcome.moved_entries,
                     dest = %dest.display(),

@@ -72,14 +72,6 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_probe_yield_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::IpReplacementRetired => self
-                .metrics
-                .download_lane_parks_ip_replacement_retired_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::ProofFailure => self
-                .metrics
-                .download_lane_parks_proof_failure_total
-                .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::Capacity | LaneParkReason::ServerQuota => 0,
             LaneParkReason::Error => self
                 .metrics
@@ -488,8 +480,8 @@ impl Pipeline {
                 ServerPipelineExplorer::seeded(proven_depth, probe_latency, None)
             });
         explorer.note_supports_pipelining(observation.supports_pipelining);
-        if let Some(latency) = observation.latency {
-            explorer.note_latency(latency);
+        if let Some(latency) = observation.latency_sample {
+            explorer.note_latency_sample(latency, observation.cold);
         }
         if let Some(transfer) = observation.transfer {
             explorer.note_transfer(transfer);
@@ -503,6 +495,7 @@ impl Pipeline {
                 observation.payload_bytes,
                 observation.policy_elapsed,
                 pressure_clear,
+                observation.cold,
             );
         }
 
@@ -789,7 +782,6 @@ impl Pipeline {
             completion_critical: lease.completion_critical,
             reason: LaneParkReason::Error,
             release_connection_slot: true,
-            release_ip_replacement_burst: false,
         });
     }
 
@@ -839,7 +831,6 @@ impl Pipeline {
                         completion_critical,
                         reason: LaneParkReason::Capacity,
                         release_connection_slot: true,
-                        release_ip_replacement_burst: false,
                     });
                     return;
                 }
@@ -890,7 +881,8 @@ impl Pipeline {
                             server_idx: None,
                             mode: lane_mode,
                             supports_pipelining: false,
-                            latency: None,
+                            latency_sample: None,
+                            cold: false,
                             transfer: None,
                             payload_bytes: 0,
                             policy_elapsed: Duration::ZERO,
@@ -929,7 +921,6 @@ impl Pipeline {
                         LaneParkReason::Error
                     },
                     release_connection_slot: true,
-                    release_ip_replacement_burst: false,
                 });
             }
             OwnedDownloadLaneEvent::BatchComplete {
@@ -1046,6 +1037,23 @@ impl Pipeline {
                 format!("{server_idx}:{snapshot:?}")
             })
             .collect();
+        // Losing a selection race to another lane is ordinary and retries at
+        // once. Only a window that swallowed more of them is worth a warning.
+        if error.kind() == "selection_contended" && suppressed_since_last == 0 {
+            debug!(
+                job_id = lease.job_id.0,
+                kind = error.kind(),
+                error = %error,
+                requeued_works = lease.works.len(),
+                requeue = error.should_requeue_owned_work(),
+                suppressed_since_last,
+                candidate_servers = ?servers,
+                candidate_recovery = ?recovery,
+                excluded_servers = ?lease.dial_exclude_servers,
+                "owned blocking download lane could not be acquired"
+            );
+            return;
+        }
         warn!(
             job_id = lease.job_id.0,
             kind = error.kind(),
@@ -1057,6 +1065,10 @@ impl Pipeline {
             candidate_recovery = ?recovery,
             excluded_servers = ?lease.dial_exclude_servers,
             "owned blocking download lane could not be acquired"
+        );
+        crate::runtime::job_debug_ring::dump(
+            lease.job_id.0,
+            "owned blocking download lane could not be acquired",
         );
     }
 
@@ -1130,7 +1142,6 @@ impl Pipeline {
             parked.mode = owner.mode;
             parked.completion_critical = owner.completion_critical;
             parked.release_connection_slot = std::mem::take(&mut owner.connection);
-            parked.release_ip_replacement_burst = std::mem::take(&mut owner.ip_replacement);
             if owner.outstanding.is_empty() {
                 self.download_lane_owners.remove(&parked.lane_id);
             }
@@ -1174,10 +1185,6 @@ impl Pipeline {
                     }
                 }
             }
-        }
-        if parked.release_ip_replacement_burst {
-            self.ip_replacement_burst_active = false;
-            self.metrics.set_ip_replacement_burst_active(false);
         }
         self.publish_active_stage_metrics();
     }

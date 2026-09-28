@@ -208,12 +208,12 @@ impl TestHarness {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,
             direct_unpack: None,
             delivery_naming: None,
+            hardware_profile: None,
             metrics: Default::default(),
             config_path: None,
         };
@@ -693,9 +693,6 @@ fn spawn_test_scheduler(
                 | SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {
-                    let _ = reply.send(());
-                }
                 SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
@@ -813,7 +810,7 @@ fn spawn_test_scheduler(
                         .expect("failed to delete history row from test db");
                     db.delete_job_events(job_id.0)
                         .expect("failed to delete history events from test db");
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(Ok(Default::default()));
                 }
                 SchedulerCommand::DeleteAllHistory {
                     delete_files,

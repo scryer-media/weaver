@@ -1,4 +1,4 @@
-use async_graphql::{Enum, InputObject, SimpleObject};
+use async_graphql::{ComplexObject, Context, Enum, InputObject, SimpleObject};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::{
@@ -48,6 +48,24 @@ impl From<CoreDirectoryBrowseListing> for DirectoryBrowseResult {
 pub struct ServiceLogsPayload {
     pub lines: Vec<String>,
     pub count: i32,
+}
+
+/// The live log filter. Changes last until the process exits.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct LogFilter {
+    /// The `RUST_LOG`-style directives in force.
+    pub directives: String,
+    /// The directives the process started with; setting blank restores them.
+    pub default_directives: String,
+}
+
+impl From<weaver_server_core::runtime::log_filter::LogFilterState> for LogFilter {
+    fn from(value: weaver_server_core::runtime::log_filter::LogFilterState) -> Self {
+        Self {
+            directives: value.directives,
+            default_directives: value.default_directives,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
@@ -157,7 +175,6 @@ pub struct Metrics {
     pub download_lanes_parking_active: u32,
     pub download_lanes_recovering_active: u32,
     pub download_lane_parks_no_work_total: u64,
-    pub download_lane_parks_ip_replacement_retired_total: u64,
     pub download_lane_parks_error_total: u64,
     pub download_lane_lease_items_total: u64,
     pub download_lane_refill_granted_total: u64,
@@ -167,18 +184,6 @@ pub struct Metrics {
     pub download_pipeline_proof_pass_total: u64,
     pub download_pipeline_cooldown_total: u64,
     pub download_pipeline_replay_items_total: u64,
-    pub ip_replacement_trial_extra_connections: u32,
-    pub ip_replacement_burst_active: bool,
-    pub ip_replacement_over_max_connections: u32,
-    pub ip_rtt_ewma_entries: u32,
-    pub ip_rtt_ewma_slowest_ms: u64,
-    pub ip_replacement_trials_started_total: u64,
-    pub ip_replacement_trials_rejected_total: u64,
-    pub ip_replacement_trials_accepted_total: u64,
-    pub ip_replacement_trials_blocked_total: u64,
-    pub ip_replacement_trials_acquire_failed_total: u64,
-    pub ip_replacement_trials_same_ip_rejected_total: u64,
-    pub ip_replacement_old_connections_retired_total: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
@@ -285,8 +290,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_lanes_parking_active: m.download_lanes_parking_active as u32,
             download_lanes_recovering_active: m.download_lanes_recovering_active as u32,
             download_lane_parks_no_work_total: m.download_lane_parks_no_work_total,
-            download_lane_parks_ip_replacement_retired_total: m
-                .download_lane_parks_ip_replacement_retired_total,
             download_lane_parks_error_total: m.download_lane_parks_error_total,
             download_lane_lease_items_total: m.download_lane_lease_items_total,
             download_lane_refill_granted_total: m.download_lane_refill_granted_total,
@@ -296,21 +299,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_pipeline_proof_pass_total: m.download_pipeline_proof_pass_total,
             download_pipeline_cooldown_total: m.download_pipeline_cooldown_total,
             download_pipeline_replay_items_total: m.download_pipeline_replay_items_total,
-            ip_replacement_trial_extra_connections: m.ip_replacement_trial_extra_connections as u32,
-            ip_replacement_burst_active: m.ip_replacement_burst_active,
-            ip_replacement_over_max_connections: m.ip_replacement_over_max_connections as u32,
-            ip_rtt_ewma_entries: m.ip_rtt_ewma_entries as u32,
-            ip_rtt_ewma_slowest_ms: m.ip_rtt_ewma_slowest_ms,
-            ip_replacement_trials_started_total: m.ip_replacement_trials_started_total,
-            ip_replacement_trials_rejected_total: m.ip_replacement_trials_rejected_total,
-            ip_replacement_trials_accepted_total: m.ip_replacement_trials_accepted_total,
-            ip_replacement_trials_blocked_total: m.ip_replacement_trials_blocked_total,
-            ip_replacement_trials_acquire_failed_total: m
-                .ip_replacement_trials_acquire_failed_total,
-            ip_replacement_trials_same_ip_rejected_total: m
-                .ip_replacement_trials_same_ip_rejected_total,
-            ip_replacement_old_connections_retired_total: m
-                .ip_replacement_old_connections_retired_total,
             segments_downloaded: m.segments_downloaded,
             segments_decoded: m.segments_decoded,
             segments_committed: m.segments_committed,
@@ -1196,6 +1184,7 @@ pub struct DiskUsage {
 
 /// Live health for one configured news server, derived from the NNTP connection pool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct ServerHealth {
     pub host: String,
     pub port: u16,
@@ -1250,6 +1239,47 @@ pub struct ServerHealth {
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,
+    /// This server's position in the connection pool, which is its
+    /// `ServerId`. Two configured servers may share a host and port, so the
+    /// pool position, not the address, says which server this is.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub pool_index: usize,
+}
+
+#[ComplexObject]
+impl ServerHealth {
+    /// The resolved address new connections to this server dial, once an
+    /// address race has picked one. Absent before the first connect and for
+    /// a server reached through a proxy.
+    async fn pinned_address(&self, ctx: &Context<'_>) -> Option<String> {
+        let live_pool = ctx
+            .data_opt::<weaver_server_core::SchedulerHandle>()
+            .and_then(|handle| handle.nntp_pool());
+        let pool = live_pool.or_else(|| {
+            ctx.data_opt::<Option<std::sync::Arc<weaver_nntp::pool::NntpPool>>>()
+                .and_then(Clone::clone)
+        })?;
+        pinned_address_in(&pool, self.pool_index, &self.host, self.port)
+    }
+}
+
+/// The pinned address of the server at `pool_index`. A pool rebuilt since the
+/// health row was read may hold a different server there; that reads as no
+/// pin rather than another server's.
+pub(crate) fn pinned_address_in(
+    pool: &weaver_nntp::pool::NntpPool,
+    pool_index: usize,
+    host: &str,
+    port: u16,
+) -> Option<String> {
+    let config = pool.server_configs().get(pool_index)?;
+    if config.host != host || config.port != port {
+        return None;
+    }
+    pool.address_plan_snapshot(weaver_nntp::ServerId(pool_index))?
+        .pinned
+        .map(|address| address.ip().to_string())
 }
 
 /// Reduce one server's health state, holdoff and socket counts to the single
@@ -1299,6 +1329,47 @@ mod tests {
     use super::*;
     use weaver_server_core::events::model::PipelineEvent;
     use weaver_server_core::jobs::JobId;
+
+    /// Two configured servers with the same host and port: a connect through
+    /// the second pins its address, and only the second reports a pin.
+    #[test]
+    fn a_pinned_address_belongs_to_its_own_server_not_its_twin() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept the one connection and close it, so the greeting read ends
+        // at once instead of waiting for a greeting that never comes.
+        let acceptor = std::thread::spawn(move || drop(listener.accept()));
+        let twin = || weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls: false,
+                ..Default::default()
+            },
+            max_connections: 1,
+            ..weaver_nntp::pool::ServerPoolConfig::default()
+        };
+        let pool = weaver_nntp::pool::NntpPool::new(weaver_nntp::pool::PoolConfig {
+            servers: vec![twin(), twin()],
+            ..Default::default()
+        });
+
+        let (config, route) = pool
+            .blocking_connect_plan(weaver_nntp::ServerId(1))
+            .unwrap();
+        // The session setup fails on the closed socket; the TCP connect
+        // before it is what pins the address.
+        let _ = weaver_nntp::BlockingNntpConnection::connect_for_group(&config, Some(&route), None);
+        acceptor.join().unwrap();
+
+        assert_eq!(pinned_address_in(&pool, 0, "127.0.0.1", port), None);
+        assert_eq!(
+            pinned_address_in(&pool, 1, "127.0.0.1", port).as_deref(),
+            Some("127.0.0.1")
+        );
+        // A row read from a different pool layout does not borrow a pin.
+        assert_eq!(pinned_address_in(&pool, 1, "127.0.0.1", port ^ 1), None);
+    }
 
     #[test]
     fn a_switched_off_server_outranks_every_other_signal() {

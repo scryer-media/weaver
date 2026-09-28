@@ -42,16 +42,17 @@ pub use jobs::{
     DuplicateAdmissionRequest, DuplicateBackfillEntry, DuplicateBackfillSource,
     DuplicateBackfillState, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary,
     DuplicateMode, DuplicatePolicy, ExtractionChunk, FieldUpdate, FileSpec, FingerprintEvidence,
-    FingerprintKind, JobFingerprint, JobId, JobInfo, JobPhase, JobPhaseProgress, JobSpec, JobState,
-    JobStatus, JobUpdate, MessageId, NntpRuntimeActivation, NzbFileId, PhaseCounters, PostState,
-    QueueMoveTarget, RecoveredJob, RestoreJobRequest, RunState, SchedulerCommand, SchedulerError,
-    SchedulerHandle, SegmentId, SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource,
-    SemanticCandidateState, SemanticDuplicate, SemanticDuplicateLifecycleEvent,
-    SemanticPromotionClaim, SemanticPromotionState, SemanticTerminalCause, ServerId,
-    ServerTransportHealth, SharedPipelineState, SubmissionOrigin, classify_semantic_terminal_cause,
-    derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
-    normalize_semantic_duplicate_key, record_semantic_duplicate_lifecycle_metric,
-    runtime_lanes_from_status_snapshot, semantic_duplicate_lifecycle_metrics_snapshot,
+    FingerprintKind, HistoryDeleteOutcome, JobFingerprint, JobId, JobInfo, JobPhase,
+    JobPhaseProgress, JobSpec, JobState, JobStatus, JobUpdate, MessageId, NntpRuntimeActivation,
+    NzbFileId, PhaseCounters, PostState, QueueMoveTarget, RecoveredJob, RestoreJobRequest,
+    RunState, SchedulerCommand, SchedulerError, SchedulerHandle, SegmentId, SegmentSpec,
+    SemanticCandidateSnapshot, SemanticCandidateSource, SemanticCandidateState, SemanticDuplicate,
+    SemanticDuplicateLifecycleEvent, SemanticPromotionClaim, SemanticPromotionState,
+    SemanticTerminalCause, ServerId, ServerTransportHealth, SharedPipelineState, SubmissionOrigin,
+    classify_semantic_terminal_cause, derive_legacy_job_status, epoch_ms_now,
+    job_status_from_persisted_str, normalize_semantic_duplicate_key,
+    record_semantic_duplicate_lifecycle_metric, runtime_lanes_from_status_snapshot,
+    semantic_duplicate_lifecycle_metrics_snapshot,
 };
 pub use operations::instrumentation::{
     ARTICLE_LATENCY_BOUNDS, AtomicHistogram, DB_OP_DURATION_BOUNDS, DECODE_TASK_DURATION_BOUNDS,
@@ -84,6 +85,7 @@ pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 pub use runtime::affinity::{
     install_tokio_worker_affinity, pin_current_thread_for_hot_download_path,
 };
+pub use runtime::hardware_profile::{HardwareProfile, ProfileTuning};
 pub use runtime::tuning::{RuntimeTuner, TunedParameters};
 
 /// Allocation counter for the tests that assert a hot path allocates nothing.

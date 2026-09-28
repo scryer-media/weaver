@@ -2,8 +2,9 @@ package weaver
 
 import (
 	"fmt"
-	"os/exec"
 	"sync"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 var (
@@ -17,7 +18,7 @@ func ensureNyuuImageBuilt() error {
 		if !envBool("E2E_FORCE_REBUILD_NYUU_IMAGE", false) && dockerImageExists(image) {
 			return
 		}
-		cmd := exec.Command("docker", dockerComposeArgs("build", "nyuu")...)
+		cmd := containerengine.Command(dockerComposeArgs("build", "nyuu")...)
 		cmd.Dir = e2eDir()
 		sharedNyuuBuildErr = runExternalCommand(cmd, "docker compose build")
 	})

@@ -44,6 +44,20 @@ impl SystemMutation {
     ///
     /// Admin-only, and the input has to echo the notice the UI displayed: the
     /// server installs the release it already found, never one the caller names.
+    /// Replace the live log filter with `RUST_LOG`-style directives. Blank
+    /// restores the directives the process started with. Not persisted: a
+    /// restart comes back up on its startup filter.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_log_filter(&self, directives: String) -> Result<crate::system::types::LogFilter> {
+        use weaver_server_core::runtime::log_filter::{LogFilterError, set_directives};
+        set_directives(&directives)
+            .map(Into::into)
+            .map_err(|error| match error {
+                LogFilterError::Invalid(_) => graphql_error("INVALID_INPUT", error.to_string()),
+                LogFilterError::NotInstalled => graphql_error("INTERNAL", error.to_string()),
+            })
+    }
+
     #[graphql(guard = "AdminGuard")]
     async fn start_application_upgrade(
         &self,

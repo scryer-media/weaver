@@ -124,6 +124,7 @@ mod tests {
     fn resolve_reads_the_config_table() {
         let mut config = Config {
             data_dir: "/tmp/weaver-direct-unpack".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
@@ -134,7 +135,6 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: crate::jobs::DuplicatePolicy::default(),
             direct_store: None,

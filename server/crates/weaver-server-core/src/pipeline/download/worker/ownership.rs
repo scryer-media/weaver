@@ -30,7 +30,6 @@ impl Pipeline {
                 completion_critical: lease.completion_critical,
                 server_idx: None,
                 connection,
-                ip_replacement: !connection,
                 outstanding: HashMap::new(),
             });
         owner.mode = lease.lane_mode;
@@ -133,7 +132,7 @@ impl Pipeline {
             return false;
         };
         let accepted = owner.outstanding.remove(&segment).is_some();
-        if owner.outstanding.is_empty() && !owner.connection && !owner.ip_replacement {
+        if owner.outstanding.is_empty() && !owner.connection {
             self.download_lane_owners.remove(&lane_id);
         }
         accepted
@@ -171,7 +170,6 @@ impl Pipeline {
                 completion_critical: owner.completion_critical,
                 reason: LaneParkReason::Error,
                 release_connection_slot: owner.connection,
-                release_ip_replacement_burst: owner.ip_replacement,
             });
         }
         self.download_restart_durable_lead_retry_after

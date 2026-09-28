@@ -33,6 +33,12 @@ const RUNG_WARMUP_WINDOW_RESPONSES: u64 = 8;
 /// whether the link has changed.
 const RUNG_WARMUP_WINDOWS: u8 = 2;
 
+/// Status-line waits held before their minimum folds into the round-trip
+/// estimate, independently of the rung window. Matches the short warm-up
+/// window, so a server whose rung window never closes refreshes its round
+/// trip about as often as one whose window is still short.
+const LATENCY_FOLD_SAMPLES: u32 = RUNG_WARMUP_WINDOW_RESPONSES as u32;
+
 /// A rung is only kept when it beats the rung below it by this much; anything
 /// less is noise on a shared link.
 const RUNG_KEEP_THROUGHPUT_RATIO: f64 = 1.05;
@@ -162,8 +168,6 @@ pub(crate) enum LaneParkReason {
     NoWork,
     Pressure,
     ProbeYield,
-    IpReplacementRetired,
-    ProofFailure,
     Capacity,
     ServerQuota,
     Error,
@@ -227,6 +231,16 @@ pub(crate) struct ServerPipelineExplorer {
     warmup_windows_left: u8,
     /// Every response folded into this window, at the current rung or below.
     window_responses: u64,
+    /// Shortest status-line wait any lane measured on a request it issued
+    /// alone during this window, split by whether the connection had already
+    /// delivered an article before. The minimum is the round trip; the mean of
+    /// the same samples carries server think time, a re-authentication after
+    /// an idle spell, or whatever else queued ahead of the status line, and
+    /// each of those asks for depth the link cannot use.
+    window_latency_warm_min: Option<Duration>,
+    window_latency_cold_min: Option<Duration>,
+    /// Status-line waits held since the last fold, warm and cold.
+    window_latency_samples: u32,
     /// Bytes and wire time of every response in the window, whatever rung it
     /// was issued at. These feed the link model — body size and wire rate —
     /// which describes the link rather than the depth, so a lane still
@@ -271,6 +285,9 @@ impl Default for ServerPipelineExplorer {
             first_climb_pending: true,
             warmup_windows_left: RUNG_WARMUP_WINDOWS,
             window_responses: 0,
+            window_latency_warm_min: None,
+            window_latency_cold_min: None,
+            window_latency_samples: 0,
             window_model_bytes: 0,
             window_wire_elapsed: Duration::ZERO,
             window_rung_responses: 0,
@@ -359,8 +376,48 @@ impl ServerPipelineExplorer {
         self.pinned_sequential
     }
 
+    #[cfg(test)]
     pub(in crate::pipeline) fn note_latency(&mut self, sample: Duration) {
         self.latency = Some(blend(self.latency, sample));
+    }
+
+    /// One status-line wait from a request a lane issued with nothing queued
+    /// ahead of it. `cold` marks the connection's first article: that wait
+    /// carries the handshake's tail — TLS session setup, authentication, the
+    /// group probe — and none of it recurs once the connection is warm.
+    ///
+    /// Samples are held and only their minimum reaches the round-trip
+    /// estimate; see `window_latency_warm_min`. They fold when the rung window
+    /// closes, and also every [`LATENCY_FOLD_SAMPLES`] samples on their own,
+    /// so a server pinned sequential or held under pressure — whose rung
+    /// window never closes — still keeps its round trip current.
+    pub(in crate::pipeline) fn note_latency_sample(&mut self, sample: Duration, cold: bool) {
+        let slot = if cold {
+            &mut self.window_latency_cold_min
+        } else {
+            &mut self.window_latency_warm_min
+        };
+        *slot = Some(slot.map_or(sample, |current| current.min(sample)));
+        self.window_latency_samples = self.window_latency_samples.saturating_add(1);
+        if self.window_latency_samples >= LATENCY_FOLD_SAMPLES {
+            self.fold_window_latency();
+        }
+    }
+
+    /// Fold the shortest status-line wait held so far into the round-trip
+    /// estimate and start holding afresh. A warm sample always wins; a cold
+    /// one is only ever a stand-in for a server that has not yet measured a
+    /// round trip at all, so a handshake never drags an estimate the warm
+    /// lanes have already settled.
+    fn fold_window_latency(&mut self) {
+        if let Some(warm) = self.window_latency_warm_min {
+            self.latency = Some(blend(self.latency, warm));
+        } else if self.latency.is_none() {
+            self.latency = self.window_latency_cold_min;
+        }
+        self.window_latency_warm_min = None;
+        self.window_latency_cold_min = None;
+        self.window_latency_samples = 0;
     }
 
     pub(in crate::pipeline) fn note_transfer(&mut self, sample: Duration) {
@@ -454,6 +511,7 @@ impl ServerPipelineExplorer {
         payload_bytes: u64,
         policy_elapsed: Duration,
         pressure_clear: bool,
+        cold: bool,
     ) -> Option<RungChange> {
         // A pinned server is out of the exploration entirely: nothing it does
         // afterwards may walk its depth back up.
@@ -463,6 +521,15 @@ impl ServerPipelineExplorer {
         // Pressure forces sequential and distorts throughput; such a sample
         // says nothing about the rung under test.
         if !pressure_clear {
+            return None;
+        }
+        // A connection's first article pays for the handshake's tail and is
+        // read through a congestion window still opening; its wire time
+        // describes neither the link nor the rung. Left in, a job's opening
+        // window — every lane's first response — would model a link several
+        // times slower than the one the download then runs on, and every
+        // reconnect afterwards would nudge the model the same way.
+        if cold {
             return None;
         }
         // A response from a *deeper* batch than the explorer is running now
@@ -517,6 +584,7 @@ impl ServerPipelineExplorer {
         // next one, by which time the shallower leases have drained.
         let rung_was_measured =
             self.window_rung_responses.saturating_mul(2) >= self.window_target_responses();
+        self.fold_window_latency();
         self.reset_window();
         self.warmup_windows_left = self.warmup_windows_left.saturating_sub(1);
 
@@ -812,10 +880,95 @@ mod tests {
         let mut change = None;
         for _ in 0..explorer.window_target_responses() {
             change = explorer
-                .note_response(now, depth, bytes_per_response, elapsed_per_response, true)
+                .note_response(
+                    now,
+                    depth,
+                    bytes_per_response,
+                    elapsed_per_response,
+                    true,
+                    false,
+                )
                 .or(change);
         }
         change
+    }
+
+    /// A connection's first article never counts toward the window, so a
+    /// job whose lanes have all just connected does not close its opening
+    /// window on handshake-era samples.
+    #[test]
+    fn cold_responses_do_not_fill_the_window() {
+        let mut explorer = explorer(300, 50);
+        let now = Instant::now();
+        let depth = explorer.current_depth();
+        for _ in 0..explorer.window_target_responses() {
+            assert_eq!(
+                explorer.note_response(now, depth, 100_000, Duration::from_millis(400), true, true),
+                None
+            );
+        }
+        assert_eq!(explorer.window_responses, 0);
+        assert_eq!(explorer.modelled_article_transfer(), None);
+        assert_eq!(explorer.current_depth(), 2);
+    }
+
+    /// The window's shortest warm status-line wait is the round trip; one
+    /// slow outlier in the same window, warm or cold, does not move it.
+    #[test]
+    fn the_window_folds_its_shortest_warm_latency() {
+        let mut explorer = explorer(300, 50);
+        let now = Instant::now();
+        explorer.note_latency_sample(Duration::from_millis(900), true);
+        explorer.note_latency_sample(Duration::from_millis(100), false);
+        explorer.note_latency_sample(Duration::from_millis(700), false);
+        explorer.note_latency_sample(Duration::from_millis(100), false);
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(300)));
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        // blend(300, 100): three quarters of the old estimate plus a quarter
+        // of the minimum, not of the 700 ms outlier or the 900 ms cold wait.
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(250)));
+        assert_eq!(explorer.window_latency_warm_min, None);
+        assert_eq!(explorer.window_latency_cold_min, None);
+    }
+
+    /// A server whose rung window never closes — pinned sequential here —
+    /// still folds its round trip every few samples.
+    #[test]
+    fn latency_folds_on_its_own_when_the_rung_window_never_closes() {
+        let mut explorer = explorer(300, 50);
+        explorer.pinned_sequential = true;
+        let now = Instant::now();
+        for _ in 0..LATENCY_FOLD_SAMPLES - 1 {
+            explorer.note_latency_sample(Duration::from_millis(100), false);
+            assert_eq!(
+                explorer.note_response(now, 1, 100_000, Duration::from_millis(100), true, false),
+                None
+            );
+        }
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(300)));
+        explorer.note_latency_sample(Duration::from_millis(100), false);
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(250)));
+        assert_eq!(explorer.window_latency_samples, 0);
+    }
+
+    /// A cold sample stands in only while the server has no round trip at
+    /// all, and never once a warm one has been measured.
+    #[test]
+    fn a_cold_latency_only_seeds_an_unmeasured_server() {
+        let mut explorer = ServerPipelineExplorer::default();
+        explorer.note_supports_pipelining(true);
+        let now = Instant::now();
+        explorer.note_latency_sample(Duration::from_millis(600), true);
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(600)));
+
+        explorer.note_latency_sample(Duration::from_millis(200), false);
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(500)));
+
+        explorer.note_latency_sample(Duration::from_millis(2_000), true);
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(500)));
     }
 
     #[test]
@@ -1003,7 +1156,7 @@ mod tests {
         let now = Instant::now();
         for _ in 0..RUNG_WINDOW_RESPONSES * 2 {
             assert_eq!(
-                explorer.note_response(now, 2, 100_000, Duration::from_millis(100), false),
+                explorer.note_response(now, 2, 100_000, Duration::from_millis(100), false, false),
                 None
             );
         }
@@ -1023,7 +1176,7 @@ mod tests {
         let short_of_a_window = explorer.window_target_responses() - 1;
         for _ in 0..short_of_a_window {
             assert_eq!(
-                explorer.note_response(now, 8, 400_000, Duration::from_millis(100), true),
+                explorer.note_response(now, 8, 400_000, Duration::from_millis(100), true, false),
                 None
             );
         }
@@ -1123,7 +1276,7 @@ mod tests {
         // is already running eight.
         for _ in 0..deep.window_target_responses() {
             assert_eq!(
-                deep.note_response(now, 2, 750_000, Duration::from_millis(125), true),
+                deep.note_response(now, 2, 750_000, Duration::from_millis(125), true, false),
                 None,
                 "a shallower lease may fill the window but may not judge the rung"
             );
@@ -1140,7 +1293,7 @@ mod tests {
         let mut shallow = explorer(300, 50);
         for _ in 0..RUNG_WINDOW_RESPONSES * 2 {
             assert_eq!(
-                shallow.note_response(now, 8, 100_000, Duration::from_millis(100), true),
+                shallow.note_response(now, 8, 100_000, Duration::from_millis(100), true, false),
                 None
             );
         }
@@ -1216,7 +1369,7 @@ mod tests {
         let now = Instant::now();
         for _ in 0..RUNG_WINDOW_RESPONSES * 2 {
             assert_eq!(
-                explorer.note_response(now, 8, 100_000, Duration::from_millis(100), true),
+                explorer.note_response(now, 8, 100_000, Duration::from_millis(100), true, false),
                 None
             );
         }

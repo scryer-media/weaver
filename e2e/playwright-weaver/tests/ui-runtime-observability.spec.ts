@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { WebSocketRoute } from "@playwright/test";
+import type { Page, WebSocketRoute } from "@playwright/test";
 import { expect, openNavigation, test, weaverRoute } from "./helpers";
 import { introspectPublicMutationNames } from "./support/runtime-introspection";
 import { seedRuntimeHistory } from "./support/setup/runtime-history";
@@ -98,7 +98,41 @@ test("monitoring metrics and live logs expose real product state and controls", 
   await expect(page.getByText("paused — scroll freely", { exact: true })).toBeVisible();
   await page.getByRole("banner").getByRole("button", { name: "Resume tail", exact: true }).click();
   await expect(following).toBeVisible();
+
+  // The live log level: a preset applies at once, the field shows the
+  // directives now in force, and Default hands back the startup filter.
+  const logLevel = page.getByRole("button", { name: "Log level", exact: true });
+  const directives = page.getByRole("textbox", { name: "Filter directives", exact: true });
+  await expect(logLevel).toContainText("Default");
+  const startupDirectives = await directives.inputValue();
+  await chooseLogLevel(page, "Download debug");
+  await expect(directives).toHaveValue(
+    "info,weaver_server_core::pipeline::download=debug,weaver_nntp=debug",
+  );
+  await expect(logLevel).toContainText("Download debug");
+  await chooseLogLevel(page, "Default");
+  await expect(directives).toHaveValue(startupDirectives);
+  await expect(logLevel).toContainText("Default");
 });
+
+/** Pick a log-level preset and wait for the server to apply it. */
+async function chooseLogLevel(page: Page, preset: string) {
+  const applied = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname.endsWith("/graphql")
+      && response.request().method() === "POST"
+      && response.request().postData()?.includes("mutation SetLogFilter") === true,
+  );
+  await page.getByRole("button", { name: "Log level", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "Log level", exact: true })
+    .getByRole("menuitemradio", { name: preset, exact: true })
+    .click();
+  const response = await applied;
+  expect(response.ok()).toBeTruthy();
+  const payload = await response.json();
+  expect(payload.errors ?? [], JSON.stringify(payload.errors ?? [])).toEqual([]);
+}
 
 test("history pagination renders metadata-only seeded records", async ({ cleanPage: page, request }) => {
   const suffix = configuredBasePath.replaceAll("/", "-") || "root";

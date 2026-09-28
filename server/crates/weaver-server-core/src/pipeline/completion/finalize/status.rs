@@ -889,7 +889,7 @@ impl Pipeline {
             }
         }
         if removed > 0 {
-            info!(
+            debug!(
                 job_id = job_id.0,
                 removed,
                 total = recovery_files.len(),

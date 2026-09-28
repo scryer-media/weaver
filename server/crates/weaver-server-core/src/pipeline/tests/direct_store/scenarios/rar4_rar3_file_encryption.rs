@@ -1226,6 +1226,64 @@ async fn a_password_harvest_that_failed_does_not_arm_the_once_per_job_memo() {
 }
 
 #[tokio::test]
+async fn a_header_encrypted_set_admitted_after_the_harvest_ran_still_gets_it() {
+    // Identity admission binds sets as their volumes are recognised, which
+    // can be well after the job's first article ran the harvest. The harvest
+    // is kept per job, so a set bound late holds the same candidates as the
+    // sets that were there when it ran.
+    let member_name = "Silver.Horizon.S04E13.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = header_encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        HeaderCheck::For("moonlit-harbour"),
+    );
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(45131);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    // No spec password: the NZB meta is the only place the key lives, so only
+    // the harvest can put it in a ring.
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    assert!(spec.password.is_none());
+    insert_active_job_with_persisted_nzb(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("moonlit-harbour"),
+    )
+    .await;
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    assert!(
+        pipeline.direct_store.header_candidates_offered(job_id),
+        "the first article must have run the harvest"
+    );
+    let first = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the job must carry its direct set");
+    assert!(first.router.wants_header_password());
+    assert_eq!(first.router.header_candidate_count(), 1);
+    let plan = first.plan().clone();
+
+    let late = pipeline.admit_identity_set(job_id, plan, None);
+
+    let late_set = pipeline
+        .direct_store
+        .set(job_id, late)
+        .expect("the late set must be installed");
+    assert!(late_set.router.wants_header_password());
+    assert_eq!(
+        late_set.router.header_candidate_count(),
+        1,
+        "a set admitted after the harvest ran must still be offered it"
+    );
+}
+
+#[tokio::test]
 async fn a_par2_bearing_header_encrypted_job_verifies_and_completes_byte_identically() {
     // The commonest real `-hp` shape, and the one every other test here builds
     // without: nearly every encrypted release carries PAR2, and both `-hp`

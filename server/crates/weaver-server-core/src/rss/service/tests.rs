@@ -744,6 +744,7 @@ fn build_service_with_security(
 ) -> RssService {
     let config = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
+        hardware_profile: None,
         intermediate_dir: None,
         complete_dir: None,
         buffer_pool: None,
@@ -753,7 +754,6 @@ fn build_service_with_security(
         max_download_speed: None,
         isp_bandwidth_cap: None,
         propagation_delay_secs: None,
-        ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),

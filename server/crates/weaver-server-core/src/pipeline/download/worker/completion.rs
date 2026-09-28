@@ -327,7 +327,7 @@ impl Pipeline {
             && let Some(owner) = self.download_lane_owners.get_mut(&result.lane_id)
         {
             owner.connection = false;
-            if owner.outstanding.is_empty() && !owner.ip_replacement {
+            if owner.outstanding.is_empty() {
                 self.download_lane_owners.remove(&result.lane_id);
             }
         }
@@ -560,9 +560,6 @@ impl Pipeline {
                 crate::runtime::perf_probe::cpu_scope("download.process_done.pre_match");
             let excluded_servers = result.exclude_servers;
             let source_server_idx = result.source_server_idx;
-            if result.origin != DownloadResultOrigin::IpReplacementTrial {
-                self.observe_ip_rtt_attempts(&result.attempts);
-            }
 
             let is_recovery = result.origin.is_recovery();
             // Per-server counters are indexed by the runtime `server_idx` of
@@ -573,6 +570,9 @@ impl Pipeline {
             // integer compare; the stale case only exists around a config
             // reload.
             let attribute_to_servers = result.runtime_generation == self.pool_generation;
+            if attribute_to_servers {
+                self.nntp.record_fetch_attempts(&result.attempts);
+            }
             for (attempt_index, attempt) in result.attempts.iter().enumerate() {
                 // Per-server metric accounting. Hot-path safe: a bounds-checked
                 // index into a lock-free `Vec<Arc<ServerCounters>>` followed by
@@ -782,28 +782,7 @@ impl Pipeline {
                         error = %failure.message,
                         "NNTP BODY fetch failed"
                     );
-                }
-                if result.origin == DownloadResultOrigin::IpReplacementTrial
-                    && !matches!(
-                        failure.kind,
-                        DownloadFailureKind::ArticleNotFound
-                            | DownloadFailureKind::Auth
-                            | DownloadFailureKind::ContentOrProtocol
-                    )
-                {
-                    if self.restore_download_result_work_without_retry(
-                        result.segment_id,
-                        result.retry_count,
-                        excluded_servers,
-                    ) {
-                        debug!(
-                            segment = %result.segment_id,
-                            error = %failure.message,
-                            "restored IP replacement trial work without consuming retry budget"
-                        );
-                    }
-                    self.maybe_finish_download_pass(job_id);
-                    return;
+                    crate::runtime::job_debug_ring::dump(job_id.0, "NNTP BODY fetch failed");
                 }
                 if failure.kind == DownloadFailureKind::ServerQuota {
                     let mut retry_after = failure.retry_after;
@@ -954,6 +933,10 @@ impl Pipeline {
                                 error = %failure.message,
                                 "downloads waiting: local BODY lane capacity is saturated; a server is eligible and the work retries as lanes free"
                             );
+                            crate::runtime::job_debug_ring::dump(
+                                job_id.0,
+                                "downloads waiting: local BODY lane capacity is saturated",
+                            );
                         }
                     } else if let Some(suppressed_since_last) = self
                         .no_eligible_server_warn_throttle
@@ -969,6 +952,10 @@ impl Pipeline {
                             suppressed_since_last,
                             error = %failure.message,
                             "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
+                        );
+                        crate::runtime::job_debug_ring::dump(
+                            job_id.0,
+                            "downloads waiting: no eligible news server",
                         );
                     }
                     self.metrics

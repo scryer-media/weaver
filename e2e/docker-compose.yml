@@ -264,6 +264,8 @@ services:
   # in this repository and mounts only paths under this directory, so a run is
   # reproducible from a clean checkout.
   weaver-playwright:
+    # Runs Chromium; the Podman overlay keeps its interface address stable.
+    x-e2e-browser: true
     image: ${E2E_WEAVER_PLAYWRIGHT_IMAGE:-weaver-e2e-playwright:local}
     pull_policy: never
     build:
@@ -322,11 +324,17 @@ volumes:
   nntp-certs:
   nntp-data:
   nntp2-data:
+  # x-e2e-owner: puid marks a volume whose root the weaver service chowns to
+  # PUID:PGID and that another service also mounts. Compose ignores it; the
+  # harness's Podman overlay creates those volumes with that owner.
   weaver-config:
   weaver-data:
+    x-e2e-owner: puid
   weaver-downloads:
+    x-e2e-owner: puid
   weaver-e2e-clock:
   weaver-watch-folder:
+    x-e2e-owner: puid
   weaver-postgres-data:
   nzbget-downloads:
   sabnzbd-downloads:

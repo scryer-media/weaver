@@ -115,7 +115,7 @@ export function NextShell({
   // Monitoring is unreachable from Downloads.
   const nav: NavEntry[] = [
     { to: "/", label: t("next.nav.downloads"), icon: "downloads", count: queue.summary.totalItems, end: false },
-    { to: "/history", label: t("next.nav.completed"), icon: "completed", count: historyCount },
+    { to: "/history", label: t("next.nav.history"), icon: "history", count: historyCount },
     { to: "/monitoring", label: t("next.nav.monitoring"), icon: "monitoring" },
     { to: "/system-info", label: t("next.nav.systemInfo"), icon: "systemInfo" },
     { to: "/logs", label: t("next.nav.logs"), icon: "logs" },

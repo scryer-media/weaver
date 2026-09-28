@@ -757,6 +757,50 @@ async fn delete_history_removes_intermediate_output_dir() {
 }
 
 #[tokio::test]
+async fn delete_history_with_a_stale_marker_removes_the_row_and_keeps_the_dir() {
+    // A marker that names this job but whose hash the directory no longer
+    // reproduces used to abort the whole delete, leaving the record behind
+    // for good. The record goes; the directory stays and is reported.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30024);
+    let output_dir = intermediate_dir.join("history-stale-marker-job");
+    tokio::fs::create_dir_all(&output_dir).await.unwrap();
+    tokio::fs::write(
+        crate::jobs::working_dir::working_dir_marker_path(&output_dir),
+        format!("weaver-job-v1:{}:{}\n", job_id.0, "0".repeat(64)),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(output_dir.join("leftover.bin"), b"leftover")
+        .await
+        .unwrap();
+    pipeline
+        .db
+        .insert_job_history(&history_row_with_output_dir(
+            job_id,
+            "History Stale Marker",
+            "failed",
+            output_dir.clone(),
+        ))
+        .unwrap();
+
+    let (reply, recv) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::DeleteHistory {
+            job_id,
+            delete_files: false,
+            reply,
+        })
+        .await;
+    let outcome = recv.await.unwrap().unwrap();
+
+    assert_eq!(outcome.left_in_place, vec![output_dir.clone()]);
+    assert!(output_dir.join("leftover.bin").exists());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn delete_history_removes_db_only_history_row() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;

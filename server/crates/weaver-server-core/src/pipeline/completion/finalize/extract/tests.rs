@@ -878,7 +878,10 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
         password: sevenz_turbo::Password::empty(),
         event_tx,
         phase_counters: Arc::new(PhaseCounters::default()),
-        decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads { end_header_bytes },
+        decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
+            end_header_bytes,
+            allowance_cap: u64::MAX,
+        },
         decode_threads: 1,
     };
     let outcome = extract_7z_stream(&context, || {
@@ -958,9 +961,99 @@ fn conventional_7z_context(
         phase_counters: Arc::new(PhaseCounters::default()),
         decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
             end_header_bytes: sevenz_end_header_bytes(archive),
+            allowance_cap: u64::MAX,
         },
         decode_threads,
     }
+}
+
+#[test]
+fn profile_caps_optional_7z_allowance_without_reducing_required_memory() {
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    let (_root, budget) = test_extraction_security_with_memory(temp.path(), 64 * MIB);
+    for (request, expected) in [
+        (
+            SevenZipDecodeReservation::UpToCeiling { floor: MIB },
+            16 * MIB,
+        ),
+        (
+            SevenZipDecodeReservation::UpToCeiling { floor: 24 * MIB },
+            24 * MIB,
+        ),
+        (SevenZipDecodeReservation::Measured(24 * MIB), 24 * MIB),
+    ] {
+        let permit = request.reserve_capped(&budget, 16 * MIB).unwrap();
+        assert_eq!(permit.bytes(), expected);
+        drop(permit);
+        assert_eq!(budget.memory_reserved_bytes(), 0);
+    }
+}
+
+#[test]
+fn conventional_7z_measured_dictionary_may_exceed_profile_allowance() {
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    let archive = sevenz_archive_with_dictionary(32 * 1024 * 1024, &[("episode.txt", b"content")]);
+    let (root, budget) = test_extraction_security_with_memory(temp.path(), 128 * MIB);
+    let mut context = conventional_7z_context(temp.path(), root, Arc::clone(&budget), &archive, 1);
+    context.decode_memory = SevenZipDecodeMemory::ReservedForFixedThreads {
+        end_header_bytes: sevenz_end_header_bytes(&archive),
+        allowance_cap: 16 * MIB,
+    };
+    let reservations = std::sync::Mutex::new(Vec::new());
+    extract_7z_stream(&context, || {
+        reservations
+            .lock()
+            .unwrap()
+            .push(budget.memory_reserved_bytes());
+        Ok(Cursor::new(archive.clone()))
+    })
+    .unwrap();
+    assert!(reservations.lock().unwrap()[1] >= 32 * MIB);
+    assert_eq!(
+        fs::read(temp.path().join("episode.txt")).unwrap(),
+        b"content"
+    );
+    assert_eq!(budget.memory_reserved_bytes(), 0);
+}
+
+/// An encoded end header decodes under the reader's limits, which reach the
+/// ceiling, before anything about the archive has been measured. The
+/// conventional metadata pass never parks, so it is admitted up to the
+/// ceiling rather than on a header-sized allowance.
+#[test]
+fn conventional_7z_metadata_pass_is_admitted_up_to_the_ceiling() {
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("wide_dictionary.7z");
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let archive = sevenz_archive_with_dictionary(
+        1024 * 1024,
+        &[("Wide.Dictionary/episode.txt", b"wide dictionary")],
+    );
+    fs::write(&archive_path, &archive).unwrap();
+    let header_floor =
+        chase_header_pass_memory_bytes(sevenz_end_header_bytes(&archive), 512 * 1024 * 1024);
+
+    let (root, budget) = test_extraction_security_with_memory(&out_dir, 512 * 1024 * 1024);
+    let context = conventional_7z_context(&out_dir, root, Arc::clone(&budget), &archive, 1);
+    let reserved_at_open = std::sync::Mutex::new(Vec::new());
+    extract_7z_stream(&context, || {
+        reserved_at_open
+            .lock()
+            .unwrap()
+            .push(budget.memory_reserved_bytes());
+        fs::File::open(&archive_path).map_err(|error| error.to_string())
+    })
+    .expect("7z extraction");
+
+    let metadata_pass = reserved_at_open.lock().unwrap()[0];
+    assert!(
+        metadata_pass > header_floor,
+        "the metadata pass held {metadata_pass} bytes, no more than the header-sized \
+         {header_floor}"
+    );
 }
 
 /// The dictionary an archive declares is allocated on the archive's say-so.
@@ -1389,7 +1482,8 @@ fn thirty_chases_fit_where_up_front_widening_room_would_not() {
 }
 
 /// Widening room is taken a thread at a time from free memory and stops at
-/// the first thread there is none for; narrowing gives it back.
+/// the first thread there is none for. Narrowing keeps it, because the
+/// decoder's workers outlive a narrowing; it goes back with the decode.
 #[test]
 fn widening_room_widens_only_as_far_as_free_memory_allows() {
     let temp = TempDir::new().unwrap();
@@ -1409,11 +1503,28 @@ fn widening_room_widens_only_as_far_as_free_memory_allows() {
     assert_eq!(room.threads(), 1);
     assert_eq!(
         budget.memory_reserved_bytes(),
-        0,
-        "narrowing to one thread gives all the room back"
+        CHASE_WIDENING_BYTES_PER_THREAD,
+        "narrowing keeps the room its workers may still be using"
+    );
+    assert!(
+        budget
+            .try_reserve_memory(CHASE_WIDENING_BYTES_PER_THREAD)
+            .is_none(),
+        "so no other decode can take it while they do"
     );
     assert_eq!(room.widen_to(1), 1, "one thread needs no room");
-    assert_eq!(budget.memory_reserved_bytes(), 0);
+    assert_eq!(room.widen_to(4), 2, "a later widening reuses the held room");
+    assert_eq!(
+        budget.memory_reserved_bytes(),
+        CHASE_WIDENING_BYTES_PER_THREAD
+    );
+
+    drop(room);
+    assert_eq!(
+        budget.memory_reserved_bytes(),
+        0,
+        "the room goes back when the decode ends"
+    );
 }
 
 /// An adaptive decode starts on one thread and widens while complete runs

@@ -529,3 +529,123 @@ async fn security_upgrade_notice_is_not_owed_on_the_current_access_model() {
     let h = TestHarness::new_with_security(security).await;
     assert!(!security_upgrade_notice_pending(&h).await);
 }
+
+const HARDWARE_PROFILE_FIELDS: &str = "{ selected recommended available \
+     options { profile sevenzDecodeMemoryBytes decodeThreads extractThreads maxConcurrentDownloads } \
+     detected { memoryBytes cores } }";
+
+#[tokio::test]
+async fn the_machine_is_offered_only_the_profiles_it_can_honour() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(&format!("{{ hardwareProfile {HARDWARE_PROFILE_FIELDS} }}"))
+        .await;
+    assert_no_errors(&resp);
+    let profile = &response_data(&resp)["hardwareProfile"];
+
+    // The harness machine has four cores and 8 GiB: enough for balanced,
+    // short of the sixteen gibibytes performance asks for.
+    assert!(profile["selected"].is_null());
+    assert_eq!(profile["recommended"], "BALANCED");
+    assert_eq!(
+        profile["available"],
+        serde_json::json!(["EFFICIENT", "BALANCED"])
+    );
+    assert_eq!(
+        profile["detected"]["memoryBytes"].as_u64().unwrap(),
+        8 * 1024 * 1024 * 1024
+    );
+    assert_eq!(profile["detected"]["cores"].as_u64().unwrap(), 4);
+
+    // The cards' numbers come from the server's table, so an interface never
+    // keeps its own copy of them.
+    assert_eq!(
+        profile["options"],
+        serde_json::json!([
+            {
+                "profile": "EFFICIENT",
+                "sevenzDecodeMemoryBytes": 512 * 1024 * 1024,
+                "decodeThreads": 2,
+                "extractThreads": 2,
+                "maxConcurrentDownloads": 10,
+            },
+            {
+                "profile": "BALANCED",
+                "sevenzDecodeMemoryBytes": 1024 * 1024 * 1024,
+                "decodeThreads": 4,
+                "extractThreads": 2,
+                "maxConcurrentDownloads": null,
+            },
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_chosen_profile_is_persisted_and_read_back() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(&format!(
+            "mutation {{ setHardwareProfile(profile: EFFICIENT) {HARDWARE_PROFILE_FIELDS} }}"
+        ))
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["setHardwareProfile"]["selected"],
+        "EFFICIENT"
+    );
+
+    assert_eq!(
+        h.config.read().await.hardware_profile,
+        Some(weaver_server_core::runtime::HardwareProfile::Efficient)
+    );
+    assert_eq!(
+        h.db.load_config().unwrap().hardware_profile,
+        Some(weaver_server_core::runtime::HardwareProfile::Efficient)
+    );
+
+    let read_back = h
+        .execute(&format!("{{ hardwareProfile {HARDWARE_PROFILE_FIELDS} }}"))
+        .await;
+    assert_no_errors(&read_back);
+    assert_eq!(
+        response_data(&read_back)["hardwareProfile"]["selected"],
+        "EFFICIENT"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_the_machine_cannot_honour_is_refused_by_name() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(&format!(
+            "mutation {{ setHardwareProfile(profile: PERFORMANCE) {HARDWARE_PROFILE_FIELDS} }}"
+        ))
+        .await;
+    let message = resp
+        .errors
+        .first()
+        .map(|error| error.message.clone())
+        .expect("an unavailable profile must be refused");
+    assert!(
+        message.contains("performance") && message.contains("16 GiB") && message.contains("8 GiB"),
+        "the refusal must name the requirement and what the machine has: {message}"
+    );
+    assert!(h.config.read().await.hardware_profile.is_none());
+    assert!(h.db.load_config().unwrap().hardware_profile.is_none());
+}
+
+#[tokio::test]
+async fn the_hardware_profile_is_an_administrator_surface() {
+    let h = TestHarness::new().await;
+    for query in [
+        "{ hardwareProfile { recommended } }",
+        "mutation { setHardwareProfile(profile: EFFICIENT) { selected } }",
+    ] {
+        let resp = h.execute_as(query, CallerScope::Read).await;
+        assert!(
+            !resp.errors.is_empty(),
+            "{query} must refuse a read-scoped caller"
+        );
+    }
+    assert!(h.config.read().await.hardware_profile.is_none());
+}

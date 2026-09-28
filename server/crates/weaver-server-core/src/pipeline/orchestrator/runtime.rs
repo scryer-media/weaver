@@ -60,18 +60,22 @@ impl Pipeline {
         let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
         let decode_backlog_budget_bytes =
             compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
-        let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
         let (
+            hardware_profile,
             initial_bandwidth_policy,
-            ip_replacement_trial_extra_connections,
             direct_store_settings,
             direct_unpack_settings,
             propagation_delay,
         ) = {
             let cfg = config.read().await;
             (
+                // An install that never chose one — every upgraded install —
+                // runs the profile this machine is recommended. A saved choice
+                // the machine can no longer honour falls back the same way.
+                cfg.hardware_profile
+                    .filter(|chosen| chosen.unmet_requirement(&profile).is_none())
+                    .unwrap_or_else(|| crate::runtime::HardwareProfile::recommended(&profile)),
                 cfg.isp_bandwidth_cap.clone(),
-                cfg.ip_replacement_trial_extra_connections(),
                 // Config, with `WEAVER_RAR_DIRECT_STORE`
                 // overriding it. Resolved once here and held for the life of
                 // the pipeline — a set admitted under an enabled gate must not
@@ -89,9 +93,15 @@ impl Pipeline {
                 Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
-        metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
+        let profile_tuning = hardware_profile.tuning(&profile);
+        let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
+        shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
         info!(
+            hardware_profile = hardware_profile.as_str(),
             max_downloads = tuner.params().max_concurrent_downloads,
+            decode_threads = tuner.params().decode_thread_count,
+            extract_threads = tuner.params().extract_thread_count,
+            sevenz_decode_memory_mb = profile_tuning.sevenz_decode_memory_bytes / (1024 * 1024),
             decode_backlog_budget_mb = decode_backlog_budget_bytes / (1024 * 1024),
             write_backlog_budget_mb = write_backlog_budget_bytes / (1024 * 1024),
             total_connections,
@@ -129,7 +139,10 @@ impl Pipeline {
         {
             warn!(path = %uu_spool_root.display(), error = %error, "failed to clear the stale UU spool");
         }
-        let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
+        let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
+            &complete_dir,
+            profile_tuning.extraction_memory_bytes,
+        )?);
         let process_memory_budget =
             Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
 
@@ -137,7 +150,6 @@ impl Pipeline {
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
         let (download_lane_parked_tx, download_lane_parked_rx) = mpsc::channel(256);
         let (owned_download_lane_event_tx, owned_download_lane_event_rx) = mpsc::channel(128);
-        let (ip_replacement_trial_tx, ip_replacement_trial_rx) = mpsc::channel(16);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
@@ -211,10 +223,6 @@ impl Pipeline {
             held_download_refills: Vec::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
-            ip_replacement_trial_extra_connections,
-            ip_rtt_ewma: HashMap::new(),
-            ip_replacement_retired_ips: HashSet::new(),
-            ip_replacement_burst_active: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             pending_released_download_results_by_job: HashMap::new(),
@@ -325,8 +333,6 @@ impl Pipeline {
             owned_download_lane_event_tx,
             owned_download_lane_event_rx,
             owned_download_lane_pool,
-            ip_replacement_trial_tx,
-            ip_replacement_trial_rx,
             decode_done_tx,
             decode_done_rx,
             retry_tx,
@@ -381,6 +387,7 @@ impl Pipeline {
             download_retry_storm_window: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),
+            duplicate_arrival_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
             last_download_lanes_under_cap_log_at: None,
@@ -467,6 +474,7 @@ impl Pipeline {
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
             par2_discovery_wait_logged: HashSet::new(),
+            posted_name_disagreement_logged: HashSet::new(),
             par2_verified: HashSet::new(),
             par2_joined_split_sets: HashMap::new(),
             par2_pre_repair_dir_entries: HashMap::new(),
@@ -1003,9 +1011,6 @@ impl Pipeline {
                             &mut pending_download_results,
                         );
                     }
-                    Some(event) = self.ip_replacement_trial_rx.recv() => {
-                        self.handle_ip_replacement_trial_event(event);
-                    }
                     Some(result) = self.decode_done_rx.recv() => {
                         crate::runtime::perf_probe::record(
                             "download.decode.done_rx.received",
@@ -1380,14 +1385,6 @@ impl Pipeline {
         loop {
             match self.download_lane_parked_rx.try_recv() {
                 Ok(parked) => self.handle_download_lane_parked(parked),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        loop {
-            match self.ip_replacement_trial_rx.try_recv() {
-                Ok(event) => self.handle_ip_replacement_trial_event(event),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }

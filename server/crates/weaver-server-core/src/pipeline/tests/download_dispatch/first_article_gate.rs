@@ -639,3 +639,163 @@ async fn recovery_volumes_listed_first_do_not_crowd_payload_out_of_the_sample() 
         "every payload file is sampled, and no recovery volume is"
     );
 }
+
+/// Completion repairs each set's files from that set, so neither set can spend
+/// its recovery slices on files described only by the other.
+async fn two_set_verdict(
+    blocks_per_set: [u32; 2],
+    recovery_segments: u32,
+    health_only: bool,
+) -> Option<String> {
+    const DESCRIBED: u64 = 480;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41712);
+    let mut payload = vec![1u32; 10];
+    payload.extend([16, 16]);
+    let mut spec = job_spec_with_recovery("Covered By Both Sets", &payload, recovery_segments);
+    let mut second = spec.files.last().unwrap().clone();
+    second.filename = "amber-lattice.b.vol00+32.par2".to_string();
+    for segment in &mut second.segments {
+        segment.message_id = format!("amber-par2-b-{}@example.com", segment.ordinal);
+    }
+    spec.total_bytes += second.segments.len() as u64 * 512;
+    spec.files.push(second);
+    let first_recovery = 12u32;
+    let second_recovery = 13u32;
+    let first_recovery_name = spec.files[first_recovery as usize].filename.clone();
+
+    // Set A describes files 0-4 and 10, set B files 5-9 and 11, so the ten
+    // files ruled missing below are five of each.
+    let set_ids = [
+        par2_rs::RecoverySetId::from_bytes([41; 16]),
+        par2_rs::RecoverySetId::from_bytes([42; 16]),
+    ];
+    let mut sets: Vec<Par2FileSet> = set_ids
+        .iter()
+        .map(|recovery_set_id| Par2FileSet {
+            recovery_set_id: *recovery_set_id,
+            slice_size: DESCRIBED,
+            recovery_file_ids: Vec::new(),
+            non_recovery_file_ids: Vec::new(),
+            files: HashMap::new(),
+            slice_checksums: HashMap::new(),
+            recovery_slices: std::collections::BTreeMap::new(),
+            creator: None,
+        })
+        .collect();
+    for (index, file) in spec.files.iter().take(12).enumerate() {
+        let set = &mut sets[usize::from(!(index < 5 || index == 10))];
+        let mut raw_id = [0u8; 16];
+        raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
+        let file_id = par2_rs::FileId::from_bytes(raw_id);
+        set.recovery_file_ids.push(file_id);
+        set.files.insert(
+            file_id,
+            par2_rs::FileDescription {
+                file_id,
+                hash_full: [index as u8; 16],
+                hash_16k: [index as u8; 16],
+                length: file.segments.len() as u64 * DESCRIBED,
+                par2_name: file.filename.clone(),
+                filename: file.filename.clone(),
+            },
+        );
+    }
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let second_set = sets.pop().unwrap();
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        sets.pop().unwrap(),
+        &[(
+            first_recovery,
+            &first_recovery_name,
+            blocks_per_set[0],
+            false,
+        )],
+    );
+    let runtime = pipeline.ensure_par2_runtime(job_id);
+    runtime.ensure_set_runtime(set_ids[1]).set = Some(Arc::new(second_set));
+    let volume = runtime.files.entry(second_recovery).or_default();
+    volume.recovery_blocks = blocks_per_set[1];
+    volume.discovery = Par2DiscoveryState::Parsed {
+        set_ids: vec![set_ids[1]],
+    };
+    if blocks_per_set[1] == 0 {
+        // The filename still advertises recovery; every article must be
+        // terminal before those advertised blocks become unobtainable.
+        let articles: Vec<_> = pipeline.jobs.get(&job_id).unwrap().spec.files
+            [second_recovery as usize]
+            .segments
+            .iter()
+            .map(|segment| SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: second_recovery,
+                },
+                segment_number: segment.ordinal,
+            })
+            .collect();
+        for article in articles {
+            pipeline
+                .segment_terminal_states
+                .insert(article, SegmentTerminalState::Missing);
+        }
+    }
+    assert_eq!(
+        pipeline.par2_served_set_id(job_id),
+        Some(set_ids[0]),
+        "set A is the served set"
+    );
+    for (set_id, expected) in set_ids.into_iter().zip(blocks_per_set) {
+        assert_eq!(
+            pipeline.obtainable_recovery_block_capacity(job_id, set_id),
+            expected,
+            "each set has only its own obtainable blocks"
+        );
+    }
+    let sample = sample_in_file_order(&pipeline, job_id);
+    assert_eq!(sample.len(), 12);
+    let missing: Vec<_> = if health_only {
+        sample.iter().skip(5).take(3).copied().collect()
+    } else {
+        sample.iter().take(10).copied().collect()
+    };
+    for segment_id in missing {
+        pipeline.book_terminal_segment(segment_id, SegmentTerminalState::Missing);
+    }
+
+    job_failed(&pipeline, job_id)
+}
+
+#[tokio::test]
+async fn losses_split_across_two_parsed_sets_are_covered_by_both() {
+    assert!(
+        two_set_verdict([5, 5], 16, false).await.is_none(),
+        "five lost files in each set fit each set's five obtainable slices"
+    );
+}
+
+#[tokio::test]
+async fn one_sets_spare_slices_cannot_cover_another_sets_lost_files() {
+    let error = two_set_verdict([10, 0], 16, false)
+        .await
+        .expect("set B has no slices to recover its five lost files");
+    assert!(error.contains("first articles are missing"), "{error}");
+}
+
+#[tokio::test]
+async fn health_deferral_cannot_spend_one_sets_slices_on_another() {
+    assert!(
+        two_set_verdict([5, 5], 1, true).await.is_none(),
+        "set B's own slices cover its three damaged files"
+    );
+    let error = two_set_verdict([10, 0], 1, true)
+        .await
+        .expect("set B cannot recover its three damaged files");
+    assert!(
+        error.starts_with("health ") && error.contains("below critical"),
+        "{error}"
+    );
+}

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -117,6 +117,11 @@ pub struct SharedPipelineState {
     /// for a server they have never fetched from; every later depth decision
     /// comes from their own measurements.
     server_probe_latency: Arc<RwLock<HashMap<u32, Duration>>>,
+    /// Memory one conventional 7z extraction may hold, as the chosen hardware
+    /// profile decides it. Read when an extraction is admitted, so a profile
+    /// picked now reaches the next job. `u64::MAX` means no profile cap, and
+    /// the extraction ceiling alone bounds the decoder.
+    sevenz_decode_memory_bytes: Arc<AtomicU64>,
     job_cancellations: JobCancellationRegistry,
     /// The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
     /// kept off the job-level broadcast: a download emits several of these
@@ -150,6 +155,7 @@ impl SharedPipelineState {
             nntp_runtime_activation: Arc::new(RwLock::new(None)),
             download_transport: Arc::new(RwLock::new(Vec::new())),
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
+            sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
         }
@@ -275,6 +281,19 @@ impl SharedPipelineState {
             state.kind = DownloadBlockKind::ServerQuota;
         }
         *current = state;
+    }
+
+    /// Memory one conventional 7z extraction may hold. `u64::MAX` when no
+    /// profile has capped it.
+    pub fn sevenz_decode_memory_bytes(&self) -> u64 {
+        self.sevenz_decode_memory_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Apply the chosen profile's 7z decoder allowance. Extractions already
+    /// running keep the allowance they were admitted with.
+    pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
+        self.sevenz_decode_memory_bytes
+            .store(bytes.max(1), Ordering::Relaxed);
     }
 
     pub fn server_quota_blocked(&self) -> bool {
@@ -564,6 +583,17 @@ pub struct NntpRuntimeActivation {
     pub configured_connections: usize,
 }
 
+/// What deleting one history record left behind.
+///
+/// The record itself is always gone when this is returned. A working
+/// directory whose ownership marker names the job but no longer matches the
+/// directory is not removed — nothing proves it is still the job's — and is
+/// listed here so the caller can say so.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryDeleteOutcome {
+    pub left_in_place: Vec<std::path::PathBuf>,
+}
+
 pub enum SchedulerCommand {
     /// Submit a new job.
     AddJob {
@@ -638,11 +668,6 @@ pub enum SchedulerCommand {
         seconds: u32,
         reply: oneshot::Sender<()>,
     },
-    /// Set global over-max latent-IP replacement burst budget. v1 allows 0 or 1.
-    SetIpReplacementTrialExtraConnections {
-        extra_connections: u8,
-        reply: oneshot::Sender<()>,
-    },
     /// Apply a scheduled action (pause, resume, or speed limit).
     /// Sent by the schedule evaluator background task.
     ApplyScheduleAction {
@@ -689,7 +714,7 @@ pub enum SchedulerCommand {
     DeleteHistory {
         job_id: JobId,
         delete_files: bool,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
+        reply: oneshot::Sender<Result<HistoryDeleteOutcome, SchedulerError>>,
     },
     /// Delete all completed/failed/cancelled jobs from history.
     DeleteAllHistory {
@@ -998,7 +1023,7 @@ impl SchedulerHandle {
         &self,
         job_id: JobId,
         delete_files: bool,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<HistoryDeleteOutcome, SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::DeleteHistory {
@@ -1040,6 +1065,13 @@ impl SchedulerHandle {
     /// channel round-trip). See [`SharedPipelineState::job_download_rates`].
     pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
         self.state.job_download_rates()
+    }
+
+    /// Apply the chosen hardware profile's 7z decoder allowance to the jobs
+    /// that start after this call. Thread pools were sized when the process
+    /// started and keep their size until the next one.
+    pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
+        self.state.set_sevenz_decode_memory_bytes(bytes);
     }
 
     /// Get current metrics (reads from shared state, no channel round-trip).
@@ -1232,22 +1264,6 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::SetPropagationDelay { seconds, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(())
-    }
-
-    pub async fn set_ip_replacement_trial_extra_connections(
-        &self,
-        extra_connections: u8,
-    ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::SetIpReplacementTrialExtraConnections {
-                extra_connections: extra_connections.min(1),
-                reply: tx,
-            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?;

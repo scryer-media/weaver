@@ -406,6 +406,7 @@ pub(super) struct ServerHealthInfo {
     pub(super) premature_deaths: usize,
     pub(super) sockets: weaver_nntp::socket_budget::SocketBudgetSnapshot,
     pub(super) recovery: weaver_nntp::recovery::RecoverySnapshot,
+    pub(super) address_plan: weaver_nntp::AddressPlanSnapshot,
 }
 
 /// Per-server facts gathered before the health lock is taken.
@@ -424,6 +425,7 @@ struct ServerPreamble {
     capacity_penalty_until_epoch_ms: u64,
     sockets: weaver_nntp::socket_budget::SocketBudgetSnapshot,
     recovery: weaver_nntp::recovery::RecoverySnapshot,
+    address_plan: weaver_nntp::AddressPlanSnapshot,
 }
 
 /// Per-server facts read under the health lock. Every field is `Copy`: the
@@ -473,6 +475,7 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
                     .unwrap_or(0),
                 sockets: pool.socket_budget_snapshot(idx),
                 recovery: pool.recovery_snapshot(idx),
+                address_plan: pool.address_plan_snapshot(server).unwrap_or_default(),
             }
         })
         .collect();
@@ -565,6 +568,7 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
             premature_deaths: reading.premature_deaths,
             sockets: pre.sockets,
             recovery: pre.recovery,
+            address_plan: pre.address_plan,
         })
         .collect()
 }

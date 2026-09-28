@@ -83,10 +83,6 @@ impl DownloadPressure {
     pub(in crate::pipeline::download::worker) fn is_hard(self) -> bool {
         self.state == DownloadPressureState::Hard
     }
-
-    pub(in crate::pipeline::download::worker) fn suppresses_spillover(self) -> bool {
-        self.state == DownloadPressureState::Soft
-    }
 }
 
 impl Pipeline {
