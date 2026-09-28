@@ -20,7 +20,15 @@ type ComposeLayout struct {
 	// EnvironmentSecrets maps a top-level secret name to the variable it is
 	// sourced from (`secrets: <name>: environment: <VAR>`).
 	EnvironmentSecrets map[string]string
+	// PUIDOwnedVolumes are the top-level volumes declared with
+	// `x-e2e-owner: puid`: a service chowns their root to PUID:PGID and
+	// another service mounts them, so their root must stay owned that way.
+	PUIDOwnedVolumes []string
 }
+
+// puidOwnerExtension marks a top-level volume whose root belongs to
+// PUID:PGID. Compose ignores `x-` keys, so the mark changes nothing by itself.
+const puidOwnerExtension = "x-e2e-owner"
 
 // ParseComposeLayout reads service names and environment-sourced secrets from
 // a Compose file. It understands only the block layout the harness's own
@@ -29,6 +37,7 @@ func ParseComposeLayout(content []byte) ComposeLayout {
 	layout := ComposeLayout{EnvironmentSecrets: map[string]string{}}
 	section := ""
 	secret := ""
+	volume := ""
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -42,6 +51,7 @@ func ParseComposeLayout(content []byte) ComposeLayout {
 		case indent == 0:
 			section = strings.TrimSuffix(strings.Fields(trimmed)[0], ":")
 			secret = ""
+			volume = ""
 		case indent == 2 && strings.HasSuffix(trimmed, ":"):
 			name := strings.TrimSuffix(trimmed, ":")
 			switch section {
@@ -49,6 +59,13 @@ func ParseComposeLayout(content []byte) ComposeLayout {
 				layout.Services = append(layout.Services, name)
 			case "secrets":
 				secret = name
+			case "volumes":
+				volume = name
+			}
+		case indent == 4 && section == "volumes" && volume != "":
+			if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(key) == puidOwnerExtension &&
+				strings.Trim(strings.TrimSpace(value), `"'`) == "puid" {
+				layout.PUIDOwnedVolumes = append(layout.PUIDOwnedVolumes, volume)
 			}
 		case indent == 4 && section == "secrets" && secret != "":
 			if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(key) == "environment" {
@@ -101,6 +118,18 @@ func (engine *Engine) OverlayYAML(layout ComposeLayout, secretFiles map[string]s
 		for _, name := range names {
 			path, _ := json.Marshal(secretFiles[name])
 			fmt.Fprintf(&body, "  %s:\n    file: %s\n", name, path)
+		}
+	}
+	if len(layout.PUIDOwnedVolumes) > 0 {
+		// Podman hands an empty named volume to the owner of the mount point
+		// in every container that mounts it, until something is written into
+		// it. A root-owned mount point in a second service therefore undoes
+		// the owning service's chown and leaves the volume unwritable to
+		// PUID. Creating the volume with that owner pins its root instead;
+		// Docker never re-owns a volume, so it needs none of this.
+		body.WriteString("volumes:\n")
+		for _, volume := range layout.PUIDOwnedVolumes {
+			fmt.Fprintf(&body, "  %s:\n    driver_opts:\n      o: \"uid=${PUID:-1000},gid=${PGID:-1000}\"\n", volume)
 		}
 	}
 	if body.Len() == 0 {

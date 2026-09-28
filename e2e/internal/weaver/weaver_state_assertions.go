@@ -753,7 +753,7 @@ func assertHealthProbeScenario(jobID int, assertion *ScenarioHealthProbeAssertio
 	inconclusive := 0
 	for _, rawLine := range strings.Split(string(raw), "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if directLogJobID(line) != wantJobID {
+		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
 			continue
 		}
 		switch {
@@ -817,7 +817,7 @@ func assertLogLines(raw string, jobID int, assertion *ScenarioLogAssertion) erro
 		previousPayload := ""
 		for _, rawLine := range strings.Split(raw, "\n") {
 			clean := ansiEscape.ReplaceAllString(rawLine, "")
-			if directLogJobID(clean) != wantJobID || !strings.Contains(clean, message) {
+			if isWeaverDebugRingReplay(clean) || directLogJobID(clean) != wantJobID || !strings.Contains(clean, message) {
 				continue
 			}
 			level, payload := splitWeaverLogLine(clean)
@@ -870,7 +870,7 @@ func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertio
 	seenMaterialization := false
 	for _, rawLine := range strings.Split(string(raw), "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if directLogJobID(line) != wantJobID {
+		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
 			continue
 		}
 		if strings.Contains(line, "direct-store set demoted") && directDemotionReason(line) == assertion.ExpectedDemotionReason {
@@ -919,7 +919,7 @@ func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssert
 	anyActivity := false
 	for _, rawLine := range strings.Split(string(raw), "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if directLogJobID(line) != wantJobID {
+		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
 			continue
 		}
 		switch {
@@ -1002,7 +1002,7 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 	observedModes := make(map[string]string, len(assertion.ExpectedSetVerificationModes))
 	for _, rawLine := range strings.Split(string(raw), "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if !strings.Contains(line, cleanPar2VerificationSourceMessage) || directLogJobID(line) != wantJobID {
+		if !strings.Contains(line, cleanPar2VerificationSourceMessage) || isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
 			continue
 		}
 		setID := weaverLogField(line, "recovery_set_id")
@@ -1040,7 +1040,7 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 	observedGridSets := make(map[string]uint64)
 	for _, rawLine := range strings.Split(string(raw), "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if !strings.Contains(line, cleanPar2SettlementMessage) || directLogJobID(line) != wantJobID {
+		if !strings.Contains(line, cleanPar2SettlementMessage) || isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
 			continue
 		}
 		setID := weaverLogField(line, "recovery_set_id")

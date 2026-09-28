@@ -1789,12 +1789,24 @@ func inspectDockerContainerImageID(containerID string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("inspect image for container %s: %w: %s", containerID, err, strings.TrimSpace(string(output)))
 	}
-	imageID := strings.TrimSpace(string(output))
-	fingerprint := strings.TrimPrefix(imageID, "sha256:")
-	if !strings.HasPrefix(imageID, "sha256:") || !encryptionKeyFingerprintPattern.MatchString(fingerprint) {
-		return "", fmt.Errorf("container %s has invalid image ID %q", containerID, imageID)
+	raw := strings.TrimSpace(string(output))
+	imageID, ok := canonicalContainerImageID(raw)
+	if !ok {
+		return "", fmt.Errorf("container %s has invalid image ID %q", containerID, raw)
 	}
 	return imageID, nil
+}
+
+// canonicalContainerImageID returns an image ID as `sha256:<64 hex>`. One
+// engine reports a container's image with the digest algorithm and the other
+// as the bare hex; both engines accept the prefixed form wherever an image
+// reference goes.
+func canonicalContainerImageID(raw string) (string, bool) {
+	digest := strings.TrimPrefix(raw, "sha256:")
+	if !encryptionKeyFingerprintPattern.MatchString(digest) {
+		return "", false
+	}
+	return "sha256:" + digest, true
 }
 
 func prepareWeaverEncryptionKeyBackup(

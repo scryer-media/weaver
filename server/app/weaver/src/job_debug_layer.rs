@@ -15,7 +15,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Filtered;
 use tracing_subscriber::layer::{Context, Filter};
 
-use weaver_server_core::runtime::job_debug_ring;
+use weaver_server_core::runtime::job_debug_ring::{self, CapturedEvent};
 
 pub(crate) struct JobDebugRingLayer;
 
@@ -64,8 +64,7 @@ impl<S: Subscriber> Layer<S> for JobDebugRingLayer {
         let Some(job_id) = visitor.job_id else {
             return;
         };
-        let metadata = event.metadata();
-        job_debug_ring::record(job_id, visitor.render(metadata));
+        job_debug_ring::record(job_id, visitor.into_event(event.metadata()));
     }
 }
 
@@ -77,21 +76,15 @@ struct LineVisitor {
 }
 
 impl LineVisitor {
-    /// `LEVEL target: message field=value...`. The ring stamps the capture
-    /// time itself and renders it only when the ring is dumped.
-    fn render(self, metadata: &Metadata<'_>) -> String {
-        let level = metadata.level().as_str();
-        let target = metadata.target();
-        let mut line = String::with_capacity(
-            level.len() + target.len() + self.message.len() + self.fields.len() + 3,
-        );
-        line.push_str(level);
-        line.push(' ');
-        line.push_str(target);
-        line.push_str(": ");
-        line.push_str(&self.message);
-        line.push_str(&self.fields);
-        line
+    /// The event in parts. The ring stamps the capture time itself and
+    /// renders it only when the ring is dumped.
+    fn into_event(self, metadata: &'static Metadata<'static>) -> CapturedEvent {
+        CapturedEvent {
+            level: *metadata.level(),
+            target: metadata.target(),
+            message: self.message,
+            fields: self.fields,
+        }
     }
 
     fn push_field(&mut self, field: &Field, value: fmt::Arguments<'_>) {
@@ -158,15 +151,17 @@ mod tests {
             tracing::info!(job_id = 91_001_u64, "info is not captured");
         });
 
-        let lines: Vec<String> = job_debug_ring::take(91_001)
+        let lines: Vec<CapturedEvent> = job_debug_ring::take(91_001)
             .into_iter()
-            .map(|line| line.text)
+            .map(|line| line.event)
             .collect();
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].starts_with("DEBUG "), "{lines:?}");
-        assert!(lines[0].contains("fetched an article"), "{lines:?}");
-        assert!(lines[0].contains("segment=3"), "{lines:?}");
-        assert!(lines[1].contains("trace detail"), "{lines:?}");
+        assert_eq!(lines[0].level, Level::DEBUG, "{lines:?}");
+        assert_eq!(lines[0].target, module_path!(), "{lines:?}");
+        assert_eq!(lines[0].message, "fetched an article", "{lines:?}");
+        assert!(lines[0].fields.contains("segment=3"), "{lines:?}");
+        assert_eq!(lines[1].level, Level::TRACE, "{lines:?}");
+        assert_eq!(lines[1].message, "trace detail", "{lines:?}");
     }
 
     /// WARN records whose message mentions stall diagnostics, as
@@ -221,12 +216,35 @@ mod tests {
             .map(|(_, fields)| fields)
             .collect();
         assert_eq!(lines.len(), 2, "one record per captured line: {records:?}");
-        assert!(lines[0].contains("before the stall"), "{records:?}");
-        assert!(lines[1].contains("just before the stall"), "{records:?}");
+        assert!(
+            lines[0].contains(" replayed_message=before the stall"),
+            "{records:?}"
+        );
+        assert!(
+            lines[1].contains(" replayed_message=just before the stall"),
+            "{records:?}"
+        );
         for fields in &lines {
-            assert!(fields.contains("job_id=91002"), "{records:?}");
+            assert!(fields.starts_with(" job_id=91002 "), "{records:?}");
             assert!(fields.contains("reason=test stall"), "{records:?}");
             assert!(fields.contains(" at="), "{records:?}");
+            assert!(fields.contains(" replayed_level=DEBUG"), "{records:?}");
+            assert!(
+                fields.contains(&format!(" replayed_target={}", module_path!())),
+                "{records:?}"
+            );
+            assert!(
+                fields.contains(" replayed_fields=job_id=91002"),
+                "{records:?}"
+            );
+            // The replay never carries the captured event's own line shape, so
+            // a reader looking for "LEVEL target: message" finds the event,
+            // not its replay.
+            assert!(!fields.contains(": before the stall"), "{records:?}");
+            assert!(
+                !fields.contains(&format!("DEBUG {}", module_path!())),
+                "{records:?}"
+            );
         }
         assert!(job_debug_ring::take(91_002).is_empty());
     }

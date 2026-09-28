@@ -322,11 +322,17 @@ volumes:
   nntp-certs:
   nntp-data:
   nntp2-data:
+  # x-e2e-owner: puid marks a volume whose root the weaver service chowns to
+  # PUID:PGID and that another service also mounts. Compose ignores it; the
+  # harness's Podman overlay creates those volumes with that owner.
   weaver-config:
   weaver-data:
+    x-e2e-owner: puid
   weaver-downloads:
+    x-e2e-owner: puid
   weaver-e2e-clock:
   weaver-watch-folder:
+    x-e2e-owner: puid
   weaver-postgres-data:
   nzbget-downloads:
   sabnzbd-downloads:
