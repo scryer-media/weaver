@@ -50,7 +50,8 @@ func TestPruneFullRunBundles(t *testing.T) {
 	if !errors.Is(err, cleanupErr) {
 		t.Fatalf("error = %v, want cleanup failure", err)
 	}
-	if strings.Join(cleaned, ",") != "z-old,cleanup-error" {
+	// Dead owners inside the retention window still lose their stacks.
+	if strings.Join(cleaned, ",") != "b-second,c-third,z-old,cleanup-error" {
 		t.Fatalf("unexpected cleanup: %v", cleaned)
 	}
 	for name, path := range paths {
@@ -62,6 +63,99 @@ func TestPruneFullRunBundles(t *testing.T) {
 		} else if err != nil || string(body) != name {
 			t.Fatalf("retained %s evidence changed: %q, %v", name, body, err)
 		}
+	}
+
+	// A retained bundle is torn down once; a failed cleanup is retried.
+	cleaned = nil
+	err = pruneFullRunBundles(root, func(pid int) bool { return pid == 1 || pid == 6 }, func(phase *fullPhaseContext) error {
+		cleaned = append(cleaned, phase.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("second prune: %v", err)
+	}
+	if strings.Join(cleaned, ",") != "cleanup-error" {
+		t.Fatalf("unexpected second cleanup: %v", cleaned)
+	}
+}
+
+func TestPruneFullRunBundlesKeepsRequestedStacksWhileRetained(t *testing.T) {
+	root := t.TempDir()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	manifests := []fullRunManifest{
+		{OwnerPID: 1, StartedAt: base.Add(4 * time.Hour), Phases: []fullRunPhaseEntry{{Name: "kept"}}, KeepStacks: true},
+		{OwnerPID: 2, StartedAt: base.Add(3 * time.Hour), Phases: []fullRunPhaseEntry{{Name: "released"}}, StacksReleased: true},
+		{OwnerPID: 3, StartedAt: base.Add(2 * time.Hour), Phases: []fullRunPhaseEntry{{Name: "third"}}, StacksReleased: true},
+		{OwnerPID: 4, StartedAt: base.Add(1 * time.Hour), Phases: []fullRunPhaseEntry{{Name: "old-kept"}}, KeepStacks: true},
+		{OwnerPID: 5, StartedAt: base, Phases: []fullRunPhaseEntry{{Name: "old-released"}}, StacksReleased: true},
+	}
+	paths := make(map[string]string)
+	for _, manifest := range manifests {
+		name := manifest.Phases[0].Name
+		path := filepath.Join(root, "weaver-e2e-full-"+name)
+		paths[name] = path
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "full-run.json"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var cleaned []string
+	err := pruneFullRunBundles(root, func(int) bool { return false }, func(phase *fullPhaseContext) error {
+		cleaned = append(cleaned, phase.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(cleaned, ",") != "old-kept" {
+		t.Fatalf("unexpected cleanup: %v", cleaned)
+	}
+	for name, path := range paths {
+		_, err := os.Stat(path)
+		if strings.HasPrefix(name, "old-") {
+			if !os.IsNotExist(err) {
+				t.Fatalf("%s bundle still exists: %v", name, err)
+			}
+		} else if err != nil {
+			t.Fatalf("%s bundle removed: %v", name, err)
+		}
+	}
+}
+
+func TestUnfinishedReleaseFlowProjects(t *testing.T) {
+	runDir := t.TempDir()
+	for slug, status := range map[string]weaverReleasePhaseStatus{
+		"running-flow": {Project: "weaver-e2e-1-running-flow", Status: "running"},
+		"passed-flow":  {Project: "weaver-e2e-2-passed-flow", Status: "passed"},
+		"failed-flow":  {Project: "weaver-e2e-3-failed-flow", Status: "failed"},
+	} {
+		dir := filepath.Join(runDir, "release-gate", "20260101-000000", slug)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(status)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "status.json"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projects, errs := unfinishedReleaseFlowProjects(runDir)
+	if len(errs) != 0 {
+		t.Fatalf("errors: %v", errs)
+	}
+	if strings.Join(projects, ",") != "weaver-e2e-1-running-flow" {
+		t.Fatalf("projects = %v", projects)
+	}
+	if projects, errs := unfinishedReleaseFlowProjects(""); len(projects) != 0 || len(errs) != 0 {
+		t.Fatalf("empty run dir = %v, %v", projects, errs)
 	}
 }
 

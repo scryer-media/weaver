@@ -349,7 +349,7 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 		}
 	}
 
-	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
 	results := runWeaverReleasePhases(ctx, phases, weaverReleaseGateJobs(len(phases)))
