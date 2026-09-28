@@ -1006,27 +1006,64 @@ impl Pipeline {
             .filter(|slice_size| *slice_size > 0);
         match (recovery.ceiling, served_slice_size) {
             (Some(ceiling), Some(served_slice_size)) => {
-                let set_ids = self.par2_servable_set_ids(job_id);
+                let mut set_ids = self.par2_servable_set_ids(job_id);
+                if let Some(served) = self.par2_served_set_id(job_id)
+                    && !set_ids.contains(&served)
+                {
+                    set_ids.push(served);
+                }
+                let set_capacities: Vec<_> = set_ids
+                    .iter()
+                    .map(|set_id| {
+                        let slice_size = self
+                            .par2_set_for(job_id, *set_id)
+                            .map_or(0, |set| set.slice_size);
+                        let capacity =
+                            u64::from(self.obtainable_recovery_block_capacity(job_id, *set_id))
+                                .saturating_mul(slice_size);
+                        (*set_id, capacity)
+                    })
+                    .collect();
+                let known_capacity = set_capacities
+                    .iter()
+                    .map(|(_, capacity)| *capacity)
+                    .fold(0u64, u64::saturating_add);
+                let unknown_capacity = ceiling.saturating_sub(known_capacity);
                 let whole_slices =
                     |len: u64, slice_size: u64| len.div_ceil(slice_size).saturating_mul(slice_size);
+                let mut needed_by_set = std::collections::HashMap::new();
                 let needed_bytes = lost_files
                     .iter()
                     .map(|file_id| {
-                        set_ids
-                            .iter()
-                            .find_map(|set_id| {
-                                let slice_size = self.par2_set_for(job_id, *set_id)?.slice_size;
-                                let binding =
-                                    self.resolve_par2_file_binding_in_set(*file_id, *set_id)?;
-                                (slice_size > 0)
-                                    .then(|| whole_slices(binding.described_length, slice_size))
+                        if let Some((set_id, needed)) = set_ids.iter().find_map(|set_id| {
+                            let slice_size = self.par2_set_for(job_id, *set_id)?.slice_size;
+                            let binding =
+                                self.resolve_par2_file_binding_in_set(*file_id, *set_id)?;
+                            (slice_size > 0).then(|| {
+                                (*set_id, whole_slices(binding.described_length, slice_size))
                             })
-                            .unwrap_or_else(|| {
-                                whole_slices(declared_bytes(*file_id), served_slice_size)
-                            })
+                        }) {
+                            let booked = needed_by_set.entry(set_id).or_insert(0u64);
+                            *booked = booked.saturating_add(needed);
+                            needed
+                        } else {
+                            whole_slices(declared_bytes(*file_id), served_slice_size)
+                        }
                     })
                     .fold(0u64, u64::saturating_add);
-                needed_bytes <= ceiling
+                // Spare slices in one parsed set cannot repair another set's
+                // files. Unparsed live candidates may still describe them.
+                let set_deficit = set_capacities
+                    .iter()
+                    .map(|(set_id, capacity)| {
+                        needed_by_set
+                            .get(set_id)
+                            .copied()
+                            .unwrap_or_default()
+                            .saturating_sub(*capacity)
+                    })
+                    .fold(0u64, u64::saturating_add);
+                needed_bytes <= ceiling && set_deficit <= unknown_capacity
             }
             (ceiling, _) => {
                 let lost_bytes = lost_files

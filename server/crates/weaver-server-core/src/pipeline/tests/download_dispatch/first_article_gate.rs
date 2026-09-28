@@ -640,15 +640,10 @@ async fn recovery_volumes_listed_first_do_not_crowd_payload_out_of_the_sample() 
     );
 }
 
-/// A job protected by two recovery sets is covered by both. Completion repairs
-/// each set's files from that set, so the files the sample rules missing are
-/// weighed against every parsed set's capacity, each charged to the set that
-/// describes it — not against the served set alone, which here could cover
-/// only half of them.
-#[tokio::test]
-async fn losses_split_across_two_parsed_sets_are_covered_by_both() {
+/// Completion repairs each set's files from that set, so neither set can spend
+/// its recovery slices on files described only by the other.
+async fn two_set_first_article_verdict(blocks_per_set: [u32; 2]) -> Option<String> {
     const DESCRIBED: u64 = 480;
-    const BLOCKS_PER_SET: u32 = 5;
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(41712);
@@ -709,29 +704,74 @@ async fn losses_split_across_two_parsed_sets_are_covered_by_both() {
         &mut pipeline,
         job_id,
         sets.pop().unwrap(),
-        &[(first_recovery, &first_recovery_name, BLOCKS_PER_SET, false)],
+        &[(
+            first_recovery,
+            &first_recovery_name,
+            blocks_per_set[0],
+            false,
+        )],
     );
     let runtime = pipeline.ensure_par2_runtime(job_id);
     runtime.ensure_set_runtime(set_ids[1]).set = Some(Arc::new(second_set));
     let volume = runtime.files.entry(second_recovery).or_default();
-    volume.recovery_blocks = BLOCKS_PER_SET;
-    volume.discovery = Par2DiscoveryState::PrefixProbed {
+    volume.recovery_blocks = blocks_per_set[1];
+    volume.discovery = Par2DiscoveryState::Parsed {
         set_ids: vec![set_ids[1]],
     };
+    if blocks_per_set[1] == 0 {
+        // The filename still advertises recovery; every article must be
+        // terminal before those advertised blocks become unobtainable.
+        let articles: Vec<_> = pipeline.jobs.get(&job_id).unwrap().spec.files
+            [second_recovery as usize]
+            .segments
+            .iter()
+            .map(|segment| SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: second_recovery,
+                },
+                segment_number: segment.ordinal,
+            })
+            .collect();
+        for article in articles {
+            pipeline
+                .segment_terminal_states
+                .insert(article, SegmentTerminalState::Missing);
+        }
+    }
     assert_eq!(
         pipeline.par2_served_set_id(job_id),
         Some(set_ids[0]),
         "set A is the served set"
     );
-
+    for (set_id, expected) in set_ids.into_iter().zip(blocks_per_set) {
+        assert_eq!(
+            pipeline.obtainable_recovery_block_capacity(job_id, set_id),
+            expected,
+            "each set has only its own obtainable blocks"
+        );
+    }
     let sample = sample_in_file_order(&pipeline, job_id);
     assert_eq!(sample.len(), 12);
     for segment_id in sample.iter().take(10) {
         pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
     }
 
+    job_failed(&pipeline, job_id)
+}
+
+#[tokio::test]
+async fn losses_split_across_two_parsed_sets_are_covered_by_both() {
     assert!(
-        job_failed(&pipeline, job_id).is_none(),
+        two_set_first_article_verdict([5, 5]).await.is_none(),
         "five lost files in each set fit each set's five obtainable slices"
     );
+}
+
+#[tokio::test]
+async fn one_sets_spare_slices_cannot_cover_another_sets_lost_files() {
+    let error = two_set_first_article_verdict([10, 0])
+        .await
+        .expect("set B has no slices to recover its five lost files");
+    assert!(error.contains("first articles are missing"), "{error}");
 }
