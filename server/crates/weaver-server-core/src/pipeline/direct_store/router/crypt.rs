@@ -347,6 +347,13 @@ impl HeaderKeyRing {
         self.verified.is_none() && self.refusal.is_none()
     }
 
+    /// How many candidates the ring holds, for tests that check which sets
+    /// were offered the harvest.
+    #[cfg(test)]
+    pub(crate) fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
+
     /// The header-encryption decision, made **before any header is decrypted**.
     ///
     /// [`unrar_rs::PasswordCheck`] has three outcomes and only one of them

@@ -195,11 +195,13 @@ pub(crate) struct DirectStoreRuntime {
     accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
     /// Jobs whose spec has already been examined for candidate sets.
     examined: HashSet<JobId>,
-    /// Jobs whose archive-password harvest has already been handed to their
-    /// sets' `-hp` gates. Separate from [`Self::examined`]
-    /// because a **restored** job is examined without ever passing through the
-    /// admission seam, and its sets still need candidates.
-    header_candidates_offered: HashSet<JobId>,
+    /// Each job's archive-password harvest, once one has run, for the `-hp`
+    /// gates of its sets. Kept rather than only offered because a set can be
+    /// admitted after the harvest ran — identity admission binds sets as
+    /// volumes are recognised — and it needs the same candidates. Separate from
+    /// [`Self::examined`] because a **restored** job is examined without ever
+    /// passing through the admission seam, and its sets still need candidates.
+    header_harvest: HashMap<JobId, Vec<crate::jobs::model::ArchivePasswordCandidate>>,
     sets: HashMap<JobId, Vec<DirectSet>>,
     /// Destinations already created and marked sparse, per job. A member stored
     /// inside a directory names a partial inside that directory and nothing
@@ -372,13 +374,13 @@ impl DirectStoreRuntime {
     /// Test hook: whether the once-per-job `-hp` harvest has already run for
     /// this job.
     ///
-    /// Only one test reads it, and only to establish the *precondition* of the
-    /// thing it is testing: once this is true the harvest can never run again,
-    /// so a password supplied later has exactly one route left into the `-hp`
-    /// ring — the per-article re-offer in [`Pipeline::refresh_direct_passwords`].
+    /// Tests read it to establish the *precondition* of what they test: once
+    /// this is true the harvest never runs again, so a password supplied later
+    /// has exactly one route left into the `-hp` ring — the per-article
+    /// re-offer in [`Pipeline::refresh_direct_passwords`].
     #[cfg(test)]
     pub(crate) fn header_candidates_offered(&self, job_id: JobId) -> bool {
-        self.header_candidates_offered.contains(&job_id)
+        self.header_harvest.contains_key(&job_id)
     }
 
     /// Test hook: force the gate without going through a config load.
@@ -454,7 +456,7 @@ impl DirectStoreRuntime {
     pub(crate) fn clear_job(&mut self, job_id: JobId) {
         self.sets.remove(&job_id);
         self.examined.remove(&job_id);
-        self.header_candidates_offered.remove(&job_id);
+        self.header_harvest.remove(&job_id);
         self.prepared_destinations.remove(&job_id);
         self.direct_extracted_members.remove(&job_id);
         self.repair_defer_waves.remove(&job_id);
@@ -586,7 +588,7 @@ impl DirectStoreRuntime {
     pub(crate) fn is_empty_for(&self, job_id: JobId) -> bool {
         !self.sets.contains_key(&job_id)
             && !self.examined.contains(&job_id)
-            && !self.header_candidates_offered.contains(&job_id)
+            && !self.header_harvest.contains_key(&job_id)
             && !self.prepared_destinations.contains_key(&job_id)
     }
 
@@ -1710,7 +1712,7 @@ impl Pipeline {
     /// Pushes one identity-admitted set into the job's set vector with the
     /// ceilings and password every admission path applies, and returns its
     /// stable index.
-    fn admit_identity_set(
+    pub(crate) fn admit_identity_set(
         &mut self,
         job_id: JobId,
         plan: DirectSetPlan,
@@ -1729,6 +1731,11 @@ impl Pipeline {
         set.router.set_password(password);
         set.router.note_par2_available(par2_available);
         set.router.note_par3_available(par3_available);
+        // A set bound after the job's harvest ran would otherwise never see
+        // it: the live seam offers the harvest when it runs, and it has run.
+        if let Some(harvest) = self.direct_store.header_harvest.get(&job_id) {
+            offer_direct_header_candidates(&mut set, password, harvest);
+        }
         let sets = self.direct_store.sets.entry(job_id).or_default();
         sets.push(set);
         sets.len() - 1
@@ -2468,9 +2475,9 @@ impl Pipeline {
         else {
             return;
         };
-        // `offer_direct_header_passwords` runs **once** per job and
-        // every set wants a header password from creation, so the harvest is
-        // memoized on the job's first article and can never re-run. That is fine
+        // The harvest `offer_direct_header_passwords` hands out is memoized per
+        // job, and every set wants a header password from creation, so it is
+        // taken on the job's first article and never re-run. That is fine
         // for `NzbMeta` and `FilenameConvention`, which are immutable per job —
         // and not fine for the spec's password, which is not. This line is its
         // only route into the `-hp` ring afterwards, and without it a password
@@ -2486,8 +2493,9 @@ impl Pipeline {
         }
     }
 
-    /// Hands the job's archive-password harvest to every set's `-hp` gate,
-    /// once per job.
+    /// Runs the job's archive-password harvest once and hands it to every
+    /// set's `-hp` gate. Sets admitted after that take the kept harvest at
+    /// admission.
     ///
     /// # Why the whole harvest, and not `spec.password`
     ///
@@ -2507,7 +2515,7 @@ impl Pipeline {
     /// article; and it must reach **restored** sets, which never go through
     /// `ensure_direct_sets` at all — `install_restored` marks the job examined
     /// precisely so the lazy seam does not rediscover them. This runs from the
-    /// one seam both populations pass through, and memoizes on the same job set
+    /// one seam both populations pass through, and memoizes in the per-job map
     /// `clear_job` clears.
     ///
     /// # Cost
@@ -2519,11 +2527,7 @@ impl Pipeline {
     /// than the conventional path already pays: `try_update_archive_topology`
     /// harvests once **per volume parse**.
     fn offer_direct_header_passwords(&mut self, job_id: JobId) {
-        if self
-            .direct_store
-            .header_candidates_offered
-            .contains(&job_id)
-        {
+        if self.direct_store.header_harvest.contains_key(&job_id) {
             return;
         }
         if !self
@@ -2555,9 +2559,10 @@ impl Pipeline {
         }
     }
 
-    /// The job's archive-password harvest for the `-hp` gate, memoizing a
-    /// harvest that ran (see [`Self::offer_direct_header_passwords`] for why a
-    /// failed read is not remembered).
+    /// The job's archive-password harvest for the `-hp` gate: the kept one when
+    /// a harvest already ran, otherwise a fresh harvest, kept when it ran (see
+    /// [`Self::offer_direct_header_passwords`] for why a failed read is not
+    /// remembered).
     ///
     /// Shared by the live seam and the restart seam. A restored set rebuilds
     /// its layout by re-running the header parse, and that parse is where
@@ -2568,9 +2573,14 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Vec<crate::jobs::model::ArchivePasswordCandidate> {
+        if let Some(kept) = self.direct_store.header_harvest.get(&job_id) {
+            return kept.clone();
+        }
         let (candidates, harvested) = self.harvest_archive_password_candidates(job_id);
         if harvested {
-            self.direct_store.header_candidates_offered.insert(job_id);
+            self.direct_store
+                .header_harvest
+                .insert(job_id, candidates.clone());
         }
         candidates
     }
