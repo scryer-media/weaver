@@ -570,6 +570,9 @@ impl Pipeline {
             // integer compare; the stale case only exists around a config
             // reload.
             let attribute_to_servers = result.runtime_generation == self.pool_generation;
+            if attribute_to_servers {
+                self.nntp.record_fetch_attempts(&result.attempts);
+            }
             for (attempt_index, attempt) in result.attempts.iter().enumerate() {
                 // Per-server metric accounting. Hot-path safe: a bounds-checked
                 // index into a lock-free `Vec<Arc<ServerCounters>>` followed by

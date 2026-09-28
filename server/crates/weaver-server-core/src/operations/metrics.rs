@@ -557,16 +557,6 @@ impl PipelineMetrics {
         std::array::from_fn(|index| self.extraction_rejections[index].load(Ordering::Relaxed))
     }
 
-
-
-
-
-
-
-
-
-
-
     pub fn note_decode_work_queued(&self, raw_bytes: u64) {
         self.decode_pending.fetch_add(1, Ordering::Relaxed);
         self.decode_pending_bytes
