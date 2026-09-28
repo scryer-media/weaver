@@ -250,6 +250,7 @@ impl Pipeline {
 
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.jobs.remove(&job_id);
+        crate::runtime::job_debug_ring::forget(job_id.0);
         self.retire_stalled_download_lanes(job_id);
         self.job_scheduling_memory.remove(&job_id);
         self.repeated_articles.remove(&job_id);

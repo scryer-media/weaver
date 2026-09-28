@@ -684,6 +684,7 @@ impl Pipeline {
                     suppressed_since_last,
                     "dispatch stall: job not eligible"
                 );
+                crate::runtime::job_debug_ring::dump(job_id.0, "dispatch stall: job not eligible");
             }
             for job_id in drained_parked_recovery_jobs {
                 self.schedule_job_completion_check_if_download_pipeline_drained(

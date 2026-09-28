@@ -17,6 +17,7 @@ mod commands;
 mod crash_dump;
 mod heartbeat;
 mod http;
+mod job_debug_layer;
 mod logging;
 mod restart;
 mod shutdown;
@@ -224,6 +225,7 @@ async fn async_main() {
     let (env_filter, env_filter_handle) = tracing_subscriber::reload::Layer::new(env_filter);
     tracing_subscriber::registry()
         .with(layers.with_filter(env_filter))
+        .with(job_debug_layer::layer())
         .init();
     weaver_server_core::runtime::log_filter::install(
         startup_directives,

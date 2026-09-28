@@ -5,6 +5,7 @@ pub(crate) mod file_cache;
 pub(crate) mod fs;
 pub(crate) mod glob;
 pub mod hardware_profile;
+pub mod job_debug_ring;
 pub mod kernels;
 pub mod log_buffer;
 pub mod log_filter;

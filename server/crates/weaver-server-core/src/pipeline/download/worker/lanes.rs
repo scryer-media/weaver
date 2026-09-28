@@ -1058,6 +1058,10 @@ impl Pipeline {
             excluded_servers = ?lease.dial_exclude_servers,
             "owned blocking download lane could not be acquired"
         );
+        crate::runtime::job_debug_ring::dump(
+            lease.job_id.0,
+            "owned blocking download lane could not be acquired",
+        );
     }
 
     pub(in crate::pipeline::download::worker) fn restore_owned_lane_unrequested_work(
