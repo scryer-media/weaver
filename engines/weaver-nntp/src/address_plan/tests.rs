@@ -900,3 +900,82 @@ fn a_race_in_which_every_address_timed_out_books_the_timeouts() {
             .all(|address| address.consecutive_failures == 1)
     );
 }
+
+/// Pin `pinned` and have two sessions on it connect and never hear from the
+/// server.
+fn pin_that_never_reaches_the_server(
+    plan: &Arc<AddressPlan>,
+    dialer: &Arc<ScriptedDialer>,
+    pinned: SocketAddr,
+    others: &[SocketAddr],
+) {
+    pin(plan, dialer, pinned, others);
+    let route = AddressRoute {
+        plan: Arc::clone(plan),
+    };
+    drop(route.watch_setup(pinned));
+    drop(route.watch_setup(pinned));
+}
+
+#[test]
+fn a_pin_that_connects_but_never_reaches_the_server_gives_way_to_one_that_does() {
+    let (deaf, healthy) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[deaf, healthy]);
+    let plan = plan();
+    pin_that_never_reaches_the_server(&plan, &dialer, deaf, &[healthy]);
+
+    // The deaf address still connects first; the healthy one is held until
+    // the test lets it go.
+    let release_healthy = dialer.gate(healthy);
+    let racer = {
+        let (plan, dialer) = (Arc::clone(&plan), Arc::clone(&dialer));
+        std::thread::spawn(move || plan.connect(&dialer).unwrap().1)
+    };
+    while !dialer.dialled.lock().unwrap().contains(&healthy) {
+        std::thread::yield_now();
+    }
+    release_healthy.send(()).unwrap();
+
+    assert_eq!(racer.join().unwrap(), healthy);
+    assert_eq!(plan.snapshot().pinned, Some(healthy));
+    settle_all(&dialer);
+    dialer.take_dialled();
+    let (_, next) = plan.connect(&dialer).unwrap();
+    assert_eq!(next, healthy);
+    assert_eq!(dialer.take_dialled(), vec![healthy]);
+}
+
+#[test]
+fn a_pin_that_never_reaches_the_server_is_kept_when_nothing_else_connects() {
+    let (deaf, refusing) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[deaf, refusing]);
+    let plan = plan();
+    pin_that_never_reaches_the_server(&plan, &dialer, deaf, &[refusing]);
+    dialer.answer(refusing, Answer::Refuse);
+
+    let (_, raced) = plan.connect(&dialer).unwrap();
+
+    assert_eq!(raced, deaf);
+    assert_eq!(plan.snapshot().pinned, Some(deaf));
+    assert_eq!(plan.snapshot().races_won, 2);
+}
+
+#[test]
+fn a_session_that_reaches_the_server_clears_the_pins_failed_setups() {
+    let (pinned, other) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, other]);
+    let plan = plan();
+    pin(&plan, &dialer, pinned, &[other]);
+    let route = AddressRoute {
+        plan: Arc::clone(&plan),
+    };
+
+    drop(route.watch_setup(pinned));
+    route.watch_setup(pinned).reached_server();
+    drop(route.watch_setup(pinned));
+    let (_, next) = plan.connect(&dialer).unwrap();
+
+    assert_eq!(next, pinned);
+    assert_eq!(dialer.take_dialled(), vec![pinned]);
+    assert_eq!(plan.snapshot().races_won, 1);
+}

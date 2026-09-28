@@ -26,6 +26,7 @@ export async function startProxyFixture(options = {}) {
   const ports = { primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090, ...options.ports };
   const events = [];
   const sockets = new Set();
+  const resolvers = new Set();
   const routes = Object.fromEntries(["primary", "secondary", "tertiary", "direct"].map(name => [name, { up: true, hold: false, sockets: new Set() }]));
   const servers = [];
   const held = new Set();
@@ -175,18 +176,32 @@ export async function startProxyFixture(options = {}) {
     // Resolve only infrastructure names through the container's own resolvers.
     // Every destination name above is answered locally, even when direct.
     if (["nntp", "nntp2", "weaver-postgres"].includes(name)) {
-      for (const server of nameservers) {
-        const answer = await new Promise(resolve => {
+      // Every resolver is asked at once and the first answer is used. One
+      // that stays silent costs nothing; when none answers, neither does this
+      // fixture, and the client asks again as it would of any resolver.
+      return new Promise(resolve => {
+        const asked = new Set();
+        let open = nameservers.length;
+        if (!open) resolve(undefined);
+        const settle = answer => {
+          for (const resolver of asked) { resolvers.delete(resolver); resolver.close(); }
+          asked.clear();
+          resolve(answer);
+        };
+        for (const server of nameservers) {
           const resolver = dgram.createSocket(net.isIPv6(server.address) ? "udp6" : "udp4");
-          const timer = setTimeout(() => { resolver.close(); resolve(undefined); }, 2000);
-          const finish = answer => { clearTimeout(timer); resolver.close(); resolve(answer); };
-          resolver.once("message", finish);
-          resolver.once("error", () => finish(undefined));
+          asked.add(resolver);
+          resolvers.add(resolver);
+          resolver.once("message", settle);
+          resolver.once("error", () => { if (!--open) settle(undefined); });
           resolver.send(query, server.port, server.address);
-        });
-        if (answer) return answer;
-      }
-      return;
+        }
+        // Queries nothing answered are given up oldest first.
+        for (const resolver of resolvers) {
+          if (resolvers.size <= 256) break;
+          resolvers.delete(resolver); resolver.close();
+        }
+      });
     }
     if (fixture) record(direct ? "direct-dns" : "routed-dns", { name, type });
     const question = query.subarray(12, cursor + 5);
@@ -252,7 +267,7 @@ export async function startProxyFixture(options = {}) {
       response.end("{}");
     } catch (error) { response.writeHead(400).end(JSON.stringify({ error: String(error) })); }
   }), "control");
-  return { ports, events, async close() { udp.close(); for (const socket of sockets) socket.destroy(); await Promise.all(servers.map(server => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); }))); } };
+  return { ports, events, async close() { udp.close(); for (const resolver of resolvers) resolver.close(); resolvers.clear(); for (const socket of sockets) socket.destroy(); await Promise.all(servers.map(server => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); }))); } };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

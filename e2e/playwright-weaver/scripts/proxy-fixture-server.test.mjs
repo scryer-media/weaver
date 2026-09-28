@@ -50,6 +50,38 @@ test("forwards only infrastructure names to the container resolver", async () =>
   } finally { socket.close(); upstream.close(); await fixture.close(); }
 });
 
+test("a silent resolver does not keep an infrastructure name from the one that answers", async () => {
+  const silent = dgram.createSocket("udp4");
+  const asked = once(silent, "message");
+  silent.bind(0, "127.0.0.1");
+  await once(silent, "listening");
+  const answering = dgram.createSocket("udp4");
+  answering.on("message", (query, remote) => {
+    const response = Buffer.from(query);
+    response.writeUInt16BE(0x8180, 2);
+    answering.send(response, remote.port, remote.address);
+  });
+  answering.bind(0, "127.0.0.1");
+  await once(answering, "listening");
+  const fixture = await startProxyFixture({
+    ip: "127.0.0.1",
+    ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 },
+    nameservers: [{ address: "127.0.0.1", port: silent.address().port }, { address: "127.0.0.1", port: answering.address().port }],
+  });
+  const socket = dgram.createSocket("udp4");
+  try {
+    const response = once(socket, "message");
+    socket.send(dnsQuery(7, "nntp"), fixture.ports.dnsUdp, "127.0.0.1");
+    const [answer] = await response;
+    assert.equal(answer.readUInt16BE(0), 7);
+    assert.equal(answer.readUInt16BE(2), 0x8180);
+    await asked;
+  } finally {
+    socket.close(); silent.close(); answering.close();
+    await fixture.close();
+  }
+});
+
 test("canary answers destination DNS locally and records host queries", async () => {
   const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 } });
   const socket = dgram.createSocket("udp4");

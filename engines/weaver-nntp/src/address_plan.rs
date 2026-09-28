@@ -255,14 +255,63 @@ impl AddressRoute {
         let dialer = Arc::new(TcpDialer::new(host, port, timeout));
         self.plan.connect(&dialer)
     }
+
+    /// Watch the session being set up on a socket this route opened to
+    /// `addr`.
+    pub(crate) fn watch_setup(&self, addr: SocketAddr) -> SetupWatch {
+        SetupWatch {
+            plan: Arc::clone(&self.plan),
+            addr,
+            reached: false,
+        }
+    }
+}
+
+/// One session's setup on a connected socket, from the connect to the point
+/// where the server has answered over it. Dropped before that point, it books
+/// a failed setup against the address: a handshake that failed, a greeting
+/// that never came, or a setup abandoned because it ran out of time.
+pub(crate) struct SetupWatch {
+    plan: Arc<AddressPlan>,
+    addr: SocketAddr,
+    reached: bool,
+}
+
+impl SetupWatch {
+    /// The server answered over this socket. What it said is the server's
+    /// answer, not the address's.
+    pub(crate) fn reached_server(mut self) {
+        self.reached = true;
+        self.plan.record_setup(self.addr, true);
+    }
+}
+
+impl Drop for SetupWatch {
+    fn drop(&mut self) {
+        if !self.reached {
+            self.plan.record_setup(self.addr, false);
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct AddrStats {
     connect_ewma: Option<Duration>,
     consecutive_failures: u32,
+    /// Sessions in a row that connected and then never heard from the
+    /// server. A connect does not clear it; only a session that did hear
+    /// from the server does.
+    setup_failures: u32,
     body_latency_ewma: Option<Duration>,
     delivery: Delivery,
+}
+
+impl AddrStats {
+    /// The address last refused a connect, or last connected without the
+    /// server answering.
+    fn failing(self) -> bool {
+        self.consecutive_failures > 0 || self.setup_failures > 0
+    }
 }
 
 /// What one address's connections delivered since the pin was last judged:
@@ -584,6 +633,9 @@ impl AddressPlan {
 
         let mut last_error = None;
         let mut slow = Vec::new();
+        // The first address to connect whose sessions have not been reaching
+        // the server. It wins only if no other address of its batch connects.
+        let mut fallback = None;
         // The next batch is dialled only once every address of this one has
         // answered without connecting.
         for batch in candidates.chunks(MAX_RACE_CANDIDATES) {
@@ -619,6 +671,10 @@ impl AddressPlan {
             for (addr, result, elapsed) in rx {
                 match result {
                     Ok(stream) => {
+                        if self.state().stats(addr).setup_failures > 0 {
+                            fallback.get_or_insert((stream, addr, elapsed));
+                            continue;
+                        }
                         // Addresses that timed out lost to this one; they are
                         // not booked as failures.
                         ticket.finish(Ok(addr), Some(elapsed), resolved);
@@ -631,6 +687,10 @@ impl AddressPlan {
                         last_error = Some(error);
                     }
                 }
+            }
+            if let Some((stream, addr, elapsed)) = fallback.take() {
+                ticket.finish(Ok(addr), Some(elapsed), resolved);
+                return Ok((stream, addr));
             }
         }
         // Nothing answered, so a timeout was a failure after all.
@@ -670,6 +730,32 @@ impl AddressPlan {
                     );
                 }
             }
+        }
+    }
+
+    /// Book one session's setup on a socket connected to `addr`: whether the
+    /// server answered over it.
+    fn record_setup(&self, addr: SocketAddr, reached: bool) {
+        let mut state = self.state();
+        let pinned = state.pinned;
+        let stats = state.per_addr.entry(addr.ip()).or_default();
+        if reached {
+            stats.setup_failures = 0;
+            return;
+        }
+        stats.setup_failures = stats.setup_failures.saturating_add(1);
+        let failures = stats.setup_failures;
+        if pinned == Some(addr)
+            && failures >= SUSPECT_AFTER_FAILURES
+            && state.pending != Some(RaceReason::Suspect)
+        {
+            state.pending = Some(RaceReason::Suspect);
+            warn!(
+                server = %self.label,
+                address = %addr,
+                failures = SUSPECT_AFTER_FAILURES,
+                "pinned address connects but the server does not answer; racing the addresses again"
+            );
         }
     }
 
@@ -737,7 +823,7 @@ impl AddressPlan {
                         address,
                         connect_time: stats.connect_ewma,
                         body_latency: stats.body_latency_ewma,
-                        consecutive_failures: stats.consecutive_failures,
+                        consecutive_failures: stats.consecutive_failures.max(stats.setup_failures),
                         delivery_bytes_per_second: stats.delivery.bytes_per_second(),
                         delivery_samples: stats.delivery.samples,
                     }
@@ -899,7 +985,7 @@ impl PlanState {
             .copied()
             .filter(|addr| *addr != pin)
             .map(|addr| (addr, self.stats(addr)))
-            .filter(|(_, stats)| stats.consecutive_failures == 0)
+            .filter(|(_, stats)| !stats.failing())
             .filter_map(|(addr, stats)| Some((addr, stats.delivery.measured_rate(now)?)))
             .max_by(|left, right| left.1.total_cmp(&right.1));
         match best {
@@ -973,7 +1059,7 @@ impl PlanState {
             .filter(|addr| *addr != pin)
             .map(|addr| (addr, self.stats(addr)))
             .filter(|(_, stats)| {
-                stats.consecutive_failures == 0
+                !stats.failing()
                     && stats.connect_ewma.is_some()
                     && stats.delivery.samples < DELIVERY_MIN_SAMPLES
             })
@@ -1002,10 +1088,7 @@ impl PlanState {
             .collect();
         others.sort_by_key(|addr| {
             let stats = self.per_addr.get(&addr.ip()).copied().unwrap_or_default();
-            (
-                stats.consecutive_failures > 0,
-                stats.connect_ewma.unwrap_or(Duration::MAX),
-            )
+            (stats.failing(), stats.connect_ewma.unwrap_or(Duration::MAX))
         });
         self.pinned.into_iter().chain(others).collect()
     }

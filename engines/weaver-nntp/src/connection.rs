@@ -429,6 +429,7 @@ impl NntpConnection {
         }
         let mut route_socket = None;
         let mut route_outcome = None;
+        let mut setup = None;
         // Register direct sockets before TLS so revocation also interrupts handshakes.
         let transport = if config.proxy.is_some() {
             let (transport, outcome) = crate::proxy::connect(config).await?;
@@ -438,6 +439,9 @@ impl NntpConnection {
             let (tcp, remote_addr) =
                 crate::tls::dial_direct(&config.host, config.port, route, config.connect_timeout)
                     .await?;
+            setup = route
+                .zip(remote_addr)
+                .map(|(route, addr)| route.watch_setup(addr));
             let plain = NntpTransport::Plain {
                 inner: tcp.into(),
                 remote_addr,
@@ -465,6 +469,9 @@ impl NntpConnection {
             let (tcp, remote_addr) =
                 crate::tls::dial_direct(&config.host, config.port, route, config.connect_timeout)
                     .await?;
+            setup = route
+                .zip(remote_addr)
+                .map(|(route, addr)| route.watch_setup(addr));
             if config.tls {
                 crate::tls::connect_tls_over(
                     tcp,
@@ -523,6 +530,12 @@ impl NntpConnection {
         // 2. Read greeting
         let greeting = conn.read_response().await?;
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received greeting");
+        let upgrades = config.starttls && !conn.transport.as_ref().unwrap().is_tls();
+        if (!upgrades || !matches!(greeting.code.raw(), 200 | 201))
+            && let Some(setup) = setup.take()
+        {
+            setup.reached_server();
+        }
 
         match greeting.code.raw() {
             200 | 201 => {} // posting allowed / no posting — both fine for readers
@@ -534,6 +547,9 @@ impl NntpConnection {
         // 3. STARTTLS upgrade if configured and transport is plain
         if config.starttls && !conn.transport.as_ref().unwrap().is_tls() {
             conn.do_starttls().await?;
+            if let Some(setup) = setup.take() {
+                setup.reached_server();
+            }
         }
 
         // 4-5. Session setup: authentication and nothing else, unless this
