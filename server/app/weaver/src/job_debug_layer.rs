@@ -77,14 +77,19 @@ struct LineVisitor {
 }
 
 impl LineVisitor {
+    /// `LEVEL target: message field=value...`. The ring stamps the capture
+    /// time itself and renders it only when the ring is dumped.
     fn render(self, metadata: &Metadata<'_>) -> String {
-        let now = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-        let mut line = format!(
-            "{now} {} {}: {}",
-            metadata.level(),
-            metadata.target(),
-            self.message
+        let level = metadata.level().as_str();
+        let target = metadata.target();
+        let mut line = String::with_capacity(
+            level.len() + target.len() + self.message.len() + self.fields.len() + 3,
         );
+        line.push_str(level);
+        line.push(' ');
+        line.push_str(target);
+        line.push_str(": ");
+        line.push_str(&self.message);
         line.push_str(&self.fields);
         line
     }
@@ -153,16 +158,21 @@ mod tests {
             tracing::info!(job_id = 91_001_u64, "info is not captured");
         });
 
-        let lines = job_debug_ring::take(91_001);
+        let lines: Vec<String> = job_debug_ring::take(91_001)
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
         assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("DEBUG "), "{lines:?}");
         assert!(lines[0].contains("fetched an article"), "{lines:?}");
         assert!(lines[0].contains("segment=3"), "{lines:?}");
         assert!(lines[1].contains("trace detail"), "{lines:?}");
     }
 
-    /// Counts WARN records whose message mentions stall diagnostics.
+    /// WARN records whose message mentions stall diagnostics, as
+    /// `(message, fields)`.
     #[derive(Clone, Default)]
-    struct StallRecords(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    struct StallRecords(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
 
     impl<S: Subscriber> Layer<S> for StallRecords {
         fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
@@ -171,7 +181,10 @@ mod tests {
             if *event.metadata().level() == Level::WARN
                 && visitor.message.contains("stall diagnostics")
             {
-                self.0.lock().unwrap().push(visitor.message);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((visitor.message, visitor.fields));
             }
         }
     }
@@ -184,17 +197,37 @@ mod tests {
             .with(layer());
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(job_id = 91_002_u64, "before the stall");
+            tracing::debug!(job_id = 91_002_u64, "just before the stall");
             job_debug_ring::dump(91_002, "test stall");
             job_debug_ring::dump(91_002, "test stall");
         });
 
         let records = records.0.lock().unwrap();
+        let headers: Vec<_> = records
+            .iter()
+            .filter(|(message, _)| message.starts_with("stall diagnostics:"))
+            .collect();
         assert_eq!(
-            records.len(),
+            headers.len(),
             1,
             "an emptied ring writes nothing: {records:?}"
         );
-        assert!(records[0].contains("before the stall"), "{records:?}");
+        assert!(headers[0].0.contains("2 recent debug lines"), "{records:?}");
+        assert!(headers[0].1.contains("job_id=91002"), "{records:?}");
+
+        let lines: Vec<&String> = records
+            .iter()
+            .filter(|(message, _)| message == "stall diagnostics line")
+            .map(|(_, fields)| fields)
+            .collect();
+        assert_eq!(lines.len(), 2, "one record per captured line: {records:?}");
+        assert!(lines[0].contains("before the stall"), "{records:?}");
+        assert!(lines[1].contains("just before the stall"), "{records:?}");
+        for fields in &lines {
+            assert!(fields.contains("job_id=91002"), "{records:?}");
+            assert!(fields.contains("reason=test stall"), "{records:?}");
+            assert!(fields.contains(" at="), "{records:?}");
+        }
         assert!(job_debug_ring::take(91_002).is_empty());
     }
 }
