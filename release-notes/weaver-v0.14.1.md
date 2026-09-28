@@ -41,6 +41,14 @@ Everything below is new since 0.14.0.
 - **A saved profile the machine can no longer honour reads as not chosen.**
   The settings page opens on the recommended profile, which is what runs.
 
+### Schedules
+
+- **A scheduled pause or speed limit no longer ends at midnight.** A rule was
+  in force only until the end of the day it fired on, so "pause at 23:00,
+  resume at 06:00" paused for one hour. A rule now stays in force until the
+  next rule fires, across midnight and across days the rules skip. The same
+  holds for watch-folder rules.
+
 ### Download health
 
 - **A set is charged what its lost files need.** While a health failure is
@@ -93,6 +101,11 @@ Everything below is new since 0.14.0.
 - An archive that fails to extract for a reason other than damage, such as a
   wrong password on a `zip`, costs one PAR2 verification pass before the job
   fails. This happens at most once per recovery set.
+- Schedules behave differently after this upgrade. A rule now stays in force
+  until the next one fires, so a pause or speed limit that used to end at
+  midnight continues until a later rule ends it. A schedule with a pause rule
+  and no resume rule now pauses permanently; add a resume rule or remove the
+  pause.
 - Restarting after a profile change is no longer needed.
 - The `WEAVER_EXTRACTION_MAX_MEMORY_BYTES` environment variable still
   outranks every profile's memory ceiling.
