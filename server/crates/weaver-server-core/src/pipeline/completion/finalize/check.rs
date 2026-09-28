@@ -817,7 +817,7 @@ fn log_clean_par2_verification_source(
     verification_mode: CleanPar2VerificationMode,
 ) {
     let verification_mode = verification_mode.as_str();
-    info!(
+    debug!(
         job_id = job_id.0,
         recovery_set_id = %set_id,
         slice_size,

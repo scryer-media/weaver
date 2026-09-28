@@ -11,6 +11,7 @@ mod cross_device;
 mod cross_device_probe;
 mod delayed_header_admission;
 mod header_encrypted_parse_cost;
+mod header_encrypted_restart;
 mod par3_spill;
 mod quick_open;
 mod rar4_rar3_file_encryption;

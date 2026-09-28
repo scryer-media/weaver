@@ -48,18 +48,106 @@ fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
     Dir::open_ambient_dir(root, cap_std::ambient_authority())?.open_dir_nofollow(relative)
 }
 
-fn working_marker_value(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<String> {
-    let metadata = dir.dir_metadata()?;
+const MARKER_V1_PREFIX: &str = "weaver-job-v1:";
+const MARKER_V2_PREFIX: &str = "weaver-job-v2:";
+
+/// The marker's identity hash.
+///
+/// v2 binds the directory's path, inode and owning job. v1 also bound the
+/// device number, which is not stable on every filesystem: pooled and layered
+/// filesystems renumber it across reboots or dataset recreation, and every
+/// marker written before the renumbering then stopped matching its own
+/// directory. `dev` is only passed when recomputing a v1 marker.
+fn marker_hash(path: &Path, dev: Option<u64>, ino: u64, job_id: JobId) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(path.as_os_str().as_encoded_bytes());
-    hash.update(&metadata.dev().to_le_bytes());
-    hash.update(&metadata.ino().to_le_bytes());
+    if let Some(dev) = dev {
+        hash.update(&dev.to_le_bytes());
+    }
+    hash.update(&ino.to_le_bytes());
     hash.update(&job_id.0.to_le_bytes());
+    hash.finalize().to_hex().to_string()
+}
+
+fn working_marker_value(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<String> {
+    let metadata = dir.dir_metadata()?;
     Ok(format!(
-        "weaver-job-v1:{}:{}\n",
+        "{MARKER_V2_PREFIX}{}:{}\n",
         job_id.0,
-        hash.finalize().to_hex()
+        marker_hash(path, None, metadata.ino(), job_id)
     ))
+}
+
+/// The v1 markers this directory could legitimately carry for `job_id`: the
+/// hash with the device number as it reads now, and with none at all.
+fn legacy_marker_values(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<[String; 2]> {
+    let metadata = dir.dir_metadata()?;
+    let line = |dev| {
+        format!(
+            "{MARKER_V1_PREFIX}{}:{}\n",
+            job_id.0,
+            marker_hash(path, dev, metadata.ino(), job_id)
+        )
+    };
+    Ok([line(Some(metadata.dev())), line(None)])
+}
+
+/// The job a marker names, from either marker version.
+fn marker_job_id(stored: &str) -> Option<JobId> {
+    stored
+        .strip_prefix(MARKER_V2_PREFIX)
+        .or_else(|| stored.strip_prefix(MARKER_V1_PREFIX))
+        .and_then(|value| value.split(':').next())
+        .and_then(|value| value.parse().ok())
+        .map(JobId)
+}
+
+/// How a stored marker compares with what this directory should carry for
+/// the job it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerMatch {
+    /// A v2 marker for this directory and job.
+    Current,
+    /// A v1 marker for this directory and job, to be rewritten as v2.
+    Legacy,
+    /// The marker names this job but its hash does not match the directory.
+    Mismatch,
+}
+
+fn match_marker(
+    dir: &Dir,
+    path: &Path,
+    stored: &str,
+    job_id: JobId,
+) -> std::io::Result<MarkerMatch> {
+    if stored == working_marker_value(dir, path, job_id)? {
+        return Ok(MarkerMatch::Current);
+    }
+    if legacy_marker_values(dir, path, job_id)?
+        .iter()
+        .any(|legacy| legacy == stored)
+    {
+        return Ok(MarkerMatch::Legacy);
+    }
+    Ok(MarkerMatch::Mismatch)
+}
+
+fn write_working_marker(dir: &Dir, value: &str) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    dir.open_with(WORKING_DIR_MARKER, &options)?
+        .write_all(value.as_bytes())
+}
+
+/// Replaces a verified v1 marker with its v2 form, so the directory stops
+/// depending on a device number that may change.
+fn upgrade_legacy_marker(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<()> {
+    let current = working_marker_value(dir, path, job_id)?;
+    dir.remove_file(WORKING_DIR_MARKER)?;
+    write_working_marker(dir, &current)
 }
 
 fn read_working_marker(dir: &Dir) -> std::io::Result<String> {
@@ -89,16 +177,16 @@ fn read_working_marker(dir: &Dir) -> std::io::Result<String> {
 fn owned_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
     let dir = open_working_directory(root, path)?;
     let stored = read_working_marker(&dir)?;
-    let job_id = stored
-        .strip_prefix("weaver-job-v1:")
-        .and_then(|value| value.split(':').next())
-        .and_then(|value| value.parse().ok())
-        .map(JobId)
+    let job_id = marker_job_id(&stored)
         .ok_or_else(|| std::io::Error::other("working directory has no valid ownership marker"))?;
-    if stored != working_marker_value(&dir, path, job_id)? {
-        return Err(std::io::Error::other(
-            "working directory ownership does not match its identity",
-        ));
+    match match_marker(&dir, path, &stored, job_id)? {
+        MarkerMatch::Current => {}
+        MarkerMatch::Legacy => upgrade_legacy_marker(&dir, path, job_id)?,
+        MarkerMatch::Mismatch => {
+            return Err(std::io::Error::other(
+                "working directory ownership does not match its identity",
+            ));
+        }
     }
     Ok(dir)
 }
@@ -109,9 +197,18 @@ pub fn mark_weaver_owned_working_dir(
     job_id: JobId,
 ) -> std::io::Result<()> {
     let dir = open_working_directory(root, path)?;
-    let expected = working_marker_value(&dir, path, job_id)?;
     match read_working_marker(&dir) {
-        Ok(stored) if stored == expected => return Ok(()),
+        Ok(stored) if marker_job_id(&stored) == Some(job_id) => {
+            match match_marker(&dir, path, &stored, job_id)? {
+                MarkerMatch::Current => return Ok(()),
+                MarkerMatch::Legacy => return upgrade_legacy_marker(&dir, path, job_id),
+                MarkerMatch::Mismatch => {
+                    return Err(std::io::Error::other(
+                        "refusing to replace a foreign working directory marker",
+                    ));
+                }
+            }
+        }
         // Only trusted active-job restoration calls this migration path.
         Ok(stored) if stored.is_empty() => dir.remove_file(WORKING_DIR_MARKER)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -121,29 +218,70 @@ pub fn mark_weaver_owned_working_dir(
             ));
         }
     }
-    let mut options = OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .follow(FollowSymlinks::No);
-    dir.open_with(WORKING_DIR_MARKER, &options)?
-        .write_all(expected.as_bytes())
+    write_working_marker(&dir, &working_marker_value(&dir, path, job_id)?)
 }
 
 pub fn remove_weaver_owned_working_dir(root: &Path, path: &Path) -> std::io::Result<()> {
     owned_working_directory(root, path)?.remove_open_dir_all()
 }
 
-/// Delete only the directory still owned by the job selected for cleanup.
-/// Validation and removal use the same opened directory capability.
-pub fn remove_job_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<()> {
-    let dir = open_working_directory(root, path)?;
-    if read_working_marker(&dir)? != working_marker_value(&dir, path, job_id)? {
+/// What a history cleanup did with one job's working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryWorkingDir {
+    /// The directory is the job's (or is already gone) and may be removed.
+    Owned,
+    /// The marker names this job but no longer matches the directory, so the
+    /// directory is left on disk. The history record can still go: nothing
+    /// about the mismatch makes the directory anyone else's.
+    LeftInPlace,
+}
+
+fn judge_history_marker(
+    dir: &Dir,
+    path: &Path,
+    stored: &str,
+    job_id: JobId,
+) -> std::io::Result<HistoryWorkingDir> {
+    // A marker naming another job is never this job's to delete.
+    if marker_job_id(stored) != Some(job_id) {
         return Err(std::io::Error::other(
             "working directory no longer belongs to the expected job",
         ));
     }
-    dir.remove_open_dir_all()
+    match match_marker(dir, path, stored, job_id)? {
+        MarkerMatch::Current => Ok(HistoryWorkingDir::Owned),
+        MarkerMatch::Legacy => {
+            upgrade_legacy_marker(dir, path, job_id)?;
+            Ok(HistoryWorkingDir::Owned)
+        }
+        MarkerMatch::Mismatch => {
+            tracing::warn!(
+                job_id = job_id.0,
+                dir = %path.display(),
+                "working directory marker names this job but no longer matches the \
+                 directory; leaving the directory in place"
+            );
+            Ok(HistoryWorkingDir::LeftInPlace)
+        }
+    }
+}
+
+/// Delete only the directory still owned by the job selected for cleanup.
+/// Validation and removal use the same opened directory capability.
+pub fn remove_job_working_dir(
+    root: &Path,
+    path: &Path,
+    job_id: JobId,
+) -> std::io::Result<HistoryWorkingDir> {
+    let dir = open_working_directory(root, path)?;
+    let stored = read_working_marker(&dir)?;
+    match judge_history_marker(&dir, path, &stored, job_id)? {
+        HistoryWorkingDir::Owned => {
+            dir.remove_open_dir_all()?;
+            Ok(HistoryWorkingDir::Owned)
+        }
+        HistoryWorkingDir::LeftInPlace => Ok(HistoryWorkingDir::LeftInPlace),
+    }
 }
 
 pub async fn stamp_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<()> {
@@ -158,25 +296,23 @@ pub async fn prepare_history_working_dir(
     root: &Path,
     path: &Path,
     job_id: JobId,
-) -> std::io::Result<()> {
+) -> std::io::Result<HistoryWorkingDir> {
     let root = root.to_path_buf();
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let dir = match open_working_directory(&root, &path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HistoryWorkingDir::Owned);
+            }
             result => result?,
         };
         let stored = read_working_marker(&dir)?;
         if stored.is_empty() {
             // The durable history row supplies the legacy directory's job identity.
-            mark_weaver_owned_working_dir(&root, &path, job_id)
-        } else if stored == working_marker_value(&dir, &path, job_id)? {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(
-                "historical working directory ownership mismatch",
-            ))
+            mark_weaver_owned_working_dir(&root, &path, job_id)?;
+            return Ok(HistoryWorkingDir::Owned);
         }
+        judge_history_marker(&dir, &path, &stored, job_id)
     })
     .await
     .map_err(std::io::Error::other)?
@@ -244,9 +380,12 @@ mod tests {
         let path = temp.path().join("job");
         std::fs::create_dir(&path).unwrap();
         mark_weaver_owned_working_dir(temp.path(), &path, JobId(7)).unwrap();
-        prepare_history_working_dir(temp.path(), &path, JobId(7))
-            .await
-            .unwrap();
+        assert_eq!(
+            prepare_history_working_dir(temp.path(), &path, JobId(7))
+                .await
+                .unwrap(),
+            HistoryWorkingDir::Owned
+        );
         std::fs::rename(&path, temp.path().join("previous")).unwrap();
         std::fs::create_dir(&path).unwrap();
         mark_weaver_owned_working_dir(temp.path(), &path, JobId(8)).unwrap();
@@ -255,6 +394,97 @@ mod tests {
         assert_eq!(std::fs::read(path.join("payload")).unwrap(), b"replacement");
         remove_job_working_dir(temp.path(), &path, JobId(8)).unwrap();
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    /// Writes a v1 marker for `path` computed with `dev`, the way a binary that
+    /// still hashed the device number would have.
+    fn write_v1_marker(path: &Path, dev: Option<u64>, job_id: JobId) {
+        let ino = std::fs::metadata(path).unwrap().ino();
+        std::fs::write(
+            working_dir_marker_path(path),
+            format!(
+                "{MARKER_V1_PREFIX}{}:{}\n",
+                job_id.0,
+                marker_hash(path, dev, ino, job_id)
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_v1_marker_for_the_same_directory_is_accepted_and_rewritten_as_v2() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, with_dev) in [("current-dev", true), ("no-dev", false)] {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            let dev = with_dev.then(|| std::fs::metadata(&path).unwrap().dev());
+            write_v1_marker(&path, dev, JobId(21));
+
+            assert_eq!(
+                prepare_history_working_dir(temp.path(), &path, JobId(21))
+                    .await
+                    .unwrap(),
+                HistoryWorkingDir::Owned,
+                "{name}: a v1 marker this directory could have written is its owner"
+            );
+            let rewritten = std::fs::read_to_string(working_dir_marker_path(&path)).unwrap();
+            assert!(
+                rewritten.starts_with(MARKER_V2_PREFIX),
+                "{name}: an accepted v1 marker is rewritten as v2, got {rewritten:?}"
+            );
+            assert!(is_weaver_owned_working_dir(&path));
+            assert_eq!(
+                remove_job_working_dir(temp.path(), &path, JobId(21)).unwrap(),
+                HistoryWorkingDir::Owned
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_marker_for_this_job_that_no_longer_matches_leaves_the_directory_in_place() {
+        // A v1 marker written under a device number the filesystem has since
+        // renumbered: it names the right job, and its hash cannot be
+        // reproduced from the directory as it is now.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("renumbered");
+        std::fs::create_dir(&path).unwrap();
+        let dev = std::fs::metadata(&path).unwrap().dev();
+        write_v1_marker(&path, Some(dev.wrapping_add(1)), JobId(22));
+        std::fs::write(path.join("payload"), b"kept").unwrap();
+
+        assert_eq!(
+            prepare_history_working_dir(temp.path(), &path, JobId(22))
+                .await
+                .unwrap(),
+            HistoryWorkingDir::LeftInPlace
+        );
+        assert_eq!(
+            remove_job_working_dir(temp.path(), &path, JobId(22)).unwrap(),
+            HistoryWorkingDir::LeftInPlace
+        );
+        assert_eq!(std::fs::read(path.join("payload")).unwrap(), b"kept");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_marker_naming_another_job_is_still_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("foreign");
+        std::fs::create_dir(&path).unwrap();
+        write_v1_marker(&path, None, JobId(23));
+        std::fs::write(path.join("payload"), b"not yours").unwrap();
+
+        assert!(
+            prepare_history_working_dir(temp.path(), &path, JobId(24))
+                .await
+                .is_err()
+        );
+        assert!(remove_job_working_dir(temp.path(), &path, JobId(24)).is_err());
+        assert_eq!(std::fs::read(path.join("payload")).unwrap(), b"not yours");
     }
 
     #[test]

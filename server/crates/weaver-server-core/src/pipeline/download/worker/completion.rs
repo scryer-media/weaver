@@ -782,6 +782,7 @@ impl Pipeline {
                         error = %failure.message,
                         "NNTP BODY fetch failed"
                     );
+                    crate::runtime::job_debug_ring::dump(job_id.0, "NNTP BODY fetch failed");
                 }
                 if result.origin == DownloadResultOrigin::IpReplacementTrial
                     && !matches!(
@@ -954,6 +955,10 @@ impl Pipeline {
                                 error = %failure.message,
                                 "downloads waiting: local BODY lane capacity is saturated; a server is eligible and the work retries as lanes free"
                             );
+                            crate::runtime::job_debug_ring::dump(
+                                job_id.0,
+                                "downloads waiting: local BODY lane capacity is saturated",
+                            );
                         }
                     } else if let Some(suppressed_since_last) = self
                         .no_eligible_server_warn_throttle
@@ -969,6 +974,10 @@ impl Pipeline {
                             suppressed_since_last,
                             error = %failure.message,
                             "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
+                        );
+                        crate::runtime::job_debug_ring::dump(
+                            job_id.0,
+                            "downloads waiting: no eligible news server",
                         );
                     }
                     self.metrics

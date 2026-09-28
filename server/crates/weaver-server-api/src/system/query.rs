@@ -297,6 +297,19 @@ impl SystemQuery {
         let count = lines.len() as i32;
         Ok(ServiceLogsPayload { lines, count })
     }
+    /// The live log filter directives.
+    #[graphql(guard = "AdminGuard")]
+    async fn log_filter(&self) -> Result<crate::system::types::LogFilter> {
+        weaver_server_core::runtime::log_filter::current_directives()
+            .map(Into::into)
+            .ok_or_else(|| {
+                graphql_error(
+                    "INTERNAL",
+                    weaver_server_core::runtime::log_filter::LogFilterError::NotInstalled
+                        .to_string(),
+                )
+            })
+    }
     /// Get current pipeline metrics.
     async fn metrics(&self, ctx: &Context<'_>) -> Result<Metrics> {
         let handle = ctx.data::<SchedulerHandle>()?;

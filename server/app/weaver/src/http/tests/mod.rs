@@ -469,7 +469,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                         let _ = db.delete_job_history(job_id.0);
                         let _ = db.delete_job_events(job_id.0);
                     }
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(Ok(Default::default()));
                 }
                 SchedulerCommand::RedownloadJob { reply, .. } => {
                     let _ = reply.send(Ok(()));

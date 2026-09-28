@@ -1,9 +1,11 @@
 import { memo, useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { useMutation, useQuery } from "urql";
+import { LOG_FILTER_QUERY, SET_LOG_FILTER_MUTATION } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "../components/chrome";
-import { SecondaryButton, TextField } from "../components/controls";
+import { SecondaryButton, Select, TextField } from "../components/controls";
 import { formatCount } from "../data/format";
 import { LOG_LEVEL_COLORS, WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
@@ -26,6 +28,119 @@ const TAIL_SLACK_PX = 24;
 const ROW_ESTIMATE_PX = 31;
 
 const FILTERS: LogLevelFilter[] = ["all", ...LOG_LEVELS];
+
+type LogFilterPreset = "default" | "download" | "directStore" | "everything" | "custom";
+
+/** Directives per preset. Blank asks the server for its startup filter. */
+const PRESET_DIRECTIVES: Record<Exclude<LogFilterPreset, "custom">, string> = {
+  default: "",
+  download: "info,weaver_server_core::pipeline::download=debug,weaver_nntp=debug",
+  directStore: "info,weaver_server_core::pipeline::direct_store=debug",
+  everything: "debug",
+};
+
+type LogFilterState = { directives: string; defaultDirectives: string };
+
+function presetFor(state: LogFilterState): LogFilterPreset {
+  if (state.directives === state.defaultDirectives) {
+    return "default";
+  }
+  for (const [preset, directives] of Object.entries(PRESET_DIRECTIVES)) {
+    if (directives !== "" && directives === state.directives) {
+      return preset as LogFilterPreset;
+    }
+  }
+  return "custom";
+}
+
+/**
+ * The live log level. The server answers `logFilter` for an admin only, so
+ * anyone else never sees the control. A change lasts until the next restart.
+ */
+function LogFilterBar() {
+  const t = useTranslate();
+  const [{ data, error: loadError }] = useQuery<{ logFilter: LogFilterState }>({
+    query: LOG_FILTER_QUERY,
+  });
+  const [{ fetching }, setLogFilter] = useMutation<{ setLogFilter: LogFilterState }>(
+    SET_LOG_FILTER_MUTATION,
+  );
+  const [applied, setApplied] = useState<LogFilterState | null>(null);
+  // `null` until edited: the field shows what is in force.
+  const [edited, setEdited] = useState<string | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  const current = applied ?? data?.logFilter ?? null;
+
+  if (loadError || !current) {
+    return null;
+  }
+  const draft = edited ?? current.directives;
+
+  const apply = async (directives: string) => {
+    setFailure(null);
+    const result = await setLogFilter({ directives });
+    if (result.error || !result.data) {
+      setFailure(
+        t("next.logs.filter.failed", {
+          error: result.error?.graphQLErrors[0]?.message ?? result.error?.message ?? "",
+        }),
+      );
+      return;
+    }
+    setApplied(result.data.setLogFilter);
+    setEdited(null);
+  };
+
+  const options: { value: LogFilterPreset; label: string }[] = [
+    { value: "default", label: t("next.logs.filter.preset.default") },
+    { value: "download", label: t("next.logs.filter.preset.download") },
+    { value: "directStore", label: t("next.logs.filter.preset.directStore") },
+    { value: "everything", label: t("next.logs.filter.preset.everything") },
+    { value: "custom", label: t("next.logs.filter.preset.custom") },
+  ];
+  const onPreset = (preset: LogFilterPreset) => {
+    if (preset === "custom") {
+      return;
+    }
+    void apply(PRESET_DIRECTIVES[preset]);
+  };
+
+  return (
+    <div className="flex min-h-10 flex-none flex-wrap items-center gap-3 border-b border-wv-hairline bg-wv-list px-4 py-1.5 sm:px-6">
+      <span className="flex-none font-wv-mono text-[11.5px] tracking-[0.1em] text-wv-muted uppercase">
+        {t("next.logs.filter.label")}
+      </span>
+      <Select
+        label={t("next.logs.filter.label")}
+        value={presetFor(current)}
+        options={options}
+        onChange={onPreset}
+        className="w-[190px]"
+      />
+      <TextField
+        label={t("next.logs.filter.directives")}
+        placeholder={current.defaultDirectives}
+        value={draft}
+        onChange={setEdited}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            void apply(draft);
+          }
+        }}
+        className="min-w-0 flex-1 sm:max-w-[420px]"
+      />
+      <SecondaryButton
+        onClick={() => void apply(draft)}
+        disabled={fetching || draft.trim() === current.directives}
+      >
+        {t("next.logs.filter.apply")}
+      </SecondaryButton>
+      <span className="flex-none font-wv-mono text-[11px] text-wv-faint">
+        {failure ?? t("next.logs.filter.note")}
+      </span>
+    </div>
+  );
+}
 
 /** Split the message so its `key=value` tail can be tinted separately. */
 function messageFragments(line: LogLine) {
@@ -140,6 +255,8 @@ export function LogsPage() {
       railMiddle={<AttentionBlock />}
       railFooter={<UptimeBlock />}
       beforeContent={
+        <>
+        <LogFilterBar />
         <div className="flex h-10 flex-none items-center border-b border-wv-hairline bg-wv-list px-4 sm:px-6">
           <div className="wv-xscroll flex min-w-0 items-center gap-4 sm:gap-5">
           {FILTERS.map((entry) => {
@@ -175,6 +292,7 @@ export function LogsPage() {
                 : t("next.logs.disconnected")}
           </span>
         </div>
+        </>
       }
       statusRight={t("next.logs.shown", {
         shown: formatCount(logs.matchedCount),

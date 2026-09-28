@@ -642,6 +642,91 @@ async fn unavailable_prefix_frontier_does_not_probe_later_carrier_segments() {
 }
 
 #[tokio::test]
+async fn metadata_carrier_promotion_requeues_only_unreceived_articles() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30939);
+    let carrier_filename = "partial-carrier.vol00+01.par2";
+    let carrier_file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let spec = JobSpec {
+        name: "Partially Received Carrier".to_string(),
+        password: None,
+        total_bytes: 257,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "partial-carrier-payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 1,
+                    message_id: "partial-carrier-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: carrier_filename.to_string(),
+                role: FileRole::from_filename(carrier_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: (0..4)
+                    .map(|ordinal| {
+                        segment_spec! {
+                            number: ordinal,
+                            bytes: 64,
+                            message_id: format!("partial-carrier-{ordinal}@example.com"),
+                        }
+                    })
+                    .collect(),
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        let carrier = state.assembly.file_mut(carrier_file_id).unwrap();
+        // Articles 0 and 2 already arrived — neither through a recorded
+        // prefix probe — so only the assembly knows they are held.
+        carrier.commit_segment(0, 64).unwrap();
+        carrier.commit_segment(2, 64).unwrap();
+    }
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(carrier_file_id.file_index)
+        .or_default()
+        .discovery = Par2DiscoveryState::PrefixProbed {
+        set_ids: vec![par2_rs::RecoverySetId::from_bytes([0x5A; 16])],
+    };
+
+    assert!(
+        pipeline.promote_par2_metadata(job_id),
+        "an unresolved observed set promotes its carrier"
+    );
+    assert_eq!(
+        drain_promoted_segments(&mut pipeline, job_id),
+        vec![
+            SegmentId {
+                file_id: carrier_file_id,
+                segment_number: 1,
+            },
+            SegmentId {
+                file_id: carrier_file_id,
+                segment_number: 3,
+            },
+        ],
+        "articles the assembly already holds must not be fetched again"
+    );
+}
+
+#[tokio::test]
 async fn exhausted_optional_prefix_probe_does_not_block_clean_completion() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

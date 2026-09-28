@@ -466,7 +466,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::DeleteHistory { reply, .. } => {
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(Ok(Default::default()));
                 }
                 SchedulerCommand::DeleteAllHistory { reply, .. } => {
                     let _ = reply.send(Ok(()));

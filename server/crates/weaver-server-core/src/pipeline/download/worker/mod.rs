@@ -80,10 +80,21 @@ const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
 /// unreadable from the log. Each job gets its own window here, and whatever a
 /// closed window swallowed is counted and reported by the next line that gets
 /// through it.
-#[derive(Debug, Default)]
-pub(crate) struct JobLogThrottle {
-    windows: HashMap<JobId, JobLogWindow>,
+#[derive(Debug)]
+pub(crate) struct KeyedLogThrottle<K> {
+    windows: HashMap<K, JobLogWindow>,
 }
+
+impl<K> Default for KeyedLogThrottle<K> {
+    fn default() -> Self {
+        Self {
+            windows: HashMap::new(),
+        }
+    }
+}
+
+/// The per-job window every job-scoped throttle uses.
+pub(crate) type JobLogThrottle = KeyedLogThrottle<JobId>;
 
 #[derive(Debug, Clone, Copy)]
 struct JobLogWindow {
@@ -91,14 +102,14 @@ struct JobLogWindow {
     suppressed: u64,
 }
 
-impl JobLogThrottle {
-    /// Whether this job may log now, and how many of its emissions the closed
+impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
+    /// Whether this key may log now, and how many of its emissions the closed
     /// window swallowed since the last one that got through.
-    pub(crate) fn admit(&mut self, job_id: JobId, interval: Duration) -> Option<u64> {
+    pub(crate) fn admit(&mut self, job_id: K, interval: Duration) -> Option<u64> {
         self.admit_at(job_id, interval, Instant::now())
     }
 
-    fn admit_at(&mut self, job_id: JobId, interval: Duration, now: Instant) -> Option<u64> {
+    fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
         match self.windows.get_mut(&job_id) {
             Some(window) if now.duration_since(window.emitted_at) < interval => {
                 window.suppressed = window.suppressed.saturating_add(1);
@@ -136,7 +147,7 @@ impl JobLogThrottle {
     }
 
     #[cfg(test)]
-    pub(crate) fn last_emitted_at(&self, job_id: JobId) -> Option<Instant> {
+    pub(crate) fn last_emitted_at(&self, job_id: K) -> Option<Instant> {
         self.windows.get(&job_id).map(|window| window.emitted_at)
     }
 }
@@ -431,7 +442,7 @@ impl Pipeline {
                 .map(|state| state.spec.total_bytes)
                 .unwrap_or(0);
             let tuner_max = self.tuner.params().max_concurrent_downloads;
-            info!(
+            debug!(
                 job_id = job_id.0,
                 total_bytes = total,
                 configured_server_count = self.nntp.pool().server_count(),
@@ -633,6 +644,20 @@ impl Pipeline {
                             status_allows_dispatch,
                             "dispatch idle: job not eligible by status"
                         );
+                    } else if parked_recovery_only && !status_allows_dispatch {
+                        // Recovery parked behind a phase that dispatches
+                        // nothing — moving the output, say — is waiting for
+                        // that phase, not stalled. The phase ends it.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch idle: parked recovery behind a non-dispatching phase"
+                        );
                     } else {
                         ineligible_jobs.push((
                             *jid,
@@ -673,6 +698,7 @@ impl Pipeline {
                     suppressed_since_last,
                     "dispatch stall: job not eligible"
                 );
+                crate::runtime::job_debug_ring::dump(job_id.0, "dispatch stall: job not eligible");
             }
             for job_id in drained_parked_recovery_jobs {
                 self.schedule_job_completion_check_if_download_pipeline_drained(

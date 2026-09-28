@@ -407,43 +407,66 @@ async fn run_postgres_maintenance_pass(
 }
 
 fn log_report(report: &DbMaintenanceReport) {
-    tracing::info!(
-        page_size = report.before.page_size,
-        page_count_before = report.before.page_count,
-        page_count_after = report.after.page_count,
-        freelist_count_before = report.before.freelist_count,
-        freelist_count_after = report.after.freelist_count,
-        reclaimable_bytes_before = report.before.reclaimable_bytes(),
-        reclaimable_bytes_after = report.after.reclaimable_bytes(),
-        reclaimed_pages_estimate = report.reclaimed_pages_estimate,
-        reclaimed_bytes_estimate = report.reclaimed_bytes_estimate,
-        db_size_bytes_before = report.before.db_size_bytes,
-        db_size_bytes_after = report.after.db_size_bytes,
-        wal_size_bytes_before = report.before.wal_size_bytes,
-        wal_size_bytes_after = report.after.wal_size_bytes,
-        wal_passive_busy_before = report.before.passive_checkpoint.busy,
-        wal_passive_log_frames_before = report.before.passive_checkpoint.log_frames,
-        wal_passive_checkpointed_frames_before =
-            report.before.passive_checkpoint.checkpointed_frames,
-        wal_passive_busy_after = report.after.passive_checkpoint.busy,
-        wal_passive_log_frames_after = report.after.passive_checkpoint.log_frames,
-        wal_passive_checkpointed_frames_after = report.after.passive_checkpoint.checkpointed_frames,
-        wal_truncate_ran = report.wal_truncate_ran,
-        wal_truncate_busy = report.wal_truncate_result.map(|result| result.busy),
-        wal_truncate_log_frames = report.wal_truncate_result.map(|result| result.log_frames),
-        wal_truncate_checkpointed_frames = report
-            .wal_truncate_result
-            .map(|result| result.checkpointed_frames),
-        active_job_count = report.active_job_count,
-        full_vacuum_ran = report.full_vacuum_ran,
-        full_vacuum_decision = report.full_vacuum_decision.as_str(),
-        full_vacuum_last_success_epoch_secs = report.full_vacuum_last_success_epoch_secs,
-        full_vacuum_error = report.full_vacuum_error.as_deref(),
-        incremental_vacuum_ran = report.incremental_vacuum_ran,
-        vacuum_iterations = report.vacuum_iterations,
-        budget_limited = report.budget_limited,
-        "sqlite maintenance pass complete"
-    );
+    // A pass that reclaimed, truncated or vacuumed nothing is the usual
+    // hourly case and not worth a line at the default level.
+    macro_rules! emit_report {
+        ($level:expr) => {
+            tracing::event!(
+                $level,
+                page_size = report.before.page_size,
+                page_count_before = report.before.page_count,
+                page_count_after = report.after.page_count,
+                freelist_count_before = report.before.freelist_count,
+                freelist_count_after = report.after.freelist_count,
+                reclaimable_bytes_before = report.before.reclaimable_bytes(),
+                reclaimable_bytes_after = report.after.reclaimable_bytes(),
+                reclaimed_pages_estimate = report.reclaimed_pages_estimate,
+                reclaimed_bytes_estimate = report.reclaimed_bytes_estimate,
+                db_size_bytes_before = report.before.db_size_bytes,
+                db_size_bytes_after = report.after.db_size_bytes,
+                wal_size_bytes_before = report.before.wal_size_bytes,
+                wal_size_bytes_after = report.after.wal_size_bytes,
+                wal_passive_busy_before = report.before.passive_checkpoint.busy,
+                wal_passive_log_frames_before = report.before.passive_checkpoint.log_frames,
+                wal_passive_checkpointed_frames_before =
+                    report.before.passive_checkpoint.checkpointed_frames,
+                wal_passive_busy_after = report.after.passive_checkpoint.busy,
+                wal_passive_log_frames_after = report.after.passive_checkpoint.log_frames,
+                wal_passive_checkpointed_frames_after =
+                    report.after.passive_checkpoint.checkpointed_frames,
+                wal_truncate_ran = report.wal_truncate_ran,
+                wal_truncate_busy = report.wal_truncate_result.map(|result| result.busy),
+                wal_truncate_log_frames =
+                    report.wal_truncate_result.map(|result| result.log_frames),
+                wal_truncate_checkpointed_frames = report
+                    .wal_truncate_result
+                    .map(|result| result.checkpointed_frames),
+                active_job_count = report.active_job_count,
+                full_vacuum_ran = report.full_vacuum_ran,
+                full_vacuum_decision = report.full_vacuum_decision.as_str(),
+                full_vacuum_last_success_epoch_secs = report.full_vacuum_last_success_epoch_secs,
+                full_vacuum_error = report.full_vacuum_error.as_deref(),
+                incremental_vacuum_ran = report.incremental_vacuum_ran,
+                vacuum_iterations = report.vacuum_iterations,
+                budget_limited = report.budget_limited,
+                "sqlite maintenance pass complete"
+            )
+        };
+    }
+    if maintenance_changed_something(report) {
+        emit_report!(tracing::Level::INFO);
+    } else {
+        emit_report!(tracing::Level::DEBUG);
+    }
+}
+
+fn maintenance_changed_something(report: &DbMaintenanceReport) -> bool {
+    report.full_vacuum_ran
+        || report.incremental_vacuum_ran
+        || report.wal_truncate_ran
+        || report.full_vacuum_error.is_some()
+        || report.reclaimed_bytes_estimate > 0
+        || report.after.page_count != report.before.page_count
 }
 
 async fn read_page_stats(datastore: &StoreDatastore) -> Result<PageStats, StateError> {

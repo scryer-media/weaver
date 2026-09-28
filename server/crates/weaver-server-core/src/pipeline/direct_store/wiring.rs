@@ -2476,26 +2476,13 @@ impl Pipeline {
         // only route into the `-hp` ring afterwards, and without it a password
         // supplied mid-download reaches the *file* key and never the archive
         // one, so a `-hp` set that had a password all along still refuses under
-        // `NoPassword`.
-        //
-        // Normalized the way the harvest normalizes, so a placeholder like
-        // `"yes"` — which `archive_password_candidates_for_job` drops — is not
-        // smuggled past it here and paid for in PBKDF2.
-        //
-        // Labelled `job_spec` rather than `explicit` because that is all that is
-        // known: for a job imported from an NZB, `import.rs` seeds `spec.password`
-        // from the harvest's *first* candidate, which is usually the NZB meta
-        // password or the `{{…}}` filename convention. The label only reaches a
-        // refusal's `sources` field, and a field that says where a candidate came
-        // from should not guess.
-        let offered = crate::ingest::normalize_archive_password_candidate(Some(password.as_str()));
+        // `NoPassword`. Normalization and labelling live in
+        // `offer_direct_header_candidates`, shared with the restart seam.
         for set in self.direct_store.sets_mut(job_id) {
             set.router.set_password(Some(password.as_str()));
             // Offering is a no-op once the ring has verified or refused, and a
             // string compare against at most three held candidates otherwise.
-            if let Some(value) = offered.as_deref() {
-                set.router.offer_header_password("job_spec", value);
-            }
+            offer_direct_header_candidates(set, Some(password.as_str()), &[]);
         }
     }
 
@@ -2559,19 +2546,33 @@ impl Pipeline {
         // Deliberately not "arm only when candidates were found": for the
         // overwhelming majority of jobs there is no password anywhere, and that
         // would re-read and re-parse the persisted NZB on **every article**.
-        let (candidates, harvested) = self.harvest_archive_password_candidates(job_id);
-        if harvested {
-            self.direct_store.header_candidates_offered.insert(job_id);
-        }
+        let candidates = self.harvest_direct_header_passwords(job_id);
         if candidates.is_empty() {
             return;
         }
         for set in self.direct_store.sets_mut(job_id) {
-            for candidate in &candidates {
-                set.router
-                    .offer_header_password(candidate.source().as_str(), candidate.value());
-            }
+            offer_direct_header_candidates(set, None, &candidates);
         }
+    }
+
+    /// The job's archive-password harvest for the `-hp` gate, memoizing a
+    /// harvest that ran (see [`Self::offer_direct_header_passwords`] for why a
+    /// failed read is not remembered).
+    ///
+    /// Shared by the live seam and the restart seam. A restored set rebuilds
+    /// its layout by re-running the header parse, and that parse is where
+    /// `-hp` admission happens — so the restart seam has to hold the same
+    /// candidates the live seam would have offered, *before* the rebuild, or
+    /// the parse refuses under `NoPassword` and the set redownloads in full.
+    pub(crate) fn harvest_direct_header_passwords(
+        &mut self,
+        job_id: JobId,
+    ) -> Vec<crate::jobs::model::ArchivePasswordCandidate> {
+        let (candidates, harvested) = self.harvest_archive_password_candidates(job_id);
+        if harvested {
+            self.direct_store.header_candidates_offered.insert(job_id);
+        }
+        candidates
     }
 
     /// What to do with one NZB file's decoded bytes.
@@ -2600,6 +2601,32 @@ impl Pipeline {
                     }
                 })
             })
+    }
+}
+
+/// Offers one set's `-hp` gate the job spec's password and the job's harvest.
+///
+/// The one implementation behind both the live seam and the restart seam, so a
+/// set rebuilt at restore holds exactly the candidates a live set would.
+///
+/// The spec's password is normalized the way the harvest normalizes, so a
+/// placeholder like `"yes"` — which `archive_password_candidates_for_job` drops
+/// — is not smuggled past it here and paid for in PBKDF2. It is labelled
+/// `job_spec` rather than `explicit` because that is all that is known: for a
+/// job imported from an NZB, the spec's password is seeded from the harvest's
+/// *first* candidate. Offering is idempotent, and a no-op once the ring has
+/// verified or refused.
+pub(crate) fn offer_direct_header_candidates(
+    set: &mut DirectSet,
+    spec_password: Option<&str>,
+    harvest: &[crate::jobs::model::ArchivePasswordCandidate],
+) {
+    if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password) {
+        set.router.offer_header_password("job_spec", value.as_str());
+    }
+    for candidate in harvest {
+        set.router
+            .offer_header_password(candidate.source().as_str(), candidate.value());
     }
 }
 

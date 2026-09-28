@@ -736,17 +736,17 @@ impl Pipeline {
                         return;
                     }
                 }
-                let cleanup_error = self
+                let cleanup = self
                     .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
-                    .await
-                    .err();
+                    .await;
                 self.cleanup_output_dir(output_dir.as_deref()).await;
                 if self.jobs.contains_key(&job_id) {
                     self.purge_terminal_job_runtime(job_id);
                 }
                 self.finished_jobs.retain(|job| job.job_id != job_id);
                 self.publish_snapshot();
-                let result = cleanup_error.map_or(Ok(()), Err);
+                let result =
+                    cleanup.map(|left_in_place| crate::HistoryDeleteOutcome { left_in_place });
                 let _ = reply.send(result);
             }
             SchedulerCommand::DeleteAllHistory {

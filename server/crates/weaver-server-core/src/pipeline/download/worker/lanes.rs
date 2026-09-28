@@ -1046,6 +1046,23 @@ impl Pipeline {
                 format!("{server_idx}:{snapshot:?}")
             })
             .collect();
+        // Losing a selection race to another lane is ordinary and retries at
+        // once. Only a window that swallowed more of them is worth a warning.
+        if error.kind() == "selection_contended" && suppressed_since_last == 0 {
+            debug!(
+                job_id = lease.job_id.0,
+                kind = error.kind(),
+                error = %error,
+                requeued_works = lease.works.len(),
+                requeue = error.should_requeue_owned_work(),
+                suppressed_since_last,
+                candidate_servers = ?servers,
+                candidate_recovery = ?recovery,
+                excluded_servers = ?lease.dial_exclude_servers,
+                "owned blocking download lane could not be acquired"
+            );
+            return;
+        }
         warn!(
             job_id = lease.job_id.0,
             kind = error.kind(),
@@ -1057,6 +1074,10 @@ impl Pipeline {
             candidate_recovery = ?recovery,
             excluded_servers = ?lease.dial_exclude_servers,
             "owned blocking download lane could not be acquired"
+        );
+        crate::runtime::job_debug_ring::dump(
+            lease.job_id.0,
+            "owned blocking download lane could not be acquired",
         );
     }
 

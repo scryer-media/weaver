@@ -50,6 +50,24 @@ pub struct ServiceLogsPayload {
     pub count: i32,
 }
 
+/// The live log filter. Changes last until the process exits.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct LogFilter {
+    /// The `RUST_LOG`-style directives in force.
+    pub directives: String,
+    /// The directives the process started with; setting blank restores them.
+    pub default_directives: String,
+}
+
+impl From<weaver_server_core::runtime::log_filter::LogFilterState> for LogFilter {
+    fn from(value: weaver_server_core::runtime::log_filter::LogFilterState) -> Self {
+        Self {
+            directives: value.directives,
+            default_directives: value.default_directives,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum DownloadBlockKindGql {
     None,
