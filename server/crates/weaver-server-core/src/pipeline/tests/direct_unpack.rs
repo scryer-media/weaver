@@ -3358,6 +3358,17 @@ async fn split_7z_job_with_par2(
     job_id: JobId,
     gate: bool,
 ) -> (Pipeline, &'static str) {
+    split_7z_job_with_par2_as_posted(temp_dir, job_id, gate, false).await
+}
+
+/// The same job, with the first part's payload arriving damaged when
+/// `damage_first_part` is set. The PAR2 set still describes the clean parts.
+async fn split_7z_job_with_par2_as_posted(
+    temp_dir: &tempfile::TempDir,
+    job_id: JobId,
+    gate: bool,
+    damage_first_part: bool,
+) -> (Pipeline, &'static str) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     enable_direct_unpack(&mut pipeline);
     let set_name = "generated_split_store_plain.7z";
@@ -3383,7 +3394,12 @@ async fn split_7z_job_with_par2(
     .await;
 
     // Part one lands and the chase arms off the topology it creates.
-    write_and_complete_file(&mut pipeline, job_id, 0, &parts[0].0, &parts[0].1).await;
+    let mut first_part = parts[0].1.clone();
+    if damage_first_part {
+        let middle = first_part.len() / 2;
+        first_part[middle] ^= 0xFF;
+    }
+    write_and_complete_file(&mut pipeline, job_id, 0, &parts[0].0, &first_part).await;
     let coverage = pipeline
         .direct_unpack
         .armed_coverage(job_id, set_name)
@@ -3491,6 +3507,92 @@ async fn a_chase_that_finished_under_a_damage_report_still_forces_the_par2_pass(
         "members decoded under a damage report are never installed"
     );
     assert!(pipeline.direct_unpack_gated_sets(job_id).is_empty());
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// A chase that fails on damaged bytes before the damage report for them
+/// arrives still forces the authoritative PAR2 pass.
+///
+/// The decoder reaches the damage in the gap between a commit and the recovery
+/// verdict for it, and fails. The report then lands on a worker that has
+/// already returned, and reaping the failure used to drop the report with it:
+/// finalize saw no gated set, let the strong-decode claim stand, and the
+/// conventional extraction read the same damage unrepaired.
+#[tokio::test]
+async fn a_chase_that_failed_under_a_damage_report_still_forces_the_par2_pass() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42004);
+    let (mut pipeline, set_name) =
+        split_7z_job_with_par2_as_posted(&temp_dir, job_id, false, true).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("the finished worker has not been reaped yet");
+    while !pipeline
+        .direct_unpack
+        .armed_worker_finished(job_id, set_name)
+    {
+        tokio::task::yield_now().await;
+    }
+    coverage.cap_at_damage(0, 0);
+
+    pipeline.reap_direct_unpack().await;
+    let outcome = pipeline
+        .direct_unpack
+        .outcome(job_id, set_name)
+        .expect("reaped into an outcome");
+    assert!(outcome.result.is_err(), "the decoder met the damage");
+    assert!(outcome.damage_reported, "the report outlives the worker");
+    assert_eq!(
+        pipeline.direct_unpack_gated_sets(job_id),
+        vec![set_name.to_string()],
+        "a failed chase under a standing report is still evidence"
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    settle_par2_analysis_work(&mut pipeline).await;
+
+    // The pass finds the damage this time, so more than one may follow it.
+    assert!(
+        drain_job_verification_started(&mut verify_events, job_id) >= 1,
+        "the authoritative pass must run for a chase that failed on reported damage"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// A damage report that arrives after its chase was reaped still stands
+/// against the outcome.
+#[tokio::test]
+async fn a_damage_report_after_the_chase_was_reaped_still_counts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42005);
+    let (mut pipeline, set_name) = split_7z_job_with_par2(&temp_dir, job_id, false).await;
+    while !pipeline
+        .direct_unpack
+        .armed_worker_finished(job_id, set_name)
+    {
+        tokio::task::yield_now().await;
+    }
+    pipeline.reap_direct_unpack().await;
+    assert!(pipeline.direct_unpack_gated_sets(job_id).is_empty());
+    let first_part = sevenz_fixture_bytes(set_name)[0].0.clone();
+
+    pipeline.note_damage_on_reaped_chase(job_id, &first_part);
+
+    assert!(
+        pipeline
+            .direct_unpack
+            .outcome(job_id, set_name)
+            .expect("reaped into an outcome")
+            .damage_reported
+    );
+    assert_eq!(
+        pipeline.direct_unpack_gated_sets(job_id),
+        vec![set_name.to_string()]
+    );
 
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
