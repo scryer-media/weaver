@@ -158,7 +158,17 @@ func TestComposeArgsUnchangedWithoutOverlay(t *testing.T) {
 			t.Fatalf("%s args = %v", engine.Kind, got)
 		}
 	}
+	down := []string{"compose", "-p", "e2e", "down", "-v", "--remove-orphans"}
 	docker := &Engine{Kind: Docker, Binary: "docker"}
+	if got := docker.Args(down...); !reflect.DeepEqual(got, down) {
+		t.Fatalf("docker down args = %v", got)
+	}
+	podman := &Engine{Kind: Podman, Binary: "podman"}
+	podman.SetComposeFiles("/e2e/docker-compose.yml", "")
+	want := []string{"compose", "-p", "e2e", "--profile", "*", "down", "-v", "--remove-orphans"}
+	if got := podman.composeArgs(down, func(string) string { return "" }); !reflect.DeepEqual(got, want) {
+		t.Fatalf("podman down args = %v", got)
+	}
 	docker.SetComposeFiles("/e2e/docker-compose.yml", "/state/overlay.yml")
 	if docker.ComposeOverlay() != "" {
 		t.Fatal("docker accepted an overlay")
@@ -191,7 +201,18 @@ func TestComposeArgsAppendOverlay(t *testing.T) {
 			name: "COMPOSE_FILE",
 			args: []string{"compose", "--project-name=e2e", "down", "-v"},
 			env:  map[string]string{"COMPOSE_FILE": "/e2e/docker-compose.yml" + string(os.PathListSeparator) + "/run/network.yml"},
-			want: []string{"compose", "--project-name=e2e", "-f", "/e2e/docker-compose.yml", "-f", "/run/network.yml", "-f", "/state/overlay.yml", "down", "-v"},
+			want: []string{"compose", "--project-name=e2e", "-f", "/e2e/docker-compose.yml", "-f", "/run/network.yml", "-f", "/state/overlay.yml", "--profile", "*", "down", "-v"},
+		},
+		{
+			name: "down keeps an explicit profile",
+			args: []string{"compose", "-p", "e2e", "--profile", "cli", "down"},
+			want: []string{"compose", "-p", "e2e", "--profile", "cli", "-f", "/e2e/docker-compose.yml", "-f", "/state/overlay.yml", "down"},
+		},
+		{
+			name: "down keeps COMPOSE_PROFILES",
+			args: []string{"compose", "-p", "e2e", "down"},
+			env:  map[string]string{"COMPOSE_PROFILES": "cli"},
+			want: []string{"compose", "-p", "e2e", "-f", "/e2e/docker-compose.yml", "-f", "/state/overlay.yml", "down"},
 		},
 		{
 			name: "COMPOSE_PATH_SEPARATOR",

@@ -191,44 +191,59 @@ func (engine *Engine) composeArgs(args []string, getenv func(string) string) []s
 	engine.mu.RLock()
 	overlay, base := engine.composeOverlay, engine.composeBaseFile
 	engine.mu.RUnlock()
-	if overlay == "" {
+	subcommand, named, profiled := composeGlobalFlags(args)
+	var insert []string
+	if overlay != "" {
+		if !named {
+			for _, file := range composeFilesFromEnv(getenv, base) {
+				insert = append(insert, "-f", file)
+			}
+		}
+		insert = append(insert, "-f", overlay)
+	}
+	// Podman refuses to remove a container while another still joins its
+	// network namespace (`network_mode: service:`), and Compose only stops
+	// and removes the services of active profiles, in dependency order,
+	// before it sweeps orphans. A `down` without every profile active would
+	// therefore reach the namespace owner first and fail. Docker removes the
+	// owner regardless, so it keeps its argument vector.
+	if engine.Kind == Podman && subcommand < len(args) && args[subcommand] == "down" &&
+		!profiled && strings.TrimSpace(getenv("COMPOSE_PROFILES")) == "" {
+		insert = append(insert, "--profile", "*")
+	}
+	if len(insert) == 0 {
 		return out
 	}
-	subcommand, named := composeGlobalFiles(args)
-	var insert []string
-	if !named {
-		for _, file := range composeFilesFromEnv(getenv, base) {
-			insert = append(insert, "-f", file)
-		}
-	}
-	insert = append(insert, "-f", overlay)
 	result := make([]string, 0, len(out)+len(insert))
 	result = append(result, out[:subcommand]...)
 	result = append(result, insert...)
 	return append(result, out[subcommand:]...)
 }
 
-// composeGlobalFiles returns the index of the Compose subcommand in args
-// (args[0] is "compose") and whether a -f/--file flag precedes it.
-func composeGlobalFiles(args []string) (int, bool) {
+// composeGlobalFlags returns the index of the Compose subcommand in args
+// (args[0] is "compose"), whether a -f/--file flag precedes it, and whether
+// a --profile flag does.
+func composeGlobalFlags(args []string) (subcommand int, named, profiled bool) {
 	valued := map[string]bool{
 		"-p": true, "--project-name": true, "-f": true, "--file": true,
 		"--project-directory": true, "--env-file": true, "--profile": true,
 		"--ansi": true, "--progress": true, "--parallel": true,
 	}
-	named := false
 	index := 1
 	for index < len(args) {
 		arg := args[index]
 		if !strings.HasPrefix(arg, "-") {
-			return index, named
+			return index, named, profiled
 		}
 		name := arg
 		if eq := strings.IndexByte(arg, '='); eq >= 0 {
 			name = arg[:eq]
 		}
-		if name == "-f" || name == "--file" {
+		switch name {
+		case "-f", "--file":
 			named = true
+		case "--profile":
+			profiled = true
 		}
 		if valued[name] && !strings.Contains(arg, "=") {
 			index += 2
@@ -236,7 +251,7 @@ func composeGlobalFiles(args []string) (int, bool) {
 		}
 		index++
 	}
-	return len(args), named
+	return len(args), named, profiled
 }
 
 func composeFilesFromEnv(getenv func(string) string, base string) []string {
