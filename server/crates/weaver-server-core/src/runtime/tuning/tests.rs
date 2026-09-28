@@ -139,6 +139,15 @@ fn set_connection_limit_decreases_capacity() {
 }
 
 #[test]
+fn fast_storage_extractions_follow_the_cpus_the_process_may_use() {
+    let mut profile = ssd_profile(16);
+    profile.cpu.logical_cores = 3;
+    let mut tuner = RuntimeTuner::with_connection_limit(profile, 8);
+    tuner.max_concurrent_extractions_override = None;
+    assert_eq!(tuner.max_concurrent_extractions(), 3);
+}
+
+#[test]
 fn random_read_iops_update_changes_future_extraction_admission_limit() {
     let mut profile = hdd_profile(4);
     profile.disk.random_read_iops = 0.0;
