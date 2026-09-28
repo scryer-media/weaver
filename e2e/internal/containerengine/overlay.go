@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -24,11 +25,19 @@ type ComposeLayout struct {
 	// `x-e2e-owner: puid`: a service chowns their root to PUID:PGID and
 	// another service mounts them, so their root must stay owned that way.
 	PUIDOwnedVolumes []string
+	// BrowserServices are the services declared with `x-e2e-browser: true`:
+	// they run a browser whose in-flight requests the network must not
+	// interrupt.
+	BrowserServices []string
 }
 
 // puidOwnerExtension marks a top-level volume whose root belongs to
 // PUID:PGID. Compose ignores `x-` keys, so the mark changes nothing by itself.
 const puidOwnerExtension = "x-e2e-owner"
+
+// browserExtension marks a service that runs a browser. Compose ignores `x-`
+// keys, so the mark changes nothing by itself.
+const browserExtension = "x-e2e-browser"
 
 // ParseComposeLayout reads service names and environment-sourced secrets from
 // a Compose file. It understands only the block layout the harness's own
@@ -36,6 +45,7 @@ const puidOwnerExtension = "x-e2e-owner"
 func ParseComposeLayout(content []byte) ComposeLayout {
 	layout := ComposeLayout{EnvironmentSecrets: map[string]string{}}
 	section := ""
+	service := ""
 	secret := ""
 	volume := ""
 	scanner := bufio.NewScanner(bytes.NewReader(content))
@@ -50,6 +60,7 @@ func ParseComposeLayout(content []byte) ComposeLayout {
 		switch {
 		case indent == 0:
 			section = strings.TrimSuffix(strings.Fields(trimmed)[0], ":")
+			service = ""
 			secret = ""
 			volume = ""
 		case indent == 2 && strings.HasSuffix(trimmed, ":"):
@@ -57,10 +68,16 @@ func ParseComposeLayout(content []byte) ComposeLayout {
 			switch section {
 			case "services":
 				layout.Services = append(layout.Services, name)
+				service = name
 			case "secrets":
 				secret = name
 			case "volumes":
 				volume = name
+			}
+		case indent == 4 && section == "services" && service != "":
+			if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(key) == browserExtension &&
+				strings.Trim(strings.TrimSpace(value), `"'`) == "true" {
+				layout.BrowserServices = append(layout.BrowserServices, service)
 			}
 		case indent == 4 && section == "volumes" && volume != "":
 			if key, value, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(key) == puidOwnerExtension &&
@@ -99,14 +116,32 @@ func (engine *Engine) OverlayYAML(layout ComposeLayout, secretFiles map[string]s
 		return ""
 	}
 	var body strings.Builder
-	if engine.SELinux && len(layout.Services) > 0 {
-		// Repository files are bind-mounted into several services. Relabeling
-		// the checkout with :z would rewrite its SELinux context, so the
-		// containers run unconfined by labels instead.
-		body.WriteString("services:\n")
-		for _, service := range layout.Services {
-			fmt.Fprintf(&body, "  %s:\n    security_opt:\n      - label=disable\n", service)
+	var services strings.Builder
+	for _, service := range layout.Services {
+		var settings strings.Builder
+		if engine.SELinux {
+			// Repository files are bind-mounted into several services.
+			// Relabeling the checkout with :z would rewrite its SELinux
+			// context, so the containers run unconfined by labels instead.
+			settings.WriteString("    security_opt:\n      - label=disable\n")
 		}
+		if slices.Contains(layout.BrowserServices, service) {
+			// Podman leaves IPv6 enabled on a container's interface even on
+			// an IPv4-only network, so the interface starts with a tentative
+			// link-local address that turns permanent once duplicate address
+			// detection finishes, about a second after the container starts.
+			// Chromium reads that address change as a network change and
+			// aborts every in-flight request with ERR_NETWORK_CHANGED. With
+			// IPv6 off on the interface there is no address to change.
+			settings.WriteString("    sysctls:\n      net.ipv6.conf.eth0.disable_ipv6: \"1\"\n")
+		}
+		if settings.Len() > 0 {
+			fmt.Fprintf(&services, "  %s:\n%s", service, settings.String())
+		}
+	}
+	if services.Len() > 0 {
+		body.WriteString("services:\n")
+		body.WriteString(services.String())
 	}
 	if engine.UsesPodmanCompose() && len(secretFiles) > 0 {
 		names := make([]string, 0, len(secretFiles))

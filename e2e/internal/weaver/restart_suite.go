@@ -1673,14 +1673,29 @@ func (ctx *restartCaseContext) submitSlugNTimes(slug string, count int) ([]int, 
 
 func (ctx *restartCaseContext) waitForFacade(jobID int, timeout time.Duration, predicate func(facadeItemSnapshot) bool) (facadeItemSnapshot, error) {
 	deadline := time.Now().Add(timeout)
+	var last facadeItemSnapshot
+	var lastErr error
 	for time.Now().Before(deadline) {
 		snapshot, err := fetchFacadeItemSnapshot(ctx.weaverURL, jobID)
 		if err == nil && predicate(snapshot) {
 			return snapshot, nil
 		}
+		last, lastErr = snapshot, err
 		time.Sleep(1 * time.Second)
 	}
-	return facadeItemSnapshot{}, fmt.Errorf("timeout waiting for facade snapshot for job %d", jobID)
+	return facadeItemSnapshot{}, facadeWaitTimeoutError(jobID, last, lastErr)
+}
+
+func facadeWaitTimeoutError(jobID int, last facadeItemSnapshot, lastErr error) error {
+	switch {
+	case lastErr != nil:
+		return fmt.Errorf("timeout waiting for facade snapshot for job %d (last error: %v)", jobID, lastErr)
+	case !last.Found:
+		return fmt.Errorf("timeout waiting for facade snapshot for job %d (last observed: not found)", jobID)
+	default:
+		return fmt.Errorf("timeout waiting for facade snapshot for job %d (last observed: state=%s in_queue=%t downloaded=%d/%d error=%q)",
+			jobID, last.Status, last.InQueue, last.DownloadedBytes, last.TotalBytes, last.Error)
+	}
 }
 
 func (ctx *restartCaseContext) observeFacade(jobID int, timeout time.Duration) (facadeItemSnapshot, bool, error) {
@@ -2482,10 +2497,11 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	_, err = ctx.waitForFacade(jobID, 3*time.Minute, func(snapshot facadeItemSnapshot) bool {
-		return snapshot.InQueue && snapshot.Status == "DOWNLOADING"
-	})
-	if err != nil {
+	// The job enters its download phase when its first segment is dispatched,
+	// which records DownloadStarted. The queue item cannot show this: with every
+	// BODY refused the job has no live download, so it reads QUEUED, and the
+	// transition is not persisted to the job row until it pauses.
+	if err := waitForJobEvents(filepath.Join(ctx.CaseDir, "weaver.db"), jobID, []string{"DownloadStarted"}, 3*time.Minute); err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := pauseQueueItemGraphQL(ctx.weaverURL, jobID); err != nil {
