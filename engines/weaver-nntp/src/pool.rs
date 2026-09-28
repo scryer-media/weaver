@@ -1716,6 +1716,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_session_that_never_hears_a_greeting_is_booked_against_its_address() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_pool_config(4);
+        config.servers[0].server.host = "127.0.0.1".into();
+        config.servers[0].server.port = listener.local_addr().unwrap().port();
+        config.servers[0].server.tls = false;
+        let pool = Arc::new(NntpPool::new(config));
+        let server = tokio::spawn(async move {
+            // The first socket is closed unanswered; the second is greeted
+            // with a refusal, which is still the server answering.
+            drop(listener.accept().await.unwrap().0);
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"502 not today\r\n").await.unwrap();
+        });
+        let failures = |pool: &NntpPool| {
+            pool.address_plan_snapshot(ServerId(0)).unwrap().addresses[0].consecutive_failures
+        };
+
+        assert!(pool.connect_server(0, None).await.is_err());
+        assert_eq!(failures(&pool), 1);
+
+        assert!(pool.connect_server(0, None).await.is_err());
+        assert_eq!(failures(&pool), 0);
+        server.await.unwrap();
+    }
+
     fn test_pool_config(max_per_server: usize) -> PoolConfig {
         PoolConfig {
             servers: vec![ServerPoolConfig {

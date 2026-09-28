@@ -1115,6 +1115,7 @@ impl BlockingNntpConnection {
                 backend_override,
                 initial_group,
                 Some(outcome),
+                None,
             );
         }
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
@@ -1130,6 +1131,7 @@ impl BlockingNntpConnection {
         tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
             .map_err(NntpError::Io)?;
         let remote_addr = Some(tcp.peer_addr().unwrap_or(addr));
+        let setup = route.map(|route| route.watch_setup(addr));
         Self::from_tcp(
             config,
             tcp,
@@ -1137,6 +1139,7 @@ impl BlockingNntpConnection {
             backend_override,
             initial_group,
             None,
+            setup,
         )
     }
 
@@ -1204,6 +1207,7 @@ impl BlockingNntpConnection {
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
         route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+        mut setup: Option<crate::address_plan::SetupWatch>,
     ) -> Result<Self> {
         let tcp = tcp.into();
         let route_socket = config
@@ -1252,6 +1256,12 @@ impl BlockingNntpConnection {
 
         let greeting = conn.read_response()?;
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received blocking NNTP greeting");
+        let upgrades = config.starttls && matches!(conn.transport, BlockingTransport::Plain(_));
+        if (!upgrades || !matches!(greeting.code.raw(), 200 | 201))
+            && let Some(setup) = setup.take()
+        {
+            setup.reached_server();
+        }
         match greeting.code.raw() {
             200 | 201 => {}
             400 => return Err(NntpError::ServiceUnavailable),
@@ -1288,6 +1298,9 @@ impl BlockingNntpConnection {
             conn.codec = NntpCodec::new();
             conn.read_buf.clear();
             debug!(host = %config.host, "blocking STARTTLS upgrade complete");
+            if let Some(setup) = setup.take() {
+                setup.reached_server();
+            }
         }
 
         // Session setup: authentication and nothing else, unless this server
