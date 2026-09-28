@@ -32,7 +32,7 @@ export const nextRouter = createBrowserRouter(
       errorElement: <RouteErrorPage />,
       children: [
         { index: true, ...lazyRoute(() => import("./pages/DownloadsPage"), "DownloadsPage") },
-        { path: "history", ...lazyRoute(() => import("./pages/CompletedPage"), "CompletedPage") },
+        { path: "history", ...lazyRoute(() => import("./pages/HistoryPage"), "HistoryPage") },
         {
           path: "jobs/:id",
           ...lazyRoute(() => import("./pages/JobDetailPage"), "JobDetailPage"),

@@ -4,7 +4,7 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 export const nextDe: LocaleDictionary = {
   // Shell
   "next.nav.downloads": "Downloads",
-  "next.nav.completed": "Abgeschlossen",
+  "next.nav.history": "Verlauf",
   "next.nav.systemInfo": "Systeminfo",
   "next.nav.monitoring": "Überwachung",
   "next.nav.logs": "Protokolle",
@@ -327,7 +327,7 @@ export const nextDe: LocaleDictionary = {
   "next.job.title": "Job",
   "next.job.missingTitle": "Job nicht gefunden",
   "next.job.missingBody": "Er wurde aus dem Verlauf gelöscht, oder der Link verweist auf eine ID, die weaver nicht kennt.",
-  "next.job.backToCompleted": "Zurück zu Abgeschlossen",
+  "next.job.backToHistory": "Zurück zum Verlauf",
   "next.job.loadingBody": "Der Stand dieses Jobs wird geladen.",
   "next.job.outcomeFailed": "Fehlgeschlagen — unvollständig, nichts verschoben",
   "next.job.outcomeRepaired": "Fertig — repariert, verschoben, Skripte ausgeführt",

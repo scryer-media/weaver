@@ -10,7 +10,7 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 export const nextEn: LocaleDictionary = {
   // Shell
   "next.nav.downloads": "Downloads",
-  "next.nav.completed": "Completed",
+  "next.nav.history": "History",
   "next.nav.systemInfo": "System info",
   "next.nav.monitoring": "Monitoring",
   "next.nav.logs": "Logs",
@@ -333,7 +333,7 @@ export const nextEn: LocaleDictionary = {
   "next.job.title": "Job",
   "next.job.missingTitle": "No such job",
   "next.job.missingBody": "It was deleted from history, or the link points at an id weaver does not hold.",
-  "next.job.backToCompleted": "Back to Completed",
+  "next.job.backToHistory": "Back to History",
   "next.job.loadingBody": "Fetching this job's snapshot.",
   "next.job.outcomeFailed": "Failed — incomplete, nothing moved",
   "next.job.outcomeRepaired": "Complete — repaired, moved, scripts run",

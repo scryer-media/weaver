@@ -4,7 +4,7 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 export const nextKo: LocaleDictionary = {
   // Shell
   "next.nav.downloads": "다운로드",
-  "next.nav.completed": "완료됨",
+  "next.nav.history": "기록",
   "next.nav.systemInfo": "시스템 정보",
   "next.nav.monitoring": "모니터링",
   "next.nav.logs": "로그",
@@ -327,7 +327,7 @@ export const nextKo: LocaleDictionary = {
   "next.job.title": "작업",
   "next.job.missingTitle": "해당 작업 없음",
   "next.job.missingBody": "기록에서 삭제되었거나, 링크가 weaver에 없는 id를 가리킵니다.",
-  "next.job.backToCompleted": "완료 목록으로 돌아가기",
+  "next.job.backToHistory": "기록으로 돌아가기",
   "next.job.loadingBody": "이 작업의 상태를 불러오는 중입니다.",
   "next.job.outcomeFailed": "실패 — 불완전, 이동된 것 없음",
   "next.job.outcomeRepaired": "완료 — 복구, 이동, 스크립트 실행됨",

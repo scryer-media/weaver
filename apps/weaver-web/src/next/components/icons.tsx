@@ -97,7 +97,7 @@ const FolderEye = createLucideIcon("folder-eye", [
 export const ICONS = {
   // Places: the navigation, and the settings panels.
   downloads: ArrowDownToLine,
-  completed: History,
+  history: History,
   monitoring: Activity,
   systemInfo: Cpu,
   logs: ScrollText,

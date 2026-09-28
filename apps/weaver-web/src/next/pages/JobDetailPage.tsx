@@ -252,7 +252,7 @@ export function JobDetailPage() {
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
           <EmptyState title={t("next.job.missingTitle")} body={t("next.job.missingBody")} />
           <div className="px-4 sm:px-6">
-            <SecondaryButton icon="back" onClick={() => navigate("/history")}>{t("next.job.backToCompleted")}</SecondaryButton>
+            <SecondaryButton icon="back" onClick={() => navigate("/history")}>{t("next.job.backToHistory")}</SecondaryButton>
           </div>
         </div>
       </NextShell>
@@ -393,7 +393,7 @@ export function JobDetailPage() {
               className="flex flex-none items-center gap-[5px] font-wv-mono text-[11.5px] text-wv-muted hover:text-wv-fg"
             >
               <Icon name="back" size={13} />
-              {inQueue ? t("next.nav.downloads") : t("next.nav.completed")}
+              {inQueue ? t("next.nav.downloads") : t("next.nav.history")}
             </Link>
             <span aria-hidden="true" className="flex-none text-wv-dim">
               /

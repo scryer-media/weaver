@@ -4,7 +4,7 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 export const nextZh: LocaleDictionary = {
   // Shell
   "next.nav.downloads": "下载",
-  "next.nav.completed": "已完成",
+  "next.nav.history": "历史",
   "next.nav.systemInfo": "系统信息",
   "next.nav.monitoring": "监控",
   "next.nav.logs": "日志",
@@ -327,7 +327,7 @@ export const nextZh: LocaleDictionary = {
   "next.job.title": "任务",
   "next.job.missingTitle": "没有该任务",
   "next.job.missingBody": "它已从历史记录中删除，或者链接指向 weaver 中不存在的 id。",
-  "next.job.backToCompleted": "返回已完成",
+  "next.job.backToHistory": "返回历史",
   "next.job.loadingBody": "正在获取该任务的状态。",
   "next.job.outcomeFailed": "失败 — 不完整，未移动任何内容",
   "next.job.outcomeRepaired": "完成 — 已修复、移动并运行脚本",

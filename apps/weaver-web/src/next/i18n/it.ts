@@ -4,7 +4,7 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 export const nextIt: LocaleDictionary = {
   // Shell
   "next.nav.downloads": "Download",
-  "next.nav.completed": "Completati",
+  "next.nav.history": "Cronologia",
   "next.nav.systemInfo": "Info di sistema",
   "next.nav.monitoring": "Monitoraggio",
   "next.nav.logs": "Log",
@@ -327,7 +327,7 @@ export const nextIt: LocaleDictionary = {
   "next.job.title": "Job",
   "next.job.missingTitle": "Job inesistente",
   "next.job.missingBody": "È stato eliminato dalla cronologia, oppure il link punta a un id che weaver non conosce.",
-  "next.job.backToCompleted": "Torna ai completati",
+  "next.job.backToHistory": "Torna alla cronologia",
   "next.job.loadingBody": "Caricamento dello stato di questo job.",
   "next.job.outcomeFailed": "Fallito — incompleto, nulla spostato",
   "next.job.outcomeRepaired": "Completato — riparato, spostato, script eseguiti",

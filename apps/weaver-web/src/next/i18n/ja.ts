@@ -4,7 +4,7 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 export const nextJa: LocaleDictionary = {
   // Shell
   "next.nav.downloads": "ダウンロード",
-  "next.nav.completed": "完了",
+  "next.nav.history": "履歴",
   "next.nav.systemInfo": "システム情報",
   "next.nav.monitoring": "モニタリング",
   "next.nav.logs": "ログ",
@@ -327,7 +327,7 @@ export const nextJa: LocaleDictionary = {
   "next.job.title": "ジョブ",
   "next.job.missingTitle": "ジョブが見つかりません",
   "next.job.missingBody": "履歴から削除されたか、リンクが weaver にない ID を指しています。",
-  "next.job.backToCompleted": "完了済みに戻る",
+  "next.job.backToHistory": "履歴に戻る",
   "next.job.loadingBody": "このジョブの状態を取得しています。",
   "next.job.outcomeFailed": "失敗 — 不完全、何も移動していません",
   "next.job.outcomeRepaired": "完了 — 修復、移動、スクリプト実行済み",

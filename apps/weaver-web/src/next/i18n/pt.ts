@@ -4,7 +4,7 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 export const nextPt: LocaleDictionary = {
   // Shell
   "next.nav.downloads": "Downloads",
-  "next.nav.completed": "Concluídos",
+  "next.nav.history": "Histórico",
   "next.nav.systemInfo": "Informações do sistema",
   "next.nav.monitoring": "Monitoramento",
   "next.nav.logs": "Logs",
@@ -327,7 +327,7 @@ export const nextPt: LocaleDictionary = {
   "next.job.title": "Tarefa",
   "next.job.missingTitle": "Tarefa não encontrada",
   "next.job.missingBody": "Ela foi excluída do histórico, ou o link aponta para um id que o weaver não possui.",
-  "next.job.backToCompleted": "Voltar para Concluídos",
+  "next.job.backToHistory": "Voltar ao histórico",
   "next.job.loadingBody": "Buscando o estado desta tarefa.",
   "next.job.outcomeFailed": "Falhou — incompleta, nada foi movido",
   "next.job.outcomeRepaired": "Concluída — reparada, movida, scripts executados",
