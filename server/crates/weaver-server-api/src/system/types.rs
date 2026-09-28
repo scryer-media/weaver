@@ -1239,6 +1239,12 @@ pub struct ServerHealth {
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,
+    /// This server's position in the connection pool, which is its
+    /// `ServerId`. Two configured servers may share a host and port, so the
+    /// pool position, not the address, says which server this is.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub pool_index: usize,
 }
 
 #[ComplexObject]
@@ -1254,14 +1260,26 @@ impl ServerHealth {
             ctx.data_opt::<Option<std::sync::Arc<weaver_nntp::pool::NntpPool>>>()
                 .and_then(Clone::clone)
         })?;
-        let idx = pool
-            .server_configs()
-            .iter()
-            .position(|config| config.host == self.host && config.port == self.port)?;
-        pool.address_plan_snapshot(weaver_nntp::ServerId(idx))?
-            .pinned
-            .map(|address| address.ip().to_string())
+        pinned_address_in(&pool, self.pool_index, &self.host, self.port)
     }
+}
+
+/// The pinned address of the server at `pool_index`. A pool rebuilt since the
+/// health row was read may hold a different server there; that reads as no
+/// pin rather than another server's.
+pub(crate) fn pinned_address_in(
+    pool: &weaver_nntp::pool::NntpPool,
+    pool_index: usize,
+    host: &str,
+    port: u16,
+) -> Option<String> {
+    let config = pool.server_configs().get(pool_index)?;
+    if config.host != host || config.port != port {
+        return None;
+    }
+    pool.address_plan_snapshot(weaver_nntp::ServerId(pool_index))?
+        .pinned
+        .map(|address| address.ip().to_string())
 }
 
 /// Reduce one server's health state, holdoff and socket counts to the single
@@ -1311,6 +1329,47 @@ mod tests {
     use super::*;
     use weaver_server_core::events::model::PipelineEvent;
     use weaver_server_core::jobs::JobId;
+
+    /// Two configured servers with the same host and port: a connect through
+    /// the second pins its address, and only the second reports a pin.
+    #[test]
+    fn a_pinned_address_belongs_to_its_own_server_not_its_twin() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept the one connection and close it, so the greeting read ends
+        // at once instead of waiting for a greeting that never comes.
+        let acceptor = std::thread::spawn(move || drop(listener.accept()));
+        let twin = || weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls: false,
+                ..Default::default()
+            },
+            max_connections: 1,
+            ..weaver_nntp::pool::ServerPoolConfig::default()
+        };
+        let pool = weaver_nntp::pool::NntpPool::new(weaver_nntp::pool::PoolConfig {
+            servers: vec![twin(), twin()],
+            ..Default::default()
+        });
+
+        let (config, route) = pool
+            .blocking_connect_plan(weaver_nntp::ServerId(1))
+            .unwrap();
+        // The session setup fails on the closed socket; the TCP connect
+        // before it is what pins the address.
+        let _ = weaver_nntp::BlockingNntpConnection::connect_for_group(&config, Some(&route), None);
+        acceptor.join().unwrap();
+
+        assert_eq!(pinned_address_in(&pool, 0, "127.0.0.1", port), None);
+        assert_eq!(
+            pinned_address_in(&pool, 1, "127.0.0.1", port).as_deref(),
+            Some("127.0.0.1")
+        );
+        // A row read from a different pool layout does not borrow a pin.
+        assert_eq!(pinned_address_in(&pool, 1, "127.0.0.1", port ^ 1), None);
+    }
 
     #[test]
     fn a_switched_off_server_outranks_every_other_signal() {
