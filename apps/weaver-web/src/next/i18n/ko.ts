@@ -466,6 +466,7 @@ export const nextKo: LocaleDictionary = {
   "next.monitoring.providersNote": "연결 부하, 왕복 시간, 실패",
   "next.monitoring.noProviders": "설정된 공급자가 없습니다 — 설정 → 공급자에서 추가하세요.",
   "next.monitoring.roundTrip": "왕복 시간",
+  "next.monitoring.pinnedAddress": "새 연결이 사용하는 주소",
   "next.monitoring.failuresSinceStart": "시작 이후 실패",
   "next.monitoring.connectionShare": "활성 연결 중 비율",
   "next.monitoring.failures": "실패",

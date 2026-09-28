@@ -333,6 +333,14 @@ export function MonitoringPage() {
                     <Eyebrow tone="rail" className="flex-none font-wv-mono tracking-[0.12em]">
                       {provider.tier}
                     </Eyebrow>
+                    {provider.pinnedAddress ? (
+                      <span
+                        title={t("next.monitoring.pinnedAddress")}
+                        className="truncate font-wv-mono text-[11.5px] text-wv-muted"
+                      >
+                        {provider.pinnedAddress}
+                      </span>
+                    ) : null}
                   </div>
                   <div className="ml-auto flex flex-wrap items-center justify-end gap-x-5 gap-y-1">
                     <Bar

@@ -472,6 +472,7 @@ export const nextEn: LocaleDictionary = {
   "next.monitoring.providersNote": "connection load, round-trip and failures",
   "next.monitoring.noProviders": "No providers configured — add one in Settings → Providers.",
   "next.monitoring.roundTrip": "round-trip",
+  "next.monitoring.pinnedAddress": "address new connections use",
   "next.monitoring.failuresSinceStart": "failures since start",
   "next.monitoring.connectionShare": "share of active connections",
   "next.monitoring.failures": "Failures",

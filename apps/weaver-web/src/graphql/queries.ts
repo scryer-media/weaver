@@ -926,6 +926,7 @@ export const SERVER_HEALTH_QUERY = gql`
       failureCount
       consecutiveFailures
       prematureDeaths
+      pinnedAddress
     }
   }
 `;

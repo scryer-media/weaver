@@ -1107,6 +1107,31 @@ fn sample_server_health() -> metrics::ServerHealthInfo {
         premature_deaths: 0,
         sockets: Default::default(),
         recovery: Default::default(),
+        address_plan: weaver_nntp::AddressPlanSnapshot {
+            pinned: Some("192.0.2.2:563".parse().unwrap()),
+            addresses: vec![
+                weaver_nntp::AddressSnapshot {
+                    address: "192.0.2.1:563".parse().unwrap(),
+                    connect_time: Some(std::time::Duration::from_millis(80)),
+                    body_latency: None,
+                    consecutive_failures: 0,
+                },
+                weaver_nntp::AddressSnapshot {
+                    address: "192.0.2.2:563".parse().unwrap(),
+                    connect_time: Some(std::time::Duration::from_millis(20)),
+                    body_latency: None,
+                    consecutive_failures: 0,
+                },
+            ],
+            races_won: 2,
+            races_failed: 1,
+            repins: vec![
+                (weaver_nntp::RaceReason::Initial, 0),
+                (weaver_nntp::RaceReason::Interval, 1),
+                (weaver_nntp::RaceReason::OverLimitCleared, 0),
+                (weaver_nntp::RaceReason::Suspect, 0),
+            ],
+        },
     }
 }
 

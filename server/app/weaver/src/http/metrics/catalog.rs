@@ -298,6 +298,15 @@ metric_families! {
         deprecated_by = "weaver_server_capacity_penalty_until_seconds");
     SERVER_CAPACITY_PENALTY_SECONDS = ("weaver_server_capacity_penalty_until_seconds", Gauge,
         ["server_id", "server"], "Provider over-limit holdoff deadline as a unix timestamp.");
+    SERVER_ADDRESS_INFO = ("weaver_server_address_info", Gauge,
+        ["server_id", "server", "address"],
+        "Resolved server addresses; 1 for the address new connections are pinned to, 0 for the rest.");
+    SERVER_ADDRESS_CONNECT_SECONDS = ("weaver_server_address_connect_seconds", Gauge,
+        ["server_id", "server", "address"], "Smoothed TCP connect time per resolved server address.");
+    SERVER_ADDRESS_RACES = ("weaver_server_address_races_total", Counter,
+        ["server_id", "server", "outcome"], "Address races run to pick the address new connections dial, by outcome.");
+    SERVER_ADDRESS_REPINS = ("weaver_server_address_repins_total", Counter,
+        ["server_id", "server", "reason"], "Changes of the pinned server address, by the reason the race ran.");
     SERVER_PREMATURE_DEATHS = ("weaver_server_premature_deaths", Gauge, ["server_id", "server"],
         "Recent connections that died before reaching 60s of age.");
     NNTP_RUNTIME_GENERATION = ("weaver_nntp_runtime_generation", Gauge, [],

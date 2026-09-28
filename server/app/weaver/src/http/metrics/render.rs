@@ -1102,9 +1102,56 @@ fn render_servers(out: &mut Encoder, server_health: &[ServerHealthInfo], runtime
             srv.capacity_penalty_until_epoch_ms as f64 / 1000.0,
         );
         out.sample(&f::SERVER_PREMATURE_DEATHS, id, srv.premature_deaths);
+        render_server_address_plan(out, srv);
     }
 
     out.sample(&f::NNTP_RUNTIME_GENERATION, &[], runtime_generation);
+}
+
+fn render_server_address_plan(out: &mut Encoder, srv: &ServerHealthInfo) {
+    let plan = &srv.address_plan;
+    for address in &plan.addresses {
+        let address_label = address.address.ip().to_string();
+        let labels = [
+            ("server_id", srv.server_id.as_str()),
+            ("server", srv.label.as_str()),
+            ("address", address_label.as_str()),
+        ];
+        out.sample(
+            &f::SERVER_ADDRESS_INFO,
+            &labels,
+            u8::from(plan.pinned == Some(address.address)),
+        );
+        if let Some(connect_time) = address.connect_time {
+            out.sample_f64(
+                &f::SERVER_ADDRESS_CONNECT_SECONDS,
+                &labels,
+                connect_time.as_secs_f64(),
+            );
+        }
+    }
+    for (outcome, count) in [("won", plan.races_won), ("failed", plan.races_failed)] {
+        out.sample(
+            &f::SERVER_ADDRESS_RACES,
+            &[
+                ("server_id", srv.server_id.as_str()),
+                ("server", srv.label.as_str()),
+                ("outcome", outcome),
+            ],
+            count,
+        );
+    }
+    for (reason, count) in &plan.repins {
+        out.sample(
+            &f::SERVER_ADDRESS_REPINS,
+            &[
+                ("server_id", srv.server_id.as_str()),
+                ("server", srv.label.as_str()),
+                ("reason", reason.as_str()),
+            ],
+            *count,
+        );
+    }
 }
 
 fn render_server_transfers(

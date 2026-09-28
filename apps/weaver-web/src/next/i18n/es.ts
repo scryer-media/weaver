@@ -466,6 +466,7 @@ export const nextEs: LocaleDictionary = {
   "next.monitoring.providersNote": "carga de conexiones, latencia y fallos",
   "next.monitoring.noProviders": "No hay proveedores configurados — añade uno en Ajustes → Proveedores.",
   "next.monitoring.roundTrip": "latencia",
+  "next.monitoring.pinnedAddress": "dirección de las nuevas conexiones",
   "next.monitoring.failuresSinceStart": "fallos desde el inicio",
   "next.monitoring.connectionShare": "parte de las conexiones activas",
   "next.monitoring.failures": "Fallos",

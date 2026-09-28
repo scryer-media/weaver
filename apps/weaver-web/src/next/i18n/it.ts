@@ -466,6 +466,7 @@ export const nextIt: LocaleDictionary = {
   "next.monitoring.providersNote": "carico delle connessioni, latenza ed errori",
   "next.monitoring.noProviders": "Nessun provider configurato — aggiungine uno in Impostazioni → Provider.",
   "next.monitoring.roundTrip": "latenza",
+  "next.monitoring.pinnedAddress": "indirizzo delle nuove connessioni",
   "next.monitoring.failuresSinceStart": "errori dall'avvio",
   "next.monitoring.connectionShare": "quota delle connessioni attive",
   "next.monitoring.failures": "Errori",

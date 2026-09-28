@@ -1,4 +1,4 @@
-use async_graphql::{Enum, InputObject, SimpleObject};
+use async_graphql::{ComplexObject, Context, Enum, InputObject, SimpleObject};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::{
@@ -1166,6 +1166,7 @@ pub struct DiskUsage {
 
 /// Live health for one configured news server, derived from the NNTP connection pool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct ServerHealth {
     pub host: String,
     pub port: u16,
@@ -1220,6 +1221,29 @@ pub struct ServerHealth {
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,
+}
+
+#[ComplexObject]
+impl ServerHealth {
+    /// The resolved address new connections to this server dial, once an
+    /// address race has picked one. Absent before the first connect and for
+    /// a server reached through a proxy.
+    async fn pinned_address(&self, ctx: &Context<'_>) -> Option<String> {
+        let live_pool = ctx
+            .data_opt::<weaver_server_core::SchedulerHandle>()
+            .and_then(|handle| handle.nntp_pool());
+        let pool = live_pool.or_else(|| {
+            ctx.data_opt::<Option<std::sync::Arc<weaver_nntp::pool::NntpPool>>>()
+                .and_then(Clone::clone)
+        })?;
+        let idx = pool
+            .server_configs()
+            .iter()
+            .position(|config| config.host == self.host && config.port == self.port)?;
+        pool.address_plan_snapshot(weaver_nntp::ServerId(idx))?
+            .pinned
+            .map(|address| address.ip().to_string())
+    }
 }
 
 /// Reduce one server's health state, holdoff and socket counts to the single

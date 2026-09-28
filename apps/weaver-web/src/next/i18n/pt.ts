@@ -466,6 +466,7 @@ export const nextPt: LocaleDictionary = {
   "next.monitoring.providersNote": "carga de conexões, latência e falhas",
   "next.monitoring.noProviders": "Nenhum provedor configurado — adicione um em Configurações → Provedores.",
   "next.monitoring.roundTrip": "latência",
+  "next.monitoring.pinnedAddress": "endereço das novas conexões",
   "next.monitoring.failuresSinceStart": "falhas desde o início",
   "next.monitoring.connectionShare": "parcela das conexões ativas",
   "next.monitoring.failures": "Falhas",

@@ -466,6 +466,7 @@ export const nextZh: LocaleDictionary = {
   "next.monitoring.providersNote": "连接负载、往返时延和失败",
   "next.monitoring.noProviders": "未配置服务商 — 请在 设置 → 服务商 中添加。",
   "next.monitoring.roundTrip": "往返时延",
+  "next.monitoring.pinnedAddress": "新连接使用的地址",
   "next.monitoring.failuresSinceStart": "启动以来的失败",
   "next.monitoring.connectionShare": "占活动连接的比例",
   "next.monitoring.failures": "失败",

@@ -466,6 +466,7 @@ export const nextJa: LocaleDictionary = {
   "next.monitoring.providersNote": "接続負荷、往復時間、失敗",
   "next.monitoring.noProviders": "プロバイダーが設定されていません — 設定 → プロバイダー で追加してください。",
   "next.monitoring.roundTrip": "往復時間",
+  "next.monitoring.pinnedAddress": "新規接続の接続先アドレス",
   "next.monitoring.failuresSinceStart": "起動以降の失敗",
   "next.monitoring.connectionShare": "アクティブ接続に占める割合",
   "next.monitoring.failures": "失敗",

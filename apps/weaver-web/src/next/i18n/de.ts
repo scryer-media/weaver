@@ -466,6 +466,7 @@ export const nextDe: LocaleDictionary = {
   "next.monitoring.providersNote": "Verbindungslast, Antwortzeit und Fehler",
   "next.monitoring.noProviders": "Keine Anbieter eingerichtet — füge einen unter Einstellungen → Anbieter hinzu.",
   "next.monitoring.roundTrip": "Antwortzeit",
+  "next.monitoring.pinnedAddress": "Adresse für neue Verbindungen",
   "next.monitoring.failuresSinceStart": "Fehler seit dem Start",
   "next.monitoring.connectionShare": "Anteil an aktiven Verbindungen",
   "next.monitoring.failures": "Fehler",

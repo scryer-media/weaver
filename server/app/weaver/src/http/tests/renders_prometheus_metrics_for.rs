@@ -315,6 +315,18 @@ fn renders_prometheus_download_observed_limiter_states() {
     assert!(rendered.contains(
         "weaver_server_info{server_id=\"7\",server=\"news.example:563\",host=\"news.example\",port=\"563\",tls=\"true\",priority=\"1\",backfill=\"false\"} 1"
     ));
+    // The address plan: which address is pinned, how fast each connects,
+    // and how often the plan raced and moved.
+    for series in [
+        "weaver_server_address_info{server_id=\"7\",server=\"news.example:563\",address=\"192.0.2.1\"} 0",
+        "weaver_server_address_info{server_id=\"7\",server=\"news.example:563\",address=\"192.0.2.2\"} 1",
+        "weaver_server_address_connect_seconds{server_id=\"7\",server=\"news.example:563\",address=\"192.0.2.2\"} 0.02",
+        "weaver_server_address_races_total{server_id=\"7\",server=\"news.example:563\",outcome=\"won\"} 2",
+        "weaver_server_address_races_total{server_id=\"7\",server=\"news.example:563\",outcome=\"failed\"} 1",
+        "weaver_server_address_repins_total{server_id=\"7\",server=\"news.example:563\",reason=\"interval\"} 1",
+    ] {
+        assert!(rendered.contains(series), "missing {series}");
+    }
     assert!(rendered.contains("weaver_nntp_runtime_generation 2"));
 
     snapshot.decode_pending_bytes = 128 * 1024 * 1024;
@@ -554,12 +566,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
         &rendered,
         "weaver_pipeline_download_lane_parks_total",
         "reason",
-        &[
-            "no_work",
-            "pressure",
-            "probe_yield",
-            "error",
-        ],
+        &["no_work", "pressure", "probe_yield", "error"],
     );
     assert_label_set(
         &rendered,
