@@ -3037,7 +3037,7 @@ func readConventional7zRepairLog(logText string, jobID int) conventional7zRepair
 	job := fmt.Sprintf(" job_id=%d ", jobID)
 	var shape conventional7zRepairLog
 	for _, line := range strings.Split(stripANSIEscapeSequences(logText), "\n") {
-		if !strings.Contains(line+" ", job) {
+		if !strings.Contains(line+" ", job) || isWeaverDebugRingReplay(line) {
 			continue
 		}
 		switch {

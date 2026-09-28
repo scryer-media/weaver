@@ -642,6 +642,69 @@ func TestAssertPar2CleanSettlementDistinguishesGridAndAuthoritativeSets(t *testi
 	}
 }
 
+// A stall report replays the job's recent debug events at WARN under the debug
+// ring's own target. The replay repeats the event's message and its job id, in
+// either the older rendered-line shape or the field-per-part shape, and must
+// not count as a second observation of the event.
+func TestAssertPar2CleanSettlementIgnoresDebugRingReplays(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logLines := []string{
+		"2026-01-02T03:04:05.000001+00:00 DEBUG weaver_server_core::pipeline::completion::finalize::check: PAR2 clean set verification source job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid",
+		"2026-01-02T03:04:05.000002+00:00 DEBUG weaver_server_core::pipeline::completion::finalize::check: PAR2 set settled clean from in-stream grid evidence job_id=42 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0",
+		`2026-01-02T03:04:06.000001+00:00  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=42 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 line=DEBUG weaver_server_core::pipeline::completion::finalize::check: PAR2 clean set verification source job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid`,
+		"\x1b[2m2026-01-02T03:04:06.000002+00:00\x1b[0m \x1b[33m WARN\x1b[0m \x1b[2mweaver_server_core::runtime::job_debug_ring\x1b[0m\x1b[2m:\x1b[0m stall diagnostics line job_id=42 reason=\"dispatch stall: job not eligible\" at=2026-01-02T03:04:05.000002+00:00 replayed_level=DEBUG replayed_target=\"weaver_server_core::pipeline::completion::finalize::check\" replayed_message=\"PAR2 set settled clean from in-stream grid evidence\" replayed_fields=\"job_id=42 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0\"",
+		`2026-01-02T03:04:06.000003+00:00  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=42 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 replayed_level=DEBUG replayed_target="weaver_server_core::pipeline::completion::finalize::check" replayed_message="PAR2 clean set verification source" replayed_fields="job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid"`,
+	}
+	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := assertPar2CleanSettlement(42, &ScenarioPar2CleanSettlementAssertion{
+		ExpectedSetSliceSizes:        map[string]uint64{"grid-set": 64},
+		ExpectedSetVerificationModes: map[string][]string{"grid-set": {"grid"}},
+	})
+	if err != nil {
+		t.Fatalf("expected the replays to be ignored, got %v", err)
+	}
+
+	if !isWeaverDebugRingReplay(logLines[3]) {
+		t.Fatal("a coloured replay must be recognised after its escapes are stripped")
+	}
+	if isWeaverDebugRingReplay(logLines[0]) {
+		t.Fatal("the event itself is not a replay")
+	}
+}
+
+func TestAssertLogLinesIgnoresDebugRingReplays(t *testing.T) {
+	maxCount := 1
+	raw := strings.Join([]string{
+		"2026-01-02T03:04:05.000001+00:00  INFO weaver_server_core::pipeline::stage: direct unpack armed job_id=7 set=a",
+		`2026-01-02T03:04:06.000001+00:00  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=7 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 replayed_level=INFO replayed_target="weaver_server_core::pipeline::stage" replayed_message="direct unpack armed" replayed_fields="job_id=7 set=a"`,
+	}, "\n")
+	err := assertLogLines(raw, 7, &ScenarioLogAssertion{Lines: []ScenarioLogLineAssertion{{
+		Message:  "direct unpack armed",
+		MinCount: 1,
+		MaxCount: &maxCount,
+	}}})
+	if err != nil {
+		t.Fatalf("expected the replay not to count, got %v", err)
+	}
+}
+
+func TestUnexpectedDirectDemotionsIgnoresDebugRingReplays(t *testing.T) {
+	raw := strings.Join([]string{
+		`2026-01-02T03:04:05.000001+00:00  INFO weaver_server_core::direct: direct-store set demoted job_id=9 reason="member_compressed"`,
+		`2026-01-02T03:04:06.000001+00:00  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=9 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 line=INFO weaver_server_core::direct: direct-store set demoted job_id=9 reason=member_compressed`,
+	}, "\n")
+	if got := unexpectedDirectDemotions(raw, nil); len(got) != 0 {
+		t.Fatalf("a replay's own reason must not be read as a demotion reason: %v", got)
+	}
+}
+
 func TestAssertPar2CleanSettlementRejectsModeOutsideSingletonPin(t *testing.T) {
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)

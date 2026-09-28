@@ -1262,6 +1262,19 @@ func submittedScenariosByJobID(jobs []testJob) map[string]*Scenario {
 	return scenarios
 }
 
+// weaverDebugRingTarget is the log target weaver writes a job's debug ring
+// under when it reports a stall. Each of those records replays an earlier
+// event of the same job — its message and its fields, `job_id` included — so a
+// scan for an event's message would count the replay as a second occurrence.
+const weaverDebugRingTarget = "weaver_server_core::runtime::job_debug_ring:"
+
+// isWeaverDebugRingReplay reports whether a weaver log line is one of the
+// stall-diagnostics records the debug ring writes rather than an event in its
+// own right. Every scan that looks for an event's message skips these.
+func isWeaverDebugRingReplay(line string) bool {
+	return strings.Contains(ansiEscape.ReplaceAllString(line, ""), weaverDebugRingTarget)
+}
+
 func directLogJobID(line string) string {
 	clean := ansiEscape.ReplaceAllString(line, "")
 	start := strings.Index(clean, "job_id=")
@@ -1306,7 +1319,7 @@ func assertNoUnexpectedDirectDemotions(jobs []testJob) error {
 func unexpectedDirectDemotions(log string, scenarios map[string]*Scenario) []string {
 	unexpected := map[string]int{}
 	for _, line := range strings.Split(log, "\n") {
-		if !strings.Contains(line, "direct-store set demoted") {
+		if !strings.Contains(line, "direct-store set demoted") || isWeaverDebugRingReplay(line) {
 			continue
 		}
 		reason := directDemotionReason(line)

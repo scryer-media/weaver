@@ -237,6 +237,9 @@ func TestPar3MixedE2E(t *testing.T) {
 			}
 			var jobLines []string
 			for _, line := range strings.Split(string(logBytes), "\n") {
+				if isWeaverDebugRingReplay(line) {
+					continue
+				}
 				for _, field := range strings.Fields(line) {
 					if field == fmt.Sprintf("job_id=%d", job) {
 						jobLines = append(jobLines, line)
