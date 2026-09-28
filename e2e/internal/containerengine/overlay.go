@@ -135,9 +135,13 @@ func (engine *Engine) OverlayYAML(layout ComposeLayout, secretFiles map[string]s
 			// IPv6 off on the interface there is no address to change.
 			settings.WriteString("    sysctls:\n      net.ipv6.conf.eth0.disable_ipv6: \"1\"\n")
 		}
-		if settings.Len() > 0 {
-			fmt.Fprintf(&services, "  %s:\n%s", service, settings.String())
-		}
+		// Podman's default log driver writes container output to the system
+		// journal and reads it back through a library it loads on demand.
+		// When that load fails, every log read fails for the life of the API
+		// service, and the read scans a journal every container on the host
+		// shares. A per-container file has neither dependency.
+		settings.WriteString("    logging:\n      driver: k8s-file\n")
+		fmt.Fprintf(&services, "  %s:\n%s", service, settings.String())
 	}
 	if services.Len() > 0 {
 		body.WriteString("services:\n")

@@ -77,7 +77,7 @@ func TestOverlayIsNeverWrittenForDocker(t *testing.T) {
 	}
 }
 
-func TestOverlayForDockerComposeProviderWithoutSELinuxIsEmpty(t *testing.T) {
+func TestOverlayForDockerComposeProviderWritesNoSecretFiles(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "docker-compose.yml")
 	writeTestFile(t, base, sampleCompose)
@@ -86,8 +86,36 @@ func TestOverlayForDockerComposeProviderWithoutSELinuxIsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if files.Compose != "" || len(files.Secrets) != 0 {
+	if len(files.Secrets) != 0 {
 		t.Fatalf("overlay = %+v; docker-compose implements environment secrets itself", files)
+	}
+	overlay := readTestFile(t, files.Compose)
+	if strings.Contains(overlay, "secrets:") || strings.Contains(overlay, "security_opt") {
+		t.Fatalf("overlay carries settings this engine does not need:\n%s", overlay)
+	}
+}
+
+func TestPodmanOverlayLogsEveryServiceToAFile(t *testing.T) {
+	const logging = "    logging:\n      driver: k8s-file\n"
+	layout := ParseComposeLayout([]byte(sampleCompose))
+	for _, engine := range []*Engine{
+		{Kind: Podman, Binary: "podman", ComposeProvider: ProviderDockerCompose},
+		{Kind: Podman, Binary: "podman", ComposeProvider: ProviderPodmanCompose, SELinux: true},
+	} {
+		yaml := engine.OverlayYAML(layout, nil)
+		if strings.Count(yaml, logging) != len(layout.Services) {
+			t.Fatalf("overlay does not set the log driver once per service:\n%s", yaml)
+		}
+		for _, service := range layout.Services {
+			if strings.Count(yaml, "  "+service+":\n") != 1 {
+				t.Fatalf("service %s is not overridden exactly once:\n%s", service, yaml)
+			}
+		}
+	}
+
+	docker := &Engine{Kind: Docker, Binary: "docker"}
+	if yaml := docker.OverlayYAML(layout, nil); yaml != "" {
+		t.Fatalf("docker got an overlay:\n%s", yaml)
 	}
 }
 
@@ -448,10 +476,8 @@ func TestPodmanOverlayDisablesIPv6OnBrowserInterfaces(t *testing.T) {
 			t.Fatalf("browser service %s keeps IPv6:\n%s", service, yaml)
 		}
 	}
-	for _, service := range []string{"fixture", "other"} {
-		if strings.Contains(yaml, "  "+service+":") {
-			t.Fatalf("overlay changed non-browser service %s:\n%s", service, yaml)
-		}
+	if strings.Count(yaml, sysctl) != 2 {
+		t.Fatalf("overlay disabled IPv6 on a non-browser service:\n%s", yaml)
 	}
 
 	selinux := &Engine{Kind: Podman, Binary: "podman", ComposeProvider: ProviderDockerCompose, SELinux: true}
