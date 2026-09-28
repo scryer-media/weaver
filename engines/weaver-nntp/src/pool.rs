@@ -451,12 +451,10 @@ impl NntpPool {
         }
     }
 
-    /// How a new connection to this server picks its address. The server
-    /// counts as idle when the caller's own permit is the only one out.
+    /// How a new connection to this server picks its address.
     fn address_route(&self, idx: usize) -> AddressRoute {
         AddressRoute {
             plan: Arc::clone(&self.address_plans[idx]),
-            server_idle: self.active_connections(idx) <= 1,
         }
     }
 
