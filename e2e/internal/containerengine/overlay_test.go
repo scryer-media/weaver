@@ -338,3 +338,73 @@ func readTestFile(t *testing.T, path string) string {
 	}
 	return string(content)
 }
+
+const ownedVolumesCompose = `services:
+  owner:
+    volumes:
+      - shared:/data
+  reader:
+    volumes:
+      - shared:/shared:ro
+    x-e2e-owner: puid
+
+volumes:
+  # a comment between volumes
+  shared:
+    x-e2e-owner: puid
+  scratch:
+  quoted:
+    x-e2e-owner: "puid"
+  other:
+    x-e2e-owner: root
+`
+
+func TestParseComposeLayoutFindsPUIDOwnedVolumes(t *testing.T) {
+	layout := ParseComposeLayout([]byte(ownedVolumesCompose))
+	if want := []string{"shared", "quoted"}; !reflect.DeepEqual(layout.PUIDOwnedVolumes, want) {
+		t.Fatalf("PUID-owned volumes = %v, want %v", layout.PUIDOwnedVolumes, want)
+	}
+}
+
+func TestHarnessComposeFileMarksVolumesWeaverShares(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "docker-compose.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout := ParseComposeLayout(content)
+	want := []string{"weaver-data", "weaver-downloads", "weaver-watch-folder"}
+	if !reflect.DeepEqual(layout.PUIDOwnedVolumes, want) {
+		t.Fatalf("PUID-owned volumes = %v, want %v", layout.PUIDOwnedVolumes, want)
+	}
+}
+
+func TestPodmanOverlayPinsPUIDOwnedVolumeOwnership(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "docker-compose.yml")
+	writeTestFile(t, base, ownedVolumesCompose)
+	engine := &Engine{Kind: Podman, Binary: "podman", ComposeProvider: ProviderDockerCompose}
+	files, err := engine.WriteOverlay(filepath.Join(dir, "state"), base, func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files.Compose == "" {
+		t.Fatal("Podman wrote no overlay for PUID-owned volumes")
+	}
+	overlay := readTestFile(t, files.Compose)
+	want := "volumes:\n" +
+		"  shared:\n    driver_opts:\n      o: \"uid=${PUID:-1000},gid=${PGID:-1000}\"\n" +
+		"  quoted:\n    driver_opts:\n      o: \"uid=${PUID:-1000},gid=${PGID:-1000}\"\n"
+	if !strings.Contains(overlay, want) {
+		t.Fatalf("overlay does not pin volume ownership:\n%s", overlay)
+	}
+	for _, unowned := range []string{"scratch", "other"} {
+		if strings.Contains(overlay, "  "+unowned+":") {
+			t.Fatalf("overlay pinned unmarked volume %s:\n%s", unowned, overlay)
+		}
+	}
+
+	docker := &Engine{Kind: Docker, Binary: "docker"}
+	if yaml := docker.OverlayYAML(ParseComposeLayout([]byte(ownedVolumesCompose)), nil); yaml != "" {
+		t.Fatalf("docker got an overlay:\n%s", yaml)
+	}
+}
