@@ -15,6 +15,8 @@ enum Answer {
     Refuse,
     /// Connect once the test sends on the paired sender.
     ConnectWhenReleased(Receiver<()>),
+    /// Fail once with this error kind; the next dial connects.
+    Fail(io::ErrorKind),
 }
 
 /// A dialer that answers each address the way the test scripted it and
@@ -74,6 +76,7 @@ impl AddressDialer for ScriptedDialer {
                 return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
             }
             Some(Answer::ConnectWhenReleased(gate)) => Some(gate),
+            Some(Answer::Fail(kind)) => return Err(io::Error::from(kind)),
         };
         if let Some(gate) = gate {
             // A dropped sender releases the gate too.
@@ -100,6 +103,14 @@ fn settle(plan: &AddressPlan, addrs: &[SocketAddr]) {
     }
 }
 
+/// Wait until every race thread has finished with `dialer`, which each does
+/// only after booking its attempt.
+fn settle_all(dialer: &Arc<ScriptedDialer>) {
+    while Arc::strong_count(dialer) > 1 {
+        std::thread::yield_now();
+    }
+}
+
 /// Pin `winner` with a first race in which every other address is held until
 /// the race is over.
 fn pin(
@@ -109,7 +120,7 @@ fn pin(
     others: &[SocketAddr],
 ) {
     let gates: Vec<_> = others.iter().map(|other| dialer.gate(*other)).collect();
-    let (_, pinned) = plan.connect(dialer, false).unwrap();
+    let (_, pinned) = plan.connect(dialer).unwrap();
     assert_eq!(pinned, winner);
     drop(gates);
     settle(plan, others);
@@ -123,7 +134,7 @@ fn the_first_address_to_answer_is_pinned_and_later_connects_dial_it() {
     let release_slow = dialer.gate(slow);
     let plan = plan();
 
-    let (_, first) = plan.connect(&dialer, false).unwrap();
+    let (_, first) = plan.connect(&dialer).unwrap();
 
     assert_eq!(first, fast);
     assert_eq!(plan.snapshot().pinned, Some(fast));
@@ -132,7 +143,7 @@ fn the_first_address_to_answer_is_pinned_and_later_connects_dial_it() {
     settle(&plan, &[slow]);
     dialer.take_dialled();
 
-    let (_, second) = plan.connect(&dialer, false).unwrap();
+    let (_, second) = plan.connect(&dialer).unwrap();
     assert_eq!(second, fast);
     assert_eq!(dialer.take_dialled(), vec![fast]);
 }
@@ -147,7 +158,7 @@ fn a_refused_pin_falls_over_to_the_candidate_that_connects_fastest() {
     plan.record_connect(faster, Some(Duration::from_millis(20)));
     dialer.answer(pinned, Answer::Refuse);
 
-    let (_, connected) = plan.connect(&dialer, false).unwrap();
+    let (_, connected) = plan.connect(&dialer).unwrap();
 
     assert_eq!(connected, faster);
     assert_eq!(dialer.take_dialled(), vec![pinned, faster]);
@@ -164,12 +175,12 @@ fn two_refusals_on_the_pin_race_again_even_while_the_server_is_busy() {
     dialer.answer(pinned, Answer::Refuse);
 
     for _ in 0..SUSPECT_AFTER_FAILURES {
-        let (_, connected) = plan.connect(&dialer, false).unwrap();
+        let (_, connected) = plan.connect(&dialer).unwrap();
         assert_eq!(connected, other);
     }
     assert_eq!(plan.snapshot().pinned, Some(pinned));
 
-    let (_, raced) = plan.connect(&dialer, false).unwrap();
+    let (_, raced) = plan.connect(&dialer).unwrap();
 
     assert_eq!(raced, other);
     let snapshot = plan.snapshot();
@@ -179,28 +190,32 @@ fn two_refusals_on_the_pin_race_again_even_while_the_server_is_busy() {
 }
 
 #[test]
-fn an_aged_pin_is_raced_again_only_once_the_server_is_idle() {
+fn an_aged_pin_is_raced_again_once_per_interval() {
     let (pinned, closer) = (addr(1), addr(2));
     let dialer = ScriptedDialer::new(&[pinned, closer]);
     let plan = plan();
     pin(&plan, &dialer, pinned, &[closer]);
     plan.age_pin_by(ADDRESS_REPLAN_INTERVAL);
 
-    // Busy: the aged pin is still dialled directly.
-    let (_, busy) = plan.connect(&dialer, false).unwrap();
-    assert_eq!(busy, pinned);
-    assert_eq!(dialer.take_dialled(), vec![pinned]);
-    assert_eq!(plan.snapshot().races_won, 1);
-
-    // Idle: the plan races, and this time the other address answers first.
+    // The next connect races, and this time the other address answers first.
     let hold_pinned = dialer.gate(pinned);
-    let (_, idle) = plan.connect(&dialer, true).unwrap();
+    let (_, raced) = plan.connect(&dialer).unwrap();
     drop(hold_pinned);
+    settle_all(&dialer);
+    dialer.take_dialled();
 
-    assert_eq!(idle, closer);
+    assert_eq!(raced, closer);
     let snapshot = plan.snapshot();
     assert_eq!(snapshot.pinned, Some(closer));
+    assert_eq!(snapshot.races_won, 2);
     assert!(snapshot.repins.contains(&(RaceReason::Interval, 1)));
+
+    // The race restarted the pin's age, so the connect after it dials the
+    // new pin directly.
+    let (_, next) = plan.connect(&dialer).unwrap();
+    assert_eq!(next, closer);
+    assert_eq!(dialer.take_dialled(), vec![closer]);
+    assert_eq!(plan.snapshot().races_won, 2);
 }
 
 #[test]
@@ -210,7 +225,7 @@ fn a_fresh_pin_is_not_raced_again_while_idle() {
     let plan = plan();
     pin(&plan, &dialer, pinned, &[other]);
 
-    let (_, connected) = plan.connect(&dialer, true).unwrap();
+    let (_, connected) = plan.connect(&dialer).unwrap();
 
     assert_eq!(connected, pinned);
     assert_eq!(dialer.take_dialled(), vec![pinned]);
@@ -218,18 +233,15 @@ fn a_fresh_pin_is_not_raced_again_while_idle() {
 }
 
 #[test]
-fn a_cleared_over_limit_holdoff_races_again_once_idle() {
+fn a_cleared_over_limit_holdoff_races_on_the_next_connect() {
     let (pinned, other) = (addr(1), addr(2));
     let dialer = ScriptedDialer::new(&[pinned, other]);
     let plan = plan();
     pin(&plan, &dialer, pinned, &[other]);
     plan.note_over_limit_cleared();
 
-    plan.connect(&dialer, false).unwrap();
-    assert_eq!(plan.snapshot().races_won, 1);
-
     let hold_pinned = dialer.gate(pinned);
-    let (_, raced) = plan.connect(&dialer, true).unwrap();
+    let (_, raced) = plan.connect(&dialer).unwrap();
     drop(hold_pinned);
 
     assert_eq!(raced, other);
@@ -250,7 +262,7 @@ fn a_resolve_that_answers_nothing_keeps_the_last_candidates() {
     dialer.resolve_to_nothing();
 
     let hold_pinned = dialer.gate(pinned);
-    let (_, raced) = plan.connect(&dialer, true).unwrap();
+    let (_, raced) = plan.connect(&dialer).unwrap();
     drop(hold_pinned);
 
     assert_eq!(raced, other);
@@ -269,7 +281,7 @@ fn a_first_race_with_nothing_resolved_fails_the_connect() {
     dialer.resolve_to_nothing();
     let plan = plan();
 
-    let error = plan.connect(&dialer, false).unwrap_err();
+    let error = plan.connect(&dialer).unwrap_err();
 
     assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
     let snapshot = plan.snapshot();
@@ -287,7 +299,7 @@ fn a_connect_that_arrives_during_a_race_dials_the_address_the_race_pins() {
 
     let racer = {
         let (plan, dialer) = (Arc::clone(&plan), Arc::clone(&dialer));
-        std::thread::spawn(move || plan.connect(&dialer, false).unwrap().1)
+        std::thread::spawn(move || plan.connect(&dialer).unwrap().1)
     };
     // The race is under way once the plan says so; a second caller now has
     // to wait for it rather than start its own.
@@ -296,7 +308,7 @@ fn a_connect_that_arrives_during_a_race_dials_the_address_the_race_pins() {
     }
     let waiter = {
         let (plan, dialer) = (Arc::clone(&plan), Arc::clone(&dialer));
-        std::thread::spawn(move || plan.connect(&dialer, false).unwrap().1)
+        std::thread::spawn(move || plan.connect(&dialer).unwrap().1)
     };
     release_fast.send(()).unwrap();
 
@@ -311,7 +323,7 @@ fn body_latency_is_kept_only_for_known_addresses() {
     let known = addr(1);
     let dialer = ScriptedDialer::new(&[known]);
     let plan = plan();
-    plan.connect(&dialer, false).unwrap();
+    plan.connect(&dialer).unwrap();
 
     plan.record_body_latency(known.ip(), Duration::from_millis(40));
     plan.record_body_latency(addr(9).ip(), Duration::from_millis(40));
@@ -321,5 +333,101 @@ fn body_latency_is_kept_only_for_known_addresses() {
     assert_eq!(
         snapshot.addresses[0].body_latency,
         Some(Duration::from_millis(40))
+    );
+}
+
+#[test]
+fn a_failed_first_race_holds_further_races_off_for_a_while() {
+    let (first, second) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[first, second]);
+    dialer.answer(first, Answer::Refuse);
+    dialer.answer(second, Answer::Refuse);
+    let plan = plan();
+
+    plan.connect(&dialer).unwrap_err();
+    settle_all(&dialer);
+    assert_eq!(plan.snapshot().races_failed, 1);
+    dialer.take_dialled();
+
+    // Within the holdoff the known candidates are dialled one after another,
+    // and no race runs.
+    plan.connect(&dialer).unwrap_err();
+    let dialled = dialer.take_dialled();
+    assert_eq!(dialled.len(), 2, "{dialled:?}");
+    assert!(dialled.contains(&first) && dialled.contains(&second));
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.races_failed, 1);
+    assert_eq!(snapshot.races_won, 0);
+
+    // Once the holdoff has passed, the next connect races again.
+    plan.age_failed_race_by(FAILED_RACE_HOLDOFF);
+    dialer.answer(second, Answer::ConnectWhenReleased(channel().1));
+    let (_, raced) = plan.connect(&dialer).unwrap();
+    assert_eq!(raced, second);
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.races_won, 1);
+    assert_eq!(snapshot.pinned, Some(second));
+}
+
+#[test]
+fn a_failed_first_race_with_nothing_resolved_fails_later_connects_without_dialling() {
+    let dialer = ScriptedDialer::new(&[]);
+    dialer.resolve_to_nothing();
+    let plan = plan();
+    plan.connect(&dialer).unwrap_err();
+
+    let error = plan.connect(&dialer).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+    assert!(dialer.take_dialled().is_empty());
+    assert_eq!(plan.snapshot().races_failed, 1);
+}
+
+#[test]
+fn a_race_loser_that_timed_out_is_not_booked_as_a_failure() {
+    let (winner, slow, refused) = (addr(1), addr(2), addr(3));
+    let dialer = ScriptedDialer::new(&[winner, slow, refused]);
+    dialer.answer(slow, Answer::Fail(io::ErrorKind::TimedOut));
+    dialer.answer(refused, Answer::Refuse);
+    let plan = plan();
+
+    let (_, pinned) = plan.connect(&dialer).unwrap();
+    assert_eq!(pinned, winner);
+    settle_all(&dialer);
+    dialer.take_dialled();
+
+    let failures = |address: SocketAddr| {
+        plan.snapshot()
+            .addresses
+            .iter()
+            .find(|candidate| candidate.address == address)
+            .map(|candidate| candidate.consecutive_failures)
+    };
+    assert_eq!(failures(slow), Some(0));
+    assert_eq!(failures(refused), Some(1));
+
+    // On failover the slow loser is tried before the address that refused.
+    dialer.answer(winner, Answer::Refuse);
+    let (_, connected) = plan.connect(&dialer).unwrap();
+    assert_eq!(connected, slow);
+    assert_eq!(dialer.take_dialled(), vec![winner, slow]);
+}
+
+#[test]
+fn a_race_in_which_every_address_timed_out_books_the_timeouts() {
+    let (first, second) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[first, second]);
+    dialer.answer(first, Answer::Fail(io::ErrorKind::TimedOut));
+    dialer.answer(second, Answer::Fail(io::ErrorKind::TimedOut));
+    let plan = plan();
+
+    let error = plan.connect(&dialer).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(
+        plan.snapshot()
+            .addresses
+            .iter()
+            .all(|address| address.consecutive_failures == 1)
     );
 }

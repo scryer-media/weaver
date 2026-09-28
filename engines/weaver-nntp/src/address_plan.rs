@@ -8,14 +8,22 @@
 //!
 //! The plan only races again when it has a reason to: the pin keeps refusing
 //! connections, the provider just lifted an over-limit holdoff, or the plan
-//! has aged past [`ADDRESS_REPLAN_INTERVAL`]. Only a failing pin re-races while
-//! the server is busy; the other reasons wait until it is idle, because
-//! moving busy connections to another address costs more than any address
-//! could save.
+//! has aged past [`ADDRESS_REPLAN_INTERVAL`]. A race runs inside one connect
+//! whether or not the server is busy: the winning stream is the connection
+//! that connect returns, so a race costs only its losing handshakes, and a
+//! race of any outcome restarts the pin's age, so age alone races at most once
+//! per interval. Existing connections stay where they are; only connections
+//! opened after a repin go to the new address.
 //!
 //! A connect that finds the pin refusing tries the remaining candidates in
 //! order of their measured connect time, so one bad address never fails a
-//! connect the server could have served.
+//! connect the server could have served. A race loser that merely timed out
+//! is not booked as a failure: it was slower than the winner, not broken.
+//!
+//! When a race finds no address at all and nothing is pinned, connects dial
+//! the known candidates one at a time for [`FAILED_RACE_HOLDOFF`] instead of
+//! racing again, so a server that is down does not start a burst of race
+//! threads on every reconnect attempt.
 
 use std::collections::HashMap;
 use std::io;
@@ -25,8 +33,19 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-/// How old a pin may get before an idle server races its addresses again.
+/// How old a pin may get before the next connect races the server's
+/// addresses again. Every race, won or failed, restarts the pin's age, so this
+/// is also the most often a server races on age alone, busy or idle.
 pub const ADDRESS_REPLAN_INTERVAL: Duration = Duration::from_mins(10);
+
+/// How long after a race in which no address answered, with nothing pinned,
+/// connects dial the known candidates one after another instead of racing.
+/// A race dials every candidate on its own thread, each held for up to
+/// [`ADDRESS_ATTEMPT_LIMIT`]; against a server that is down, racing on every
+/// reconnect attempt would keep that many threads blocked for nothing. A
+/// minute is long enough to absorb a reconnect loop and short enough that a
+/// server coming back is raced, and pinned, soon after.
+pub const FAILED_RACE_HOLDOFF: Duration = Duration::from_mins(1);
 
 /// Longest one connect attempt to one address may take, whatever the connect
 /// timeout, so an address that swallows packets neither holds a race thread
@@ -34,7 +53,7 @@ pub const ADDRESS_REPLAN_INTERVAL: Duration = Duration::from_mins(10);
 pub const ADDRESS_ATTEMPT_LIMIT: Duration = Duration::from_secs(15);
 
 /// Consecutive connect failures on the pin that make it suspect. A suspect pin
-/// is raced again on the next connect, even while the server is busy.
+/// is raced again on the next connect, however young it is.
 pub const SUSPECT_AFTER_FAILURES: u32 = 2;
 
 /// Most addresses one race dials. Each gets its own thread for the length of
@@ -49,7 +68,7 @@ const EWMA_WEIGHT: f64 = 0.25;
 pub enum RaceReason {
     /// Nothing was pinned yet.
     Initial,
-    /// The pin aged past [`ADDRESS_REPLAN_INTERVAL`] and the server was idle.
+    /// The pin aged past [`ADDRESS_REPLAN_INTERVAL`].
     Interval,
     /// An over-limit holdoff cleared, so the provider's view of this client
     /// may have changed.
@@ -148,12 +167,10 @@ impl AddressDialer for TcpDialer {
     }
 }
 
-/// A server's address plan plus what the caller knows about the server's
-/// load, which the plan needs to decide whether a due race may run now.
+/// The address plan a new connection to one server goes through.
 #[derive(Clone)]
 pub struct AddressRoute {
     pub(crate) plan: Arc<AddressPlan>,
-    pub(crate) server_idle: bool,
 }
 
 impl AddressRoute {
@@ -165,7 +182,7 @@ impl AddressRoute {
         timeout: Duration,
     ) -> io::Result<(TcpStream, SocketAddr)> {
         let dialer = Arc::new(TcpDialer::new(host, port, timeout));
-        self.plan.connect(&dialer, self.server_idle)
+        self.plan.connect(&dialer)
     }
 }
 
@@ -190,6 +207,9 @@ struct PlanState {
     pending: Option<RaceReason>,
     /// Why the last race found nothing, handed to callers that waited on it.
     last_race_error: Option<(io::ErrorKind, String)>,
+    /// When a race last found no address while nothing was pinned. Holds
+    /// further races off for [`FAILED_RACE_HOLDOFF`].
+    last_race_failed_at: Option<Instant>,
     races_won: u64,
     races_failed: u64,
     repins: [u64; RaceReason::ALL.len()],
@@ -199,6 +219,7 @@ enum Next {
     Dial(Vec<SocketAddr>),
     Race(RaceReason),
     Wait(u64),
+    Fail(io::ErrorKind, String),
 }
 
 /// The address state of one server. See the module docs.
@@ -230,13 +251,13 @@ impl AddressPlan {
     pub(crate) fn connect<D: AddressDialer>(
         self: &Arc<Self>,
         dialer: &Arc<D>,
-        server_idle: bool,
     ) -> io::Result<(D::Stream, SocketAddr)> {
         loop {
-            let next = self.state().next(Instant::now(), server_idle);
+            let next = self.state().next(Instant::now());
             match next {
                 Next::Dial(order) => return self.dial_in_order(dialer.as_ref(), &order),
                 Next::Race(reason) => return self.race(dialer, reason),
+                Next::Fail(kind, message) => return Err(io::Error::new(kind, message)),
                 Next::Wait(generation) => {
                     let mut state = self.state();
                     while state.racing && state.generation == generation {
@@ -332,7 +353,14 @@ impl AddressPlan {
                     let started = Instant::now();
                     let result = dialer.dial(addr);
                     let elapsed = started.elapsed();
-                    plan.record_connect(addr, result.is_ok().then_some(elapsed));
+                    match &result {
+                        Ok(_) => plan.record_connect(addr, Some(elapsed)),
+                        // Only slow. Whether that counts against the address
+                        // depends on whether anything won, which the race
+                        // decides below.
+                        Err(error) if is_slow(error) => {}
+                        Err(_) => plan.record_connect(addr, None),
+                    }
                     // A loser's stream is dropped here once the winner has
                     // stopped listening, which closes it.
                     let _ = tx.send((addr, result, elapsed));
@@ -343,14 +371,26 @@ impl AddressPlan {
         }
         drop(tx);
 
+        let mut slow = Vec::new();
         for (addr, result, elapsed) in rx {
             match result {
                 Ok(stream) => {
+                    // Addresses that timed out lost to this one; they are
+                    // not booked as failures.
                     ticket.finish(Ok(addr), Some(elapsed), resolved);
                     return Ok((stream, addr));
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    if is_slow(&error) {
+                        slow.push(addr);
+                    }
+                    last_error = Some(error);
+                }
             }
+        }
+        // Nothing answered, so a timeout was a failure after all.
+        for addr in slow {
+            self.record_connect(addr, None);
         }
         let error = last_error.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::AddrNotAvailable, "no address answered")
@@ -400,8 +440,9 @@ impl AddressPlan {
     }
 
     /// The provider accepts new connections again after refusing them. Its
-    /// addresses may have been rebalanced meanwhile, so race again once the
-    /// server is idle.
+    /// addresses may have been rebalanced meanwhile, so the next connect races
+    /// again, busy or not: this is exactly when a fresh look is worth the
+    /// losing handshakes.
     pub(crate) fn note_over_limit_cleared(&self) {
         let mut state = self.state();
         if state.pinned.is_some() && state.pending.is_none() {
@@ -445,18 +486,34 @@ impl AddressPlan {
         let mut state = self.state();
         state.chosen_at = state.chosen_at.and_then(|at| at.checked_sub(age));
     }
+
+    /// Make the last failed race look `age` older, as if the clock had moved on.
+    #[cfg(test)]
+    pub(crate) fn age_failed_race_by(&self, age: Duration) {
+        let mut state = self.state();
+        state.last_race_failed_at = state.last_race_failed_at.and_then(|at| at.checked_sub(age));
+    }
 }
 
 impl PlanState {
-    fn next(&mut self, now: Instant, server_idle: bool) -> Next {
+    fn next(&mut self, now: Instant) -> Next {
         if self.racing {
             return Next::Wait(self.generation);
         }
         let reason = match (self.pinned, self.pending) {
+            (None, _) if self.failed_race_is_recent(now) => {
+                if self.candidates.is_empty() {
+                    let (kind, message) = self.last_race_error.clone().unwrap_or((
+                        io::ErrorKind::AddrNotAvailable,
+                        "no address answered".to_string(),
+                    ));
+                    return Next::Fail(kind, message);
+                }
+                None
+            }
             (None, _) => Some(RaceReason::Initial),
-            (Some(_), Some(RaceReason::Suspect)) => Some(RaceReason::Suspect),
-            (Some(_), Some(pending)) if server_idle => Some(pending),
-            (Some(_), _) if server_idle && self.pin_is_due(now) => Some(RaceReason::Interval),
+            (Some(_), Some(pending)) => Some(pending),
+            (Some(_), None) if self.pin_is_due(now) => Some(RaceReason::Interval),
             _ => None,
         };
         match reason {
@@ -466,6 +523,11 @@ impl PlanState {
             }
             None => Next::Dial(self.dial_order()),
         }
+    }
+
+    fn failed_race_is_recent(&self, now: Instant) -> bool {
+        self.last_race_failed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < FAILED_RACE_HOLDOFF)
     }
 
     fn pin_is_due(&self, now: Instant) -> bool {
@@ -528,6 +590,7 @@ impl RaceTicket<'_> {
                 state.chosen_at = Some(Instant::now());
                 state.races_won += 1;
                 state.last_race_error = None;
+                state.last_race_failed_at = None;
                 if previous.is_some_and(|previous| previous != winner) {
                     state.repins[reason.index()] += 1;
                 }
@@ -565,6 +628,8 @@ impl RaceTicket<'_> {
                     // Keep the old pin, and do not race again on age alone
                     // straight away.
                     state.chosen_at = Some(Instant::now());
+                } else {
+                    state.last_race_failed_at = Some(Instant::now());
                 }
                 let candidates = state.candidates.len();
                 drop(state);
@@ -589,6 +654,14 @@ impl Drop for RaceTicket<'_> {
             self.finish(Err(&error), None, Vec::new());
         }
     }
+}
+
+/// A connect that ran out of time rather than being turned away.
+fn is_slow(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }
 
 fn distinct_capped(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {

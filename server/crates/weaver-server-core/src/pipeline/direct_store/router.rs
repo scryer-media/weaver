@@ -2868,6 +2868,12 @@ impl DirectSetRouter {
         self.demoted.is_none() && self.header_crypt.wants_password()
     }
 
+    /// How many `-hp` candidates this set holds.
+    #[cfg(test)]
+    pub(crate) fn header_candidate_count(&self) -> usize {
+        self.header_crypt.candidate_count()
+    }
+
     /// The key ring's own `Debug`, for the test that proves a password cannot
     /// reach a log through it. The router's `Debug` does not print the ring at
     /// all, so this is the only way to assert on the type that holds the

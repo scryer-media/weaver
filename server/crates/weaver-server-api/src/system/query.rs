@@ -751,6 +751,7 @@ async fn collect_server_health(
                 failure_count: srv.failure_count,
                 consecutive_failures: srv.consecutive_failures,
                 premature_deaths: health.recent_premature_deaths(idx) as u32,
+                pool_index: idx,
             }
         })
         .collect()

@@ -1092,10 +1092,10 @@ impl Pipeline {
                     let mut set = DirectSet::new(job_id, plan.clone());
                     self.direct_store.apply_ceilings(&mut set);
                     set.router.set_password(spec.password.as_deref());
-                    // A harvest above may have armed the job's once-per-job
-                    // memo, which would stop the live seam from ever offering
-                    // it to this fresh set; hand it over here instead. With no
-                    // harvest yet, the live seam offers it on the first article.
+                    // A harvest above has already been kept for the job, and
+                    // the live seam only offers a harvest when it runs; hand it
+                    // to this fresh set here instead. With no harvest yet, the
+                    // live seam runs it and offers it on the first article.
                     if let Some(harvest) = header_candidates.as_deref() {
                         super::wiring::offer_direct_header_candidates(
                             &mut set,
