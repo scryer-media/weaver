@@ -1,13 +1,14 @@
+import { Leaf, Rocket, Scale } from "lucide-react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import {
-  detectedHardware,
   profileBody,
-  profileFacts,
   profileName,
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../data/hardware-profiles";
+
+const PROFILE_ICONS = { EFFICIENT: Leaf, BALANCED: Scale, PERFORMANCE: Rocket };
 
 /**
  * The three named profiles as cards, shared by first-run setup and Settings.
@@ -38,6 +39,7 @@ export function HardwareProfilePicker({
         {settings.options.map((option) => {
           const active = option.profile === value;
           const recommended = option.profile === settings.recommended;
+          const Icon = PROFILE_ICONS[option.profile];
           return (
             <button
               key={option.profile}
@@ -47,13 +49,14 @@ export function HardwareProfilePicker({
               disabled={disabled}
               onClick={() => onChange(option.profile)}
               className={cn(
-                "flex cursor-pointer flex-col gap-2 border p-3 text-left disabled:cursor-default",
+                "flex cursor-pointer flex-col items-center gap-3 border px-4 py-6 text-center disabled:cursor-default",
                 active
                   ? "border-wv-accent bg-wv-segment-active"
                   : "border-wv-control bg-wv-input hover:border-wv-control-focus",
               )}
             >
-              <div className="flex items-baseline gap-2">
+              <Icon aria-hidden="true" strokeWidth={1.5} className={cn("h-10 w-10", active ? "text-wv-accent" : "text-wv-muted")} />
+              <div className="flex flex-col items-center gap-1">
                 <span
                   className={cn(
                     "font-wv-title text-[13.5px] font-semibold",
@@ -71,21 +74,10 @@ export function HardwareProfilePicker({
               <p className="text-[12px] leading-[1.45] text-wv-muted">
                 {profileBody(t, option.profile)}
               </p>
-              <ul className="flex flex-col gap-0.5">
-                {profileFacts(t, option).map((fact) => (
-                  <li key={fact} className="font-wv-mono text-[11px] text-wv-dim">
-                    {fact}
-                  </li>
-                ))}
-              </ul>
             </button>
           );
         })}
       </div>
-      <p className="text-[11.5px] leading-[1.45] text-wv-muted">
-        {detectedHardware(t, settings)}
-      </p>
-      <p className="text-[11.5px] leading-[1.45] text-wv-muted">{t("next.performance.timing")}</p>
     </div>
   );
 }

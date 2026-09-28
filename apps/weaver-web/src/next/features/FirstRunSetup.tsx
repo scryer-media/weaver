@@ -594,7 +594,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
               </FormField>
             </div>
 
-            <FormField label={t("next.providers.connections")} help={t("next.providers.connectionsHelp")}>
+            <FormField label={t("next.providers.connections")}>
               <NumberField
                 label={t("next.providers.connections")}
                 value={form.connections}

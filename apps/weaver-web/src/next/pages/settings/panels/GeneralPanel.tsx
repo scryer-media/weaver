@@ -15,14 +15,15 @@ import {
   type DuplicatePolicy,
 } from "@/features/duplicates/duplicate-policy";
 import { useUpdateCheck } from "@/features/updates/use-update-check";
-import { HardwareProfilePicker } from "../../../components/HardwareProfilePicker";
+import { Leaf, Rocket, Scale } from "lucide-react";
 import {
   initialProfile,
   offersProfileChoice,
+  profileName,
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
-import { SecondaryButton } from "../../../components/controls";
+import { SecondaryButton, Select } from "../../../components/controls";
 import {
   SettingsBlocks,
   useDraft,
@@ -330,10 +331,10 @@ export function GeneralPanel() {
 }
 
 /**
- * The hardware profile, saved the moment a card is picked.
+ * The hardware profile, saved the moment a profile is picked.
  *
  * It is not part of the panel's draft: the daemon validates the pick against
- * the machine it is running on, and a refusal belongs beside the cards rather
+ * the machine it is running on, and a refusal belongs beside the select rather
  * than in the top bar's Save.
  */
 function PerformanceProfile({ settings }: { settings: HardwareProfileSettings }) {
@@ -359,9 +360,19 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
   };
 
   return (
-    <div className="flex flex-col gap-3">
-      <HardwareProfilePicker
-        settings={saved}
+    <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6">
+      <span className="text-[13px] font-semibold text-wv-fg">{t("next.performance.profile")}</span>
+      <div className="ml-auto flex min-w-0 flex-col items-end gap-2">
+      <Select
+        label={t("next.performance.profile")}
+        options={saved.options.map((option) => {
+          const Icon = { EFFICIENT: Leaf, BALANCED: Scale, PERFORMANCE: Rocket }[option.profile];
+          return {
+            value: option.profile,
+            label: profileName(t, option.profile),
+            icon: <Icon aria-hidden="true" size={16} strokeWidth={1.5} className="flex-none text-wv-muted" />,
+          };
+        })}
         value={value}
         onChange={pick}
         disabled={state.fetching}
@@ -374,6 +385,7 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
           {error}
         </p>
       ) : null}
+      </div>
     </div>
   );
 }
@@ -383,11 +395,11 @@ function UpdateCheck() {
   const t = useTranslate();
   const { busy, summary, failed, check } = useUpdateCheck();
   return (
-    <div className="flex min-w-0 flex-col items-start gap-2">
+    <div className="flex min-w-0 max-w-full flex-col items-end gap-2">
       <SecondaryButton icon="refresh" disabled={busy} onClick={check}>
         {t("next.general.checkNow")}
       </SecondaryButton>
-      <span role="status" className={failed ? "text-[12.5px] text-wv-error" : "text-[12.5px] text-wv-dim"}>
+      <span role="status" className={`max-w-full text-right text-[12.5px] whitespace-normal [overflow-wrap:anywhere] ${failed ? "text-wv-error" : "text-wv-dim"}`}>
         {summary}
       </span>
     </div>
