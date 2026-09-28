@@ -69,9 +69,23 @@ Everything below is new since 0.13.4.
   worker counts and the extraction-memory ceiling take effect after restart.
   An explicit `WEAVER_EXTRACTION_MAX_MEMORY_BYTES` still overrides that ceiling.
 - The retired `ipReplacementTrialExtraConnections` setting is removed from
-  saved configuration on load. Its API field and trial metrics are gone;
-  clients and dashboards that referenced them need to use the address-plan
-  fields and metrics instead.
+  saved configuration on load. GraphQL clients and metrics dashboards must
+  stop referencing these removed fields:
+  - `GeneralSettings.ipReplacementTrialExtraConnections`
+  - `GeneralSettingsInput.ipReplacementTrialExtraConnections`
+  - `Metrics.downloadLaneParksIpReplacementRetiredTotal`
+  - `Metrics.ipReplacementTrialExtraConnections`
+  - `Metrics.ipReplacementBurstActive`
+  - `Metrics.ipReplacementOverMaxConnections`
+  - `Metrics.ipRttEwmaEntries`
+  - `Metrics.ipRttEwmaSlowestMs`
+  - `Metrics.ipReplacementTrialsStartedTotal`
+  - `Metrics.ipReplacementTrialsRejectedTotal`
+  - `Metrics.ipReplacementTrialsAcceptedTotal`
+  - `Metrics.ipReplacementTrialsBlockedTotal`
+  - `Metrics.ipReplacementTrialsAcquireFailedTotal`
+  - `Metrics.ipReplacementTrialsSameIpRejectedTotal`
+  - `Metrics.ipReplacementOldConnectionsRetiredTotal`
 - Finalized direct-store markers from 0.13.4 are not accepted by the expanded
   output check. Affected sets download again so Weaver can verify all outputs
   before restoring them as finished.
