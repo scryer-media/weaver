@@ -522,7 +522,6 @@ type GeneralSettings {
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
-	ipReplacementTrialExtraConnections: Int!
 	enableSrrdbLookup: Boolean!
 	ispBandwidthCap: IspBandwidthCapSettings
 	watchFolder: WatchFolderSettings!
@@ -536,7 +535,6 @@ input GeneralSettingsInput {
 	maxDownloadSpeed: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
-	ipReplacementTrialExtraConnections: Int
 	enableSrrdbLookup: Boolean
 	ispBandwidthCap: IspBandwidthCapSettingsInput
 	watchFolder: WatchFolderSettingsInput
@@ -1013,6 +1011,20 @@ type KernelSelectionInfo {
 	pinnedBy: String
 }
 
+"""
+The live log filter. Changes last until the process exits.
+"""
+type LogFilter {
+	"""
+	The `RUST_LOG`-style directives in force.
+	"""
+	directives: String!
+	"""
+	The directives the process started with; setting blank restores them.
+	"""
+	defaultDirectives: String!
+}
+
 type LoginStatusResult {
 	enabled: Boolean!
 	username: String
@@ -1106,7 +1118,6 @@ type Metrics {
 	downloadLanesParkingActive: Int!
 	downloadLanesRecoveringActive: Int!
 	downloadLaneParksNoWorkTotal: Int!
-	downloadLaneParksIpReplacementRetiredTotal: Int!
 	downloadLaneParksErrorTotal: Int!
 	downloadLaneLeaseItemsTotal: Int!
 	downloadLaneRefillGrantedTotal: Int!
@@ -1116,18 +1127,6 @@ type Metrics {
 	downloadPipelineProofPassTotal: Int!
 	downloadPipelineCooldownTotal: Int!
 	downloadPipelineReplayItemsTotal: Int!
-	ipReplacementTrialExtraConnections: Int!
-	ipReplacementBurstActive: Boolean!
-	ipReplacementOverMaxConnections: Int!
-	ipRttEwmaEntries: Int!
-	ipRttEwmaSlowestMs: Int!
-	ipReplacementTrialsStartedTotal: Int!
-	ipReplacementTrialsRejectedTotal: Int!
-	ipReplacementTrialsAcceptedTotal: Int!
-	ipReplacementTrialsBlockedTotal: Int!
-	ipReplacementTrialsAcquireFailedTotal: Int!
-	ipReplacementTrialsSameIpRejectedTotal: Int!
-	ipReplacementOldConnectionsRetiredTotal: Int!
 	segmentsDownloaded: Int!
 	segmentsDecoded: Int!
 	segmentsCommitted: Int!
@@ -1474,7 +1473,11 @@ type MutationRoot {
 
 	Admin-only, and the input has to echo the notice the UI displayed: the
 	server installs the release it already found, never one the caller names.
+	Replace the live log filter with `RUST_LOG`-style directives. Blank
+	restores the directives the process started with. Not persisted: a
+	restart comes back up on its startup filter.
 	"""
+	setLogFilter(directives: String!): LogFilter!
 	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
 }
 
@@ -1978,6 +1981,10 @@ type QueryRoot {
 	Return recent log lines from the in-memory ring buffer.
 	"""
 	serviceLogs(limit: Int! = 250): ServiceLogsPayload!
+	"""
+	The live log filter directives.
+	"""
+	logFilter: LogFilter!
 	"""
 	Get current pipeline metrics.
 	"""
@@ -2755,6 +2762,12 @@ type ServerHealth {
 	Connections that died before reaching a healthy age, recently.
 	"""
 	prematureDeaths: Int!
+	"""
+	The resolved address new connections to this server dial, once an
+	address race has picked one. Absent before the first connect and for
+	a server reached through a proxy.
+	"""
+	pinnedAddress: String
 }
 
 input ServerInput {
