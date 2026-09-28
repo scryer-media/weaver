@@ -23,6 +23,7 @@ use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use weaver_yenc::CheckpointPlan;
 
+use crate::address_plan::AddressRoute;
 use crate::client::{
     BodyLaneMode, BodyLaneTraceMeta, DecodedBody, DecodedBodyCpu, DecodedBodyError, DecodedBodyIo,
     DecodedBodyTrace, FetchAttemptOutcome, FetchAttemptTrace, ProbeBatchResult,
@@ -233,8 +234,7 @@ impl BlockingBodyLane {
         stable_server_id: StableServerId,
         transfer_control: Option<Arc<ServerTransferControl>>,
         config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
+        route: Option<&AddressRoute>,
         groups: &[String],
         soft_timeout: Duration,
         permit: BlockingConnectionPermit,
@@ -249,10 +249,9 @@ impl BlockingBodyLane {
         }
         // On a pipelining server the first candidate group rides in the
         // session-setup write; `select_group` then short-circuits on it.
-        let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
+        let mut conn = BlockingNntpConnection::connect_for_group(
             config,
-            excluded_ips,
-            address_offset,
+            route,
             groups.first().map(String::as_str),
         )?;
         conn.set_transfer_control(transfer_control);
@@ -1017,38 +1016,29 @@ impl BlockingNntpConnection {
         std::mem::replace(&mut self.last_response_line_wait, Duration::ZERO)
     }
 
-    pub fn connect_with_ip_policy(
-        config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
-    ) -> Result<Self> {
-        Self::connect_with_ip_policy_for_group(config, excluded_ips, address_offset, None)
+    /// Connect to the first resolved address that answers.
+    pub fn connect(config: &ServerConfig) -> Result<Self> {
+        Self::connect_for_group(config, None, None)
     }
 
     /// Connect and, on a server known to pipeline, select `initial_group`
     /// inside the session-setup write. An unselectable group is not an
-    /// error here; the lane walks its candidate list afterwards.
-    pub fn connect_with_ip_policy_for_group(
+    /// error here; the lane walks its candidate list afterwards. A direct
+    /// connection dials the address `route`'s plan picks, or the first
+    /// resolved address that answers when there is no route.
+    pub fn connect_for_group(
         config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
+        route: Option<&AddressRoute>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
-        Self::connect_with_ip_policy_with_backend(
-            config,
-            excluded_ips,
-            address_offset,
-            None,
-            initial_group,
-        )
+        Self::connect_with_backend(config, route, None, initial_group)
     }
 
     /// `backend_override` bypasses env/platform backend selection; tests use
     /// it to exercise a specific TLS transport deterministically.
-    fn connect_with_ip_policy_with_backend(
+    fn connect_with_backend(
         config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
+        route: Option<&AddressRoute>,
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
@@ -1067,33 +1057,26 @@ impl BlockingNntpConnection {
             );
         }
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
-        let addrs = resolve_addrs(&config.host, config.port, excluded_ips, address_offset)?;
-        let mut last_error = None;
-        for addr in addrs {
-            match TcpStream::connect_timeout(&addr, connect_timeout) {
-                Ok(tcp) => {
-                    tcp.set_nodelay(true).map_err(NntpError::Io)?;
-                    tcp.set_read_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
-                        .map_err(NntpError::Io)?;
-                    tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
-                        .map_err(NntpError::Io)?;
-                    let remote_addr = Some(tcp.peer_addr().unwrap_or(addr));
-                    return Self::from_tcp(
-                        config,
-                        tcp,
-                        remote_addr,
-                        backend_override,
-                        initial_group,
-                        None,
-                    );
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        Err(NntpError::Io(last_error.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no NNTP address resolved")
-        })))
+        let (tcp, addr) = match route {
+            Some(route) => route
+                .connect_tcp(&config.host, config.port, connect_timeout)
+                .map_err(NntpError::Io)?,
+            None => connect_first_answering(&config.host, config.port, connect_timeout)?,
+        };
+        tcp.set_nodelay(true).map_err(NntpError::Io)?;
+        tcp.set_read_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
+            .map_err(NntpError::Io)?;
+        tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
+            .map_err(NntpError::Io)?;
+        let remote_addr = Some(tcp.peer_addr().unwrap_or(addr));
+        Self::from_tcp(
+            config,
+            tcp,
+            remote_addr,
+            backend_override,
+            initial_group,
+            None,
+        )
     }
 
     /// The TLS backend that carries this server's bytes on an owned lane.
@@ -2942,25 +2925,22 @@ fn nntp_error_to_io(error: NntpError) -> io::Error {
     }
 }
 
-fn resolve_addrs(
+/// Connect to the first of `host`'s resolved addresses that answers.
+fn connect_first_answering(
     host: &str,
     port: u16,
-    excluded_ips: &[IpAddr],
-    address_offset: usize,
-) -> Result<Vec<SocketAddr>> {
-    let mut addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(NntpError::Io)?
-        .filter(|addr| !excluded_ips.contains(&addr.ip()))
-        .collect::<Vec<_>>();
-    if addrs.is_empty() {
-        return Err(NntpError::PoolExhausted);
+    timeout: Duration,
+) -> Result<(TcpStream, SocketAddr)> {
+    let mut last_error = None;
+    for addr in (host, port).to_socket_addrs().map_err(NntpError::Io)? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(tcp) => return Ok((tcp, addr)),
+            Err(error) => last_error = Some(error),
+        }
     }
-    if !addrs.is_empty() {
-        let offset = address_offset % addrs.len();
-        addrs.rotate_left(offset);
-    }
-    Ok(addrs)
+    Err(NntpError::Io(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no NNTP address resolved")
+    })))
 }
 
 fn decoded_body_from_article(article: FusedYencArticle) -> DecodedBody {

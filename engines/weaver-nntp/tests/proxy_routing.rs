@@ -236,8 +236,7 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
     if !starttls {
         let blocking_config = config.clone();
         tokio::task::spawn_blocking(move || {
-            let mut client =
-                BlockingNntpConnection::connect_with_ip_policy(&blocking_config, &[], 0).unwrap();
+            let mut client = BlockingNntpConnection::connect(&blocking_config).unwrap();
             assert_eq!(client.remote_ip(), None);
             assert_eq!(client.send_command(&Command::Date).unwrap().code.raw(), 111);
             client.quit().unwrap();
@@ -355,8 +354,7 @@ async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
         };
         let started = std::time::Instant::now();
         let client = tokio::task::spawn_blocking(move || {
-            let mut client =
-                BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+            let mut client = BlockingNntpConnection::connect(&config).unwrap();
             client.send_command(&Command::Body(weaver_nntp::ArticleId::MessageId(
                 "stall@fixture".into(),
             )))

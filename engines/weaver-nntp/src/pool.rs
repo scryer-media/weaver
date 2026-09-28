@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::OwnedSemaphorePermit;
@@ -21,6 +21,7 @@ use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
+use crate::address_plan::{AddressPlan, AddressPlanSnapshot, AddressRoute};
 use crate::connection::{NntpConnection, ServerConfig};
 
 async fn acquisition_budget<T>(
@@ -114,7 +115,8 @@ pub struct NntpPool {
     /// would be a log flood; a silent one is what made the condition invisible.
     blocking_connect_warn_after: Vec<AtomicU64>,
     blocking_connect_failures_since_warning: Vec<AtomicU64>,
-    connect_cursors: Vec<AtomicUsize>,
+    /// Per-server choice of which resolved address new connections dial.
+    address_plans: Vec<Arc<AddressPlan>>,
     // Cold connection admission only; established BODY lanes never touch it.
     auth_admission: Vec<AuthAdmission>,
 }
@@ -355,7 +357,7 @@ impl NntpPool {
         let mut over_limit_episodes = Vec::with_capacity(server_count);
         let mut blocking_connect_warn_after = Vec::with_capacity(server_count);
         let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
-        let mut connect_cursors = Vec::with_capacity(server_count);
+        let mut address_plans = Vec::with_capacity(server_count);
         let mut socket_budgets = Vec::with_capacity(server_count);
 
         // A config where every server is backfill has no fill tier to
@@ -389,7 +391,10 @@ impl NntpPool {
             over_limit_episodes.push(SyncMutex::new(OverLimitEpisode::default()));
             blocking_connect_warn_after.push(AtomicU64::new(0));
             blocking_connect_failures_since_warning.push(AtomicU64::new(0));
-            connect_cursors.push(AtomicUsize::new(0));
+            address_plans.push(Arc::new(AddressPlan::new(format!(
+                "{}:{}",
+                spc.server.host, spc.server.port
+            ))));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
             pools.push(Arc::new(SyncMutex::new(ServerPool {
@@ -435,7 +440,7 @@ impl NntpPool {
             over_limit_episodes,
             blocking_connect_warn_after,
             blocking_connect_failures_since_warning,
-            connect_cursors,
+            address_plans,
             auth_admission: (0..server_count)
                 .map(|_| AuthAdmission {
                     state: AtomicU64::new(0),
@@ -446,14 +451,30 @@ impl NntpPool {
         }
     }
 
-    fn next_connect_offset(&self, idx: usize) -> usize {
-        self.connect_cursors[idx].fetch_add(1, Ordering::Relaxed)
+    /// How a new connection to this server picks its address. The server
+    /// counts as idle when the caller's own permit is the only one out.
+    fn address_route(&self, idx: usize) -> AddressRoute {
+        AddressRoute {
+            plan: Arc::clone(&self.address_plans[idx]),
+            server_idle: self.active_connections(idx) <= 1,
+        }
     }
 
-    async fn connect_server_excluding(
+    /// This server's address plan as it stands.
+    pub fn address_plan_snapshot(&self, server: ServerId) -> Option<AddressPlanSnapshot> {
+        self.address_plans.get(server.0).map(|plan| plan.snapshot())
+    }
+
+    /// Book how long an article fetch on a connection to `ip` took.
+    pub fn record_address_body_latency(&self, server: ServerId, ip: IpAddr, elapsed: Duration) {
+        if let Some(plan) = self.address_plans.get(server.0) {
+            plan.record_body_latency(ip, elapsed);
+        }
+    }
+
+    async fn connect_server(
         &self,
         idx: usize,
-        excluded_ips: &[IpAddr],
         initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
         let auth = &self.auth_admission[idx];
@@ -463,9 +484,7 @@ impl NntpPool {
         // Asked only once this connect will actually dial, so a probe slot is
         // never taken by a caller the auth gate turns away.
         let admission = self.admit_fresh_connect(ServerId(idx))?;
-        let result = self
-            .connect_server_excluding_untracked(idx, excluded_ips, initial_group)
-            .await;
+        let result = self.connect_server_untracked(idx, initial_group).await;
         auth.finish(&result);
         // A refusal here is the provider declining a new socket, not answering
         // for the sessions already held, so it arms the holdoff and stays out
@@ -480,20 +499,15 @@ impl NntpPool {
         }
     }
 
-    async fn connect_server_excluding_untracked(
+    async fn connect_server_untracked(
         &self,
         idx: usize,
-        excluded_ips: &[IpAddr],
         initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
-        let offset = self.next_connect_offset(idx);
-        let mut connection = NntpConnection::connect_with_ip_policy_for_group(
-            &self.configs[idx],
-            excluded_ips,
-            offset,
-            initial_group,
-        )
-        .await?;
+        let route = self.address_route(idx);
+        let mut connection =
+            NntpConnection::connect_for_group(&self.configs[idx], Some(&route), initial_group)
+                .await?;
         connection.set_transfer_control(self.transfer_controls[idx].clone());
         Ok(connection)
     }
@@ -691,7 +705,7 @@ impl NntpPool {
                         .admit(demanded)
                         .ok_or(NntpError::PoolExhausted)?;
                     let started = tokio::time::Instant::now();
-                    let connect = self.connect_server_excluding(idx, &[], initial_group);
+                    let connect = self.connect_server(idx, initial_group);
                     let connected = if self.configs[idx].proxy.is_some() {
                         let result = connect.await;
                         if let Some(deadline) = deadline.as_deref_mut() {
@@ -795,7 +809,7 @@ impl NntpPool {
             .try_acquire_replacement()
             .ok_or(NntpError::PoolExhausted)?;
         let started = tokio::time::Instant::now();
-        let connect = self.connect_server_excluding(idx, &[], initial_group);
+        let connect = self.connect_server(idx, initial_group);
         let connected = if self.configs[idx].proxy.is_some() {
             let result = connect.await;
             if let Some(deadline) = deadline {
@@ -1095,6 +1109,9 @@ impl NntpPool {
         episode.probe_started = 0;
         deadline_slot.store(0, Ordering::Release);
         drop(episode);
+        if let Some(plan) = self.address_plans.get(idx) {
+            plan.note_over_limit_cleared();
+        }
         info!(
             server = idx,
             server_address = %self.server_address(server),
@@ -1395,20 +1412,13 @@ impl NntpPool {
         result
     }
 
-    pub fn blocking_connect_plan(
-        &self,
-        server: ServerId,
-        excluded_ips: &[IpAddr],
-    ) -> Result<(ServerConfig, Vec<IpAddr>, usize)> {
+    /// The config and address route a blocking connection to `server` uses.
+    pub fn blocking_connect_plan(&self, server: ServerId) -> Result<(ServerConfig, AddressRoute)> {
         let idx = server.0;
         if idx >= self.configs.len() {
             return Err(NntpError::PoolExhausted);
         }
-        let mut exclusions = excluded_ips.to_vec();
-        exclusions.sort_unstable();
-        exclusions.dedup();
-        let offset = self.next_connect_offset(idx);
-        Ok((self.configs[idx].clone(), exclusions, offset))
+        Ok((self.configs[idx].clone(), self.address_route(idx)))
     }
 
     /// Returns `(available_permits, configured_connections)` for the given server.
@@ -1584,7 +1594,7 @@ mod tests {
     #[test]
     fn cold_auth_admission_fans_out_then_latches_rejection() {
         let pool = NntpPool::new(test_pool_config(4));
-        let attempts = AtomicUsize::new(0);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
         let (started, starts) = std::sync::mpsc::channel();
         let release = (SyncMutex::new(false), std::sync::Condvar::new());
         std::thread::scope(|scope| {
@@ -1675,7 +1685,7 @@ mod tests {
         let mut dials = tokio::task::JoinSet::new();
         for _ in 0..4 {
             let pool = Arc::clone(&pool);
-            dials.spawn(async move { pool.connect_server_excluding(0, &[], None).await });
+            dials.spawn(async move { pool.connect_server(0, None).await });
         }
         async {
             while let Some(result) = dials.join_next().await {
@@ -1684,6 +1694,14 @@ mod tests {
             server.await.unwrap();
         }
         .await;
+        // Four cold dials at once still race the addresses only once; the
+        // rest dial the address that race pinned.
+        let plan = pool.address_plan_snapshot(ServerId(0)).unwrap();
+        assert_eq!(plan.races_won, 1);
+        assert_eq!(
+            plan.pinned.map(|address| address.ip()),
+            Some(std::net::IpAddr::from([127, 0, 0, 1]))
+        );
     }
 
     fn test_pool_config(max_per_server: usize) -> PoolConfig {

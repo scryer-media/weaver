@@ -10,6 +10,7 @@ use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use weaver_yenc::CheckpointPlan;
 
+use crate::address_plan::AddressRoute;
 use crate::codec::{NntpCodec, NntpFrame, StreamChunk};
 use crate::commands::Command;
 use crate::error::{NntpError, Result};
@@ -386,17 +387,18 @@ impl NntpConnection {
 
     /// Connect to an NNTP server, perform TLS negotiation and authentication.
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
-        Self::connect_with_ip_policy_for_group(config, &[], 0, None).await
+        Self::connect_for_group(config, None, None).await
     }
 
     /// Connect and, on servers known to pipeline, select `initial_group` in
     /// the same write as the session setup so a BODY lane starts with no
     /// extra round trip. An unselectable group is not an error here: the
-    /// lane walks its candidate list afterwards.
-    pub(crate) async fn connect_with_ip_policy_for_group(
+    /// lane walks its candidate list afterwards. A direct connection dials
+    /// the address `route`'s plan picks, or the first resolved address that
+    /// answers when there is no route.
+    pub(crate) async fn connect_for_group(
         config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
+        route: Option<&AddressRoute>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT)
@@ -405,7 +407,7 @@ impl NntpConnection {
                 .as_ref()
                 .map_or(Duration::ZERO, |p| p.connect_timeout);
         let result = tokio::time::timeout(connect_timeout, async {
-            Self::connect_inner(config, excluded_ips, address_offset, initial_group).await
+            Self::connect_inner(config, route, initial_group).await
         })
         .await;
 
@@ -417,8 +419,7 @@ impl NntpConnection {
 
     async fn connect_inner(
         config: &ServerConfig,
-        excluded_ips: &[IpAddr],
-        address_offset: usize,
+        route: Option<&AddressRoute>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
         debug!(host = %config.host, port = config.port, tls = config.tls, "connecting to NNTP server");
@@ -434,13 +435,13 @@ impl NntpConnection {
             route_outcome = Some(outcome);
             transport
         } else if let Some(registry) = &config.revocation {
-            let plain = crate::tls::connect_plain_with_ip_policy(
-                &config.host,
-                config.port,
-                excluded_ips,
-                address_offset,
-            )
-            .await?;
+            let (tcp, remote_addr) =
+                crate::tls::dial_direct(&config.host, config.port, route, config.connect_timeout)
+                    .await?;
+            let plain = NntpTransport::Plain {
+                inner: tcp.into(),
+                remote_addr,
+            };
             if let NntpTransport::Plain {
                 inner: crate::route_stream::RouteStream::Tcp(inner),
                 ..
@@ -460,25 +461,26 @@ impl NntpConnection {
             } else {
                 plain
             }
-        } else if config.tls {
-            crate::tls::connect_tls_with_ip_policy(
-                &config.host,
-                config.port,
-                config.tls_ca_cert.as_deref(),
-                config.tls_name_mismatch_certificate_der.as_deref(),
-                config.tls_cipher_preference,
-                excluded_ips,
-                address_offset,
-            )
-            .await?
         } else {
-            crate::tls::connect_plain_with_ip_policy(
-                &config.host,
-                config.port,
-                excluded_ips,
-                address_offset,
-            )
-            .await?
+            let (tcp, remote_addr) =
+                crate::tls::dial_direct(&config.host, config.port, route, config.connect_timeout)
+                    .await?;
+            if config.tls {
+                crate::tls::connect_tls_over(
+                    tcp,
+                    remote_addr,
+                    &config.host,
+                    config.tls_ca_cert.as_deref(),
+                    config.tls_name_mismatch_certificate_der.as_deref(),
+                    config.tls_cipher_preference,
+                )
+                .await?
+            } else {
+                NntpTransport::Plain {
+                    inner: tcp.into(),
+                    remote_addr,
+                }
+            }
         };
 
         let now = Instant::now();

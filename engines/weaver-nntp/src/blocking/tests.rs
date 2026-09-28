@@ -402,8 +402,7 @@ fn test_transfer_control(
 }
 
 fn connect_with_backend(config: &ServerConfig, backend: NntpTlsBackend) -> BlockingNntpConnection {
-    BlockingNntpConnection::connect_with_ip_policy_with_backend(config, &[], 0, Some(backend), None)
-        .unwrap()
+    BlockingNntpConnection::connect_with_backend(config, None, Some(backend), None).unwrap()
 }
 
 /// A plain server that answers each AUTHINFO line as it arrives, then
@@ -557,8 +556,7 @@ fn probe_server_lane(config: &ServerConfig, groups: &[&str]) -> BlockingBodyLane
         StableServerId(9001),
         None,
         config,
-        &[],
-        0,
+        None,
         &groups,
         Duration::from_secs(30),
         crate::pool::BlockingConnectionPermit::for_tests(),
@@ -647,7 +645,7 @@ fn a_probe_batch_heads_only_the_articles_stat_missed() {
     let config = probe_config(port);
     crate::server_caps::forget(&config.host, config.port);
 
-    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    let mut conn = BlockingNntpConnection::connect(&config).unwrap();
     let verdicts = conn
         .probe_exists(&[
             "<held@silver.horizon>".to_string(),
@@ -684,7 +682,7 @@ fn a_server_without_stat_is_probed_with_head_and_stays_healthy() {
     let config = probe_config(port);
     crate::server_caps::forget(&config.host, config.port);
 
-    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    let mut conn = BlockingNntpConnection::connect(&config).unwrap();
     let verdicts = conn
         .probe_exists(&[
             "<held@silver.horizon>".to_string(),
@@ -730,7 +728,7 @@ fn a_server_without_head_settles_on_the_stat_verdict() {
     let config = probe_config(port);
     crate::server_caps::forget(&config.host, config.port);
 
-    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    let mut conn = BlockingNntpConnection::connect(&config).unwrap();
     let verdicts = conn
         .probe_exists(&[
             "<held@silver.horizon>".to_string(),
@@ -763,10 +761,9 @@ fn blocking_known_pipelining_servers_authenticate_then_get_the_group_in_one_writ
     );
     crate::server_caps::note_group_required("127.0.0.1", port);
 
-    let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
+    let mut conn = BlockingNntpConnection::connect_for_group(
         &blocking_pipelined_setup_config(port),
-        &[],
-        0,
+        None,
         Some("alt.test"),
     )
     .unwrap();
@@ -792,10 +789,9 @@ fn blocking_unproven_server_gets_no_mode_reader_and_no_group() {
         b"430 no article\r\n",
     );
 
-    let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
+    let mut conn = BlockingNntpConnection::connect_for_group(
         &blocking_pipelined_setup_config(port),
-        &[],
-        0,
+        None,
         Some("alt.test"),
     )
     .unwrap();
@@ -827,10 +823,9 @@ fn blocking_500_after_setup_leaves_the_connection_alone() {
         b"500 unknown command\r\n",
     );
 
-    let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
+    let mut conn = BlockingNntpConnection::connect_for_group(
         &blocking_pipelined_setup_config(port),
-        &[],
-        0,
+        None,
         None,
     )
     .unwrap();
@@ -864,10 +859,9 @@ fn blocking_412_after_setup_records_the_group_requirement() {
         b"412 no newsgroup selected\r\n",
     );
 
-    let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
+    let mut conn = BlockingNntpConnection::connect_for_group(
         &blocking_pipelined_setup_config(port),
-        &[],
-        0,
+        None,
         Some("alt.test"),
     )
     .unwrap();
@@ -903,11 +897,7 @@ fn blocking_pipelined_setup_maps_a_rejected_password() {
         b"",
     );
 
-    let result = BlockingNntpConnection::connect_with_ip_policy(
-        &blocking_pipelined_setup_config(port),
-        &[],
-        0,
-    );
+    let result = BlockingNntpConnection::connect(&blocking_pipelined_setup_config(port));
 
     let Err(error) = result else {
         panic!("expected a rejected password");
@@ -1180,7 +1170,7 @@ fn assert_blocking_known_pipelining_skips_capabilities_probe(supports_pipelining
         pipelining: crate::connection::PipeliningCapability::Known(supports_pipelining),
         ..Default::default()
     };
-    let conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    let conn = BlockingNntpConnection::connect(&config).unwrap();
     assert_eq!(
         conn.capabilities().supports_pipelining(),
         supports_pipelining
@@ -1264,10 +1254,9 @@ fn blocking_starttls_refusal_fails_the_connect() {
         command_timeout: Duration::from_secs(5),
         ..ServerConfig::default()
     };
-    let Err(error) = BlockingNntpConnection::connect_with_ip_policy_with_backend(
+    let Err(error) = BlockingNntpConnection::connect_with_backend(
         &config,
-        &[],
-        0,
+        None,
         Some(NntpTlsBackend::ManualRustls),
         None,
     ) else {
@@ -1739,8 +1728,7 @@ fn test_body_lane(config: &ServerConfig) -> BlockingBodyLane {
         StableServerId(9001),
         None,
         config,
-        &[],
-        0,
+        None,
         &["alt.test".to_string()],
         Duration::from_secs(30),
         crate::pool::BlockingConnectionPermit::for_tests(),
@@ -2010,7 +1998,7 @@ fn a_480_mid_batch_is_a_session_expiry_not_an_auth_failure() {
     config.command_timeout = Duration::from_secs(5);
     crate::server_caps::forget(&config.host, config.port);
 
-    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    let mut conn = BlockingNntpConnection::connect(&config).unwrap();
     conn.authenticate("user", "pass").unwrap();
     conn.write_body_request("<first@silver.horizon>").unwrap();
     conn.write_body_request("<second@silver.horizon>").unwrap();

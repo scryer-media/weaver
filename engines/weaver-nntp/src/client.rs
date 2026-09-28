@@ -2347,6 +2347,23 @@ impl NntpClient {
         &self.pool
     }
 
+    /// Feed the fetch times of successful attempts to the address plans of
+    /// the servers that served them.
+    pub fn record_fetch_attempts(&self, attempts: &[FetchAttemptTrace]) {
+        for attempt in attempts {
+            if attempt.outcome != FetchAttemptOutcome::Success {
+                continue;
+            }
+            if let Some(ip) = attempt.remote_ip {
+                self.pool.record_address_body_latency(
+                    ServerId(attempt.server_idx),
+                    ip,
+                    attempt.elapsed,
+                );
+            }
+        }
+    }
+
     pub fn try_acquire_blocking_body_lane(
         &self,
         groups: &[String],
@@ -2433,9 +2450,9 @@ impl NntpClient {
                     continue;
                 }
             };
-            let (config, excluded_ips, address_offset) = self
+            let (config, route) = self
                 .pool
-                .blocking_connect_plan(server, &[])
+                .blocking_connect_plan(server)
                 .map_err(BlockingBodyLaneAcquireError::Other)?;
             if !supports_blocking_body_lane(&config) {
                 continue;
@@ -2460,8 +2477,7 @@ impl NntpClient {
                     self.pool.stable_server_id(server).unwrap_or_default(),
                     self.pool.server_transfer_control(server),
                     &config,
-                    &excluded_ips,
-                    address_offset,
+                    Some(&route),
                     groups,
                     self.soft_timeout,
                     permit,
@@ -2564,7 +2580,7 @@ impl NntpClient {
             if self.pool.server_load(server.0).1 == 0 {
                 return false;
             }
-            let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
+            let Ok((config, _)) = self.pool.blocking_connect_plan(server) else {
                 return false;
             };
             supports_blocking_body_lane(&config)
