@@ -149,19 +149,19 @@ fn the_first_address_to_answer_is_pinned_and_later_connects_dial_it() {
 }
 
 #[test]
-fn addresses_beyond_the_race_limit_remain_available_for_fallback() {
-    let addresses: Vec<_> = (1..=MAX_RACE_CANDIDATES + 1)
-        .map(|index| addr(index as u8))
-        .collect();
+fn every_resolved_address_is_raced_however_many_there_are() {
+    let addresses: Vec<_> = (1..=40).map(addr).collect();
+    let (answers, refusing) = addresses.split_last().unwrap();
     let dialer = ScriptedDialer::new(&addresses);
-    for &address in addresses.iter().take(MAX_RACE_CANDIDATES) {
+    for &address in refusing {
         dialer.answer(address, Answer::Refuse);
     }
     let plan = plan();
 
     let (_, connected) = plan.connect(&dialer).unwrap();
 
-    assert_eq!(connected, addresses[MAX_RACE_CANDIDATES]);
+    assert_eq!(connected, *answers);
+    settle_all(&dialer);
     let dialled = dialer.take_dialled();
     assert_eq!(dialled.len(), addresses.len());
     assert!(addresses.iter().all(|address| dialled.contains(address)));
@@ -843,38 +843,6 @@ fn a_race_loser_that_timed_out_is_not_booked_as_a_failure() {
     let (_, connected) = plan.connect(&dialer).unwrap();
     assert_eq!(connected, slow);
     assert_eq!(dialer.take_dialled(), vec![winner, slow]);
-}
-
-#[test]
-fn a_timeout_beyond_the_race_limit_that_lost_is_not_booked_as_a_failure() {
-    let addresses: Vec<_> = (1..=MAX_RACE_CANDIDATES + 2)
-        .map(|index| addr(index as u8))
-        .collect();
-    let (slow, winner) = (
-        addresses[MAX_RACE_CANDIDATES],
-        addresses[MAX_RACE_CANDIDATES + 1],
-    );
-    let dialer = ScriptedDialer::new(&addresses);
-    for &address in addresses.iter().take(MAX_RACE_CANDIDATES) {
-        dialer.answer(address, Answer::Refuse);
-    }
-    dialer.answer(slow, Answer::Fail(io::ErrorKind::TimedOut));
-    let plan = plan();
-
-    let (_, pinned) = plan.connect(&dialer).unwrap();
-    assert_eq!(pinned, winner);
-    settle_all(&dialer);
-
-    let snapshot = plan.snapshot();
-    let failures = |address: SocketAddr| {
-        snapshot
-            .addresses
-            .iter()
-            .find(|candidate| candidate.address == address)
-            .map(|candidate| candidate.consecutive_failures)
-    };
-    assert_eq!(failures(slow), Some(0));
-    assert_eq!(failures(addresses[0]), Some(1));
 }
 
 #[test]
