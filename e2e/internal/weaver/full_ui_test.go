@@ -944,3 +944,40 @@ func TestUnrecordedProfileFallsThroughToRecompute(t *testing.T) {
 		t.Fatalf("image env must be set as a pair, got primary=%v backup=%v", primary, backup)
 	}
 }
+
+func TestFullPhaseJobsBoundsTheRequestedWidth(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		phaseCount int
+		want       int
+	}{
+		{name: "default", value: "", phaseCount: 8, want: defaultFullPhaseJobs},
+		{name: "fewer phases than the default", value: "", phaseCount: 2, want: 2},
+		{name: "operator width", value: "6", phaseCount: 8, want: 6},
+		{name: "width above the phase count", value: "20", phaseCount: 8, want: 8},
+		{name: "width below one", value: "0", phaseCount: 8, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("E2E_FULL_PHASE_JOBS", tt.value)
+			if got := fullPhaseJobs(tt.phaseCount); got != tt.want {
+				t.Fatalf("fullPhaseJobs(%d) = %d, want %d", tt.phaseCount, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFullRunNarrowsTheReleaseGateUnlessTheOperatorSetsAWidth(t *testing.T) {
+	phase := &fullPhaseContext{Name: "Release Gate", Command: "release-gate", RunDir: t.TempDir()}
+
+	t.Setenv("E2E_WEAVER_RELEASE_GATE_JOBS", "")
+	if got, want := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"], strconv.Itoa(fullRunReleaseGateJobs); got != want {
+		t.Fatalf("release-gate jobs = %q, want %q", got, want)
+	}
+
+	t.Setenv("E2E_WEAVER_RELEASE_GATE_JOBS", "12")
+	if got, ok := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"]; ok {
+		t.Fatalf("release-gate jobs = %q, want the operator's width left in place", got)
+	}
+}

@@ -1121,6 +1121,26 @@ func newFullPreseedBootstrap(tempRoot, profile string, source *fullPhaseContext,
 	return bootstrap, nil
 }
 
+const (
+	defaultFullPhaseJobs = 4
+	// A full run's release gate shares the engine with the other phases, so
+	// it runs narrower than a standalone gate unless the operator sets a width.
+	fullRunReleaseGateJobs = 4
+)
+
+// fullPhaseJobs is how many phases of a full run execute at once, set with
+// E2E_FULL_PHASE_JOBS.
+func fullPhaseJobs(phaseCount int) int {
+	requested := envInt("E2E_FULL_PHASE_JOBS", defaultFullPhaseJobs)
+	if requested > phaseCount {
+		requested = phaseCount
+	}
+	if requested < 1 {
+		requested = 1
+	}
+	return requested
+}
+
 func runFullPipeline(
 	ctx context.Context,
 	phases []*fullPhaseContext,
@@ -1131,11 +1151,25 @@ func runFullPipeline(
 	seedResults := make(chan childRunResult, len(phases))
 	phaseResults := make(chan childRunResult, len(phases))
 
+	// Every phase brings up its own stack and drives it hard, so phases share
+	// a fixed number of slots instead of all starting together. A phase holds
+	// its slot from seeding through its own cleanup.
+	slots := make(chan struct{}, fullPhaseJobs(len(phases)))
+
 	var wg sync.WaitGroup
 	for _, phase := range phases {
 		wg.Add(1)
 		go func(phase *fullPhaseContext) {
 			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				canceledErr := fmt.Errorf("canceled before the phase started: %w", ctx.Err())
+				phaseResults <- recordPhaseSetupFailure(phase, phase.Command, time.Now(), canceledErr)
+				dashboard.markPhaseResult(phase.Name, "fail")
+				return
+			}
 			defer func() {
 				if !keepStacks {
 					if err := cleanupFullPhaseContext(phase); err != nil {
@@ -1431,6 +1465,9 @@ func (p *fullPhaseContext) env() map[string]string {
 	}
 	if p.Command == "release-gate" {
 		env["E2E_WEAVER_RELEASE_GATE_ROOT"] = filepath.Join(p.RunDir, "release-gate")
+		if strings.TrimSpace(os.Getenv("E2E_WEAVER_RELEASE_GATE_JOBS")) == "" {
+			env["E2E_WEAVER_RELEASE_GATE_JOBS"] = strconv.Itoa(fullRunReleaseGateJobs)
+		}
 	}
 	if p.Command == "restart-all" {
 		env["E2E_SEED_RETRIES"] = "5"

@@ -422,7 +422,8 @@ Environment:
   E2E_RUNTIME_PORTS_FILE  Path to the runtime port state file
   E2E_RUN_DIR          Path to local temp state for managed weaver runs
   E2E_WEAVER_DATASTORE Weaver datastore for managed local runs: sqlite|postgres (default: sqlite)
-  E2E_WEAVER_RELEASE_GATE_JOBS Parallel product-flow workers (default: 8, max: 16)
+  E2E_WEAVER_RELEASE_GATE_JOBS Parallel product-flow workers (default: 8, or 4 inside a full run; max: 16)
+  E2E_FULL_PHASE_JOBS  Phases a full run executes at once (default: 4)
   E2E_WEAVER_RELEASE_GATE_ROOT Stable root for release-gate runs and latest pointer
   E2E_WEAVER_PLAYWRIGHT_IMAGE Weaver-only Playwright image override
   E2E_VERBOSE          Stream external command output instead of summarizing it
