@@ -3597,6 +3597,194 @@ async fn a_damage_report_after_the_chase_was_reaped_still_counts() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
+/// Put a Damaged grid verdict on the first recovery block of one part of the
+/// split 7z fixture, the way the article path would after a decoded range's
+/// CRC disagreed with what the recovery set describes. The rest of the part
+/// verifies.
+fn note_grid_damage_on_split_7z_part(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    set_name: &str,
+    file_index: u32,
+) -> NzbFileId {
+    let bytes = sevenz_fixture_bytes(set_name)[file_index as usize]
+        .1
+        .clone();
+    let file_id = NzbFileId { job_id, file_index };
+    let slice_size = 65_536usize;
+    let plan = pipeline.par2_checkpoint_plan(job_id);
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let end = (offset + slice_size).min(bytes.len());
+        let chunk = &bytes[offset..end];
+        let mut crc32 = par2_rs::checksum::crc32(chunk);
+        if offset == 0 {
+            crc32 = !crc32;
+        }
+        pipeline.note_block_crc_segments_for_plan(
+            file_id,
+            &plan,
+            offset as u64,
+            chunk.len() as u64,
+            crc32,
+            true,
+            false,
+            &[weaver_yenc::Segment {
+                file_offset: offset as u64,
+                len: chunk.len() as u64,
+                crc32,
+            }],
+        );
+        offset = end;
+    }
+    pipeline
+        .block_crcs
+        .note_file_len(file_id, bytes.len() as u64);
+    assert_eq!(
+        pipeline.in_stream_chase_evidence(file_id),
+        Some((Some(0), 0)),
+        "non-vacuity: the recovery data has to report damage at byte zero"
+    );
+    file_id
+}
+
+/// Damage the recovery data reported against a chased part still forces the
+/// authoritative PAR2 pass after the chase that was gated on it is demoted.
+///
+/// The gate lives on the worker, and a demoted worker takes it with it. The
+/// bytes it was gated on are just as wrong for the conventional extraction that
+/// follows, so the damage has to be on record against the set itself or the
+/// strong-decode claim settles it as clean.
+#[tokio::test]
+async fn damage_reported_against_a_chased_part_outlives_the_demoted_chase() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42006);
+    let (mut pipeline, set_name) = split_7z_job_with_par2(&temp_dir, job_id, false).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    let file_id = note_grid_damage_on_split_7z_part(&mut pipeline, job_id, set_name, 0);
+
+    pipeline.publish_completed_part_to_chase(job_id, file_id);
+    pipeline.direct_unpack_abort_set(
+        job_id,
+        set_name,
+        "test demotes the gated chase",
+        crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+        crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
+    );
+    assert!(
+        pipeline.direct_unpack_gated_sets(job_id).is_empty(),
+        "non-vacuity: the demoted chase no longer carries a gate"
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    settle_par2_analysis_work(&mut pipeline).await;
+
+    assert!(
+        drain_job_verification_started(&mut verify_events, job_id) >= 1,
+        "reported damage must force the authoritative pass whatever became of the chase"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// A chased part whose damage is reported after its chase was reaped, with no
+/// other chase armed anywhere, still has the report put on the reaped outcome.
+#[tokio::test]
+async fn a_damaged_part_reaches_a_reaped_chase_with_nothing_else_armed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42007);
+    let (mut pipeline, set_name) = split_7z_job_with_par2(&temp_dir, job_id, false).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    reap_until_outcome(&mut pipeline, job_id, set_name).await;
+    assert!(
+        pipeline
+            .direct_unpack
+            .armed_coverage(job_id, set_name)
+            .is_none(),
+        "non-vacuity: the reaped chase was the only one"
+    );
+    assert!(pipeline.direct_unpack_gated_sets(job_id).is_empty());
+    let file_id = note_grid_damage_on_split_7z_part(&mut pipeline, job_id, set_name, 0);
+
+    pipeline.publish_completed_part_to_chase(job_id, file_id);
+
+    assert!(
+        pipeline
+            .direct_unpack
+            .outcome(job_id, set_name)
+            .expect("reaped into an outcome")
+            .damage_reported,
+        "the report reaches the reaped outcome"
+    );
+    assert_eq!(
+        pipeline.direct_unpack_gated_sets(job_id),
+        vec![set_name.to_string()]
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    settle_par2_analysis_work(&mut pipeline).await;
+
+    assert!(
+        drain_job_verification_started(&mut verify_events, job_id) >= 1,
+        "the authoritative pass must run for a set reported damaged"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// A damaged-path PAR2 analysis that found damage is read even when the gate
+/// that asked for it is gone by the time it lands.
+///
+/// The gated chase forces the analysis; the chase is demoted while the
+/// analysis runs, taking its gate with it. The completion check the verdict
+/// re-arms must not settle the set on the strong-decode claim over a verdict
+/// already in hand that calls it damaged.
+#[tokio::test]
+async fn a_parked_damaged_verdict_outlives_the_gate_that_asked_for_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42008);
+    let (mut pipeline, set_name) =
+        split_7z_job_with_par2_as_posted(&temp_dir, job_id, true, true).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    let set_id = pipeline
+        .par2_served_set_id(job_id)
+        .expect("a served recovery set");
+
+    pipeline.check_job_completion(job_id).await;
+    assert!(
+        pipeline.par2_analysis_in_flight.contains_key(&job_id),
+        "non-vacuity: the gate forced the analysis"
+    );
+    pipeline.direct_unpack_abort_set(
+        job_id,
+        set_name,
+        "test demotes the gated chase while its analysis runs",
+        crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+        crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
+    );
+    assert!(
+        pipeline.direct_unpack_gated_sets(job_id).is_empty(),
+        "non-vacuity: the gate is gone before the verdict lands"
+    );
+
+    settle_par2_analysis_work(&mut pipeline).await;
+
+    assert!(drain_job_verification_started(&mut verify_events, job_id) >= 1);
+    assert!(
+        !pipeline.par2_analysis_results.contains_key(&job_id),
+        "the parked verdict is read, not left behind"
+    );
+    assert!(
+        !pipeline
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.set_runtime(set_id))
+            .is_some_and(|set_runtime| set_runtime.settled_via_strong_decode),
+        "a set the verdict calls damaged is never settled on the strong-decode claim"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
 /// A chase gated on recovery-reported damage forces the authoritative PAR2
 /// pass, over the strong-decode claim that would otherwise skip it.
 ///

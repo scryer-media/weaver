@@ -2000,6 +2000,97 @@ impl Pipeline {
             })
     }
 
+    /// Reopen the strong-decode claim a failed full-set extraction has just
+    /// contradicted, so the recovery set rules on the bytes after all.
+    ///
+    /// A recovery set settled on that claim was never read: it stood on the
+    /// promise that extracting the archive would prove its bytes. An
+    /// extraction that fails breaks the promise, and until the authoritative
+    /// pass has read the set nothing says whether the bytes are wrong or
+    /// something else is. The formats reaching this have no finer error
+    /// vocabulary than a failed read of their stream; budget and path
+    /// refusals are ruled terminal before this is asked.
+    ///
+    /// Once per recovery set. The authoritative pass settles the set on its
+    /// own verdict, never on the claim again, so an extraction that fails after
+    /// it finds no claim left to reopen and the failure is final. 7z and RAR
+    /// sets are left to the routes that already classify their failures —
+    /// a 7z data error reopens the verdict from the completion check, and a
+    /// password or an unsupported method is not something repair can change.
+    pub(in crate::pipeline) fn reopen_strong_decode_claim_after_failed_extraction(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> bool {
+        if self.par2_bypassed.contains(&job_id) {
+            return false;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(topology) = state.assembly.archive_topology_for(set_name) else {
+            return false;
+        };
+        if matches!(
+            topology.archive_type,
+            crate::jobs::assembly::ArchiveType::SevenZip | crate::jobs::assembly::ArchiveType::Rar
+        ) {
+            return false;
+        }
+        let parts: Vec<NzbFileId> = state
+            .assembly
+            .files()
+            .filter(|file| {
+                topology
+                    .volume_map
+                    .contains_key(&self.current_filename_for_file(job_id, file))
+            })
+            .map(|file| file.file_id())
+            .collect();
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return false;
+        };
+        let claims: Vec<par2_rs::RecoverySetId> = runtime
+            .sets
+            .iter()
+            .filter(|(set_id, set)| {
+                set.settled
+                    && set.settled_via_strong_decode
+                    && set.failure.is_none()
+                    && parts.iter().any(|file_id| {
+                        self.resolve_par2_file_binding_in_set(*file_id, **set_id)
+                            .is_some()
+                    })
+            })
+            .map(|(set_id, _)| *set_id)
+            .collect();
+        if claims.is_empty() {
+            return false;
+        }
+        let runtime = self
+            .par2_runtime
+            .get_mut(&job_id)
+            .expect("the claims were read from this job's runtime");
+        for set_id in &claims {
+            let set = runtime
+                .sets
+                .get_mut(set_id)
+                .expect("the claims were read from this runtime");
+            set.settled = false;
+            set.settled_via_strong_decode = false;
+            set.post_verdict_reconcile_attempts = 0;
+        }
+        self.par2_verified.remove(&job_id);
+        info!(
+            job_id = job_id.0,
+            set_name,
+            recovery_sets = claims.len(),
+            "extraction failed on a set settled by the strong-decode claim — the recovery set \
+             rules on its bytes before the failure stands"
+        );
+        true
+    }
+
     /// One 7z set's half of [`Self::job_has_sevenz_set_waiting_for_absent_volumes`]:
     /// a gap in its numbering, or a part the recovery set describes that
     /// neither the topology nor the working directory has.

@@ -2665,12 +2665,20 @@ impl Pipeline {
     /// extraction ready: the completion check reads the gate from armed sets
     /// only, and a gate it sees is what turns a clean strong-decode claim into
     /// the authoritative PAR2 pass that repairs the part and resumes the chase.
+    ///
+    /// The damage is also put on record against the set itself, where the
+    /// completion check finds it whatever becomes of the chase: a worker that
+    /// fails, is reaped or is demoted takes its gate with it, and the bytes it
+    /// was gated on are just as wrong for the conventional extraction that
+    /// follows. So a part of a chased set is published even when nothing is
+    /// armed any more.
     pub(in crate::pipeline) fn publish_completed_part_to_chase(
         &mut self,
         job_id: JobId,
         file_id: crate::jobs::ids::NzbFileId,
     ) {
-        if self.direct_unpack.idle() {
+        if self.direct_unpack.idle() && !self.direct_unpack.watermark_targets.contains_key(&job_id)
+        {
             return;
         }
         let Some(state) = self.jobs.get(&job_id) else {
@@ -2686,10 +2694,20 @@ impl Pipeline {
         let received = file_asm.received_bytes();
         self.direct_unpack_note_commit(file_id, &filename, received, true);
         self.refresh_chased_part_by_filename(file_id, &filename, false);
+        let Some(set_name) = self
+            .direct_unpack
+            .watermark_targets
+            .get(&job_id)
+            .and_then(|targets| targets.get(&filename))
+            .map(|(set_name, _)| set_name.clone())
+        else {
+            return;
+        };
         let damaged = self
             .in_stream_chase_evidence(file_id)
             .is_some_and(|(floor, _)| floor.is_some());
         if damaged {
+            self.note_known_archive_set_damage(job_id, &set_name);
             self.note_damage_on_reaped_chase(job_id, &filename);
         }
     }
