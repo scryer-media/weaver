@@ -644,6 +644,25 @@ impl Pipeline {
                             status_allows_dispatch,
                             "dispatch idle: parked recovery behind a non-dispatching phase"
                         );
+                    } else if !status_allows_dispatch
+                        || (s.download_queue.is_empty() && s.recovery_queue.is_empty())
+                    {
+                        // A job with nothing queued to fetch — its download is
+                        // done and it is verifying, extracting or moving its
+                        // output, or its last articles are still settling — is
+                        // not waiting on dispatch, and neither is a phase that
+                        // dispatches nothing. Only queued work that dispatch
+                        // will not hand out is a stall.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch idle: nothing for dispatch to hand out"
+                        );
                     } else {
                         ineligible_jobs.push((
                             *jid,
