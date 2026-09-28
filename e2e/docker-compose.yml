@@ -264,6 +264,8 @@ services:
   # in this repository and mounts only paths under this directory, so a run is
   # reproducible from a clean checkout.
   weaver-playwright:
+    # Runs Chromium; the Podman overlay keeps its interface address stable.
+    x-e2e-browser: true
     image: ${E2E_WEAVER_PLAYWRIGHT_IMAGE:-weaver-e2e-playwright:local}
     pull_policy: never
     build:

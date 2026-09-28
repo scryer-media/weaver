@@ -408,3 +408,61 @@ func TestPodmanOverlayPinsPUIDOwnedVolumeOwnership(t *testing.T) {
 		t.Fatalf("docker got an overlay:\n%s", yaml)
 	}
 }
+
+const browserCompose = `services:
+  browser:
+    x-e2e-browser: true
+    image: browser
+  fixture:
+    image: browser
+  quoted:
+    x-e2e-browser: "true"
+  other:
+    x-e2e-browser: false
+`
+
+func TestParseComposeLayoutFindsBrowserServices(t *testing.T) {
+	layout := ParseComposeLayout([]byte(browserCompose))
+	if want := []string{"browser", "quoted"}; !reflect.DeepEqual(layout.BrowserServices, want) {
+		t.Fatalf("browser services = %v, want %v", layout.BrowserServices, want)
+	}
+}
+
+func TestHarnessComposeFileMarksPlaywrightAsBrowser(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "docker-compose.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout := ParseComposeLayout(content)
+	if want := []string{"weaver-playwright"}; !reflect.DeepEqual(layout.BrowserServices, want) {
+		t.Fatalf("browser services = %v, want %v", layout.BrowserServices, want)
+	}
+}
+
+func TestPodmanOverlayDisablesIPv6OnBrowserInterfaces(t *testing.T) {
+	const sysctl = "    sysctls:\n      net.ipv6.conf.eth0.disable_ipv6: \"1\"\n"
+	engine := &Engine{Kind: Podman, Binary: "podman", ComposeProvider: ProviderDockerCompose}
+	yaml := engine.OverlayYAML(ParseComposeLayout([]byte(browserCompose)), nil)
+	for _, service := range []string{"browser", "quoted"} {
+		if !strings.Contains(yaml, "services:\n") || !strings.Contains(yaml, "  "+service+":\n"+sysctl) {
+			t.Fatalf("browser service %s keeps IPv6:\n%s", service, yaml)
+		}
+	}
+	for _, service := range []string{"fixture", "other"} {
+		if strings.Contains(yaml, "  "+service+":") {
+			t.Fatalf("overlay changed non-browser service %s:\n%s", service, yaml)
+		}
+	}
+
+	selinux := &Engine{Kind: Podman, Binary: "podman", ComposeProvider: ProviderDockerCompose, SELinux: true}
+	yaml = selinux.OverlayYAML(ParseComposeLayout([]byte(browserCompose)), nil)
+	if strings.Count(yaml, "services:\n") != 1 || strings.Count(yaml, "  browser:\n") != 1 ||
+		!strings.Contains(yaml, "  browser:\n    security_opt:\n      - label=disable\n"+sysctl) {
+		t.Fatalf("SELinux overlay does not merge the browser service settings:\n%s", yaml)
+	}
+
+	docker := &Engine{Kind: Docker, Binary: "docker"}
+	if yaml := docker.OverlayYAML(ParseComposeLayout([]byte(browserCompose)), nil); yaml != "" {
+		t.Fatalf("docker got an overlay:\n%s", yaml)
+	}
+}
