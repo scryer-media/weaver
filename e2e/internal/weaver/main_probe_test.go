@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 func TestDetectE2EDirRecognizesCanonicalCLIs(t *testing.T) {
@@ -43,6 +45,24 @@ func TestDockerHostPortBindCollisionRecognition(t *testing.T) {
 	}
 	if isDockerHostPortBindCollision(fmt.Errorf("docker compose up: invalid compose file")) {
 		t.Fatal("non-bind Docker error must not be retried")
+	}
+}
+
+func TestPodmanHostPortBindCollisionRecognition(t *testing.T) {
+	for _, message := range []string{
+		"docker compose up: exit status 1\n\nLast command output:\nError response from daemon: cannot bind tcp port :60868: address already in use",
+		"rootlessport listen tcp 0.0.0.0:55482: bind: address already in use",
+		"cannot listen on the TCP port: listen tcp4 :55482: bind: address already in use",
+	} {
+		if !isHostPortBindCollisionMessage(message, containerengine.Podman) {
+			t.Fatalf("expected Podman host-port bind collision to be retryable: %q", message)
+		}
+	}
+	if isHostPortBindCollisionMessage("cannot bind tcp port :60868: address already in use", containerengine.Docker) {
+		t.Fatal("a Podman-only message must not be retried under Docker")
+	}
+	if isHostPortBindCollisionMessage("cannot bind tcp port :60868: permission denied", containerengine.Podman) {
+		t.Fatal("a bind failure that is not a collision must not be retried")
 	}
 }
 

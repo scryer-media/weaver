@@ -693,17 +693,28 @@ func isDockerHostPortBindCollision(err error) bool {
 	if err == nil {
 		return false
 	}
-	message := strings.ToLower(err.Error())
+	return isHostPortBindCollisionMessage(err.Error(), containerengine.Current().Kind)
+}
+
+func isHostPortBindCollisionMessage(message string, kind containerengine.Kind) bool {
+	message = strings.ToLower(message)
 	if !strings.Contains(message, "address already in use") {
 		return false
 	}
 	if strings.Contains(message, "failed to bind host port") {
 		return true
 	}
-	// Podman reports the same collision from its rootless port forwarder or,
-	// rootful, from its own listener.
-	return containerengine.Current().Kind == containerengine.Podman &&
-		(strings.Contains(message, "rootlessport") || strings.Contains(message, "cannot listen on the tcp port"))
+	if kind != containerengine.Podman {
+		return false
+	}
+	// Podman reports the same collision from its rootless port forwarder,
+	// from its own listener, or from its machine's port binding.
+	for _, marker := range []string{"rootlessport", "cannot listen on the tcp port", "cannot bind tcp port"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateRuntimePortState(state runtimePortState) error {
