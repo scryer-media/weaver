@@ -56,9 +56,16 @@ export function offersProfileChoice(settings: HardwareProfileSettings | null | u
   return (settings?.available.length ?? 0) > 1;
 }
 
-/** The card the picker should open on: the operator's choice, else the recommendation. */
+/**
+ * The card the picker should open on: the operator's choice, else the
+ * recommendation. A choice this machine no longer offers is not what runs, so
+ * it opens on the recommendation too.
+ */
 export function initialProfile(settings: HardwareProfileSettings): HardwareProfileName {
-  return settings.selected ?? settings.recommended;
+  const selected = settings.selected;
+  return selected !== null && settings.available.includes(selected)
+    ? selected
+    : settings.recommended;
 }
 
 export function profileName(t: Translate, profile: HardwareProfileName): string {

@@ -254,6 +254,48 @@ impl Pipeline {
         shortfall <= ceiling.saturating_sub(known_capacity)
     }
 
+    /// Books each lost file's charge against a set that describes it.
+    ///
+    /// `charges` holds, for every lost file some parsed set describes, the
+    /// charge each describing set would take for it. A file only one set
+    /// describes is that set's to repair and is booked there first. A file
+    /// several sets describe can be repaired from any of them, so it goes to
+    /// whichever still has the most capacity left once the files booked
+    /// before it are counted. That is a greedy assignment, not an exact one:
+    /// it never charges a shared file to a set that has nothing left while
+    /// another describing set does, but it does not search every split.
+    fn book_needs_by_set(
+        sets: &[SetRecoveryCapacity],
+        charges: &[Vec<(par2_rs::RecoverySetId, u64)>],
+    ) -> std::collections::HashMap<par2_rs::RecoverySetId, u64> {
+        let mut needed_by_set = std::collections::HashMap::new();
+        for describing in charges.iter().filter(|describing| describing.len() == 1) {
+            let (set_id, charge) = describing[0];
+            let booked = needed_by_set.entry(set_id).or_insert(0u64);
+            *booked = booked.saturating_add(charge);
+        }
+        let capacity_of = |set_id: par2_rs::RecoverySetId| {
+            sets.iter()
+                .find(|set| set.set_id == set_id)
+                .map_or(0, |set| set.capacity_bytes)
+        };
+        for describing in charges.iter().filter(|describing| describing.len() > 1) {
+            // The first of the sets with the most left, so a tie goes the
+            // same way every time.
+            let Some(&(set_id, charge)) = describing.iter().min_by_key(|(set_id, _)| {
+                std::cmp::Reverse(
+                    capacity_of(*set_id)
+                        .saturating_sub(needed_by_set.get(set_id).copied().unwrap_or_default()),
+                )
+            }) else {
+                continue;
+            };
+            let booked = needed_by_set.entry(set_id).or_insert(0u64);
+            *booked = booked.saturating_add(charge);
+        }
+        needed_by_set
+    }
+
     /// Whether this job's declared recovery is still *obtainable*, and how many
     /// bytes of it there could be.
     ///
@@ -487,8 +529,10 @@ impl Pipeline {
             < failed_bytes
     }
 
-    /// Known damaged files each require at least one slice from their own set.
-    /// A probe projection has no set attribution, so only booked failures can
+    /// Known damaged files each require what they lost, and at least one
+    /// slice, from their own set. The loss is counted in declared bytes, the
+    /// same measure the job's failed bytes are compared to the ceiling in. A
+    /// probe projection has no set attribution, so only booked failures can
     /// prove that one set is already beyond repair.
     fn known_health_losses_fit_recovery_sets(&self, job_id: JobId, ceiling: Option<u64>) -> bool {
         let Some(ceiling) = ceiling else {
@@ -499,26 +543,54 @@ impl Pipeline {
         };
         let sets = self.par2_set_recovery_capacities(job_id);
         // This runs on every article lost while the failure is deferred. A
-        // set with a slice for every damaged file is covered whichever of
-        // them it describes, and that is known without matching any names.
+        // set that could take every lost byte and a slice for every damaged
+        // file is covered whichever of them it describes, and that is known
+        // without matching any names.
         let damaged_files = state.health_failing_files.len() as u64;
-        if sets
-            .iter()
-            .all(|set| damaged_files.saturating_mul(set.slice_size) <= set.capacity_bytes)
-        {
+        if sets.iter().all(|set| {
+            damaged_files
+                .saturating_mul(set.slice_size)
+                .saturating_add(state.failed_bytes)
+                <= set.capacity_bytes
+        }) {
             return true;
         }
-        let mut needed_by_set = std::collections::HashMap::new();
+        let mut charges = Vec::new();
         for &file_index in &state.health_failing_files {
             let file_id = NzbFileId { job_id, file_index };
-            if let Some(set) = sets.iter().find(|set| {
-                self.resolve_par2_file_binding_in_set(file_id, set.set_id)
-                    .is_some()
-            }) {
-                let needed = needed_by_set.entry(set.set_id).or_insert(0u64);
-                *needed = needed.saturating_add(set.slice_size);
+            let describing: Vec<_> = sets
+                .iter()
+                .filter(|set| {
+                    set.slice_size > 0
+                        && self
+                            .resolve_par2_file_binding_in_set(file_id, set.set_id)
+                            .is_some()
+                })
+                .collect();
+            if describing.is_empty() {
+                continue;
             }
+            // Walks this file's own articles, not the job's whole ledger.
+            let lost_bytes = state.spec.files.get(file_index as usize).map_or(0, |file| {
+                file.segments
+                    .iter()
+                    .filter(|segment| {
+                        self.segment_terminal_states.contains_key(&SegmentId {
+                            file_id,
+                            segment_number: segment.ordinal,
+                        })
+                    })
+                    .map(|segment| segment.bytes as u64)
+                    .fold(0u64, u64::saturating_add)
+            });
+            charges.push(
+                describing
+                    .into_iter()
+                    .map(|set| (set.set_id, lost_bytes.max(set.slice_size)))
+                    .collect::<Vec<_>>(),
+            );
         }
+        let needed_by_set = Self::book_needs_by_set(&sets, &charges);
         Self::par2_sets_cover_needs(&sets, &needed_by_set, ceiling)
     }
 
@@ -1051,7 +1123,9 @@ impl Pipeline {
     /// file's declared size is yEnc-encoded, about 3% larger — enough to fail
     /// a post whose losses the set covers exactly. Each lost file costs the
     /// whole slices of the length the set that describes it gives, at that
-    /// set's slice size, which is what the repair will spend; a file no parsed
+    /// set's slice size, which is what the repair will spend (a file several
+    /// sets describe is charged to one of them, as [`Self::book_needs_by_set`]
+    /// chooses); a file no parsed
     /// set describes costs its declared size in the served set's slices. That
     /// charge is generous rather than exact — no set can repair such a file —
     /// and it is the same charge the byte comparison has always made for a
@@ -1097,28 +1171,35 @@ impl Pipeline {
                 let sets = self.par2_set_recovery_capacities(job_id);
                 let whole_slices =
                     |len: u64, slice_size: u64| len.div_ceil(slice_size).saturating_mul(slice_size);
-                let mut needed_by_set = std::collections::HashMap::new();
-                let needed_bytes = lost_files
-                    .iter()
-                    .map(|file_id| {
-                        if let Some((set_id, needed)) = sets.iter().find_map(|set| {
+                let mut charges = Vec::new();
+                let mut undescribed_bytes = 0u64;
+                for file_id in &lost_files {
+                    let describing: Vec<_> = sets
+                        .iter()
+                        .filter(|set| set.slice_size > 0)
+                        .filter_map(|set| {
                             let binding =
                                 self.resolve_par2_file_binding_in_set(*file_id, set.set_id)?;
-                            (set.slice_size > 0).then(|| {
-                                (
-                                    set.set_id,
-                                    whole_slices(binding.described_length, set.slice_size),
-                                )
-                            })
-                        }) {
-                            let booked = needed_by_set.entry(set_id).or_insert(0u64);
-                            *booked = booked.saturating_add(needed);
-                            needed
-                        } else {
-                            whole_slices(declared_bytes(*file_id), served_slice_size)
-                        }
-                    })
-                    .fold(0u64, u64::saturating_add);
+                            Some((
+                                set.set_id,
+                                whole_slices(binding.described_length, set.slice_size),
+                            ))
+                        })
+                        .collect();
+                    if describing.is_empty() {
+                        undescribed_bytes = undescribed_bytes.saturating_add(whole_slices(
+                            declared_bytes(*file_id),
+                            served_slice_size,
+                        ));
+                    } else {
+                        charges.push(describing);
+                    }
+                }
+                let needed_by_set = Self::book_needs_by_set(&sets, &charges);
+                let needed_bytes = needed_by_set
+                    .values()
+                    .copied()
+                    .fold(undescribed_bytes, u64::saturating_add);
                 needed_bytes <= ceiling
                     && Self::par2_sets_cover_needs(&sets, &needed_by_set, ceiling)
             }

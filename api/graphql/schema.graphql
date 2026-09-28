@@ -588,8 +588,8 @@ question entirely.
 """
 type HardwareProfileSettings {
 	"""
-	The operator's choice, or null when they have never made one and the
-	recommendation is standing in.
+	The operator's choice, or null when the recommendation is standing in:
+	they have never made one, or this machine can no longer honour it.
 	"""
 	selected: HardwareProfileGql
 	"""

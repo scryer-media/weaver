@@ -79,8 +79,8 @@ impl HardwareProfileOption {
 /// question entirely.
 #[derive(Debug, Clone, SimpleObject)]
 pub struct HardwareProfileSettings {
-    /// The operator's choice, or null when they have never made one and the
-    /// recommendation is standing in.
+    /// The operator's choice, or null when the recommendation is standing in:
+    /// they have never made one, or this machine can no longer honour it.
     pub selected: Option<HardwareProfileGql>,
     /// The most capable profile this machine can honour.
     pub recommended: HardwareProfileGql,
@@ -103,7 +103,11 @@ impl HardwareProfileSettings {
     pub(crate) fn resolve(selected: Option<HardwareProfile>, probe: &SystemProfile) -> Self {
         let available = HardwareProfile::available(probe);
         Self {
-            selected: selected.map(Into::into),
+            // A saved choice the machine can no longer honour is not what
+            // runs: the pipeline falls back to the recommendation at startup.
+            selected: selected
+                .filter(|chosen| available.contains(chosen))
+                .map(Into::into),
             recommended: HardwareProfile::recommended(probe).into(),
             options: available
                 .iter()

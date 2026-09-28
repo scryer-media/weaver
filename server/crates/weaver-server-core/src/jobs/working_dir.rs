@@ -142,12 +142,33 @@ fn write_working_marker(dir: &Dir, value: &str) -> std::io::Result<()> {
         .write_all(value.as_bytes())
 }
 
+/// Where the v2 form of a marker is written before it replaces the v1 one.
+/// Never read as a marker.
+const WORKING_DIR_MARKER_UPGRADE: &str = ".weaver-job-dir.upgrade";
+
 /// Replaces a verified v1 marker with its v2 form, so the directory stops
 /// depending on a device number that may change.
+///
+/// The v2 value is written and synced under another name and then renamed
+/// over the marker, so a crash or a failed write leaves the v1 marker in
+/// place rather than a directory with no marker at all. A temporary left by
+/// an earlier attempt is removed first.
 fn upgrade_legacy_marker(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<()> {
     let current = working_marker_value(dir, path, job_id)?;
-    dir.remove_file(WORKING_DIR_MARKER)?;
-    write_working_marker(dir, &current)
+    match dir.remove_file(WORKING_DIR_MARKER_UPGRADE) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    let mut file = dir.open_with(WORKING_DIR_MARKER_UPGRADE, &options)?;
+    file.write_all(current.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    dir.rename(WORKING_DIR_MARKER_UPGRADE, dir, WORKING_DIR_MARKER)
 }
 
 fn read_working_marker(dir: &Dir) -> std::io::Result<String> {
@@ -441,6 +462,61 @@ mod tests {
             );
             assert!(!path.exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_temporary_left_by_an_interrupted_upgrade_does_not_block_the_next_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("interrupted");
+        std::fs::create_dir(&path).unwrap();
+        write_v1_marker(&path, None, JobId(25));
+        std::fs::write(path.join(WORKING_DIR_MARKER_UPGRADE), b"partial").unwrap();
+
+        assert_eq!(
+            prepare_history_working_dir(temp.path(), &path, JobId(25))
+                .await
+                .unwrap(),
+            HistoryWorkingDir::Owned
+        );
+        let rewritten = std::fs::read_to_string(working_dir_marker_path(&path)).unwrap();
+        assert!(
+            rewritten.starts_with(MARKER_V2_PREFIX),
+            "the upgrade completes over the stale temporary, got {rewritten:?}"
+        );
+        assert!(
+            !path.join(WORKING_DIR_MARKER_UPGRADE).exists(),
+            "the temporary is consumed by the upgrade"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upgrade_that_cannot_write_keeps_the_v1_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("unwritable");
+        std::fs::create_dir(&path).unwrap();
+        write_v1_marker(&path, None, JobId(26));
+        let original = std::fs::read_to_string(working_dir_marker_path(&path)).unwrap();
+        // A directory where the temporary goes cannot be removed as a file,
+        // so the upgrade fails before it has written anything.
+        std::fs::create_dir(path.join(WORKING_DIR_MARKER_UPGRADE)).unwrap();
+
+        assert!(
+            prepare_history_working_dir(temp.path(), &path, JobId(26))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(working_dir_marker_path(&path)).unwrap(),
+            original,
+            "a failed upgrade leaves the v1 marker as it was"
+        );
+        let dir = open_working_directory(temp.path(), &path).unwrap();
+        assert_eq!(
+            match_marker(&dir, &path, &original, JobId(26)).unwrap(),
+            MarkerMatch::Legacy
+        );
     }
 
     #[cfg(unix)]

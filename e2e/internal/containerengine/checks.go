@@ -101,7 +101,7 @@ func (engine *Engine) podmanChecks() []Check {
 	if engine.Rootless {
 		checks = append(checks, Check{
 			Name:   "rootless ID mapping",
-			OK:     idMapCovers(engine.UIDMap, 1000) && idMapCovers(engine.GIDMap, 1000),
+			OK:     idMapCoversAll(engine.UIDMap, serviceIDs) && idMapCoversAll(engine.GIDMap, serviceIDs),
 			Hard:   true,
 			Detail: "service entrypoints chown to uid/gid 1000 (and PostgreSQL to 999) inside the user namespace",
 			Remedy: "add subordinate ranges: `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER && podman system migrate`",
@@ -124,6 +124,19 @@ func HardFailures(checks []Check) []Check {
 		}
 	}
 	return failed
+}
+
+// serviceIDs are the in-container user and group IDs the services take
+// ownership as: 1000 for the service entrypoints, 999 for PostgreSQL.
+var serviceIDs = []int{999, 1000}
+
+func idMapCoversAll(maps []IDMap, ids []int) bool {
+	for _, id := range ids {
+		if !idMapCovers(maps, id) {
+			return false
+		}
+	}
+	return true
 }
 
 func idMapCovers(maps []IDMap, id int) bool {

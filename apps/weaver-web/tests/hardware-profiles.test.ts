@@ -61,6 +61,10 @@ test("the picker opens on the choice, and on the recommendation when there is no
   assert.equal(initialProfile(settings({ selected: "EFFICIENT" })), "EFFICIENT");
 });
 
+test("a saved choice this machine no longer offers opens on the recommendation", () => {
+  assert.equal(initialProfile(settings({ selected: "PERFORMANCE" })), "BALANCED");
+});
+
 test("a card's lines come from the daemon's numbers", () => {
   assert.deepEqual(profileFacts(englishTranslate, EFFICIENT), [
     "512 MB 7z decode memory",

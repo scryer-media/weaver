@@ -142,7 +142,7 @@ impl RuntimeTuner {
         }
         if self.is_fast_storage() {
             // Fast storage: bottleneck is CPU decompression, not I/O.
-            let cores = self.profile.cpu.physical_cores;
+            let cores = HardwareProfile::effective_cores(&self.profile);
             cores.clamp(2, 6)
         } else {
             // Slow storage: head seeks between concurrent streams hurt.
