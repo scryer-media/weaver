@@ -896,3 +896,109 @@ fn the_linux_clippy_image_follows_the_pinned_toolchain() {
     .unwrap_err();
     assert!(format!("{error:#}").contains("failed to read"));
 }
+
+/// A host as the engine probe sees it: which CLIs are on PATH and what each
+/// command answers.
+struct ScriptedHost {
+    on_path: &'static [&'static str],
+    answers: &'static [(
+        &'static str,
+        std::result::Result<&'static str, &'static str>,
+    )],
+}
+
+impl container_engine::EngineProbe for ScriptedHost {
+    fn on_path(&self, program: &str) -> bool {
+        self.on_path.contains(&program)
+    }
+
+    fn output(&self, program: &str, args: &[&str]) -> std::result::Result<String, String> {
+        let command = format!("{program} {}", args.join(" "));
+        self.answers
+            .iter()
+            .find(|(scripted, _)| command.starts_with(scripted))
+            .map(|(_, answer)| answer.map(str::to_string).map_err(str::to_string))
+            .unwrap_or_else(|| Err(format!("unscripted command: {command}")))
+    }
+}
+
+#[test]
+fn the_running_container_engine_is_picked() {
+    use container_engine::{ContainerEngine, running_engine};
+
+    let both_running = ScriptedHost {
+        on_path: &["docker", "podman"],
+        answers: &[
+            ("docker --version", Ok("Docker version 28.0.1")),
+            ("docker version", Ok("28.0.1")),
+            ("podman info", Ok("6.0.2")),
+        ],
+    };
+    assert_eq!(
+        running_engine(&both_running).unwrap(),
+        ContainerEngine::Docker
+    );
+
+    let docker_installed_but_stopped = ScriptedHost {
+        on_path: &["docker", "podman"],
+        answers: &[
+            ("docker --version", Ok("Docker version 28.0.1")),
+            ("docker version", Err("failed to connect to the docker API")),
+            ("podman info", Ok("6.0.2")),
+        ],
+    };
+    assert_eq!(
+        running_engine(&docker_installed_but_stopped).unwrap(),
+        ContainerEngine::Podman
+    );
+
+    let podman_behind_a_docker_wrapper = ScriptedHost {
+        on_path: &["docker", "podman"],
+        answers: &[
+            ("docker --version", Ok("podman version 6.0.2")),
+            ("podman info", Ok("6.0.2")),
+        ],
+    };
+    assert_eq!(
+        running_engine(&podman_behind_a_docker_wrapper).unwrap(),
+        ContainerEngine::Podman
+    );
+
+    let nothing_running = ScriptedHost {
+        on_path: &["podman"],
+        answers: &[("podman info", Err("cannot connect to Podman"))],
+    };
+    let error = format!("{:#}", running_engine(&nothing_running).unwrap_err());
+    assert!(error.contains("the docker CLI is not on PATH"), "{error}");
+    assert!(error.contains("podman machine start"), "{error}");
+}
+
+#[test]
+fn podman_is_given_images_it_can_pull_without_asking() {
+    use container_engine::ContainerEngine::{Docker, Podman};
+
+    assert_eq!(
+        Docker.image_reference("rust:1.98.0-bookworm"),
+        "rust:1.98.0-bookworm"
+    );
+    assert_eq!(
+        Podman.image_reference("rust:1.98.0-bookworm"),
+        "docker.io/library/rust:1.98.0-bookworm"
+    );
+    assert_eq!(
+        Podman.image_reference("example/toolchain:1"),
+        "docker.io/example/toolchain:1"
+    );
+    for qualified in [
+        "ghcr.io/example/toolchain:1",
+        "localhost/toolchain:1",
+        "registry.test:5000/toolchain:1",
+    ] {
+        assert_eq!(Podman.image_reference(qualified), qualified);
+    }
+    assert!(Docker.bind_mount_run_args().is_empty());
+    assert_eq!(
+        Podman.bind_mount_run_args(),
+        ["--security-opt", "label=disable"]
+    );
+}
