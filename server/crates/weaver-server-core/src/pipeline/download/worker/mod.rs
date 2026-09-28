@@ -80,10 +80,21 @@ const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
 /// unreadable from the log. Each job gets its own window here, and whatever a
 /// closed window swallowed is counted and reported by the next line that gets
 /// through it.
-#[derive(Debug, Default)]
-pub(crate) struct JobLogThrottle {
-    windows: HashMap<JobId, JobLogWindow>,
+#[derive(Debug)]
+pub(crate) struct KeyedLogThrottle<K> {
+    windows: HashMap<K, JobLogWindow>,
 }
+
+impl<K> Default for KeyedLogThrottle<K> {
+    fn default() -> Self {
+        Self {
+            windows: HashMap::new(),
+        }
+    }
+}
+
+/// The per-job window every job-scoped throttle uses.
+pub(crate) type JobLogThrottle = KeyedLogThrottle<JobId>;
 
 #[derive(Debug, Clone, Copy)]
 struct JobLogWindow {
@@ -91,14 +102,14 @@ struct JobLogWindow {
     suppressed: u64,
 }
 
-impl JobLogThrottle {
-    /// Whether this job may log now, and how many of its emissions the closed
+impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
+    /// Whether this key may log now, and how many of its emissions the closed
     /// window swallowed since the last one that got through.
-    pub(crate) fn admit(&mut self, job_id: JobId, interval: Duration) -> Option<u64> {
+    pub(crate) fn admit(&mut self, job_id: K, interval: Duration) -> Option<u64> {
         self.admit_at(job_id, interval, Instant::now())
     }
 
-    fn admit_at(&mut self, job_id: JobId, interval: Duration, now: Instant) -> Option<u64> {
+    fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
         match self.windows.get_mut(&job_id) {
             Some(window) if now.duration_since(window.emitted_at) < interval => {
                 window.suppressed = window.suppressed.saturating_add(1);
@@ -136,7 +147,7 @@ impl JobLogThrottle {
     }
 
     #[cfg(test)]
-    pub(crate) fn last_emitted_at(&self, job_id: JobId) -> Option<Instant> {
+    pub(crate) fn last_emitted_at(&self, job_id: K) -> Option<Instant> {
         self.windows.get(&job_id).map(|window| window.emitted_at)
     }
 }

@@ -16,7 +16,7 @@ pub(in crate::pipeline) use worker::{
 };
 
 pub(super) use worker::HeldDownloadRefill;
-pub(crate) use worker::JobLogThrottle;
+pub(crate) use worker::{JobLogThrottle, KeyedLogThrottle};
 
 pub use queue::{DownloadQueue, DownloadWork};
 pub(super) use transport::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};

@@ -11,6 +11,8 @@ use tempfile::Builder;
 const MAX_DEFERRED_FILE_HASH_DATA_BYTES: usize = 128 * 1024 * 1024;
 const OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS: usize = 16;
 const UU_SPOOL_FILE_PREFIX: &str = "part-";
+/// How often one file may report articles arriving that it already holds.
+const DUPLICATE_ARRIVAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
 enum SegmentHashMode {
@@ -3733,6 +3735,22 @@ impl Pipeline {
                 // digests the disk as the rewrite left it. Duplicates are the
                 // exceptional path; clean downloads never pay this.
                 if was_duplicate {
+                    // A duplicate is legal and handled, but a stream of them
+                    // means something keeps requesting articles the file
+                    // already holds. Say so once a window, with the count.
+                    if let Some(suppressed_since_last) = self
+                        .duplicate_arrival_log_throttle
+                        .admit(file_id, DUPLICATE_ARRIVAL_LOG_INTERVAL)
+                    {
+                        warn!(
+                            job_id = job_id.0,
+                            file_id = %file_id,
+                            file = %filename,
+                            segment = segment_id.segment_number,
+                            duplicates = suppressed_since_last.saturating_add(1),
+                            "article arrived for a segment the file already holds"
+                        );
+                    }
                     self.mark_file_hash_reread_required_for(file_id, "duplicate_rewrite");
                     drop(data);
                 } else {

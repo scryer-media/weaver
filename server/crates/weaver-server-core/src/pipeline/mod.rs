@@ -1040,6 +1040,9 @@ pub(super) struct Par2FileRuntime {
     /// Article ordinals already used for bounded prefix probing. Full-carrier
     /// escalation skips them because their decoded bytes are already retained.
     pub(super) discovery_probe_ordinals: HashSet<u32>,
+    /// Digest of the bytes the last completed metadata parse of this file
+    /// read. A re-finalisation that leaves the bytes unchanged skips the parse.
+    pub(super) metadata_parse_fingerprint: Option<[u8; 32]>,
 }
 
 /// What a job knows about one recovery set it has encountered.
@@ -2759,6 +2762,10 @@ pub struct Pipeline {
     /// warning. Every dispatch wake re-visits every job, so this one fires as
     /// fast as the actor is woken until the job leaves the phase it is in.
     pub(super) dispatch_ineligible_log_throttle: download::JobLogThrottle,
+    /// Rate limiter, per file, for the "an article arrived that the file
+    /// already holds" warning. Duplicates arrive in bursts when something
+    /// requeues work the assembly already has.
+    pub(super) duplicate_arrival_log_throttle: download::KeyedLogThrottle<NzbFileId>,
     /// Last time an owned blocking lane failed to be acquired at all, warned
     /// about or not. The under-cap report below is gated on it: lanes below
     /// their cap are only a fault when a lane actually failed to open.

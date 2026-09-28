@@ -31,12 +31,57 @@ impl Pipeline {
         };
         let parse_path = file_path.clone();
         let budget = self.par2_scan_budget(job_id);
-        let parsed = match tokio::task::spawn_blocking(move || {
+        let last_fingerprint = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.files.get(&file_id.file_index))
+            .and_then(|file| file.metadata_parse_fingerprint);
+        // A file finalised again with the bytes it already had — a duplicate
+        // article re-completing it — has nothing new to say. Parsing it again
+        // re-runs every install and merge below for the same packets.
+        let (fingerprint, parsed) = match tokio::task::spawn_blocking(move || {
+            let fingerprint = par2_content_fingerprint(&parse_path);
+            if fingerprint.is_some() && fingerprint == last_fingerprint {
+                return Ok((fingerprint, None));
+            }
             scan_completed_par2_packet_groups(&parse_path, &budget)
+                .map(|parsed| (fingerprint, Some(parsed)))
         })
         .await
         {
-            Ok(Ok(parsed)) => parsed,
+            Ok(Ok((_, None))) => {
+                debug!(
+                    job_id = job_id.0,
+                    filename = %filename,
+                    "PAR2 metadata candidate unchanged since its last parse"
+                );
+                // The earlier parse of these bytes is the answer. Work queued
+                // for the file since then is settled by it, not left waiting.
+                let entry = self
+                    .ensure_par2_runtime(job_id)
+                    .files
+                    .entry(file_id.file_index)
+                    .or_default();
+                if entry.discovery.work_is_queued() {
+                    if let Par2DiscoveryState::MetadataCarrierQueued {
+                        target_set_id: Some(target_set_id),
+                        ..
+                    } = &entry.discovery
+                    {
+                        entry.metadata_targets_attempted.insert(*target_set_id);
+                    }
+                    let set_ids = entry.discovery.observed_set_ids().to_vec();
+                    entry
+                        .metadata_targets_attempted
+                        .extend(set_ids.iter().copied());
+                    entry.discovery = if set_ids.is_empty() {
+                        Par2DiscoveryState::Exhausted { set_ids }
+                    } else {
+                        Par2DiscoveryState::Parsed { set_ids }
+                    };
+                }
+                return;
+            }
+            Ok(Ok((fingerprint, Some(parsed)))) => (fingerprint, parsed),
             Ok(Err(error @ par2_rs::Par2Error::ResourceLimitExceeded { .. })) => {
                 self.fail_job(job_id, error.to_string());
                 return;
@@ -200,6 +245,7 @@ impl Pipeline {
             let runtime = self.ensure_par2_runtime(job_id);
             let entry = runtime.files.entry(file_id.file_index).or_default();
             entry.filename = filename.clone();
+            entry.metadata_parse_fingerprint = fingerprint;
             for set_id in &observed_set_ids {
                 let accepted = accepted_recovery_blocks.remove(set_id).unwrap_or(0);
                 let blocks = entry.recovery_blocks_by_set.entry(*set_id).or_insert(0);
@@ -1240,4 +1286,13 @@ impl Pipeline {
             entry.readback_failure_reported = false;
         }
     }
+}
+
+/// A digest of a completed PAR2 file's bytes, or `None` when the file cannot
+/// be read — in which case the parse that follows reports the failure.
+fn par2_content_fingerprint(path: &Path) -> Option<[u8; 32]> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(&mut file).ok()?;
+    Some(*hasher.finalize().as_bytes())
 }
