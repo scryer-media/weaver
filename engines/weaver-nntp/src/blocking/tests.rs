@@ -78,6 +78,18 @@ fn unique_ca_path(label: &str) -> std::path::PathBuf {
     ))
 }
 
+/// Whether a fixture server's failed write means only that the client had
+/// already closed its end.
+fn client_hung_up(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn spawn_tls_nntp_server(
     articles: Vec<(&'static str, TestArticle)>,
 ) -> (
@@ -181,125 +193,132 @@ fn spawn_tls_nntp_server_with_upgrade(
                 stream
             };
 
-            let mut line = String::new();
-            let mut close_after_next_request = false;
-            loop {
-                line.clear();
-                let Ok(read) = stream.read_line(&mut line).await else {
-                    break;
-                };
-                if read == 0 {
-                    break;
-                }
-                if close_after_next_request {
-                    break;
-                }
-                let command = line.trim_end_matches(['\r', '\n']);
-                if command.eq_ignore_ascii_case("CAPABILITIES") {
-                    stream
-                        .get_mut()
-                        .write_all(
-                            b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
-                        )
-                        .await
-                        .unwrap();
-                } else if command.to_ascii_uppercase().starts_with("GROUP ") {
-                    stream
-                        .get_mut()
-                        .write_all(b"211 1 1 1 alt.test\r\n")
-                        .await
-                        .unwrap();
-                } else if let Some(id) = command.strip_prefix("BODY ") {
-                    match articles.get(id.trim()) {
-                        Some(TestArticle::Body(data)) => {
-                            stream
-                                .get_mut()
-                                .write_all(
-                                    format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
-                                )
-                                .await
-                                .unwrap();
-                            stream.get_mut().write_all(&yenc_body(data)).await.unwrap();
-                            stream.get_mut().write_all(b".\r\n").await.unwrap();
-                        }
-                        #[cfg(not(windows))]
-                        Some(TestArticle::DelayedInitial { data, delay }) => {
-                            tokio::time::sleep(*delay).await;
-                            if stream
-                                .get_mut()
-                                .write_all(
-                                    format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
-                                )
-                                .await
-                                .is_err()
-                                || stream.get_mut().write_all(&yenc_body(data)).await.is_err()
-                                || stream.get_mut().write_all(b".\r\n").await.is_err()
-                            {
-                                return;
+            // The client ends most sessions by dropping its connection, and may do
+            // so while a response is still being written: a test that abandons a
+            // read, or never reads what it asked for, closes first by design. A
+            // write that finds the client gone ends the session like a read that
+            // does; any other write failure is the fixture's own and fails the test.
+            let served: io::Result<()> = async {
+                let mut line = String::new();
+                let mut close_after_next_request = false;
+                loop {
+                    line.clear();
+                    let Ok(read) = stream.read_line(&mut line).await else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    if close_after_next_request {
+                        break;
+                    }
+                    let command = line.trim_end_matches(['\r', '\n']);
+                    if command.eq_ignore_ascii_case("CAPABILITIES") {
+                        stream
+                            .get_mut()
+                            .write_all(
+                                b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+                            )
+                            .await?;
+                    } else if command.to_ascii_uppercase().starts_with("GROUP ") {
+                        stream
+                            .get_mut()
+                            .write_all(b"211 1 1 1 alt.test\r\n")
+                            .await?;
+                    } else if let Some(id) = command.strip_prefix("BODY ") {
+                        match articles.get(id.trim()) {
+                            Some(TestArticle::Body(data)) => {
+                                stream
+                                    .get_mut()
+                                    .write_all(
+                                        format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
+                                    )
+                                    .await?;
+                                stream.get_mut().write_all(&yenc_body(data)).await?;
+                                stream.get_mut().write_all(b".\r\n").await?;
                             }
-                        }
-                        Some(TestArticle::Silent) => {}
-                        Some(TestArticle::Trickle { data, line_delay }) => {
-                            stream
-                                .get_mut()
-                                .write_all(
-                                    format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
-                                )
-                                .await
-                                .unwrap();
-                            let encoded = yenc_body(data);
-                            for line in encoded.split_inclusive(|byte| *byte == b'\n') {
-                                tokio::time::sleep(*line_delay).await;
-                                if stream.get_mut().write_all(line).await.is_err()
-                                    || stream.get_mut().flush().await.is_err()
+                            #[cfg(not(windows))]
+                            Some(TestArticle::DelayedInitial { data, delay }) => {
+                                tokio::time::sleep(*delay).await;
+                                if stream
+                                    .get_mut()
+                                    .write_all(
+                                        format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
+                                    )
+                                    .await
+                                    .is_err()
+                                    || stream.get_mut().write_all(&yenc_body(data)).await.is_err()
+                                    || stream.get_mut().write_all(b".\r\n").await.is_err()
                                 {
-                                    return;
+                                    return Ok(());
                                 }
                             }
-                        }
-                        Some(TestArticle::Truncated {
-                            data,
-                            wait_for_next_request,
-                        }) => {
-                            stream
-                                .get_mut()
-                                .write_all(
-                                    format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
-                                )
-                                .await
-                                .unwrap();
-                            stream.get_mut().write_all(&yenc_body(data)).await.unwrap();
-                            stream.get_mut().flush().await.unwrap();
-                            if *wait_for_next_request {
-                                close_after_next_request = true;
-                            } else {
-                                break;
+                            Some(TestArticle::Silent) => {}
+                            Some(TestArticle::Trickle { data, line_delay }) => {
+                                stream
+                                    .get_mut()
+                                    .write_all(
+                                        format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
+                                    )
+                                    .await?;
+                                let encoded = yenc_body(data);
+                                for line in encoded.split_inclusive(|byte| *byte == b'\n') {
+                                    tokio::time::sleep(*line_delay).await;
+                                    if stream.get_mut().write_all(line).await.is_err()
+                                        || stream.get_mut().flush().await.is_err()
+                                    {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Some(TestArticle::Truncated {
+                                data,
+                                wait_for_next_request,
+                            }) => {
+                                stream
+                                    .get_mut()
+                                    .write_all(
+                                        format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
+                                    )
+                                    .await?;
+                                stream.get_mut().write_all(&yenc_body(data)).await?;
+                                stream.get_mut().flush().await?;
+                                if *wait_for_next_request {
+                                    close_after_next_request = true;
+                                } else {
+                                    break;
+                                }
+                            }
+                            None => {
+                                stream
+                                    .get_mut()
+                                    .write_all(b"430 no such article\r\n")
+                                    .await?;
                             }
                         }
-                        None => {
-                            stream
-                                .get_mut()
-                                .write_all(b"430 no such article\r\n")
-                                .await
-                                .unwrap();
-                        }
+                    } else if command.eq_ignore_ascii_case("QUIT") {
+                        stream
+                            .get_mut()
+                            .write_all(b"205 closing\r\n")
+                            .await?;
+                        stream.get_mut().flush().await?;
+                        break;
+                    } else {
+                        stream
+                            .get_mut()
+                            .write_all(b"500 command not recognized\r\n")
+                            .await?;
                     }
-                } else if command.eq_ignore_ascii_case("QUIT") {
-                    stream
-                        .get_mut()
-                        .write_all(b"205 closing\r\n")
-                        .await
-                        .unwrap();
-                    stream.get_mut().flush().await.unwrap();
-                    break;
-                } else {
-                    stream
-                        .get_mut()
-                        .write_all(b"500 command not recognized\r\n")
-                        .await
-                        .unwrap();
+                    stream.get_mut().flush().await?;
                 }
-                stream.get_mut().flush().await.unwrap();
+                Ok(())
+            }
+            .await;
+            if let Err(error) = served {
+                assert!(
+                    client_hung_up(&error),
+                    "test NNTP server failed to write: {error}"
+                );
             }
         });
     });
