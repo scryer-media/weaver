@@ -96,6 +96,10 @@ impl Pipeline {
         let profile_tuning = hardware_profile.tuning(&profile);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
+        shared_state.set_hardware_profile_in_force(crate::HardwareProfileInForce {
+            active: hardware_profile,
+            scheduled: None,
+        });
         info!(
             hardware_profile = hardware_profile.as_str(),
             max_downloads = tuner.params().max_concurrent_downloads,
@@ -210,6 +214,8 @@ impl Pipeline {
             nntp,
             buffers,
             tuner,
+            configured_hardware_profile: hardware_profile,
+            scheduled_hardware_profile: None,
             metrics,
             jobs: HashMap::new(),
             semantic_terminal_causes: HashMap::new(),

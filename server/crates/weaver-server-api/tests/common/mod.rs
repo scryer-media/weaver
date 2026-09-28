@@ -729,6 +729,20 @@ fn spawn_test_scheduler(
                 SchedulerCommand::ClearScheduleAction { reply } => {
                     let _ = reply.send(());
                 }
+                // Stands in for the pipeline: the chosen profile is in force
+                // at once, since this mock has no schedule behind it.
+                SchedulerCommand::SetHardwareProfile { profile, reply } => {
+                    scheduler_state.set_hardware_profile_in_force(
+                        weaver_server_core::HardwareProfileInForce {
+                            active: profile,
+                            scheduled: None,
+                        },
+                    );
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::SetScheduledHardwareProfile { reply, .. } => {
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::RestoreJob { request, reply } => {
                     let RestoreJobRequest {
                         job_id,

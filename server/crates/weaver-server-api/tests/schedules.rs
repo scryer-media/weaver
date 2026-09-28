@@ -277,3 +277,150 @@ async fn toggle_schedule() {
         .unwrap();
     assert!(!sched["enabled"].as_bool().unwrap());
 }
+
+#[tokio::test]
+async fn create_hardware_profile_schedule() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                createSchedule(input: {
+                    enabled: true,
+                    label: "Evening",
+                    days: [],
+                    time: "17:00",
+                    actionType: "hardware_profile",
+                    hardwareProfile: EFFICIENT
+                }) {
+                    actionType speedLimitBytes hardwareProfile
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let sched = &data["createSchedule"].as_array().unwrap()[0];
+    assert_eq!(sched["actionType"].as_str().unwrap(), "hardware_profile");
+    assert_eq!(sched["hardwareProfile"].as_str().unwrap(), "EFFICIENT");
+    assert!(sched["speedLimitBytes"].is_null());
+
+    let resp = h
+        .execute("{ schedules { actionType hardwareProfile } }")
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["schedules"][0]["hardwareProfile"].as_str().unwrap(),
+        "EFFICIENT"
+    );
+}
+
+#[tokio::test]
+async fn other_schedule_actions_carry_no_hardware_profile() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                createSchedule(input: {
+                    time: "08:00",
+                    actionType: "pause",
+                    hardwareProfile: EFFICIENT
+                }) {
+                    actionType hardwareProfile
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let sched = &data["createSchedule"].as_array().unwrap()[0];
+    assert_eq!(sched["actionType"].as_str().unwrap(), "pause");
+    assert!(sched["hardwareProfile"].is_null());
+}
+
+#[tokio::test]
+async fn a_hardware_profile_schedule_without_a_profile_is_refused() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                createSchedule(input: {
+                    time: "17:00",
+                    actionType: "hardware_profile"
+                }) { id }
+            }"#,
+        )
+        .await;
+    let message = resp
+        .errors
+        .first()
+        .map(|error| error.message.clone())
+        .expect("a profile rule without a profile must be refused");
+    assert!(message.contains("hardwareProfile"), "{message}");
+    assert!(h.db.list_schedules().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_hardware_profile_the_machine_cannot_honour_is_refused_in_a_schedule() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                createSchedule(input: {
+                    time: "23:00",
+                    actionType: "hardware_profile",
+                    hardwareProfile: PERFORMANCE
+                }) { id }
+            }"#,
+        )
+        .await;
+    let message = resp
+        .errors
+        .first()
+        .map(|error| error.message.clone())
+        .expect("an unavailable profile must be refused");
+    // The harness machine has 8 GiB; performance needs 16 GiB.
+    assert!(
+        message.contains("performance") && message.contains("16 GiB"),
+        "{message}"
+    );
+    assert!(h.db.list_schedules().unwrap().is_empty());
+
+    // An update is judged the same way and leaves the rule as it was.
+    let resp = h
+        .execute(
+            r#"mutation {
+                createSchedule(input: {
+                    time: "23:00",
+                    actionType: "hardware_profile",
+                    hardwareProfile: BALANCED
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["createSchedule"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                updateSchedule(id: "{id}", input: {{
+                    time: "23:00",
+                    actionType: "hardware_profile",
+                    hardwareProfile: PERFORMANCE
+                }}) {{ id }}
+            }}"#
+        ))
+        .await;
+    assert!(!resp.errors.is_empty(), "the update must be refused");
+    let resp = h.execute("{ schedules { hardwareProfile } }").await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["schedules"][0]["hardwareProfile"]
+            .as_str()
+            .unwrap(),
+        "BALANCED"
+    );
+}

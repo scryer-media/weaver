@@ -486,6 +486,15 @@ impl Pipeline {
                 let result = self.apply_bandwidth_cap_policy(policy);
                 let _ = reply.send(result);
             }
+            // A profile rule is its own track: it never ends a scheduled pause
+            // or speed limit, so it is taken before the code below that does.
+            SchedulerCommand::ApplyScheduleAction {
+                action: crate::bandwidth::ScheduleAction::HardwareProfile { profile },
+                reply,
+            } => {
+                self.set_scheduled_hardware_profile(Some(profile));
+                let _ = reply.send(());
+            }
             SchedulerCommand::ApplyScheduleAction { action, reply } => {
                 use crate::bandwidth::ScheduleAction;
                 if !matches!(&action, ScheduleAction::SpeedLimit { .. }) {
@@ -531,6 +540,8 @@ impl Pipeline {
                             "watch folder schedule action reached download pipeline"
                         );
                     }
+                    // Taken by the arm above.
+                    ScheduleAction::HardwareProfile { .. } => {}
                 }
                 let _ = reply.send(());
             }
@@ -544,6 +555,14 @@ impl Pipeline {
                 self.rate_limiter.set_rate(self.configured_rate_limit);
                 let _ = self.refresh_bandwidth_cap_window();
                 info!("schedule: cleared scheduled action");
+                let _ = reply.send(());
+            }
+            SchedulerCommand::SetHardwareProfile { profile, reply } => {
+                self.set_configured_hardware_profile(profile);
+                let _ = reply.send(());
+            }
+            SchedulerCommand::SetScheduledHardwareProfile { profile, reply } => {
+                self.set_scheduled_hardware_profile(profile);
                 let _ = reply.send(());
             }
             SchedulerCommand::RebuildNntp {

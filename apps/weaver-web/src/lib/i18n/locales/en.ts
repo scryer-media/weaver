@@ -751,6 +751,8 @@ const en: LocaleDictionary = {
   "schedule.actionSpeedLimit": "Speed Limit",
   "schedule.actionPauseWatchFolder": "Pause Watch Folder Scanning",
   "schedule.actionResumeWatchFolder": "Resume Watch Folder Scanning",
+  "schedule.actionHardwareProfile": "Hardware Profile",
+  "schedule.hardwareProfile": "Profile",
   "schedule.speedLimit": "Speed Limit",
   "schedule.days": "Days",
   "schedule.daysHint": "Leave all unchecked for every day.",

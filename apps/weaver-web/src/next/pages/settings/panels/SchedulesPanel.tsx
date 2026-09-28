@@ -3,6 +3,7 @@ import { useMutation, useQuery } from "urql";
 import {
   CREATE_SCHEDULE_MUTATION,
   DELETE_SCHEDULE_MUTATION,
+  HARDWARE_PROFILE_QUERY,
   SCHEDULES_QUERY,
   TOGGLE_SCHEDULE_MUTATION,
   UPDATE_SCHEDULE_MUTATION,
@@ -13,10 +14,16 @@ import { RecordEditor } from "../../../components/RecordEditor";
 import { PrimaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatRate } from "../../../data/format";
+import {
+  profileName,
+  type HardwareProfileName,
+  type HardwareProfileSettings,
+} from "../../../data/hardware-profiles";
 import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
 
 /**
- * Schedules: a clock that pauses, resumes or throttles the queue.
+ * Schedules: a clock that pauses, resumes or throttles the queue, or switches
+ * the hardware profile.
  *
  * Weekdays are a set rather than a list of rules, so the editor draws them as
  * seven toggling chips — the one control in the design system that repeats
@@ -31,6 +38,7 @@ interface Schedule {
   time: string;
   actionType: string;
   speedLimitBytes: number | null;
+  hardwareProfile: HardwareProfileName | null;
 }
 
 interface ScheduleForm {
@@ -41,6 +49,8 @@ interface ScheduleForm {
   actionType: string;
   speedMib: string;
   speedUnlimited: boolean;
+  /** Null until one is picked; the editor then offers the recommendation. */
+  hardwareProfile: HardwareProfileName | null;
 }
 
 const MIB = 1024 * 1024;
@@ -62,6 +72,7 @@ const ACTIONS: { value: string; label: string }[] = [
   { value: "speed_limit", label: "next.schedules.setLimit" },
   { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
   { value: "resume_watch_folder_scanning", label: "next.schedules.resumeWatchFolder" },
+  { value: "hardware_profile", label: "next.schedules.setProfile" },
 ];
 
 const NEW_SCHEDULE: ScheduleForm = {
@@ -72,6 +83,7 @@ const NEW_SCHEDULE: ScheduleForm = {
   actionType: "pause",
   speedMib: "5",
   speedUnlimited: false,
+  hardwareProfile: null,
 };
 
 function actionLabel(t: Translate, schedule: Schedule): string {
@@ -79,6 +91,9 @@ function actionLabel(t: Translate, schedule: Schedule): string {
     return schedule.speedLimitBytes
       ? t("next.schedules.limitTo", { rate: formatRate(schedule.speedLimitBytes) })
       : t("next.schedules.removeLimit");
+  }
+  if (schedule.actionType === "hardware_profile" && schedule.hardwareProfile) {
+    return t("next.schedules.profileTo", { profile: profileName(t, schedule.hardwareProfile) });
   }
   const action = ACTIONS.find((option) => option.value === schedule.actionType);
   return action ? t(action.label) : schedule.actionType;
@@ -100,6 +115,9 @@ export function SchedulesPanel() {
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
   const [, deleteSchedule] = useMutation(DELETE_SCHEDULE_MUTATION);
   const [, toggleSchedule] = useMutation(TOGGLE_SCHEDULE_MUTATION);
+  const [{ data: profileData }] = useQuery<{ hardwareProfile: HardwareProfileSettings }>({
+    query: HARDWARE_PROFILE_QUERY,
+  });
 
   const [editingId, setEditingId] = useState<string | "new" | null>(null);
   const [form, setForm] = useState<ScheduleForm>(NEW_SCHEDULE);
@@ -109,6 +127,15 @@ export function SchedulesPanel() {
 
   const schedules = data?.schedules ?? [];
   const editing = schedules.find((entry) => entry.id === editingId) ?? null;
+
+  // A rule may only name a profile this machine can honour.
+  const offeredProfiles = profileData?.hardwareProfile.available ?? [];
+  const formProfile =
+    form.hardwareProfile && offeredProfiles.includes(form.hardwareProfile)
+      ? form.hardwareProfile
+      : offeredProfiles.find((profile) => profile === profileData?.hardwareProfile.recommended) ??
+        offeredProfiles[0] ??
+        null;
 
   const open = (schedule: Schedule | null) => {
     setError(null);
@@ -123,6 +150,7 @@ export function SchedulesPanel() {
             speedUnlimited:
               schedule.actionType === "speed_limit" && !schedule.speedLimitBytes,
             speedMib: schedule.speedLimitBytes ? String(schedule.speedLimitBytes / MIB) : "5",
+            hardwareProfile: schedule.hardwareProfile,
           }
         : NEW_SCHEDULE,
     );
@@ -142,6 +170,9 @@ export function SchedulesPanel() {
       input.speedLimitBytes = form.speedUnlimited
         ? 0
         : Math.round(Number.parseFloat(form.speedMib || "0") * MIB);
+    }
+    if (form.actionType === "hardware_profile") {
+      input.hardwareProfile = formProfile;
     }
     const result =
       editingId === "new"
@@ -340,6 +371,28 @@ export function SchedulesPanel() {
                             },
                           },
                         ]),
+                  ]
+                : []),
+              ...(form.actionType === "hardware_profile"
+                ? [
+                    {
+                      id: "hardwareProfile",
+                      label: t("next.schedules.profile"),
+                      help: t("next.schedules.profileHelp"),
+                      control: {
+                        kind: "select" as const,
+                        value: formProfile ?? "",
+                        options: offeredProfiles.map((profile) => ({
+                          value: profile,
+                          label: profileName(t, profile),
+                        })),
+                        onChange: (next: string) =>
+                          setForm((current) => ({
+                            ...current,
+                            hardwareProfile: next as HardwareProfileName,
+                          })),
+                      },
+                    },
                   ]
                 : []),
               {

@@ -1373,6 +1373,8 @@ export const UPDATE_SETTINGS_MUTATION = gql`
 const HARDWARE_PROFILE_FIELDS = gql`
   fragment HardwareProfileFields on HardwareProfileSettings {
     selected
+    active
+    scheduled
     recommended
     available
     options {
@@ -1800,6 +1802,7 @@ export const SCHEDULES_QUERY = gql`
       time
       actionType
       speedLimitBytes
+      hardwareProfile
     }
   }
 `;
@@ -1814,6 +1817,7 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       time
       actionType
       speedLimitBytes
+      hardwareProfile
     }
   }
 `;
@@ -1828,6 +1832,7 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       time
       actionType
       speedLimitBytes
+      hardwareProfile
     }
   }
 `;
@@ -1842,6 +1847,7 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       time
       actionType
       speedLimitBytes
+      hardwareProfile
     }
   }
 `;
@@ -1856,6 +1862,7 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       time
       actionType
       speedLimitBytes
+      hardwareProfile
     }
   }
 `;

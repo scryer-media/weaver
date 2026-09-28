@@ -601,6 +601,8 @@ const ja: LocaleDictionary = {
   "schedule.actionSpeedLimit": "速度制限",
   "schedule.actionPauseWatchFolder": "監視フォルダーのスキャンを一時停止",
   "schedule.actionResumeWatchFolder": "監視フォルダーのスキャンを再開",
+  "schedule.actionHardwareProfile": "ハードウェアプロファイル",
+  "schedule.hardwareProfile": "プロファイル",
   "schedule.speedLimit": "速度制限",
   "schedule.days": "曜日",
   "schedule.daysHint": "すべて未チェックの場合は毎日適用されます。",

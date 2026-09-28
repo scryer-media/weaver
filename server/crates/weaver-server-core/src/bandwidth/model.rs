@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-/// A time-based rule that pauses, resumes, or changes the speed limit.
+/// A time-based rule that pauses, resumes, changes the speed limit, or puts a
+/// hardware profile in force.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleEntry {
     pub id: String,
@@ -28,6 +29,18 @@ pub enum ScheduleAction {
         /// Bytes per second. 0 = unlimited.
         bytes_per_sec: u64,
     },
+    /// Put a hardware profile in force until the next profile rule fires.
+    /// Profile rules are evaluated apart from every other action: one never
+    /// ends a scheduled pause or speed limit, and neither of those ends it.
+    HardwareProfile {
+        profile: crate::runtime::HardwareProfile,
+    },
+}
+
+impl ScheduleAction {
+    pub const fn is_hardware_profile(&self) -> bool {
+        matches!(self, Self::HardwareProfile { .. })
+    }
 }
 
 /// Day of week for schedule entries. Reuses the same serialization as
@@ -45,6 +58,19 @@ pub enum Weekday {
 }
 
 impl Weekday {
+    /// The day before this one.
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Mon => Self::Sun,
+            Self::Tue => Self::Mon,
+            Self::Wed => Self::Tue,
+            Self::Thu => Self::Wed,
+            Self::Fri => Self::Thu,
+            Self::Sat => Self::Fri,
+            Self::Sun => Self::Sat,
+        }
+    }
+
     /// Convert from `chrono::Weekday`.
     pub fn from_chrono(w: chrono::Weekday) -> Self {
         match w {

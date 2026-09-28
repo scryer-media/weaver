@@ -403,6 +403,10 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::ClearScheduleAction { reply } => {
                     let _ = reply.send(());
                 }
+                SchedulerCommand::SetHardwareProfile { reply, .. }
+                | SchedulerCommand::SetScheduledHardwareProfile { reply, .. } => {
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::RestoreJob { request, reply } => {
                     let RestoreJobRequest {
                         job_id,

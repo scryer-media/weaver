@@ -27,10 +27,10 @@ pub struct ProfileTuning {
     pub decode_threads: usize,
     /// Threads in the post-processing and chase pools: 7z and xz decode
     /// threads, PAR2 verify and repair, and concurrent chases all come from
-    /// these. Fixed when the pools are built, so a profile change reaches them
-    /// at the next start.
+    /// these. A profile change builds new pools for the work that starts after
+    /// it; work already running finishes on the pool it started on.
     pub extract_threads: usize,
-    /// A startup cap on concurrent downloads, chosen by the profile rather
+    /// A cap on concurrent downloads, chosen by the profile rather
     /// than derived from pressure. Per-job live memory scales with the number
     /// of downloads in flight, which is the whole point of the efficient
     /// profile; `None` leaves the configured connection count alone.

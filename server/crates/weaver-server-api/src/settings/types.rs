@@ -89,6 +89,13 @@ pub struct HardwareProfileSettings {
     /// What each available profile would do here, in the same order.
     pub options: Vec<HardwareProfileOption>,
     pub detected: DetectedHardware,
+    /// The profile whose limits are in force now: the scheduled one while a
+    /// schedule rule has one in force, the choice or the recommendation
+    /// otherwise.
+    pub active: HardwareProfileGql,
+    /// The profile a schedule rule has in force over the choice, or null when
+    /// no rule does and the choice applies.
+    pub scheduled: Option<HardwareProfileGql>,
 }
 
 impl HardwareProfileSettings {
@@ -107,7 +114,25 @@ impl HardwareProfileSettings {
                 memory_bytes: HardwareProfile::effective_memory_bytes(probe),
                 cores: HardwareProfile::effective_cores(probe) as u32,
             },
+            active: selected
+                .filter(|profile| profile.unmet_requirement(probe).is_none())
+                .unwrap_or_else(|| HardwareProfile::recommended(probe))
+                .into(),
+            scheduled: None,
         }
+    }
+
+    /// The same answer with the profile the pipeline reports in force. Without
+    /// a report, the choice or the recommendation is what is in force.
+    pub(crate) fn with_in_force(
+        mut self,
+        in_force: Option<weaver_server_core::HardwareProfileInForce>,
+    ) -> Self {
+        if let Some(in_force) = in_force {
+            self.active = in_force.active.into();
+            self.scheduled = in_force.scheduled.map(Into::into);
+        }
+        self
     }
 }
 
@@ -402,10 +427,14 @@ pub struct Schedule {
     pub time: String,
     pub action_type: String,
     pub speed_limit_bytes: Option<u64>,
+    /// The profile a `hardware_profile` rule puts in force; null for every
+    /// other action.
+    pub hardware_profile: Option<HardwareProfileGql>,
 }
 
 impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
     fn from(e: weaver_server_core::bandwidth::ScheduleEntry) -> Self {
+        let mut hardware_profile = None;
         let (action_type, speed_limit_bytes) = match &e.action {
             weaver_server_core::bandwidth::ScheduleAction::Pause => ("pause".into(), None),
             weaver_server_core::bandwidth::ScheduleAction::Resume => ("resume".into(), None),
@@ -417,6 +446,10 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             }
             weaver_server_core::bandwidth::ScheduleAction::SpeedLimit { bytes_per_sec } => {
                 ("speed_limit".into(), Some(*bytes_per_sec))
+            }
+            weaver_server_core::bandwidth::ScheduleAction::HardwareProfile { profile } => {
+                hardware_profile = Some((*profile).into());
+                ("hardware_profile".into(), None)
             }
         };
         Self {
@@ -431,6 +464,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             time: e.time,
             action_type,
             speed_limit_bytes,
+            hardware_profile,
         }
     }
 }
@@ -443,9 +477,28 @@ pub struct ScheduleInput {
     pub time: String,
     pub action_type: String,
     pub speed_limit_bytes: Option<u64>,
+    /// Required when the action is `hardware_profile`, ignored otherwise.
+    pub hardware_profile: Option<HardwareProfileGql>,
 }
 
 impl ScheduleInput {
+    /// Refuse a rule [`Self::into_entry`] would not build as asked. A
+    /// `hardware_profile` rule needs a profile, and one this machine can
+    /// honour: a rule that could never apply is refused by name here rather
+    /// than saved and skipped every time it fires.
+    pub fn validate(&self, probe: &SystemProfile) -> Result<(), String> {
+        if self.action_type != "hardware_profile" {
+            return Ok(());
+        }
+        let Some(profile) = self.hardware_profile else {
+            return Err("a hardware_profile schedule needs a hardwareProfile".to_string());
+        };
+        match HardwareProfile::from(profile).unmet_requirement(probe) {
+            Some(requirement) => Err(requirement),
+            None => Ok(()),
+        }
+    }
+
     pub fn into_entry(self) -> weaver_server_core::bandwidth::ScheduleEntry {
         use weaver_server_core::bandwidth::{ScheduleAction, Weekday};
 
@@ -456,6 +509,13 @@ impl ScheduleInput {
             "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
             "speed_limit" => ScheduleAction::SpeedLimit {
                 bytes_per_sec: self.speed_limit_bytes.unwrap_or(0),
+            },
+            "hardware_profile" => match self.hardware_profile {
+                Some(profile) => ScheduleAction::HardwareProfile {
+                    profile: profile.into(),
+                },
+                // Refused by `validate` before an entry is built.
+                None => ScheduleAction::Resume,
             },
             _ => ScheduleAction::Resume,
         };

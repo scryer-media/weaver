@@ -23,6 +23,10 @@ export interface HardwareProfileOption {
 
 export interface HardwareProfileSettings {
   selected: HardwareProfileName | null;
+  /** The profile whose limits the next activity starts with. */
+  active: HardwareProfileName;
+  /** The profile a schedule rule has in force, null when none does. */
+  scheduled: HardwareProfileName | null;
   recommended: HardwareProfileName;
   available: HardwareProfileName[];
   options: HardwareProfileOption[];
@@ -83,6 +87,18 @@ export function profileFacts(t: Translate, option: HardwareProfileOption): strin
     facts.push(t("next.performance.factDownloads", { count: option.maxConcurrentDownloads }));
   }
   return facts;
+}
+
+/**
+ * The line that explains why the profile in force may not be the one picked:
+ * a schedule rule outranks the choice while it holds. Null when no rule does.
+ */
+export function scheduledProfileNotice(
+  t: Translate,
+  settings: HardwareProfileSettings,
+): string | null {
+  if (settings.scheduled === null) return null;
+  return t("next.performance.scheduled", { profile: profileName(t, settings.scheduled) });
 }
 
 /** "16 GB RAM, 8 cores" — what the recommendation was judged against. */

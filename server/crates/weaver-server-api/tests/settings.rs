@@ -649,3 +649,28 @@ async fn the_hardware_profile_is_an_administrator_surface() {
     }
     assert!(h.config.read().await.hardware_profile.is_none());
 }
+
+#[tokio::test]
+async fn the_profile_in_force_is_reported_beside_the_choice() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute("{ hardwareProfile { selected active scheduled } }")
+        .await;
+    assert_no_errors(&resp);
+    let profile = &response_data(&resp)["hardwareProfile"];
+    // Never chosen: the recommendation is what is in force.
+    assert!(profile["selected"].is_null());
+    assert_eq!(profile["active"], "BALANCED");
+    assert!(profile["scheduled"].is_null());
+
+    let resp = h
+        .execute(
+            "mutation { setHardwareProfile(profile: EFFICIENT) { selected active scheduled } }",
+        )
+        .await;
+    assert_no_errors(&resp);
+    let profile = &response_data(&resp)["setHardwareProfile"];
+    assert_eq!(profile["selected"], "EFFICIENT");
+    assert_eq!(profile["active"], "EFFICIENT");
+    assert!(profile["scheduled"].is_null());
+}

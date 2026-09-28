@@ -90,3 +90,124 @@ fn speed_limit_entry() {
         }
     );
 }
+
+fn profile_rule(
+    id: &str,
+    time: &str,
+    days: Vec<Weekday>,
+    profile: HardwareProfile,
+) -> ScheduleEntry {
+    entry(id, time, days, ScheduleAction::HardwareProfile { profile })
+}
+
+fn at(hour: u32, minute: u32) -> NaiveTime {
+    NaiveTime::from_hms_opt(hour, minute, 0).unwrap()
+}
+
+#[test]
+fn profile_rule_holds_across_midnight() {
+    let entries = vec![
+        profile_rule("day", "17:00", vec![], HardwareProfile::Efficient),
+        profile_rule("night", "23:00", vec![], HardwareProfile::Performance),
+    ];
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Tue, at(16, 59)),
+        Some(HardwareProfile::Performance)
+    );
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Tue, at(17, 0)),
+        Some(HardwareProfile::Efficient)
+    );
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Tue, at(23, 30)),
+        Some(HardwareProfile::Performance)
+    );
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Wed, at(0, 5)),
+        Some(HardwareProfile::Performance)
+    );
+}
+
+#[test]
+fn profile_rule_holds_across_days_it_skips() {
+    let entries = vec![
+        profile_rule(
+            "fri",
+            "18:00",
+            vec![Weekday::Fri],
+            HardwareProfile::Efficient,
+        ),
+        profile_rule(
+            "mon",
+            "08:00",
+            vec![Weekday::Mon],
+            HardwareProfile::Balanced,
+        ),
+    ];
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Sun, at(12, 0)),
+        Some(HardwareProfile::Efficient)
+    );
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Thu, at(12, 0)),
+        Some(HardwareProfile::Balanced)
+    );
+}
+
+#[test]
+fn single_weekly_profile_rule_is_in_force_all_week() {
+    let entries = vec![profile_rule(
+        "only",
+        "18:00",
+        vec![Weekday::Fri],
+        HardwareProfile::Efficient,
+    )];
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Fri, at(17, 0)),
+        Some(HardwareProfile::Efficient)
+    );
+}
+
+#[test]
+fn no_profile_rule_means_no_scheduled_profile() {
+    let mut disabled = profile_rule("off", "08:00", vec![], HardwareProfile::Efficient);
+    disabled.enabled = false;
+    let entries = vec![
+        disabled,
+        entry("pause", "08:00", vec![], ScheduleAction::Pause),
+    ];
+    assert_eq!(find_active_profile(&entries, Weekday::Mon, at(9, 0)), None);
+}
+
+#[test]
+fn profile_rules_and_other_actions_do_not_displace_each_other() {
+    let entries = vec![
+        entry(
+            "limit",
+            "08:00",
+            vec![],
+            ScheduleAction::SpeedLimit {
+                bytes_per_sec: 1_000_000,
+            },
+        ),
+        profile_rule("profile", "17:00", vec![], HardwareProfile::Efficient),
+    ];
+    let active = find_active_entry(&entries, Weekday::Mon, at(18, 0)).unwrap();
+    assert_eq!(active.id, "limit");
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Mon, at(18, 0)),
+        Some(HardwareProfile::Efficient)
+    );
+}
+
+#[test]
+fn later_profile_rule_wins_at_the_same_minute() {
+    let entries = vec![
+        profile_rule("a", "17:00", vec![], HardwareProfile::Efficient),
+        profile_rule("b", "17:00", vec![], HardwareProfile::Balanced),
+    ];
+    assert_eq!(
+        find_active_profile(&entries, Weekday::Mon, at(17, 0)),
+        Some(HardwareProfile::Balanced)
+    );
+}

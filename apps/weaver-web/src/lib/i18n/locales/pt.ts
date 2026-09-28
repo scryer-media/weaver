@@ -602,6 +602,8 @@ const pt: LocaleDictionary = {
   "schedule.actionSpeedLimit": "Limite de Velocidade",
   "schedule.actionPauseWatchFolder": "Pausar verificação da pasta monitorada",
   "schedule.actionResumeWatchFolder": "Retomar verificação da pasta monitorada",
+  "schedule.actionHardwareProfile": "Perfil de Hardware",
+  "schedule.hardwareProfile": "Perfil",
   "schedule.speedLimit": "Limite de Velocidade",
   "schedule.days": "Dias",
   "schedule.daysHint": "Deixe todos desmarcados para todos os dias.",

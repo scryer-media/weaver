@@ -605,6 +605,17 @@ type HardwareProfileSettings {
 	"""
 	options: [HardwareProfileOption!]!
 	detected: DetectedHardware!
+	"""
+	The profile whose limits are in force now: the scheduled one while a
+	schedule rule has one in force, the choice or the recommendation
+	otherwise.
+	"""
+	active: HardwareProfileGql!
+	"""
+	The profile a schedule rule has in force over the choice, or null when
+	no rule does and the choice applies.
+	"""
+	scheduled: HardwareProfileGql
 }
 
 """
@@ -2376,6 +2387,11 @@ type Schedule {
 	time: String!
 	actionType: String!
 	speedLimitBytes: Int
+	"""
+	The profile a `hardware_profile` rule puts in force; null for every
+	other action.
+	"""
+	hardwareProfile: HardwareProfileGql
 }
 
 input ScheduleInput {
@@ -2385,6 +2401,10 @@ input ScheduleInput {
 	time: String!
 	actionType: String!
 	speedLimitBytes: Int
+	"""
+	Required when the action is `hardware_profile`, ignored otherwise.
+	"""
+	hardwareProfile: HardwareProfileGql
 }
 
 enum ScriptAdapterGql {
