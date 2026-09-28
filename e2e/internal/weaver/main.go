@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -289,6 +290,29 @@ func Run(args []string, programName string) {
 		os.Exit(1)
 	}
 
+	switch args[0] {
+	case "doctor":
+		if err := cmdDoctor(os.Stdout); err != nil {
+			os.Exit(1)
+		}
+		return
+	case "compose":
+		cleanup := mustActivateContainerEngine()
+		err := cmdCompose(args[1:])
+		cleanup()
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if !commandSkipsContainerPreflight(args[0]) {
+		defer mustActivateContainerEngine()()
+	}
+
 	if args[0] != "scenarios" && args[0] != "full" && args[0] != "release-gate" {
 		ensureRuntimePortEnv()
 	}
@@ -365,6 +389,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, `Usage: %s <command> [args]
 
 Commands:
+  doctor                Check the container engine and Compose provider this harness will use
+  compose <args>        Run "compose <args>" here through the resolved container engine
   seed <fixture-dir>    Post fixture via Nyuu, register NZB with indexer
   seed-all              Seed all fixtures from testdata/
   functional            Run functional full-suite phases with the dashboard
@@ -388,6 +414,7 @@ Commands:
   tls-test              Run the TLS NNTP suite
 
 Environment:
+  E2E_CONTAINER_ENGINE Container engine: docker|podman|auto (default: auto, Docker when its daemon answers)
   E2E_DIR              Path to the e2e repo root (auto-detected by default)
   E2E_PROJECT          Compose project name for this run (default: e2e)
   FIXTURES_DIR         Path to seeded fixtures (default: <repo>/fixtures)
