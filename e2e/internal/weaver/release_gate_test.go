@@ -346,6 +346,15 @@ func TestWeaverCleanupUsesExactComposeProject(t *testing.T) {
 	}
 }
 
+func TestComposeRestartWaitsForAGracefulStop(t *testing.T) {
+	t.Setenv("E2E_PROJECT", "weaver-release-restart")
+	got := dockerComposeRestartArgs("weaver")
+	want := []string{"compose", "-p", "weaver-release-restart", "restart", "--timeout", "10", "weaver"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("restart args = %q, want %q", got, want)
+	}
+}
+
 func TestPreseededNntpComposeArgsUseTheNoVolumeOverride(t *testing.T) {
 	t.Setenv("E2E_PROJECT", "weaver-seeded-images")
 	t.Setenv(nntpSeedImageActiveEnv, "1")

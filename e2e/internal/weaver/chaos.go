@@ -326,10 +326,18 @@ func requiresWeaverService(services []string) bool {
 
 func dockerComposeRestart(services ...string) error {
 	log.Printf("restarting docker services: %s", strings.Join(services, ", "))
-	args := append(dockerComposeArgs("restart"), services...)
-	cmd := containerengine.Command(args...)
+	cmd := containerengine.Command(dockerComposeRestartArgs(services...)...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "docker compose restart")
+}
+
+// dockerComposeRestartArgs restarts services with an explicit shutdown
+// timeout. Without one, Podman's restart kills the container at once instead
+// of sending the stop signal and waiting, so a restart never exercises
+// Weaver's graceful shutdown and anything it flushes on the way out is lost.
+// Docker already waits by default; the explicit timeout keeps both the same.
+func dockerComposeRestartArgs(services ...string) []string {
+	return append(dockerComposeArgs("restart", "--timeout", "10"), services...)
 }
 
 func dockerImageExists(image string) bool {
