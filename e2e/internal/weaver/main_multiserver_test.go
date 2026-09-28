@@ -3,6 +3,8 @@ package weaver
 import (
 	"reflect"
 	"testing"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 func TestExtractFirstMessageIDsReturnsLeadingIDsInNZBOrder(t *testing.T) {
@@ -83,10 +85,11 @@ func TestScenarioUsesExclusiveNntpState(t *testing.T) {
 
 func TestArticleSyncCommandsUseDockerArchiveStreaming(t *testing.T) {
 	source, destination := articleSyncCommands("primary", "backup")
-	if want := []string{"docker", "cp", "primary:/data/articles/.", "-"}; !reflect.DeepEqual(source.Args, want) {
+	binary := containerengine.Current().Binary
+	if want := []string{binary, "cp", "primary:/data/articles/.", "-"}; !reflect.DeepEqual(source.Args, want) {
 		t.Fatalf("source command = %q, want %q", source.Args, want)
 	}
-	if want := []string{"docker", "cp", "-", "backup:/data/articles"}; !reflect.DeepEqual(destination.Args, want) {
+	if want := []string{binary, "cp", "-", "backup:/data/articles"}; !reflect.DeepEqual(destination.Args, want) {
 		t.Fatalf("destination command = %q, want %q", destination.Args, want)
 	}
 }
