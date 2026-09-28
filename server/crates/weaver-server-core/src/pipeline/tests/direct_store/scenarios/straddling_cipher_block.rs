@@ -419,11 +419,7 @@ async fn a_held_only_article_republishes_its_par3_image() {
     }
     let before = par3_lost_blocks(&pipeline, job_id).expect("a settled PAR3 view");
     assert!(
-        !pipeline
-            .par3_runtime
-            .as_ref()
-            .unwrap()
-            .has_work(job_id),
+        !pipeline.par3_runtime.as_ref().unwrap().has_work(job_id),
         "the runtime is idle over the published images before the last article"
     );
 
@@ -452,11 +448,7 @@ async fn a_held_only_article_republishes_its_par3_image() {
         "the last article is held, not placed"
     );
     assert!(
-        pipeline
-            .par3_runtime
-            .as_ref()
-            .unwrap()
-            .has_work(job_id),
+        pipeline.par3_runtime.as_ref().unwrap().has_work(job_id),
         "a held article owes its volume a fresh PAR3 publication"
     );
 
