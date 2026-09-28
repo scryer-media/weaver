@@ -253,6 +253,15 @@ impl Pipeline {
         // is two writes per volume for the life of the job.
         self.cache_direct_volume_facts(job_id, set_index).await;
 
+        // An article can land wholly in the set's holds — a run behind a lost
+        // cipher predecessor is staged, not placed — so no destination write
+        // below retires the set's PAR3 images. Its bytes are still posted bytes
+        // those images serve, and one published before it landed would go on
+        // reporting them missing.
+        if spans.is_empty() {
+            self.invalidate_par3_direct_set(job_id, set_index);
+        }
+
         if !self
             .place_direct_spans(job_id, set_index, Some(segment_id), &spans)
             .await
