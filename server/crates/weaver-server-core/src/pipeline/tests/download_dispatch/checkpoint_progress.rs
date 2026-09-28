@@ -149,7 +149,6 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
         lane_id: old_id,
         runtime_generation: pipeline.pool_generation,
         server_idx: 0,
-        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: true,
         current_mode: DownloadLaneMode::Sequential,
         response_tx,
@@ -172,7 +171,6 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
         completion_critical: false,
         reason: LaneParkReason::Error,
         release_connection_slot: true,
-        release_ip_replacement_burst: false,
     });
     assert_eq!(pipeline.active_downloads, 1);
     assert_eq!(pipeline.active_download_connections, 1);
@@ -269,7 +267,6 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
             lane_id,
             runtime_generation: pipeline.pool_generation,
             server_idx: 0,
-            remote_ip: Some("127.0.0.1".parse().unwrap()),
             supports_pipelining: true,
             current_mode: DownloadLaneMode::Sequential,
             response_tx,
@@ -292,7 +289,6 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
             completion_critical: false,
             reason: LaneParkReason::Error,
             release_connection_slot: true,
-            release_ip_replacement_burst: false,
         });
         let remaining = pipeline.rate_limiter.time_until_ready().as_secs_f64();
         // Retired results still charge their ten actual transport bytes.

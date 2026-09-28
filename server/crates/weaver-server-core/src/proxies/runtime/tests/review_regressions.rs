@@ -214,7 +214,7 @@ async fn blocking_nntp_reports_unexpected_eof_but_not_quit_or_auth_rejection() {
             cfg.password = Some("fixture".into());
         }
         tokio::task::spawn_blocking(move || {
-            match weaver_nntp::BlockingNntpConnection::connect_with_ip_policy(&cfg, &[], 0) {
+            match weaver_nntp::BlockingNntpConnection::connect(&cfg) {
                 Ok(mut connection) => {
                     if matches!(mode, Mode::NoResponse) {
                         assert!(

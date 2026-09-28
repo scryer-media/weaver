@@ -482,23 +482,6 @@ impl Pipeline {
                 }
                 let _ = reply.send(());
             }
-            SchedulerCommand::SetIpReplacementTrialExtraConnections {
-                extra_connections,
-                reply,
-            } => {
-                self.ip_replacement_trial_extra_connections = extra_connections.min(1);
-                if self.ip_replacement_trial_extra_connections == 0 {
-                    self.ip_replacement_burst_active = false;
-                    self.ip_rtt_ewma.clear();
-                    self.ip_replacement_retired_ips.clear();
-                    self.metrics.set_ip_replacement_burst_active(false);
-                    self.metrics.set_ip_rtt_ewma_summary(0, 0);
-                }
-                self.metrics.set_ip_replacement_trial_extra_connections(
-                    self.ip_replacement_trial_extra_connections,
-                );
-                let _ = reply.send(());
-            }
             SchedulerCommand::SetBandwidthCapPolicy { policy, reply } => {
                 let result = self.apply_bandwidth_cap_policy(policy);
                 let _ = reply.send(result);

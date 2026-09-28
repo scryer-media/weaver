@@ -668,11 +668,6 @@ pub enum SchedulerCommand {
         seconds: u32,
         reply: oneshot::Sender<()>,
     },
-    /// Set global over-max latent-IP replacement burst budget. v1 allows 0 or 1.
-    SetIpReplacementTrialExtraConnections {
-        extra_connections: u8,
-        reply: oneshot::Sender<()>,
-    },
     /// Apply a scheduled action (pause, resume, or speed limit).
     /// Sent by the schedule evaluator background task.
     ApplyScheduleAction {
@@ -1269,22 +1264,6 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::SetPropagationDelay { seconds, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(())
-    }
-
-    pub async fn set_ip_replacement_trial_extra_connections(
-        &self,
-        extra_connections: u8,
-    ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::SetIpReplacementTrialExtraConnections {
-                extra_connections: extra_connections.min(1),
-                reply: tx,
-            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?;

@@ -380,7 +380,6 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder,
             duplicate_policy: Default::default(),
             direct_store: None,

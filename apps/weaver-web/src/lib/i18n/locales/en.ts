@@ -452,8 +452,6 @@ const en: LocaleDictionary = {
   "settings.propagationDelayDesc": "Wait until a post is this old before downloading. 0 starts immediately. Changes apply to waiting downloads without a restart.",
   "settings.maxRetries": "Max Retries",
   "settings.maxRetriesDesc": "How many times Weaver should retry an article before marking it permanently missing.",
-  "settings.ipReplacementTrialExtraConnections": "IP Replacement Burst",
-  "settings.ipReplacementTrialExtraConnectionsDesc": "Allow one temporary extra connection for proven slower-IP replacement.",
   "settings.storageAndBehavior": "Storage and Behavior",
   "settings.storageAndBehaviorDesc": "These values control where job state lives on disk and how aggressively Weaver cleans up and retries work.",
   "settings.save": "Save",

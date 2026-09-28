@@ -42,7 +42,6 @@ type GeneralSettings = {
   maxDownloadSpeed: number;
   maxRetries: number;
   propagationDelaySecs: number;
-  ipReplacementTrialExtraConnections: number;
   enableSrrdbLookup: boolean;
   duplicatePolicy: DuplicatePolicy;
 };
@@ -102,7 +101,6 @@ export function GeneralSettingsPage() {
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
   const [propagationDelaySecs, setPropagationDelaySecs] = useState(0);
-  const [ipReplacementBurst, setIpReplacementBurst] = useState(false);
   const [srrdbLookup, setSrrdbLookup] = useState(false);
   const [duplicatePolicySaveStatus, setDuplicatePolicySaveStatus] = useState<
     "idle" | "saved" | "error"
@@ -125,7 +123,6 @@ export function GeneralSettingsPage() {
     setCleanup(settings.cleanupAfterExtract ?? true);
     setMaxRetries(settings.maxRetries ?? 3);
     setPropagationDelaySecs(settings.propagationDelaySecs ?? 0);
-    setIpReplacementBurst((settings.ipReplacementTrialExtraConnections ?? 0) > 0);
     setSrrdbLookup(settings.enableSrrdbLookup ?? false);
   }, [settings]);
 
@@ -225,24 +222,6 @@ export function GeneralSettingsPage() {
     const result = await updateSettings({
       input: {
         maxDownloadSpeed: speedValue,
-      },
-    });
-
-    if (result.data?.updateSettings) {
-      applyUpdatedSettings(result.data.updateSettings);
-      toast.success(t("settings.saved"), { id: "general-settings-save" });
-    } else if (result.error) {
-      toast.error(result.error.message ?? "Unable to save settings.", {
-        id: "general-settings-save",
-      });
-    }
-  };
-
-  const updateIpReplacementBurst = async (enabled: boolean) => {
-    setIpReplacementBurst(enabled);
-    const result = await updateSettings({
-      input: {
-        ipReplacementTrialExtraConnections: enabled ? 1 : 0,
       },
     });
 
@@ -464,19 +443,6 @@ export function GeneralSettingsPage() {
                   aria-label={t("settings.propagationDelay")}
                   className="max-w-32"
                 />
-              </SettingField>
-              <SettingField
-                label={t("settings.ipReplacementTrialExtraConnections")}
-                description={t("settings.ipReplacementTrialExtraConnectionsDesc")}
-              >
-                <div className="flex flex-wrap items-center gap-3">
-                  <Switch
-                    checked={ipReplacementBurst}
-                    onCheckedChange={(enabled) => void updateIpReplacementBurst(enabled)}
-                    aria-label={t("settings.ipReplacementTrialExtraConnections")}
-                    disabled={updateState.fetching}
-                  />
-                </div>
               </SettingField>
               <SettingField
                 label="Use SRRDB release lookup"

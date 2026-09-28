@@ -429,7 +429,6 @@ const GENERAL_SETTINGS_FIELDS = `
     maxDownloadSpeed
     maxRetries
     propagationDelaySecs
-    ipReplacementTrialExtraConnections
     enableSrrdbLookup
     duplicatePolicy {
       strictActiveOrSuccess
@@ -927,6 +926,7 @@ export const SERVER_HEALTH_QUERY = gql`
       failureCount
       consecutiveFailures
       prematureDeaths
+      pinnedAddress
     }
   }
 `;

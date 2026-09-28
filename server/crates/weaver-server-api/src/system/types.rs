@@ -1,4 +1,4 @@
-use async_graphql::{Enum, InputObject, SimpleObject};
+use async_graphql::{ComplexObject, Context, Enum, InputObject, SimpleObject};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::{
@@ -175,7 +175,6 @@ pub struct Metrics {
     pub download_lanes_parking_active: u32,
     pub download_lanes_recovering_active: u32,
     pub download_lane_parks_no_work_total: u64,
-    pub download_lane_parks_ip_replacement_retired_total: u64,
     pub download_lane_parks_error_total: u64,
     pub download_lane_lease_items_total: u64,
     pub download_lane_refill_granted_total: u64,
@@ -185,18 +184,6 @@ pub struct Metrics {
     pub download_pipeline_proof_pass_total: u64,
     pub download_pipeline_cooldown_total: u64,
     pub download_pipeline_replay_items_total: u64,
-    pub ip_replacement_trial_extra_connections: u32,
-    pub ip_replacement_burst_active: bool,
-    pub ip_replacement_over_max_connections: u32,
-    pub ip_rtt_ewma_entries: u32,
-    pub ip_rtt_ewma_slowest_ms: u64,
-    pub ip_replacement_trials_started_total: u64,
-    pub ip_replacement_trials_rejected_total: u64,
-    pub ip_replacement_trials_accepted_total: u64,
-    pub ip_replacement_trials_blocked_total: u64,
-    pub ip_replacement_trials_acquire_failed_total: u64,
-    pub ip_replacement_trials_same_ip_rejected_total: u64,
-    pub ip_replacement_old_connections_retired_total: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
@@ -303,8 +290,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_lanes_parking_active: m.download_lanes_parking_active as u32,
             download_lanes_recovering_active: m.download_lanes_recovering_active as u32,
             download_lane_parks_no_work_total: m.download_lane_parks_no_work_total,
-            download_lane_parks_ip_replacement_retired_total: m
-                .download_lane_parks_ip_replacement_retired_total,
             download_lane_parks_error_total: m.download_lane_parks_error_total,
             download_lane_lease_items_total: m.download_lane_lease_items_total,
             download_lane_refill_granted_total: m.download_lane_refill_granted_total,
@@ -314,21 +299,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_pipeline_proof_pass_total: m.download_pipeline_proof_pass_total,
             download_pipeline_cooldown_total: m.download_pipeline_cooldown_total,
             download_pipeline_replay_items_total: m.download_pipeline_replay_items_total,
-            ip_replacement_trial_extra_connections: m.ip_replacement_trial_extra_connections as u32,
-            ip_replacement_burst_active: m.ip_replacement_burst_active,
-            ip_replacement_over_max_connections: m.ip_replacement_over_max_connections as u32,
-            ip_rtt_ewma_entries: m.ip_rtt_ewma_entries as u32,
-            ip_rtt_ewma_slowest_ms: m.ip_rtt_ewma_slowest_ms,
-            ip_replacement_trials_started_total: m.ip_replacement_trials_started_total,
-            ip_replacement_trials_rejected_total: m.ip_replacement_trials_rejected_total,
-            ip_replacement_trials_accepted_total: m.ip_replacement_trials_accepted_total,
-            ip_replacement_trials_blocked_total: m.ip_replacement_trials_blocked_total,
-            ip_replacement_trials_acquire_failed_total: m
-                .ip_replacement_trials_acquire_failed_total,
-            ip_replacement_trials_same_ip_rejected_total: m
-                .ip_replacement_trials_same_ip_rejected_total,
-            ip_replacement_old_connections_retired_total: m
-                .ip_replacement_old_connections_retired_total,
             segments_downloaded: m.segments_downloaded,
             segments_decoded: m.segments_decoded,
             segments_committed: m.segments_committed,
@@ -1214,6 +1184,7 @@ pub struct DiskUsage {
 
 /// Live health for one configured news server, derived from the NNTP connection pool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct ServerHealth {
     pub host: String,
     pub port: u16,
@@ -1268,6 +1239,29 @@ pub struct ServerHealth {
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,
+}
+
+#[ComplexObject]
+impl ServerHealth {
+    /// The resolved address new connections to this server dial, once an
+    /// address race has picked one. Absent before the first connect and for
+    /// a server reached through a proxy.
+    async fn pinned_address(&self, ctx: &Context<'_>) -> Option<String> {
+        let live_pool = ctx
+            .data_opt::<weaver_server_core::SchedulerHandle>()
+            .and_then(|handle| handle.nntp_pool());
+        let pool = live_pool.or_else(|| {
+            ctx.data_opt::<Option<std::sync::Arc<weaver_nntp::pool::NntpPool>>>()
+                .and_then(Clone::clone)
+        })?;
+        let idx = pool
+            .server_configs()
+            .iter()
+            .position(|config| config.host == self.host && config.port == self.port)?;
+        pool.address_plan_snapshot(weaver_nntp::ServerId(idx))?
+            .pinned
+            .map(|address| address.ip().to_string())
+    }
 }
 
 /// Reduce one server's health state, holdoff and socket counts to the single

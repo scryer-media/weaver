@@ -203,15 +203,7 @@ impl Pipeline {
         }
 
         let mut park_reason = None;
-        if request.remote_ip.is_some_and(|ip| {
-            self.ip_replacement_retired_ips
-                .contains(&ServerIpKey { server_idx, ip })
-        }) {
-            park_reason = Some(LaneParkReason::IpReplacementRetired);
-        }
-        if park_reason.is_none()
-            && let Err(error) = self.refresh_bandwidth_cap_window()
-        {
+        if let Err(error) = self.refresh_bandwidth_cap_window() {
             error!(error = %error, "failed to refresh ISP bandwidth cap state for lane refill");
             park_reason = Some(LaneParkReason::Error);
         }

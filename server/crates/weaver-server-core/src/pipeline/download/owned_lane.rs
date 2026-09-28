@@ -1517,7 +1517,6 @@ fn run_owned_blocking_download_lane(
                     lane_id: context.lane_id,
                     runtime_generation: context.runtime_generation,
                     server_idx,
-                    remote_ip: lane.remote_ip(),
                     supports_pipelining,
                     current_mode: booked_mode,
                     response_tx,
@@ -1558,7 +1557,6 @@ fn run_owned_blocking_download_lane(
                         lane_id: context.lane_id,
                         runtime_generation: context.runtime_generation,
                         server_idx,
-                        remote_ip: lane.remote_ip(),
                         supports_pipelining,
                         current_mode: booked_mode,
                         response_tx: retry_tx,
@@ -1742,7 +1740,6 @@ fn run_owned_blocking_download_lane(
         completion_critical: park_context.completion_critical,
         reason: park_reason,
         release_connection_slot: true,
-        release_ip_replacement_burst: false,
     });
     crate::runtime::perf_probe::record("download.fetch_body.owned", fetch_started.elapsed());
     deferred

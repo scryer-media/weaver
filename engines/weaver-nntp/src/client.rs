@@ -1062,8 +1062,7 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
     ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, false, &[])
-            .await
+        self.acquire_body_lane_inner(server, groups, false).await
     }
 
     pub async fn acquire_extra_body_lane(
@@ -1071,18 +1070,7 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
     ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, true, &[])
-            .await
-    }
-
-    pub async fn acquire_extra_body_lane_excluding(
-        &self,
-        server: ServerId,
-        groups: &[String],
-        excluded_ips: &[IpAddr],
-    ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, true, excluded_ips)
-            .await
+        self.acquire_body_lane_inner(server, groups, true).await
     }
 
     async fn acquire_body_lane_inner(
@@ -1090,7 +1078,6 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
         extra: bool,
-        excluded_ips: &[IpAddr],
     ) -> Result<BodyLaneLease> {
         let mut deadline = TokioInstant::now() + self.soft_timeout;
         // A BODY lane fetches by message-id, which RFC 3977 answers with no
@@ -1102,7 +1089,7 @@ impl NntpClient {
         let initial_group = groups.first().map(String::as_str);
         let mut conn = if extra {
             self.pool
-                .acquire_extra_before_deadline(server, excluded_ips, initial_group, &mut deadline)
+                .acquire_extra_before_deadline(server, initial_group, &mut deadline)
                 .await
         } else {
             self.pool
@@ -2360,8 +2347,21 @@ impl NntpClient {
         &self.pool
     }
 
-    pub async fn retire_server_ip(&self, server: ServerId, ip: IpAddr) {
-        self.pool.retire_ip(server, ip).await;
+    /// Feed the fetch times of successful attempts to the address plans of
+    /// the servers that served them.
+    pub fn record_fetch_attempts(&self, attempts: &[FetchAttemptTrace]) {
+        for attempt in attempts {
+            if attempt.outcome != FetchAttemptOutcome::Success {
+                continue;
+            }
+            if let Some(ip) = attempt.remote_ip {
+                self.pool.record_address_body_latency(
+                    ServerId(attempt.server_idx),
+                    ip,
+                    attempt.elapsed,
+                );
+            }
+        }
     }
 
     pub fn try_acquire_blocking_body_lane(
@@ -2450,9 +2450,9 @@ impl NntpClient {
                     continue;
                 }
             };
-            let (config, excluded_ips, address_offset) = self
+            let (config, route) = self
                 .pool
-                .blocking_connect_plan(server, &[])
+                .blocking_connect_plan(server)
                 .map_err(BlockingBodyLaneAcquireError::Other)?;
             if !supports_blocking_body_lane(&config) {
                 continue;
@@ -2477,8 +2477,7 @@ impl NntpClient {
                     self.pool.stable_server_id(server).unwrap_or_default(),
                     self.pool.server_transfer_control(server),
                     &config,
-                    &excluded_ips,
-                    address_offset,
+                    Some(&route),
                     groups,
                     self.soft_timeout,
                     permit,
@@ -2581,7 +2580,7 @@ impl NntpClient {
             if self.pool.server_load(server.0).1 == 0 {
                 return false;
             }
-            let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
+            let Ok((config, _)) = self.pool.blocking_connect_plan(server) else {
                 return false;
             };
             supports_blocking_body_lane(&config)

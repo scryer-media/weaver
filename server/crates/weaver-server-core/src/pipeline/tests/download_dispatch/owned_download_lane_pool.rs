@@ -3800,7 +3800,6 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
             completion_critical: false,
             server_idx: Some(0),
             connection: true,
-            ip_replacement: false,
             outstanding: HashMap::from([(
                 segment_id,
                 DownloadWork {

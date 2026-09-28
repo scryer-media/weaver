@@ -126,7 +126,6 @@ fn config_roundtrip() {
         max_download_speed: Some(1_000_000),
         isp_bandwidth_cap: None,
         propagation_delay_secs: None,
-        ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(false),
         watch_folder: crate::watch_folder::WatchFolderConfig {
             mode: crate::watch_folder::WatchFolderMode::Polling,
@@ -219,6 +218,25 @@ fn config_roundtrip() {
         .expect("the delivery-naming table must survive the round trip");
     assert_eq!(delivery_naming.deobfuscate_delivered_members, Some(false));
     assert_eq!(delivery_naming.enable_srrdb_lookup, Some(true));
+}
+
+#[test]
+fn loading_the_config_removes_settings_no_release_reads() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting("data_dir", "/tmp/weaver").unwrap();
+    for key in crate::settings::service::RETIRED_SETTING_KEYS {
+        db.set_setting(key, "1").unwrap();
+    }
+
+    db.load_config().unwrap();
+
+    for key in crate::settings::service::RETIRED_SETTING_KEYS {
+        assert_eq!(db.get_setting(key).unwrap(), None, "{key} survived a load");
+    }
+    assert_eq!(
+        db.get_setting("data_dir").unwrap(),
+        Some("/tmp/weaver".to_string())
+    );
 }
 
 /// An install that never touched direct unpack loads no table at all, which is

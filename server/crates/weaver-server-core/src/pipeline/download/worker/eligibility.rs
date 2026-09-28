@@ -17,6 +17,7 @@ impl Pipeline {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::pipeline::download::worker) fn job_has_dispatchable_work(
         &mut self,
         job_id: JobId,

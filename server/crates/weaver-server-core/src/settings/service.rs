@@ -14,6 +14,11 @@ use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 /// operator picks one.
 pub const HARDWARE_PROFILE_SETTING: &str = "hardware_profile";
 
+/// Keys earlier releases stored that nothing reads any more. Loading the
+/// config removes them, so an old database or a restored backup does not
+/// carry a setting the product no longer has.
+pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &["ip_replacement_trial_extra_connections"];
+
 impl Database {
     /// Load a full `Config` from the settings and servers tables.
     pub fn load_config(&self) -> Result<Config, StateError> {
@@ -22,6 +27,11 @@ impl Database {
             .into_iter()
             .map(|SettingRecord { key, value }| (key, value))
             .collect();
+        for key in RETIRED_SETTING_KEYS {
+            if settings.contains_key(*key) {
+                self.delete_setting(key)?;
+            }
+        }
         let servers = self.list_servers()?;
         let categories = self.list_categories()?;
 
@@ -33,9 +43,6 @@ impl Database {
         let complete_dir = settings.get("complete_dir").cloned();
         let max_download_speed = settings
             .get("max_download_speed")
-            .and_then(|v| v.parse().ok());
-        let ip_replacement_trial_extra_connections = settings
-            .get("ip_replacement_trial_extra_connections")
             .and_then(|v| v.parse().ok());
         let propagation_delay_secs = settings
             .get("propagation_delay_secs")
@@ -267,7 +274,6 @@ impl Database {
             max_download_speed,
             cleanup_after_extract,
             isp_bandwidth_cap,
-            ip_replacement_trial_extra_connections,
             propagation_delay_secs,
             watch_folder,
             duplicate_policy,
@@ -297,9 +303,6 @@ impl Database {
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;
-        }
-        if let Some(extra) = config.ip_replacement_trial_extra_connections {
-            self.set_setting("ip_replacement_trial_extra_connections", &extra.to_string())?;
         }
         self.set_setting("watch_folder.mode", config.watch_folder.mode.as_str())?;
         match config.watch_folder.normalized_path() {

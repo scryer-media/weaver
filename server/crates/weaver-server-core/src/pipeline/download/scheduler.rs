@@ -155,6 +155,7 @@ impl Pipeline {
     /// that job can still serve the server, it keeps it: a second spill job
     /// never opens beside one in flight. `pressure` is the pressure sample the
     /// caller already took for this pass.
+    #[cfg(test)]
     pub(in crate::pipeline) fn next_works(
         &mut self,
         server_idx: usize,

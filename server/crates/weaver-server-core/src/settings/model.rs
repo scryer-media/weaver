@@ -44,10 +44,6 @@ pub struct Config {
     /// Optional ISP bandwidth cap policy.
     #[serde(default)]
     pub isp_bandwidth_cap: Option<IspBandwidthCapConfig>,
-    /// Optional global burst for make-before-break latent-IP replacement trials.
-    /// Defaults to 0 and is capped at 1.
-    #[serde(default)]
-    pub ip_replacement_trial_extra_connections: Option<u8>,
     /// Watched-folder NZB intake settings.
     #[serde(default)]
     pub watch_folder: WatchFolderConfig,
@@ -124,12 +120,6 @@ impl Config {
             .unwrap_or(false)
     }
 
-    pub fn ip_replacement_trial_extra_connections(&self) -> u8 {
-        self.ip_replacement_trial_extra_connections
-            .unwrap_or(0)
-            .min(1)
-    }
-
     /// A saved setting takes precedence over the legacy environment override.
     pub fn propagation_delay_secs(&self) -> u32 {
         self.propagation_delay_secs
@@ -163,10 +153,6 @@ impl Config {
 
         if self.data_dir.is_empty() {
             errors.push("data_dir must not be empty".to_string());
-        }
-
-        if self.ip_replacement_trial_extra_connections.unwrap_or(0) > 1 {
-            errors.push("ip_replacement_trial_extra_connections must be 0 or 1".to_string());
         }
 
         if let Err(error) = self.watch_folder.validate() {
@@ -394,7 +380,6 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             propagation_delay_secs: None,
-            ip_replacement_trial_extra_connections: None,
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),
             direct_store: None,
