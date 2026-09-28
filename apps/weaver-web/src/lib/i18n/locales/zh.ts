@@ -602,6 +602,8 @@ const zh: LocaleDictionary = {
   "schedule.actionSpeedLimit": "速度限制",
   "schedule.actionPauseWatchFolder": "暂停监视文件夹扫描",
   "schedule.actionResumeWatchFolder": "恢复监视文件夹扫描",
+  "schedule.actionHardwareProfile": "硬件配置",
+  "schedule.hardwareProfile": "配置",
   "schedule.speedLimit": "速度限制",
   "schedule.days": "日期",
   "schedule.daysHint": "全部不选则表示每天生效。",

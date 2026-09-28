@@ -5,6 +5,7 @@ import {
   initialProfile,
   offersProfileChoice,
   profileFacts,
+  scheduledProfileNotice,
   type HardwareProfileOption,
   type HardwareProfileSettings,
 } from "../src/next/data/hardware-profiles.ts";
@@ -29,6 +30,8 @@ const BALANCED: HardwareProfileOption = {
 function settings(overrides: Partial<HardwareProfileSettings> = {}): HardwareProfileSettings {
   return {
     selected: null,
+    active: "BALANCED",
+    scheduled: null,
     recommended: "BALANCED",
     available: ["EFFICIENT", "BALANCED"],
     options: [EFFICIENT, BALANCED],
@@ -80,5 +83,16 @@ test("the recommendation names what it was judged against", () => {
   assert.equal(
     detectedHardware(englishTranslate, settings()),
     "Recommended for this machine: 8.0 GB RAM, 4 cores.",
+  );
+});
+
+test("a schedule holding a profile says so, and nothing is said without one", () => {
+  assert.equal(scheduledProfileNotice(englishTranslate, settings()), null);
+  assert.equal(
+    scheduledProfileNotice(
+      englishTranslate,
+      settings({ selected: "BALANCED", active: "EFFICIENT", scheduled: "EFFICIENT" }),
+    ),
+    "A schedule has the Efficient profile in force now; your choice applies whenever no schedule rule does.",
   );
 });

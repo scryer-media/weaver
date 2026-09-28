@@ -602,6 +602,8 @@ const ko: LocaleDictionary = {
   "schedule.actionSpeedLimit": "속도 제한",
   "schedule.actionPauseWatchFolder": "감시 폴더 스캔 일시정지",
   "schedule.actionResumeWatchFolder": "감시 폴더 스캔 재개",
+  "schedule.actionHardwareProfile": "하드웨어 프로필",
+  "schedule.hardwareProfile": "프로필",
   "schedule.speedLimit": "속도 제한",
   "schedule.days": "요일",
   "schedule.daysHint": "모두 선택하지 않으면 매일 적용됩니다.",

@@ -36,6 +36,7 @@ impl SettingsQuery {
         ctx: &Context<'_>,
     ) -> Result<crate::settings::types::HardwareProfileSettings> {
         let config = ctx.data::<SharedConfig>()?;
+        let handle = ctx.data::<SchedulerHandle>()?;
         let system = ctx.data::<crate::context::SystemRuntimeContext>()?;
         let probe = system
             .profile
@@ -48,9 +49,10 @@ impl SettingsQuery {
         })
         .await;
 
-        Ok(crate::settings::types::HardwareProfileSettings::resolve(
-            selected, &probe,
-        ))
+        Ok(
+            crate::settings::types::HardwareProfileSettings::resolve(selected, &probe)
+                .with_in_force(handle.hardware_profile_in_force()),
+        )
     }
 
     /// Whether first-run setup is still owed to this install.

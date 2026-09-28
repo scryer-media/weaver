@@ -54,6 +54,23 @@ impl ExtractionLimits {
         Self::resolve(complete_dir, Some(ceiling_bytes))
     }
 
+    /// These limits under another hardware profile's memory ceiling. Nothing
+    /// else here depends on the profile, and a ceiling pinned by the
+    /// environment stays pinned.
+    pub(crate) fn with_profile_ceiling(&self, ceiling_bytes: u64) -> Self {
+        self.with_memory_ceiling(ceiling_bytes, std::env::var_os(MAX_MEMORY_ENV).is_some())
+    }
+
+    /// [`Self::with_profile_ceiling`] with the environment's answer given:
+    /// the ceiling clamped as at startup, or left alone when it is pinned.
+    fn with_memory_ceiling(&self, ceiling_bytes: u64, pinned: bool) -> Self {
+        let mut limits = self.clone();
+        if !pinned {
+            limits.max_memory_bytes = ceiling_bytes.clamp(MIN_MEMORY_LIMIT, MAX_MEMORY_LIMIT);
+        }
+        limits
+    }
+
     fn resolve(complete_dir: &Path, profile_ceiling_bytes: Option<u64>) -> Result<Self, String> {
         // The completed-download directory may not exist yet at startup; its
         // nearest existing ancestor answers for the filesystem the reserve is
@@ -236,6 +253,12 @@ pub(crate) struct ProcessMemoryBudget {
     /// cannot fit posts one, so one waiter unwinds at most one parked chase
     /// per release instead of every chase in the process.
     yield_tickets: Arc<AtomicU64>,
+    /// The limit a lowered one replaced, while reservations made under it
+    /// still exceed the new one; zero otherwise. Retained admissions fail
+    /// outright instead of waiting, so without this a lowered limit would
+    /// reject every submission until the work admitted under the wider limit
+    /// had finished.
+    lowered_from: Arc<AtomicU64>,
     idle: Arc<Mutex<()>>,
     released: Arc<Condvar>,
     owners: Arc<Mutex<std::collections::HashMap<u64, std::sync::Weak<AtomicU64>>>>,
@@ -251,10 +274,52 @@ impl ProcessMemoryBudget {
             total_retained: Arc::new(AtomicU64::new(0)),
             waiting: Arc::new(AtomicU64::new(0)),
             yield_tickets: Arc::new(AtomicU64::new(0)),
+            lowered_from: Arc::new(AtomicU64::new(0)),
             idle: Arc::new(Mutex::new(())),
             released: Arc::new(Condvar::new()),
             owners: Arc::default(),
         }
+    }
+
+    /// The same pool under another limit, for the work admitted from now on.
+    ///
+    /// Reservations, waiters and owners are shared with the budget this one
+    /// replaces. A view already handed to running work keeps the limit it was
+    /// given, so lowering the limit never fails a decode that was planned
+    /// against the wider one.
+    pub(crate) fn with_limit(&self, limit: u64) -> Self {
+        let _guard = self.idle.lock().expect("process memory state poisoned");
+        if limit < self.limit {
+            self.lowered_from.fetch_max(self.limit, Ordering::AcqRel);
+        }
+        Self {
+            limit,
+            ceiling_headroom: ceiling_headroom_bytes(limit),
+            reserved: Arc::clone(&self.reserved),
+            retained: Arc::clone(&self.retained),
+            total_retained: Arc::clone(&self.total_retained),
+            waiting: Arc::clone(&self.waiting),
+            yield_tickets: Arc::clone(&self.yield_tickets),
+            lowered_from: Arc::clone(&self.lowered_from),
+            idle: Arc::clone(&self.idle),
+            released: Arc::clone(&self.released),
+            owners: Arc::clone(&self.owners),
+        }
+    }
+
+    /// The limit a retained admission is judged against: this budget's own,
+    /// or the wider one it replaced for as long as reservations made under
+    /// that one are still above this one. Called with `idle` held.
+    fn retained_admission_limit(&self) -> u64 {
+        let lowered_from = self.lowered_from.load(Ordering::Acquire);
+        if lowered_from <= self.limit {
+            return self.limit;
+        }
+        if self.reserved.load(Ordering::Acquire) <= self.limit {
+            self.lowered_from.store(0, Ordering::Release);
+            return self.limit;
+        }
+        lowered_from
     }
 
     /// Share physical admission and wakeups, but only count this job's retained
@@ -278,6 +343,7 @@ impl ProcessMemoryBudget {
             total_retained: Arc::clone(&self.total_retained),
             waiting: Arc::clone(&self.waiting),
             yield_tickets: Arc::clone(&self.yield_tickets),
+            lowered_from: Arc::clone(&self.lowered_from),
             idle: Arc::clone(&self.idle),
             released: Arc::clone(&self.released),
             owners: Arc::clone(&self.owners),
@@ -291,8 +357,9 @@ impl ProcessMemoryBudget {
         bytes: u64,
     ) -> Result<ProcessMemoryPermit, String> {
         let _guard = self.idle.lock().expect("process memory state poisoned");
-        reserve_atomic(&self.reserved, bytes, self.limit).map_err(|requested| format!(
-            "WEAVER_RESOURCE_LIMIT[memory]: reservation would reach {requested} bytes; process limit is {}", self.limit
+        let limit = self.retained_admission_limit();
+        reserve_atomic(&self.reserved, bytes, limit).map_err(|requested| format!(
+            "WEAVER_RESOURCE_LIMIT[memory]: reservation would reach {requested} bytes; process limit is {limit}"
         ))?;
         self.retained.fetch_add(bytes, Ordering::AcqRel);
         self.total_retained.fetch_add(bytes, Ordering::AcqRel);
@@ -524,6 +591,11 @@ impl ProcessMemoryBudget {
     #[cfg(test)]
     pub(crate) fn reserved_bytes(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn limit(&self) -> u64 {
+        self.limit
     }
 }
 
@@ -2618,5 +2690,101 @@ mod tests {
             "and it proceeds the moment the holder releases"
         );
         assert_eq!(shared.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn a_budget_view_taken_before_the_limit_changes_keeps_its_limit() {
+        let wide = Arc::new(ProcessMemoryBudget::new(1024));
+        let running = wide.for_job(1);
+        let narrow = Arc::new(wide.with_limit(512));
+
+        assert_eq!(running.limit(), 1024);
+        assert_eq!(narrow.limit(), 512);
+        assert_eq!(narrow.for_job(2).limit(), 512);
+        // Work planned against the wider limit still gets all of it; the same
+        // request made from now on is judged against the new limit.
+        assert!(narrow.reserve_wait(900, || Ok(())).is_err());
+        let decoder = running
+            .reserve_wait(900, || Ok(()))
+            .expect("the running view keeps its limit");
+        assert_eq!(narrow.reserved_bytes(), 900, "the views share one pool");
+        drop(decoder);
+        assert_eq!(wide.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn a_lowered_limit_admits_retained_state_up_to_the_old_one_until_reservations_drain() {
+        let wide = Arc::new(ProcessMemoryBudget::new(1024));
+        let held = wide.for_job(1).try_reserve_retained(700).unwrap();
+        let narrow = Arc::new(wide.with_limit(512));
+
+        // Reservations made under the wider limit are still above the new
+        // one: a submission is judged against the old limit, not refused.
+        let submitted = narrow.for_job(2).try_reserve_retained(200).unwrap();
+        assert_eq!(narrow.reserved_bytes(), 900);
+        assert!(
+            narrow.for_job(3).try_reserve_retained(200).is_err(),
+            "the old limit still bounds the pool"
+        );
+
+        // Once the pool is back within the new limit, the new limit applies.
+        drop(held);
+        assert_eq!(narrow.reserved_bytes(), 200);
+        let error = narrow
+            .for_job(4)
+            .try_reserve_retained(400)
+            .expect_err("the new limit applies once reservations fit it");
+        assert!(error.contains("process limit is 512"), "{error}");
+        let fits = narrow.for_job(4).try_reserve_retained(312).unwrap();
+        assert_eq!(narrow.reserved_bytes(), 512);
+        drop(fits);
+        drop(submitted);
+        assert_eq!(narrow.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn a_raised_limit_admits_more_at_once() {
+        let narrow = Arc::new(ProcessMemoryBudget::new(512));
+        let held = narrow.for_job(1).try_reserve_retained(500).unwrap();
+        assert!(narrow.for_job(2).try_reserve_retained(100).is_err());
+
+        let wide = Arc::new(narrow.with_limit(1024));
+        assert_eq!(wide.limit(), 1024);
+        let more = wide.for_job(2).try_reserve_retained(500).unwrap();
+        assert_eq!(wide.reserved_bytes(), 1000);
+        drop(more);
+        drop(held);
+        assert_eq!(narrow.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn a_profile_ceiling_is_clamped_unless_the_environment_pins_it() {
+        let base = ExtractionLimits {
+            max_memory_bytes: 3 * GIB,
+            ..(*limits()).clone()
+        };
+        assert_eq!(
+            base.with_memory_ceiling(2 * GIB, false).max_memory_bytes,
+            2 * GIB
+        );
+        assert_eq!(
+            base.with_memory_ceiling(MIB, false).max_memory_bytes,
+            MIN_MEMORY_LIMIT
+        );
+        assert_eq!(
+            base.with_memory_ceiling(512 * GIB, false).max_memory_bytes,
+            MAX_MEMORY_LIMIT
+        );
+        assert_eq!(
+            base.with_memory_ceiling(2 * GIB, true).max_memory_bytes,
+            3 * GIB
+        );
+
+        // Only the memory ceiling depends on the profile.
+        let other = base.with_memory_ceiling(2 * GIB, false);
+        assert_eq!(other.max_job_bytes, base.max_job_bytes);
+        assert_eq!(other.max_member_bytes, base.max_member_bytes);
+        assert_eq!(other.max_entries, base.max_entries);
+        assert_eq!(other.min_free_bytes, base.min_free_bytes);
     }
 }

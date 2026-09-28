@@ -24,8 +24,14 @@ import {
   UPDATE_SCHEDULE_MUTATION,
   DELETE_SCHEDULE_MUTATION,
   TOGGLE_SCHEDULE_MUTATION,
+  HARDWARE_PROFILE_QUERY,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import {
+  profileName,
+  type HardwareProfileName,
+  type HardwareProfileSettings,
+} from "@/next/data/hardware-profiles";
 
 type Schedule = {
   id: string;
@@ -35,6 +41,7 @@ type Schedule = {
   time: string;
   actionType: string;
   speedLimitBytes: number | null;
+  hardwareProfile: HardwareProfileName | null;
 };
 
 const ALL_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
@@ -55,6 +62,9 @@ export function ScheduleSettingsPage() {
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
   const [, deleteSchedule] = useMutation(DELETE_SCHEDULE_MUTATION);
   const [, toggleSchedule] = useMutation(TOGGLE_SCHEDULE_MUTATION);
+  const [profileResult] = useQuery<{ hardwareProfile: HardwareProfileSettings }>({
+    query: HARDWARE_PROFILE_QUERY,
+  });
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -65,8 +75,21 @@ export function ScheduleSettingsPage() {
   const [formLabel, setFormLabel] = useState("");
   const [formSpeed, setFormSpeed] = useState("5");
   const [formSpeedUnlimited, setFormSpeedUnlimited] = useState(false);
+  const [formProfile, setFormProfile] = useState<HardwareProfileName | null>(null);
 
   const schedules: Schedule[] = result.data?.schedules ?? [];
+
+  // A rule may only name a profile this machine can honour; until one is
+  // picked the recommendation is offered.
+  const offeredProfiles = profileResult.data?.hardwareProfile.available ?? [];
+  const chosenProfile =
+    formProfile && offeredProfiles.includes(formProfile)
+      ? formProfile
+      : offeredProfiles.find(
+          (profile) => profile === profileResult.data?.hardwareProfile.recommended,
+        ) ??
+        offeredProfiles[0] ??
+        null;
 
   const resetForm = () => {
     setShowForm(false);
@@ -78,6 +101,7 @@ export function ScheduleSettingsPage() {
     setFormDays([]);
     setFormSpeed("5");
     setFormSpeedUnlimited(false);
+    setFormProfile(null);
   };
 
   const openCreate = () => {
@@ -92,6 +116,7 @@ export function ScheduleSettingsPage() {
     setFormAction(entry.actionType);
     setFormDays(entry.days);
     setFormLabel(entry.label ?? "");
+    setFormProfile(entry.hardwareProfile);
     if (entry.actionType === "speed_limit") {
       if (entry.speedLimitBytes === 0 || entry.speedLimitBytes == null) {
         setFormSpeedUnlimited(true);
@@ -117,6 +142,9 @@ export function ScheduleSettingsPage() {
     };
     if (formAction === "speed_limit") {
       input.speedLimitBytes = formSpeedUnlimited ? 0 : parseFloat(formSpeed) * 1024 * 1024;
+    }
+    if (formAction === "hardware_profile") {
+      input.hardwareProfile = chosenProfile;
     }
     return input;
   };
@@ -197,6 +225,9 @@ export function ScheduleSettingsPage() {
                       <SelectItem value="resume_watch_folder_scanning">
                         {t("schedule.actionResumeWatchFolder")}
                       </SelectItem>
+                      <SelectItem value="hardware_profile">
+                        {t("schedule.actionHardwareProfile")}
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -227,6 +258,32 @@ export function ScheduleSettingsPage() {
                       {t("settings.unlimited")}
                     </label>
                   </div>
+                </div>
+              )}
+
+              {formAction === "hardware_profile" && (
+                <div className="space-y-2">
+                  <Label htmlFor="schedule-hardware-profile" className="text-sm font-semibold">
+                    {t("schedule.hardwareProfile")}
+                  </Label>
+                  <Select
+                    value={chosenProfile ?? ""}
+                    onValueChange={(value) => setFormProfile(value as HardwareProfileName)}
+                  >
+                    <SelectTrigger id="schedule-hardware-profile" className="w-48">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {offeredProfiles.map((profile) => (
+                        <SelectItem key={profile} value={profile}>
+                          {profileName(t, profile)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[12.5px] text-muted-foreground">
+                    {t("next.schedules.profileHelp")}
+                  </p>
                 </div>
               )}
 
@@ -313,7 +370,9 @@ export function ScheduleSettingsPage() {
                             ? t("schedule.actionResume")
                             : entry.actionType === "pause_watch_folder_scanning"
                               ? t("schedule.actionPauseWatchFolder")
-                              : t("schedule.actionResumeWatchFolder")}
+                              : entry.actionType === "hardware_profile"
+                                ? `${t("schedule.actionHardwareProfile")}: ${entry.hardwareProfile ? profileName(t, entry.hardwareProfile) : ""}`
+                                : t("schedule.actionResumeWatchFolder")}
                     </span>
                   </div>
                   <div className="mt-1 text-xs text-muted-foreground">

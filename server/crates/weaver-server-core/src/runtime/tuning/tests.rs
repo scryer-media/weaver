@@ -160,3 +160,32 @@ fn random_read_iops_update_changes_future_extraction_admission_limit() {
     tuner.set_random_read_iops(200.0);
     assert_eq!(tuner.max_concurrent_extractions(), 1);
 }
+
+#[test]
+fn a_new_profile_moves_every_limit_and_keeps_the_connection_limit() {
+    use crate::runtime::hardware_profile::HardwareProfile;
+
+    let profile = ssd_profile(16);
+    let performance = HardwareProfile::Performance.tuning(&profile);
+    let efficient = HardwareProfile::Efficient.tuning(&profile);
+    let mut tuner = RuntimeTuner::with_profile_tuning(profile, TEST_CONNECTIONS, performance);
+    assert_eq!(tuner.params().max_concurrent_downloads, 20);
+    assert_eq!(tuner.params().decode_thread_count, 16);
+    assert_eq!(tuner.params().extract_thread_count, 8);
+
+    tuner.set_profile_tuning(efficient);
+    assert_eq!(tuner.profile_tuning(), efficient);
+    assert_eq!(tuner.params().max_concurrent_downloads, 10);
+    assert_eq!(tuner.params().decode_thread_count, 2);
+    assert_eq!(tuner.params().extract_thread_count, 4);
+
+    // The configured connections still bound the profile's cap, and lifting
+    // the cap never goes past them.
+    tuner.set_connection_limit(6);
+    assert_eq!(tuner.params().max_concurrent_downloads, 6);
+    tuner.set_profile_tuning(performance);
+    assert_eq!(tuner.params().max_concurrent_downloads, 6);
+    assert_eq!(tuner.params().decode_thread_count, 16);
+    assert_eq!(tuner.params().extract_thread_count, 8);
+    assert_eq!(tuner.system_profile().cpu.physical_cores, 16);
+}

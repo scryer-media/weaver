@@ -117,11 +117,15 @@ pub struct SharedPipelineState {
     /// for a server they have never fetched from; every later depth decision
     /// comes from their own measurements.
     server_probe_latency: Arc<RwLock<HashMap<u32, Duration>>>,
-    /// Memory one conventional 7z extraction may hold, as the chosen hardware
-    /// profile decides it. Read when an extraction is admitted, so a profile
-    /// picked now reaches the next job. `u64::MAX` means no profile cap, and
+    /// Memory one conventional 7z extraction may hold, as the hardware
+    /// profile in force decides it. Read when an extraction is admitted, so a
+    /// profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
     /// the extraction ceiling alone bounds the decoder.
     sevenz_decode_memory_bytes: Arc<AtomicU64>,
+    /// The hardware profile whose limits are in force, and the scheduled one
+    /// overriding the operator's choice, if any. `None` until a pipeline has
+    /// resolved one.
+    hardware_profile: Arc<RwLock<Option<HardwareProfileInForce>>>,
     job_cancellations: JobCancellationRegistry,
     /// The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
     /// kept off the job-level broadcast: a download emits several of these
@@ -156,6 +160,7 @@ impl SharedPipelineState {
             download_transport: Arc::new(RwLock::new(Vec::new())),
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
+            hardware_profile: Arc::new(RwLock::new(None)),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
         }
@@ -294,6 +299,17 @@ impl SharedPipelineState {
     pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
         self.sevenz_decode_memory_bytes
             .store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    /// The hardware profile in force, or `None` before a pipeline has
+    /// resolved one.
+    pub fn hardware_profile_in_force(&self) -> Option<HardwareProfileInForce> {
+        *self.hardware_profile.read().unwrap()
+    }
+
+    /// Publish the hardware profile the pipeline has put in force.
+    pub fn set_hardware_profile_in_force(&self, in_force: HardwareProfileInForce) {
+        *self.hardware_profile.write().unwrap() = Some(in_force);
     }
 
     pub fn server_quota_blocked(&self) -> bool {
@@ -577,6 +593,17 @@ pub enum CancellationOrigin {
     SemanticSuperseded,
 }
 
+/// Which hardware profile's limits the pipeline is running under, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareProfileInForce {
+    /// The profile whose limits the next download, decode and extraction use.
+    pub active: crate::runtime::HardwareProfile,
+    /// The profile a schedule rule put in force over the operator's choice.
+    /// `None` when no rule does, or when the rule's profile is one this
+    /// machine cannot honour and the choice stands instead.
+    pub scheduled: Option<crate::runtime::HardwareProfile>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NntpRuntimeActivation {
     pub generation: u64,
@@ -674,8 +701,21 @@ pub enum SchedulerCommand {
         action: crate::bandwidth::ScheduleAction,
         reply: oneshot::Sender<()>,
     },
-    /// Clear any schedule-imposed pause or speed limit.
+    /// Clear any schedule-imposed pause or speed limit. A scheduled hardware
+    /// profile is a separate track and is left alone.
     ClearScheduleAction { reply: oneshot::Sender<()> },
+    /// Make this the operator's hardware profile: the one in force whenever
+    /// no schedule rule puts another in force.
+    SetHardwareProfile {
+        profile: crate::runtime::HardwareProfile,
+        reply: oneshot::Sender<()>,
+    },
+    /// Put a hardware profile in force from the schedule, or hand control
+    /// back to the operator's choice with `None`.
+    SetScheduledHardwareProfile {
+        profile: Option<crate::runtime::HardwareProfile>,
+        reply: oneshot::Sender<()>,
+    },
     /// Set or clear the ISP bandwidth cap policy.
     SetBandwidthCapPolicy {
         policy: Option<IspBandwidthCapConfig>,
@@ -1067,11 +1107,10 @@ impl SchedulerHandle {
         self.state.job_download_rates()
     }
 
-    /// Apply the chosen hardware profile's 7z decoder allowance to the jobs
-    /// that start after this call. Thread pools were sized when the process
-    /// started and keep their size until the next one.
-    pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
-        self.state.set_sevenz_decode_memory_bytes(bytes);
+    /// The hardware profile in force and the scheduled one overriding the
+    /// operator's choice (reads from shared state, no channel round-trip).
+    pub fn hardware_profile_in_force(&self) -> Option<HardwareProfileInForce> {
+        self.state.hardware_profile_in_force()
     }
 
     /// Get current metrics (reads from shared state, no channel round-trip).
@@ -1289,6 +1328,37 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::ClearScheduleAction { reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
+    /// Make `profile` the operator's hardware profile. Its limits are in
+    /// force when this returns unless a schedule rule has another in force;
+    /// work already running keeps the limits it started with.
+    pub async fn set_hardware_profile(
+        &self,
+        profile: crate::runtime::HardwareProfile,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::SetHardwareProfile { profile, reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
+    /// Put the schedule's hardware profile in force, or with `None` return to
+    /// the operator's choice (called by the schedule evaluator).
+    pub async fn set_scheduled_hardware_profile(
+        &self,
+        profile: Option<crate::runtime::HardwareProfile>,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::SetScheduledHardwareProfile { profile, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?;

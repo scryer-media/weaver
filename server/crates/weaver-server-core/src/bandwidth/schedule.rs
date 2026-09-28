@@ -3,6 +3,11 @@
 //! Every 60 seconds, evaluates all enabled schedule entries against the current
 //! local time and day-of-week. When the most recent applicable entry changes,
 //! sends the appropriate command to the scheduler.
+//!
+//! Hardware-profile entries are a second, independent track. The profile a
+//! rule put in force stays in force until the next profile rule fires, across
+//! midnight and across days the rules skip, so "performance at 23:00,
+//! efficient at 17:00" means performance all night.
 
 use std::sync::Arc;
 
@@ -11,6 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::bandwidth::{ScheduleAction, ScheduleEntry, Weekday};
+use crate::runtime::HardwareProfile;
 
 use crate::jobs::handle::SchedulerHandle;
 use crate::watch_folder::WatchFolderService;
@@ -34,6 +40,7 @@ pub fn spawn_evaluator_with_watch_folder(
 ) {
     tokio::spawn(async move {
         let mut last_action: Option<ScheduleAction> = None;
+        let mut last_profile: Option<HardwareProfile> = None;
         let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
 
         loop {
@@ -43,6 +50,7 @@ pub fn spawn_evaluator_with_watch_folder(
             let handle = handle.clone();
             let watch_folder = watch_folder.clone();
             let prev_action = last_action.clone();
+            let prev_profile = last_profile;
 
             let result = tokio::spawn(async move {
                 let entries = schedules.read().await;
@@ -50,11 +58,22 @@ pub fn spawn_evaluator_with_watch_folder(
                 let current_day = Weekday::from_chrono(now.weekday());
                 let current_time = now.time();
 
+                let desired_profile = find_active_profile(&entries, current_day, current_time);
+                if desired_profile != prev_profile {
+                    info!(
+                        profile = desired_profile.map(HardwareProfile::as_str),
+                        "schedule transition: hardware profile"
+                    );
+                    if let Err(e) = handle.set_scheduled_hardware_profile(desired_profile).await {
+                        warn!(error = %e, "failed to apply the scheduled hardware profile");
+                    }
+                }
+
                 let active = find_active_entry(&entries, current_day, current_time);
                 let desired_action = active.map(|e| e.action.clone());
 
                 if desired_action == prev_action {
-                    return desired_action; // no transition
+                    return (desired_action, desired_profile); // no transition
                 }
 
                 match &desired_action {
@@ -83,12 +102,15 @@ pub fn spawn_evaluator_with_watch_folder(
                     }
                 }
 
-                desired_action
+                (desired_action, desired_profile)
             })
             .await;
 
             match result {
-                Ok(action) => last_action = action,
+                Ok((action, profile)) => {
+                    last_action = action;
+                    last_profile = profile;
+                }
                 Err(panic) => {
                     tracing::error!(error = %panic, "CRITICAL: schedule evaluator tick panicked — loop continues");
                 }
@@ -121,6 +143,10 @@ async fn apply_schedule_action(
                 .await
                 .map_err(|error| error.to_string())
         }
+        ScheduleAction::HardwareProfile { profile } => handle
+            .set_scheduled_hardware_profile(Some(profile))
+            .await
+            .map_err(|error| error.to_string()),
         other => handle
             .apply_schedule_action(other)
             .await
@@ -132,6 +158,7 @@ async fn apply_schedule_action(
 ///
 /// Returns the entry whose `time` is closest to (but not after) `current_time`
 /// on the current day. If multiple entries have the same time, the last one wins.
+/// Hardware-profile entries are not candidates; see [`find_active_profile`].
 fn find_active_entry(
     entries: &[ScheduleEntry],
     current_day: Weekday,
@@ -141,7 +168,7 @@ fn find_active_entry(
     let mut best_time: Option<NaiveTime> = None;
 
     for entry in entries {
-        if !entry.enabled {
+        if !entry.enabled || entry.action.is_hardware_profile() {
             continue;
         }
 
@@ -171,6 +198,53 @@ fn find_active_entry(
     }
 
     best
+}
+
+/// The hardware profile the schedule has in force, or `None` when no enabled
+/// profile rule exists.
+///
+/// The rule that fired most recently wins, however long ago that was: today's
+/// rules up to now, then each earlier day's in turn, back to the rest of this
+/// weekday a week ago. Among rules at the same minute the last one wins.
+fn find_active_profile(
+    entries: &[ScheduleEntry],
+    current_day: Weekday,
+    current_time: NaiveTime,
+) -> Option<HardwareProfile> {
+    let rules: Vec<(&ScheduleEntry, NaiveTime, HardwareProfile)> = entries
+        .iter()
+        .filter(|entry| entry.enabled)
+        .filter_map(|entry| match entry.action {
+            ScheduleAction::HardwareProfile { profile } => {
+                Some((entry, parse_time(&entry.time)?, profile))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut day = current_day;
+    for days_back in 0..=7 {
+        let fired = rules
+            .iter()
+            .filter(|(entry, _, _)| entry.days.is_empty() || entry.days.contains(&day))
+            .filter(|(_, time, _)| match days_back {
+                0 => *time <= current_time,
+                7 => *time > current_time,
+                _ => true,
+            })
+            .fold(
+                None,
+                |best: Option<(NaiveTime, HardwareProfile)>, (_, time, profile)| match best {
+                    Some((best_time, _)) if best_time > *time => best,
+                    _ => Some((*time, *profile)),
+                },
+            );
+        if let Some((_, profile)) = fired {
+            return Some(profile);
+        }
+        day = day.previous();
+    }
+    None
 }
 
 fn parse_time(s: &str) -> Option<NaiveTime> {
