@@ -3,11 +3,26 @@
 import net from "node:net";
 import http from "node:http";
 import dgram from "node:dgram";
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+
+// The resolvers this container was given, in resolv.conf order. Docker lists
+// its embedded resolver; Podman lists the network's own DNS server.
+export function parseNameservers(text) {
+  return text.split("\n")
+    .map(line => /^\s*nameserver\s+(\S+)\s*$/.exec(line)?.[1])
+    .filter(address => address && net.isIP(address))
+    .map(address => ({ address, port: 53 }));
+}
+
+function containerNameservers() {
+  try { return parseNameservers(readFileSync("/etc/resolv.conf", "utf8")); } catch { return []; }
+}
 
 export async function startProxyFixture(options = {}) {
   const ip = options.ip ?? process.env.PROXY_FIXTURE_IP;
   if (!net.isIPv4(ip)) throw new Error("PROXY_FIXTURE_IP must be an IPv4 address");
+  const nameservers = options.nameservers ?? containerNameservers();
   const ports = { primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090, ...options.ports };
   const events = [];
   const sockets = new Set();
@@ -157,17 +172,21 @@ export async function startProxyFixture(options = {}) {
     const name = labels.join(".").toLowerCase();
     const type = query.readUInt16BE(cursor + 1);
     const fixture = name.endsWith(".proxy.test");
-    // Resolve only infrastructure names through Docker's embedded resolver.
+    // Resolve only infrastructure names through the container's own resolvers.
     // Every destination name above is answered locally, even when direct.
     if (["nntp", "nntp2", "weaver-postgres"].includes(name)) {
-      return await new Promise(resolve => {
-        const resolver = dgram.createSocket("udp4");
-        const timer = setTimeout(() => { resolver.close(); resolve(undefined); }, 2000);
-        const finish = answer => { clearTimeout(timer); resolver.close(); resolve(answer); };
-        resolver.once("message", finish);
-        resolver.once("error", () => finish(undefined));
-        resolver.send(query, 53, "127.0.0.11");
-      });
+      for (const server of nameservers) {
+        const answer = await new Promise(resolve => {
+          const resolver = dgram.createSocket(net.isIPv6(server.address) ? "udp6" : "udp4");
+          const timer = setTimeout(() => { resolver.close(); resolve(undefined); }, 2000);
+          const finish = answer => { clearTimeout(timer); resolver.close(); resolve(answer); };
+          resolver.once("message", finish);
+          resolver.once("error", () => finish(undefined));
+          resolver.send(query, server.port, server.address);
+        });
+        if (answer) return answer;
+      }
+      return;
     }
     if (fixture) record(direct ? "direct-dns" : "routed-dns", { name, type });
     const question = query.subarray(12, cursor + 5);
