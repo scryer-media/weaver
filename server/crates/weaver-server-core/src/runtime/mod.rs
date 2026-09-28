@@ -7,6 +7,7 @@ pub(crate) mod glob;
 pub mod hardware_profile;
 pub mod kernels;
 pub mod log_buffer;
+pub mod log_filter;
 pub(crate) mod perf_probe;
 pub mod postprocess_pool;
 pub mod process_metrics;

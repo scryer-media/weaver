@@ -1147,6 +1147,24 @@ export const SERVICE_LOGS_QUERY = gql`
   }
 `;
 
+export const LOG_FILTER_QUERY = gql`
+  query LogFilter {
+    logFilter {
+      directives
+      defaultDirectives
+    }
+  }
+`;
+
+export const SET_LOG_FILTER_MUTATION = gql`
+  mutation SetLogFilter($directives: String!) {
+    setLogFilter(directives: $directives) {
+      directives
+      defaultDirectives
+    }
+  }
+`;
+
 export const SERVICE_LOG_LINES_SUBSCRIPTION = gql`
   subscription ServiceLogLines {
     serviceLogLines
