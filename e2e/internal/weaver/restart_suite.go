@@ -2452,7 +2452,30 @@ func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCase
 }
 
 func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResult, error) {
+	// The job downloads in well under a second, so polling cannot catch it
+	// mid-download. Refuse every BODY until the job has been observed in the
+	// state under test; the job then waits on the provider instead of racing
+	// the harness.
+	const articleGate = "greet_400=100,reauth_body=100"
+	var releaseArticleGate func() error
+	defer func() {
+		if releaseArticleGate != nil {
+			if err := releaseArticleGate(); err != nil {
+				log.Printf("warning: release primary NNTP article gate: %v", err)
+			}
+		}
+	}()
+	openArticleGate := func() error {
+		release := releaseArticleGate
+		releaseArticleGate = nil
+		return release()
+	}
+
 	if err := ctx.startWeaverWithOptions("", 1); err != nil {
+		return restartCaseResult{}, err
+	}
+	releaseArticleGate, err := holdNntpChaosOnServer(nntpHost(), nntpPort(), articleGate)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2460,9 +2483,7 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 		return restartCaseResult{}, err
 	}
 	_, err = ctx.waitForFacade(jobID, 3*time.Minute, func(snapshot facadeItemSnapshot) bool {
-		return snapshot.InQueue &&
-			snapshot.Status == "DOWNLOADING" &&
-			snapshot.DownloadedBytes >= 4*1024*1024
+		return snapshot.InQueue && snapshot.Status == "DOWNLOADING"
 	})
 	if err != nil {
 		return restartCaseResult{}, err
@@ -2474,6 +2495,9 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 		return jobStatusFromDB(snapshot, jobID) == "paused"
 	})
 	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := openArticleGate(); err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := ctx.killWeaverForRestart(); err != nil {
@@ -2503,6 +2527,12 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 
 	firstResumedDBStatus := ""
 	if restoredPaused {
+		// Hold the resumed job the same way, so the first status it takes
+		// cannot be overtaken by the job completing between two polls.
+		releaseArticleGate, err = holdNntpChaosOnServer(nntpHost(), nntpPort(), articleGate)
+		if err != nil {
+			return restartCaseResult{}, err
+		}
 		if err := resumeQueueItemGraphQL(ctx.weaverURL, jobID); err != nil {
 			return restartCaseResult{}, err
 		}
@@ -2518,6 +2548,9 @@ func runPausedJobRestoresResumeTarget(ctx *restartCaseContext) (restartCaseResul
 			return restartCaseResult{}, err
 		}
 		writeRestartJSON(filepath.Join(ctx.CaseDir, "post_resume_db.json"), resumeSnapshot)
+		if err := openArticleGate(); err != nil {
+			return restartCaseResult{}, err
+		}
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if err != nil {
