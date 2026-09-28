@@ -33,6 +33,12 @@ const RUNG_WARMUP_WINDOW_RESPONSES: u64 = 8;
 /// whether the link has changed.
 const RUNG_WARMUP_WINDOWS: u8 = 2;
 
+/// Status-line waits held before their minimum folds into the round-trip
+/// estimate, independently of the rung window. Matches the short warm-up
+/// window, so a server whose rung window never closes refreshes its round
+/// trip about as often as one whose window is still short.
+const LATENCY_FOLD_SAMPLES: u32 = RUNG_WARMUP_WINDOW_RESPONSES as u32;
+
 /// A rung is only kept when it beats the rung below it by this much; anything
 /// less is noise on a shared link.
 const RUNG_KEEP_THROUGHPUT_RATIO: f64 = 1.05;
@@ -233,6 +239,8 @@ pub(crate) struct ServerPipelineExplorer {
     /// each of those asks for depth the link cannot use.
     window_latency_warm_min: Option<Duration>,
     window_latency_cold_min: Option<Duration>,
+    /// Status-line waits held since the last fold, warm and cold.
+    window_latency_samples: u32,
     /// Bytes and wire time of every response in the window, whatever rung it
     /// was issued at. These feed the link model — body size and wire rate —
     /// which describes the link rather than the depth, so a lane still
@@ -279,6 +287,7 @@ impl Default for ServerPipelineExplorer {
             window_responses: 0,
             window_latency_warm_min: None,
             window_latency_cold_min: None,
+            window_latency_samples: 0,
             window_model_bytes: 0,
             window_wire_elapsed: Duration::ZERO,
             window_rung_responses: 0,
@@ -377,8 +386,11 @@ impl ServerPipelineExplorer {
     /// carries the handshake's tail — TLS session setup, authentication, the
     /// group probe — and none of it recurs once the connection is warm.
     ///
-    /// Samples are held to the end of the window and only their minimum
-    /// reaches the round-trip estimate; see `window_latency_warm_min`.
+    /// Samples are held and only their minimum reaches the round-trip
+    /// estimate; see `window_latency_warm_min`. They fold when the rung window
+    /// closes, and also every [`LATENCY_FOLD_SAMPLES`] samples on their own,
+    /// so a server pinned sequential or held under pressure — whose rung
+    /// window never closes — still keeps its round trip current.
     pub(in crate::pipeline) fn note_latency_sample(&mut self, sample: Duration, cold: bool) {
         let slot = if cold {
             &mut self.window_latency_cold_min
@@ -386,18 +398,26 @@ impl ServerPipelineExplorer {
             &mut self.window_latency_warm_min
         };
         *slot = Some(slot.map_or(sample, |current| current.min(sample)));
+        self.window_latency_samples = self.window_latency_samples.saturating_add(1);
+        if self.window_latency_samples >= LATENCY_FOLD_SAMPLES {
+            self.fold_window_latency();
+        }
     }
 
-    /// Fold the window's shortest status-line wait into the round-trip
-    /// estimate. A warm sample always wins; a cold one is only ever a stand-in
-    /// for a server that has not yet measured a round trip at all, so a
-    /// handshake never drags an estimate the warm lanes have already settled.
+    /// Fold the shortest status-line wait held so far into the round-trip
+    /// estimate and start holding afresh. A warm sample always wins; a cold
+    /// one is only ever a stand-in for a server that has not yet measured a
+    /// round trip at all, so a handshake never drags an estimate the warm
+    /// lanes have already settled.
     fn fold_window_latency(&mut self) {
         if let Some(warm) = self.window_latency_warm_min {
             self.latency = Some(blend(self.latency, warm));
         } else if self.latency.is_none() {
             self.latency = self.window_latency_cold_min;
         }
+        self.window_latency_warm_min = None;
+        self.window_latency_cold_min = None;
+        self.window_latency_samples = 0;
     }
 
     pub(in crate::pipeline) fn note_transfer(&mut self, sample: Duration) {
@@ -705,8 +725,6 @@ impl ServerPipelineExplorer {
 
     fn reset_window(&mut self) {
         self.window_responses = 0;
-        self.window_latency_warm_min = None;
-        self.window_latency_cold_min = None;
         self.window_model_bytes = 0;
         self.window_wire_elapsed = Duration::ZERO;
         self.window_rung_responses = 0;
@@ -898,17 +916,39 @@ mod tests {
     /// slow outlier in the same window, warm or cold, does not move it.
     #[test]
     fn the_window_folds_its_shortest_warm_latency() {
-        let mut explorer = explorer(100, 50);
+        let mut explorer = explorer(300, 50);
         let now = Instant::now();
         explorer.note_latency_sample(Duration::from_millis(900), true);
         explorer.note_latency_sample(Duration::from_millis(100), false);
         explorer.note_latency_sample(Duration::from_millis(700), false);
         explorer.note_latency_sample(Duration::from_millis(100), false);
-        assert_eq!(explorer.latency(), Some(Duration::from_millis(100)));
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(300)));
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
-        assert_eq!(explorer.latency(), Some(Duration::from_millis(100)));
+        // blend(300, 100): three quarters of the old estimate plus a quarter
+        // of the minimum, not of the 700 ms outlier or the 900 ms cold wait.
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(250)));
         assert_eq!(explorer.window_latency_warm_min, None);
         assert_eq!(explorer.window_latency_cold_min, None);
+    }
+
+    /// A server whose rung window never closes — pinned sequential here —
+    /// still folds its round trip every few samples.
+    #[test]
+    fn latency_folds_on_its_own_when_the_rung_window_never_closes() {
+        let mut explorer = explorer(300, 50);
+        explorer.pinned_sequential = true;
+        let now = Instant::now();
+        for _ in 0..LATENCY_FOLD_SAMPLES - 1 {
+            explorer.note_latency_sample(Duration::from_millis(100), false);
+            assert_eq!(
+                explorer.note_response(now, 1, 100_000, Duration::from_millis(100), true, false),
+                None
+            );
+        }
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(300)));
+        explorer.note_latency_sample(Duration::from_millis(100), false);
+        assert_eq!(explorer.latency(), Some(Duration::from_millis(250)));
+        assert_eq!(explorer.window_latency_samples, 0);
     }
 
     /// A cold sample stands in only while the server has no round trip at
