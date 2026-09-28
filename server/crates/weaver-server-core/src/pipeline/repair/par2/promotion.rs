@@ -958,7 +958,7 @@ impl Pipeline {
             file.discovery = Par2DiscoveryState::Exhausted { set_ids };
             return false;
         }
-        info!(
+        debug!(
             job_id = job_id.0,
             file_index,
             filename = %filename,
@@ -1095,7 +1095,9 @@ impl Pipeline {
             should_warn
         };
         if should_warn {
-            warn!(
+            // Routine for a posting whose recovery files carry no usable
+            // metadata. A repair or failure it leads to reports itself.
+            info!(
                 job_id = job_id.0,
                 exhausted_candidates = ?exhausted,
                 "PAR2 metadata discovery exhausted every declared candidate"

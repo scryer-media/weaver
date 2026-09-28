@@ -235,7 +235,7 @@ impl Pipeline {
         }
         match tokio::fs::remove_dir_all(dir).await {
             Ok(()) => {
-                info!(dir = %dir.display(), "removed complete output directory");
+                debug!(dir = %dir.display(), "removed complete output directory");
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -251,6 +251,7 @@ impl Pipeline {
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.jobs.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
+        self.posted_name_disagreement_logged.remove(&job_id);
         self.retire_stalled_download_lanes(job_id);
         self.job_scheduling_memory.remove(&job_id);
         self.repeated_articles.remove(&job_id);

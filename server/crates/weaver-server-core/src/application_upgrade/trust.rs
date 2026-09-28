@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// How long a successful refresh is trusted before the next one.
 const TRUST_ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -53,10 +53,19 @@ where
 {
     install_default_rustls_provider();
     tokio::spawn(async move {
+        // The first success replaces the embedded snapshot, which is news. The
+        // refresher reports nothing about what later ones changed, so those
+        // stay at debug.
+        let mut refreshed_before = false;
         loop {
             match refresh().await {
                 Ok(()) => {
-                    info!("sigstore trust roots refreshed");
+                    if refreshed_before {
+                        debug!("sigstore trust roots refreshed");
+                    } else {
+                        info!("sigstore trust roots refreshed");
+                    }
+                    refreshed_before = true;
                     tokio::time::sleep(TRUST_ROOT_REFRESH_INTERVAL).await;
                 }
                 Err(error) => {

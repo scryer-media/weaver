@@ -70,8 +70,15 @@ async fn run_maintenance_pass(db: Database, complete_dir: PathBuf) {
     }
 
     match tokio::task::spawn_blocking(move || run_staging_cleanup(&db, &complete_dir)).await {
-        Ok(Ok(report)) => {
+        Ok(Ok(report)) if report.removed_count > 0 => {
             tracing::info!(
+                staging_dirs_removed = report.removed_count,
+                staging_bytes_removed = report.removed_bytes,
+                "stale staging cleanup complete"
+            );
+        }
+        Ok(Ok(report)) => {
+            tracing::debug!(
                 staging_dirs_removed = report.removed_count,
                 staging_bytes_removed = report.removed_bytes,
                 "stale staging cleanup complete"

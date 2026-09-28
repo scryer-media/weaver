@@ -2975,6 +2975,10 @@ pub struct Pipeline {
     /// completion check comes round again for as long as discovery is open,
     /// and the wait is news once.
     pub(super) par2_discovery_wait_logged: HashSet<JobId>,
+    /// Jobs that have reported a posted article name disagreeing with its
+    /// file. Obfuscated posts do this for every file; the job says so once and
+    /// each file's detail stays at debug.
+    pub(super) posted_name_disagreement_logged: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
     /// Split sets a recovery set has already answered for, keyed by set name,

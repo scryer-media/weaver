@@ -442,7 +442,7 @@ impl Pipeline {
                 .map(|state| state.spec.total_bytes)
                 .unwrap_or(0);
             let tuner_max = self.tuner.params().max_concurrent_downloads;
-            info!(
+            debug!(
                 job_id = job_id.0,
                 total_bytes = total,
                 configured_server_count = self.nntp.pool().server_count(),
@@ -643,6 +643,20 @@ impl Pipeline {
                             parked_recovery_only,
                             status_allows_dispatch,
                             "dispatch idle: job not eligible by status"
+                        );
+                    } else if parked_recovery_only && !status_allows_dispatch {
+                        // Recovery parked behind a phase that dispatches
+                        // nothing — moving the output, say — is waiting for
+                        // that phase, not stalled. The phase ends it.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch idle: parked recovery behind a non-dispatching phase"
                         );
                     } else {
                         ineligible_jobs.push((

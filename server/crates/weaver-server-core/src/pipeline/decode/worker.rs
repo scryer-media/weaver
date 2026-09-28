@@ -4108,7 +4108,16 @@ impl Pipeline {
                                 "posted article name deferred to PAR2 canonical identity"
                             );
                         } else {
-                            warn!(
+                            if self.posted_name_disagreement_logged.insert(job_id) {
+                                info!(
+                                    job_id = job_id.0,
+                                    assembly = %filename,
+                                    posted = %posted_name,
+                                    "posted article names disagree with assembly filenames; \
+                                     further files of this job are reported at debug"
+                                );
+                            }
+                            debug!(
                                 job_id = job_id.0,
                                 assembly = %filename,
                                 posted = %posted_name,
@@ -4117,7 +4126,7 @@ impl Pipeline {
                         }
                     }
 
-                    info!(file_id = %file_id, filename = %filename, "file complete");
+                    debug!(file_id = %file_id, filename = %filename, "file complete");
                     let _ = self.event_tx.send(PipelineEvent::FileComplete {
                         file_id,
                         filename: filename.to_string(),

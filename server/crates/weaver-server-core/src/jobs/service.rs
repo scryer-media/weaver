@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::events::model::PipelineEvent;
 use crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
@@ -667,7 +667,7 @@ impl Pipeline {
             "pipeline.add_job.working_dir_ready",
             stage_start.elapsed(),
         );
-        info!(
+        debug!(
             job_id = job_id.0,
             working_dir = %working_dir.display(),
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -788,7 +788,7 @@ impl Pipeline {
             "pipeline.add_job.persist_active_job",
             stage_start.elapsed(),
         );
-        info!(
+        debug!(
             job_id = job_id.0,
             elapsed_ms = started.elapsed().as_millis() as u64,
             stage = "active_job_persisted",
