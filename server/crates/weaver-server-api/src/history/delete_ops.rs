@@ -22,10 +22,12 @@ use weaver_server_core::{
 /// answer is normal; no answer at all is not. Without a bound, a pipeline
 /// that never replies leaves the whole operation claimed forever and every
 /// target in it showing as in progress. Past this the target is failed as
-/// unanswered and the operation finalises, so the rows can be retried.
+/// unanswered and the operation finalises, so the rows can be retried. The
+/// pipeline may still carry the delete out after the deadline; the error
+/// text says so, and a retry settles which way it went.
 const HISTORY_DELETE_REPLY_DEADLINE: Duration = Duration::from_secs(300);
 
-const PIPELINE_DID_NOT_ANSWER: &str = "pipeline did not answer the history delete";
+const PIPELINE_DID_NOT_ANSWER: &str = "pipeline did not answer the history delete within the deadline; the delete may still finish, retry to confirm";
 
 #[derive(Clone)]
 pub(crate) struct HistoryDeleteManager {
@@ -225,7 +227,7 @@ impl HistoryDeleteManager {
                     operation_id = target.operation_id,
                     job_id = target.target_id,
                     deadline_secs = HISTORY_DELETE_REPLY_DEADLINE.as_secs(),
-                    "{PIPELINE_DID_NOT_ANSWER}; failing the target"
+                    "pipeline did not answer the history delete in time; failing the target, the delete may still finish"
                 );
                 Err(SchedulerError::Internal(
                     PIPELINE_DID_NOT_ANSWER.to_string(),
@@ -513,6 +515,10 @@ mod tests {
             state[&9].error_message.as_deref(),
             Some(PIPELINE_DID_NOT_ANSWER)
         );
+        // The row may yet be deleted by the pipeline, so the message must not
+        // read as a final refusal.
+        assert!(PIPELINE_DID_NOT_ANSWER.contains("may still finish"));
+        assert!(PIPELINE_DID_NOT_ANSWER.contains("retry"));
         let summaries = db.list_history_delete_operations(false).unwrap();
         assert_eq!(summaries[0].id, operation_id);
         assert_eq!(
