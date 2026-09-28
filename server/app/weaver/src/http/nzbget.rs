@@ -851,12 +851,15 @@ struct AppendRequest {
 }
 
 async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
-    let request = parse_append_params(params)?;
-    let script_override = resolve_nzbget_script_override(ctx, &request).await?;
+    let request = parse_append_params(params).map_err(|error| append_refused("", error))?;
+    let requested_name = request.filename.clone().unwrap_or_default();
+    let script_override = resolve_nzbget_script_override(ctx, &request)
+        .await
+        .map_err(|error| append_refused(&requested_name, error))?;
     let (nzb_bytes, fetched_filename) = if is_http_url(&request.content_or_url) {
         match fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await {
             Ok(fetched) => fetched,
-            Err(error) => return append_rejection_result(error),
+            Err(error) => return append_rejection_result(&requested_name, error),
         }
     } else {
         // Strip ASCII whitespace before decoding: with trim_text off, typed
@@ -874,9 +877,12 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
                 .copied()
                 .filter(|byte| !byte.is_ascii_whitespace()),
         );
-        let bytes = BASE64_STANDARD
-            .decode(&cleaned)
-            .map_err(|error| RpcError::invalid_parameter(format!("invalid base64: {error}")))?;
+        let bytes = BASE64_STANDARD.decode(&cleaned).map_err(|error| {
+            append_refused(
+                &requested_name,
+                RpcError::invalid_parameter(format!("invalid base64: {error}")),
+            )
+        })?;
         (bytes, None)
     };
 
@@ -921,7 +927,7 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
     }
 
     let mut metadata = submit_metadata(Some(attributes), client_request_id)
-        .map_err(RpcError::invalid_parameter)?;
+        .map_err(|error| append_refused(&requested_name, RpcError::invalid_parameter(error)))?;
     if let Some(scripts) = script_override {
         metadata.push((
             weaver_server_core::post_processing::settings::JOB_SCRIPT_OVERRIDE_METADATA_KEY
@@ -929,12 +935,14 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
             scripts,
         ));
     }
+    let filename = request.filename.or(fetched_filename);
+    let release = filename.clone().unwrap_or_default();
     let submitted = submit_nzb_bytes_with_options(
         &ctx.db,
         &ctx.handle,
         &ctx.config,
         &nzb_bytes,
-        request.filename.or(fetched_filename),
+        filename,
         None,
         request.category.clone(),
         metadata,
@@ -959,7 +967,7 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
 
     match submitted {
         Ok(submitted) => Ok(json!(submitted.job_id.0)),
-        Err(error) => append_rejection_result(error),
+        Err(error) => append_rejection_result(&release, error),
     }
 }
 
@@ -1034,7 +1042,54 @@ fn script_override_from_listing(
     Ok(Some(selected.join(",")))
 }
 
-fn append_rejection_result(error: SubmitNzbError) -> Result<Value, RpcError> {
+/// Logs an append the facade refused before it reached submission. The
+/// release is named by its file name only: a fetch URL can carry credentials.
+fn append_refused(release: &str, error: RpcError) -> RpcError {
+    tracing::warn!(
+        target: "weaver::nzbget_facade",
+        release,
+        kind = "invalid request",
+        error = %error.message,
+        "rejected NZB append"
+    );
+    error
+}
+
+fn append_rejection_kind(error: &SubmitNzbError) -> &'static str {
+    match error {
+        SubmitNzbError::Parse(_) => "parse",
+        SubmitNzbError::Empty => "empty",
+        SubmitNzbError::Save(_) => "save",
+        SubmitNzbError::Upload(_) => "upload",
+        SubmitNzbError::Scheduler(_) => "scheduler",
+        SubmitNzbError::State(_) => "state",
+        SubmitNzbError::Fetch(_) => "fetch",
+        SubmitNzbError::NotXml => "not xml",
+        SubmitNzbError::InvalidCategory(_) => "invalid category",
+        SubmitNzbError::DuplicateBlocked { .. } => "duplicate",
+        SubmitNzbError::IdempotencyConflict { .. } => "idempotency conflict",
+    }
+}
+
+fn append_rejection_result(release: &str, error: SubmitNzbError) -> Result<Value, RpcError> {
+    let kind = append_rejection_kind(&error);
+    if matches!(error, SubmitNzbError::DuplicateBlocked { .. }) {
+        tracing::info!(
+            target: "weaver::nzbget_facade",
+            release,
+            kind,
+            error = %error,
+            "rejected NZB append"
+        );
+    } else {
+        tracing::warn!(
+            target: "weaver::nzbget_facade",
+            release,
+            kind,
+            error = %error,
+            "rejected NZB append"
+        );
+    }
     match error {
         SubmitNzbError::Parse(_) | SubmitNzbError::Empty | SubmitNzbError::NotXml => Ok(json!(0)),
         SubmitNzbError::DuplicateBlocked { .. } => Ok(json!(0)),
@@ -1082,23 +1137,46 @@ mod append_rejection_tests {
     }
 
     #[test]
+    fn each_rejection_is_named_by_its_kind() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(append_rejection_kind(&SubmitNzbError::Empty), "empty");
+        assert_eq!(append_rejection_kind(&SubmitNzbError::NotXml), "not xml");
+        assert_eq!(
+            append_rejection_kind(&SubmitNzbError::Save(denied())),
+            "save"
+        );
+        assert_eq!(
+            append_rejection_kind(&SubmitNzbError::Upload(denied())),
+            "upload"
+        );
+        assert_eq!(
+            append_rejection_kind(&SubmitNzbError::Fetch("HTTP 404".into())),
+            "fetch"
+        );
+        assert_eq!(
+            append_rejection_kind(&SubmitNzbError::IdempotencyConflict { job_id: 7 }),
+            "idempotency conflict"
+        );
+    }
+
+    #[test]
     fn append_rejection_result_returns_zero_for_parse_empty_and_notxml() {
         let parse_error = weaver_nzb::parse_nzb(b"not an nzb").unwrap_err();
         assert_eq!(
-            append_rejection_result(SubmitNzbError::Parse(parse_error)).unwrap(),
+            append_rejection_result("", SubmitNzbError::Parse(parse_error)).unwrap(),
             json!(0)
         );
         assert_eq!(
-            append_rejection_result(SubmitNzbError::Empty).unwrap(),
+            append_rejection_result("", SubmitNzbError::Empty).unwrap(),
             json!(0)
         );
         assert_eq!(
-            append_rejection_result(SubmitNzbError::NotXml).unwrap(),
+            append_rejection_result("", SubmitNzbError::NotXml).unwrap(),
             json!(0)
         );
 
         let error =
-            append_rejection_result(SubmitNzbError::Fetch("not allowed".into())).unwrap_err();
+            append_rejection_result("", SubmitNzbError::Fetch("not allowed".into())).unwrap_err();
         assert_eq!(error.code, 2);
         assert!(error.message.contains("not allowed"));
     }
