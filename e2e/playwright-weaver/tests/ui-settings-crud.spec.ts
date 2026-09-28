@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
+import { introspectHardwareProfile } from "./support/runtime-introspection";
 
 const afterRestart = process.env.E2E_WEAVER_UI_STAGE === "after-restart";
 const persistedCategory = "e2e-product-category-persisted";
@@ -218,6 +219,45 @@ test("schedule rules support create, toggle, edit, and delete", async ({ cleanPa
   const persistedEnabled = rule.getByRole("switch", { name: "04:30 schedule enabled", exact: true });
   await persistedEnabled.click();
   await expect(persistedEnabled).not.toBeChecked();
+});
+
+test("the performance profile saves the moment a card is picked and keeps it", async ({ cleanPage: page, request }) => {
+  const offered = await introspectHardwareProfile(request);
+  test.skip(
+    offered.available.length < 2,
+    "this machine can run only one hardware profile, so Settings offers no choice",
+  );
+
+  await page.goto("/settings/general");
+  const recommended = page
+    .getByRole("radiogroup", { name: "Performance", exact: true })
+    .getByRole("radio")
+    .filter({ has: page.getByText("Recommended", { exact: true }) });
+  const unconfirmed = page.getByText("Running the recommended profile, not yet confirmed.", { exact: true });
+  if (afterRestart) {
+    await expect(recommended).toHaveAttribute("aria-checked", "true");
+    await expect(unconfirmed).toBeHidden();
+    return;
+  }
+
+  const saved = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname.endsWith("/graphql")
+      && response.request().method() === "POST"
+      && response.request().postData()?.includes("mutation SetHardwareProfile") === true,
+  );
+  await recommended.click();
+  const response = await saved;
+  expect(response.ok()).toBeTruthy();
+  const payload = await response.json();
+  expect(payload.errors ?? [], JSON.stringify(payload.errors ?? [])).toEqual([]);
+  await expect(recommended).toHaveAttribute("aria-checked", "true");
+  await expect(unconfirmed).toBeHidden();
+  await expect(page.getByRole("alert")).toBeHidden();
+
+  await page.reload();
+  await expect(recommended).toHaveAttribute("aria-checked", "true");
+  await expect(unconfirmed).toBeHidden();
 });
 
 test("settings navigation owns every coverage-ledger route", async ({ cleanPage: page }) => {

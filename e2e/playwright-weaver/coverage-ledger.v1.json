@@ -395,6 +395,11 @@
       "rationale": "The runtime browser flow verifies history rendering and pagination without deleting release evidence."
     },
     {
+      "name": "setLogFilter",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
       "name": "startApplicationUpgrade",
       "owner": "ui-runtime-observability",
       "oracle": "unit-only",
@@ -500,6 +505,11 @@
     },
     {
       "name": "removeServer",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
+      "name": "setHardwareProfile",
       "owner": "ui-settings-crud",
       "oracle": "browser"
     },
