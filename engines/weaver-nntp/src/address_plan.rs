@@ -557,7 +557,7 @@ impl AddressPlan {
             done: false,
         };
         let resolved = match dialer.resolve() {
-            Ok(addrs) => distinct_capped(addrs),
+            Ok(addrs) => distinct_addrs(addrs),
             Err(error) => {
                 debug!(server = %self.label, error = %error, "address race could not resolve");
                 Vec::new()
@@ -581,7 +581,7 @@ impl AddressPlan {
 
         let (tx, rx) = mpsc::channel();
         let mut last_error = None;
-        for &addr in &candidates {
+        for &addr in candidates.iter().take(MAX_RACE_CANDIDATES) {
             let tx = tx.clone();
             let dialer = Arc::clone(dialer);
             let plan = Arc::clone(self);
@@ -622,6 +622,23 @@ impl AddressPlan {
                     if is_slow(&error) {
                         slow.push(addr);
                     }
+                    last_error = Some(error);
+                }
+            }
+        }
+        // Keep the thread count bounded, but let this connect try every
+        // address the resolver returned before declaring the race lost.
+        for &addr in candidates.iter().skip(MAX_RACE_CANDIDATES) {
+            let started = Instant::now();
+            match dialer.dial(addr) {
+                Ok(stream) => {
+                    let elapsed = started.elapsed();
+                    self.record_connect(addr, Some(elapsed));
+                    ticket.finish(Ok(addr), Some(elapsed), resolved);
+                    return Ok((stream, addr));
+                }
+                Err(error) => {
+                    self.record_connect(addr, None);
                     last_error = Some(error);
                 }
             }
@@ -1117,12 +1134,9 @@ fn is_slow(error: &io::Error) -> bool {
     )
 }
 
-fn distinct_capped(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    let mut distinct = Vec::with_capacity(addrs.len().min(MAX_RACE_CANDIDATES));
+fn distinct_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut distinct = Vec::with_capacity(addrs.len());
     for addr in addrs {
-        if distinct.len() == MAX_RACE_CANDIDATES {
-            break;
-        }
         if !distinct.contains(&addr) {
             distinct.push(addr);
         }

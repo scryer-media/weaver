@@ -149,6 +149,35 @@ fn the_first_address_to_answer_is_pinned_and_later_connects_dial_it() {
 }
 
 #[test]
+fn addresses_beyond_the_race_limit_remain_available_for_fallback() {
+    let addresses: Vec<_> = (1..=MAX_RACE_CANDIDATES + 1)
+        .map(|index| addr(index as u8))
+        .collect();
+    let dialer = ScriptedDialer::new(&addresses);
+    for &address in addresses.iter().take(MAX_RACE_CANDIDATES) {
+        dialer.answer(address, Answer::Refuse);
+    }
+    let plan = plan();
+
+    let (_, connected) = plan.connect(&dialer).unwrap();
+
+    assert_eq!(connected, addresses[MAX_RACE_CANDIDATES]);
+    let dialled = dialer.take_dialled();
+    assert_eq!(dialled.len(), addresses.len());
+    assert!(addresses.iter().all(|address| dialled.contains(address)));
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.pinned, Some(connected));
+    assert_eq!(
+        snapshot
+            .addresses
+            .iter()
+            .map(|candidate| candidate.address)
+            .collect::<Vec<_>>(),
+        addresses
+    );
+}
+
+#[test]
 fn a_refused_pin_falls_over_to_the_candidate_that_connects_fastest() {
     let (pinned, slower, faster) = (addr(1), addr(2), addr(3));
     let dialer = ScriptedDialer::new(&[pinned, slower, faster]);
