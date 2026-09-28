@@ -180,29 +180,40 @@ tasks:
     cmds:
       - "{{.E2E_BIN}} pgo {{.CLI_ARGS}}"
 
-  stack:up:
-    desc: Start the Weaver e2e Docker stack
+  doctor:
+    desc: Check the container engine (Docker or Podman) and Compose provider
     dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
     cmds:
-      - docker compose up -d {{.CLI_ARGS}}
+      - "{{.E2E_BIN}} doctor"
+
+  stack:up:
+    desc: Start the Weaver e2e container stack
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} compose up -d {{.CLI_ARGS}}"
 
   stack:down:
-    desc: Stop the Weaver e2e Docker stack
+    desc: Stop the Weaver e2e container stack
     dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
     cmds:
-      - docker compose down {{.CLI_ARGS}}
+      - "{{.E2E_BIN}} compose down {{.CLI_ARGS}}"
 
   stack:ps:
-    desc: Show e2e Docker service status
+    desc: Show e2e container service status
     dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
     cmds:
-      - docker compose ps {{.CLI_ARGS}}
+      - "{{.E2E_BIN}} compose ps {{.CLI_ARGS}}"
 
   stack:logs:
-    desc: Tail e2e Docker service logs
+    desc: Tail e2e container service logs
     dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
     cmds:
-      - docker compose logs {{.CLI_ARGS}}
+      - "{{.E2E_BIN}} compose logs {{.CLI_ARGS}}"
 
   bench:download:
     desc: Run the download hotpath benchmark

@@ -5,32 +5,35 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
-// ListNetworkSubnets returns every subnet currently claimed by Docker.
+// ListNetworkSubnets returns every subnet currently claimed by the container
+// engine.
 func ListNetworkSubnets(ctx context.Context, workDir string) ([]string, error) {
-	list := exec.CommandContext(ctx, "docker", "network", "ls", "-q")
+	engine := containerengine.Current()
+	list := engine.CommandContext(ctx, "network", "ls", "-q")
 	list.Dir = workDir
 	output, err := list.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("docker network ls: %w: %s", err, strings.TrimSpace(string(output)))
+		return nil, fmt.Errorf("%s network ls: %w: %s", engine.Binary, err, strings.TrimSpace(string(output)))
 	}
 	ids := strings.Fields(string(output))
 	if len(ids) == 0 {
 		return nil, nil
 	}
 	args := append(
-		[]string{"network", "inspect", "--format", "{{range .IPAM.Config}}{{.Subnet}}{{\"\\n\"}}{{end}}"},
+		[]string{"network", "inspect", "--format", engine.NetworkSubnetTemplate()},
 		ids...,
 	)
-	inspect := exec.CommandContext(ctx, "docker", args...)
+	inspect := engine.CommandContext(ctx, args...)
 	inspect.Dir = workDir
 	output, err = inspect.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("docker network inspect: %w: %s", err, strings.TrimSpace(string(output)))
+		return nil, fmt.Errorf("%s network inspect: %w: %s", engine.Binary, err, strings.TrimSpace(string(output)))
 	}
 	var subnets []string
 	for _, line := range strings.Split(string(output), "\n") {

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/scryer-media/weaver/e2e/internal/composeutil"
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 type weaverReleaseFlowKind string
@@ -866,7 +867,7 @@ func removeExactWeaverReleaseProjectContainers(project string) error {
 		"--filter",
 		"label=com.docker.compose.project=" + project,
 	}
-	listCmd := exec.Command("docker", listArgs...)
+	listCmd := containerengine.Command(listArgs...)
 	listCmd.Dir = e2eDir()
 	output, err := listCmd.Output()
 	if err != nil {
@@ -878,7 +879,7 @@ func removeExactWeaverReleaseProjectContainers(project string) error {
 	}
 
 	removeArgs := append([]string{"rm", "-f"}, containerIDs...)
-	removeCmd := exec.Command("docker", removeArgs...)
+	removeCmd := containerengine.Command(removeArgs...)
 	removeCmd.Dir = e2eDir()
 	if output, err := removeCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf(
@@ -1195,7 +1196,7 @@ func initializeWeaverE2EClock() error {
 		"-c",
 		"umask 077; printf '%s\\n' '2032-06-01T00:00:00Z' > /e2e-clock/now; chown \"${PUID:-1000}:${PGID:-1000}\" /e2e-clock/now",
 	)
-	cmd := exec.Command("docker", args...)
+	cmd := containerengine.Command(args...)
 	cmd.Dir = e2eDir()
 	cmd.Env = os.Environ()
 	return runExternalCommand(cmd, "initialize Weaver e2e clock")
@@ -1782,7 +1783,7 @@ func validateWeaverEncryptionKeyFaultState(
 }
 
 func inspectDockerContainerImageID(containerID string) (string, error) {
-	cmd := exec.Command("docker", "inspect", "-f", "{{.Image}}", containerID)
+	cmd := containerengine.Command("inspect", "-f", "{{.Image}}", containerID)
 	cmd.Dir = e2eDir()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1935,7 +1936,7 @@ func runWeaverDataVolumeShell(
 		"-c",
 		script,
 	}
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := containerengine.CommandContext(ctx, args...)
 	cmd.Dir = e2eDir()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1946,7 +1947,7 @@ func runWeaverDataVolumeShell(
 
 func stopWeaverReleaseService(ctx context.Context) error {
 	args := dockerComposeArgs("stop", "--timeout", "10", "weaver")
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := containerengine.CommandContext(ctx, args...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "stop exact Weaver release service")
 }
@@ -2002,7 +2003,7 @@ func waitForWeaverEncryptionKeyStartupFailure(
 }
 
 func dockerComposeServiceContainerIDIncludingStopped(service string) (string, error) {
-	cmd := exec.Command("docker", dockerComposeArgs("ps", "-a", "-q", service)...)
+	cmd := composeServiceContainersCommand(context.Background(), composeProject(), service, true, dockerComposeArgs("ps", "-a", "-q", service))
 	cmd.Dir = e2eDir()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -2016,8 +2017,7 @@ func dockerComposeServiceContainerIDIncludingStopped(service string) (string, er
 }
 
 func inspectDockerContainerRuntimeState(containerID string) (weaverContainerRuntimeState, error) {
-	cmd := exec.Command(
-		"docker",
+	cmd := containerengine.Command(
 		"inspect",
 		"-f",
 		"{{.State.Status}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}",
@@ -2063,19 +2063,19 @@ func outputLine(output string, index int) string {
 
 func forceRecreateWeaverReleaseService(ctx context.Context) error {
 	args := dockerComposeArgs("up", "-d", "--quiet-pull", "--force-recreate", "--no-deps", "weaver")
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := containerengine.CommandContext(ctx, args...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "force-recreate Weaver release service")
 }
 
 func dockerComposeDownRetainingVolumes() error {
-	cmd := exec.Command("docker", dockerComposeArgs("down", "--remove-orphans")...)
+	cmd := containerengine.Command(dockerComposeArgs("down", "--remove-orphans")...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "docker compose down retaining volumes")
 }
 
 func inspectDockerVolume(name string) error {
-	cmd := exec.Command("docker", "volume", "inspect", "--format", "{{.Name}}", name)
+	cmd := containerengine.Command("volume", "inspect", "--format", "{{.Name}}", name)
 	cmd.Dir = e2eDir()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -2124,7 +2124,7 @@ func ensureLocalWeaverPlaywrightImage() error {
 		log.Printf("reusing current Weaver Playwright image: %s (source fingerprint %s)", image, shortFingerprint(fingerprint))
 		return nil
 	}
-	cmd := exec.Command("docker", dockerComposeArgs("build", "weaver-playwright")...)
+	cmd := containerengine.Command(dockerComposeArgs("build", "weaver-playwright")...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "docker compose build weaver-playwright")
 }
@@ -2156,7 +2156,7 @@ func runWeaverReleasePlaywrightOnce(ctx context.Context, script string) error {
 		dockerComposeArgs("run", "--rm", "--no-deps", "weaver-playwright"),
 		"npm", "run", "test:"+script,
 	)
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := containerengine.CommandContext(ctx, args...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "docker compose run weaver-playwright "+script)
 }

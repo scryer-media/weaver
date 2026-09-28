@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // --- seed ---
@@ -532,7 +534,7 @@ func runNyuuPost(
 		nyuuArgs = append(nyuuArgs, strings.TrimRight(stageDirInNyuu, "/")+"/"+f)
 	}
 
-	cmd := exec.Command("docker", nyuuArgs...)
+	cmd := containerengine.Command(nyuuArgs...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "nyuu post")
 }
@@ -772,7 +774,7 @@ func streamArticlesToBackup(sourceID, backupID string) error {
 // containers. Unlike `docker exec ... tar`, this does not require tar inside
 // the intentionally minimal e2e-nntp image.
 func articleSyncCommands(sourceID, backupID string) (*exec.Cmd, *exec.Cmd) {
-	source := exec.Command("docker", "cp", sourceID+":/data/articles/.", "-")
-	destination := exec.Command("docker", "cp", "-", backupID+":/data/articles")
+	source := containerengine.Command("cp", sourceID+":/data/articles/.", "-")
+	destination := containerengine.Command("cp", "-", backupID+":/data/articles")
 	return source, destination
 }

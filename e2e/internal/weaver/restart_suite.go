@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 type restartProfile string
@@ -518,7 +520,7 @@ func ensureRestartInfrastructure() {
 		services = append(services, "weaver-postgres")
 	}
 	args := append(dockerComposeArgs("up", "-d", "--build", "--quiet-pull"), services...)
-	cmd := exec.Command("docker", args...)
+	cmd := containerengine.Command(args...)
 	cmd.Dir = e2eDir()
 	if err := runExternalCommand(cmd, "docker compose up --build for restart suite"); err != nil {
 		log.Fatalf("start restart-suite infrastructure: %v", err)

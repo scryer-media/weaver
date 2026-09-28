@@ -1,12 +1,15 @@
 package weaver
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // waitForDockerServiceReady blocks until the Compose service's container
@@ -37,7 +40,7 @@ func dockerServiceReadyStatus(service string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.Command("docker", "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else if .State.Running}}running{{else}}{{.State.Status}}{{end}}", containerID)
+	cmd := containerengine.Command("inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else if .State.Running}}running{{else}}{{.State.Status}}{{end}}", containerID)
 	cmd.Dir = e2eDir()
 	output, err := cmd.Output()
 	if err != nil {
@@ -49,7 +52,7 @@ func dockerServiceReadyStatus(service string) (string, error) {
 // captureDockerComposeOutput runs one Compose subcommand and writes its
 // combined output to path for the artifact record, returning the run error.
 func captureDockerComposeOutput(path string, args ...string) error {
-	cmd := exec.Command("docker", dockerComposeArgs(args...)...)
+	cmd := containerengine.Command(dockerComposeArgs(args...)...)
 	cmd.Dir = e2eDir()
 	output, err := cmd.CombinedOutput()
 	if writeErr := os.WriteFile(path, output, 0o644); writeErr != nil {
@@ -59,4 +62,16 @@ func captureDockerComposeOutput(path string, args ...string) error {
 		return fmt.Errorf("docker compose %s: %w", strings.Join(args, " "), err)
 	}
 	return nil
+}
+
+// composeServiceContainersCommand lists one Compose service's container IDs.
+// Docker Compose answers dockerArgs (a `compose ... ps` vector); podman-compose
+// cannot filter `ps` by service, so the engine filters on the Compose labels
+// instead.
+func composeServiceContainersCommand(ctx context.Context, project, service string, includeStopped bool, dockerArgs []string) *exec.Cmd {
+	engine := containerengine.Current()
+	if engine.UsesPodmanCompose() {
+		return engine.CommandContext(ctx, engine.ServiceContainerArgs(project, service, includeStopped)...)
+	}
+	return engine.CommandContext(ctx, dockerArgs...)
 }

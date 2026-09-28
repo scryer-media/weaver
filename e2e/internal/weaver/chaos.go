@@ -12,11 +12,12 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // --- chaos ---
@@ -255,7 +256,7 @@ func inspectContainerEncryptionKeyState(containerID string) (containerEncryption
 }
 
 func dockerContainerLogs(containerID string) (string, error) {
-	cmd := exec.Command("docker", "logs", containerID)
+	cmd := containerengine.Command("logs", containerID)
 	cmd.Dir = e2eDir()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -266,7 +267,7 @@ func dockerContainerLogs(containerID string) (string, error) {
 
 func dockerExecOutput(containerID string, args ...string) (string, error) {
 	dockerArgs := append([]string{"exec", containerID}, args...)
-	cmd := exec.Command("docker", dockerArgs...)
+	cmd := containerengine.Command(dockerArgs...)
 	cmd.Dir = e2eDir()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -301,7 +302,7 @@ func dockerComposeUp(services ...string) error {
 	for attempt := 0; ; attempt++ {
 		log.Printf("starting docker services: %s", strings.Join(services, ", "))
 		args := append(dockerComposeArgs("up", "-d", "--quiet-pull"), services...)
-		cmd := exec.Command("docker", args...)
+		cmd := containerengine.Command(args...)
 		cmd.Dir = e2eDir()
 		err := runExternalCommand(cmd, "docker compose up")
 		if err == nil || !isDockerHostPortBindCollision(err) || attempt == maxPortBindRetries {
@@ -326,7 +327,7 @@ func requiresWeaverService(services []string) bool {
 func dockerComposeRestart(services ...string) error {
 	log.Printf("restarting docker services: %s", strings.Join(services, ", "))
 	args := append(dockerComposeArgs("restart"), services...)
-	cmd := exec.Command("docker", args...)
+	cmd := containerengine.Command(args...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "docker compose restart")
 }
@@ -335,13 +336,13 @@ func dockerImageExists(image string) bool {
 	if strings.TrimSpace(image) == "" {
 		return false
 	}
-	cmd := exec.Command("docker", "image", "inspect", image)
+	cmd := containerengine.Command("image", "inspect", image)
 	cmd.Dir = e2eDir()
 	return cmd.Run() == nil
 }
 
 func dockerComposeDown() error {
-	cmd := exec.Command("docker", dockerComposeArgs("down", "-v", "--remove-orphans")...)
+	cmd := containerengine.Command(dockerComposeArgs("down", "-v", "--remove-orphans")...)
 	cmd.Dir = e2eDir()
 	return runExternalCommand(cmd, "docker compose down")
 }

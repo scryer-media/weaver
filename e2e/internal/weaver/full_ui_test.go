@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 func TestPruneFullRunBundles(t *testing.T) {
@@ -449,7 +450,7 @@ func TestPostgresFullPhaseEnvConfiguresWeaverDatastoreAndComposeDB(t *testing.T)
 }
 
 func TestDockerComposePublishesPostgresRuntimePort(t *testing.T) {
-	versionCmd := exec.Command("docker", "compose", "version")
+	versionCmd := containerengine.Command("compose", "version")
 	if output, err := versionCmd.CombinedOutput(); err != nil {
 		t.Skipf("docker compose unavailable: %v: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -474,7 +475,7 @@ type dockerComposePort struct {
 func dockerComposePostgresPorts(t *testing.T, overrides map[string]string) []dockerComposePort {
 	t.Helper()
 
-	cmd := exec.Command("docker", "compose", "config", "--format", "json")
+	cmd := containerengine.Command("compose", "config", "--format", "json")
 	cmd.Dir = e2eDir()
 	cmd.Env = composeTestEnv(overrides)
 	output, err := cmd.CombinedOutput()

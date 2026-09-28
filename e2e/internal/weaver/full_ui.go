@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 type fullPhaseContext struct {
@@ -1462,7 +1464,7 @@ func cleanupFullPhaseContext(phase *fullPhaseContext) error {
 	if err := stopManagedLocalWeaverForPhase(phase); err != nil {
 		errs = append(errs, fmt.Errorf("stop managed local weaver: %w", err))
 	}
-	cmd := exec.Command("docker", "compose", "-p", phase.Project, "down", "-v", "--remove-orphans")
+	cmd := containerengine.Command("compose", "-p", phase.Project, "down", "-v", "--remove-orphans")
 	cmd.Dir = e2eDir()
 	if err := runExternalCommand(cmd, "docker compose down"); err != nil {
 		errs = append(errs, err)
@@ -1648,7 +1650,7 @@ func (r *phaseRunRecorder) flushLocked() error {
 func capturePhaseDiagnostics(phase *fullPhaseContext) error {
 	var errs []error
 
-	logsCmd := exec.Command("docker", "compose", "-p", phase.Project, "logs", "--no-color", "--timestamps")
+	logsCmd := containerengine.Command("compose", "-p", phase.Project, "logs", "--no-color", "--timestamps")
 	logsCmd.Dir = e2eDir()
 	if output, err := logsCmd.CombinedOutput(); err == nil {
 		if writeErr := os.WriteFile(filepath.Join(phase.RootDir, "docker-compose.log"), output, 0o644); writeErr != nil {
@@ -1658,7 +1660,7 @@ func capturePhaseDiagnostics(phase *fullPhaseContext) error {
 		errs = append(errs, fmt.Errorf("docker compose logs: %w", err))
 	}
 
-	psCmd := exec.Command("docker", "compose", "-p", phase.Project, "ps", "-a")
+	psCmd := containerengine.Command("compose", "-p", phase.Project, "ps", "-a")
 	psCmd.Dir = e2eDir()
 	if output, err := psCmd.CombinedOutput(); err == nil {
 		if writeErr := os.WriteFile(filepath.Join(phase.RootDir, "docker-compose.ps.txt"), output, 0o644); writeErr != nil {
