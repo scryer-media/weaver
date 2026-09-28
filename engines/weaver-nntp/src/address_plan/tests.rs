@@ -336,6 +336,221 @@ fn body_latency_is_kept_only_for_known_addresses() {
     );
 }
 
+/// Book `samples` warm fetches of one megabyte each against `address`, each
+/// taking `wire`.
+fn deliver(plan: &AddressPlan, address: SocketAddr, samples: u32, wire: Duration) {
+    for _ in 0..samples {
+        plan.record_delivery(address.ip(), 1_000_000, wire);
+    }
+}
+
+fn delivery_samples(plan: &AddressPlan, address: SocketAddr) -> u32 {
+    plan.snapshot()
+        .addresses
+        .iter()
+        .find(|candidate| candidate.address == address)
+        .map_or(0, |candidate| candidate.delivery_samples)
+}
+
+#[test]
+fn delivery_is_kept_only_for_known_addresses_and_only_when_bytes_moved() {
+    let known = addr(1);
+    let dialer = ScriptedDialer::new(&[known]);
+    let plan = plan();
+    plan.connect(&dialer).unwrap();
+
+    plan.record_delivery(known.ip(), 500_000, Duration::from_millis(50));
+    plan.record_delivery(known.ip(), 0, Duration::from_millis(50));
+    plan.record_delivery(known.ip(), 500_000, Duration::ZERO);
+    plan.record_delivery(addr(9).ip(), 500_000, Duration::from_millis(50));
+
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.addresses.len(), 1);
+    assert_eq!(snapshot.addresses[0].delivery_samples, 1);
+    assert_eq!(
+        snapshot.addresses[0].delivery_bytes_per_second,
+        Some(10_000_000.0)
+    );
+}
+
+#[test]
+fn a_reconnect_is_pointed_at_a_challenger_once_the_pin_is_measured() {
+    let (pinned, challenger, refusing) = (addr(1), addr(2), addr(3));
+    let dialer = ScriptedDialer::new(&[pinned, challenger, refusing]);
+    let plan = plan();
+    pin(&plan, &dialer, pinned, &[challenger, refusing]);
+    plan.record_connect(refusing, None);
+    deliver(
+        &plan,
+        pinned,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_millis(100),
+    );
+
+    // Too young a pin: every reconnect still dials the pin.
+    for _ in 0..SHADOW_EVERY_CONNECTS {
+        let (_, connected) = plan.connect(&dialer).unwrap();
+        assert_eq!(connected, pinned);
+    }
+    assert_eq!(
+        dialer.take_dialled(),
+        vec![pinned; SHADOW_EVERY_CONNECTS as usize]
+    );
+
+    // Old enough: the reconnect that completes the count goes to the
+    // challenger that has never refused, and the ones before it to the pin.
+    plan.age_pin_by(SHADOW_MIN_PIN_AGE);
+    let (_, shadowed) = plan.connect(&dialer).unwrap();
+    assert_eq!(shadowed, challenger);
+    assert_eq!(dialer.take_dialled(), vec![challenger]);
+    assert_eq!(plan.snapshot().pinned, Some(pinned));
+
+    // The next reconnects go back to the pin until both the count and the
+    // interval allow another.
+    for _ in 0..SHADOW_EVERY_CONNECTS {
+        let (_, connected) = plan.connect(&dialer).unwrap();
+        assert_eq!(connected, pinned);
+    }
+    dialer.take_dialled();
+    plan.age_last_shadow_by(SHADOW_INTERVAL);
+    let (_, shadowed) = plan.connect(&dialer).unwrap();
+    assert_eq!(shadowed, challenger);
+}
+
+#[test]
+fn a_measured_challenger_is_not_shadowed_again_before_the_pin_is_judged() {
+    let (pinned, challenger) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, challenger]);
+    let plan = plan();
+    pin(&plan, &dialer, pinned, &[challenger]);
+    deliver(
+        &plan,
+        pinned,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_millis(100),
+    );
+    deliver(
+        &plan,
+        challenger,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_millis(100),
+    );
+    plan.age_pin_by(SHADOW_MIN_PIN_AGE);
+
+    for _ in 0..SHADOW_EVERY_CONNECTS {
+        let (_, connected) = plan.connect(&dialer).unwrap();
+        assert_eq!(connected, pinned);
+    }
+    assert_eq!(
+        dialer.take_dialled(),
+        vec![pinned; SHADOW_EVERY_CONNECTS as usize]
+    );
+}
+
+#[test]
+fn a_challenger_that_delivered_faster_takes_the_pin_at_the_interval_without_a_race() {
+    let (pinned, challenger) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, challenger]);
+    let plan = plan();
+    pin(&plan, &dialer, pinned, &[challenger]);
+    deliver(
+        &plan,
+        pinned,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_millis(100),
+    );
+    deliver(
+        &plan,
+        challenger,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_millis(80),
+    );
+    plan.age_pin_by(ADDRESS_REPLAN_INTERVAL);
+
+    let (_, connected) = plan.connect(&dialer).unwrap();
+
+    assert_eq!(connected, challenger);
+    assert_eq!(dialer.take_dialled(), vec![challenger]);
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.pinned, Some(challenger));
+    assert_eq!(snapshot.races_won, 1);
+    assert!(snapshot.repins.contains(&(RaceReason::Delivery, 1)));
+    // The verdict starts the next judgment from nothing.
+    assert_eq!(delivery_samples(&plan, pinned), 0);
+    assert_eq!(delivery_samples(&plan, challenger), 0);
+}
+
+#[test]
+fn a_pin_its_challengers_did_not_beat_is_kept_at_the_interval_without_a_race() {
+    let (pinned, challenger) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, challenger]);
+    let plan = plan();
+    pin(&plan, &dialer, pinned, &[challenger]);
+    deliver(
+        &plan,
+        pinned,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_millis(100),
+    );
+    deliver(
+        &plan,
+        challenger,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_millis(90),
+    );
+    plan.age_pin_by(ADDRESS_REPLAN_INTERVAL);
+
+    let (_, connected) = plan.connect(&dialer).unwrap();
+
+    assert_eq!(connected, pinned);
+    assert_eq!(dialer.take_dialled(), vec![pinned]);
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.pinned, Some(pinned));
+    assert_eq!(snapshot.races_won, 1);
+    assert!(snapshot.repins.iter().all(|(_, count)| *count == 0));
+    assert_eq!(delivery_samples(&plan, pinned), 0);
+
+    // The verdict restarted the pin's age: the next connect neither races
+    // nor judges again.
+    let (_, connected) = plan.connect(&dialer).unwrap();
+    assert_eq!(connected, pinned);
+    assert_eq!(dialer.take_dialled(), vec![pinned]);
+    assert_eq!(plan.snapshot().races_won, 1);
+}
+
+#[test]
+fn an_aged_pin_with_no_measured_challenger_races_as_before() {
+    let (pinned, closer) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, closer]);
+    let plan = plan();
+    pin(&plan, &dialer, pinned, &[closer]);
+    deliver(
+        &plan,
+        pinned,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_millis(100),
+    );
+    deliver(
+        &plan,
+        closer,
+        DELIVERY_MIN_SAMPLES - 1,
+        Duration::from_millis(10),
+    );
+    plan.age_pin_by(ADDRESS_REPLAN_INTERVAL);
+
+    let hold_pinned = dialer.gate(pinned);
+    let (_, raced) = plan.connect(&dialer).unwrap();
+    drop(hold_pinned);
+    settle_all(&dialer);
+
+    assert_eq!(raced, closer);
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.races_won, 2);
+    assert!(snapshot.repins.contains(&(RaceReason::Interval, 1)));
+    // A race, too, starts the next judgment from nothing.
+    assert_eq!(delivery_samples(&plan, closer), 0);
+}
+
 #[test]
 fn a_failed_first_race_holds_further_races_off_for_a_while() {
     let (first, second) = (addr(1), addr(2));

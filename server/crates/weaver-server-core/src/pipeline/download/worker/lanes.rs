@@ -480,8 +480,8 @@ impl Pipeline {
                 ServerPipelineExplorer::seeded(proven_depth, probe_latency, None)
             });
         explorer.note_supports_pipelining(observation.supports_pipelining);
-        if let Some(latency) = observation.latency {
-            explorer.note_latency(latency);
+        if let Some(latency) = observation.latency_sample {
+            explorer.note_latency_sample(latency, observation.cold);
         }
         if let Some(transfer) = observation.transfer {
             explorer.note_transfer(transfer);
@@ -495,6 +495,7 @@ impl Pipeline {
                 observation.payload_bytes,
                 observation.policy_elapsed,
                 pressure_clear,
+                observation.cold,
             );
         }
 
@@ -880,7 +881,8 @@ impl Pipeline {
                             server_idx: None,
                             mode: lane_mode,
                             supports_pipelining: false,
-                            latency: None,
+                            latency_sample: None,
+                            cold: false,
                             transfer: None,
                             payload_bytes: 0,
                             policy_elapsed: Duration::ZERO,

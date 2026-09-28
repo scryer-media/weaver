@@ -470,6 +470,20 @@ impl NntpPool {
         }
     }
 
+    /// Book the bytes one warm article fetch on a connection to `ip` moved
+    /// and the wire time they took.
+    pub fn record_address_delivery(
+        &self,
+        server: ServerId,
+        ip: IpAddr,
+        bytes: u64,
+        wire: Duration,
+    ) {
+        if let Some(plan) = self.address_plans.get(server.0) {
+            plan.record_delivery(ip, bytes, wire);
+        }
+    }
+
     async fn connect_server(
         &self,
         idx: usize,

@@ -433,10 +433,16 @@ pub(super) struct DownloadLaneObservation {
     pub(super) server_idx: Option<usize>,
     pub(super) mode: DownloadLaneMode,
     pub(super) supports_pipelining: bool,
-    /// Command-to-status-line wait, present only when the lane could take an
-    /// unbiased sample (nothing else outstanding when the request went out).
-    pub(super) latency: Option<Duration>,
-    /// Status-line-to-terminator wait: what the article cost on the wire.
+    /// Command-to-status-line wait this one response measured, present only
+    /// when the lane could take an unbiased sample (nothing else outstanding
+    /// when the request went out).
+    pub(super) latency_sample: Option<Duration>,
+    /// This response was its connection's first. Its timings carry setup
+    /// costs no later response repeats, so the depth explorer keeps it out
+    /// of the link model and the rung comparison.
+    pub(super) cold: bool,
+    /// Status-line-to-terminator wait: what the article cost on the wire,
+    /// smoothed over the lane's warm responses.
     pub(super) transfer: Option<Duration>,
     /// Decoded payload of this one response, for the depth explorer's
     /// throughput window.

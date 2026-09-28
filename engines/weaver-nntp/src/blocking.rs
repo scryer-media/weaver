@@ -179,6 +179,12 @@ pub struct BlockingBodyLane {
     /// Status-line-to-terminator wait: what the article itself cost on the
     /// wire, independent of how far away the server is.
     transfer_ewma: Option<Duration>,
+    /// Successful responses this connection has produced. The first one is
+    /// cold: see [`Self::take_response_sample`].
+    responses_completed: u64,
+    /// What the latest successful response measured, until the caller takes
+    /// it.
+    last_sample: ResponseSample,
     soft_timeout: Duration,
     /// Outstanding pipelined BODY commands, when the caller drives the lane
     /// request-by-request instead of batch-by-batch.
@@ -271,6 +277,8 @@ impl BlockingBodyLane {
                 mode: BodyLaneMode::Sequential,
                 latency_ewma: None,
                 transfer_ewma: None,
+                responses_completed: 0,
+                last_sample: ResponseSample::default(),
                 soft_timeout,
                 ring: BodyRing::default(),
                 _permit: permit,
@@ -291,6 +299,8 @@ impl BlockingBodyLane {
                         mode: BodyLaneMode::Sequential,
                         latency_ewma: None,
                         transfer_ewma: None,
+                        responses_completed: 0,
+                        last_sample: ResponseSample::default(),
                         soft_timeout,
                         ring: BodyRing::default(),
                         idle_since: std::sync::Mutex::new(None),
@@ -314,6 +324,8 @@ impl BlockingBodyLane {
                 mode: BodyLaneMode::Sequential,
                 latency_ewma: None,
                 transfer_ewma: None,
+                responses_completed: 0,
+                last_sample: ResponseSample::default(),
                 soft_timeout,
                 ring: BodyRing::default(),
                 idle_since: std::sync::Mutex::new(None),
@@ -516,8 +528,7 @@ impl BlockingBodyLane {
             // Nothing else was outstanding, so the status-line wait is a clean
             // latency sample.
             let latency = self.conn.take_response_line_wait().min(policy_elapsed);
-            self.observe_latency(latency);
-            self.observe_transfer(policy_elapsed.saturating_sub(latency));
+            self.book_response(Some(latency), policy_elapsed.saturating_sub(latency));
         }
         self.trace_item(message_id, policy_elapsed, result)
     }
@@ -616,10 +627,10 @@ impl BlockingBodyLane {
                 // Only the head of the batch was issued with nothing else in
                 // flight; later responses are already queued behind it, so
                 // their status-line wait says nothing about distance.
-                if idx == 0 {
-                    self.observe_latency(response_line_wait);
-                }
-                self.observe_transfer(policy_elapsed.saturating_sub(response_line_wait));
+                self.book_response(
+                    (idx == 0).then_some(response_line_wait),
+                    policy_elapsed.saturating_sub(response_line_wait),
+                );
             }
             if self.conn.poisoned
                 || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -808,10 +819,10 @@ impl BlockingBodyLane {
             // Only a request issued into an empty ring measures distance;
             // anything issued behind another article was queued behind its
             // payload and would read as near zero.
-            if request.issued_alone {
-                self.observe_latency(response_line_wait);
-            }
-            self.observe_transfer(policy_elapsed.saturating_sub(response_line_wait));
+            self.book_response(
+                request.issued_alone.then_some(response_line_wait),
+                policy_elapsed.saturating_sub(response_line_wait),
+            );
         }
         if self.conn.poisoned
             || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
@@ -988,13 +999,47 @@ impl BlockingBodyLane {
         }
     }
 
-    fn observe_latency(&mut self, sample: Duration) {
-        self.latency_ewma = Some(blend_ewma(self.latency_ewma, sample));
+    /// Book one successful response: its status-line wait when the request
+    /// went out alone, and the wire time of its article.
+    ///
+    /// The connection's first response is only recorded as the sample the
+    /// caller can take; it does not move the lane's averages. That response
+    /// carries costs no later one repeats — a session that still has to
+    /// re-authenticate or select a group answers its first BODY late, and a
+    /// socket still in slow start delivers its first article slowly — and on
+    /// a pipelined lane it is also the only request ever issued alone, so
+    /// without this rule the lane's idea of the server's distance would be
+    /// that one cold sample for as long as the connection lived.
+    fn book_response(&mut self, latency: Option<Duration>, transfer: Duration) {
+        let cold = self.responses_completed == 0;
+        self.responses_completed = self.responses_completed.saturating_add(1);
+        self.last_sample = ResponseSample { latency, cold };
+        if cold {
+            return;
+        }
+        if let Some(latency) = latency {
+            self.latency_ewma = Some(blend_ewma(self.latency_ewma, latency));
+        }
+        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, transfer));
     }
 
-    fn observe_transfer(&mut self, sample: Duration) {
-        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, sample));
+    /// What the latest successful response measured, taken once. A response
+    /// that failed leaves nothing to take.
+    pub fn take_response_sample(&mut self) -> ResponseSample {
+        std::mem::take(&mut self.last_sample)
     }
+}
+
+/// What one successful response on a lane measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResponseSample {
+    /// Command-to-status-line wait, present only when the request went out
+    /// with nothing else outstanding on the connection.
+    pub latency: Option<Duration>,
+    /// The response was the connection's first. Its timings include setup
+    /// costs no later response repeats, so it describes the connection's
+    /// start, not the link.
+    pub cold: bool,
 }
 
 fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
