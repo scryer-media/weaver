@@ -94,6 +94,22 @@ fn a_container_is_held_to_its_quota_not_the_host() {
     );
 }
 
+/// A cpuset or affinity mask narrows the CPUs a process may use without any
+/// quota, while the physical count is still read host-wide.
+#[test]
+fn a_process_pinned_to_two_cpus_is_held_to_them_without_a_quota() {
+    let mut pinned = machine(16, 32);
+    pinned.cpu.logical_cores = 2;
+    assert_eq!(HardwareProfile::effective_cores(&pinned), 2);
+    assert_eq!(
+        HardwareProfile::available(&pinned),
+        vec![HardwareProfile::Efficient]
+    );
+    let tuning = HardwareProfile::Efficient.tuning(&pinned);
+    assert_eq!(tuning.decode_threads, 2);
+    assert_eq!(tuning.extract_threads, 1);
+}
+
 #[test]
 fn a_fractional_quota_below_one_core_still_leaves_a_thread() {
     let mut sliver = machine(8, 8);

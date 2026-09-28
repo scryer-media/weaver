@@ -28,8 +28,8 @@ impl SettingsQuery {
         )
     }
     /// The hardware profile in force, and the profiles this machine can
-    /// honour. Judged against the live probe, so a container that was given
-    /// more memory since startup is offered what it has now.
+    /// honour. Judged against the machine as probed at startup, the same
+    /// probe the running limits were derived from.
     #[graphql(guard = "AdminGuard")]
     async fn hardware_profile(
         &self,

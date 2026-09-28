@@ -126,11 +126,18 @@ impl HardwareProfile {
         }
     }
 
-    /// Physical cores this machine can actually use. A fractional cgroup quota
-    /// rounds down but never to zero: half a core is still one thread's worth
-    /// of work, and a zero here would divide by nothing downstream.
+    /// Physical cores this machine can actually use. The physical count is
+    /// read host-wide, so it is capped by the CPUs this process may run on,
+    /// which an affinity mask or cpuset narrows without any quota. A
+    /// fractional cgroup quota rounds down but never to zero: half a core is
+    /// still one thread's worth of work, and a zero here would divide by
+    /// nothing downstream.
     pub fn effective_cores(probe: &SystemProfile) -> usize {
-        let cores = probe.cpu.physical_cores.max(1);
+        let cores = probe
+            .cpu
+            .physical_cores
+            .max(1)
+            .min(probe.cpu.logical_cores.max(1));
         match probe.cpu.cgroup_limit {
             Some(limit) if limit > 0.0 => cores.min((limit as usize).max(1)),
             _ => cores,
