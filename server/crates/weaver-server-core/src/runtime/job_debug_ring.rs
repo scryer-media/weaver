@@ -15,12 +15,17 @@
 //! Rings are bounded per job and in the number of jobs held, and dropped when
 //! the job's runtime is purged, so a process that never stalls pays only the
 //! capture itself.
+//!
+//! A replayed record never repeats the captured event's own line shape. It
+//! carries the event's level, target, message and fields as separate
+//! `replayed_*` values, so a reader scanning the log for an event's message
+//! can tell the event itself from a later replay of it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::SystemTime;
 
-use tracing::warn;
+use tracing::{Level, warn};
 
 /// Lines kept per job. Older lines fall off the front.
 pub const LINES_PER_JOB: usize = 256;
@@ -33,11 +38,21 @@ const MAX_JOBS: usize = 512;
 /// rarely meet on the same lock.
 const SHARDS: usize = 64;
 
-/// One captured line: when it was recorded and what it said.
+/// What one captured event said, kept in parts rather than as a rendered line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedEvent {
+    pub level: Level,
+    pub target: &'static str,
+    pub message: String,
+    /// The event's other fields as ` name=value` pairs, `job_id` included.
+    pub fields: String,
+}
+
+/// One captured event and when it was recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugLine {
     pub at: SystemTime,
-    pub text: String,
+    pub event: CapturedEvent,
 }
 
 impl DebugLine {
@@ -72,11 +87,11 @@ impl JobDebugRings {
         }
     }
 
-    /// Appends one line to the job's ring, stamped with the current time.
-    pub fn record(&self, job_id: u64, text: String) {
+    /// Appends one event to the job's ring, stamped with the current time.
+    pub fn record(&self, job_id: u64, event: CapturedEvent) {
         let line = DebugLine {
             at: SystemTime::now(),
-            text,
+            event,
         };
         let mut shard = self.shard(job_id);
         if !shard.contains_key(&job_id) && shard.len() >= self.jobs_per_shard {
@@ -133,10 +148,10 @@ pub fn install() {
     let _ = RINGS.get_or_init(|| JobDebugRings::new(LINES_PER_JOB, MAX_JOBS));
 }
 
-/// Appends one formatted line to the job's ring, stamped with the current time.
-pub fn record(job_id: u64, line: String) {
+/// Appends one captured event to the job's ring, stamped with the current time.
+pub fn record(job_id: u64, event: CapturedEvent) {
     if let Some(rings) = RINGS.get() {
-        rings.record(job_id, line);
+        rings.record(job_id, event);
     }
 }
 
@@ -157,7 +172,9 @@ pub fn forget(job_id: u64) {
 
 /// Writes the job's ring out once, at WARN, and clears it: a header record
 /// giving the count, then one record per captured line, so a log viewer shows
-/// one row per line.
+/// one row per line. Each record carries the captured event in parts, as
+/// `replayed_level`, `replayed_target`, `replayed_message` and
+/// `replayed_fields`, never as the event's own rendered line.
 ///
 /// Callers are the throttled stall reports, so this runs at most as often as
 /// they do; an empty ring writes nothing.
@@ -181,7 +198,10 @@ pub fn dump(job_id: u64, reason: &'static str) {
             job_id,
             reason,
             at = %line.timestamp(),
-            line = %line.text,
+            replayed_level = %line.event.level,
+            replayed_target = line.event.target,
+            replayed_message = line.event.message.as_str(),
+            replayed_fields = line.event.fields.trim_start(),
             "stall diagnostics line"
         );
     }
@@ -191,15 +211,24 @@ pub fn dump(job_id: u64, reason: &'static str) {
 mod tests {
     use super::*;
 
+    fn event(message: &str) -> CapturedEvent {
+        CapturedEvent {
+            level: Level::DEBUG,
+            target: "weaver_test",
+            message: message.to_string(),
+            fields: String::new(),
+        }
+    }
+
     fn texts(lines: Vec<DebugLine>) -> Vec<String> {
-        lines.into_iter().map(|line| line.text).collect()
+        lines.into_iter().map(|line| line.event.message).collect()
     }
 
     #[test]
     fn a_ring_keeps_only_its_newest_lines() {
         let rings = JobDebugRings::new(3, 8);
         for index in 0..5 {
-            rings.record(7, format!("line {index}"));
+            rings.record(7, event(&format!("line {index}")));
         }
 
         assert_eq!(texts(rings.take(7)), vec!["line 2", "line 3", "line 4"]);
@@ -209,8 +238,8 @@ mod tests {
     #[test]
     fn rings_are_kept_per_job_and_forgotten_per_job() {
         let rings = JobDebugRings::new(4, 8);
-        rings.record(1, "one".to_string());
-        rings.record(2, "two".to_string());
+        rings.record(1, event("one"));
+        rings.record(2, event("two"));
 
         rings.forget(1);
 
@@ -221,9 +250,9 @@ mod tests {
     #[test]
     fn the_number_of_jobs_held_is_bounded() {
         let rings = JobDebugRings::new(4, 2);
-        rings.record(1, "one".to_string());
-        rings.record(2, "two".to_string());
-        rings.record(3, "three".to_string());
+        rings.record(1, event("one"));
+        rings.record(2, event("two"));
+        rings.record(3, event("three"));
 
         assert!(rings.job_count() <= 2);
         assert_eq!(texts(rings.take(3)), vec!["three"]);
@@ -233,7 +262,7 @@ mod tests {
     fn the_job_bound_holds_across_every_shard() {
         let rings = JobDebugRings::new(2, MAX_JOBS);
         for job_id in 0..(MAX_JOBS as u64 * 3) {
-            rings.record(job_id, "line".to_string());
+            rings.record(job_id, event("line"));
         }
 
         assert!(rings.job_count() <= MAX_JOBS, "{}", rings.job_count());
@@ -248,7 +277,7 @@ mod tests {
     fn a_line_renders_its_capture_time_only_on_request() {
         let line = DebugLine {
             at: SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(1_500_000),
-            text: "stamped".to_string(),
+            event: event("stamped"),
         };
 
         let rendered = line.timestamp();
