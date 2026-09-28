@@ -1485,7 +1485,8 @@ fn run_owned_blocking_download_lane(
                     server_idx: Some(server_idx),
                     mode: work_context.mode,
                     supports_pipelining,
-                    latency: lane.latency_ewma(),
+                    latency_sample: None,
+                    cold: false,
                     transfer: lane.transfer_ewma(),
                     payload_bytes: 0,
                     policy_elapsed: std::time::Duration::ZERO,
@@ -1615,6 +1616,13 @@ fn run_owned_blocking_download_lane(
         };
         nntp.record_blocking_attempts(&trace.attempts);
         let (payload_bytes, policy_elapsed) = Pipeline::decoded_trace_throughput_sample(&trace);
+        let sample = lane.take_response_sample();
+        // A connection's first article says nothing about what its address
+        // delivers in steady state, and neither does one fetched while the
+        // job could not take bytes as fast as the wire offered them.
+        if !sample.cold && payload_bytes > 0 && work_context.pressure_clear {
+            nntp.record_address_delivery(&trace.attempts, payload_bytes, policy_elapsed);
+        }
         let result = result_from_trace(
             work,
             work_context.runtime_generation,
@@ -1625,7 +1633,8 @@ fn run_owned_blocking_download_lane(
                 server_idx: Some(server_idx),
                 mode: work_context.mode,
                 supports_pipelining,
-                latency: lane.latency_ewma(),
+                latency_sample: sample.latency,
+                cold: sample.cold,
                 transfer: lane.transfer_ewma(),
                 payload_bytes,
                 policy_elapsed,
@@ -1668,7 +1677,6 @@ fn run_owned_blocking_download_lane(
                     server_idx,
                     work_context.mode,
                     supports_pipelining,
-                    lane.latency_ewma(),
                     lane.transfer_ewma(),
                     work_context.pressure_clear,
                     unresolved_count,
@@ -1917,7 +1925,6 @@ fn unresolved_result(
     server_idx: usize,
     mode: DownloadLaneMode,
     supports_pipelining: bool,
-    latency: Option<std::time::Duration>,
     transfer: Option<std::time::Duration>,
     pressure_clear: bool,
     unresolved_count: u64,
@@ -1941,7 +1948,8 @@ fn unresolved_result(
             server_idx: Some(server_idx),
             mode,
             supports_pipelining,
-            latency,
+            latency_sample: None,
+            cold: false,
             transfer,
             payload_bytes: 0,
             policy_elapsed: std::time::Duration::ZERO,
@@ -2120,7 +2128,8 @@ mod tests {
             server_idx: Some(0),
             mode: DownloadLaneMode::Pipelined { depth: 4 },
             supports_pipelining: true,
-            latency: None,
+            latency_sample: None,
+            cold: false,
             transfer: None,
             payload_bytes: 0,
             policy_elapsed: std::time::Duration::ZERO,
@@ -2192,7 +2201,8 @@ mod tests {
                 server_idx: Some(1),
                 mode: DownloadLaneMode::Sequential,
                 supports_pipelining: false,
-                latency: None,
+                latency_sample: None,
+                cold: false,
                 transfer: None,
                 payload_bytes: 0,
                 policy_elapsed: std::time::Duration::ZERO,
@@ -2232,7 +2242,6 @@ mod tests {
                     0,
                     DownloadLaneMode::Sequential,
                     false,
-                    None,
                     None,
                     true,
                     0,
@@ -2385,7 +2394,8 @@ mod tests {
                 server_idx: Some(0),
                 mode: DownloadLaneMode::Pipelined { depth: 4 },
                 supports_pipelining: true,
-                latency: None,
+                latency_sample: None,
+                cold: false,
                 transfer: None,
                 payload_bytes: 0,
                 policy_elapsed: Duration::ZERO,
@@ -2484,7 +2494,8 @@ mod tests {
                 server_idx: Some(0),
                 mode: DownloadLaneMode::Sequential,
                 supports_pipelining: true,
-                latency: None,
+                latency_sample: None,
+                cold: false,
                 transfer: None,
                 payload_bytes: 0,
                 policy_elapsed: Duration::ZERO,

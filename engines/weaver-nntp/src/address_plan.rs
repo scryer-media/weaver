@@ -24,6 +24,21 @@
 //! the known candidates one at a time for [`FAILED_RACE_HOLDOFF`] instead of
 //! racing again, so a server that is down does not start a burst of race
 //! threads on every reconnect attempt.
+//!
+//! A race measures handshakes, and the address that shakes hands fastest is
+//! not always the one that delivers articles fastest. So while the pin is
+//! busy, the plan also measures delivery: every warm article fetch books its
+//! bytes and wire time against the address that served it, and now and then a
+//! connection the server was reopening anyway is pointed at a challenger
+//! instead of the pin — at most one in [`SHADOW_EVERY_CONNECTS`], no sooner
+//! than [`SHADOW_INTERVAL`] apart, never an extra connection and never a
+//! handshake the server would not have paid for regardless. When the pin's age
+//! comes due and both the pin and a challenger have delivered at least
+//! [`DELIVERY_MIN_SAMPLES`] articles, that evidence decides instead of a race:
+//! the challenger takes the pin if it delivered [`DELIVERY_REPIN_RATIO`] times
+//! the pin's per-connection rate, and otherwise the pin stays, with no losing
+//! handshakes paid either way. A pin without that evidence — an idle server,
+//! or one whose connections never turned over — races on age as before.
 
 use std::collections::HashMap;
 use std::io;
@@ -63,7 +78,33 @@ const MAX_RACE_CANDIDATES: usize = 16;
 /// Weight of a new sample in the per-address averages.
 const EWMA_WEIGHT: f64 = 0.25;
 
-/// Why a race ran.
+/// Warm article fetches an address must have served since the pin was last
+/// judged before its delivery rate counts as evidence, for the pin and for a
+/// challenger alike. A busy server fills this in seconds; an idle one never
+/// does, and races on age as before.
+pub const DELIVERY_MIN_SAMPLES: u32 = 16;
+
+/// How much faster, per connection, a challenger must have delivered than the
+/// pin to take the pin on that evidence alone. Addresses of one provider are
+/// usually within a few percent of each other, and moving the pin for less
+/// than this would just chase noise from one address to the next.
+pub const DELIVERY_REPIN_RATIO: f64 = 1.15;
+
+/// Youngest a pin may be when a reconnect is first pointed at a challenger.
+/// A fresh pin has yet to show what it delivers, and the first connections
+/// after a race are the ones a download is waiting on.
+pub const SHADOW_MIN_PIN_AGE: Duration = Duration::from_secs(30);
+
+/// Least time between two reconnects pointed at a challenger.
+pub const SHADOW_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Most reconnects, counted since the last one pointed at a challenger, that
+/// go to the pin before the next may be pointed at a challenger. A challenger
+/// keeps whatever it is given for the life of that connection, so this bounds
+/// the share of a busy server's connections that are off the pin at any time.
+pub const SHADOW_EVERY_CONNECTS: u32 = 8;
+
+/// Why the pin moved, or a race ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RaceReason {
     /// Nothing was pinned yet.
@@ -75,14 +116,18 @@ pub enum RaceReason {
     OverLimitCleared,
     /// The pin failed [`SUSPECT_AFTER_FAILURES`] connects in a row.
     Suspect,
+    /// A challenger out-delivered the aged pin by [`DELIVERY_REPIN_RATIO`]. No
+    /// race ran: the pin moved on measured delivery alone.
+    Delivery,
 }
 
 impl RaceReason {
-    pub const ALL: [RaceReason; 4] = [
+    pub const ALL: [RaceReason; 5] = [
         RaceReason::Initial,
         RaceReason::Interval,
         RaceReason::OverLimitCleared,
         RaceReason::Suspect,
+        RaceReason::Delivery,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -91,6 +136,7 @@ impl RaceReason {
             RaceReason::Interval => "interval",
             RaceReason::OverLimitCleared => "over_limit_cleared",
             RaceReason::Suspect => "suspect",
+            RaceReason::Delivery => "delivery",
         }
     }
 
@@ -100,6 +146,7 @@ impl RaceReason {
             RaceReason::Interval => 1,
             RaceReason::OverLimitCleared => 2,
             RaceReason::Suspect => 3,
+            RaceReason::Delivery => 4,
         }
     }
 }
@@ -113,6 +160,11 @@ pub struct AddressSnapshot {
     /// Smoothed article fetch time on connections to it.
     pub body_latency: Option<Duration>,
     pub consecutive_failures: u32,
+    /// Bytes per second of wire time one connection to it delivered, over the
+    /// warm fetches booked since the pin was last judged.
+    pub delivery_bytes_per_second: Option<f64>,
+    /// Warm fetches booked against it since the pin was last judged.
+    pub delivery_samples: u32,
 }
 
 /// A server's address plan at one moment.
@@ -124,7 +176,8 @@ pub struct AddressPlanSnapshot {
     pub races_won: u64,
     /// Races in which no address answered.
     pub races_failed: u64,
-    /// Pin changes, by the reason of the race that made them.
+    /// Pin changes, by the reason of the race or the delivery verdict that
+    /// made them.
     pub repins: Vec<(RaceReason, u64)>,
 }
 
@@ -191,6 +244,56 @@ struct AddrStats {
     connect_ewma: Option<Duration>,
     consecutive_failures: u32,
     body_latency_ewma: Option<Duration>,
+    delivery: Delivery,
+}
+
+/// What one address's connections delivered since the pin was last judged:
+/// warm fetches only, each booked as its bytes and its own wire time, so the
+/// quotient is what one connection to the address moves per second whatever
+/// the number of connections that happened to land there.
+#[derive(Debug, Default, Clone, Copy)]
+struct Delivery {
+    bytes: u64,
+    wire: Duration,
+    samples: u32,
+}
+
+impl Delivery {
+    fn book(&mut self, bytes: u64, wire: Duration) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.wire = self.wire.saturating_add(wire);
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    fn bytes_per_second(self) -> Option<f64> {
+        (self.samples > 0 && !self.wire.is_zero())
+            .then(|| self.bytes as f64 / self.wire.as_secs_f64())
+    }
+
+    /// The rate, once enough fetches stand behind it to be evidence.
+    fn measured_rate(self) -> Option<f64> {
+        (self.samples >= DELIVERY_MIN_SAMPLES)
+            .then(|| self.bytes_per_second())
+            .flatten()
+    }
+}
+
+/// What the delivery booked since the pin was last judged says about it.
+enum DeliveryVerdict {
+    /// A challenger out-delivered the pin by [`DELIVERY_REPIN_RATIO`].
+    Repin {
+        challenger: SocketAddr,
+        challenger_rate: f64,
+        pin_rate: f64,
+    },
+    /// The best measured challenger did not.
+    Keep {
+        best: SocketAddr,
+        best_rate: f64,
+        pin_rate: f64,
+    },
+    /// The pin or every challenger is short of [`DELIVERY_MIN_SAMPLES`].
+    Unmeasured,
 }
 
 #[derive(Default)]
@@ -199,6 +302,10 @@ struct PlanState {
     pinned: Option<SocketAddr>,
     chosen_at: Option<Instant>,
     per_addr: HashMap<IpAddr, AddrStats>,
+    /// When a reconnect was last pointed at a challenger.
+    last_shadow_at: Option<Instant>,
+    /// Reconnects handed out since then.
+    connects_since_shadow: u32,
     /// Bumped whenever a race finishes, so a caller waiting on one can tell
     /// that it did.
     generation: u64,
@@ -253,7 +360,7 @@ impl AddressPlan {
         dialer: &Arc<D>,
     ) -> io::Result<(D::Stream, SocketAddr)> {
         loop {
-            let next = self.state().next(Instant::now());
+            let next = self.state().next(Instant::now(), &self.label);
             match next {
                 Next::Dial(order) => return self.dial_in_order(dialer.as_ref(), &order),
                 Next::Race(reason) => return self.race(dialer, reason),
@@ -439,6 +546,30 @@ impl AddressPlan {
         stats.body_latency_ewma = Some(ewma(stats.body_latency_ewma, elapsed));
     }
 
+    /// Book one warm article fetch on a connection to `ip`: its decoded bytes
+    /// and the wire time they took. Ignored for an address the plan does not
+    /// know, and for a fetch that moved nothing.
+    ///
+    /// The caller keeps a connection's first fetch out of this: it pays for
+    /// the tail of the handshake and runs through a congestion window still
+    /// opening, and would count against whichever address was connected to
+    /// most recently.
+    pub(crate) fn record_delivery(&self, ip: IpAddr, bytes: u64, wire: Duration) {
+        if bytes == 0 || wire.is_zero() {
+            return;
+        }
+        let mut state = self.state();
+        if !state.candidates.iter().any(|addr| addr.ip() == ip) {
+            return;
+        }
+        state
+            .per_addr
+            .entry(ip)
+            .or_default()
+            .delivery
+            .book(bytes, wire);
+    }
+
     /// The provider accepts new connections again after refusing them. Its
     /// addresses may have been rebalanced meanwhile, so the next connect races
     /// again, busy or not: this is exactly when a fresh look is worth the
@@ -468,6 +599,8 @@ impl AddressPlan {
                         connect_time: stats.connect_ewma,
                         body_latency: stats.body_latency_ewma,
                         consecutive_failures: stats.consecutive_failures,
+                        delivery_bytes_per_second: stats.delivery.bytes_per_second(),
+                        delivery_samples: stats.delivery.samples,
                     }
                 })
                 .collect(),
@@ -493,10 +626,18 @@ impl AddressPlan {
         let mut state = self.state();
         state.last_race_failed_at = state.last_race_failed_at.and_then(|at| at.checked_sub(age));
     }
+
+    /// Make the last challenger dial look `age` older, as if the clock had
+    /// moved on.
+    #[cfg(test)]
+    pub(crate) fn age_last_shadow_by(&self, age: Duration) {
+        let mut state = self.state();
+        state.last_shadow_at = state.last_shadow_at.and_then(|at| at.checked_sub(age));
+    }
 }
 
 impl PlanState {
-    fn next(&mut self, now: Instant) -> Next {
+    fn next(&mut self, now: Instant, label: &str) -> Next {
         if self.racing {
             return Next::Wait(self.generation);
         }
@@ -513,7 +654,7 @@ impl PlanState {
             }
             (None, _) => Some(RaceReason::Initial),
             (Some(_), Some(pending)) => Some(pending),
-            (Some(_), None) if self.pin_is_due(now) => Some(RaceReason::Interval),
+            (Some(pin), None) if self.pin_is_due(now) => self.judge_on_delivery(now, label, pin),
             _ => None,
         };
         match reason {
@@ -521,8 +662,158 @@ impl PlanState {
                 self.racing = true;
                 Next::Race(reason)
             }
-            None => Next::Dial(self.dial_order()),
+            None => Next::Dial(self.dial_order_for_connect(now, label)),
         }
+    }
+
+    fn stats(&self, addr: SocketAddr) -> AddrStats {
+        self.per_addr.get(&addr.ip()).copied().unwrap_or_default()
+    }
+
+    /// The pin's age is due. Settle it on delivery when there is enough, and
+    /// say which race to run when there is not.
+    fn judge_on_delivery(
+        &mut self,
+        now: Instant,
+        label: &str,
+        pin: SocketAddr,
+    ) -> Option<RaceReason> {
+        match self.delivery_verdict(pin) {
+            DeliveryVerdict::Repin {
+                challenger,
+                challenger_rate,
+                pin_rate,
+            } => {
+                self.pinned = Some(challenger);
+                self.chosen_at = Some(now);
+                self.repins[RaceReason::Delivery.index()] += 1;
+                self.reset_delivery();
+                info!(
+                    server = label,
+                    reason = RaceReason::Delivery.as_str(),
+                    address = %challenger,
+                    previous = %pin,
+                    bytes_per_second = challenger_rate as u64,
+                    previous_bytes_per_second = pin_rate as u64,
+                    "pinned the address that delivered faster"
+                );
+                None
+            }
+            DeliveryVerdict::Keep {
+                best,
+                best_rate,
+                pin_rate,
+            } => {
+                self.chosen_at = Some(now);
+                self.reset_delivery();
+                debug!(
+                    server = label,
+                    address = %pin,
+                    bytes_per_second = pin_rate as u64,
+                    challenger = %best,
+                    challenger_bytes_per_second = best_rate as u64,
+                    "kept the pinned address on delivery"
+                );
+                None
+            }
+            DeliveryVerdict::Unmeasured => Some(RaceReason::Interval),
+        }
+    }
+
+    fn delivery_verdict(&self, pin: SocketAddr) -> DeliveryVerdict {
+        let Some(pin_rate) = self.stats(pin).delivery.measured_rate() else {
+            return DeliveryVerdict::Unmeasured;
+        };
+        let best = self
+            .candidates
+            .iter()
+            .copied()
+            .filter(|addr| *addr != pin)
+            .filter_map(|addr| Some((addr, self.stats(addr).delivery.measured_rate()?)))
+            .max_by(|left, right| left.1.total_cmp(&right.1));
+        match best {
+            Some((challenger, challenger_rate))
+                if challenger_rate >= pin_rate * DELIVERY_REPIN_RATIO =>
+            {
+                DeliveryVerdict::Repin {
+                    challenger,
+                    challenger_rate,
+                    pin_rate,
+                }
+            }
+            Some((best, best_rate)) => DeliveryVerdict::Keep {
+                best,
+                best_rate,
+                pin_rate,
+            },
+            None => DeliveryVerdict::Unmeasured,
+        }
+    }
+
+    /// Every verdict, and every race, judges the pin afresh from here.
+    fn reset_delivery(&mut self) {
+        for stats in self.per_addr.values_mut() {
+            stats.delivery = Delivery::default();
+        }
+    }
+
+    /// The order one connect dials: the usual order, or a challenger ahead of
+    /// it when this reconnect is the one to point at a challenger.
+    fn dial_order_for_connect(&mut self, now: Instant, label: &str) -> Vec<SocketAddr> {
+        let order = self.dial_order();
+        self.connects_since_shadow = self.connects_since_shadow.saturating_add(1);
+        let Some(challenger) = self.shadow_candidate(now) else {
+            return order;
+        };
+        self.last_shadow_at = Some(now);
+        self.connects_since_shadow = 0;
+        debug!(
+            server = label,
+            address = %challenger,
+            pinned = self.pinned.map(|addr| addr.to_string()),
+            "pointing a reconnect at a challenger address to measure its delivery"
+        );
+        std::iter::once(challenger)
+            .chain(order.into_iter().filter(|addr| *addr != challenger))
+            .collect()
+    }
+
+    /// The challenger this reconnect goes to, if it is time for one: the
+    /// candidate with the fewest fetches booked among those not yet measured,
+    /// never one that last refused. `None` while the pin is too young, too
+    /// recently or too often shadowed, not yet measured itself, or already
+    /// judged against every challenger.
+    fn shadow_candidate(&self, now: Instant) -> Option<SocketAddr> {
+        let pin = self.pinned?;
+        if now.saturating_duration_since(self.chosen_at?) < SHADOW_MIN_PIN_AGE {
+            return None;
+        }
+        if self
+            .last_shadow_at
+            .is_some_and(|at| now.saturating_duration_since(at) < SHADOW_INTERVAL)
+        {
+            return None;
+        }
+        if self.connects_since_shadow < SHADOW_EVERY_CONNECTS {
+            return None;
+        }
+        // The pin must be measured before any challenger is worth a look.
+        self.stats(pin).delivery.measured_rate()?;
+        self.candidates
+            .iter()
+            .copied()
+            .filter(|addr| *addr != pin)
+            .map(|addr| (addr, self.stats(addr)))
+            .filter(|(_, stats)| {
+                stats.consecutive_failures == 0 && stats.delivery.samples < DELIVERY_MIN_SAMPLES
+            })
+            .min_by_key(|(_, stats)| {
+                (
+                    stats.delivery.samples,
+                    stats.connect_ewma.unwrap_or(Duration::MAX),
+                )
+            })
+            .map(|(addr, _)| addr)
     }
 
     fn failed_race_is_recent(&self, now: Instant) -> bool {
@@ -583,6 +874,7 @@ impl RaceTicket<'_> {
         state.racing = false;
         state.pending = None;
         state.generation = state.generation.wrapping_add(1);
+        state.reset_delivery();
         let previous = state.pinned;
         match outcome {
             Ok(winner) => {

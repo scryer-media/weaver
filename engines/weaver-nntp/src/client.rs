@@ -434,6 +434,9 @@ pub struct BodyLaneLease {
     latency_ewma: Option<Duration>,
     /// Status-line-to-terminator wait: the article's own cost on the wire.
     transfer_ewma: Option<Duration>,
+    /// Successful responses this connection has produced. The first is cold
+    /// and moves neither average; see the blocking lane for why.
+    responses_completed: u64,
     checkpoint_plan: CheckpointPlan,
 }
 
@@ -536,8 +539,7 @@ impl BodyLaneLease {
             // Nothing else was outstanding, so the status-line wait is a clean
             // latency sample.
             let latency = self.take_response_line_wait().min(policy_elapsed);
-            self.observe_latency(latency);
-            self.observe_transfer(policy_elapsed.saturating_sub(latency));
+            self.book_response(Some(latency), policy_elapsed.saturating_sub(latency));
         }
 
         if result.as_ref().is_err_and(
@@ -728,10 +730,10 @@ impl BodyLaneLease {
                 let response_line_wait = self.take_response_line_wait().min(policy_elapsed);
                 // Only the head of the batch was issued with nothing else in
                 // flight; later responses are already queued behind it.
-                if response_idx == 0 {
-                    self.observe_latency(response_line_wait);
-                }
-                self.observe_transfer(policy_elapsed.saturating_sub(response_line_wait));
+                self.book_response(
+                    (response_idx == 0).then_some(response_line_wait),
+                    policy_elapsed.saturating_sub(response_line_wait),
+                );
             }
             let poisoned = self.conn.as_ref().is_some_and(|conn| conn.is_poisoned());
 
@@ -920,12 +922,18 @@ impl BodyLaneLease {
         }
     }
 
-    fn observe_latency(&mut self, sample: Duration) {
-        self.latency_ewma = Some(blend_ewma(self.latency_ewma, sample));
-    }
-
-    fn observe_transfer(&mut self, sample: Duration) {
-        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, sample));
+    /// Book one successful response. The connection's first response is
+    /// skipped: it carries setup costs no later one repeats.
+    fn book_response(&mut self, latency: Option<Duration>, transfer: Duration) {
+        let cold = self.responses_completed == 0;
+        self.responses_completed = self.responses_completed.saturating_add(1);
+        if cold {
+            return;
+        }
+        if let Some(latency) = latency {
+            self.latency_ewma = Some(blend_ewma(self.latency_ewma, latency));
+        }
+        self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, transfer));
     }
 
     /// Consume the last article's status-line wait so one response's latency
@@ -1109,6 +1117,7 @@ impl NntpClient {
                 mode: BodyLaneMode::Sequential,
                 latency_ewma: None,
                 transfer_ewma: None,
+                responses_completed: 0,
                 checkpoint_plan: CheckpointPlan::None,
             });
         }
@@ -1124,6 +1133,7 @@ impl NntpClient {
                 mode: BodyLaneMode::Sequential,
                 latency_ewma: None,
                 transfer_ewma: None,
+                responses_completed: 0,
                 checkpoint_plan: CheckpointPlan::None,
             }),
             Ok(Err(error)) => {
@@ -2361,6 +2371,30 @@ impl NntpClient {
                     attempt.elapsed,
                 );
             }
+        }
+    }
+
+    /// Book one decoded article's bytes and wire time against the address
+    /// that served it, for the address plan's delivery comparison. `attempts`
+    /// is the fetch's trace; the successful attempt names the server and the
+    /// address. The caller leaves out a connection's first fetch and any fetch
+    /// made while the job could not take bytes as fast as the wire offered.
+    pub fn record_address_delivery(
+        &self,
+        attempts: &[FetchAttemptTrace],
+        payload_bytes: u64,
+        wire: Duration,
+    ) {
+        let Some(served) = attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.outcome == FetchAttemptOutcome::Success)
+        else {
+            return;
+        };
+        if let Some(ip) = served.remote_ip {
+            self.pool
+                .record_address_delivery(ServerId(served.server_idx), ip, payload_bytes, wire);
         }
     }
 
