@@ -233,7 +233,10 @@ mod tests {
                 fields.contains(&format!(" replayed_target={}", module_path!())),
                 "{records:?}"
             );
-            assert!(fields.contains(" replayed_fields=job_id=91002"), "{records:?}");
+            assert!(
+                fields.contains(" replayed_fields=job_id=91002"),
+                "{records:?}"
+            );
             // The replay never carries the captured event's own line shape, so
             // a reader looking for "LEVEL target: message" finds the event,
             // not its replay.
