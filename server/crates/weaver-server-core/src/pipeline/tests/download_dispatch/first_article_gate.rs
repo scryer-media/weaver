@@ -642,14 +642,18 @@ async fn recovery_volumes_listed_first_do_not_crowd_payload_out_of_the_sample() 
 
 /// Completion repairs each set's files from that set, so neither set can spend
 /// its recovery slices on files described only by the other.
-async fn two_set_first_article_verdict(blocks_per_set: [u32; 2]) -> Option<String> {
+async fn two_set_verdict(
+    blocks_per_set: [u32; 2],
+    recovery_segments: u32,
+    health_only: bool,
+) -> Option<String> {
     const DESCRIBED: u64 = 480;
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(41712);
     let mut payload = vec![1u32; 10];
     payload.extend([16, 16]);
-    let mut spec = job_spec_with_recovery("Covered By Both Sets", &payload, 16);
+    let mut spec = job_spec_with_recovery("Covered By Both Sets", &payload, recovery_segments);
     let mut second = spec.files.last().unwrap().clone();
     second.filename = "amber-lattice.b.vol00+32.par2".to_string();
     for segment in &mut second.segments {
@@ -753,8 +757,13 @@ async fn two_set_first_article_verdict(blocks_per_set: [u32; 2]) -> Option<Strin
     }
     let sample = sample_in_file_order(&pipeline, job_id);
     assert_eq!(sample.len(), 12);
-    for segment_id in sample.iter().take(10) {
-        pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
+    let missing: Vec<_> = if health_only {
+        sample.iter().skip(5).take(3).copied().collect()
+    } else {
+        sample.iter().take(10).copied().collect()
+    };
+    for segment_id in missing {
+        pipeline.book_terminal_segment(segment_id, SegmentTerminalState::Missing);
     }
 
     job_failed(&pipeline, job_id)
@@ -763,15 +772,30 @@ async fn two_set_first_article_verdict(blocks_per_set: [u32; 2]) -> Option<Strin
 #[tokio::test]
 async fn losses_split_across_two_parsed_sets_are_covered_by_both() {
     assert!(
-        two_set_first_article_verdict([5, 5]).await.is_none(),
+        two_set_verdict([5, 5], 16, false).await.is_none(),
         "five lost files in each set fit each set's five obtainable slices"
     );
 }
 
 #[tokio::test]
 async fn one_sets_spare_slices_cannot_cover_another_sets_lost_files() {
-    let error = two_set_first_article_verdict([10, 0])
+    let error = two_set_verdict([10, 0], 16, false)
         .await
         .expect("set B has no slices to recover its five lost files");
     assert!(error.contains("first articles are missing"), "{error}");
+}
+
+#[tokio::test]
+async fn health_deferral_cannot_spend_one_sets_slices_on_another() {
+    assert!(
+        two_set_verdict([5, 5], 1, true).await.is_none(),
+        "set B's own slices cover its three damaged files"
+    );
+    let error = two_set_verdict([10, 0], 1, true)
+        .await
+        .expect("set B cannot recover its three damaged files");
+    assert!(
+        error.starts_with("health ") && error.contains("below critical"),
+        "{error}"
+    );
 }

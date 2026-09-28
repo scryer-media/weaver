@@ -435,6 +435,63 @@ impl Pipeline {
             < failed_bytes
     }
 
+    /// Known damaged files each require at least one slice from their own set.
+    /// A probe projection has no set attribution, so only booked failures can
+    /// prove that one set is already beyond repair.
+    fn known_health_losses_fit_recovery_sets(&self, job_id: JobId, ceiling: Option<u64>) -> bool {
+        let Some(ceiling) = ceiling else {
+            return true;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let mut set_ids = self.par2_servable_set_ids(job_id);
+        if let Some(served) = self.par2_served_set_id(job_id)
+            && !set_ids.contains(&served)
+        {
+            set_ids.push(served);
+        }
+        let set_capacities: Vec<_> = set_ids
+            .iter()
+            .filter_map(|set_id| {
+                let slice_size = self.par2_set_for(job_id, *set_id)?.slice_size;
+                Some((
+                    *set_id,
+                    slice_size,
+                    u64::from(self.obtainable_recovery_block_capacity(job_id, *set_id))
+                        .saturating_mul(slice_size),
+                ))
+            })
+            .collect();
+        let known_capacity = set_capacities
+            .iter()
+            .map(|(_, _, capacity)| *capacity)
+            .fold(0u64, u64::saturating_add);
+        let unknown_capacity = ceiling.saturating_sub(known_capacity);
+        let mut needed_by_set = std::collections::HashMap::new();
+        for &file_index in &state.health_failing_files {
+            let file_id = NzbFileId { job_id, file_index };
+            if let Some((set_id, slice_size, _)) = set_capacities.iter().find(|(set_id, _, _)| {
+                self.resolve_par2_file_binding_in_set(file_id, *set_id)
+                    .is_some()
+            }) {
+                let needed = needed_by_set.entry(*set_id).or_insert(0u64);
+                *needed = needed.saturating_add(*slice_size);
+            }
+        }
+        let deficit = set_capacities
+            .iter()
+            .map(|(set_id, _, capacity)| {
+                needed_by_set
+                    .get(set_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_sub(*capacity)
+            })
+            .fold(0u64, u64::saturating_add);
+        deficit <= unknown_capacity
+    }
+
     /// Check job health and abort if below critical threshold.
     ///
     /// Health = (total_bytes - failed_bytes) / total_bytes × 1000.
@@ -540,6 +597,7 @@ impl Pipeline {
                 && recovery
                     .ceiling
                     .is_none_or(|ceiling| failed_bytes <= ceiling)
+                && self.known_health_losses_fit_recovery_sets(job_id, recovery.ceiling)
             {
                 let entered = self.note_health_deferral(job_id, HealthDeferralKind::Par2Recovery);
                 if entered {
