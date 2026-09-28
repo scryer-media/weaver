@@ -306,7 +306,7 @@ metric_families! {
     SERVER_ADDRESS_RACES = ("weaver_server_address_races_total", Counter,
         ["server_id", "server", "outcome"], "Address races run to pick the address new connections dial, by outcome.");
     SERVER_ADDRESS_REPINS = ("weaver_server_address_repins_total", Counter,
-        ["server_id", "server", "reason"], "Changes of the pinned server address, by the reason the race ran.");
+        ["server_id", "server", "reason"], "Changes of the pinned server address, by what decided them: the reason a race ran, or measured delivery.");
     SERVER_PREMATURE_DEATHS = ("weaver_server_premature_deaths", Gauge, ["server_id", "server"],
         "Recent connections that died before reaching 60s of age.");
     NNTP_RUNTIME_GENERATION = ("weaver_nntp_runtime_generation", Gauge, [],

@@ -1617,10 +1617,10 @@ fn run_owned_blocking_download_lane(
         nntp.record_blocking_attempts(&trace.attempts);
         let (payload_bytes, policy_elapsed) = Pipeline::decoded_trace_throughput_sample(&trace);
         let sample = lane.take_response_sample();
-        // A connection's first article says nothing about what its address
-        // delivers in steady state, and neither does one fetched while the
-        // job could not take bytes as fast as the wire offered them.
-        if !sample.cold && payload_bytes > 0 && work_context.pressure_clear {
+        // A connection's first few articles say nothing about what its
+        // address delivers in steady state, and neither does one fetched
+        // while the job could not take bytes as fast as the wire offered them.
+        if sample.settled && payload_bytes > 0 && work_context.pressure_clear {
             nntp.record_address_delivery(&trace.attempts, payload_bytes, policy_elapsed);
         }
         let result = result_from_trace(

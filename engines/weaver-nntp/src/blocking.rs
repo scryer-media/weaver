@@ -1012,8 +1012,13 @@ impl BlockingBodyLane {
     /// that one cold sample for as long as the connection lived.
     fn book_response(&mut self, latency: Option<Duration>, transfer: Duration) {
         let cold = self.responses_completed == 0;
+        let settled = self.responses_completed >= SETTLED_AFTER_RESPONSES;
         self.responses_completed = self.responses_completed.saturating_add(1);
-        self.last_sample = ResponseSample { latency, cold };
+        self.last_sample = ResponseSample {
+            latency,
+            cold,
+            settled,
+        };
         if cold {
             return;
         }
@@ -1040,7 +1045,18 @@ pub struct ResponseSample {
     /// costs no later response repeats, so it describes the connection's
     /// start, not the link.
     pub cold: bool,
+    /// The connection had already answered [`SETTLED_AFTER_RESPONSES`]
+    /// requests, so its congestion window has had the round trips it needs
+    /// to open and this response's wire rate is the address's, not the
+    /// socket's ramp. Implies `!cold`.
+    pub settled: bool,
 }
+
+/// Responses a connection answers before its wire rate is taken as the
+/// address's. The first response is cold; the next few are still read
+/// through a window that doubles each round trip, and on a link with a long
+/// round trip and large articles that ramp outlasts several of them.
+pub const SETTLED_AFTER_RESPONSES: u64 = 4;
 
 fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
     match current {
