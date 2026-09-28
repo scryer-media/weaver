@@ -246,6 +246,27 @@ func TestChecksFlagPodmanIncompatibilities(t *testing.T) {
 	}
 }
 
+func TestRootlessIDMappingMustCoverThePostgreSQLIDs(t *testing.T) {
+	// Enough for the service entrypoints' 1000 but not PostgreSQL's 999.
+	partial := []IDMap{{ContainerID: 0, HostID: 1000, Size: 1}, {ContainerID: 1000, HostID: 101000, Size: 1}}
+	engine := &Engine{
+		Kind: Podman, Binary: "podman", Probed: true, Version: "5.3.0",
+		ComposeProvider: ProviderDockerCompose, ComposeVersion: "2.24.4",
+		CgroupManager: "systemd", Rootless: true,
+		UIDMap: partial, GIDMap: []IDMap{{ContainerID: 0, HostID: 1000, Size: 1}, {ContainerID: 1, HostID: 100000, Size: 65536}},
+	}
+	failed := HardFailures(engine.Checks())
+	if len(failed) != 1 || failed[0].Name != "rootless ID mapping" {
+		t.Fatalf("uid map without 999: hard failures = %+v", failed)
+	}
+
+	engine.UIDMap, engine.GIDMap = engine.GIDMap, partial
+	failed = HardFailures(engine.Checks())
+	if len(failed) != 1 || failed[0].Name != "rootless ID mapping" {
+		t.Fatalf("gid map without 999: hard failures = %+v", failed)
+	}
+}
+
 func TestChecksDocker(t *testing.T) {
 	engine := &Engine{Kind: Docker, Binary: "docker", Probed: true, Version: "29.8.0", ComposeProvider: ProviderDockerCompose, ComposeVersion: "5.5.1"}
 	if failed := HardFailures(engine.Checks()); len(failed) != 0 {
