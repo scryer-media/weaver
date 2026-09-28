@@ -846,6 +846,38 @@ fn a_race_loser_that_timed_out_is_not_booked_as_a_failure() {
 }
 
 #[test]
+fn a_timeout_beyond_the_race_limit_that_lost_is_not_booked_as_a_failure() {
+    let addresses: Vec<_> = (1..=MAX_RACE_CANDIDATES + 2)
+        .map(|index| addr(index as u8))
+        .collect();
+    let (slow, winner) = (
+        addresses[MAX_RACE_CANDIDATES],
+        addresses[MAX_RACE_CANDIDATES + 1],
+    );
+    let dialer = ScriptedDialer::new(&addresses);
+    for &address in addresses.iter().take(MAX_RACE_CANDIDATES) {
+        dialer.answer(address, Answer::Refuse);
+    }
+    dialer.answer(slow, Answer::Fail(io::ErrorKind::TimedOut));
+    let plan = plan();
+
+    let (_, pinned) = plan.connect(&dialer).unwrap();
+    assert_eq!(pinned, winner);
+    settle_all(&dialer);
+
+    let snapshot = plan.snapshot();
+    let failures = |address: SocketAddr| {
+        snapshot
+            .addresses
+            .iter()
+            .find(|candidate| candidate.address == address)
+            .map(|candidate| candidate.consecutive_failures)
+    };
+    assert_eq!(failures(slow), Some(0));
+    assert_eq!(failures(addresses[0]), Some(1));
+}
+
+#[test]
 fn a_race_in_which_every_address_timed_out_books_the_timeouts() {
     let (first, second) = (addr(1), addr(2));
     let dialer = ScriptedDialer::new(&[first, second]);
