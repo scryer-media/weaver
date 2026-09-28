@@ -40,6 +40,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // Toolchain is one pinned oracle: a container image built from a Dockerfile in
@@ -281,9 +283,12 @@ func (docker *Docker) containerArgs(toolchain Toolchain, mount, relative string,
 	args := []string{
 		"run", "--rm", "--platform", toolchain.Platform,
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	}
+	args = append(args, containerengine.Current().RunUserArgs()...)
+	args = append(args,
 		"--mount", bind,
 		"--workdir", workdir,
-	}
+	)
 	if toolchain.UTF8Locale {
 		args = append(args, "--env", "LANG=C.UTF-8", "--env", "LC_ALL=C.UTF-8")
 	}
@@ -294,7 +299,7 @@ func (docker *Docker) binary() string {
 	if docker.Binary != "" {
 		return docker.Binary
 	}
-	return "docker"
+	return containerengine.Current().Binary
 }
 
 func (docker *Docker) run(ctx context.Context, args ...string) error {

@@ -13,6 +13,7 @@ package weaver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // Scenario is the JSON manifest for a pre-built test fixture.
@@ -386,7 +389,7 @@ Commands:
 
 Environment:
   E2E_DIR              Path to the e2e repo root (auto-detected by default)
-  E2E_PROJECT          Docker Compose project name for this run (default: e2e)
+  E2E_PROJECT          Compose project name for this run (default: e2e)
   FIXTURES_DIR         Path to seeded fixtures (default: <repo>/fixtures)
   TESTDATA_DIR         Path to source fixtures (default: <repo>/testdata)
   E2E_RUNTIME_PORTS_FILE  Path to the runtime port state file
@@ -664,8 +667,16 @@ func isDockerHostPortBindCollision(err error) bool {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "failed to bind host port") &&
-		strings.Contains(message, "address already in use")
+	if !strings.Contains(message, "address already in use") {
+		return false
+	}
+	if strings.Contains(message, "failed to bind host port") {
+		return true
+	}
+	// Podman reports the same collision from its rootless port forwarder or,
+	// rootful, from its own listener.
+	return containerengine.Current().Kind == containerengine.Podman &&
+		(strings.Contains(message, "rootlessport") || strings.Contains(message, "cannot listen on the tcp port"))
 }
 
 func validateRuntimePortState(state runtimePortState) error {
@@ -881,8 +892,7 @@ func dockerComposeArgs(args ...string) []string {
 }
 
 func dockerComposeServiceContainerID(service string) (string, error) {
-	args := dockerComposeArgs("ps", "-q", service)
-	cmd := exec.Command("docker", args...)
+	cmd := composeServiceContainersCommand(context.Background(), composeProject(), service, false, dockerComposeArgs("ps", "-q", service))
 	cmd.Dir = e2eDir()
 	out, err := cmd.Output()
 	if err != nil {
@@ -900,7 +910,7 @@ func inspectDockerHostPort(serviceName, containerPort string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	cmd := exec.Command("docker", "inspect", "-f", fmt.Sprintf("{{(index (index .NetworkSettings.Ports %q) 0).HostPort}}", containerPort), containerID)
+	cmd := containerengine.Command("inspect", "-f", fmt.Sprintf("{{(index (index .NetworkSettings.Ports %q) 0).HostPort}}", containerPort), containerID)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("inspect %s %s: %w", serviceName, containerPort, err)
@@ -995,7 +1005,7 @@ func dockerContainerRunning(service string) bool {
 	if err != nil {
 		return false
 	}
-	check := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", containerID)
+	check := containerengine.Command("inspect", "-f", "{{.State.Running}}", containerID)
 	out, err := check.Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }

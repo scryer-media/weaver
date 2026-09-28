@@ -3,8 +3,9 @@ package weaver
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
+
+	"github.com/scryer-media/weaver/e2e/internal/containerengine"
 )
 
 // printRoundDiagnostics queries weaver for per-job health details and
@@ -66,7 +67,7 @@ func readWeaverLogForDiagnostics(useDockerLogs bool) string {
 		if err != nil {
 			return ""
 		}
-		cmd := exec.Command("docker", "logs", "--tail", "5000", containerID)
+		cmd := containerengine.Command("logs", "--tail", "5000", containerID)
 		cmd.Dir = e2eDir()
 		out, err := cmd.CombinedOutput()
 		if err != nil && len(out) == 0 {
