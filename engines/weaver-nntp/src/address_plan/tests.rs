@@ -178,6 +178,43 @@ fn every_resolved_address_is_raced_however_many_there_are() {
 }
 
 #[test]
+fn addresses_beyond_one_batch_are_raced_in_the_next() {
+    let addresses: Vec<_> = (0..MAX_RACE_CANDIDATES + 2)
+        .map(|index| {
+            SocketAddr::from(([192, 0, (index / 250) as u8, (index % 250) as u8 + 1], 563))
+        })
+        .collect();
+    let (slow, winner) = (
+        addresses[MAX_RACE_CANDIDATES],
+        addresses[MAX_RACE_CANDIDATES + 1],
+    );
+    let dialer = ScriptedDialer::new(&addresses);
+    for &address in addresses.iter().take(MAX_RACE_CANDIDATES) {
+        dialer.answer(address, Answer::Refuse);
+    }
+    dialer.answer(slow, Answer::Fail(io::ErrorKind::TimedOut));
+    let plan = plan();
+
+    let (_, pinned) = plan.connect(&dialer).unwrap();
+
+    assert_eq!(pinned, winner);
+    settle_all(&dialer);
+    assert_eq!(dialer.take_dialled().len(), addresses.len());
+    let snapshot = plan.snapshot();
+    assert_eq!(snapshot.addresses.len(), addresses.len());
+    let failures = |address: SocketAddr| {
+        snapshot
+            .addresses
+            .iter()
+            .find(|candidate| candidate.address == address)
+            .map(|candidate| candidate.consecutive_failures)
+    };
+    // The timeout lost to the winner of its own batch, so it is not a failure.
+    assert_eq!(failures(slow), Some(0));
+    assert_eq!(failures(addresses[0]), Some(1));
+}
+
+#[test]
 fn a_refused_pin_falls_over_to_the_candidate_that_connects_fastest() {
     let (pinned, slower, faster) = (addr(1), addr(2), addr(3));
     let dialer = ScriptedDialer::new(&[pinned, slower, faster]);
