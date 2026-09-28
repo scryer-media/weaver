@@ -3522,6 +3522,225 @@ async fn a_7z_data_error_the_recovery_data_finds_clean_fails_after_one_retry() {
     }
 }
 
+/// A gzip job with its recovery set loaded, walked through its completion
+/// checks until its conventional extraction is in flight, settled clean on the
+/// strong-decode claim with no verification pass. `damaged` flips one byte in
+/// the middle of the posted archive, which the recovery set describes intact.
+async fn strong_decode_verified_gzip(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    damaged: bool,
+) -> (PathBuf, &'static str, Vec<u8>) {
+    use std::io::Write;
+
+    let archive_filename = "amber_lantern.gz";
+    let index_filename = "amber_lantern.par2";
+    let recovery_filename = "amber_lantern.vol00+02.par2";
+    let slice_size = 4096;
+    // Enough varied payload that the deflate stream spans several slices.
+    let payload: Vec<u8> = (0..96 * 1024u32)
+        .map(|value| (value.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&payload).unwrap();
+    let gzip_bytes = encoder.finish().unwrap();
+    let described: Vec<(&str, &[u8])> = vec![(archive_filename, gzip_bytes.as_slice())];
+    let par2_bytes = build_test_par2_index_for_files(&described, slice_size);
+    let recovery_bytes = vec![0xAA; 64];
+
+    let mut posted = gzip_bytes.clone();
+    if damaged {
+        let middle = posted.len() / 2;
+        posted[middle] ^= 0xFF;
+    }
+    let files = vec![
+        (archive_filename.to_string(), posted.clone()),
+        (index_filename.to_string(), par2_bytes.clone()),
+        (recovery_filename.to_string(), recovery_bytes.clone()),
+    ];
+    let working_dir = insert_active_job(
+        pipeline,
+        job_id,
+        rar_job_spec("Amber Lantern Strong Decode", &files),
+    )
+    .await;
+    write_and_complete_file(pipeline, job_id, 0, archive_filename, &posted).await;
+    write_and_complete_file(pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    write_and_complete_file(pipeline, job_id, 2, recovery_filename, &recovery_bytes).await;
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        build_repairable_par2_set_for_files(&described, slice_size, 2),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 2, true),
+        ],
+    );
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.assembly.set_archive_topology(
+            archive_filename.to_string(),
+            crate::jobs::assembly::ArchiveTopology {
+                archive_type: crate::jobs::assembly::ArchiveType::Gz,
+                volume_map: HashMap::from([(archive_filename.to_string(), 0)]),
+                complete_volumes: [0u32].into_iter().collect(),
+                expected_volume_count: Some(1),
+                members: vec![crate::jobs::assembly::ArchiveMember {
+                    name: "amber_lantern".to_string(),
+                    first_volume: 0,
+                    last_volume: 0,
+                    unpacked_size: payload.len() as u64,
+                }],
+                unresolved_spans: Vec::new(),
+            },
+        );
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    let mut events = pipeline.event_tx.subscribe();
+    pipeline.schedule_job_completion_check(job_id);
+    loop {
+        settle_par2_analysis_work(pipeline).await;
+        if pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| !sets.is_empty())
+        {
+            break;
+        }
+        let queued = pipeline
+            .pending_completion_checks
+            .pop_front()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the completion checks start the extraction: {}",
+                    debug_job_state(pipeline, job_id)
+                )
+            });
+        pipeline.check_job_completion(queued).await;
+    }
+    assert!(
+        pipeline.par2_verified.contains(&job_id),
+        "the set is settled before its extraction starts"
+    );
+    assert_eq!(
+        drain_job_verification_started(&mut events, job_id),
+        0,
+        "settled on the strong-decode claim, not by a verification pass"
+    );
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0);
+    (working_dir, archive_filename, gzip_bytes)
+}
+
+/// The strong-decode claim is not the 7z's alone. A gzip set settled on it
+/// whose extraction then fails has its claim reopened the same way: the
+/// authoritative pass finds the damage, one repair rebuilds the archive, and
+/// the set extracts from the repaired bytes rather than failing the job.
+#[tokio::test]
+async fn a_strong_decode_verified_gzip_whose_extraction_fails_is_repaired_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30297);
+    let (working_dir, archive_filename, original) =
+        strong_decode_verified_gzip(&mut pipeline, job_id, true).await;
+
+    let first = next_extraction_done(&mut pipeline).await;
+    match &first {
+        ExtractionDone::FullSet {
+            set_name,
+            result: Err(_),
+            ..
+        } => assert_eq!(set_name, archive_filename),
+        _ => panic!("expected the damaged gzip's extraction to fail"),
+    }
+    pipeline.handle_extraction_done(first).await;
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "a failure the recovery data never ruled on is for it to rule on: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    let done = next_7z_extraction_or_rest(&mut pipeline, job_id)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the repaired set is extracted again: {}",
+                debug_job_state(&pipeline, job_id)
+            )
+        });
+    assert_eq!(
+        pipeline.par2_repairer_execute_calls, 1,
+        "the reopened claim routes the job to one repair"
+    );
+    assert_eq!(
+        std::fs::read(working_dir.join(archive_filename)).unwrap(),
+        original,
+        "the repair rebuilt the archive byte for byte"
+    );
+    match &done {
+        ExtractionDone::FullSet { result, .. } => {
+            let outcome = result.as_ref().expect("the repaired set extracts");
+            assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        }
+        _ => panic!("expected a full-set extraction of the repaired gzip"),
+    }
+    pipeline.handle_extraction_done(done).await;
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1, "and only one");
+}
+
+/// The gzip reopen is bounded too. Once the authoritative pass has ruled, an
+/// extraction that keeps failing finds no claim left to reopen, and the job
+/// fails on the extraction's own error after exactly one fallback.
+#[tokio::test]
+async fn a_gzip_failure_the_recovery_data_finds_clean_is_final_after_one_fallback() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30298);
+    let _ = strong_decode_verified_gzip(&mut pipeline, job_id, false).await;
+    let _ = drain_job_verification_started(&mut events, job_id);
+    let injected = "gzip stream ended in a corrupt deflate block";
+
+    let mut failures = 0;
+    let mut next = Some(next_extraction_done(&mut pipeline).await);
+    while let Some(done) = next.take() {
+        // Whatever the extraction really produced, it reports the same
+        // failure: the shape of a defect repair cannot reach.
+        let done = match done {
+            ExtractionDone::FullSet {
+                job_id, set_name, ..
+            } => ExtractionDone::FullSet {
+                job_id,
+                set_name,
+                result: Err(injected.to_string()),
+            },
+            _ => panic!("expected a full-set gzip extraction"),
+        };
+        failures += 1;
+        assert!(failures <= 2, "the claim kept reopening");
+        pipeline.handle_extraction_done(done).await;
+        next = next_7z_extraction_or_rest(&mut pipeline, job_id).await;
+    }
+
+    assert_eq!(failures, 2, "one fallback after the claim was contradicted");
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0, "nothing to repair");
+    assert_eq!(
+        drain_job_verification_started(&mut events, job_id),
+        1,
+        "exactly one authoritative pass"
+    );
+    match job_status_for_assert(&pipeline, job_id) {
+        Some(JobStatus::Failed { error, .. }) => assert!(error.contains(injected), "{error}"),
+        other => panic!(
+            "expected the job to fail, got {other:?}: {}",
+            debug_job_state(&pipeline, job_id)
+        ),
+    }
+}
+
 /// A 7z data error is one a repair can change; a method this build cannot
 /// decode and a missing or wrong password are not, and still end the job.
 #[test]
