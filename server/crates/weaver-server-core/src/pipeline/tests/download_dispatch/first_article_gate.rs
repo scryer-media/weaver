@@ -640,12 +640,25 @@ async fn recovery_volumes_listed_first_do_not_crowd_payload_out_of_the_sample() 
     );
 }
 
+/// What [`two_set_verdict`] books missing.
+#[derive(Clone, Copy)]
+enum TwoSetLoss {
+    /// The first articles of files 0-9: five of each set's files.
+    TenSampledFiles,
+    /// The first articles of files 5-7, all set B's.
+    ThreeSetBFiles,
+    /// Articles 1 onward of file 11, set B's sixteen-article file.
+    SetBFileArticles(u32),
+}
+
 /// Completion repairs each set's files from that set, so neither set can spend
-/// its recovery slices on files described only by the other.
+/// its recovery slices on files described only by the other. With `shared`,
+/// both sets describe every payload file, and either can repair any of them.
 async fn two_set_verdict(
     blocks_per_set: [u32; 2],
     recovery_segments: u32,
-    health_only: bool,
+    loss: TwoSetLoss,
+    shared: bool,
 ) -> Option<String> {
     const DESCRIBED: u64 = 480;
     let temp_dir = tempfile::tempdir().unwrap();
@@ -685,22 +698,27 @@ async fn two_set_verdict(
         })
         .collect();
     for (index, file) in spec.files.iter().take(12).enumerate() {
-        let set = &mut sets[usize::from(!(index < 5 || index == 10))];
-        let mut raw_id = [0u8; 16];
-        raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
-        let file_id = par2_rs::FileId::from_bytes(raw_id);
-        set.recovery_file_ids.push(file_id);
-        set.files.insert(
-            file_id,
-            par2_rs::FileDescription {
+        let own = usize::from(!(index < 5 || index == 10));
+        for (set_index, set) in sets.iter_mut().enumerate() {
+            if !shared && set_index != own {
+                continue;
+            }
+            let mut raw_id = [0u8; 16];
+            raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
+            let file_id = par2_rs::FileId::from_bytes(raw_id);
+            set.recovery_file_ids.push(file_id);
+            set.files.insert(
                 file_id,
-                hash_full: [index as u8; 16],
-                hash_16k: [index as u8; 16],
-                length: file.segments.len() as u64 * DESCRIBED,
-                par2_name: file.filename.clone(),
-                filename: file.filename.clone(),
-            },
-        );
+                par2_rs::FileDescription {
+                    file_id,
+                    hash_full: [index as u8; 16],
+                    hash_16k: [index as u8; 16],
+                    length: file.segments.len() as u64 * DESCRIBED,
+                    par2_name: file.filename.clone(),
+                    filename: file.filename.clone(),
+                },
+            );
+        }
     }
     insert_active_job(&mut pipeline, job_id, spec).await;
     let second_set = sets.pop().unwrap();
@@ -722,17 +740,22 @@ async fn two_set_verdict(
     volume.discovery = Par2DiscoveryState::Parsed {
         set_ids: vec![set_ids[1]],
     };
-    if blocks_per_set[1] == 0 {
+    for (recovery, blocks) in [first_recovery, second_recovery]
+        .into_iter()
+        .zip(blocks_per_set)
+    {
+        if blocks != 0 {
+            continue;
+        }
         // The filename still advertises recovery; every article must be
         // terminal before those advertised blocks become unobtainable.
-        let articles: Vec<_> = pipeline.jobs.get(&job_id).unwrap().spec.files
-            [second_recovery as usize]
+        let articles: Vec<_> = pipeline.jobs.get(&job_id).unwrap().spec.files[recovery as usize]
             .segments
             .iter()
             .map(|segment| SegmentId {
                 file_id: NzbFileId {
                     job_id,
-                    file_index: second_recovery,
+                    file_index: recovery,
                 },
                 segment_number: segment.ordinal,
             })
@@ -757,10 +780,18 @@ async fn two_set_verdict(
     }
     let sample = sample_in_file_order(&pipeline, job_id);
     assert_eq!(sample.len(), 12);
-    let missing: Vec<_> = if health_only {
-        sample.iter().skip(5).take(3).copied().collect()
-    } else {
-        sample.iter().take(10).copied().collect()
+    let missing: Vec<_> = match loss {
+        TwoSetLoss::TenSampledFiles => sample.iter().take(10).copied().collect(),
+        TwoSetLoss::ThreeSetBFiles => sample.iter().skip(5).take(3).copied().collect(),
+        TwoSetLoss::SetBFileArticles(articles) => (1..=articles)
+            .map(|segment_number| SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 11,
+                },
+                segment_number,
+            })
+            .collect(),
     };
     for segment_id in missing {
         pipeline.book_terminal_segment(segment_id, SegmentTerminalState::Missing);
@@ -772,14 +803,16 @@ async fn two_set_verdict(
 #[tokio::test]
 async fn losses_split_across_two_parsed_sets_are_covered_by_both() {
     assert!(
-        two_set_verdict([5, 5], 16, false).await.is_none(),
+        two_set_verdict([5, 5], 16, TwoSetLoss::TenSampledFiles, false)
+            .await
+            .is_none(),
         "five lost files in each set fit each set's five obtainable slices"
     );
 }
 
 #[tokio::test]
 async fn one_sets_spare_slices_cannot_cover_another_sets_lost_files() {
-    let error = two_set_verdict([10, 0], 16, false)
+    let error = two_set_verdict([10, 0], 16, TwoSetLoss::TenSampledFiles, false)
         .await
         .expect("set B has no slices to recover its five lost files");
     assert!(error.contains("first articles are missing"), "{error}");
@@ -788,14 +821,58 @@ async fn one_sets_spare_slices_cannot_cover_another_sets_lost_files() {
 #[tokio::test]
 async fn health_deferral_cannot_spend_one_sets_slices_on_another() {
     assert!(
-        two_set_verdict([5, 5], 1, true).await.is_none(),
+        two_set_verdict([5, 5], 1, TwoSetLoss::ThreeSetBFiles, false)
+            .await
+            .is_none(),
         "set B's own slices cover its three damaged files"
     );
-    let error = two_set_verdict([10, 0], 1, true)
+    let error = two_set_verdict([10, 0], 1, TwoSetLoss::ThreeSetBFiles, false)
         .await
         .expect("set B cannot recover its three damaged files");
     assert!(
         error.starts_with("health ") && error.contains("below critical"),
         "{error}"
+    );
+}
+
+/// A damaged file costs its set every slice it lost, not one slice whatever it
+/// lost: set A's spare slices do not stretch set B's two to cover a file that
+/// lost three or more.
+#[tokio::test]
+async fn health_deferral_charges_a_set_every_slice_its_file_lost() {
+    assert!(
+        two_set_verdict([10, 5], 1, TwoSetLoss::SetBFileArticles(4), false)
+            .await
+            .is_none(),
+        "set B's five slices cover four lost articles of its file"
+    );
+    let error = two_set_verdict([10, 2], 1, TwoSetLoss::SetBFileArticles(4), false)
+        .await
+        .expect("set B's two slices cannot cover the articles its file lost");
+    assert!(
+        error.starts_with("health ") && error.contains("below critical"),
+        "{error}"
+    );
+}
+
+/// A file both sets describe can be repaired from either, so it is not
+/// charged to the set listed first when that set has nothing to give.
+#[tokio::test]
+async fn a_lost_file_both_sets_describe_is_charged_to_the_set_that_can_repair_it() {
+    assert!(
+        two_set_verdict([0, 10], 16, TwoSetLoss::TenSampledFiles, true)
+            .await
+            .is_none(),
+        "set B's ten slices cover the ten lost files both sets describe"
+    );
+}
+
+#[tokio::test]
+async fn health_deferral_charges_a_file_both_sets_describe_to_the_set_that_can_repair_it() {
+    assert!(
+        two_set_verdict([0, 10], 1, TwoSetLoss::ThreeSetBFiles, true)
+            .await
+            .is_none(),
+        "set B's ten slices cover the three damaged files both sets describe"
     );
 }
