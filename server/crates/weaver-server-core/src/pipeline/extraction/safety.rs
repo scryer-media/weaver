@@ -243,6 +243,13 @@ enum AdmissionOrder {
     /// as it fits: queued behind a request waiting for the memory this work
     /// holds, neither would ever be granted.
     Holder,
+    /// A chase growing its decoder while it holds `held` bytes of it. It
+    /// passes the queue as any holder does, and while it waits it is a chase
+    /// stopped with memory in hand, the same as one parked on its download:
+    /// what it holds counts as parked, and it yields to a waiter that asks.
+    /// Two chases growing at once would otherwise each wait for what the
+    /// other holds.
+    Chase { held: u64 },
 }
 
 /// One queued request, as its owner last stated it.
@@ -510,6 +517,16 @@ impl ProcessMemoryBudget {
             .is_ok()
     }
 
+    /// Take one posted yield, leaving the `own` tickets the caller posted
+    /// itself: yielding to its own request would free nothing it could use.
+    fn claim_yield_beyond(&self, own: u64) -> bool {
+        self.yield_tickets
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |tickets| {
+                (tickets > own).then(|| tickets - 1)
+            })
+            .is_ok()
+    }
+
     /// Give back a ticket this waiter posted. If a chase already claimed it,
     /// this takes another waiter's instead, which only means fewer yields.
     fn withdraw_yield(&self) {
@@ -609,6 +626,17 @@ impl ProcessMemoryBudget {
                 self.0.withdraw_yield();
             }
         }
+        struct Parked<'a>(&'a AtomicU64, u64);
+        impl Drop for Parked<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(self.1, Ordering::AcqRel);
+            }
+        }
+        let held = match order {
+            AdmissionOrder::Chase { held } => held,
+            AdmissionOrder::Queued | AdmissionOrder::Holder => 0,
+        };
+        let mut parked = None;
         let mut waiting = None;
         // The ticket this request has posted, and the releases counted when
         // it posted it.
@@ -649,7 +677,7 @@ impl ProcessMemoryBudget {
             if let Some(sequence) = queued {
                 wait_guard.restate(sequence, bytes);
             }
-            let next_in_line = order == AdmissionOrder::Holder
+            let next_in_line = order != AdmissionOrder::Queued
                 || !wait_guard
                     .held_by_an_older_request(queued, self.total_retained.load(Ordering::Acquire));
             if next_in_line && reserve_atomic(&self.reserved, bytes, self.limit).is_ok() {
@@ -692,7 +720,23 @@ impl ProcessMemoryBudget {
                 .load(Ordering::Acquire)
                 .saturating_add(bytes)
                 .saturating_sub(self.limit);
-            if ticket.is_none() && next_in_line && short <= self.parked.load(Ordering::Acquire) {
+            if held != 0 {
+                if self.claim_yield_beyond(u64::from(ticket.is_some())) {
+                    break Err(format!(
+                        "{}: it was waiting for {bytes} more bytes with {held} in hand",
+                        crate::pipeline::direct_unpack::coverage::MEMORY_YIELD_ABORT
+                    ));
+                }
+                if parked.is_none() {
+                    self.parked.fetch_add(held, Ordering::AcqRel);
+                    parked = Some(Parked(&self.parked, held));
+                    // The waiters weigh what this chase holds.
+                    self.released.notify_all();
+                }
+            }
+            // What this request holds itself frees nothing for it.
+            let parked_by_others = self.parked.load(Ordering::Acquire).saturating_sub(held);
+            if ticket.is_none() && next_in_line && short <= parked_by_others {
                 self.yield_tickets.fetch_add(1, Ordering::AcqRel);
                 ticket = Some((Ticket(self), releases));
             }
@@ -723,6 +767,7 @@ impl ProcessMemoryBudget {
         // been answered and no admission sees a waiter that has left.
         drop(ticket);
         drop(waiting);
+        drop(parked);
         if let Some(sequence) = queued {
             // Whoever was behind this request may be next now.
             wait_guard.leave(sequence);
@@ -922,22 +967,23 @@ impl JobExtractionBudget {
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<MemoryPermit, String> {
-        self.reserve_memory(DecoderRequest::Exact(bytes), AdmissionOrder::Queued)
+        self.reserve_memory(DecoderRequest::Exact(bytes), false)
     }
 
-    /// Reserve `bytes` more for a decode that already holds memory from this
+    /// Reserve `bytes` more for a chase that already holds memory from this
     /// budget and keeps it until this is granted.
     ///
-    /// What the decode holds is memory a queued request may be waiting for,
-    /// and the decode releases it only by finishing, which is what this
+    /// What the chase holds is memory a queued request may be waiting for,
+    /// and the chase releases it only by finishing, which is what this
     /// request is for; so it takes the first room there is instead of a place
-    /// in the queue. Only for the decode's own growth: a job's other tasks end
-    /// on their own and queue like anyone.
+    /// in the queue. While it waits it yields like a parked chase, and the
+    /// error then carries the yield's message. Only for a chase's own growth,
+    /// on the budget that is the chase's alone.
     pub(crate) fn reserve_more_memory_wait(
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<MemoryPermit, String> {
-        self.reserve_memory(DecoderRequest::Exact(bytes), AdmissionOrder::Holder)
+        self.reserve_memory(DecoderRequest::Exact(bytes), true)
     }
 
     /// Reserve as much of this job's decoder ceiling as fits beside the
@@ -968,7 +1014,7 @@ impl JobExtractionBudget {
                 ceiling: self.max_memory_bytes().min(cap.max(1)).max(floor),
                 floor,
             },
-            AdmissionOrder::Queued,
+            false,
         )
     }
 
@@ -999,7 +1045,7 @@ impl JobExtractionBudget {
     fn reserve_memory(
         self: &Arc<Self>,
         request: DecoderRequest,
-        order: AdmissionOrder,
+        growth: bool,
     ) -> Result<MemoryPermit, String> {
         let (required, bytes) = match request {
             DecoderRequest::Exact(bytes) => (bytes, bytes),
@@ -1040,6 +1086,16 @@ impl JobExtractionBudget {
                 // runs. This job's tasks and writers take the lock to start
                 // and to finish, and none of them waits for that.
                 drop(wait_guard);
+                let order = if growth {
+                    AdmissionOrder::Chase {
+                        held: self
+                            .memory_reserved
+                            .load(Ordering::Acquire)
+                            .saturating_sub(bytes),
+                    }
+                } else {
+                    AdmissionOrder::Queued
+                };
                 let process_request = match request {
                     DecoderRequest::Exact(_) => DecoderRequest::Exact(bytes),
                     DecoderRequest::UpToCeiling { floor, .. } => DecoderRequest::UpToCeiling {
@@ -1055,6 +1111,13 @@ impl JobExtractionBudget {
                     .map_err(|error| {
                         self.memory_reserved.fetch_sub(bytes, Ordering::AcqRel);
                         self.idle.notify_all();
+                        // A yield is the chase stepping aside, not a limit
+                        // the archive ran into.
+                        if error
+                            .contains(crate::pipeline::direct_unpack::coverage::MEMORY_YIELD_ABORT)
+                        {
+                            return error;
+                        }
                         self.reject(ExtractionRejectionReason::Memory, error)
                             .to_string()
                     })?;
@@ -2539,6 +2602,68 @@ mod tests {
         queued.join().unwrap();
         assert_eq!(pool.reserved_bytes(), 0);
         assert_eq!(pool.queued_requests(), 0);
+    }
+
+    /// Two chases that each grow their decoder while holding the rest of the
+    /// pool wait for what the other holds. One yields to the other's request
+    /// and is extracted conventionally; the other gets its memory.
+    #[test]
+    fn of_two_chases_growing_at_once_one_yields_to_the_other() {
+        use crate::pipeline::direct_unpack::coverage::MEMORY_YIELD_ABORT;
+
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let mut chases = Vec::new();
+        for job in 1..3u64 {
+            let temp = tempfile::tempdir().unwrap();
+            let budget = JobExtractionBudget::new_with_process_memory(
+                limits(),
+                pool.for_job(job),
+                temp.path().to_path_buf(),
+                1,
+                0,
+                0,
+                PipelineMetrics::new(),
+            )
+            .unwrap();
+            let held = budget.reserve_memory_wait(512).unwrap();
+            chases.push((temp, budget, held));
+        }
+        let growing: Vec<_> = chases
+            .into_iter()
+            .map(|(temp, budget, held)| {
+                std::thread::spawn(move || {
+                    let _temp = temp;
+                    let grown = budget.reserve_more_memory_wait(256);
+                    // A chase that yields unwinds and gives up what it held.
+                    drop(held);
+                    let cancelled = budget.check_active_io().is_err();
+                    (grown.map(|permit| permit.bytes()), cancelled)
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<_> = growing
+            .into_iter()
+            .map(|chase| chase.join().unwrap())
+            .collect();
+        let grown = outcomes
+            .iter()
+            .filter(|(outcome, _)| *outcome == Ok(256))
+            .count();
+        let yielded = outcomes
+            .iter()
+            .filter(|(outcome, cancelled)| {
+                !cancelled
+                    && outcome
+                        .as_ref()
+                        .is_err_and(|error| error.contains(MEMORY_YIELD_ABORT))
+            })
+            .count();
+        assert_eq!((grown, yielded), (1, 1), "{outcomes:?}");
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert_eq!(pool.parked_bytes(), 0);
+        assert_eq!(pool.yield_tickets(), 0);
+        assert!(!pool.has_waiters());
     }
 
     /// A queued request that cannot fit beside the retained state does not
