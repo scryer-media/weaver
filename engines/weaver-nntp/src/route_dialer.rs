@@ -84,6 +84,9 @@ impl Dialer for AddressPlanned {
     }
 }
 
+/// Slack past the route budget before the outer deadline abandons a dial.
+const ROUTE_BUDGET_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub struct RouteDialer {
     pub inner: Arc<dyn Dialer>,
     pub egress_controls: Arc<crate::transfer::ServerTransferRegistry>,
@@ -108,14 +111,19 @@ impl RouteDialer {
                 leg: 0,
             },
         };
-        tokio::time::timeout(self.inner.budget(), self.inner.dial(&target))
-            .await
-            .unwrap_or_else(|_| {
-                Err(weaver_tunnel::pipe::DialError::Timeout {
-                    stage: "network route".into(),
-                })
+        // A dialer that enforces its own budget (a weighted route books a
+        // timed-out leg) must see its deadline first; this one is a backstop.
+        tokio::time::timeout(
+            self.inner.budget() + ROUTE_BUDGET_BACKSTOP,
+            self.inner.dial(&target),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(weaver_tunnel::pipe::DialError::Timeout {
+                stage: "network route".into(),
             })
-            .map_err(|error| NntpError::Route(Arc::new(error)))
+        })
+        .map_err(|error| NntpError::Route(Arc::new(error)))
     }
     pub(crate) fn blocking_stream(
         &self,
@@ -171,7 +179,7 @@ mod tests {
         let started = inner.0.notified();
         let dial = tokio::spawn(async move { route.dial(&ServerConfig::default()).await });
         started.await;
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(1) + ROUTE_BUDGET_BACKSTOP).await;
         assert!(
             matches!(dial.await.unwrap(), Err(NntpError::Route(error)) if matches!(error.as_ref(), DialError::Timeout { .. }))
         );

@@ -155,6 +155,27 @@ async fn two_failures_redistribute_then_offer_one_probe_and_restore() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_leg_that_swallows_connects_is_booked_and_cooled() {
+    let (route, stages) = create(5);
+    stages[0].mode.store(3, Ordering::SeqCst);
+    // Each dial lands on leg 0 until it cools; its hung connect times out
+    // on the leg's own budget instead of being dropped unbooked.
+    for _ in 0..2 {
+        assert!(matches!(
+            route.dial(&target()).await,
+            Err(DialError::Timeout { .. })
+        ));
+    }
+    let state = route.allocations();
+    assert_eq!(state[0].opening, 0);
+    assert!(matches!(state[0].health, LegHealthState::Down(_)));
+    assert_eq!(
+        state.iter().map(|s| s.target).collect::<Vec<_>>(),
+        vec![0, 5]
+    );
+}
+
 #[tokio::test]
 async fn skipped_rungs_are_not_evidence_and_reweight_keeps_connections() {
     let (route, stages) = create(5);

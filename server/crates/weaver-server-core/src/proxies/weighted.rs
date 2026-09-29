@@ -535,7 +535,17 @@ impl Dialer for Weighted {
         {
             target.purpose = weaver_tunnel::pipe::Purpose::NntpProbe { server, leg };
         }
-        match opening.dialer.dial(&target).await {
+        // Enforce the leg's own budget here so a leg that swallows connects
+        // books the timeout against itself; the caller's route budget is
+        // only a backstop and fires later.
+        let dialed = tokio::time::timeout(opening.dialer.budget(), opening.dialer.dial(&target))
+            .await
+            .unwrap_or_else(|_| {
+                Err(DialError::Timeout {
+                    stage: "route leg".into(),
+                })
+            });
+        match dialed {
             Ok(mut dialed) => {
                 opening.success(&mut dialed)?;
                 Ok(dialed)
