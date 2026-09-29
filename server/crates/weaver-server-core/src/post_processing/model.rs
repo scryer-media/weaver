@@ -932,6 +932,8 @@ impl ScriptLists {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct EventScriptSettings {
+    /// Scan, feed and scheduler runs allowed at once. Queue events drain one
+    /// at a time regardless.
     pub event_script_concurrency: u8,
     pub event_script_timeout_seconds: u64,
     pub file_downloaded_event_interval: i64,

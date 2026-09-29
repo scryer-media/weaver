@@ -17,7 +17,7 @@ export function eventScriptOptions(source: Partial<EventScriptOptions>): EventSc
 }
 
 const fields: [keyof EventScriptOptions, string, number, number][] = [
-  ["eventScriptConcurrency", "Concurrent event scripts", 1, 8],
+  ["eventScriptConcurrency", "Concurrent scan, feed and scheduler scripts", 1, 8],
   ["eventScriptTimeoutSeconds", "Default event timeout (seconds)", 1, 86400],
   ["fileDownloadedEventInterval", "File event interval (seconds; -1 disables, 0 unthrottled)", -1, 86400],
   ["scriptOutputCeilingBytes", "Captured output per run (bytes)", 65536, 8388608],
