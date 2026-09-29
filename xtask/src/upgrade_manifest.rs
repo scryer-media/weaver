@@ -294,7 +294,7 @@ fn collect_upgrade_manifest_artifact(
         bail!("release asset {asset_name} is not a regular file");
     }
     let members = if spec.archive == "tar.gz" {
-        collect_tar_gz_members(&path)?
+        collect_tar_gz_members(&path, spec.channel == "app")?
     } else {
         Vec::new()
     };
@@ -334,7 +334,16 @@ fn blake3_of(path: &Path) -> Result<String> {
 /// installed build extracts this archive over its own installation, and a member
 /// it cannot describe is a member it must not be asked to trust. Directory
 /// entries carry no content and are not described.
-fn collect_tar_gz_members(path: &Path) -> Result<Vec<UpgradeArtifactMember>> {
+///
+/// Directories are held to what installed builds accept, not only to what a
+/// manifest can describe. Those builds validate every entry's path before its
+/// type and skip directory entries only in the application-bundle channel, so a
+/// flat archive with any directory entry, including the `./` root that
+/// `tar -C dir .` writes, is one they refuse to install.
+fn collect_tar_gz_members(
+    path: &Path,
+    allows_directories: bool,
+) -> Result<Vec<UpgradeArtifactMember>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let decoder = flate2::read::GzDecoder::new(BufReader::new(file));
     let mut archive = tar::Archive::new(decoder);
@@ -347,6 +356,21 @@ fn collect_tar_gz_members(path: &Path) -> Result<Vec<UpgradeArtifactMember>> {
             entry.with_context(|| format!("failed to read an entry of {}", path.display()))?;
         let entry_type = entry.header().entry_type();
         if entry_type.is_dir() {
+            let raw = entry.path().with_context(|| {
+                format!(
+                    "{} contains a member with an unreadable path",
+                    path.display()
+                )
+            })?;
+            if !allows_directories {
+                bail!(
+                    "{} contains the directory entry '{}'; installed builds refuse directory \
+                     entries in this archive, so pack the files by name rather than `.`",
+                    path.display(),
+                    raw.display()
+                );
+            }
+            archive_member_path(&raw)?;
             continue;
         }
         if !entry_type.is_file() {
@@ -706,6 +730,62 @@ mod tests {
                 .expect("nested paths are kept"),
             "Weaver.app/Contents/MacOS/weaver"
         );
+    }
+
+    /// `tar -C dir .` writes a `./` root entry that installed builds refuse, so
+    /// a flat archive packed that way fails generation instead of shipping a
+    /// release no installation can upgrade to. The bundle archive may carry
+    /// directories, but not one whose path normalizes to nothing.
+    #[test]
+    fn an_archive_installed_builds_refuse_fails_generation() {
+        let cases = [
+            (
+                "weaver-linux-x86_64-portable.tar.gz",
+                vec![
+                    ("./".to_string(), Vec::new(), 0o755, true),
+                    ("./weaver".to_string(), b"weaver".to_vec(), 0o755, false),
+                ],
+                "directory entry './'",
+            ),
+            (
+                "weaver-linux-x86_64-portable.tar.gz",
+                vec![
+                    ("bin/".to_string(), Vec::new(), 0o755, true),
+                    ("bin/weaver".to_string(), b"weaver".to_vec(), 0o755, false),
+                ],
+                "directory entry 'bin/'",
+            ),
+            (
+                "weaver-darwin-arm64.app.tar.gz",
+                vec![
+                    ("./".to_string(), Vec::new(), 0o755, true),
+                    (
+                        "Weaver.app/Contents/MacOS/weaver".to_string(),
+                        b"weaver".to_vec(),
+                        0o755,
+                        false,
+                    ),
+                ],
+                "empty member path",
+            ),
+        ];
+        for (asset_name, members, expected) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            write_fixture_assets(temp.path());
+            write_tar_gz(&temp.path().join(asset_name), &members);
+            let error = generate_upgrade_manifest(
+                UpgradeManifestGeneration::V2,
+                "9.8.7",
+                "weaver-v9.8.7",
+                "scryer-media/weaver",
+                temp.path(),
+            )
+            .expect_err("an archive installed builds refuse fails generation");
+            assert!(
+                error.to_string().contains(expected),
+                "{asset_name}: {error}"
+            );
+        }
     }
 
     /// A missing asset fails the release rather than publishing a manifest that

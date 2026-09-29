@@ -750,7 +750,9 @@ jobs:
         run: |
           mkdir -p dist/package
           cp target/x86_64-unknown-linux-musl/release/weaver dist/package/weaver
-          tar -czf weaver-linux-x86_64-portable.tar.gz -C dist/package .
+          # Name the binary rather than packing `.`: installed builds refuse the
+          # `./` root entry that `.` adds, and the upgrade manifest step fails on it.
+          tar -czf weaver-linux-x86_64-portable.tar.gz -C dist/package weaver
           test -f weaver-linux-x86_64-portable.tar.gz
       - name: Upload release package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -846,7 +848,9 @@ jobs:
         run: |
           mkdir -p dist/package
           cp target/aarch64-unknown-linux-musl/release/weaver dist/package/weaver
-          tar -czf weaver-linux-arm64-portable.tar.gz -C dist/package .
+          # Name the binary rather than packing `.`: installed builds refuse the
+          # `./` root entry that `.` adds, and the upgrade manifest step fails on it.
+          tar -czf weaver-linux-arm64-portable.tar.gz -C dist/package weaver
           test -f weaver-linux-arm64-portable.tar.gz
       - name: Upload release package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -985,7 +989,9 @@ jobs:
         run: |
           mkdir -p dist/package
           cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
-          tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package .
+          # Name the binary rather than packing `.`: installed builds refuse the
+          # `./` root entry that `.` adds, and the upgrade manifest step fails on it.
+          tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package weaver
           test -f weaver-darwin-x86_64-portable.tar.gz
       # The bundle as an upgradeable asset. The in-application upgrade replaces a
       # whole `.app` in place, so the release has to carry the bundle itself, not
@@ -1252,7 +1258,9 @@ jobs:
         run: |
           mkdir -p dist/package
           cp target/aarch64-apple-darwin/release/weaver dist/package/weaver
-          tar -czf weaver-darwin-arm64-portable.tar.gz -C dist/package .
+          # Name the binary rather than packing `.`: installed builds refuse the
+          # `./` root entry that `.` adds, and the upgrade manifest step fails on it.
+          tar -czf weaver-darwin-arm64-portable.tar.gz -C dist/package weaver
           test -f weaver-darwin-arm64-portable.tar.gz
       # The bundle as an upgradeable asset. The in-application upgrade replaces a
       # whole `.app` in place, so the release has to carry the bundle itself, not
