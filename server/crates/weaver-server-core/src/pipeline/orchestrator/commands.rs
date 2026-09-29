@@ -467,7 +467,10 @@ impl Pipeline {
                 let deferred_moves: Vec<_> = self.deferred_moves.drain().collect();
                 for job_id in deferred_moves {
                     if self.jobs.get(&job_id).is_some_and(|state| {
-                        !matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
+                        !matches!(
+                            state.status,
+                            JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                        )
                     }) && let Err(error) = self.start_move_to_complete(job_id).await
                     {
                         self.fail_job(job_id, error);

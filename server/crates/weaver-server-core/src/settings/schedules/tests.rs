@@ -176,3 +176,41 @@ fn invalid_legacy_json_leaves_settings_and_version_untouched() {
     );
     assert_eq!(db.get_setting(TRACKS_VERSION_KEY).unwrap(), None);
 }
+
+#[test]
+fn disabled_legacy_download_rules_enable_their_reset_companions() {
+    for action in [ScheduleAction::Pause, ScheduleAction::Resume] {
+        let db = Database::open_in_memory().unwrap();
+        let mut disabled = rule("download", "08:00", vec![], action);
+        disabled.enabled = false;
+        let entries = vec![
+            limit("limit", "07:00", vec![]),
+            disabled,
+            rule("later", "09:00", vec![], ScheduleAction::Resume),
+        ];
+        db.set_setting("schedules", &serde_json::to_string(&entries).unwrap())
+            .unwrap();
+        let mut migrated = db.list_schedules().unwrap();
+        assert_eq!(migrated.len(), 5);
+        assert!(!migrated[2].enabled);
+        assert!(migrated[4].enabled);
+        assert_eq!(migrate_legacy_tracks(migrated.clone()), migrated);
+        migrated[1].enabled = true;
+        db.save_schedules(&migrated).unwrap();
+        let mut saved = db.list_schedules().unwrap();
+        assert!(saved[2].enabled);
+        saved[2].enabled = false;
+        db.save_schedules(&saved).unwrap();
+        saved[1].enabled = false;
+        db.save_schedules(&saved).unwrap();
+        saved[1].enabled = true;
+        db.save_schedules(&saved).unwrap();
+        assert!(!db.list_schedules().unwrap()[2].enabled);
+        saved.remove(2);
+        saved[1].enabled = false;
+        db.save_schedules(&saved).unwrap();
+        saved[1].enabled = true;
+        db.save_schedules(&saved).unwrap();
+        assert_eq!(db.list_schedules().unwrap(), saved);
+    }
+}

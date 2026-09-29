@@ -31,7 +31,10 @@ mod restore;
 mod service;
 mod stored;
 mod upgrade;
-pub use upgrade::{prepare_upgrade_backup, reset_automatic_backup_settings, skip_upgrade_backup};
+pub use upgrade::{
+    prepare_upgrade_backup, record_started_version, reset_automatic_backup_settings,
+    skip_upgrade_backup,
+};
 
 pub use self::logical::TablePartMetadata;
 #[cfg(test)]

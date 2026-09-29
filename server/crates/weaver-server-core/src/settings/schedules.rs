@@ -33,7 +33,7 @@ impl Database {
                     if version == TRACKS_VERSION {
                         return Ok(entries);
                     }
-                    let entries = migrate_legacy_tracks(entries);
+                    let entries = migrate_legacy_tracks_with_links(tx, entries).await?;
                     write_schedules(tx, &entries).await?;
                     Ok(entries)
                 })
@@ -47,9 +47,10 @@ impl Database {
         let entries = entries.to_vec();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "save_schedule_tracks", |tx| {
-                let entries = entries.clone();
+                let mut entries = entries.clone();
                 Box::pin(async move {
                     lock_version(tx).await?;
+                    sync_legacy_reset_enablement(tx, &mut entries).await?;
                     for entry in &entries {
                         if let ScheduleAction::FetchRss {
                             feed_id: Some(feed_id),
@@ -103,7 +104,7 @@ impl Database {
             .unwrap_or_else(|| "[]".into());
         let mut entries = decode(&json)?;
         if version != TRACKS_VERSION {
-            entries = migrate_legacy_tracks(entries);
+            entries = migrate_legacy_tracks_with_links(tx, entries).await?;
         }
         entries.retain(|entry| {
             !matches!(entry.action,
@@ -128,7 +129,7 @@ impl Database {
             .unwrap_or_else(|| "[]".into());
         let mut entries = decode(&json)?;
         if version != TRACKS_VERSION {
-            entries = migrate_legacy_tracks(entries);
+            entries = migrate_legacy_tracks_with_links(tx, entries).await?;
         }
         entries.retain(|entry| !matches!(entry.action, ScheduleAction::SetServerActive { server_id: id, .. } if id == server_id));
         write_schedules(tx, &entries).await
@@ -137,6 +138,95 @@ impl Database {
 
 fn decode(json: &str) -> Result<Vec<ScheduleEntry>, StateError> {
     serde_json::from_str(json).map_err(|error| StateError::Database(error.to_string()))
+}
+
+async fn migrate_legacy_tracks_with_links(
+    tx: &mut SqlTx<'_>,
+    entries: Vec<ScheduleEntry>,
+) -> Result<Vec<ScheduleEntry>, StateError> {
+    let original_ids: std::collections::HashSet<_> =
+        entries.iter().map(|entry| entry.id.clone()).collect();
+    let migrated = migrate_legacy_tracks(entries);
+    let links: std::collections::BTreeMap<_, _> = migrated
+        .windows(2)
+        .filter(|pair| !original_ids.contains(&pair[1].id))
+        .map(|pair| (pair[1].id.clone(), pair[0].id.clone()))
+        .collect();
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        &[
+            SqlArg::Text("schedule_legacy_speed_reset_links".into()),
+            SqlArg::Text(serde_json::to_string(&links).map_err(|error| StateError::Database(error.to_string()))?),
+        ],
+    ).await?;
+    Ok(migrated)
+}
+
+async fn sync_legacy_reset_enablement(
+    tx: &mut SqlTx<'_>,
+    entries: &mut [ScheduleEntry],
+) -> Result<(), StateError> {
+    let Some(row) = tx
+        .fetch_optional(
+            "SELECT value FROM settings WHERE key = {}",
+            &[SqlArg::Text("schedule_legacy_speed_reset_links".into())],
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let links: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&row.text("value")?)
+            .map_err(|error| StateError::Database(error.to_string()))?;
+    let previous = tx
+        .fetch_optional(
+            "SELECT value FROM settings WHERE key = {}",
+            &[SqlArg::Text("schedules".into())],
+        )
+        .await?
+        .map(|row| row.text("value"))
+        .transpose()?
+        .unwrap_or_else(|| "[]".into());
+    let previous = decode(&previous)?;
+    let mut retained_links = std::collections::BTreeMap::new();
+    for (reset_id, original_id) in links {
+        // Once an operator edits or removes the generated companion, it becomes
+        // independent and later toggles of the original must not revive it.
+        let old_reset = previous.iter().find(|entry| entry.id == reset_id);
+        let new_reset = entries.iter().find(|entry| entry.id == reset_id);
+        if old_reset.is_none() || old_reset != new_reset {
+            continue;
+        }
+        let Some(old) = previous.iter().find(|entry| entry.id == original_id) else {
+            continue;
+        };
+        let Some(new) = entries.iter().find(|entry| entry.id == original_id) else {
+            continue;
+        };
+        let enabled = new.enabled;
+        if enabled != old.enabled
+            && let Some(reset) = entries.iter_mut().find(|entry| {
+                entry.id == reset_id
+                    && entry.action == ScheduleAction::ConfiguredSpeedLimit
+                    && entry.enabled == old.enabled
+            })
+        {
+            reset.enabled = enabled;
+        }
+        retained_links.insert(reset_id, original_id);
+    }
+    tx.execute(
+        "UPDATE settings SET value = {} WHERE key = {}",
+        &[
+            SqlArg::Text(
+                serde_json::to_string(&retained_links)
+                    .map_err(|error| StateError::Database(error.to_string()))?,
+            ),
+            SqlArg::Text("schedule_legacy_speed_reset_links".into()),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Serialize migration and schedule saves on both SQL backends. The version and
@@ -211,11 +301,9 @@ fn migrate_legacy_tracks(entries: Vec<ScheduleEntry>) -> Vec<ScheduleEntry> {
     let mut week = Vec::new();
     for (day_index, day) in DAYS.iter().enumerate() {
         for (index, entry) in entries.iter().enumerate() {
-            // An existing disabled limit can be enabled later. Preserve its
-            // legacy end at the next enabled download rule as well.
-            if (!entry.enabled && !matches!(entry.action, ScheduleAction::SpeedLimit { .. }))
-                || (!entry.days.is_empty() && !entry.days.contains(day))
-            {
+            // Disabled legacy rules can be enabled later; migrate their reset
+            // companions too, preserving the original enabled state.
+            if !entry.days.is_empty() && !entry.days.contains(day) {
                 continue;
             }
             if !matches!(
@@ -247,7 +335,13 @@ fn migrate_legacy_tracks(entries: Vec<ScheduleEntry>) -> Vec<ScheduleEntry> {
     week.sort_unstable();
     let mut resets = vec![Vec::new(); entries.len()];
     for (position, &(day, time, index)) in week.iter().enumerate() {
-        let previous = week[(position + week.len() - 1) % week.len()].2;
+        let previous = (1..=week.len())
+            .map(|offset| week[(position + week.len() - offset) % week.len()].2)
+            .find(|&candidate| {
+                entries[candidate].enabled
+                    || matches!(entries[candidate].action, ScheduleAction::SpeedLimit { .. })
+            })
+            .unwrap_or(index);
         let (next_day, next_time, next) = week[(position + 1) % week.len()];
         // A saved compatibility reset (or an operator's equivalent rule)
         // already covers this occurrence. Do not insert it twice.
@@ -279,7 +373,7 @@ fn migrate_legacy_tracks(entries: Vec<ScheduleEntry>) -> Vec<ScheduleEntry> {
         }
         let reset = ScheduleEntry {
             id,
-            enabled: true,
+            enabled: entry.enabled,
             label: "Preserve legacy speed reset".into(),
             days: if days.len() == 7 { Vec::new() } else { days },
             time: entry.time.clone(),

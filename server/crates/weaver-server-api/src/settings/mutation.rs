@@ -469,7 +469,11 @@ impl SettingsMutation {
         .await??;
         entries.push(entry);
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
         *schedules_guard = entries.clone();
         Ok(entries
             .into_iter()
@@ -500,7 +504,11 @@ impl SettingsMutation {
             *existing = updated;
         }
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
         *schedules_guard = entries.clone();
         Ok(entries
             .into_iter()
@@ -525,7 +533,11 @@ impl SettingsMutation {
         .await??;
         entries.retain(|e| e.id != id);
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
         *schedules_guard = entries.clone();
         Ok(entries
             .into_iter()
@@ -553,7 +565,11 @@ impl SettingsMutation {
             existing.enabled = enabled;
         }
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
         *schedules_guard = entries.clone();
         Ok(entries
             .into_iter()

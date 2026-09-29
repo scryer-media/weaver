@@ -63,6 +63,28 @@ struct LoadedBackup {
     warnings: Vec<String>,
 }
 
+/// Cancellation is cooperative: retain and drain the future so its blocking writers
+/// have exited before reporting failure or releasing the execution lock.
+pub(super) async fn run_backup_work<T>(
+    work: impl std::future::Future<Output = Result<T, BackupServiceError>>,
+    cancellation: super::archive::BackupCancellation,
+    shutdown: super::archive::BackupCancellation,
+) -> Result<T, BackupServiceError> {
+    tokio::pin!(work);
+    let error = tokio::select! {
+        result = tokio::time::timeout(super::stored::BACKUP_EXECUTION_TIMEOUT, &mut work) => {
+            match result {
+                Ok(result) => return result,
+                Err(_) => BackupServiceError::Io("backup timed out".into()),
+            }
+        },
+        _ = shutdown.cancelled() => BackupServiceError::Io("backup cancelled during shutdown".into()),
+    };
+    cancellation.cancel();
+    let _ = work.await;
+    Err(error)
+}
+
 impl BackupService {
     pub fn new(
         handle: SchedulerHandle,
@@ -139,13 +161,50 @@ impl BackupService {
         &self,
         password: Option<String>,
     ) -> Result<BackupArtifact, BackupServiceError> {
-        let (_, artifact, finished) = self
-            .begin_backup_with_artifact(password, super::stored::BackupTrigger::Manual)
+        let password = password
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(BackupServiceError::PasswordRequired)?;
+        let execution = Arc::new(
+            self.inner
+                .manual_lock
+                .clone()
+                .try_lock_owned()
+                .map_err(|_| BackupServiceError::Busy)?,
+        );
+        if self
+            .inner
+            .shutting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(BackupServiceError::Validation(
+                "backup service is shutting down".into(),
+            ));
+        }
+        let temporary_directory = super::create_backup_temp_dir().map_err(io_err)?;
+        let info = super::stored::new_backup_info(
+            super::stored::BackupTrigger::Manual,
+            self.inner.db.engine_name(),
+            env!("CARGO_PKG_VERSION"),
+        )?;
+        let path = temporary_directory.path().join(&info.filename);
+        let service = self.clone();
+        // Keep the temporary directory and execution guard alive if the request disconnects.
+        tokio::spawn(async move {
+            let cancellation = super::archive::BackupCancellation::new();
+            run_backup_work(
+                service.write_backup(password, path.clone(), execution, cancellation.clone()),
+                cancellation,
+                service.inner.shutdown_signal.clone(),
+            )
             .await?;
-        finished
-            .await
-            .map_err(|error| BackupServiceError::Io(error.to_string()))??;
-        Ok(artifact)
+            Ok(BackupArtifact {
+                filename: info.filename,
+                path,
+                temporary_directory: Some(temporary_directory),
+            })
+        })
+        .await
+        .map_err(io_err)?
     }
 
     pub(super) async fn write_backup(
@@ -174,9 +233,10 @@ impl BackupService {
 
         let db = self.inner.db.clone();
         let export_execution = execution.clone();
+        let export_cancellation = cancellation.clone();
         let export = tokio::task::spawn_blocking(move || {
             let _execution = export_execution;
-            db.export_logical_backup()
+            db.export_logical_backup_cancellable(export_cancellation)
         })
         .await
         .map_err(|error| BackupServiceError::Io(error.to_string()))?
@@ -677,4 +737,49 @@ pub(super) fn write_json(
             .map_err(|error| BackupServiceError::Validation(error.to_string()))?,
     )
     .map_err(io_err)
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_drains_writer_before_reporting_failure() {
+        let cancellation = super::super::archive::BackupCancellation::new();
+        let shutdown = super::super::archive::BackupCancellation::new();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (done, mut done_rx) = tokio::sync::oneshot::channel();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("writer-finished");
+        let writer_path = path.clone();
+        let work = async move {
+            tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                std::fs::write(writer_path, b"finished").unwrap();
+            })
+            .await
+            .unwrap();
+            Ok(())
+        };
+        let task_cancellation = cancellation.clone();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            let result = run_backup_work(work, task_cancellation, task_shutdown).await;
+            done.send(()).unwrap();
+            result
+        });
+        started_rx.await.unwrap();
+        shutdown.cancel();
+        cancellation.cancelled().await;
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("shutdown"));
+        assert_eq!(std::fs::read(path).unwrap(), b"finished");
+    }
 }

@@ -85,6 +85,11 @@ impl WatchFolderService {
     }
 
     pub async fn set_scanning_paused(&self, paused: bool) -> Result<(), WatchFolderServiceError> {
+        if paused {
+            // A failed persistence write must not admit intake while the schedule
+            // evaluator retries the hold or exposes the failure through the UI.
+            self.pause_scanning_runtime().await;
+        }
         let db = self.inner.db.clone();
         tokio::task::spawn_blocking(move || {
             db.set_setting("watch_folder.scanning_paused", &paused.to_string())
@@ -96,6 +101,23 @@ impl WatchFolderService {
             let mut cfg = self.inner.config.write().await;
             cfg.watch_folder.scanning_paused = paused;
         }
+        self.reconcile_from_config().await
+    }
+
+    pub(crate) async fn pause_scanning_runtime(&self) {
+        self.inner.config.write().await.watch_folder.scanning_paused = true;
+        self.stop().await;
+    }
+
+    pub(crate) async fn scanning_paused(&self) -> bool {
+        self.inner.config.read().await.watch_folder.scanning_paused
+    }
+
+    pub(crate) async fn restore_scanning_runtime(
+        &self,
+        paused: bool,
+    ) -> Result<(), WatchFolderServiceError> {
+        self.inner.config.write().await.watch_folder.scanning_paused = paused;
         self.reconcile_from_config().await
     }
 

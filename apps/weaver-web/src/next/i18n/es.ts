@@ -1348,7 +1348,6 @@ export const nextEs: LocaleDictionary = {
   "next.backup.saveStorage": "Guardar ruta",
   "next.backup.automatic": "Copias automáticas",
   "next.backup.retention": "Conserva tres copias de esta versión y una de la anterior. Las manuales se conservan hasta que se eliminan.",
-  "next.backup.retainedExport": "Cada exportación también guarda una copia cifrada en el almacenamiento de copias hasta que la elimines de las copias guardadas.",
   "next.backup.verifyAccountPassword": "Confirma la contraseña de tu cuenta para continuar. Es la contraseña de inicio de sesión, no la clave de cifrado del archivo.",
   "next.backup.autoEnabled": "Activar copias automáticas",
   "next.backup.dailyTime": "Hora diaria (local)",

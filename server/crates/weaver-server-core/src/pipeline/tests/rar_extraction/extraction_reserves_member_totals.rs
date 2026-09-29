@@ -2329,7 +2329,20 @@ async fn nested_rar_three_deep_extracts_through_inner_7z() {
     let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
 
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(crate::pipeline::SchedulerCommand::PausePostProcessing { reply })
+        .await;
+    received.await.unwrap();
     pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.deferred_post_processing.contains(&job_id));
+    assert_eq!(pipeline.jobs[&job_id].extraction_depth, 0);
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(crate::pipeline::SchedulerCommand::ResumePostProcessing { reply })
+        .await;
+    received.await.unwrap();
+    assert!(pipeline.pending_completion_checks.contains(&job_id));
     drive_extractions_to_terminal(&mut pipeline, job_id, 6).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
@@ -2418,6 +2431,7 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
         .await;
     received.await.unwrap();
 
+    assert!(pipeline.pending_completion_checks.contains(&job_id));
     assert!(matches!(
         pipeline
             .maybe_start_nested_extraction(job_id)

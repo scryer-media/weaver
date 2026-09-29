@@ -1348,7 +1348,6 @@ export const nextZh: LocaleDictionary = {
   "next.backup.saveStorage": "保存路径",
   "next.backup.automatic": "自动备份",
   "next.backup.retention": "保留当前版本的三个备份和上一版本的一个备份。手动备份将保留到主动删除。",
-  "next.backup.retainedExport": "每次导出也会在备份存储中保留一份加密副本，直到您从已保存的备份中将其删除。",
   "next.backup.verifyAccountPassword": "请确认您的账户密码以继续。这是登录密码，而不是存档加密密钥。",
   "next.backup.autoEnabled": "启用自动备份",
   "next.backup.dailyTime": "每日时间（本地）",

@@ -55,7 +55,7 @@ test("backup settings, retained create, token download and delete use the render
   } finally { await page.close(); }
 });
 
-test("all new schedule actions support disabled create, edit, draft toggle and delete", async () => {
+test("all new schedule actions support disabled create, edit, draft and list toggles, and delete", async () => {
   const page = await open("?schedules");
   try {
     for (const [action, group] of [["Pause all intake", "Downloads"], ["Pause post-processing", "Post-processing"], ["Resume post-processing", "Post-processing"], ["Set server availability", "Servers"], ["Set quota metering", "Quota metering"], ["Scan watch folder", "One-shot actions"], ["Fetch RSS", "One-shot actions"], ["Prune history", "One-shot actions"]]) {
@@ -73,6 +73,13 @@ test("all new schedule actions support disabled create, edit, draft toggle and d
       const row = page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(`fixture ${action}`, { exact: true }) });
       await row.waitFor();
       assert.equal(await row.getByRole("switch").isChecked(), false);
+      if (action === "Scan watch folder") {
+        // The fixture stores mutations without dispatching real schedule actions.
+        await row.getByRole("switch").click();
+        await row.locator('[role="switch"][aria-checked="true"]').waitFor();
+        await row.getByRole("switch").click();
+        await row.locator('[role="switch"][aria-checked="false"]').waitFor();
+      }
       const description = {
         "Set server availability": "Set server availability: fixture-provider (On)",
         "Set quota metering": "Set quota metering: On",
@@ -158,7 +165,6 @@ test("an automatic backup and next run update while the backup panel stays open"
 test("classic backup page exposes automatic settings and creates a retained backup", async () => {
   const page = await open("?classic");
   try {
-    await page.getByText("Every export also keeps an encrypted copy in Backup storage until you delete it from Stored backups.", { exact: true }).waitFor();
     const automatic = page.getByRole("region", { name: "Automatic backups", exact: true });
     await automatic.getByLabel("Automatic backup key", { exact: true }).fill("classic fixture archive key");
     await automatic.getByRole("switch", { name: "Enable automatic backups", exact: true }).click();
@@ -177,6 +183,30 @@ test("classic backup page exposes automatic settings and creates a retained back
     await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
     await automatic.getByText("Not scheduled", { exact: true }).waitFor();
   } finally { await page.close(); }
+});
+
+test("both UIs export a download without creating a stored backup", async () => {
+  for (const query of ["", "?classic"]) {
+    const page = await open(query);
+    try {
+      if (query.includes("classic")) {
+        await page.locator("#backup-export-password").fill("fixture archive key");
+        await page.locator("#backup-export-password-confirm").fill("fixture archive key");
+      } else {
+        const manual = page.getByRole("region", { name: "Backup", exact: true });
+        await manual.getByLabel("Password", { exact: true }).fill("fixture archive key");
+        await manual.getByLabel("Confirm password", { exact: true }).fill("fixture archive key");
+      }
+      const download = page.waitForEvent("download");
+      await page.getByRole("button", { name: query.includes("classic") ? "Download Backup" : "Download backup", exact: true }).click();
+      assert.match((await download).suggestedFilename(), /^weaver_backup_fixture_/);
+      const payload = await page.evaluate(() => fetch("/graphql", {
+        method: "POST", body: JSON.stringify({ operationName: "Backups", variables: {} }),
+      }).then((response) => response.json()));
+      assert.deepEqual(payload.data.backups, []);
+      await page.getByRole("region", { name: "Stored backups", exact: true }).getByText("Nothing configured yet.", { exact: true }).waitFor();
+    } finally { await page.close(); }
+  }
 });
 
 test("expired backup administration verifies the account password before replaying the mutation in both UIs", async () => {

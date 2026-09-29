@@ -99,6 +99,7 @@ pub struct SharedPipelineState {
     jobs: Arc<RwLock<Vec<JobInfo>>>,
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
+    schedule_replay_paused: Arc<AtomicBool>,
     post_processing_paused: Arc<AtomicBool>,
     metrics: Arc<PipelineMetrics>,
     metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
@@ -148,6 +149,7 @@ impl SharedPipelineState {
             jobs: Arc::new(RwLock::new(initial_jobs)),
             job_revision,
             paused: Arc::new(AtomicBool::new(false)),
+            schedule_replay_paused: Arc::new(AtomicBool::new(false)),
             post_processing_paused: Arc::new(AtomicBool::new(false)),
             metrics,
             metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
@@ -207,6 +209,10 @@ impl SharedPipelineState {
 
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn schedule_replay_paused(&self) -> bool {
+        self.schedule_replay_paused.load(Ordering::Acquire)
     }
 
     pub fn is_post_processing_paused(&self) -> bool {
@@ -1267,6 +1273,12 @@ impl SchedulerHandle {
     /// Check whether the pipeline is globally paused (reads from shared state).
     pub fn is_globally_paused(&self) -> bool {
         self.state.is_paused()
+    }
+
+    pub(crate) fn set_schedule_replay_paused(&self, paused: bool) {
+        self.state
+            .schedule_replay_paused
+            .store(paused, Ordering::Release);
     }
 
     pub fn is_post_processing_paused(&self) -> bool {

@@ -1348,7 +1348,6 @@ export const nextIt: LocaleDictionary = {
   "next.backup.saveStorage": "Salva percorso",
   "next.backup.automatic": "Backup automatici",
   "next.backup.retention": "Conserva tre backup di questa versione e uno della precedente. I backup manuali restano fino alla cancellazione.",
-  "next.backup.retainedExport": "Ogni esportazione conserva anche una copia crittografata nell’archivio dei backup finché non la elimini dai backup salvati.",
   "next.backup.verifyAccountPassword": "Conferma la password dell’account per continuare. È la password di accesso, non la chiave di crittografia dell’archivio.",
   "next.backup.autoEnabled": "Abilita backup automatici",
   "next.backup.dailyTime": "Orario giornaliero (locale)",

@@ -29,7 +29,7 @@ async fn daylight_saving_fallback_does_not_reassert_or_rewind_hold_tracks() {
         .apply_effects_at(
             &entries,
             local_time(28, 1, 29),
-            local_time(28, 8, 59),
+            local_time(28, 8, 54),
             |action, _| {
                 actions.push(action);
                 std::future::ready(Ok(()))
@@ -39,7 +39,7 @@ async fn daylight_saving_fallback_does_not_reassert_or_rewind_hold_tracks() {
     assert_eq!(
         actions.last(),
         Some(&ScheduleAction::Pause),
-        "an actual backward UTC jump still replays holds"
+        "a backward UTC jump exceeding the correction tolerance still replays holds"
     );
 }
 
@@ -527,9 +527,35 @@ async fn clock_jumps_replay_holds() {
         vec![ScheduleAction::Pause]
     );
     assert_eq!(
-        tick(&mut evaluator, &entries, local_time(28, 10, 59)).await,
+        tick(&mut evaluator, &entries, local_time(28, 10, 55)).await,
         vec![ScheduleAction::Pause]
     );
+}
+
+#[tokio::test]
+async fn small_backward_clock_steps_preserve_applied_holds() {
+    let entries = vec![
+        entry("resume", "08:00", vec![], ScheduleAction::Resume),
+        entry(
+            "speed",
+            "08:00",
+            vec![],
+            ScheduleAction::SpeedLimit {
+                bytes_per_sec: 1024,
+            },
+        ),
+    ];
+    let mut evaluator = HoldEvaluator::default();
+    let now = local_time(28, 8, 0);
+    assert_eq!(tick(&mut evaluator, &entries, now).await.len(), 2);
+    // Crossing the occurrence boundary backwards must not replace an operator's
+    // manual pause or speed setting, nor replay when the clock catches up.
+    assert!(
+        tick(&mut evaluator, &entries, now - Duration::seconds(1))
+            .await
+            .is_empty()
+    );
+    assert!(tick(&mut evaluator, &entries, now).await.is_empty());
 }
 
 #[test]
@@ -855,4 +881,198 @@ async fn initial_replay_and_shutdown_wait_for_runtime_acknowledgement() {
     replayed.await.unwrap().unwrap();
     shutdown.await;
     assert!(received.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn timed_download_resume_does_not_defer_intake_resume() {
+    let db = crate::Database::open_in_memory().unwrap();
+    db.set_setting("nzbget.scheduled_resume_at", "12345")
+        .unwrap();
+    let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+    let (commands, mut received) = tokio::sync::mpsc::channel(1);
+    let (events, _) = tokio::sync::broadcast::channel(1);
+    let handle = SchedulerHandle::new(
+        commands,
+        events,
+        crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
+    );
+    let rss = crate::rss::RssService::new(handle.clone(), config.clone(), db.clone());
+    let watch_folder = WatchFolderService::new(db.clone(), handle.clone(), config.clone());
+    rss.set_scheduled_paused(true);
+    watch_folder.set_scanning_paused(true).await.unwrap();
+    let services = ScheduleServices {
+        db: Some(db),
+        rss: Some(rss.clone()),
+        watch_folder: Some(watch_folder),
+        ..Default::default()
+    };
+    for track in [ScheduleTrack::Rss, ScheduleTrack::WatchFolder] {
+        apply_schedule_action(
+            handle.clone(),
+            services.clone(),
+            ScheduleAction::Resume,
+            Some(track),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(!rss.is_scheduled_paused());
+    assert!(!config.read().await.watch_folder.scanning_paused);
+    assert!(matches!(
+        apply_schedule_action(
+            handle,
+            services,
+            ScheduleAction::Resume,
+            Some(ScheduleTrack::Downloads)
+        )
+        .await,
+        Err(ScheduleApplyError::Pending)
+    ));
+    assert!(received.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_initial_hold_reports_readiness_and_retries_after_repair() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+    let (commands, _) = tokio::sync::mpsc::channel(1);
+    let (events, _) = tokio::sync::broadcast::channel(1);
+    let handle = SchedulerHandle::new(
+        commands,
+        events,
+        crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
+    );
+    let watch_folder = WatchFolderService::new(db.clone(), handle.clone(), config.clone());
+    let schedules = Arc::new(RwLock::new(vec![entry(
+        "watch",
+        "00:00",
+        vec![],
+        ScheduleAction::PauseWatchFolderScanning,
+    )]));
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        crate::persistence::sql_runtime::SqlRuntime::execute(datastore.read_exec(),
+            "CREATE TRIGGER reject_watch_pause BEFORE INSERT ON settings WHEN NEW.key = 'watch_folder.scanning_paused' BEGIN SELECT RAISE(FAIL, 'injected write failure'); END", &[]).await?;
+        Ok(())
+    }).unwrap();
+    let (task, replayed) = spawn_evaluator_with_services(
+        handle,
+        schedules,
+        ScheduleServices {
+            watch_folder: Some(watch_folder.clone()),
+            db: Some(db.clone()),
+            ..Default::default()
+        },
+    );
+    assert!(replayed.await.unwrap().is_err());
+    assert!(config.read().await.watch_folder.scanning_paused);
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        crate::persistence::sql_runtime::SqlRuntime::execute(
+            datastore.read_exec(),
+            "DROP TRIGGER reject_watch_pause",
+            &[],
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    while db
+        .get_setting("watch_folder.scanning_paused")
+        .unwrap()
+        .as_deref()
+        != Some("true")
+    {
+        tokio::task::yield_now().await;
+    }
+    task.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_scheduled_server_activation_restores_persisted_state() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let server: crate::servers::ServerConfig = serde_json::from_value(serde_json::json!({
+        "id": 42, "host": "news.example.test", "port": 119, "tls": false,
+        "connections": 1, "active": false
+    }))
+    .unwrap();
+    db.insert_server(&server).unwrap();
+    let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+    let (commands, _) = tokio::sync::mpsc::channel(1);
+    let (events, _) = tokio::sync::broadcast::channel(1);
+    let handle = SchedulerHandle::new(
+        commands,
+        events,
+        crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
+    );
+    let service = crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+    for _ in 0..2 {
+        let error = service.set_active(42, true).await.unwrap_err();
+        assert!(error.contains("server transfer policy registry unavailable"));
+        assert!(!config.read().await.servers[0].active);
+        assert!(!db.load_config().unwrap().servers[0].active);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_metadata_failure_pauses_intake_until_recovery() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+    let (commands, _) = tokio::sync::mpsc::channel(1);
+    let (events, _) = tokio::sync::broadcast::channel(1);
+    let handle = SchedulerHandle::new(
+        commands,
+        events,
+        crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
+    );
+    let watch_folder = WatchFolderService::new(db.clone(), handle.clone(), config.clone());
+    let rss = crate::rss::RssService::new(handle.clone(), config.clone(), db.clone());
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        crate::persistence::sql_runtime::SqlRuntime::execute(
+            datastore.read_exec(),
+            "ALTER TABLE settings RENAME TO unavailable_settings",
+            &[],
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+    let (task, replayed) = spawn_evaluator_with_services(
+        handle,
+        Arc::new(RwLock::new(vec![])),
+        ScheduleServices {
+            watch_folder: Some(watch_folder),
+            rss: Some(rss.clone()),
+            db: Some(db.clone()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        replayed
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("cannot load schedule intake state")
+    );
+    assert!(config.read().await.watch_folder.scanning_paused);
+    assert!(rss.is_scheduled_paused());
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        crate::persistence::sql_runtime::SqlRuntime::execute(
+            datastore.read_exec(),
+            "ALTER TABLE unavailable_settings RENAME TO settings",
+            &[],
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    while rss.is_scheduled_paused() {
+        tokio::task::yield_now().await;
+    }
+    assert!(!config.read().await.watch_folder.scanning_paused);
+    task.shutdown().await;
 }

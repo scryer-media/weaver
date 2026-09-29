@@ -509,6 +509,41 @@ async fn toggle_schedule() {
 }
 
 #[tokio::test]
+async fn toggling_a_migrated_download_rule_publishes_its_speed_reset() {
+    use std::sync::Arc;
+    use weaver_server_core::bandwidth::schedule::SharedSchedules;
+    let h = common::TestHarness::new().await;
+    h.db.set_setting("schedules", &serde_json::json!([
+        { "id": "limit", "time": "07:00", "action": {"type": "speed_limit", "bytes_per_sec": 1024} },
+        { "id": "resume", "time": "08:00", "enabled": false, "action": {"type": "resume"} }
+    ]).to_string()).unwrap();
+    let schedules: SharedSchedules =
+        Arc::new(tokio::sync::RwLock::new(h.db.list_schedules().unwrap()));
+    let response = h
+        .schema
+        .execute(
+            async_graphql::Request::new(
+                r#"mutation { toggleSchedule(id: "resume", enabled: true) { id enabled } }"#,
+            )
+            .data(weaver_server_core::auth::CallerScope::Local)
+            .data(schedules.clone()),
+        )
+        .await;
+    common::assert_no_errors(&response);
+    let persisted = h.db.list_schedules().unwrap();
+    assert!(persisted.iter().all(|entry| entry.enabled));
+    assert_eq!(persisted.len(), 3);
+    assert_eq!(*schedules.read().await, persisted);
+    assert!(
+        common::response_data(&response)["toggleSchedule"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["enabled"] == true)
+    );
+}
+
+#[tokio::test]
 async fn create_hardware_profile_schedule() {
     let h = TestHarness::new().await;
     let resp = h

@@ -135,11 +135,12 @@ pub struct RestoreReport {
 pub struct BackupArtifact {
     pub filename: String,
     pub path: PathBuf,
+    pub(super) temporary_directory: Option<tempfile::TempDir>,
 }
 
 impl BackupArtifact {
-    pub fn into_parts(self) -> (String, PathBuf) {
-        (self.filename, self.path)
+    pub fn into_parts(self) -> (String, PathBuf, Option<tempfile::TempDir>) {
+        (self.filename, self.path, self.temporary_directory)
     }
 }
 

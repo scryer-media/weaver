@@ -415,7 +415,7 @@ export function BackupPanel() {
       kind: "section",
       id: "export",
       title: t("next.settings.panel.backup"),
-      note: `${t("next.backup.exportNote")}. ${t("next.backup.retainedExport")}`,
+      note: t("next.backup.exportNote"),
       fields: [
         {
           id: "password",

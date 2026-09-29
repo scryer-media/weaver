@@ -6,13 +6,27 @@ use sqlx::Connection;
 use super::automatic::{AUTO_SETTINGS_KEY, decode_auto_settings};
 use super::manifest::{BackupInstanceSecrets, BackupServiceError, build_bundle_manifest, io_err};
 use super::stored::{
-    BACKUP_EXECUTION_TIMEOUT, BackupTrigger, STORAGE_KEY, complete_backup, new_backup_info,
-    prune_retained_backups, validate_storage_dir, write_metadata,
+    BackupTrigger, STORAGE_KEY, complete_backup, new_backup_info, prune_retained_backups,
+    validate_storage_dir, write_metadata,
 };
 use crate::persistence::database_target::DatabaseTarget;
 
 const LAST_VERSION: &str = "last_started_version";
 const PENDING_VERSION: &str = "pending_auto_backup_version";
+
+/// Record the version after the database has opened and restore recovery has completed.
+/// A failed pre-upgrade backup remains pending, but a later retry must describe the
+/// migrated database rather than claiming to be the original rollback copy.
+pub fn record_started_version(db: &crate::Database) -> Result<(), BackupServiceError> {
+    record_started_version_for(db, env!("CARGO_PKG_VERSION"))
+}
+
+fn record_started_version_for(
+    db: &crate::Database,
+    version: &str,
+) -> Result<(), BackupServiceError> {
+    db.set_setting(LAST_VERSION, version).map_err(io_err)
+}
 
 /// Explicit operator recovery from an unavailable pre-upgrade backup target.
 /// This deliberately forfeits rollback protection for this version transition.
@@ -33,8 +47,8 @@ async fn skip_upgrade_backup_for_target(
         write_marker(target, PENDING_VERSION, "").await?;
         write_marker(target, LAST_VERSION, current_version).await?;
     }
-    tracing::warn!(
-        "pre-migration automatic backup explicitly skipped; rollback backup was not created"
+    tracing::error!(
+        "pre-migration automatic backup explicitly skipped; rollback backup was not created; remove the skip option from persistent startup configuration after recovery"
     );
     Ok(())
 }
@@ -141,7 +155,7 @@ async fn write_marker(
 }
 
 /// Called only at server startup, before the normal database opener can migrate it.
-/// A failed enabled backup blocks migration so the retry still has the old schema.
+/// The caller chooses whether a failure blocks migration; failures retain the retry marker.
 pub async fn prepare_upgrade_backup(config_path: &Path) -> Result<(), BackupServiceError> {
     let target = DatabaseTarget::resolve(config_path).map_err(io_err)?;
     prepare_upgrade_backup_for_target(
@@ -186,9 +200,7 @@ pub(super) async fn prepare_upgrade_backup_for_target(
         write_marker(target, LAST_VERSION, current_version).await?;
         return Ok(());
     }
-    if previous.is_none()
-        || (previous.is_some_and(|version| version == current_version) && pending.is_none())
-    {
+    if previous.is_some_and(|version| version == current_version) && pending.is_none() {
         write_marker(target, LAST_VERSION, current_version).await?;
         return Ok(());
     }
@@ -231,7 +243,7 @@ pub(super) async fn prepare_upgrade_backup_for_target(
             .ok_or(BackupServiceError::PasswordRequired)?,
     )
     .map_err(BackupServiceError::Validation)?;
-    let source_version = previous.map(String::as_str).unwrap_or(current_version);
+    let source_version = previous.map(String::as_str).unwrap_or("unknown");
     let engine = if matches!(target, DatabaseTarget::PostgresUrl(_)) {
         "postgres"
     } else {
@@ -241,9 +253,10 @@ pub(super) async fn prepare_upgrade_backup_for_target(
     write_metadata(&dir, &info)?;
     let cancellation = super::archive::BackupCancellation::new();
     let run = async {
-        let export = super::logical::export_before_migrations(target)
-            .await
-            .map_err(io_err)?;
+        let export =
+            super::logical::export_before_migrations_cancellable(target, cancellation.clone())
+                .await
+                .map_err(io_err)?;
         let source_paths = super::service::source_paths_from_export(
             export.staging.path(),
             &data_dir.to_string_lossy(),
@@ -280,15 +293,12 @@ pub(super) async fn prepare_upgrade_backup_for_target(
         .map_err(io_err)?;
         Ok::<_, BackupServiceError>(manifest)
     };
-    let result = match tokio::time::timeout(BACKUP_EXECUTION_TIMEOUT, run).await {
-        Ok(result) => result,
-        Err(_) => {
-            cancellation.cancel();
-            Err(BackupServiceError::Io(
-                "pre-migration backup timed out".into(),
-            ))
-        }
-    };
+    let result = super::service::run_backup_work(
+        run,
+        cancellation.clone(),
+        super::archive::BackupCancellation::new(),
+    )
+    .await;
     let info = complete_backup(&dir, info, result)?;
     // Clear pending first: a crash before advancing the last version safely retries.
     write_marker(target, PENDING_VERSION, "").await?;
@@ -304,6 +314,45 @@ mod tests {
     use super::super::stored::{BackupArtifactStatus, list_backups};
     use super::*;
     use crate::persistence::encryption::{EncryptionKey, encrypt_value};
+
+    #[tokio::test]
+    async fn successful_open_keeps_retry_pending_and_labels_retry_with_running_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("weaver.db");
+        let db = crate::Database::open(&path).unwrap();
+        let key = EncryptionKey::generate();
+        db.set_setting("data_dir", &root.path().display().to_string())
+            .unwrap();
+        db.set_setting(LAST_VERSION, "0.14.1").unwrap();
+        db.set_setting(PENDING_VERSION, "0.14.2").unwrap();
+        db.set_setting(
+            AUTO_SETTINGS_KEY,
+            &serde_json::to_string(&StoredAutoSettings {
+                enabled: true,
+                daily_time_local: "03:00".into(),
+                encrypted_key: Some(encrypt_value(&key, "upgrade password").unwrap()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        record_started_version_for(&db, "0.14.2").unwrap();
+        assert_eq!(
+            db.get_setting(PENDING_VERSION).unwrap().as_deref(),
+            Some("0.14.2")
+        );
+        db.close().unwrap();
+        let target = DatabaseTarget::SqlitePath(path);
+        prepare_upgrade_backup_for_target(&target, root.path(), "0.14.2", |_| Ok(key))
+            .await
+            .unwrap();
+        let rows = list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_weaver_version, "0.14.2");
+        assert_eq!(
+            read_settings(&target).await.unwrap().unwrap()[PENDING_VERSION],
+            ""
+        );
+    }
 
     #[tokio::test]
     async fn explicit_automatic_reset_preserves_other_credentials_and_version_markers() {
@@ -472,6 +521,39 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_unmarked_database_is_backed_up_before_establishing_version_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("weaver.db");
+        let db = crate::Database::open(&path).unwrap();
+        let key = EncryptionKey::generate();
+        db.set_setting("data_dir", &root.path().display().to_string())
+            .unwrap();
+        db.set_setting(
+            AUTO_SETTINGS_KEY,
+            &serde_json::to_string(&StoredAutoSettings {
+                enabled: true,
+                daily_time_local: "03:00".into(),
+                encrypted_key: Some(encrypt_value(&key, "upgrade password").unwrap()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        db.close().unwrap();
+        let target = DatabaseTarget::SqlitePath(path);
+        prepare_upgrade_backup_for_target(&target, root.path(), "0.14.2", |_| Ok(key))
+            .await
+            .unwrap();
+        let rows = list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, BackupArtifactStatus::Ready);
+        assert_eq!(rows[0].source_weaver_version, "unknown");
+        assert_eq!(
+            read_settings(&target).await.unwrap().unwrap()[LAST_VERSION],
+            "0.14.2"
         );
     }
 

@@ -491,7 +491,10 @@ impl Pipeline {
         // Lanes already connected and waiting in the actor are answered
         // before any dial: an established socket outranks a new one.
         self.service_held_download_refills();
-        if self.global_paused || self.rate_limiter.should_wait() {
+        if self.global_paused
+            || self.shared_state.schedule_replay_paused()
+            || self.rate_limiter.should_wait()
+        {
             if self.active_downloads == 0 {
                 debug!(
                     global_paused = self.global_paused,

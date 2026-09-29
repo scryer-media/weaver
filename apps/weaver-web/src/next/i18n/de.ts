@@ -1348,7 +1348,6 @@ export const nextDe: LocaleDictionary = {
   "next.backup.saveStorage": "Speicherpfad speichern",
   "next.backup.automatic": "Automatische Sicherungen",
   "next.backup.retention": "Drei Sicherungen dieser Version und eine der vorherigen bleiben erhalten. Manuelle Sicherungen bleiben bis zum Löschen.",
-  "next.backup.retainedExport": "Jeder Export behält auch eine verschlüsselte Kopie im Sicherungsspeicher, bis Sie sie unter Gespeicherte Sicherungen löschen.",
   "next.backup.verifyAccountPassword": "Bestätigen Sie Ihr Kontopasswort, um fortzufahren. Gemeint ist das Anmeldepasswort, nicht der Archivschlüssel.",
   "next.backup.autoEnabled": "Automatische Sicherungen aktivieren",
   "next.backup.dailyTime": "Tägliche Uhrzeit (lokal)",

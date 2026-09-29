@@ -126,6 +126,7 @@ async fn async_main() {
         log_file: log_file_override,
         log_format: log_format_override,
         skip_upgrade_backup,
+        require_upgrade_backup,
         reset_automatic_backup_settings,
         command,
         ..
@@ -285,18 +286,28 @@ async fn async_main() {
             std::process::exit(1);
         }
         let backup_result = if skip_upgrade_backup {
-            tracing::warn!(
-                "operator skipped the pre-migration backup; this startup has no new rollback copy"
+            tracing::error!(
+                "operator skipped the pre-migration backup; this startup has no new rollback copy; remove --skip-upgrade-backup from persistent service configuration after recovery"
             );
             weaver_server_core::operations::backup::skip_upgrade_backup(&config_path).await
         } else {
             weaver_server_core::operations::backup::prepare_upgrade_backup(&config_path).await
         };
         if let Err(error) = backup_result {
+            if args::upgrade_backup_required(
+                require_upgrade_backup,
+                std::env::var("WEAVER_REQUIRE_UPGRADE_BACKUP")
+                    .ok()
+                    .as_deref(),
+            ) {
+                error!(
+                    "pre-migration backup preparation failed; refusing migration because backup protection is required: {error}"
+                );
+                std::process::exit(1);
+            }
             error!(
-                "pre-migration backup preparation failed; database migration has not started: {error}. Repair backup storage or use --skip-upgrade-backup to explicitly accept starting without a rollback copy"
+                "pre-migration backup preparation failed; continuing startup without a new rollback copy and retaining the retry marker: {error}. Set --require-upgrade-backup or WEAVER_REQUIRE_UPGRADE_BACKUP=true to refuse migration on backup failure"
             );
-            std::process::exit(1);
         }
     }
     let db = match bootstrap::open_database(&config_path) {
@@ -314,6 +325,11 @@ async fn async_main() {
                 std::process::exit(1);
             }
         };
+    if matches!(&command, Command::Serve { .. })
+        && let Err(error) = weaver_server_core::operations::backup::record_started_version(&db)
+    {
+        error!("could not record the running version after database startup: {error}");
+    }
     // Restoring can upgrade the restored database too, so the page stays up
     // through it. It must be down before the real server binds the port.
     if let Some(splash) = upgrade_splash {

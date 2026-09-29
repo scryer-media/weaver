@@ -19,6 +19,21 @@ use weaver_server_core::Database;
 use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
 use weaver_server_core::security::RuntimeSecurityConfig;
 
+struct BackupDownload {
+    file: tokio::fs::File,
+    _temporary_directory: Option<tempfile::TempDir>,
+}
+
+impl tokio::io::AsyncRead for BackupDownload {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.file).poll_read(cx, buffer)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct BackupExportRequest {
     password: Option<String>,
@@ -138,7 +153,7 @@ pub(super) async fn backup_export_handler(
     }
     match backup.create_backup(body.password).await {
         Ok(artifact) => {
-            let (filename, path) = artifact.into_parts();
+            let (filename, path, temporary_directory) = artifact.into_parts();
             match tokio::fs::File::open(path).await {
                 Ok(file) => (
                     [
@@ -148,7 +163,10 @@ pub(super) async fn backup_export_handler(
                             format!("attachment; filename=\"{filename}\""),
                         ),
                     ],
-                    Body::from_stream(ReaderStream::new(file)),
+                    Body::from_stream(ReaderStream::new(BackupDownload {
+                        file,
+                        _temporary_directory: temporary_directory,
+                    })),
                 )
                     .into_response(),
                 Err(error) => super::error_response(
@@ -231,7 +249,7 @@ pub(super) async fn backup_download_handler(
     }
     match backup.backup_artifact(&filename).await {
         Ok(artifact) => {
-            let (filename, path) = artifact.into_parts();
+            let (filename, path, temporary_directory) = artifact.into_parts();
             match tokio::fs::File::open(path).await {
                 Ok(file) => (
                     [
@@ -242,7 +260,10 @@ pub(super) async fn backup_download_handler(
                         ),
                         (header::CACHE_CONTROL, "no-store".into()),
                     ],
-                    Body::from_stream(ReaderStream::new(file)),
+                    Body::from_stream(ReaderStream::new(BackupDownload {
+                        file,
+                        _temporary_directory: temporary_directory,
+                    })),
                 )
                     .into_response(),
                 Err(error) => {
@@ -583,6 +604,31 @@ mod tests {
     use axum::routing::post;
     use tower::ServiceExt;
     use tower_http::limit::RequestBodyLimitLayer;
+
+    #[tokio::test]
+    async fn temporary_backup_download_is_cleaned_after_completion_or_disconnect() {
+        for complete in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("backup.enc");
+            std::fs::write(&path, b"encrypted backup").unwrap();
+            let file = tokio::fs::File::open(&path).await.unwrap();
+            let body =
+                Body::from_stream(tokio_util::io::ReaderStream::new(super::BackupDownload {
+                    file,
+                    _temporary_directory: Some(directory),
+                }));
+            assert!(path.exists());
+            if complete {
+                assert_eq!(
+                    axum::body::to_bytes(body, usize::MAX).await.unwrap(),
+                    "encrypted backup"
+                );
+            } else {
+                drop(body);
+            }
+            assert!(!path.exists());
+        }
+    }
 
     fn push_part(body: &mut Vec<u8>, boundary: &str, name: &str, bytes: &[u8]) {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());

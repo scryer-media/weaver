@@ -81,7 +81,15 @@ pub(crate) struct LogicalBackupExport {
 }
 
 impl Database {
+    #[cfg(test)]
     pub(crate) fn export_logical_backup(&self) -> Result<LogicalBackupExport, StateError> {
+        self.export_logical_backup_cancellable(super::archive::BackupCancellation::new())
+    }
+
+    pub(super) fn export_logical_backup_cancellable(
+        &self,
+        cancellation: super::archive::BackupCancellation,
+    ) -> Result<LogicalBackupExport, StateError> {
         let staging = super::create_backup_temp_dir().map_err(db_err)?;
         let tables_dir = staging.path().join("tables");
         std::fs::create_dir_all(&tables_dir).map_err(db_err)?;
@@ -95,13 +103,13 @@ impl Database {
                     .sqlite_path()?
                     .ok_or_else(|| StateError::Database("SQLite backup has no path".into()))?;
                 self.run_sql_blocking_local(move || async move {
-                    export_sqlite(&path, &tables_dir, false).await
+                    export_sqlite(&path, &tables_dir, false, &cancellation).await
                 })?
             }
             StoreDatastore::Postgres { pool } => {
                 let tables_dir = tables_dir.clone();
                 self.run_sql_blocking_read(async move {
-                    export_postgres(pool, &tables_dir, false).await
+                    export_postgres(pool, &tables_dir, false, &cancellation).await
                 })?
             }
         };
@@ -197,6 +205,7 @@ async fn export_sqlite(
     database_path: &Path,
     tables_dir: &Path,
     allow_older_catalog: bool,
+    cancellation: &super::archive::BackupCancellation,
 ) -> Result<BTreeMap<String, TablePartMetadata>, StateError> {
     let options = SqliteConnectOptions::new()
         .filename(database_path)
@@ -213,11 +222,14 @@ async fn export_sqlite(
         .await
         .map_err(db_err)?;
     let result = async {
-        let tables =
+        let mut tables =
             ordered_sqlite_tables(&mut conn, &actual, &[BackupTableClassification::Export]).await?;
+        if allow_older_catalog {
+            append_unclassified_tables(&mut tables, &actual)?;
+        }
         let mut parts = BTreeMap::new();
         for table in tables {
-            let part = export_sqlite_table(&mut conn, &table, tables_dir).await?;
+            let part = export_sqlite_table(&mut conn, &table, tables_dir, cancellation).await?;
             parts.insert(table, part);
         }
         Ok::<_, StateError>(parts)
@@ -235,6 +247,7 @@ async fn export_postgres(
     pool: sqlx::PgPool,
     tables_dir: &Path,
     allow_older_catalog: bool,
+    cancellation: &super::archive::BackupCancellation,
 ) -> Result<BTreeMap<String, TablePartMetadata>, StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_postgres_catalog_mode(&mut conn, allow_older_catalog).await?;
@@ -243,11 +256,14 @@ async fn export_postgres(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-    let tables =
+    let mut tables =
         ordered_postgres_tables(&mut tx, &actual, &[BackupTableClassification::Export]).await?;
+    if allow_older_catalog {
+        append_unclassified_tables(&mut tables, &actual)?;
+    }
     let mut parts = BTreeMap::new();
     for table in tables {
-        let part = export_postgres_table(&mut tx, &table, tables_dir).await?;
+        let part = export_postgres_table(&mut tx, &table, tables_dir, cancellation).await?;
         parts.insert(table, part);
     }
     tx.rollback().await.map_err(db_err)?;
@@ -324,7 +340,7 @@ fn validate_actual_tables(
         .filter(|table| !is_optional_catalog_table(table))
         .cloned()
         .collect::<Vec<_>>();
-    if unclassified.is_empty() && (allow_older_catalog || nonexistent.is_empty()) {
+    if allow_older_catalog || (unclassified.is_empty() && nonexistent.is_empty()) {
         Ok(())
     } else {
         Err(StateError::Database(format!(
@@ -335,11 +351,47 @@ fn validate_actual_tables(
     }
 }
 
+fn append_unclassified_tables(
+    tables: &mut Vec<String>,
+    actual: &BTreeSet<String>,
+) -> Result<(), StateError> {
+    let classified = BACKUP_TABLE_CATALOG
+        .iter()
+        .map(|entry| entry.table)
+        .collect::<BTreeSet<_>>();
+    for table in actual {
+        if !classified.contains(table.as_str()) {
+            if !table
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err(StateError::Database(
+                    "legacy table name cannot be represented safely in a backup".into(),
+                ));
+            }
+            tables.push(table.clone());
+        }
+    }
+    Ok(())
+}
+
+fn check_export_cancellation(
+    cancellation: &super::archive::BackupCancellation,
+) -> Result<(), StateError> {
+    if cancellation.is_cancelled() {
+        Err(StateError::Database("backup export cancelled".into()))
+    } else {
+        Ok(())
+    }
+}
+
 async fn export_sqlite_table(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
     tables_dir: &Path,
+    cancellation: &super::archive::BackupCancellation,
 ) -> Result<TablePartMetadata, StateError> {
+    check_export_cancellation(cancellation)?;
     let columns = sqlite_table_columns(conn, table).await?;
     let order = sqlite_row_order(conn, table).await?;
     let base = export_query(table, &columns);
@@ -348,6 +400,7 @@ async fn export_sqlite_table(
     let mut output = ExportTableWriter::new(&path)?;
     let mut offset = 0_i64;
     loop {
+        check_export_cancellation(cancellation)?;
         let batch = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .bind(EXPORT_BATCH_SIZE)
             .bind(offset)
@@ -369,7 +422,9 @@ async fn export_postgres_table(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table: &str,
     tables_dir: &Path,
+    cancellation: &super::archive::BackupCancellation,
 ) -> Result<TablePartMetadata, StateError> {
+    check_export_cancellation(cancellation)?;
     let columns = postgres_table_columns(tx, table).await?;
     let order = postgres_row_order(tx, table).await?;
     let base = export_query(table, &columns);
@@ -378,6 +433,7 @@ async fn export_postgres_table(
     let mut output = ExportTableWriter::new(&path)?;
     let mut offset = 0_i64;
     loop {
+        check_export_cancellation(cancellation)?;
         let batch = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .bind(EXPORT_BATCH_SIZE)
             .bind(offset)
@@ -1506,8 +1562,16 @@ pub(crate) async fn validate_legacy_encryption_key(
 }
 
 /// Export an existing schema before opening the application database or running migrations.
+#[cfg(test)]
 pub(super) async fn export_before_migrations(
     target: &crate::persistence::database_target::DatabaseTarget,
+) -> Result<LogicalBackupExport, StateError> {
+    export_before_migrations_cancellable(target, super::archive::BackupCancellation::new()).await
+}
+
+pub(super) async fn export_before_migrations_cancellable(
+    target: &crate::persistence::database_target::DatabaseTarget,
+    cancellation: super::archive::BackupCancellation,
 ) -> Result<LogicalBackupExport, StateError> {
     use crate::persistence::database_target::DatabaseTarget;
     let staging = super::create_backup_temp_dir().map_err(db_err)?;
@@ -1525,7 +1589,8 @@ pub(super) async fn export_before_migrations(
                     .fetch_one(&pool)
                     .await
                     .map_err(db_err)?;
-                let tables = export_postgres(pool.clone(), &tables_dir, true).await?;
+                let tables =
+                    export_postgres(pool.clone(), &tables_dir, true, &cancellation).await?;
                 Ok::<_, StateError>(("postgres", version, tables))
             }
             .await;
@@ -1551,7 +1616,7 @@ pub(super) async fn export_before_migrations(
             (
                 "sqlite",
                 version,
-                export_sqlite(&path, &tables_dir, true).await?,
+                export_sqlite(&path, &tables_dir, true, &cancellation).await?,
             )
         }
     };
@@ -1566,6 +1631,45 @@ pub(super) async fn export_before_migrations(
 #[cfg(test)]
 mod logical_reader_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pre_migration_export_preserves_unclassified_tables_and_checks_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut conn = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE schema_version (version INTEGER); INSERT INTO schema_version VALUES (1); CREATE TABLE retired_settings (id INTEGER PRIMARY KEY, value TEXT); INSERT INTO retired_settings VALUES (7, 'retained');")
+            .execute(&mut conn).await.unwrap();
+        assert!(validate_sqlite_catalog(&mut conn).await.is_err());
+        conn.close().await.unwrap();
+        let target = crate::persistence::database_target::DatabaseTarget::SqlitePath(path.clone());
+        let export = export_before_migrations(&target).await.unwrap();
+        assert_eq!(export.tables["retired_settings"].rows, 1);
+        assert_eq!(
+            read_table_objects(export.staging.path(), "retired_settings").unwrap()[0]["value"],
+            "retained"
+        );
+
+        let tables = tempfile::tempdir().unwrap();
+        let mut conn = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        let cancellation = super::super::archive::BackupCancellation::new();
+        export_sqlite_table(&mut conn, "schema_version", tables.path(), &cancellation)
+            .await
+            .unwrap();
+        cancellation.cancel();
+        let error =
+            export_sqlite_table(&mut conn, "retired_settings", tables.path(), &cancellation)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!tables.path().join("retired_settings.ndjson").exists());
+    }
 
     #[test]
     fn restore_manifest_requires_the_complete_export_catalog() {

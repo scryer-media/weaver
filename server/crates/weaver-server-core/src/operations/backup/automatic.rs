@@ -14,16 +14,28 @@ pub(super) struct StoredAutoSettings {
 }
 
 pub(super) fn decode_auto_settings(value: &str) -> Result<StoredAutoSettings, String> {
-    let value: serde_json::Value = serde_json::from_str(value)
-        .map_err(|error| format!("invalid automatic backup settings: {error}"))?;
-    let object = value.as_object().ok_or_else(|| {
-        "automatic backup settings must be an object; encryption key presence is unknown"
-            .to_string()
-    })?;
+    let value: serde_json::Value = match serde_json::from_str(value) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "corrupt automatic backup settings disabled in memory; original settings retained for recovery");
+            return Ok(StoredAutoSettings::default());
+        }
+    };
+    let Some(object) = value.as_object() else {
+        tracing::error!(
+            "non-object automatic backup settings disabled in memory; original settings retained for recovery"
+        );
+        return Ok(StoredAutoSettings::default());
+    };
     let encrypted_key = match object.get("encrypted_key") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(key)) => Some(key.clone()),
-        Some(_) => return Err("automatic backup encryption key has an invalid type".into()),
+        Some(_) => {
+            tracing::error!(
+                "automatic backup settings with invalid password type disabled in memory; original settings retained for recovery"
+            );
+            return Ok(StoredAutoSettings::default());
+        }
     };
     match serde_json::from_value(value) {
         Ok(settings) => Ok(settings),
@@ -348,7 +360,13 @@ mod tests {
         assert_eq!(db.get_setting(AUTO_SETTINGS_KEY).unwrap(), Some(json));
         for corrupt in ["{broken", "[]", r#"{"encrypted_key":42}"#] {
             db.set_setting(AUTO_SETTINGS_KEY, corrupt).unwrap();
-            assert!(db.has_encrypted_credentials().is_err());
+            assert!(!decode_auto_settings(corrupt).unwrap().enabled);
+            assert!(!db.has_encrypted_credentials().unwrap());
+            db.validate_encrypted_credentials(&key).unwrap();
+            assert_eq!(
+                db.get_setting(AUTO_SETTINGS_KEY).unwrap().as_deref(),
+                Some(corrupt)
+            );
         }
     }
 

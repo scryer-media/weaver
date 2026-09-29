@@ -62,8 +62,8 @@ impl ServersService {
         if let Err(error) =
             crate::runtime::reload::rebuild_nntp_from_config(&self.config, &self.handle).await
         {
-            // Persistence records intent, but keep the runtime snapshot on its
-            // prior state so a retry cannot mistake a failed activation for a no-op.
+            // Failed activations must leave persistence and runtime in agreement,
+            // including when the next attempt happens after a process restart.
             if let Some(server) = self
                 .config
                 .write()
@@ -73,6 +73,16 @@ impl ServersService {
                 .find(|server| server.id == server_id)
             {
                 server.active = previous_active;
+            }
+            let db = self.db.clone();
+            let rollback = tokio::task::spawn_blocking(move || {
+                db.set_server_active(server_id, previous_active)
+            })
+            .await;
+            if !matches!(rollback, Ok(Ok(()))) {
+                return Err(format!(
+                    "{error}; restoring server activation failed: {rollback:?}"
+                ));
             }
             return Err(error.to_string());
         }

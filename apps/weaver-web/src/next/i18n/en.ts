@@ -1355,7 +1355,6 @@ export const nextEn: LocaleDictionary = {
   "next.backup.saveStorage": "Save storage path",
   "next.backup.automatic": "Automatic backups",
   "next.backup.retention": "Keeps three backups from this version and one from the previous version. Manual backups are kept until deleted.",
-  "next.backup.retainedExport": "Every export also keeps an encrypted copy in Backup storage until you delete it from Stored backups.",
   "next.backup.verifyAccountPassword": "Confirm your account password to continue. This is your sign-in password, not the archive encryption key.",
   "next.backup.autoEnabled": "Enable automatic backups",
   "next.backup.dailyTime": "Daily time (local)",

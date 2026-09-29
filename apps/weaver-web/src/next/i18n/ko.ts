@@ -1348,7 +1348,6 @@ export const nextKo: LocaleDictionary = {
   "next.backup.saveStorage": "저장 경로 저장",
   "next.backup.automatic": "자동 백업",
   "next.backup.retention": "현재 버전 3개와 이전 버전 1개를 보관합니다. 수동 백업은 삭제할 때까지 유지됩니다.",
-  "next.backup.retainedExport": "내보낼 때마다 암호화된 사본도 백업 저장소에 보관되며 저장된 백업에서 삭제할 때까지 유지됩니다.",
   "next.backup.verifyAccountPassword": "계속하려면 계정 비밀번호를 확인하세요. 보관 파일 암호화 키가 아닌 로그인 비밀번호입니다.",
   "next.backup.autoEnabled": "자동 백업 활성화",
   "next.backup.dailyTime": "매일 실행 시각 (현지)",

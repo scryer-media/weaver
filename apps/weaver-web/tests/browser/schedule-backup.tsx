@@ -45,6 +45,9 @@ function graphql(name: string, variables: Record<string, any>) {
   } else if (name === "UpdateSchedule") {
     state.schedules = state.schedules.map((rule) => rule.id === variables.id ? { ...rule, ...variables.input, days: variables.input.days ?? [], times: variables.input.times ?? [], track: track(variables.input.actionType) } : rule);
     mutation = { updateSchedule: state.schedules };
+  } else if (name === "ToggleSchedule") {
+    state.schedules = state.schedules.map((rule) => rule.id === variables.id ? { ...rule, enabled: variables.enabled } : rule);
+    mutation = { toggleSchedule: state.schedules };
   } else if (name === "DeleteSchedule") {
     state.schedules = state.schedules.filter((rule) => rule.id !== variables.id); mutation = { deleteSchedule: state.schedules };
   } else if (name === "UpdateBackupSettings") {
@@ -89,8 +92,10 @@ window.fetch = async (request, init) => {
       acceptedBackupCreates += 1;
     }
     const info = { filename: `weaver_backup_fixture_${++sequence}.enc`, sizeBytes: 1024, createdAt: "2026-01-02T03:00:00Z", sourceWeaverVersion: "0.14.2", trigger: "MANUAL", status: "READY", error: null };
-    state.backups.push(info);
-    if (url.pathname.endsWith("create")) return Response.json({ ...info, status: "Creating" }, { status: 202 });
+    if (url.pathname.endsWith("create")) {
+      state.backups.push(info);
+      return Response.json({ ...info, status: "Creating" }, { status: 202 });
+    }
     return new Response("fixture archive", { headers: { "Content-Disposition": `attachment; filename="${info.filename}"` } });
   }
   if (url.pathname.startsWith("/api/backup/download/")) {

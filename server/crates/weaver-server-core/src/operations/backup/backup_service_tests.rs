@@ -253,9 +253,13 @@ async fn password_protected_backup_roundtrip_inspects() {
         .await
         .unwrap();
     assert!(artifact.filename.ends_with(".enc"));
+    assert!(service.backups().await.unwrap().is_empty());
+    let artifact_path = artifact.path.clone();
 
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::copy(&artifact.path, temp.path()).unwrap();
+    drop(artifact);
+    assert!(!artifact_path.exists());
 
     let inspect = service
         .inspect_backup(temp.path(), Some("secret-pass".into()))
@@ -1830,7 +1834,7 @@ async fn stored_backup_lifecycle_and_execution_guards() {
         BackupArtifactStatus::Ready
     );
     let artifact = service.backup_artifact(&manual.filename).await.unwrap();
-    let (_, path) = artifact.into_parts();
+    let (_, path, _temporary_directory) = artifact.into_parts();
     assert!(path.exists());
     let token = service
         .create_download_token(&manual.filename)
@@ -1947,7 +1951,7 @@ async fn completed_backup_artifact_keeps_its_original_storage_directory() {
         .await
         .unwrap();
     assert!(service.backups().await.unwrap().is_empty());
-    let (filename, path) = artifact.into_parts();
+    let (filename, path, _temporary_directory) = artifact.into_parts();
     assert_eq!(filename, info.filename);
     assert_eq!(path, original.join(&filename));
     let unpacked = super::create_backup_temp_dir().unwrap();
@@ -2010,7 +2014,7 @@ async fn automatic_backup_key_is_encrypted_and_restored_with_settings() {
     let info = service.run_auto_backup().await.unwrap().unwrap();
     assert_eq!(info.trigger, BackupTrigger::Auto);
     assert_eq!(info.status, BackupArtifactStatus::Ready);
-    let (_, artifact) = service
+    let (_, artifact, _temporary_directory) = service
         .backup_artifact(&info.filename)
         .await
         .unwrap()

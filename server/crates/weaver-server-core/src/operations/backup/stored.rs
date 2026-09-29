@@ -315,8 +315,9 @@ pub(super) fn retention_victims<'a>(
             if info.source_weaver_version == current_version {
                 current_kept += 1;
                 current_kept > 3
-            } else if previous.is_some()
-                && semver::Version::parse(&info.source_weaver_version).ok() == previous
+            } else if (previous.is_some()
+                && semver::Version::parse(&info.source_weaver_version).ok() == previous)
+                || (previous.is_none() && info.source_weaver_version == "unknown")
             {
                 previous_kept += 1;
                 previous_kept > 1
@@ -422,6 +423,7 @@ impl BackupService {
         Ok(BackupArtifact {
             filename: info.filename,
             path,
+            temporary_directory: None,
         })
     }
 
@@ -535,30 +537,21 @@ impl BackupService {
         let artifact = BackupArtifact {
             filename: info.filename.clone(),
             path: dir.join(&info.filename),
+            temporary_directory: None,
         };
         let finished = tokio::spawn(async move {
             let cancellation = super::archive::BackupCancellation::new();
-            let result = tokio::select! {
-                result = tokio::time::timeout(
-                    BACKUP_EXECUTION_TIMEOUT,
-                    service.write_backup(
-                        password,
-                        dir.join(&completed.filename),
-                        execution.clone(),
-                        cancellation.clone(),
-                    ),
-                ) => match result {
-                    Ok(result) => result,
-                    Err(_) => {
-                        cancellation.cancel();
-                        Err(BackupServiceError::Io("backup timed out".into()))
-                    }
-                },
-                _ = service.inner.shutdown_signal.cancelled() => {
-                    cancellation.cancel();
-                    Err(BackupServiceError::Io("backup cancelled during shutdown".into()))
-                }
-            };
+            let result = super::service::run_backup_work(
+                service.write_backup(
+                    password,
+                    dir.join(&completed.filename),
+                    execution.clone(),
+                    cancellation.clone(),
+                ),
+                cancellation,
+                service.inner.shutdown_signal.clone(),
+            )
+            .await;
             let completed = complete_backup(&dir, completed, result)?;
             if trigger == BackupTrigger::Auto {
                 prune_retained_backups(&dir, env!("CARGO_PKG_VERSION"));

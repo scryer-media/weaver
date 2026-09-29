@@ -66,29 +66,9 @@ impl Database {
                 };
                 let ids: Vec<_> = rows.into_iter().map(|row| row.job_id).collect();
                 if !ids.is_empty() {
-                    match db.accept_history_delete_ids(&ids, delete_files, delete_files) {
-                        Ok(_) => {}
-                        Err(
-                            HistoryDeleteOperationInsertError::MissingRows
-                            | HistoryDeleteOperationInsertError::LockedTargets,
-                        ) => {
-                            // A concurrent manual delete must not exclude unrelated rows.
-                            // Each acceptance rechecks existence and locks transactionally.
-                            for id in ids {
-                                match db.accept_history_delete_ids(
-                                    &[id],
-                                    delete_files,
-                                    delete_files,
-                                ) {
-                                    Ok(_)
-                                    | Err(
-                                        HistoryDeleteOperationInsertError::MissingRows
-                                        | HistoryDeleteOperationInsertError::LockedTargets,
-                                    ) => {}
-                                    Err(error) => errors.push(error.to_string()),
-                                }
-                            }
-                        }
+                    match db.insert_available_history_delete_operation(&ids, delete_files) {
+                        Ok(Some(_)) => db.history_delete_wake.notify_one(),
+                        Ok(None) => {}
                         Err(error) => errors.push(error.to_string()),
                     }
                 }

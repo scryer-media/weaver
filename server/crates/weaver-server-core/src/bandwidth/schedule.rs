@@ -105,6 +105,7 @@ pub fn spawn_evaluator_with_services(
     tokio::sync::oneshot::Receiver<Result<(), String>>,
 ) {
     let (ready, replayed) = tokio::sync::oneshot::channel();
+    handle.set_schedule_replay_paused(true);
     let (stop, mut stopping) = tokio::sync::oneshot::channel();
     let cancellation = crate::bandwidth::schedule::ScheduleCancellation::new();
     let stopping_actions = cancellation.clone();
@@ -112,31 +113,8 @@ pub fn spawn_evaluator_with_services(
         let mut stop_open = true;
         let mut ready = Some(ready);
         let mut evaluator = HoldEvaluator::default();
-        if let Some(db) = services.db.clone() {
-            let pause_all_configured = schedules
-                .read()
-                .await
-                .iter()
-                .any(|entry| entry.enabled && matches!(entry.action, ScheduleAction::PauseAll));
-            match tokio::task::spawn_blocking(move || {
-                if pause_all_configured {
-                    db.set_setting("schedule_pause_all_used", "true")?;
-                }
-                db.get_setting("schedule_pause_all_used")
-            })
-            .await
-            {
-                Ok(Ok(value)) => evaluator.pause_all_seen = value.as_deref() == Some("true"),
-                result => {
-                    if let Some(ready) = ready.take() {
-                        let _ = ready.send(Err(format!(
-                            "cannot load schedule intake state: {result:?}"
-                        )));
-                    }
-                    return;
-                }
-            }
-        }
+        let mut intake_state_loaded = services.db.is_none();
+        let mut intake_before_failure = None;
         let mut one_shots = OneShotEvaluator::default();
         let mut dispatcher = OneShotDispatcher::default();
         let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
@@ -172,6 +150,54 @@ pub fn spawn_evaluator_with_services(
             }
 
             let entries = schedules.read().await.clone();
+            if !intake_state_loaded {
+                let db = services.db.clone().expect("database checked above");
+                let pause_all_configured = entries
+                    .iter()
+                    .any(|entry| entry.enabled && matches!(entry.action, ScheduleAction::PauseAll));
+                match tokio::task::spawn_blocking(move || {
+                    if pause_all_configured {
+                        db.set_setting("schedule_pause_all_used", "true")?;
+                    }
+                    db.get_setting("schedule_pause_all_used")
+                })
+                .await
+                {
+                    Ok(Ok(value)) => {
+                        evaluator.pause_all_seen |= value.as_deref() == Some("true");
+                        intake_state_loaded = true;
+                    }
+                    result => {
+                        if intake_before_failure.is_none() {
+                            let watch_paused = match &services.watch_folder {
+                                Some(watch) => watch.scanning_paused().await,
+                                None => false,
+                            };
+                            let rss_paused = services
+                                .rss
+                                .as_ref()
+                                .is_some_and(|rss| rss.is_scheduled_paused());
+                            intake_before_failure = Some((watch_paused, rss_paused));
+                        }
+                        if let Some(watch) = &services.watch_folder {
+                            watch.pause_scanning_runtime().await;
+                        }
+                        if let Some(rss) = &services.rss {
+                            rss.set_scheduled_paused(true);
+                        }
+                        warn!(
+                            ?result,
+                            "cannot load schedule intake state; retrying next tick"
+                        );
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(Err(format!(
+                                "cannot load schedule intake state: {result:?}"
+                            )));
+                        }
+                        continue;
+                    }
+                }
+            }
             let clock = crate::e2e_clock::local_now();
             let now = clock.naive_local();
             let utc = clock.naive_utc();
@@ -201,6 +227,24 @@ pub fn spawn_evaluator_with_services(
             match result {
                 Ok((tick, failures)) => {
                     evaluator = tick;
+                    handle.set_schedule_replay_paused(evaluator.download_admission_blocked);
+                    if failures.is_empty()
+                        && let Some((watch_paused, rss_paused)) = intake_before_failure.take()
+                    {
+                        if !evaluator.applied.contains_key(&ScheduleTrack::WatchFolder)
+                            && let Some(watch) = &services.watch_folder
+                            && let Err(error) = watch.restore_scanning_runtime(watch_paused).await
+                        {
+                            watch.pause_scanning_runtime().await;
+                            intake_before_failure = Some((watch_paused, rss_paused));
+                            warn!(%error, "cannot restore watch intake after schedule recovery; retrying next tick");
+                        }
+                        if !evaluator.applied.contains_key(&ScheduleTrack::Rss)
+                            && let Some(rss) = &services.rss
+                        {
+                            rss.set_scheduled_paused(rss_paused);
+                        }
+                    }
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(if failures.is_empty() {
                             Ok(())
@@ -210,6 +254,26 @@ pub fn spawn_evaluator_with_services(
                     }
                 }
                 Err(panic) => {
+                    handle.set_schedule_replay_paused(true);
+                    evaluator.applied.remove(&ScheduleTrack::WatchFolder);
+                    evaluator.applied.remove(&ScheduleTrack::Rss);
+                    if intake_before_failure.is_none() {
+                        let watch_paused = match &services.watch_folder {
+                            Some(watch) => watch.scanning_paused().await,
+                            None => false,
+                        };
+                        let rss_paused = services
+                            .rss
+                            .as_ref()
+                            .is_some_and(|rss| rss.is_scheduled_paused());
+                        intake_before_failure = Some((watch_paused, rss_paused));
+                    }
+                    if let Some(watch_folder) = &services.watch_folder {
+                        watch_folder.pause_scanning_runtime().await;
+                    }
+                    if let Some(rss) = &services.rss {
+                        rss.set_scheduled_paused(true);
+                    }
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(Err(format!("initial schedule replay failed: {panic}")));
                     }
@@ -305,6 +369,7 @@ struct HoldEvaluator {
     last_utc: Option<NaiveDateTime>,
     repeated_until: Option<NaiveDateTime>,
     pause_all_seen: bool,
+    download_admission_blocked: bool,
 }
 
 impl HoldEvaluator {
@@ -345,9 +410,9 @@ impl HoldEvaluator {
         F: FnMut(ScheduleAction, ScheduleTrack) -> Fut,
         Fut: std::future::Future<Output = Result<(), ScheduleApplyError>>,
     {
-        let jumped = self
-            .last_utc
-            .is_some_and(|last| utc < last || utc - last > Duration::minutes(90));
+        let jumped = self.last_utc.is_some_and(|last| {
+            last - utc > Duration::minutes(5) || utc - last > Duration::minutes(90)
+        });
         if jumped {
             self.applied.clear();
             self.repeated_until = None;
@@ -360,6 +425,7 @@ impl HoldEvaluator {
         self.last_tick = Some(now);
         self.last_utc = Some(utc);
         let mut failures = Vec::new();
+        self.download_admission_blocked = false;
         // A legacy Resume only affects downloads. Once PauseAll has introduced
         // intake holds, Resume must clear them even if that rule is later deleted.
         self.pause_all_seen |= entries
@@ -415,6 +481,8 @@ impl HoldEvaluator {
                 }
                 Err(ScheduleApplyError::Pending) => {}
                 Err(ScheduleApplyError::Failed(error)) => {
+                    self.download_admission_blocked |=
+                        matches!(track, ScheduleTrack::Downloads | ScheduleTrack::Server(_));
                     warn!(%error, id = %entry.id, "failed to apply schedule action; retrying next tick");
                     failures.push(error);
                 }
@@ -454,7 +522,8 @@ async fn apply_schedule_action(
     action: ScheduleAction,
     track: Option<ScheduleTrack>,
 ) -> Result<(), ScheduleApplyError> {
-    if matches!(action, ScheduleAction::Resume)
+    if track == Some(ScheduleTrack::Downloads)
+        && matches!(action, ScheduleAction::Resume)
         && let Some(db) = services.db.clone()
         && tokio::task::spawn_blocking(move || db.get_setting("nzbget.scheduled_resume_at"))
             .await
@@ -473,15 +542,19 @@ async fn apply_schedule_action(
         return Ok(());
     }
     if track == Some(ScheduleTrack::WatchFolder) {
-        return services
+        let watch_folder = services
             .watch_folder
-            .ok_or("watch folder service is not available")?
+            .ok_or("watch folder service is not available")?;
+        let result = watch_folder
             .set_scanning_paused(matches!(
                 action,
                 ScheduleAction::PauseAll | ScheduleAction::PauseWatchFolderScanning
             ))
-            .await
-            .map_err(|error| ScheduleApplyError::Failed(error.to_string()));
+            .await;
+        if result.is_err() {
+            watch_folder.pause_scanning_runtime().await;
+        }
+        return result.map_err(|error| ScheduleApplyError::Failed(error.to_string()));
     }
     let result = match action {
         ScheduleAction::SetServerActive { server_id, active } => {

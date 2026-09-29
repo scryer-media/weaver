@@ -1348,7 +1348,6 @@ export const nextJa: LocaleDictionary = {
   "next.backup.saveStorage": "保存パスを保存",
   "next.backup.automatic": "自動バックアップ",
   "next.backup.retention": "現在のバージョンを3件、前のバージョンを1件保持します。手動バックアップは削除するまで保持されます。",
-  "next.backup.retainedExport": "エクスポート時にも暗号化されたコピーがバックアップ保存先に残ります。保存済みバックアップから削除するまで保持されます。",
   "next.backup.verifyAccountPassword": "続行するにはアカウントのパスワードを確認してください。アーカイブの暗号化キーではなく、ログイン用のパスワードです。",
   "next.backup.autoEnabled": "自動バックアップを有効化",
   "next.backup.dailyTime": "毎日の時刻（現地時間）",

@@ -219,7 +219,7 @@ export function BackupRestoreSection({
     setBackupError(null);
     setBackupMessage(null);
     try {
-      const response = await fetch(new URL(download ? "api/backup/export" : "api/backup/create", document.baseURI).href, {
+      const response = await fetch(new URL("api/backup/export", document.baseURI).href, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
@@ -229,14 +229,8 @@ export function BackupRestoreSection({
       if (!response.ok) {
         await throwJsonError(response);
       }
-      if (download) {
-        await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
-        setBackupMessage(t("settings.backupDownloadReady"));
-      } else {
-        await response.json();
-        setBackupMessage(t("next.backup.building"));
-      }
-      onBackupCreated?.();
+      await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
+      setBackupMessage(t("settings.backupDownloadReady"));
     } catch (error) {
       setBackupError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -356,7 +350,6 @@ export function BackupRestoreSection({
           <p className="mt-1 text-[12.5px] text-muted-foreground">
             {t("settings.backupExportDesc")}
           </p>
-          <p className="mt-1 text-[12.5px] text-muted-foreground">{t("next.backup.retainedExport")}</p>
           <div className="mt-4 space-y-1.5">
             <Label htmlFor="backup-export-password">{t("settings.backupPassword")}</Label>
             <Input

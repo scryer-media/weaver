@@ -427,7 +427,11 @@ pub(crate) async fn run(
     // Intake pollers must not race the first PauseAll replay. The pipeline is
     // running now, so every initial hold finishes before intake starts, including
     // disabling servers that must not accept the first recovered download.
-    schedules_replayed.await??;
+    match schedules_replayed.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "initial schedule replay failed; evaluator will retry"),
+        Err(error) => error!(%error, "schedule evaluator stopped before initial replay"),
+    }
     let rss_task = rss.start_background_loop();
     let update_check_task = update_check.start_background_loop();
     watch_folder.reconcile_from_config().await?;
