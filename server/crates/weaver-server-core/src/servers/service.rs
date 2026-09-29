@@ -3,7 +3,105 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::servers::ServerConfig;
 
+/// Shared serialization for server mutations and whole-generation reloads.
+pub static SERVER_MUTATION_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Clone)]
+pub struct ServersService {
+    db: Database,
+    config: crate::settings::SharedConfig,
+    handle: crate::SchedulerHandle,
+}
+
+impl ServersService {
+    pub fn new(
+        db: Database,
+        config: crate::settings::SharedConfig,
+        handle: crate::SchedulerHandle,
+    ) -> Self {
+        Self { db, config, handle }
+    }
+
+    /// Persist operator intent even when the provider is offline. Scheduled
+    /// activation deliberately performs no connection probe.
+    pub async fn set_active(&self, server_id: u32, active: bool) -> Result<(), String> {
+        let _guard = SERVER_MUTATION_GUARD.lock().await;
+        let previous_active = self
+            .config
+            .read()
+            .await
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .ok_or_else(|| format!("server {server_id} is missing from the runtime configuration"))?
+            .active;
+        if previous_active == active {
+            return Ok(());
+        }
+        let proxy_runtime = self.handle.proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.set_server_active(server_id, active))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        {
+            let mut config = self.config.write().await;
+            let server = config
+                .servers
+                .iter_mut()
+                .find(|server| server.id == server_id)
+                .ok_or_else(|| {
+                    format!("server {server_id} is missing from the runtime configuration")
+                })?;
+            server.active = active;
+        }
+        if let Err(error) =
+            crate::runtime::reload::rebuild_nntp_from_config(&self.config, &self.handle).await
+        {
+            // Persistence records intent, but keep the runtime snapshot on its
+            // prior state so a retry cannot mistake a failed activation for a no-op.
+            if let Some(server) = self
+                .config
+                .write()
+                .await
+                .servers
+                .iter_mut()
+                .find(|server| server.id == server_id)
+            {
+                server.active = previous_active;
+            }
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+}
+
 impl Database {
+    pub fn set_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE servers SET active = {} WHERE id = {}",
+                &[
+                    SqlArg::I64(i64::from(active)),
+                    SqlArg::I64(i64::from(server_id)),
+                ],
+            )
+            .await?;
+            if changed == 0 {
+                return Err(StateError::Database(format!(
+                    "server {server_id} not found"
+                )));
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn replace_servers(&self, servers: &[ServerConfig]) -> Result<(), StateError> {
         use crate::persistence::encryption::encrypt_secret_for_write;
 

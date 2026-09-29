@@ -196,3 +196,40 @@ fn global_pause_origin_selects_the_block_kind() {
         crate::DownloadBlockKind::Scheduled
     );
 }
+
+#[test]
+fn quota_metering_preserves_reservations_and_excludes_unmetered_ledger_rows_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quota.db");
+    let db = crate::Database::open(&path).unwrap();
+    let mut runtime = BandwidthCapRuntime::default();
+    runtime.set_policy(Some(cap(IspBandwidthCapPeriod::Daily)));
+    runtime.reserve(300);
+    runtime.record_pending_usage(100, 200);
+    runtime.set_metering_enabled(false);
+    assert!(!runtime.cap_enabled());
+    assert!(runtime.can_reserve(10000));
+    assert_eq!(runtime.reserved_bytes, 300);
+    assert!(runtime.policy.as_ref().unwrap().enabled);
+    runtime.record_pending_usage(100, 700);
+    runtime.set_metering_enabled(true);
+    runtime.record_pending_usage(100, 100);
+    assert_eq!(runtime.reserved_bytes, 300);
+    runtime.flush_pending_usage(&db).unwrap();
+    assert_eq!(db.sum_bandwidth_usage_minutes(100, 101).unwrap(), 1000);
+    assert_eq!(
+        db.sum_metered_bandwidth_usage_minutes(100, 101).unwrap(),
+        300
+    );
+    let reopened = crate::Database::open(&path).unwrap();
+    assert_eq!(
+        reopened.sum_bandwidth_usage_minutes(100, 101).unwrap(),
+        1000
+    );
+    assert_eq!(
+        reopened
+            .sum_metered_bandwidth_usage_minutes(100, 101)
+            .unwrap(),
+        300
+    );
+}

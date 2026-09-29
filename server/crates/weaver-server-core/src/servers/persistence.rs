@@ -118,6 +118,7 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
                 Box::pin(async move {
+                    Database::remove_server_schedules(tx, id).await?;
                     let changed = tx
                         .execute(
                             "DELETE FROM servers WHERE id = {}",

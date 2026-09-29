@@ -868,12 +868,13 @@ impl Pipeline {
             }
             return;
         }
-        self.par3_runtime.get_or_insert_with(|| {
+        let coordinator = self.par3_runtime.get_or_insert_with(|| {
             Box::new(work::Coordinator::new(
                 self.repair_work_done_tx.clone(),
                 Arc::clone(&self.metrics),
             ))
         });
+        coordinator.admission_paused = self.shared_state.is_post_processing_paused();
         if let Err(error) = self.enqueue_par3_file_with_inside(job_id, file_id, embedded) {
             self.fail_job(job_id, format!("PAR3 discovery failed: {error}"));
             return;

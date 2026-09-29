@@ -1466,3 +1466,102 @@ mod nzbget_version_uses_jsonrpc;
 mod renders_prometheus_metrics_for;
 mod restart_handler_tests;
 mod setup_handler_tests;
+
+#[tokio::test]
+async fn stored_backup_create_challenges_only_expired_administrators() {
+    let db = Database::open_in_memory().unwrap();
+    let config = test_config();
+    let handle = test_scheduler_handle();
+    let rss = weaver_server_api::RssService::new(handle.clone(), config.clone(), db.clone());
+    let service = weaver_server_api::BackupService::new(
+        handle,
+        config,
+        db.clone(),
+        rss,
+        std::env::temp_dir(),
+    );
+    let security = Arc::new(weaver_server_core::security::RuntimeSecurityConfig::default());
+    security.apply_stored_access_policy_revision(None, None, false);
+    let request_auth = RequestAuthContext {
+        db: db.clone(),
+        auth_cache: LoginAuthCache::default(),
+        api_key_cache: ApiKeyCache::default(),
+        session_token: SessionToken(Arc::new("fixture-process-token".to_string())),
+        security,
+    };
+    let router = Router::new()
+        .route("/api/backup/create", post(backup::backup_create_handler))
+        .layer(Extension(service))
+        .layer(Extension(request_auth));
+    let request = |authorization: Option<&str>, cookie: Option<&str>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/backup/create")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(authorization) = authorization {
+            builder = builder.header(header::AUTHORIZATION, authorization);
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder
+            .body(Body::from(r#"{"password":"fixture archive key"}"#))
+            .unwrap()
+    };
+    let unauthenticated = router.clone().oneshot(request(None, None)).await.unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        to_bytes(unauthenticated.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    db.insert_api_key(
+        "fixture-readonly",
+        &hash_api_key("fixture-readonly-key"),
+        "readonly",
+    )
+    .unwrap();
+    let readonly = router
+        .clone()
+        .oneshot(request(Some("Bearer fixture-readonly-key"), None))
+        .await
+        .unwrap();
+    assert_eq!(readonly.status(), StatusCode::FORBIDDEN);
+    assert!(
+        to_bytes(readonly.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let browser_token = "fixture-expired-admin";
+    let token_hash = hash_api_key(browser_token)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    db.create_browser_session(&weaver_server_core::auth::BrowserSession {
+        token_hash,
+        csrf_verifier: "fixture-csrf".to_string(),
+        origin: "http://localhost".to_string(),
+        client_ip: None,
+        remembered: false,
+        created_at: now - 3_600,
+        expires_at: now + 3_600,
+        revoked_at: None,
+    })
+    .unwrap();
+    let expired = router
+        .oneshot(request(None, Some("weaver_session=fixture-expired-admin")))
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::PRECONDITION_REQUIRED);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(expired.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["code"], "REAUTH_REQUIRED");
+}

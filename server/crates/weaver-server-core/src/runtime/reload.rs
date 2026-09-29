@@ -290,4 +290,196 @@ mod tests {
         assert!(cmd_rx.try_recv().is_err());
         assert!(handle.nntp_pool().is_none());
     }
+    #[tokio::test]
+    async fn scheduled_server_activation_failure_is_retried_not_treated_as_unchanged() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_server(&server(42)).unwrap();
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let (commands, _received) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        let service =
+            crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+        // No transfer-policy registry: activation must fail before a new generation.
+        for _ in 0..2 {
+            assert!(service.set_active(42, false).await.is_err());
+            assert!(!db.load_config().unwrap().servers[0].active);
+            assert!(config.read().await.servers[0].active);
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_server_activation_gates_startup_readiness() {
+        use crate::bandwidth::schedule::{ScheduleServices, spawn_evaluator_with_services};
+        let db = Database::open_in_memory().unwrap();
+        let provider = server(42);
+        db.insert_server(&provider).unwrap();
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let registry = Arc::new(
+            crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                db.clone(),
+                &[provider],
+            )
+            .unwrap(),
+        );
+        let (commands, mut received) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        handle.set_server_transfer_policy(registry);
+        let schedules = Arc::new(RwLock::new(vec![crate::bandwidth::ScheduleEntry {
+            id: "provider-hold".into(),
+            enabled: true,
+            label: String::new(),
+            days: vec![],
+            time: "00:00".into(),
+            times: vec![],
+            every_hour_at_minute: None,
+            action: crate::bandwidth::ScheduleAction::SetServerActive {
+                server_id: 42,
+                active: false,
+            },
+        }]));
+        let (task, mut ready) = spawn_evaluator_with_services(
+            handle.clone(),
+            schedules,
+            ScheduleServices {
+                servers: Some(crate::servers::service::ServersService::new(
+                    db.clone(),
+                    config,
+                    handle,
+                )),
+                db: Some(db),
+                ..Default::default()
+            },
+        );
+        let crate::SchedulerCommand::RebuildNntp { reply, .. } = received.recv().await.unwrap()
+        else {
+            panic!("expected server runtime rebuild");
+        };
+        tokio::select! {
+            biased;
+            _ = &mut ready => panic!("startup became ready before server hold activated"),
+            () = std::future::ready(()) => {}
+        }
+        reply
+            .send(Ok(NntpRuntimeActivation {
+                generation: 1,
+                configured_connections: 0,
+            }))
+            .unwrap();
+        ready.await.unwrap().unwrap();
+        task.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_server_activation_persists_and_only_rebuilds_nntp_generations() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = server(42);
+        db.insert_server(&provider).unwrap();
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let registry = Arc::new(
+            crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                db.clone(),
+                std::slice::from_ref(&provider),
+            )
+            .unwrap(),
+        );
+        let (commands, mut received) = mpsc::channel(2);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        handle.set_server_transfer_policy(registry);
+        let (generations, mut activations) = mpsc::channel(2);
+        let pipeline = tokio::spawn(async move {
+            let mut generation = 0;
+            while let Some(command) = received.recv().await {
+                match command {
+                    crate::SchedulerCommand::RebuildNntp {
+                        total_connections,
+                        reply,
+                        ..
+                    } => {
+                        generation += 1;
+                        let activation = NntpRuntimeActivation {
+                            generation,
+                            configured_connections: total_connections,
+                        };
+                        generations
+                            .send((generation, total_connections))
+                            .await
+                            .unwrap();
+                        reply.send(Ok(activation)).unwrap();
+                    }
+                    _ => panic!(
+                        "a server toggle must not alter download, speed, profile or quota tracks"
+                    ),
+                }
+            }
+        });
+        let service =
+            crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+        service.set_active(42, false).await.unwrap();
+        assert_eq!(activations.recv().await.unwrap(), (1, 0));
+        assert!(!db.load_config().unwrap().servers[0].active);
+        service.set_active(42, true).await.unwrap();
+        assert_eq!(activations.recv().await.unwrap(), (2, 2));
+        assert!(db.load_config().unwrap().servers[0].active);
+        assert!(config.read().await.servers[0].active);
+        service.set_active(42, true).await.unwrap();
+        assert!(
+            activations.try_recv().is_err(),
+            "an unchanged active state must not rebuild"
+        );
+        config.write().await.servers.clear();
+        assert!(service.set_active(42, false).await.is_err());
+        assert!(
+            db.load_config().unwrap().servers[0].active,
+            "missing runtime entry must not mutate persistence"
+        );
+        assert!(service.set_active(999, true).await.is_err());
+        drop(service);
+        pipeline.await.unwrap();
+    }
+
+    #[test]
+    fn deleting_server_removes_only_its_schedules() {
+        use crate::bandwidth::{ScheduleAction, ScheduleEntry};
+        let db = Database::open_in_memory().unwrap();
+        for id in [42, 43] {
+            db.insert_server(&server(id)).unwrap();
+        }
+        let rules: Vec<_> = [42, 43]
+            .into_iter()
+            .map(|server_id| ScheduleEntry {
+                id: format!("provider-{server_id}"),
+                enabled: true,
+                label: String::new(),
+                days: vec![],
+                time: "08:00".into(),
+                times: vec![],
+                every_hour_at_minute: None,
+                action: ScheduleAction::SetServerActive {
+                    server_id,
+                    active: false,
+                },
+            })
+            .collect();
+        db.save_schedules(&rules).unwrap();
+        assert!(db.delete_server(42).unwrap());
+        assert_eq!(db.list_schedules().unwrap(), rules[1..]);
+        assert_eq!(db.load_config().unwrap().servers[0].id, 43);
+        assert!(db.save_schedules(&rules).is_err());
+        assert_eq!(db.list_schedules().unwrap(), rules[1..]);
+    }
 }

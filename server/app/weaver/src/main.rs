@@ -125,6 +125,8 @@ async fn async_main() {
     let Cli {
         log_file: log_file_override,
         log_format: log_format_override,
+        skip_upgrade_backup,
+        reset_automatic_backup_settings,
         command,
         ..
     } = cli;
@@ -271,6 +273,32 @@ async fn async_main() {
         )),
         _ => None,
     };
+    if matches!(&command, Command::Serve { .. }) {
+        if reset_automatic_backup_settings
+            && let Err(error) =
+                weaver_server_core::operations::backup::reset_automatic_backup_settings(
+                    &config_path,
+                )
+                .await
+        {
+            error!("failed to reset automatic-backup settings before startup: {error}");
+            std::process::exit(1);
+        }
+        let backup_result = if skip_upgrade_backup {
+            tracing::warn!(
+                "operator skipped the pre-migration backup; this startup has no new rollback copy"
+            );
+            weaver_server_core::operations::backup::skip_upgrade_backup(&config_path).await
+        } else {
+            weaver_server_core::operations::backup::prepare_upgrade_backup(&config_path).await
+        };
+        if let Err(error) = backup_result {
+            error!(
+                "pre-migration backup preparation failed; database migration has not started: {error}. Repair backup storage or use --skip-upgrade-backup to explicitly accept starting without a rollback copy"
+            );
+            std::process::exit(1);
+        }
+    }
     let db = match bootstrap::open_database(&config_path) {
         Ok(db) => db,
         Err(error) => {

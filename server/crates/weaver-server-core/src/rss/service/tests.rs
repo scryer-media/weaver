@@ -23,6 +23,61 @@ use crate::security::RuntimeSecurityConfig;
 use crate::settings::Config;
 use crate::{JobSpec, PipelineMetrics, SchedulerCommand, SharedPipelineState};
 
+#[tokio::test]
+async fn scheduled_rss_cancellation_releases_network_wait_and_sync_lock() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let hold = Arc::new(FeedHold::default());
+    let state = TestHttpState {
+        feed_body: sample_rss_feed("cancelled", "Held feed", "/download.nzb"),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: Some(hold.clone()),
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server) = start_test_server(state).await;
+    db.insert_rss_feed(&RssFeedRow {
+        id: 1,
+        name: "Held feed".into(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 60,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
+    let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
+    let cancellation = crate::bandwidth::schedule::ScheduleCancellation::new();
+    let task = tokio::spawn({
+        let service = service.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            service
+                .run_scheduled_sync_cancellable(None, cancellation)
+                .await
+        }
+    });
+    hold.arrived.notified().await;
+    cancellation.cancel();
+    assert_eq!(task.await.unwrap().unwrap().feeds_polled, 0);
+    assert!(service.inner.sync_lock.try_lock().is_ok());
+    assert_eq!(db.get_rss_feed(1).unwrap().unwrap().last_polled_at, None);
+    hold.release.notify_one();
+    server.abort();
+}
+
 #[derive(Clone)]
 struct TestHttpState {
     feed_body: String,
@@ -877,4 +932,64 @@ fn sample_nzb_bytes() -> Vec<u8> {
           </file>
         </nzb>"#
         .to_vec()
+}
+
+#[tokio::test]
+async fn pause_all_holds_scheduled_and_regular_rss_but_not_manual_fetch() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open(&temp.path().join("state.db")).unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let state = TestHttpState {
+        feed_body: "<rss version=\"2.0\"><channel><title>Empty</title></channel></rss>".into(),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: requests.clone(),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server) = start_test_server(state).await;
+    db.insert_rss_feed(&RssFeedRow {
+        id: 1,
+        name: "Scheduled feed".into(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 60,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
+    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+    service.set_scheduled_paused(true);
+    assert_eq!(
+        service
+            .run_scheduled_sync(Some(1))
+            .await
+            .unwrap()
+            .feeds_polled,
+        0
+    );
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(service.run_feed_sync(1).await.unwrap().feeds_polled, 1);
+    service.set_scheduled_paused(false);
+    assert_eq!(
+        service.run_scheduled_sync(None).await.unwrap().feeds_polled,
+        1
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    server.abort();
 }

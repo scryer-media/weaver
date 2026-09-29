@@ -32,14 +32,18 @@ import {
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "@/next/data/hardware-profiles";
+import { SCHEDULE_TRACKS, type ScheduleTrack } from "@/next/data/schedule-tracks";
+import { ScheduleOptionsFields, useScheduleTargets } from "@/next/components/ScheduleOptionsFields";
+import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleTimeLabel, type ScheduleOptions } from "@/next/data/schedule-options";
 
-type Schedule = {
+type Schedule = ScheduleOptions & {
   id: string;
   enabled: boolean;
   label: string;
   days: string[];
   time: string;
   actionType: string;
+  track: ScheduleTrack;
   speedLimitBytes: number | null;
   hardwareProfile: HardwareProfileName | null;
 };
@@ -57,6 +61,7 @@ const DAY_LABELS: Record<string, string> = {
 
 export function ScheduleSettingsPage() {
   const t = useTranslate();
+  const targets = useScheduleTargets();
   const [result, reexecute] = useQuery({ query: SCHEDULES_QUERY });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
@@ -67,6 +72,8 @@ export function ScheduleSettingsPage() {
   });
 
   const [showForm, setShowForm] = useState(false);
+  const [options, setOptions] = useState(NEW_SCHEDULE_OPTIONS);
+  const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [formEnabled, setFormEnabled] = useState(true);
   const [formTime, setFormTime] = useState("08:00");
@@ -92,6 +99,8 @@ export function ScheduleSettingsPage() {
         null;
 
   const resetForm = () => {
+    setOptions(NEW_SCHEDULE_OPTIONS);
+    setError(null);
     setShowForm(false);
     setEditingId(null);
     setFormEnabled(true);
@@ -110,6 +119,8 @@ export function ScheduleSettingsPage() {
   };
 
   const openEdit = (entry: Schedule) => {
+    setOptions(optionsFromSchedule(entry));
+    setError(null);
     setEditingId(entry.id);
     setFormEnabled(entry.enabled);
     setFormTime(entry.time);
@@ -139,6 +150,7 @@ export function ScheduleSettingsPage() {
       days: formDays.length > 0 ? formDays : null,
       label: formLabel || null,
       enabled: formEnabled,
+      ...optionsInput(options, formAction),
     };
     if (formAction === "speed_limit") {
       input.speedLimitBytes = formSpeedUnlimited ? 0 : parseFloat(formSpeed) * 1024 * 1024;
@@ -151,11 +163,8 @@ export function ScheduleSettingsPage() {
 
   const handleSave = async () => {
     const input = buildInput();
-    if (editingId) {
-      await updateSchedule({ id: editingId, input });
-    } else {
-      await createSchedule({ input });
-    }
+    const result = editingId ? await updateSchedule({ id: editingId, input }) : await createSchedule({ input });
+    if (result.error) { setError(result.error.message); return; }
     reexecute({ requestPolicy: "network-only" });
     resetForm();
   };
@@ -216,6 +225,7 @@ export function ScheduleSettingsPage() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
+                      {ADDITIONAL_SCHEDULE_ACTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}
                       <SelectItem value="pause">{t("schedule.actionPause")}</SelectItem>
                       <SelectItem value="resume">{t("schedule.actionResume")}</SelectItem>
                       <SelectItem value="speed_limit">{t("schedule.actionSpeedLimit")}</SelectItem>
@@ -228,11 +238,16 @@ export function ScheduleSettingsPage() {
                       <SelectItem value="hardware_profile">
                         {t("schedule.actionHardwareProfile")}
                       </SelectItem>
+                      <SelectItem value="configured_speed_limit">
+                        {t("next.schedules.useConfiguredLimit")}
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
               </div>
 
+              {error && <p role="alert">{error}</p>}
+              <ScheduleOptionsFields action={formAction} value={options} onChange={setOptions} />
               {formAction === "speed_limit" && (
                 <div className="space-y-2">
                   <Label className="text-sm font-semibold">{t("schedule.speedLimit")}</Label>
@@ -340,7 +355,11 @@ export function ScheduleSettingsPage() {
             />
           )}
 
-          {schedules.map((entry) => (
+          {SCHEDULE_TRACKS.filter((track) => schedules.some((entry) => entry.track === track.value)).map((track) => (
+            <section key={track.value} aria-label={t(track.label)} className="space-y-4">
+              <h3 className="text-sm font-semibold">{t(track.label)}</h3>
+              <p className="text-xs text-muted-foreground">{t("next.schedules.trackHelp")}</p>
+              {schedules.filter((entry) => entry.track === track.value).map((entry) => (
             <div
               key={entry.id}
               role="group"
@@ -360,10 +379,12 @@ export function ScheduleSettingsPage() {
                 </span>
                 <div>
                   <div className="flex items-center gap-2 text-sm font-semibold">
-                    <span className="font-mono">{entry.time}</span>
+                    <span className="font-mono">{scheduleTimeLabel(entry)}</span>
                     <span className="capitalize">
-                      {entry.actionType === "speed_limit"
+                      {scheduleActionDetails(t, entry, targets) ?? (entry.actionType === "speed_limit"
                         ? `${t("schedule.actionSpeedLimit")}: ${entry.speedLimitBytes === 0 || entry.speedLimitBytes == null ? t("settings.unlimited") : formatSpeed(entry.speedLimitBytes)}`
+                        : entry.actionType === "configured_speed_limit"
+                          ? t("next.schedules.useConfiguredLimit")
                         : entry.actionType === "pause"
                           ? t("schedule.actionPause")
                           : entry.actionType === "resume"
@@ -372,7 +393,8 @@ export function ScheduleSettingsPage() {
                               ? t("schedule.actionPauseWatchFolder")
                               : entry.actionType === "hardware_profile"
                                 ? `${t("schedule.actionHardwareProfile")}: ${entry.hardwareProfile ? profileName(t, entry.hardwareProfile) : ""}`
-                                : t("schedule.actionResumeWatchFolder")}
+                                : entry.actionType === "resume_watch_folder_scanning" ? t("schedule.actionResumeWatchFolder")
+                                : t(ADDITIONAL_SCHEDULE_ACTIONS.find((option) => option.value === entry.actionType)?.label ?? entry.actionType))}
                     </span>
                   </div>
                   <div className="mt-1 text-xs text-muted-foreground">
@@ -409,6 +431,8 @@ export function ScheduleSettingsPage() {
                 </Button>
               </div>
             </div>
+              ))}
+            </section>
           ))}
         </div>
       </SectionCard>

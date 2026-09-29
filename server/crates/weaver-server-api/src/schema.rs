@@ -50,6 +50,7 @@ pub struct JobsSnapshot {
 
 #[derive(Default, MergedObject)]
 pub struct QueryRoot(
+    crate::backup::BackupQuery,
     crate::proxies::ProxiesQuery,
     auth_query::AuthQuery,
     categories_query::CategoriesQuery,
@@ -77,6 +78,7 @@ struct ConnectivityMutations(
 
 #[derive(Default, MergedObject)]
 struct ApplicationMutations(
+    crate::backup::BackupMutation,
     categories_mutation::CategoriesMutation,
     jobs_mutation::JobsMutation,
     post_processing_mutation::PostProcessingMutation,

@@ -924,6 +924,10 @@ impl Pipeline {
         total_len: Option<u64>,
         format: ChaseFormat,
     ) {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return;
+        }
         if self.direct_unpack.repairing_jobs.contains(&job_id) {
             return;
         }

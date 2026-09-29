@@ -2397,6 +2397,27 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
     pipeline.jobs.insert(job_id, state);
     pipeline.job_order.push(job_id);
 
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(crate::pipeline::SchedulerCommand::PausePostProcessing { reply })
+        .await;
+    received.await.unwrap();
+    assert_eq!(
+        pipeline
+            .maybe_start_nested_extraction(job_id)
+            .await
+            .unwrap(),
+        crate::pipeline::completion::NestedExtractionDecision::Deferred
+    );
+    assert_eq!(pipeline.jobs[&job_id].extraction_depth, 0);
+    assert!(!pipeline.inflight_extractions.contains_key(&job_id));
+    assert!(staging_dir.join("release.nfo.xz").exists());
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(crate::pipeline::SchedulerCommand::ResumePostProcessing { reply })
+        .await;
+    received.await.unwrap();
+
     assert!(matches!(
         pipeline
             .maybe_start_nested_extraction(job_id)

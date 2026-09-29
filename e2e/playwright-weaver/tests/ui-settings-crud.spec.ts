@@ -172,17 +172,20 @@ test("category create, edit, persistence, and delete are browser-owned", async (
 
 test("schedule rules support create, toggle, edit, and delete", async ({ cleanPage: page }) => {
   await page.goto("/settings/schedules");
+  for (const group of ["Downloads", "Watch folder", "Speed limit", "Hardware profile"]) {
+    await expect(page.getByRole("region", { name: group, exact: true })).toBeVisible();
+  }
   const removeSchedule = async (label: string) => {
-    await tableRow(page, "Schedules", label).click();
+    await tableRow(page, "Downloads", label).click();
     await page
       .getByRole("dialog", { name: label, exact: true })
       .getByRole("button", { name: "Remove schedule", exact: true })
       .click();
     await confirmRemoval(page, "Remove schedule");
-    await expect(tableRow(page, "Schedules", label)).toHaveCount(0);
+    await expect(tableRow(page, "Downloads", label)).toHaveCount(0);
   };
   if (afterRestart) {
-    const persistedRule = tableRow(page, "Schedules", persistedSchedule);
+    const persistedRule = tableRow(page, "Downloads", persistedSchedule);
     await expect(persistedRule.getByRole("switch", { name: "04:30 schedule enabled", exact: true })).not.toBeChecked();
     await removeSchedule(persistedSchedule);
     return;
@@ -193,15 +196,14 @@ test("schedule rules support create, toggle, edit, and delete", async ({ cleanPa
     const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
     await form.getByLabel("Time", { exact: true }).fill(time);
     await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
+    await form.getByRole("switch", { name: "Enabled", exact: true }).click();
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await expect(form).toBeHidden();
-    return tableRow(page, "Schedules", label);
+    return tableRow(page, "Downloads", label);
   };
 
   let rule = await addSchedule("03:15", "e2e-off-peak");
-  const enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
-  await expect(enabled).toBeChecked();
-  await enabled.click();
+  let enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
   await expect(enabled).not.toBeChecked();
   await page.reload();
   await expect(enabled).not.toBeChecked();
@@ -209,16 +211,70 @@ test("schedule rules support create, toggle, edit, and delete", async ({ cleanPa
   await rule.click();
   const form = page.getByRole("dialog", { name: "e2e-off-peak", exact: true });
   await form.getByRole("textbox", { name: "Label", exact: true }).fill("e2e-off-peak-edited");
+  // Exercise the editor toggle without publishing an enabled hold to this
+  // shared instance, where either pause or resume affects other scenarios.
+  const draftEnabled = form.getByRole("switch", { name: "Enabled", exact: true });
+  await draftEnabled.click();
+  await expect(draftEnabled).toBeChecked();
+  await draftEnabled.click();
+  await expect(draftEnabled).not.toBeChecked();
   await form.getByRole("button", { name: "Save", exact: true }).click();
   await expect(form).toBeHidden();
-  rule = tableRow(page, "Schedules", "e2e-off-peak-edited");
+  rule = tableRow(page, "Downloads", "e2e-off-peak-edited");
   await expect(rule).toBeVisible();
+  enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
+  await expect(enabled).not.toBeChecked();
   await removeSchedule("e2e-off-peak-edited");
 
   rule = await addSchedule("04:30", persistedSchedule);
   const persistedEnabled = rule.getByRole("switch", { name: "04:30 schedule enabled", exact: true });
-  await persistedEnabled.click();
   await expect(persistedEnabled).not.toBeChecked();
+});
+
+test("new schedule actions stay disabled and appear on their own tracks", async ({ cleanPage: page }) => {
+  test.skip(afterRestart, "temporary rules are removed before restart");
+  await page.goto("/settings/schedules");
+  const cases = [
+    ["Pause all intake", "Downloads"],
+    ["Pause post-processing", "Post-processing"],
+    ["Resume post-processing", "Post-processing"],
+    ["Set server availability", "Servers"],
+    ["Set quota metering", "Quota metering"],
+    ["Scan watch folder", "One-shot actions"],
+    ["Fetch RSS", "One-shot actions"],
+    ["Prune history", "One-shot actions"],
+  ];
+  for (const [action, track] of cases) {
+    const label = `e2e-disabled-${action}`;
+    await page.getByRole("banner").getByRole("button", { name: "Add schedule", exact: true }).click();
+    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
+    await form.getByRole("switch", { name: "Enabled", exact: true }).click();
+    await form.getByRole("button", { name: "Action", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: action, exact: true }).click();
+    if (action === "Set server availability") await form.getByRole("combobox", { name: "Server", exact: true }).selectOption({ label: "nntp" });
+    if (action === "Prune history") await form.getByRole("checkbox", { name: "Completed", exact: true }).check();
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(form).toBeHidden();
+    let row = tableRow(page, track, label);
+    await expect(row).toBeVisible();
+    await expect(row.getByRole("switch")).not.toBeChecked();
+    await row.click();
+    const edit = page.getByRole("dialog", { name: label, exact: true });
+    await edit.getByRole("textbox", { name: "Label", exact: true }).fill(`${label}-edited`);
+    // Toggle only the draft, and save disabled so no hold reaches the shared instance.
+    await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
+    await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
+    await edit.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(edit).toBeHidden();
+    await page.reload();
+    row = tableRow(page, track, `${label}-edited`);
+    await expect(row.getByRole("switch")).not.toBeChecked();
+    await row.click();
+    await page.getByRole("dialog", { name: `${label}-edited`, exact: true }).getByRole("button", { name: "Remove schedule", exact: true }).click();
+    await confirmRemoval(page, "Remove schedule");
+    await expect(row).toHaveCount(0);
+  }
 });
 
 const profileNames: Record<string, string> = {

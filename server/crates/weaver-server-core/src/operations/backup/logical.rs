@@ -95,12 +95,14 @@ impl Database {
                     .sqlite_path()?
                     .ok_or_else(|| StateError::Database("SQLite backup has no path".into()))?;
                 self.run_sql_blocking_local(move || async move {
-                    export_sqlite(&path, &tables_dir).await
+                    export_sqlite(&path, &tables_dir, false).await
                 })?
             }
             StoreDatastore::Postgres { pool } => {
                 let tables_dir = tables_dir.clone();
-                self.run_sql_blocking_read(async move { export_postgres(pool, &tables_dir).await })?
+                self.run_sql_blocking_read(async move {
+                    export_postgres(pool, &tables_dir, false).await
+                })?
             }
         };
         Ok(LogicalBackupExport {
@@ -194,6 +196,7 @@ impl Database {
 async fn export_sqlite(
     database_path: &Path,
     tables_dir: &Path,
+    allow_older_catalog: bool,
 ) -> Result<BTreeMap<String, TablePartMetadata>, StateError> {
     let options = SqliteConnectOptions::new()
         .filename(database_path)
@@ -204,7 +207,7 @@ async fn export_sqlite(
     let mut conn = sqlx::SqliteConnection::connect_with(&options)
         .await
         .map_err(db_err)?;
-    let actual = validate_sqlite_catalog(&mut conn).await?;
+    let actual = validate_sqlite_catalog_mode(&mut conn, allow_older_catalog).await?;
     sqlx::query("BEGIN")
         .execute(&mut conn)
         .await
@@ -231,9 +234,10 @@ async fn export_sqlite(
 async fn export_postgres(
     pool: sqlx::PgPool,
     tables_dir: &Path,
+    allow_older_catalog: bool,
 ) -> Result<BTreeMap<String, TablePartMetadata>, StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
-    let actual = validate_postgres_catalog(&mut conn).await?;
+    let actual = validate_postgres_catalog_mode(&mut conn, allow_older_catalog).await?;
     let mut tx = conn.begin().await.map_err(db_err)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
@@ -253,6 +257,13 @@ async fn export_postgres(
 async fn validate_sqlite_catalog(
     conn: &mut sqlx::SqliteConnection,
 ) -> Result<BTreeSet<String>, StateError> {
+    validate_sqlite_catalog_mode(conn, false).await
+}
+
+async fn validate_sqlite_catalog_mode(
+    conn: &mut sqlx::SqliteConnection,
+    allow_older_catalog: bool,
+) -> Result<BTreeSet<String>, StateError> {
     let rows = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .fetch_all(&mut *conn)
         .await
@@ -262,12 +273,19 @@ async fn validate_sqlite_catalog(
         .filter_map(|row| row.try_get::<String, _>("name").ok())
         .filter(|table| !is_engine_internal_table(table))
         .collect::<BTreeSet<_>>();
-    validate_actual_tables(&actual)?;
+    validate_actual_tables(&actual, allow_older_catalog)?;
     Ok(actual)
 }
 
 async fn validate_postgres_catalog(
     conn: &mut sqlx::PgConnection,
+) -> Result<BTreeSet<String>, StateError> {
+    validate_postgres_catalog_mode(conn, false).await
+}
+
+async fn validate_postgres_catalog_mode(
+    conn: &mut sqlx::PgConnection,
+    allow_older_catalog: bool,
 ) -> Result<BTreeSet<String>, StateError> {
     let rows = sqlx::query(
         "SELECT table_name
@@ -283,11 +301,14 @@ async fn validate_postgres_catalog(
         .into_iter()
         .filter_map(|row| row.try_get::<String, _>("table_name").ok())
         .collect::<BTreeSet<_>>();
-    validate_actual_tables(&actual)?;
+    validate_actual_tables(&actual, allow_older_catalog)?;
     Ok(actual)
 }
 
-fn validate_actual_tables(actual: &BTreeSet<String>) -> Result<(), StateError> {
+fn validate_actual_tables(
+    actual: &BTreeSet<String>,
+    allow_older_catalog: bool,
+) -> Result<(), StateError> {
     let classified = BACKUP_TABLE_CATALOG
         .iter()
         .map(|entry| entry.table.to_string())
@@ -303,7 +324,7 @@ fn validate_actual_tables(actual: &BTreeSet<String>) -> Result<(), StateError> {
         .filter(|table| !is_optional_catalog_table(table))
         .cloned()
         .collect::<Vec<_>>();
-    if unclassified.is_empty() && nonexistent.is_empty() {
+    if unclassified.is_empty() && (allow_older_catalog || nonexistent.is_empty()) {
         Ok(())
     } else {
         Err(StateError::Database(format!(
@@ -1482,6 +1503,64 @@ pub(crate) async fn validate_legacy_encryption_key(
         }
     }
     Ok(())
+}
+
+/// Export an existing schema before opening the application database or running migrations.
+pub(super) async fn export_before_migrations(
+    target: &crate::persistence::database_target::DatabaseTarget,
+) -> Result<LogicalBackupExport, StateError> {
+    use crate::persistence::database_target::DatabaseTarget;
+    let staging = super::create_backup_temp_dir().map_err(db_err)?;
+    let tables_dir = staging.path().join("tables");
+    std::fs::create_dir_all(&tables_dir).map_err(db_err)?;
+    let (source_engine, schema_version, tables) = match target {
+        DatabaseTarget::PostgresUrl(url) => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(url)
+                .await
+                .map_err(db_err)?;
+            let result = async {
+                let version = sqlx::query_scalar::<_, i64>("SELECT version FROM schema_version")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(db_err)?;
+                let tables = export_postgres(pool.clone(), &tables_dir, true).await?;
+                Ok::<_, StateError>(("postgres", version, tables))
+            }
+            .await;
+            pool.close().await;
+            result?
+        }
+        target => {
+            let path = target
+                .sqlite_path()?
+                .ok_or_else(|| StateError::Database("SQLite backup has no path".into()))?;
+            let options = SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true)
+                .create_if_missing(false);
+            let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .map_err(db_err)?;
+            let version = sqlx::query_scalar::<_, i64>("SELECT version FROM schema_version")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(db_err)?;
+            connection.close().await.map_err(db_err)?;
+            (
+                "sqlite",
+                version,
+                export_sqlite(&path, &tables_dir, true).await?,
+            )
+        }
+    };
+    Ok(LogicalBackupExport {
+        staging,
+        source_engine: source_engine.into(),
+        schema_version,
+        tables,
+    })
 }
 
 #[cfg(test)]

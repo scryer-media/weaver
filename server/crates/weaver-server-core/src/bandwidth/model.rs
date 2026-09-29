@@ -14,6 +14,10 @@ pub struct ScheduleEntry {
     pub days: Vec<Weekday>,
     /// Time of day (HH:MM, 24-hour, local time).
     pub time: String,
+    #[serde(default)]
+    pub times: Vec<String>,
+    #[serde(default)]
+    pub every_hour_at_minute: Option<u8>,
     pub action: ScheduleAction,
 }
 
@@ -23,21 +27,90 @@ pub struct ScheduleEntry {
 pub enum ScheduleAction {
     Pause,
     Resume,
+    PauseAll,
+    PausePostProcessing,
+    ResumePostProcessing,
     PauseWatchFolderScanning,
     ResumeWatchFolderScanning,
     SpeedLimit {
         /// Bytes per second. 0 = unlimited.
         bytes_per_sec: u64,
     },
+    /// End the scheduled override and follow the operator's configured limit.
+    ConfiguredSpeedLimit,
     /// Put a hardware profile in force until the next profile rule fires.
     /// Profile rules are evaluated apart from every other action: one never
     /// ends a scheduled pause or speed limit, and neither of those ends it.
     HardwareProfile {
         profile: crate::runtime::HardwareProfile,
     },
+    SetServerActive {
+        server_id: u32,
+        active: bool,
+    },
+    SetQuotaMetering {
+        enabled: bool,
+    },
+    ScanWatchFolder,
+    FetchRss {
+        feed_id: Option<u32>,
+    },
+    PruneHistory {
+        failed: Option<PruneFiles>,
+        completed: Option<PruneFiles>,
+        cancelled: Option<PruneFiles>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneFiles {
+    pub delete_files: bool,
+}
+
+/// Independent held state. Removing its last rule leaves the last applied state
+/// in place until the operator or another rule changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScheduleTrack {
+    Downloads,
+    PostProcessing,
+    WatchFolder,
+    Rss,
+    Speed,
+    Profile,
+    Quota,
+    Server(u32),
 }
 
 impl ScheduleAction {
+    pub const fn track(&self) -> Option<ScheduleTrack> {
+        Some(match self {
+            Self::Pause | Self::Resume | Self::PauseAll => ScheduleTrack::Downloads,
+            Self::PausePostProcessing | Self::ResumePostProcessing => ScheduleTrack::PostProcessing,
+            Self::PauseWatchFolderScanning | Self::ResumeWatchFolderScanning => {
+                ScheduleTrack::WatchFolder
+            }
+            Self::SpeedLimit { .. } | Self::ConfiguredSpeedLimit => ScheduleTrack::Speed,
+            Self::HardwareProfile { .. } => ScheduleTrack::Profile,
+            Self::SetQuotaMetering { .. } => ScheduleTrack::Quota,
+            Self::SetServerActive { server_id, .. } => ScheduleTrack::Server(*server_id),
+            Self::ScanWatchFolder | Self::FetchRss { .. } | Self::PruneHistory { .. } => {
+                return None;
+            }
+        })
+    }
+
+    pub fn tracks(&self) -> Vec<ScheduleTrack> {
+        if matches!(self, Self::PauseAll | Self::Resume) {
+            vec![
+                ScheduleTrack::Downloads,
+                ScheduleTrack::WatchFolder,
+                ScheduleTrack::Rss,
+            ]
+        } else {
+            self.track().into_iter().collect()
+        }
+    }
+
     pub const fn is_hardware_profile(&self) -> bool {
         matches!(self, Self::HardwareProfile { .. })
     }

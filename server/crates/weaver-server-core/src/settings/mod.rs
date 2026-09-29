@@ -4,6 +4,7 @@ pub mod persistence;
 pub mod queries;
 pub mod record;
 pub mod repository;
+mod schedules;
 pub mod service;
 
 pub use model::{

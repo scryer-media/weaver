@@ -21,6 +21,7 @@ use crate::rss::RssService;
 use crate::{HistoryFilter, SchedulerHandle};
 
 mod archive;
+mod automatic;
 mod catalog;
 mod logical;
 mod manifest;
@@ -28,6 +29,9 @@ mod pending;
 mod permissions;
 mod restore;
 mod service;
+mod stored;
+mod upgrade;
+pub use upgrade::{prepare_upgrade_backup, reset_automatic_backup_settings, skip_upgrade_backup};
 
 pub use self::logical::TablePartMetadata;
 #[cfg(test)]
@@ -37,7 +41,11 @@ pub use self::manifest::{
     BackupStatus, CategoryRemapInput, CategoryRemapRequirement, RestoreOptions, RestoreReport,
 };
 pub use self::service::BackupService;
+pub use automatic::{AutoBackupSettings, AutoBackupSettingsInput, compute_next_auto_backup_run_at};
 pub use pending::{PendingRestoreOutcome, apply_pending_restore};
+pub use stored::{
+    BACKUP_EXECUTION_TIMEOUT, BackupArtifactStatus, BackupInfo, BackupSettings, BackupTrigger,
+};
 
 #[doc(hidden)]
 pub fn create_backup_temp_dir() -> Result<tempfile::TempDir, std::io::Error> {
@@ -912,6 +920,18 @@ impl Database {
                             } else {
                                 "NULL"
                             };
+                            let src_bandwidth_metered = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "bandwidth_usage_minute_buckets",
+                                "metered",
+                            )
+                            .await?
+                            {
+                                "metered"
+                            } else {
+                                "1"
+                            };
                             let src_has_server_download_usage = table_has_column(
                                 &mut conn,
                                 "src",
@@ -992,8 +1012,8 @@ impl Database {
                                      FROM src.job_history;
                                  INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                                      SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;
-                                 INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
-                                     SELECT bucket_epoch_minute, payload_bytes FROM src.bandwidth_usage_minute_buckets;
+                                 INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, metered, payload_bytes)
+                                     SELECT bucket_epoch_minute, {src_bandwidth_metered}, payload_bytes FROM src.bandwidth_usage_minute_buckets;
                                  INSERT INTO rss_feeds
                                      (id, name, url, enabled, poll_interval_secs, username, password, default_category, default_metadata, etag, last_modified, last_polled_at, last_success_at, last_error, consecutive_failures)
                                      SELECT id, name, url, enabled, poll_interval_secs, username, password, default_category, default_metadata, etag, last_modified, last_polled_at, last_success_at, last_error, consecutive_failures

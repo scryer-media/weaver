@@ -618,6 +618,7 @@ pub(crate) struct WorkDone {
 /// when many jobs arrive together. Retired tickets hold capacity until their
 /// cancelled workers return; recreating a job cannot evade that bound.
 pub(in crate::pipeline) struct Coordinator {
+    pub(in crate::pipeline) admission_paused: bool,
     jobs: BTreeMap<JobId, JobSlot>,
     in_flight: BTreeMap<u64, (JobId, CancellationToken)>,
     worker_allowances: BTreeMap<u64, usize>,
@@ -847,6 +848,7 @@ impl Coordinator {
     ) -> Self {
         Self {
             jobs: BTreeMap::new(),
+            admission_paused: false,
             in_flight: BTreeMap::new(),
             worker_allowances: BTreeMap::new(),
             contended: std::collections::BTreeSet::new(),
@@ -1905,7 +1907,10 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn dispatch(&mut self) -> EngineResult<()> {
+    pub(in crate::pipeline) fn dispatch(&mut self) -> EngineResult<()> {
+        if self.admission_paused {
+            return Ok(());
+        }
         for _ in 0..2 {
             self.dispatch_one()?;
         }

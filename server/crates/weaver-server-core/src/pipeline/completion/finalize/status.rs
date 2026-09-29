@@ -739,6 +739,10 @@ impl Pipeline {
     }
 
     fn start_repair_phase(&mut self, job_id: JobId) -> bool {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return false;
+        }
         let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
             return false;
         };
@@ -773,6 +777,10 @@ impl Pipeline {
     }
 
     pub(crate) async fn maybe_start_extraction(&mut self, job_id: JobId) -> bool {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return false;
+        }
         let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
             return false;
         };
@@ -810,6 +818,9 @@ impl Pipeline {
     }
 
     pub(crate) fn promote_queued_repairs(&mut self) {
+        if self.shared_state.is_post_processing_paused() {
+            return;
+        }
         let Some(job_id) = self.next_queued_repair_job() else {
             return;
         };
@@ -819,6 +830,9 @@ impl Pipeline {
     }
 
     pub(crate) fn promote_queued_extractions(&mut self) {
+        if self.shared_state.is_post_processing_paused() {
+            return;
+        }
         let available = self
             .tuner
             .max_concurrent_extractions()

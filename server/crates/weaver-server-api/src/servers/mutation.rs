@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::LazyLock;
 
 use async_graphql::{Context, Object, Result};
 use base64::Engine;
@@ -16,8 +15,7 @@ use weaver_server_core::servers::{ServerConnectivityResult, ServerTlsDiagnostics
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{Database, SchedulerHandle};
 
-static SERVER_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+use weaver_server_core::servers::service::SERVER_MUTATION_GUARD;
 
 #[derive(Default)]
 pub(crate) struct ServersMutation;
@@ -244,6 +242,13 @@ impl ServersMutation {
             .await?;
         }
 
+        // Serialize schedule persistence and publication with schedule CRUD, so
+        // an earlier save cannot republish rules for this deleted server.
+        let mut schedules_guard =
+            match ctx.data_opt::<weaver_server_core::bandwidth::schedule::SharedSchedules>() {
+                Some(schedules) => Some(schedules.write().await),
+                None => None,
+            };
         {
             let db = db.clone();
             let deleted = spawn_blocking_db("servers.mutation.remove_server.persist", move || {
@@ -254,6 +259,12 @@ impl ServersMutation {
                 return Err(async_graphql::Error::new(format!("server {id} not found")));
             }
         }
+
+        if let Some(schedules) = schedules_guard.as_mut() {
+            schedules.retain(|entry| !matches!(entry.action,
+                weaver_server_core::bandwidth::ScheduleAction::SetServerActive { server_id, .. } if server_id == id));
+        }
+        drop(schedules_guard);
 
         let remaining =
             with_timed_config_write(config, "servers.mutation.remove_server.apply", move |cfg| {

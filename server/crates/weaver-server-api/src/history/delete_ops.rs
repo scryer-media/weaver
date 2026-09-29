@@ -39,11 +39,12 @@ pub(crate) struct HistoryDeleteManager {
 
 impl HistoryDeleteManager {
     pub(crate) fn new(db: Database, handle: SchedulerHandle, replay: QueueEventReplay) -> Self {
+        let wake = db.history_delete_notification();
         Self {
             db,
             handle,
             replay,
-            wake: Arc::new(Notify::new()),
+            wake,
         }
     }
 
@@ -72,7 +73,7 @@ impl HistoryDeleteManager {
                 let db = self.db.clone();
                 let ids_for_insert = ids.clone();
                 let operation_id = tokio::task::spawn_blocking(move || {
-                    db.insert_history_delete_operation(
+                    db.accept_history_delete_ids(
                         &ids_for_insert,
                         input.delete_files,
                         file_delete_authorized,
@@ -91,10 +92,7 @@ impl HistoryDeleteManager {
             AcceptHistoryDeleteMode::AllHistory => {
                 let db = self.db.clone();
                 let (operation_id, ids) = tokio::task::spawn_blocking(move || {
-                    db.insert_all_history_delete_operation(
-                        input.delete_files,
-                        file_delete_authorized,
-                    )
+                    db.accept_all_history_delete(input.delete_files, file_delete_authorized)
                 })
                 .await
                 .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -526,5 +524,67 @@ mod tests {
             weaver_server_core::AsyncOperationState::CompletedWithErrors,
             "an unanswered target must not leave the operation claimed"
         );
+    }
+    #[tokio::test]
+    async fn scheduled_pruning_uses_manual_worker_with_per_status_file_authority() {
+        use weaver_server_core::bandwidth::PruneFiles;
+        let db = Database::open_in_memory().unwrap();
+        for (id, status) in [
+            (1, "complete"),
+            (2, "failed"),
+            (3, "cancelled"),
+            (4, "failed"),
+        ] {
+            let mut row = history(id);
+            row.status = status.into();
+            db.insert_job_history(&row).unwrap();
+        }
+        let notification = db.history_delete_notification();
+        db.prune_history(
+            Some(PruneFiles { delete_files: true }),
+            Some(PruneFiles {
+                delete_files: false,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        notification.notified().await;
+        let (commands, mut received) = mpsc::channel(3);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        let worker_db = db.clone();
+        let pipeline = tokio::spawn(async move {
+            let mut removed = std::collections::BTreeMap::new();
+            for _ in 0..3 {
+                let weaver_server_core::SchedulerCommand::DeleteHistory {
+                    job_id,
+                    delete_files,
+                    reply,
+                } = received.recv().await.unwrap()
+                else {
+                    panic!("expected manual delete path");
+                };
+                removed.insert(job_id.0, delete_files);
+                worker_db.delete_job_history(job_id.0).unwrap();
+                reply.send(Ok(Default::default())).unwrap();
+            }
+            removed
+        });
+        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
+        while let Some(operation) = db.next_history_delete_operation().unwrap() {
+            assert_eq!(operation.file_delete_authorized, operation.delete_files);
+            manager.process_operation(operation).await.unwrap();
+        }
+        assert_eq!(
+            pipeline.await.unwrap(),
+            [(1, false), (2, true), (4, true)].into_iter().collect()
+        );
+        assert!(db.get_job_history(3).unwrap().is_some());
+        assert_eq!(db.list_history_delete_operations(false).unwrap().len(), 2);
     }
 }

@@ -3,6 +3,7 @@ import { CheckIcon, CopyIcon } from "lucide-react";
 import { useLocation } from "react-router";
 import { useMutation, useQuery } from "urql";
 import { authHeaders } from "@/graphql/client";
+import { createStoredBackup, useBackupAdminAction } from "@/next/pages/settings/panels/useBackupAdminAction";
 import {
   API_KEYS_QUERY,
   CREATE_API_KEY_MUTATION,
@@ -150,8 +151,10 @@ function deleteQueryParams(params: URLSearchParams, names: readonly string[]) {
 
 export function BackupRestoreSection({
   currentDataDir,
+  onBackupCreated,
 }: {
   currentDataDir: string;
+  onBackupCreated?: () => void;
 }) {
   const t = useTranslate();
   const [status, setStatus] = useState<BackupStatusResponse | null>(null);
@@ -161,6 +164,7 @@ export function BackupRestoreSection({
   const [backupBusy, setBackupBusy] = useState(false);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
   const [backupError, setBackupError] = useState<string | null>(null);
+  const createAction = useBackupAdminAction();
 
   const [restoreFile, setRestoreFile] = useState<File | null>(null);
   const [restorePassword, setRestorePassword] = useState("");
@@ -201,12 +205,21 @@ export function BackupRestoreSection({
     }
   };
 
-  const handleDownloadBackup = async () => {
+  const handleBackup = async (download: boolean) => {
+    if (!download) {
+      setBackupError(null); setBackupMessage(null);
+      await createAction.run(async () => {
+        await createStoredBackup(backupPassword, t);
+        setBackupMessage(t("next.backup.building"));
+        onBackupCreated?.();
+      });
+      return;
+    }
     setBackupBusy(true);
     setBackupError(null);
     setBackupMessage(null);
     try {
-      const response = await fetch(new URL("api/backup/export", document.baseURI).href, {
+      const response = await fetch(new URL(download ? "api/backup/export" : "api/backup/create", document.baseURI).href, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
@@ -216,8 +229,14 @@ export function BackupRestoreSection({
       if (!response.ok) {
         await throwJsonError(response);
       }
-      await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
-      setBackupMessage(t("settings.backupDownloadReady"));
+      if (download) {
+        await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
+        setBackupMessage(t("settings.backupDownloadReady"));
+      } else {
+        await response.json();
+        setBackupMessage(t("next.backup.building"));
+      }
+      onBackupCreated?.();
     } catch (error) {
       setBackupError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -337,6 +356,7 @@ export function BackupRestoreSection({
           <p className="mt-1 text-[12.5px] text-muted-foreground">
             {t("settings.backupExportDesc")}
           </p>
+          <p className="mt-1 text-[12.5px] text-muted-foreground">{t("next.backup.retainedExport")}</p>
           <div className="mt-4 space-y-1.5">
             <Label htmlFor="backup-export-password">{t("settings.backupPassword")}</Label>
             <Input
@@ -366,7 +386,7 @@ export function BackupRestoreSection({
           ) : null}
           <Button
             className="mt-3"
-            onClick={handleDownloadBackup}
+            onClick={() => void handleBackup(true)}
             disabled={
               backupBusy ||
               status?.busy ||
@@ -376,8 +396,12 @@ export function BackupRestoreSection({
           >
             {backupBusy ? t("settings.backupDownloading") : t("settings.backupDownload")}
           </Button>
+          <Button className="ml-2 mt-3" variant="outline" onClick={() => void handleBackup(false)} disabled={backupBusy || createAction.busy || !backupPassword.trim() || backupPasswordConfirm !== backupPassword}>
+            {t("next.backup.createStored")}
+          </Button>
           {backupMessage && <p className="mt-3 text-xs text-status-completed">{backupMessage}</p>}
-          {backupError && <p className="mt-3 text-xs text-destructive">{backupError}</p>}
+          {backupError || createAction.error ? <p role="alert" className="mt-3 text-xs text-destructive">{backupError ?? createAction.error}</p> : null}
+          {createAction.reauthentication}
         </SettingsInnerBox>
 
         <SettingsInnerBox>

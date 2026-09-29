@@ -466,6 +466,8 @@ impl Pipeline {
             direct_demotion_done_tx,
             direct_demotion_done_rx,
             inflight_moves: HashSet::new(),
+            deferred_moves: HashSet::new(),
+            deferred_post_processing: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),
             known_damaged_archive_sets: HashMap::new(),

@@ -1,18 +1,15 @@
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::{path::PathBuf, sync::Arc};
 
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{
-    ConnectInfo, Extension, FromRequestParts, Multipart,
+    ConnectInfo, Extension, FromRequestParts, Multipart, Path, Query,
     multipart::{Field, MultipartError},
 };
 use axum::http::{HeaderMap, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::net::SocketAddr;
-use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use weaver_server_api::{
@@ -34,21 +31,6 @@ pub(super) struct BackupHandlerState {
     backup: BackupService,
     session_token: Arc<String>,
     security: RuntimeSecurityConfig,
-}
-
-struct BackupArtifactReader {
-    file: tokio::fs::File,
-    _temp_dir: tempfile::TempDir,
-}
-
-impl AsyncRead for BackupArtifactReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_read(context, buffer)
-    }
 }
 
 impl<S> FromRequestParts<S> for BackupHandlerState
@@ -156,7 +138,7 @@ pub(super) async fn backup_export_handler(
     }
     match backup.create_backup(body.password).await {
         Ok(artifact) => {
-            let (filename, path, temp_dir) = artifact.into_parts();
+            let (filename, path) = artifact.into_parts();
             match tokio::fs::File::open(path).await {
                 Ok(file) => (
                     [
@@ -166,10 +148,7 @@ pub(super) async fn backup_export_handler(
                             format!("attachment; filename=\"{filename}\""),
                         ),
                     ],
-                    Body::from_stream(ReaderStream::new(BackupArtifactReader {
-                        file,
-                        _temp_dir: temp_dir,
-                    })),
+                    Body::from_stream(ReaderStream::new(file)),
                 )
                     .into_response(),
                 Err(error) => super::error_response(
@@ -178,6 +157,122 @@ pub(super) async fn backup_export_handler(
                 ),
             }
         }
+        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+    }
+}
+
+pub(super) async fn backup_create_handler(
+    Extension(backup): Extension<BackupService>,
+    Extension(auth): Extension<super::RequestAuthContext>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(body): Json<BackupExportRequest>,
+) -> Response {
+    if let Err(status) = super::auth::require_fresh_admin(
+        &auth,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
+        &headers,
+    )
+    .await
+    {
+        if status == StatusCode::PRECONDITION_REQUIRED {
+            return (
+                status,
+                Json(serde_json::json!({
+                    "error": "recent password verification required",
+                    "code": "REAUTH_REQUIRED",
+                })),
+            )
+                .into_response();
+        }
+        return status.into_response();
+    }
+    match backup.create_stored_backup(body.password).await {
+        Ok(info) => (StatusCode::ACCEPTED, Json(info)).into_response(),
+        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct BackupDownloadQuery {
+    token: Option<String>,
+}
+
+pub(super) async fn backup_download_handler(
+    Extension(backup): Extension<BackupService>,
+    Extension(auth): Extension<super::RequestAuthContext>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Path(filename): Path<String>,
+    Query(query): Query<BackupDownloadQuery>,
+) -> Response {
+    if let Err(status) = require_admin(
+        &auth.db,
+        &auth.auth_cache,
+        &auth.api_key_cache,
+        auth.session_token.0.as_str(),
+        &auth.security,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
+        &headers,
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    let token = headers
+        .get("x-weaver-backup-token")
+        .and_then(|value| value.to_str().ok())
+        .or(query.token.as_deref());
+    let Some(token) = token else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !backup.consume_download_token(&filename, token).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match backup.backup_artifact(&filename).await {
+        Ok(artifact) => {
+            let (filename, path) = artifact.into_parts();
+            match tokio::fs::File::open(path).await {
+                Ok(file) => (
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                        (
+                            header::CONTENT_DISPOSITION,
+                            format!("attachment; filename=\"{filename}\""),
+                        ),
+                        (header::CACHE_CONTROL, "no-store".into()),
+                    ],
+                    Body::from_stream(ReaderStream::new(file)),
+                )
+                    .into_response(),
+                Err(error) => {
+                    super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+                }
+            }
+        }
+        Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
+    }
+}
+
+pub(super) async fn backup_delete_handler(
+    Extension(backup): Extension<BackupService>,
+    Extension(auth): Extension<super::RequestAuthContext>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Path(filename): Path<String>,
+) -> Response {
+    if let Err(status) = super::auth::require_fresh_admin(
+        &auth,
+        peer.map(|Extension(ConnectInfo(peer))| peer),
+        &headers,
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    match backup.delete_backup(&filename).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
     }
 }

@@ -460,6 +460,10 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Result<NestedExtractionDecision, String> {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return Ok(NestedExtractionDecision::Deferred);
+        }
         let current_archive_sources: HashSet<String> = self
             .jobs
             .get(&job_id)

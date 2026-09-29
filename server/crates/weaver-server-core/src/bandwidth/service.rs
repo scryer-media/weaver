@@ -63,6 +63,7 @@ pub(crate) struct BandwidthCapRuntime {
     window: Option<BandwidthCapWindow>,
     used_bytes: u64,
     reserved_bytes: u64,
+    metering_suspended: bool,
     /// Dispatch was refused because the next reservation no longer fits the
     /// allowance. Conservative pre-reservation parks work before `used`
     /// reaches the limit, so the blocked presentation must not wait for
@@ -75,7 +76,7 @@ pub(crate) struct BandwidthCapRuntime {
     /// hour (DST transitions), and resolving one allocates and walks the tz
     /// database, which the per-article refresh must not pay.
     timezone_label: Option<(i64, String)>,
-    pending_usage_by_minute: BTreeMap<i64, u64>,
+    pending_usage_by_minute: BTreeMap<(i64, bool), u64>,
     pending_usage_bytes: u64,
     pending_usage_started_at: Option<Instant>,
 }
@@ -90,7 +91,12 @@ impl BandwidthCapRuntime {
     }
 
     pub(crate) fn cap_enabled(&self) -> bool {
-        self.policy.as_ref().is_some_and(|policy| policy.enabled)
+        !self.metering_suspended && self.policy.as_ref().is_some_and(|policy| policy.enabled)
+    }
+
+    pub(crate) fn set_metering_enabled(&mut self, enabled: bool) {
+        self.metering_suspended = !enabled;
+        self.parked_on_cap = false;
     }
 
     pub(crate) fn limit_bytes(&self) -> u64 {
@@ -137,7 +143,8 @@ impl BandwidthCapRuntime {
                 self.flush_pending_usage(db)?;
                 let start_minute = next_window.starts_at().timestamp().div_euclid(60);
                 let end_minute = next_window.ends_at().timestamp().div_euclid(60);
-                self.used_bytes = db.sum_bandwidth_usage_minutes(start_minute, end_minute)?;
+                self.used_bytes =
+                    db.sum_metered_bandwidth_usage_minutes(start_minute, end_minute)?;
                 self.window = Some(next_window);
                 self.reserved_bytes = 0;
                 self.parked_on_cap = false;
@@ -188,7 +195,9 @@ impl BandwidthCapRuntime {
         if let Some(window) = &self.window
             && window.contains_unix_seconds(now_secs)
         {
-            self.used_bytes = self.used_bytes.saturating_add(payload_bytes);
+            if !self.metering_suspended {
+                self.used_bytes = self.used_bytes.saturating_add(payload_bytes);
+            }
         } else {
             self.flush_pending_usage(db)?;
             self.update_for_now(db)?;
@@ -210,9 +219,9 @@ impl BandwidthCapRuntime {
         let entries = self
             .pending_usage_by_minute
             .iter()
-            .map(|(bucket, bytes)| (*bucket, *bytes))
+            .map(|((bucket, metered), bytes)| (*bucket, *metered, *bytes))
             .collect::<Vec<_>>();
-        db.add_bandwidth_usage_minutes(&entries)?;
+        db.add_metered_bandwidth_usage_minutes(&entries)?;
         self.pending_usage_by_minute.clear();
         self.pending_usage_bytes = 0;
         self.pending_usage_started_at = None;
@@ -225,7 +234,7 @@ impl BandwidthCapRuntime {
             self.pending_usage_started_at = Some(Instant::now());
         }
         self.pending_usage_by_minute
-            .entry(bucket_epoch_minute)
+            .entry((bucket_epoch_minute, !self.metering_suspended))
             .and_modify(|bytes| *bytes = bytes.saturating_add(payload_bytes))
             .or_insert(payload_bytes);
         self.pending_usage_bytes = self.pending_usage_bytes.saturating_add(payload_bytes);

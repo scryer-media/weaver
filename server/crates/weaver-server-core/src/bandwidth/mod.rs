@@ -9,4 +9,4 @@ pub mod schedule;
 pub mod service;
 
 pub use caps::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
-pub use model::{ScheduleAction, ScheduleEntry, Weekday};
+pub use model::{PruneFiles, ScheduleAction, ScheduleEntry, ScheduleTrack, Weekday};

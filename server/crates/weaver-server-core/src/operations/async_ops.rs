@@ -1037,6 +1037,40 @@ mod tests {
         assert!(recovered.file_delete_authorized);
     }
 
+    #[tokio::test]
+    async fn scheduled_prune_skips_locked_rows_and_accepts_both_file_policies() {
+        let db = Database::open_in_memory().unwrap();
+        for (id, status) in [
+            (10, "complete"),
+            (11, "complete"),
+            (12, "failed"),
+            (13, "cancelled"),
+        ] {
+            let mut row = history(id, 100);
+            row.status = status.into();
+            db.insert_job_history(&row).unwrap();
+        }
+        let existing = db
+            .insert_history_delete_operation(&[10], false, false)
+            .unwrap();
+        db.prune_history(
+            Some(crate::bandwidth::PruneFiles { delete_files: true }),
+            Some(crate::bandwidth::PruneFiles {
+                delete_files: false,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let states = db
+            .list_history_delete_row_states(&[10, 11, 12, 13])
+            .unwrap();
+        assert_eq!(states[&10].operation_id, existing);
+        assert!(!states[&11].delete_files);
+        assert!(states[&12].delete_files);
+        assert!(!states.contains_key(&13));
+    }
+
     #[test]
     fn insert_history_delete_operation_creates_targets_and_locked_states() {
         let db = Database::open_in_memory().unwrap();

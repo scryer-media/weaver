@@ -60,6 +60,7 @@ pub(crate) enum SimpleArchiveKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NestedExtractionDecision {
     Started,
+    Deferred,
     NoNestedArchives,
     PreserveOutputsAtDepthLimit,
 }
