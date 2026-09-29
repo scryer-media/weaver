@@ -329,6 +329,9 @@ pub(crate) struct ProcessMemoryBudget {
     /// Decoder bytes held by chases parked on input that has not arrived:
     /// what yields could release.
     parked: Arc<AtomicU64>,
+    /// Counts the releases of reserved memory, so a waiter woken for any
+    /// other reason can tell that nothing was released.
+    releases: Arc<AtomicU64>,
     /// The limit a lowered one replaced, while reservations made under it
     /// still exceed the new one; zero otherwise. Retained admissions fail
     /// outright instead of waiting, so without this a lowered limit would
@@ -351,6 +354,7 @@ impl ProcessMemoryBudget {
             waiting: Arc::new(AtomicU64::new(0)),
             yield_tickets: Arc::new(AtomicU64::new(0)),
             parked: Arc::new(AtomicU64::new(0)),
+            releases: Arc::new(AtomicU64::new(0)),
             lowered_from: Arc::new(AtomicU64::new(0)),
             idle: Arc::new(Mutex::new(AdmissionQueue::default())),
             released: Arc::new(Condvar::new()),
@@ -378,6 +382,7 @@ impl ProcessMemoryBudget {
             waiting: Arc::clone(&self.waiting),
             yield_tickets: Arc::clone(&self.yield_tickets),
             parked: Arc::clone(&self.parked),
+            releases: Arc::clone(&self.releases),
             lowered_from: Arc::clone(&self.lowered_from),
             idle: Arc::clone(&self.idle),
             released: Arc::clone(&self.released),
@@ -422,6 +427,7 @@ impl ProcessMemoryBudget {
             waiting: Arc::clone(&self.waiting),
             yield_tickets: Arc::clone(&self.yield_tickets),
             parked: Arc::clone(&self.parked),
+            releases: Arc::clone(&self.releases),
             lowered_from: Arc::clone(&self.lowered_from),
             idle: Arc::clone(&self.idle),
             released: Arc::clone(&self.released),
@@ -604,7 +610,9 @@ impl ProcessMemoryBudget {
             }
         }
         let mut waiting = None;
-        let mut ticket = None;
+        // The ticket this request has posted, and the releases counted when
+        // it posted it.
+        let mut ticket: Option<(Ticket<'_>, u64)> = None;
         // This request's place in the queue, once it has had to wait.
         let mut queued = None;
         let mut wait_guard = self.idle.lock().expect("process memory state poisoned");
@@ -626,6 +634,18 @@ impl ProcessMemoryBudget {
             // than waiting for it: that state lives as long as its jobs do.
             // Other decoders still make it wait, never shrink it; they end.
             let bytes = self.requested_bytes(request);
+            // A release since the ticket was posted may be the yield it asked
+            // for; if the request still does not fit, this pass posts a fresh
+            // one. Until then the ticket stands, so a chase still unwinding
+            // is not joined by a second one: parked chases and the queue wake
+            // this loop too, and release nothing.
+            let releases = self.releases.load(Ordering::Acquire);
+            if ticket
+                .as_ref()
+                .is_some_and(|(_, posted)| *posted != releases)
+            {
+                ticket = None;
+            }
             if let Some(sequence) = queued {
                 wait_guard.restate(sequence, bytes);
             }
@@ -636,6 +656,11 @@ impl ProcessMemoryBudget {
                 if retained {
                     self.retained.fetch_add(bytes, Ordering::AcqRel);
                     self.total_retained.fetch_add(bytes, Ordering::AcqRel);
+                    // Retained state decides which queued request holds the
+                    // next grant.
+                    if self.has_waiters() {
+                        self.released.notify_all();
+                    }
                 }
                 if announced {
                     info!(
@@ -669,7 +694,7 @@ impl ProcessMemoryBudget {
                 .saturating_sub(self.limit);
             if ticket.is_none() && next_in_line && short <= self.parked.load(Ordering::Acquire) {
                 self.yield_tickets.fetch_add(1, Ordering::AcqRel);
-                ticket = Some(Ticket(self));
+                ticket = Some((Ticket(self), releases));
             }
             // This wait has no deadline, by design: the holder will finish. But
             // an extraction that reserves the whole process allowance and then
@@ -688,19 +713,16 @@ impl ProcessMemoryBudget {
                      another extraction is holding it"
                 );
             }
-            let (guard, timeout) = self
+            wait_guard = self
                 .released
                 .wait_timeout(wait_guard, Duration::from_millis(250))
-                .expect("process memory state poisoned");
-            wait_guard = guard;
-            // Woken by a release, perhaps the yield this waiter asked for. If
-            // it still does not fit, the next pass posts a fresh ticket. A
-            // timeout leaves the ticket standing, so a chase still unwinding
-            // is not joined by a second one.
-            if !timeout.timed_out() {
-                ticket = None;
-            }
+                .expect("process memory state poisoned")
+                .0;
         };
+        // Under the lock, so no chase claims the ticket of a request that has
+        // been answered and no admission sees a waiter that has left.
+        drop(ticket);
+        drop(waiting);
         if let Some(sequence) = queued {
             // Whoever was behind this request may be next now.
             wait_guard.leave(sequence);
@@ -900,7 +922,22 @@ impl JobExtractionBudget {
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<MemoryPermit, String> {
-        self.reserve_memory(DecoderRequest::Exact(bytes))
+        self.reserve_memory(DecoderRequest::Exact(bytes), AdmissionOrder::Queued)
+    }
+
+    /// Reserve `bytes` more for a decode that already holds memory from this
+    /// budget and keeps it until this is granted.
+    ///
+    /// What the decode holds is memory a queued request may be waiting for,
+    /// and the decode releases it only by finishing, which is what this
+    /// request is for; so it takes the first room there is instead of a place
+    /// in the queue. Only for the decode's own growth: a job's other tasks end
+    /// on their own and queue like anyone.
+    pub(crate) fn reserve_more_memory_wait(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<MemoryPermit, String> {
+        self.reserve_memory(DecoderRequest::Exact(bytes), AdmissionOrder::Holder)
     }
 
     /// Reserve as much of this job's decoder ceiling as fits beside the
@@ -926,10 +963,13 @@ impl JobExtractionBudget {
         floor: u64,
         cap: u64,
     ) -> Result<MemoryPermit, String> {
-        self.reserve_memory(DecoderRequest::UpToCeiling {
-            ceiling: self.max_memory_bytes().min(cap.max(1)).max(floor),
-            floor,
-        })
+        self.reserve_memory(
+            DecoderRequest::UpToCeiling {
+                ceiling: self.max_memory_bytes().min(cap.max(1)).max(floor),
+                floor,
+            },
+            AdmissionOrder::Queued,
+        )
     }
 
     /// Reserve `bytes` now or not at all: no wait, and no waiter registered.
@@ -956,7 +996,11 @@ impl JobExtractionBudget {
         })
     }
 
-    fn reserve_memory(self: &Arc<Self>, request: DecoderRequest) -> Result<MemoryPermit, String> {
+    fn reserve_memory(
+        self: &Arc<Self>,
+        request: DecoderRequest,
+        order: AdmissionOrder,
+    ) -> Result<MemoryPermit, String> {
         let (required, bytes) = match request {
             DecoderRequest::Exact(bytes) => (bytes, bytes),
             // The job stage holds the whole ceiling until the process stage
@@ -992,14 +1036,10 @@ impl JobExtractionBudget {
                         "job decoder memory granted after waiting"
                     );
                 }
-                // Memory this job's decoders already hold is memory a queued
-                // request may be waiting for, and they release it only by
-                // finishing, which is what this request is for.
-                let order = if self.memory_reserved.load(Ordering::Acquire) > bytes {
-                    AdmissionOrder::Holder
-                } else {
-                    AdmissionOrder::Queued
-                };
+                // The process stage can wait as long as another job's decode
+                // runs. This job's tasks and writers take the lock to start
+                // and to finish, and none of them waits for that.
+                drop(wait_guard);
                 let process_request = match request {
                     DecoderRequest::Exact(_) => DecoderRequest::Exact(bytes),
                     DecoderRequest::UpToCeiling { floor, .. } => DecoderRequest::UpToCeiling {
@@ -1425,11 +1465,16 @@ impl ProcessMemoryPermit {
         F: FnMut() -> Result<(), String>,
     {
         assert!(self.retained);
-        // The permit being grown is memory a queued request may be waiting
-        // for, held until this growth is granted.
-        let mut extra =
-            self.budget
-                .reserve_wait_kind(bytes, true, AdmissionOrder::Holder, check_active)?;
+        // A permit that holds memory holds what a queued request may be
+        // waiting for, until this growth is granted.
+        let order = if self.bytes == 0 {
+            AdmissionOrder::Queued
+        } else {
+            AdmissionOrder::Holder
+        };
+        let mut extra = self
+            .budget
+            .reserve_wait_kind(bytes, true, order, check_active)?;
         self.bytes += extra.bytes;
         extra.bytes = 0;
         Ok(())
@@ -1458,6 +1503,7 @@ impl Drop for ProcessMemoryPermit {
             .lock()
             .expect("process memory state poisoned");
         self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget.releases.fetch_add(1, Ordering::AcqRel);
         if self.retained {
             self.budget.retained.fetch_sub(self.bytes, Ordering::AcqRel);
             self.budget
@@ -2436,10 +2482,10 @@ mod tests {
         assert_eq!(pool.reserved_bytes(), 0);
     }
 
-    /// A job's second decoder request is made by work holding memory; its
-    /// first is not.
+    /// A decode's growth passes the queue; another task of the same job does
+    /// not, and the job stays free to start tasks while that one waits.
     #[test]
-    fn a_jobs_decoder_request_passes_the_queue_only_while_the_job_holds_memory() {
+    fn a_decodes_growth_passes_the_queue_and_its_jobs_other_tasks_do_not() {
         let temp = tempfile::tempdir().unwrap();
         let pool = Arc::new(ProcessMemoryBudget::new(1024));
         let budget = JobExtractionBudget::new_with_process_memory(
@@ -2460,13 +2506,13 @@ mod tests {
         }
 
         let second = budget
-            .reserve_memory_wait(256)
-            .expect("the job holds a decoder, so its next request is not queued");
+            .reserve_more_memory_wait(256)
+            .expect("the decode holds memory, so its growth is not queued");
         assert_eq!(pool.reserved_bytes(), 512);
         drop(second);
-        drop(first);
 
-        // Holding nothing now, the job queues behind the waiter like anyone.
+        // Another task of the job ends on its own, so it queues behind the
+        // waiter like anyone, for room it would fit in.
         let (granted_tx, granted_rx) = std::sync::mpsc::channel();
         let queued_budget = Arc::clone(&budget);
         let queued = std::thread::spawn(move || {
@@ -2474,10 +2520,25 @@ mod tests {
             granted_tx.send(()).unwrap();
             drop(permit);
         });
+        while pool.queued_requests() != 2 {
+            std::thread::yield_now();
+        }
+        assert!(granted_rx.try_recv().is_err());
+        assert_eq!(pool.reserved_bytes(), 256);
+
+        // The job's lock is not held while its task waits for the process.
+        drop(
+            budget
+                .task_permit()
+                .expect("the job takes on a task meanwhile"),
+        );
+
+        drop(first);
         drop(waiter.join().unwrap().unwrap());
         granted_rx.recv().unwrap();
         queued.join().unwrap();
         assert_eq!(pool.reserved_bytes(), 0);
+        assert_eq!(pool.queued_requests(), 0);
     }
 
     /// A queued request that cannot fit beside the retained state does not
