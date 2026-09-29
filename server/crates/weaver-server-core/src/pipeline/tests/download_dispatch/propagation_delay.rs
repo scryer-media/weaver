@@ -925,6 +925,30 @@ async fn clearing_scheduled_speed_limit_restores_latest_configured_limit() {
     received.await.unwrap();
     assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
 
+    for action in [
+        crate::bandwidth::ScheduleAction::Pause,
+        crate::bandwidth::ScheduleAction::Resume,
+    ] {
+        let (reply, received) = oneshot::channel();
+        pipeline
+            .handle_command(SchedulerCommand::ApplyScheduleAction {
+                action: action.clone(),
+                reply,
+            })
+            .await;
+        received.await.unwrap();
+        assert_eq!(
+            pipeline.global_paused,
+            action == crate::bandwidth::ScheduleAction::Pause
+        );
+        assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+        assert_eq!(pipeline.scheduled_rate_limit, Some(128 * 1024));
+        assert_eq!(
+            pipeline.shared_state.download_block().scheduled_speed_limit,
+            128 * 1024
+        );
+    }
+
     let (reply, received) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::SetSpeedLimit {
@@ -935,6 +959,32 @@ async fn clearing_scheduled_speed_limit_restores_latest_configured_limit() {
     received.await.unwrap();
     assert_eq!(pipeline.configured_rate_limit, 768 * 1024);
     assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+
+    for action in [
+        crate::bandwidth::ScheduleAction::Pause,
+        crate::bandwidth::ScheduleAction::ConfiguredSpeedLimit,
+    ] {
+        let (reply, received) = oneshot::channel();
+        pipeline
+            .handle_command(SchedulerCommand::ApplyScheduleAction { action, reply })
+            .await;
+        received.await.unwrap();
+    }
+    assert!(pipeline.global_paused);
+    assert_eq!(pipeline.scheduled_rate_limit, None);
+    assert_eq!(pipeline.rate_limiter.rate(), 768 * 1024);
+    // Unlimited still means unlimited, even when the configured limit is nonzero.
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ApplyScheduleAction {
+            action: crate::bandwidth::ScheduleAction::SpeedLimit { bytes_per_sec: 0 },
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert_eq!(pipeline.scheduled_rate_limit, Some(0));
+    assert_eq!(pipeline.rate_limiter.rate(), 0);
+    assert!(pipeline.global_paused);
 
     let (reply, received) = oneshot::channel();
     pipeline

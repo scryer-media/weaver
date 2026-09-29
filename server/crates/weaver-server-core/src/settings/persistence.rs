@@ -1,5 +1,4 @@
 use crate::StateError;
-use crate::bandwidth::ScheduleEntry;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
@@ -136,12 +135,6 @@ impl Database {
             .await?;
             Ok(())
         })
-    }
-
-    pub fn save_schedules(&self, entries: &[ScheduleEntry]) -> Result<(), StateError> {
-        let json =
-            serde_json::to_string(entries).map_err(|e| StateError::Database(e.to_string()))?;
-        self.set_setting("schedules", &json)
     }
 
     pub fn initialize_next_job_id_counter(&self) -> Result<u64, StateError> {

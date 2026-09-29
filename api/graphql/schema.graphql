@@ -206,6 +206,50 @@ input AttributeInput {
 	value: String!
 }
 
+type AutoBackupSettings {
+	enabled: Boolean!
+	dailyTimeLocal: String!
+	autoBackupKeyPresent: Boolean!
+	nextRunAt: String
+}
+
+input AutoBackupSettingsInput {
+	enabled: Boolean!
+	dailyTimeLocal: String!
+	setAutoBackupKey: String
+	clearAutoBackupKey: Boolean! = false
+}
+
+enum BackupArtifactStatus {
+	CREATING
+	READY
+	FAILED
+}
+
+type BackupInfo {
+	filename: String!
+	sizeBytes: Int!
+	createdAt: String!
+	formatVersion: String!
+	sourceWeaverVersion: String!
+	sourceEngine: String!
+	encrypted: Boolean!
+	rowCounts: JSON!
+	trigger: BackupTrigger!
+	status: BackupArtifactStatus!
+	error: String
+}
+
+type BackupSettings {
+	customBackupPath: String
+	backupPath: String!
+}
+
+enum BackupTrigger {
+	MANUAL
+	AUTO
+}
+
 type Category {
 	id: Int!
 	name: String!
@@ -854,6 +898,11 @@ enum IspBandwidthCapWeekdayGql {
 	SUN
 }
 
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
 type Job {
 	id: Int!
 	name: String!
@@ -1286,6 +1335,10 @@ type MutationRoot {
 	Test connectivity to an NNTP server without saving it.
 	"""
 	testConnection(input: ServerInput!): TestConnectionResult!
+	updateBackupSettings(customBackupPath: String): BackupSettings!
+	updateAutoBackupSettings(input: AutoBackupSettingsInput!): AutoBackupSettings!
+	deleteBackup(filename: String!): Boolean!
+	createBackupDownloadToken(filename: String!): String!
 	"""
 	Add a new category.
 	"""
@@ -1759,6 +1812,9 @@ type ProxyTestResult {
 }
 
 type QueryRoot {
+	backups: [BackupInfo!]!
+	backupSettings: BackupSettings!
+	autoBackupSettings: AutoBackupSettings!
 	proxyProfiles: [ProxyProfile!]!
 	"""
 	Admin-facing auth status moved to query semantics.
@@ -2385,7 +2441,20 @@ type Schedule {
 	label: String!
 	days: [String!]!
 	time: String!
+	times: [String!]!
+	everyHourAtMinute: Int
+	serverId: Int
+	serverActive: Boolean
+	feedId: Int
+	quotaMeteringEnabled: Boolean
+	pruneFailed: SchedulePruneFiles
+	pruneCompleted: SchedulePruneFiles
+	pruneCancelled: SchedulePruneFiles
 	actionType: String!
+	"""
+	Rules on this track hold independently of every other track.
+	"""
+	track: ScheduleTrack!
 	speedLimitBytes: Int
 	"""
 	The profile a `hardware_profile` rule puts in force; null for every
@@ -2399,12 +2468,41 @@ input ScheduleInput {
 	label: String
 	days: [String!]
 	time: String!
+	times: [String!]
+	everyHourAtMinute: Int
+	serverId: Int
+	serverActive: Boolean
+	feedId: Int
+	quotaMeteringEnabled: Boolean
+	pruneFailed: SchedulePruneFilesInput
+	pruneCompleted: SchedulePruneFilesInput
+	pruneCancelled: SchedulePruneFilesInput
 	actionType: String!
 	speedLimitBytes: Int
 	"""
 	Required when the action is `hardware_profile`, ignored otherwise.
 	"""
 	hardwareProfile: HardwareProfileGql
+}
+
+type SchedulePruneFiles {
+	deleteFiles: Boolean!
+}
+
+input SchedulePruneFilesInput {
+	deleteFiles: Boolean!
+}
+
+enum ScheduleTrack {
+	DOWNLOADS
+	POST_PROCESSING
+	WATCH_FOLDER
+	RSS
+	SPEED
+	PROFILE
+	QUOTA
+	SERVER
+	ONE_SHOT
 }
 
 enum ScriptAdapterGql {

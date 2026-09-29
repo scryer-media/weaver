@@ -422,6 +422,42 @@ impl From<IspBandwidthCapSettingsInput> for IspBandwidthCapConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "ScheduleTrack")]
+pub enum ScheduleTrackGql {
+    Downloads,
+    PostProcessing,
+    WatchFolder,
+    Rss,
+    Speed,
+    Profile,
+    Quota,
+    Server,
+    OneShot,
+}
+
+#[derive(Clone, Copy, SimpleObject, InputObject)]
+#[graphql(input_name = "SchedulePruneFilesInput")]
+pub struct SchedulePruneFiles {
+    pub delete_files: bool,
+}
+
+impl From<weaver_server_core::bandwidth::PruneFiles> for SchedulePruneFiles {
+    fn from(value: weaver_server_core::bandwidth::PruneFiles) -> Self {
+        Self {
+            delete_files: value.delete_files,
+        }
+    }
+}
+
+impl From<SchedulePruneFiles> for weaver_server_core::bandwidth::PruneFiles {
+    fn from(value: SchedulePruneFiles) -> Self {
+        Self {
+            delete_files: value.delete_files,
+        }
+    }
+}
+
 #[derive(SimpleObject)]
 pub struct Schedule {
     pub id: String,
@@ -429,7 +465,18 @@ pub struct Schedule {
     pub label: String,
     pub days: Vec<String>,
     pub time: String,
+    pub times: Vec<String>,
+    pub every_hour_at_minute: Option<u8>,
+    pub server_id: Option<u32>,
+    pub server_active: Option<bool>,
+    pub feed_id: Option<u32>,
+    pub quota_metering_enabled: Option<bool>,
+    pub prune_failed: Option<SchedulePruneFiles>,
+    pub prune_completed: Option<SchedulePruneFiles>,
+    pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
+    /// Rules on this track hold independently of every other track.
+    pub track: ScheduleTrackGql,
     pub speed_limit_bytes: Option<u64>,
     /// The profile a `hardware_profile` rule puts in force; null for every
     /// other action.
@@ -438,10 +485,57 @@ pub struct Schedule {
 
 impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
     fn from(e: weaver_server_core::bandwidth::ScheduleEntry) -> Self {
+        use weaver_server_core::bandwidth::ScheduleTrack;
+        let track = match e.action.track() {
+            Some(ScheduleTrack::Downloads) => ScheduleTrackGql::Downloads,
+            Some(ScheduleTrack::PostProcessing) => ScheduleTrackGql::PostProcessing,
+            Some(ScheduleTrack::WatchFolder) => ScheduleTrackGql::WatchFolder,
+            Some(ScheduleTrack::Rss) => ScheduleTrackGql::Rss,
+            Some(ScheduleTrack::Speed) => ScheduleTrackGql::Speed,
+            Some(ScheduleTrack::Profile) => ScheduleTrackGql::Profile,
+            Some(ScheduleTrack::Quota) => ScheduleTrackGql::Quota,
+            Some(ScheduleTrack::Server(_)) => ScheduleTrackGql::Server,
+            None => ScheduleTrackGql::OneShot,
+        };
+        use weaver_server_core::bandwidth::ScheduleAction;
+        let (server_id, server_active) = match e.action {
+            ScheduleAction::SetServerActive { server_id, active } => {
+                (Some(server_id), Some(active))
+            }
+            _ => (None, None),
+        };
+        let feed_id = match e.action {
+            ScheduleAction::FetchRss { feed_id } => feed_id,
+            _ => None,
+        };
+        let quota_metering_enabled = match e.action {
+            ScheduleAction::SetQuotaMetering { enabled } => Some(enabled),
+            _ => None,
+        };
+        let (prune_failed, prune_completed, prune_cancelled) = match e.action {
+            ScheduleAction::PruneHistory {
+                failed,
+                completed,
+                cancelled,
+            } => (
+                failed.map(Into::into),
+                completed.map(Into::into),
+                cancelled.map(Into::into),
+            ),
+            _ => (None, None, None),
+        };
         let mut hardware_profile = None;
         let (action_type, speed_limit_bytes) = match &e.action {
             weaver_server_core::bandwidth::ScheduleAction::Pause => ("pause".into(), None),
             weaver_server_core::bandwidth::ScheduleAction::Resume => ("resume".into(), None),
+            ScheduleAction::PauseAll => ("pause_all".into(), None),
+            ScheduleAction::PausePostProcessing => ("pause_post_processing".into(), None),
+            ScheduleAction::ResumePostProcessing => ("resume_post_processing".into(), None),
+            ScheduleAction::SetServerActive { .. } => ("set_server_active".into(), None),
+            ScheduleAction::SetQuotaMetering { .. } => ("set_quota_metering".into(), None),
+            ScheduleAction::ScanWatchFolder => ("scan_watch_folder".into(), None),
+            ScheduleAction::FetchRss { .. } => ("fetch_rss".into(), None),
+            ScheduleAction::PruneHistory { .. } => ("prune_history".into(), None),
             weaver_server_core::bandwidth::ScheduleAction::PauseWatchFolderScanning => {
                 ("pause_watch_folder_scanning".into(), None)
             }
@@ -451,6 +545,9 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             weaver_server_core::bandwidth::ScheduleAction::SpeedLimit { bytes_per_sec } => {
                 ("speed_limit".into(), Some(*bytes_per_sec))
             }
+            weaver_server_core::bandwidth::ScheduleAction::ConfiguredSpeedLimit => {
+                ("configured_speed_limit".into(), None)
+            }
             weaver_server_core::bandwidth::ScheduleAction::HardwareProfile { profile } => {
                 hardware_profile = Some((*profile).into());
                 ("hardware_profile".into(), None)
@@ -458,6 +555,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
         };
         Self {
             id: e.id,
+            track,
             enabled: e.enabled,
             label: e.label,
             days: e
@@ -466,6 +564,15 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
                 .map(|d| format!("{d:?}").to_lowercase())
                 .collect(),
             time: e.time,
+            times: e.times,
+            every_hour_at_minute: e.every_hour_at_minute,
+            server_id,
+            server_active,
+            feed_id,
+            quota_metering_enabled,
+            prune_failed,
+            prune_completed,
+            prune_cancelled,
             action_type,
             speed_limit_bytes,
             hardware_profile,
@@ -479,6 +586,15 @@ pub struct ScheduleInput {
     pub label: Option<String>,
     pub days: Option<Vec<String>>,
     pub time: String,
+    pub times: Option<Vec<String>>,
+    pub every_hour_at_minute: Option<u8>,
+    pub server_id: Option<u32>,
+    pub server_active: Option<bool>,
+    pub feed_id: Option<u32>,
+    pub quota_metering_enabled: Option<bool>,
+    pub prune_failed: Option<SchedulePruneFiles>,
+    pub prune_completed: Option<SchedulePruneFiles>,
+    pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
     pub speed_limit_bytes: Option<u64>,
     /// Required when the action is `hardware_profile`, ignored otherwise.
@@ -491,6 +607,66 @@ impl ScheduleInput {
     /// honour: a rule that could never apply is refused by name here rather
     /// than saved and skipped every time it fires.
     pub fn validate(&self, probe: &SystemProfile) -> Result<(), String> {
+        if !matches!(
+            self.action_type.as_str(),
+            "pause"
+                | "resume"
+                | "speed_limit"
+                | "configured_speed_limit"
+                | "pause_watch_folder_scanning"
+                | "resume_watch_folder_scanning"
+                | "hardware_profile"
+                | "pause_all"
+                | "pause_post_processing"
+                | "resume_post_processing"
+                | "set_server_active"
+                | "set_quota_metering"
+                | "scan_watch_folder"
+                | "fetch_rss"
+                | "prune_history"
+        ) {
+            return Err(format!("unknown schedule actionType: {}", self.action_type));
+        }
+        let one_shot = matches!(
+            self.action_type.as_str(),
+            "scan_watch_folder" | "fetch_rss" | "prune_history"
+        );
+        if let Some(minute) = self.every_hour_at_minute {
+            if !one_shot {
+                return Err("hourly schedules are only supported for one-shot actions".into());
+            }
+            if minute > 59 {
+                return Err("hourly minute must be between 0 and 59".into());
+            }
+            if self.times.as_ref().is_some_and(|times| !times.is_empty()) {
+                return Err("choose multiple times or hourly, not both".into());
+            }
+        }
+        if weaver_server_core::bandwidth::schedule::parse_time(&self.time).is_none()
+            || self.times.as_ref().is_some_and(|times| {
+                times.len() > 24
+                    || times.iter().any(|time| {
+                        weaver_server_core::bandwidth::schedule::parse_time(time).is_none()
+                    })
+            })
+        {
+            return Err("schedule times must be HH:MM, with at most 24 times per rule".into());
+        }
+        if self.action_type == "set_server_active"
+            && (self.server_id.is_none() || self.server_active.is_none())
+        {
+            return Err("set_server_active requires serverId and serverActive".into());
+        }
+        if self.action_type == "set_quota_metering" && self.quota_metering_enabled.is_none() {
+            return Err("set_quota_metering requires quotaMeteringEnabled".into());
+        }
+        if self.action_type == "prune_history"
+            && self.prune_failed.is_none()
+            && self.prune_completed.is_none()
+            && self.prune_cancelled.is_none()
+        {
+            return Err("prune_history requires at least one status".into());
+        }
         if self.action_type != "hardware_profile" {
             return Ok(());
         }
@@ -503,25 +679,50 @@ impl ScheduleInput {
         }
     }
 
-    pub fn into_entry(self) -> weaver_server_core::bandwidth::ScheduleEntry {
+    pub fn into_entry(self) -> Result<weaver_server_core::bandwidth::ScheduleEntry, String> {
         use weaver_server_core::bandwidth::{ScheduleAction, Weekday};
 
         let action = match self.action_type.as_str() {
             "pause" => ScheduleAction::Pause,
             "resume" => ScheduleAction::Resume,
+            "pause_all" => ScheduleAction::PauseAll,
+            "pause_post_processing" => ScheduleAction::PausePostProcessing,
+            "resume_post_processing" => ScheduleAction::ResumePostProcessing,
+            "set_server_active" => ScheduleAction::SetServerActive {
+                server_id: self
+                    .server_id
+                    .ok_or("set_server_active requires serverId")?,
+                active: self
+                    .server_active
+                    .ok_or("set_server_active requires serverActive")?,
+            },
+            "set_quota_metering" => ScheduleAction::SetQuotaMetering {
+                enabled: self
+                    .quota_metering_enabled
+                    .ok_or("set_quota_metering requires quotaMeteringEnabled")?,
+            },
+            "scan_watch_folder" => ScheduleAction::ScanWatchFolder,
+            "fetch_rss" => ScheduleAction::FetchRss {
+                feed_id: self.feed_id,
+            },
+            "prune_history" => ScheduleAction::PruneHistory {
+                failed: self.prune_failed.map(Into::into),
+                completed: self.prune_completed.map(Into::into),
+                cancelled: self.prune_cancelled.map(Into::into),
+            },
             "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,
             "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
             "speed_limit" => ScheduleAction::SpeedLimit {
                 bytes_per_sec: self.speed_limit_bytes.unwrap_or(0),
             },
+            "configured_speed_limit" => ScheduleAction::ConfiguredSpeedLimit,
             "hardware_profile" => match self.hardware_profile {
                 Some(profile) => ScheduleAction::HardwareProfile {
                     profile: profile.into(),
                 },
-                // Refused by `validate` before an entry is built.
-                None => ScheduleAction::Resume,
+                None => return Err("a hardware_profile schedule needs a hardwareProfile".into()),
             },
-            _ => ScheduleAction::Resume,
+            _ => return Err(format!("unknown schedule actionType: {}", self.action_type)),
         };
         let days: Vec<Weekday> = self
             .days
@@ -538,7 +739,7 @@ impl ScheduleInput {
                 _ => None,
             })
             .collect();
-        weaver_server_core::bandwidth::ScheduleEntry {
+        Ok(weaver_server_core::bandwidth::ScheduleEntry {
             id: format!(
                 "sched-{:x}",
                 std::time::SystemTime::now()
@@ -549,8 +750,15 @@ impl ScheduleInput {
             enabled: self.enabled.unwrap_or(true),
             label: self.label.unwrap_or_default(),
             days,
-            time: self.time,
+            time: self
+                .times
+                .as_ref()
+                .and_then(|times| times.first())
+                .cloned()
+                .unwrap_or(self.time),
+            times: self.times.unwrap_or_default(),
+            every_hour_at_minute: self.every_hour_at_minute,
             action,
-        }
+        })
     }
 }

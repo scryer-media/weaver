@@ -1101,6 +1101,7 @@ pub struct Database {
     /// own `Flush` so a re-send in progress is not skipped at shutdown.
     pending_write_retries: Arc<AtomicUsize>,
     pending_write_notify: Arc<Notify>,
+    pub(crate) history_delete_wake: Arc<Notify>,
     job_history_cache: Arc<Mutex<JobHistoryCache>>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
     _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
@@ -1134,6 +1135,7 @@ impl Database {
             writer_tx,
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
+            history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: None,
             _ephemeral_dir: None,
@@ -1159,6 +1161,7 @@ impl Database {
             writer_tx,
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
+            history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: Some(crate::persistence::encryption::EncryptionKey::generate()),
             _ephemeral_dir: Some(tempdir),
@@ -1371,6 +1374,7 @@ impl Database {
             writer_tx: detached_tx,
             pending_write_retries: self.pending_write_retries.clone(),
             pending_write_notify: self.pending_write_notify.clone(),
+            history_delete_wake: self.history_delete_wake.clone(),
             job_history_cache: self.job_history_cache.clone(),
             encryption_key: self.encryption_key.clone(),
             _ephemeral_dir: self._ephemeral_dir.clone(),
@@ -1624,6 +1628,9 @@ impl Database {
         use crate::persistence::encryption::is_encrypted;
         use crate::persistence::sql_runtime::SqlRuntime;
 
+        if self.automatic_backup_ciphertext()?.is_some() {
+            return Ok(true);
+        }
         let datastore = self.datastore();
         let encrypted_credentials_exist = self.run_sql_blocking_read(async move {
             for query in [
@@ -1666,6 +1673,18 @@ impl Database {
         use crate::persistence::encryption::{decrypt_value, is_encrypted};
         use crate::persistence::sql_runtime::SqlRuntime;
 
+        if let Some(ciphertext) = self.automatic_backup_ciphertext()? {
+            if !is_encrypted(&ciphertext) {
+                return Err(StateError::Conflict(
+                    "persisted automatic backup key is not encrypted".into(),
+                ));
+            }
+            decrypt_value(key, &ciphertext).map_err(|error| {
+                StateError::Conflict(format!(
+                    "cannot decrypt persisted automatic backup key: {error}"
+                ))
+            })?;
+        }
         let datastore = self.datastore();
         let credential_key = key.clone();
         self.run_sql_blocking_read(async move {

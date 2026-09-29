@@ -8,6 +8,23 @@ impl Database {
         start_bucket_epoch_minute: i64,
         end_bucket_epoch_minute: i64,
     ) -> Result<u64, StateError> {
+        self.sum_bandwidth_usage(start_bucket_epoch_minute, end_bucket_epoch_minute, false)
+    }
+
+    pub fn sum_metered_bandwidth_usage_minutes(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> Result<u64, StateError> {
+        self.sum_bandwidth_usage(start, end, true)
+    }
+
+    fn sum_bandwidth_usage(
+        &self,
+        start_bucket_epoch_minute: i64,
+        end_bucket_epoch_minute: i64,
+        metered_only: bool,
+    ) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let sql = match datastore.engine() {
@@ -22,9 +39,14 @@ impl Database {
                       WHERE bucket_epoch_minute >= {} AND bucket_epoch_minute < {}"
                 }
             };
+            let sql = if metered_only {
+                format!("{sql} AND metered = 1")
+            } else {
+                sql.to_owned()
+            };
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                sql,
+                &sql,
                 &[
                     SqlArg::I64(start_bucket_epoch_minute),
                     SqlArg::I64(end_bucket_epoch_minute),

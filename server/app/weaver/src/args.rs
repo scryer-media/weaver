@@ -33,6 +33,19 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "FORMAT", global = true)]
     pub(crate) log_format: Option<String>,
 
+    /// Start without a pre-migration backup, accepting loss of the rollback copy.
+    #[arg(long, global = true)]
+    pub(crate) skip_upgrade_backup: bool,
+
+    /// Refuse database migration if the pre-upgrade backup fails.
+    /// Also settable with WEAVER_REQUIRE_UPGRADE_BACKUP=true (or 1).
+    #[arg(long, global = true, conflicts_with = "skip_upgrade_backup")]
+    pub(crate) require_upgrade_backup: bool,
+
+    /// Disable automatic backups and discard their stored password to recover corrupt settings.
+    #[arg(long, global = true, requires = "skip_upgrade_backup")]
+    pub(crate) reset_automatic_backup_settings: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 }
@@ -168,6 +181,10 @@ pub(crate) enum Par2Command {
     },
 }
 
+pub(crate) fn upgrade_backup_required(flag: bool, env: Option<&str>) -> bool {
+    flag || env.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -175,6 +192,46 @@ mod tests {
     use clap::{Parser, error::ErrorKind};
 
     use super::{Cli, Command, DEFAULT_CONFIG_FILE};
+
+    #[test]
+    fn skipping_upgrade_backup_requires_an_explicit_flag() {
+        assert!(!Cli::parse_from(["weaver"]).skip_upgrade_backup);
+        assert!(Cli::parse_from(["weaver", "--skip-upgrade-backup"]).skip_upgrade_backup);
+        assert!(Cli::parse_from(["weaver", "serve", "--skip-upgrade-backup"]).skip_upgrade_backup);
+    }
+
+    #[test]
+    fn requiring_upgrade_backup_is_opt_in() {
+        assert!(!Cli::parse_from(["weaver"]).require_upgrade_backup);
+        assert!(Cli::parse_from(["weaver", "--require-upgrade-backup"]).require_upgrade_backup);
+        assert!(
+            Cli::try_parse_from([
+                "weaver",
+                "--require-upgrade-backup",
+                "--skip-upgrade-backup"
+            ])
+            .is_err()
+        );
+        assert!(super::upgrade_backup_required(false, Some("true")));
+        assert!(super::upgrade_backup_required(false, Some("1")));
+        assert!(!super::upgrade_backup_required(false, Some("false")));
+        assert!(!super::upgrade_backup_required(false, None));
+        assert!(super::upgrade_backup_required(true, Some("false")));
+    }
+
+    #[test]
+    fn automatic_backup_reset_requires_an_explicit_rollback_waiver() {
+        assert!(!Cli::parse_from(["weaver"]).reset_automatic_backup_settings);
+        assert!(Cli::try_parse_from(["weaver", "--reset-automatic-backup-settings"]).is_err());
+        let cli = Cli::parse_from([
+            "weaver",
+            "serve",
+            "--skip-upgrade-backup",
+            "--reset-automatic-backup-settings",
+        ]);
+        assert!(cli.reset_automatic_backup_settings);
+        assert!(cli.skip_upgrade_backup);
+    }
 
     #[test]
     fn version_flag_reports_the_package_version() {

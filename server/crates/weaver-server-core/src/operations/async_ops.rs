@@ -515,6 +515,59 @@ impl Database {
         })?
     }
 
+    pub(crate) fn insert_available_history_delete_operation(
+        &self,
+        ids: &[u64],
+        delete_files: bool,
+    ) -> Result<Option<u64>, StateError> {
+        let ids = dedupe_ids(ids);
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "insert_available_history_delete_operation",
+                |tx| {
+                    let ids = ids.clone();
+                    Box::pin(async move {
+                        let mut available = Vec::new();
+                        for chunk in ids.chunks(id_chunk_size(bind_budget_for_tx(tx), 1)) {
+                            let sql = format!(
+                                "SELECT job_id FROM job_history
+                             WHERE job_id IN ({}) AND NOT EXISTS (
+                                 SELECT 1 FROM async_operation_targets
+                                 WHERE target_kind = {{}} AND target_id = job_history.job_id
+                                   AND state IN ('queued', 'running'))",
+                                placeholders(chunk.len())
+                            );
+                            let mut args = id_args(chunk);
+                            args.push(SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()));
+                            let present: HashSet<_> = tx
+                                .fetch_all(&sql, &args)
+                                .await?
+                                .into_iter()
+                                .map(|row| row.i64("job_id").map(|id| id as u64))
+                                .collect::<Result<_, _>>()?;
+                            available
+                                .extend(chunk.iter().copied().filter(|id| present.contains(id)));
+                        }
+                        if available.is_empty() {
+                            return Ok(None);
+                        }
+                        insert_history_delete_operation_tx(
+                            tx,
+                            &available,
+                            delete_files,
+                            delete_files,
+                        )
+                        .await
+                        .map(Some)
+                    })
+                },
+            )
+            .await
+        })
+    }
+
     pub fn insert_all_history_delete_operation(
         &self,
         delete_files: bool,
@@ -1035,6 +1088,68 @@ mod tests {
         let recovered = db.next_history_delete_operation().unwrap().unwrap();
         assert!(recovered.delete_files);
         assert!(recovered.file_delete_authorized);
+    }
+
+    #[tokio::test]
+    async fn scheduled_prune_skips_locked_rows_and_accepts_both_file_policies() {
+        let db = Database::open_in_memory().unwrap();
+        for (id, status) in [
+            (10, "complete"),
+            (11, "complete"),
+            (12, "failed"),
+            (13, "cancelled"),
+        ] {
+            let mut row = history(id, 100);
+            row.status = status.into();
+            db.insert_job_history(&row).unwrap();
+        }
+        let existing = db
+            .insert_history_delete_operation(&[10], false, false)
+            .unwrap();
+        db.prune_history(
+            Some(crate::bandwidth::PruneFiles { delete_files: true }),
+            Some(crate::bandwidth::PruneFiles {
+                delete_files: false,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let states = db
+            .list_history_delete_row_states(&[10, 11, 12, 13])
+            .unwrap();
+        assert_eq!(states[&10].operation_id, existing);
+        assert!(!states[&11].delete_files);
+        assert!(states[&12].delete_files);
+        assert!(!states.contains_key(&13));
+    }
+
+    #[test]
+    fn scheduled_prune_batches_available_rows_and_skips_missing_targets() {
+        let db = Database::open_in_memory().unwrap();
+        for id in 10..110 {
+            db.insert_job_history(&history(id, 100)).unwrap();
+        }
+        let locked = db
+            .insert_history_delete_operation(&[10], false, false)
+            .unwrap();
+        let ids: Vec<_> = (9..111).collect();
+        let operation = db
+            .insert_available_history_delete_operation(&ids, true)
+            .unwrap()
+            .unwrap();
+        let states = db.list_history_delete_row_states(&ids).unwrap();
+        assert_eq!(states.len(), 100);
+        assert_eq!(states[&10].operation_id, locked);
+        for id in 11..110 {
+            assert_eq!(states[&id].operation_id, operation);
+            assert!(states[&id].delete_files);
+        }
+        assert_eq!(
+            db.insert_available_history_delete_operation(&ids, true)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

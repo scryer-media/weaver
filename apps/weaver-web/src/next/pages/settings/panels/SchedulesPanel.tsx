@@ -14,12 +14,15 @@ import { RecordEditor } from "../../../components/RecordEditor";
 import { PrimaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatRate } from "../../../data/format";
+import { SCHEDULE_TRACKS, type ScheduleTrack } from "../../../data/schedule-tracks";
 import {
   profileName,
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
 import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
+import { ScheduleOptionsFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
+import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleTimeLabel, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -30,18 +33,20 @@ import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework"
  * horizontally — and "no day selected" means every day.
  */
 
-interface Schedule {
+interface Schedule extends ScheduleOptions {
   id: string;
   enabled: boolean;
   label: string | null;
   days: string[];
   time: string;
   actionType: string;
+  track: ScheduleTrack;
   speedLimitBytes: number | null;
   hardwareProfile: HardwareProfileName | null;
 }
 
 interface ScheduleForm {
+  options: ScheduleOptionsForm;
   enabled: boolean;
   label: string;
   days: string[];
@@ -67,15 +72,18 @@ const DAYS = [
 ];
 
 const ACTIONS: { value: string; label: string }[] = [
+  ...ADDITIONAL_SCHEDULE_ACTIONS,
   { value: "pause", label: "next.schedules.pause" },
   { value: "resume", label: "next.schedules.resume" },
   { value: "speed_limit", label: "next.schedules.setLimit" },
+  { value: "configured_speed_limit", label: "next.schedules.useConfiguredLimit" },
   { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
   { value: "resume_watch_folder_scanning", label: "next.schedules.resumeWatchFolder" },
   { value: "hardware_profile", label: "next.schedules.setProfile" },
 ];
 
 const NEW_SCHEDULE: ScheduleForm = {
+  options: NEW_SCHEDULE_OPTIONS,
   enabled: true,
   label: "",
   days: [],
@@ -86,7 +94,9 @@ const NEW_SCHEDULE: ScheduleForm = {
   hardwareProfile: null,
 };
 
-function actionLabel(t: Translate, schedule: Schedule): string {
+function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets): string {
+  const details = scheduleActionDetails(t, schedule, targets);
+  if (details) return details;
   if (schedule.actionType === "speed_limit") {
     return schedule.speedLimitBytes
       ? t("next.schedules.limitTo", { rate: formatRate(schedule.speedLimitBytes) })
@@ -110,6 +120,7 @@ function daysLabel(t: Translate, days: string[]): string {
 
 export function SchedulesPanel() {
   const t = useTranslate();
+  const targets = useScheduleTargets();
   const [{ data, fetching }, reexecute] = useQuery<{ schedules: Schedule[] }>({ query: SCHEDULES_QUERY });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
@@ -151,6 +162,7 @@ export function SchedulesPanel() {
               schedule.actionType === "speed_limit" && !schedule.speedLimitBytes,
             speedMib: schedule.speedLimitBytes ? String(schedule.speedLimitBytes / MIB) : "5",
             hardwareProfile: schedule.hardwareProfile,
+            options: optionsFromSchedule(schedule),
           }
         : NEW_SCHEDULE,
     );
@@ -165,6 +177,7 @@ export function SchedulesPanel() {
       days: form.days.length > 0 ? form.days : null,
       label: form.label.trim() || null,
       enabled: form.enabled,
+      ...optionsInput(form.options, form.actionType),
     };
     if (form.actionType === "speed_limit") {
       input.speedLimitBytes = form.speedUnlimited
@@ -199,12 +212,11 @@ export function SchedulesPanel() {
     void reexecute({ requestPolicy: "network-only" });
   };
 
-  const blocks: SettingsBlock[] = [
-    {
+  const blocks: SettingsBlock[] = SCHEDULE_TRACKS.map((track) => ({
       kind: "table",
-      id: "schedules",
-      title: t("next.settings.panel.schedules"),
-      note: t("next.schedules.note"),
+      id: `schedules-${track.value}`,
+      title: t(track.label),
+      note: t(track.value === "ONE_SHOT" ? "next.schedules.oneShotHelp" : "next.schedules.trackHelp"),
       columns: "84px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr) 44px",
       headers: [
         t("next.schedules.time"),
@@ -213,7 +225,7 @@ export function SchedulesPanel() {
         t("next.schedules.label"),
         "",
       ],
-      empty: t("next.schedules.empty"),
+      empty: t("next.schedules.trackEmpty"),
       emptyAction: { label: t("next.schedules.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const schedule = schedules.find((entry) => entry.id === id);
@@ -221,17 +233,17 @@ export function SchedulesPanel() {
           open(schedule);
         }
       },
-      rows: schedules.map((schedule) => ({
+      rows: schedules.filter((schedule) => schedule.track === track.value).map((schedule) => ({
         id: schedule.id,
-        searchText: `${schedule.time} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule)} ${schedule.label ?? ""}`,
+        searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""}`,
         cells: [
           <Cell key="time" mono className="text-wv-fg">
-            {schedule.time}
+            {scheduleTimeLabel(schedule)}
           </Cell>,
           <Cell key="days" mono className="text-wv-secondary">
             {daysLabel(t, schedule.days)}
           </Cell>,
-          <Cell key="action">{actionLabel(t, schedule)}</Cell>,
+          <Cell key="action" title={actionLabel(t, schedule, targets)}>{actionLabel(t, schedule, targets)}</Cell>,
           <Cell key="label" className="text-wv-muted">
             {schedule.label || "—"}
           </Cell>,
@@ -249,8 +261,7 @@ export function SchedulesPanel() {
           </span>,
         ],
       })),
-    },
-  ];
+  }));
 
   return (
     <>
@@ -373,6 +384,11 @@ export function SchedulesPanel() {
                         ]),
                   ]
                 : []),
+              {
+                id: "scheduleOptions",
+                label: t("next.schedules.options"),
+                control: { kind: "custom", control: <ScheduleOptionsFields action={form.actionType} value={form.options} onChange={(options) => setForm((current) => ({ ...current, options }))} /> },
+              },
               ...(form.actionType === "hardware_profile"
                 ? [
                     {

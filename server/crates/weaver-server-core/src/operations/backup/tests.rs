@@ -104,6 +104,8 @@ fn backup_temp_directory_is_owner_only() {
 async fn export_and_import_stable_state_roundtrip() {
     let src = Database::open_in_memory().unwrap();
     src.save_config(&sample_config()).unwrap();
+    src.add_metered_bandwidth_usage_minutes(&[(42, true, 120), (42, false, 300)])
+        .unwrap();
     let usage_updated_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     src.upsert_server_download_usage(&crate::servers::ServerDownloadUsage {
         server_id: 1,
@@ -224,6 +226,11 @@ async fn export_and_import_stable_state_roundtrip() {
     let dest = Database::open_in_memory().unwrap();
     assert!(dest.restore_target_is_pristine().unwrap());
     dest.import_stable_state(temp.path()).unwrap();
+    assert_eq!(dest.sum_bandwidth_usage_minutes(42, 43).unwrap(), 420);
+    assert_eq!(
+        dest.sum_metered_bandwidth_usage_minutes(42, 43).unwrap(),
+        120
+    );
 
     let restored = dest.load_config().unwrap();
     assert_eq!(restored.data_dir, "/old/data");

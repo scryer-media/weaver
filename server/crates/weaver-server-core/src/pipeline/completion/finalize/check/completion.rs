@@ -249,6 +249,10 @@ impl Pipeline {
     /// CRC failures occur, recovery files are promoted for download and repair
     /// runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return;
+        }
         // A container set whose map nothing left in flight could read holds its
         // volumes off the conventional path forever, and holding them is
         // exactly what keeps this gate from ruling. Asked here because this is
@@ -2865,6 +2869,7 @@ impl Pipeline {
                     }
                 };
                 match nested_decision {
+                    NestedExtractionDecision::Deferred => return,
                     NestedExtractionDecision::Started
                     | NestedExtractionDecision::NoNestedArchives => {
                         let mut removed = 0u32;

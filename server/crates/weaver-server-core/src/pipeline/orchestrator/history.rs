@@ -271,6 +271,8 @@ impl Pipeline {
         self.extraction_budgets.remove(&job_id);
         self.unacceptable_extension_policies.remove(&job_id);
         self.inflight_moves.remove(&job_id);
+        self.deferred_moves.remove(&job_id);
+        self.deferred_post_processing.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);

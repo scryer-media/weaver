@@ -98,6 +98,20 @@ pub fn export_schema_sdl() -> String {
 }
 
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
+    let backup = crate::BackupService::new(
+        context.handle.clone(),
+        context.config.clone(),
+        context.db.clone(),
+        context.rss.clone(),
+        std::path::PathBuf::new(),
+    );
+    build_schema_with_backup(context, backup)
+}
+
+pub fn build_schema_with_backup(
+    context: SchemaContext,
+    backup: crate::BackupService,
+) -> WeaverSchema {
     let replay = QueueEventReplay::default();
     replay.spawn_producer(context.handle.clone(), context.config.clone());
     let history_delete_manager = crate::history::delete_ops::HistoryDeleteManager::new(
@@ -145,6 +159,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         MutationRoot::default(),
         SubscriptionRoot::default(),
     ))
+    .data(backup)
     .data(context.handle)
     .data(context.scheduled_resume)
     .data(context.config)

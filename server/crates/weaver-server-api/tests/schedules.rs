@@ -1,5 +1,193 @@
 mod common;
 
+#[test]
+fn schedule_conversion_refuses_missing_action_parameters_without_fallbacks() {
+    use async_graphql::{InputType, value};
+    use weaver_server_api::settings::types::ScheduleInput;
+
+    for action in [
+        "set_server_active",
+        "set_quota_metering",
+        "hardware_profile",
+        "unknown_action",
+    ] {
+        let input = ScheduleInput::parse(Some(value!({ "time": "08:00", "actionType": action })))
+            .unwrap_or_else(|_| panic!("failed to parse schedule test input"));
+        assert!(
+            input.into_entry().is_err(),
+            "converted {action} without its required parameters"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rss_targets_are_validated_and_feed_deletion_removes_only_targeted_rules() {
+    use std::sync::Arc;
+    use weaver_server_core::bandwidth::{ScheduleAction, schedule::SharedSchedules};
+
+    let h = common::TestHarness::new().await;
+    let schedules: SharedSchedules = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let request = |query: String| {
+        async_graphql::Request::new(query)
+            .data(weaver_server_core::auth::CallerScope::Local)
+            .data(schedules.clone())
+    };
+    let invalid = h.schema.execute(request(r#"mutation { createSchedule(input: { enabled: false, time: "08:00", actionType: "fetch_rss", feedId: 123456 }) { id } }"#.into())).await;
+    assert!(
+        invalid
+            .errors
+            .iter()
+            .any(|error| error.message.contains("RSS feed 123456 not found"))
+    );
+    let feed = h.execute(r#"mutation { addRssFeed(input: { name: "scheduled feed", url: "https://example.com/rss", enabled: false }) { id } }"#).await;
+    common::assert_no_errors(&feed);
+    let id = common::response_data(&feed)["addRssFeed"]["id"]
+        .as_u64()
+        .unwrap();
+    for target in [format!(", feedId: {id}"), String::new()] {
+        let response = h.schema.execute(request(format!(r#"mutation {{ createSchedule(input: {{ enabled: false, time: "08:00", actionType: "fetch_rss" {target} }}) {{ id }} }}"#))).await;
+        common::assert_no_errors(&response);
+    }
+    let (deleted, added) = tokio::join!(
+        h.schema.execute(request(format!("mutation {{ deleteRssFeed(id: {id}) }}"))),
+        h.schema.execute(request(r#"mutation { createSchedule(input: { enabled: false, time: "09:00", actionType: "pause" }) { id } }"#.into())),
+    );
+    common::assert_no_errors(&deleted);
+    common::assert_no_errors(&added);
+    let persisted = h.db.list_schedules().unwrap();
+    assert_eq!(persisted.len(), 2);
+    assert!(
+        persisted
+            .iter()
+            .any(|entry| entry.action == ScheduleAction::FetchRss { feed_id: None })
+    );
+    assert!(
+        persisted
+            .iter()
+            .any(|entry| entry.action == ScheduleAction::Pause)
+    );
+    assert_eq!(*schedules.read().await, persisted);
+}
+
+#[tokio::test]
+async fn concurrent_schedule_creates_preserve_every_rule_and_runtime_publication() {
+    use std::sync::Arc;
+    use weaver_server_core::bandwidth::schedule::SharedSchedules;
+
+    let h = common::TestHarness::new().await;
+    let schedules: SharedSchedules = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let mut tasks = tokio::task::JoinSet::new();
+    for number in 0..12 {
+        let schema = h.schema.clone();
+        let schedules = schedules.clone();
+        tasks.spawn(async move {
+            schema
+                .execute(
+                    async_graphql::Request::new(format!(
+                        r#"mutation {{ createSchedule(input: {{ enabled: false, label: "rule-{number}", time: "08:00", actionType: "pause" }}) {{ id }} }}"#
+                    ))
+                    .data(weaver_server_core::auth::CallerScope::Local)
+                    .data(schedules),
+                )
+                .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        common::assert_no_errors(&result.unwrap());
+    }
+    let persisted = h.db.list_schedules().unwrap();
+    assert_eq!(persisted.len(), 12);
+    assert_eq!(*schedules.read().await, persisted);
+}
+
+#[tokio::test]
+async fn server_deletion_and_schedule_creation_publish_the_same_rule_set() {
+    use std::sync::Arc;
+    use weaver_server_core::bandwidth::schedule::SharedSchedules;
+
+    let h = common::TestHarness::new().await;
+    let schedules: SharedSchedules = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let response = h.execute(r#"mutation {
+        addServer(input: { host: "news.example.com", port: 119, tls: false, connections: 1, active: false }) { id }
+    }"#).await;
+    common::assert_no_errors(&response);
+    let id = common::response_data(&response)["addServer"]["id"]
+        .as_u64()
+        .unwrap();
+    let request = |query: String| {
+        async_graphql::Request::new(query)
+            .data(weaver_server_core::auth::CallerScope::Local)
+            .data(schedules.clone())
+    };
+    let response = h.schema.execute(request(format!(r#"mutation {{
+        createSchedule(input: {{ enabled: false, time: "08:00", actionType: "set_server_active", serverId: {id}, serverActive: false }}) {{ id }}
+    }}"#))).await;
+    common::assert_no_errors(&response);
+    let (removed, created) = tokio::join!(
+        h.schema.execute(request(format!(
+            "mutation {{ removeServer(id: {id}) {{ id }} }}"
+        ))),
+        h.schema.execute(request(
+            r#"mutation { createSchedule(input: { enabled: false, time: "09:00", actionType: "pause" }) { id } }"#.into()
+        )),
+    );
+    common::assert_no_errors(&removed);
+    common::assert_no_errors(&created);
+    let persisted = h.db.list_schedules().unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(
+        persisted[0].action,
+        weaver_server_core::bandwidth::ScheduleAction::Pause
+    );
+    assert_eq!(*schedules.read().await, persisted);
+}
+
+#[tokio::test]
+async fn one_shot_and_hourly_inputs_validate_and_update_every_field() {
+    let h = common::TestHarness::new().await;
+    for input in [
+        r#"{ time: "08:00", actionType: "pause", everyHourAtMinute: 10 }"#,
+        r#"{ time: "08:00", actionType: "fetch_rss", everyHourAtMinute: 60 }"#,
+        r#"{ time: "08:00", actionType: "set_server_active" }"#,
+        r#"{ time: "08:00", actionType: "set_quota_metering" }"#,
+        r#"{ time: "08:00", actionType: "prune_history" }"#,
+    ] {
+        let response = h
+            .execute(&format!(
+                "mutation {{ createSchedule(input: {input}) {{ id }} }}"
+            ))
+            .await;
+        assert!(
+            !response.errors.is_empty(),
+            "accepted invalid input {input}"
+        );
+    }
+    let response = h
+        .execute(
+            r#"mutation { createSchedule(input: {
+        enabled: false, time: "08:00", times: ["09:00", "17:00"], actionType: "fetch_rss"
+    }) { id time times track } }"#,
+        )
+        .await;
+    common::assert_no_errors(&response);
+    let data = common::response_data(&response);
+    let rule = &data["createSchedule"][0];
+    assert_eq!(rule["time"], "09:00");
+    assert_eq!(rule["track"], "ONE_SHOT");
+    let id = rule["id"].as_str().unwrap();
+    let response = h.execute(&format!(r#"mutation {{ updateSchedule(id: "{id}", input: {{
+        enabled: false, time: "00:00", everyHourAtMinute: 15, actionType: "prune_history",
+        pruneFailed: {{ deleteFiles: true }}, pruneCompleted: {{ deleteFiles: false }}
+    }}) {{ id times everyHourAtMinute actionType pruneFailed {{ deleteFiles }} pruneCompleted {{ deleteFiles }} }} }}"#)).await;
+    common::assert_no_errors(&response);
+    let data = common::response_data(&response);
+    let rule = &data["updateSchedule"][0];
+    assert_eq!(rule["id"], id);
+    assert_eq!(rule["everyHourAtMinute"], 15);
+    assert_eq!(rule["times"], serde_json::json!([]));
+    assert_eq!(rule["pruneCompleted"]["deleteFiles"], false);
+}
+
 use common::{TestHarness, assert_no_errors, response_data};
 use weaver_server_core::auth::CallerScope;
 
@@ -24,6 +212,32 @@ async fn list_schedules_empty() {
 }
 
 #[tokio::test]
+async fn unknown_schedule_action_is_refused_without_saving_a_resume() {
+    let h = TestHarness::new().await;
+    let response = h
+        .execute(
+            r#"mutation {
+        createSchedule(input: { time: "08:00", actionType: "typo" }) { id }
+    }"#,
+        )
+        .await;
+    assert!(
+        response
+            .errors
+            .iter()
+            .any(|error| error.message.contains("unknown schedule actionType"))
+    );
+    let response = h.execute("{ schedules { id } }").await;
+    assert_no_errors(&response);
+    assert!(
+        response_data(&response)["schedules"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn schedules_require_admin_scope() {
     let h = TestHarness::new().await;
     let query = "{ schedules { id } }";
@@ -33,6 +247,22 @@ async fn schedules_require_admin_scope() {
 
     let resp = h.execute_as(query, CallerScope::Admin).await;
     assert_no_errors(&resp);
+}
+
+#[tokio::test]
+async fn configured_speed_limit_is_a_distinct_speed_track_action() {
+    let h = TestHarness::new().await;
+    let response = h.execute(r#"mutation {
+        createSchedule(input: { enabled: false, time: "08:00", actionType: "configured_speed_limit" }) {
+            actionType track speedLimitBytes
+        }
+    }"#).await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let schedule = &data["createSchedule"][0];
+    assert_eq!(schedule["actionType"], "configured_speed_limit");
+    assert_eq!(schedule["track"], "SPEED");
+    assert!(schedule["speedLimitBytes"].is_null());
 }
 
 #[tokio::test]
@@ -279,6 +509,41 @@ async fn toggle_schedule() {
 }
 
 #[tokio::test]
+async fn toggling_a_migrated_download_rule_publishes_its_speed_reset() {
+    use std::sync::Arc;
+    use weaver_server_core::bandwidth::schedule::SharedSchedules;
+    let h = common::TestHarness::new().await;
+    h.db.set_setting("schedules", &serde_json::json!([
+        { "id": "limit", "time": "07:00", "action": {"type": "speed_limit", "bytes_per_sec": 1024} },
+        { "id": "resume", "time": "08:00", "enabled": false, "action": {"type": "resume"} }
+    ]).to_string()).unwrap();
+    let schedules: SharedSchedules =
+        Arc::new(tokio::sync::RwLock::new(h.db.list_schedules().unwrap()));
+    let response = h
+        .schema
+        .execute(
+            async_graphql::Request::new(
+                r#"mutation { toggleSchedule(id: "resume", enabled: true) { id enabled } }"#,
+            )
+            .data(weaver_server_core::auth::CallerScope::Local)
+            .data(schedules.clone()),
+        )
+        .await;
+    common::assert_no_errors(&response);
+    let persisted = h.db.list_schedules().unwrap();
+    assert!(persisted.iter().all(|entry| entry.enabled));
+    assert_eq!(persisted.len(), 3);
+    assert_eq!(*schedules.read().await, persisted);
+    assert!(
+        common::response_data(&response)["toggleSchedule"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["enabled"] == true)
+    );
+}
+
+#[tokio::test]
 async fn create_hardware_profile_schedule() {
     let h = TestHarness::new().await;
     let resp = h
@@ -326,7 +591,7 @@ async fn other_schedule_actions_carry_no_hardware_profile() {
                     actionType: "pause",
                     hardwareProfile: EFFICIENT
                 }) {
-                    actionType hardwareProfile
+                    actionType hardwareProfile track
                 }
             }"#,
         )
@@ -335,6 +600,7 @@ async fn other_schedule_actions_carry_no_hardware_profile() {
     let data = response_data(&resp);
     let sched = &data["createSchedule"].as_array().unwrap()[0];
     assert_eq!(sched["actionType"].as_str().unwrap(), "pause");
+    assert_eq!(sched["track"].as_str().unwrap(), "DOWNLOADS");
     assert!(sched["hardwareProfile"].is_null());
 }
 

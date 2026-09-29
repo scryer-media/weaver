@@ -1347,6 +1347,7 @@ impl Pipeline {
         };
 
         match nested_decision {
+            NestedExtractionDecision::Deferred => return,
             NestedExtractionDecision::Started | NestedExtractionDecision::NoNestedArchives => {
                 let mut removed = 0u32;
                 for filename in &cleanup_files {

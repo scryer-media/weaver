@@ -460,7 +460,8 @@ impl SettingsMutation {
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
         validate_schedule_input(ctx, &input)?;
-        let entry = input.into_entry();
+        let entry = input.into_entry().map_err(async_graphql::Error::new)?;
+        let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -468,8 +469,12 @@ impl SettingsMutation {
         .await??;
         entries.push(entry);
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
-        *schedules_state.write().await = entries.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
+        *schedules_guard = entries.clone();
         Ok(entries
             .into_iter()
             .map(crate::settings::types::Schedule::from)
@@ -487,22 +492,24 @@ impl SettingsMutation {
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
         validate_schedule_input(ctx, &input)?;
+        let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
         })
         .await??;
         if let Some(existing) = entries.iter_mut().find(|e| e.id == id) {
-            let updated = input.into_entry();
-            existing.enabled = updated.enabled;
-            existing.label = updated.label;
-            existing.days = updated.days;
-            existing.time = updated.time;
-            existing.action = updated.action;
+            let mut updated = input.into_entry().map_err(async_graphql::Error::new)?;
+            updated.id = existing.id.clone();
+            *existing = updated;
         }
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
-        *schedules_state.write().await = entries.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
+        *schedules_guard = entries.clone();
         Ok(entries
             .into_iter()
             .map(crate::settings::types::Schedule::from)
@@ -518,6 +525,7 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
+        let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -525,8 +533,12 @@ impl SettingsMutation {
         .await??;
         entries.retain(|e| e.id != id);
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
-        *schedules_state.write().await = entries.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
+        *schedules_guard = entries.clone();
         Ok(entries
             .into_iter()
             .map(crate::settings::types::Schedule::from)
@@ -543,6 +555,7 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
+        let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -552,8 +565,12 @@ impl SettingsMutation {
             existing.enabled = enabled;
         }
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
-        *schedules_state.write().await = entries.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
+        *schedules_guard = entries.clone();
         Ok(entries
             .into_iter()
             .map(crate::settings::types::Schedule::from)

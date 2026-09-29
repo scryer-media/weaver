@@ -901,6 +901,13 @@ impl Pipeline {
         if self.inflight_moves.contains(&job_id) {
             return Ok(());
         }
+        if self.shared_state.is_post_processing_paused() {
+            if self.jobs.contains_key(&job_id) {
+                self.deferred_moves.insert(job_id);
+            }
+            return Ok(());
+        }
+        self.deferred_moves.remove(&job_id);
 
         // The last gate at which every settlement fact is still in hand, and
         // the last at which refusing costs nothing: nothing has moved yet. The

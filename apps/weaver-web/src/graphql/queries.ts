@@ -1801,6 +1801,16 @@ export const SCHEDULES_QUERY = gql`
       days
       time
       actionType
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      feedId
+      quotaMeteringEnabled
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
     }
@@ -1816,6 +1826,16 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      feedId
+      quotaMeteringEnabled
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
     }
@@ -1831,6 +1851,16 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      feedId
+      quotaMeteringEnabled
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
     }
@@ -1846,6 +1876,16 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      feedId
+      quotaMeteringEnabled
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
     }
@@ -1861,6 +1901,16 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      feedId
+      quotaMeteringEnabled
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
     }
@@ -2010,3 +2060,15 @@ export const CANCEL_JOB_POST_PROCESSING_MUTATION = gql`
     cancelJobPostProcessing(jobId: $jobId)
   }
 `;
+
+export const BACKUP_LIBRARY_QUERY = gql`
+  query BackupLibrary {
+    backups { filename sizeBytes createdAt formatVersion sourceWeaverVersion sourceEngine encrypted rowCounts trigger status error }
+    backupSettings { customBackupPath backupPath }
+    autoBackupSettings { enabled dailyTimeLocal autoBackupKeyPresent nextRunAt }
+  }
+`;
+export const UPDATE_BACKUP_SETTINGS_MUTATION = gql`mutation UpdateBackupSettings($path: String) { updateBackupSettings(customBackupPath: $path) { customBackupPath backupPath } }`;
+export const UPDATE_AUTO_BACKUP_SETTINGS_MUTATION = gql`mutation UpdateAutoBackupSettings($input: AutoBackupSettingsInput!) { updateAutoBackupSettings(input: $input) { enabled dailyTimeLocal autoBackupKeyPresent nextRunAt } }`;
+export const DELETE_BACKUP_MUTATION = gql`mutation DeleteBackup($filename: String!) { deleteBackup(filename: $filename) }`;
+export const BACKUP_DOWNLOAD_TOKEN_MUTATION = gql`mutation BackupDownloadToken($filename: String!) { createBackupDownloadToken(filename: $filename) }`;

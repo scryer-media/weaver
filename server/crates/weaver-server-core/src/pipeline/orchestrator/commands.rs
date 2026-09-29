@@ -435,14 +435,61 @@ impl Pipeline {
                 let _ = self.event_tx.send(PipelineEvent::GlobalResumed);
                 let _ = reply.send(());
             }
-            SchedulerCommand::PausePostProcessing { reply } => {
+            SchedulerCommand::PausePostProcessing { reply }
+            | SchedulerCommand::ApplyScheduleAction {
+                action: crate::bandwidth::ScheduleAction::PausePostProcessing,
+                reply,
+            } => {
                 self.terminal_post_processing_executor.pause();
                 self.shared_state.set_post_processing_paused(true);
+                if let Some(runtime) = self.par3_runtime.as_mut() {
+                    runtime.admission_paused = true;
+                }
                 let _ = reply.send(());
             }
-            SchedulerCommand::ResumePostProcessing { reply } => {
+            SchedulerCommand::ResumePostProcessing { reply }
+            | SchedulerCommand::ApplyScheduleAction {
+                action: crate::bandwidth::ScheduleAction::ResumePostProcessing,
+                reply,
+            } => {
+                if !self.shared_state.is_post_processing_paused() {
+                    let _ = reply.send(());
+                    return;
+                }
                 self.terminal_post_processing_executor.resume();
                 self.shared_state.set_post_processing_paused(false);
+                if let Some(runtime) = self.par3_runtime.as_mut() {
+                    runtime.admission_paused = false;
+                    if let Err(error) = runtime.dispatch() {
+                        error!(%error, "PAR3 dispatch failed on post-processing resume");
+                    }
+                }
+                let deferred_moves: Vec<_> = self.deferred_moves.drain().collect();
+                for job_id in deferred_moves {
+                    if self.jobs.get(&job_id).is_some_and(|state| {
+                        !matches!(
+                            state.status,
+                            JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                        )
+                    }) && let Err(error) = self.start_move_to_complete(job_id).await
+                    {
+                        self.fail_job(job_id, error);
+                    }
+                }
+                self.promote_queued_repairs();
+                self.promote_queued_extractions();
+                let jobs: Vec<_> = self.deferred_post_processing.drain().collect();
+                for job_id in jobs {
+                    let Some(state) = self.jobs.get(&job_id) else {
+                        continue;
+                    };
+                    let files: Vec<_> = state.assembly.files().map(|file| file.file_id()).collect();
+                    for file_id in files {
+                        self.try_arm_direct_unpack_for_file(job_id, file_id);
+                    }
+                    self.try_rar_extraction(job_id).await;
+                    self.schedule_job_completion_check(job_id);
+                }
                 let _ = reply.send(());
             }
             SchedulerCommand::CancelPostProcessing { job_id, reply } => {
@@ -486,8 +533,7 @@ impl Pipeline {
                 let result = self.apply_bandwidth_cap_policy(policy);
                 let _ = reply.send(result);
             }
-            // A profile rule is its own track: it never ends a scheduled pause
-            // or speed limit, so it is taken before the code below that does.
+            // Profile commands use the profile activation path.
             SchedulerCommand::ApplyScheduleAction {
                 action: crate::bandwidth::ScheduleAction::HardwareProfile { profile },
                 reply,
@@ -497,22 +543,15 @@ impl Pipeline {
             }
             SchedulerCommand::ApplyScheduleAction { action, reply } => {
                 use crate::bandwidth::ScheduleAction;
-                if !matches!(&action, ScheduleAction::SpeedLimit { .. }) {
-                    self.scheduled_rate_limit = None;
-                    self.rate_limiter.set_rate(self.configured_rate_limit);
-                }
                 match action {
-                    ScheduleAction::Pause => {
+                    ScheduleAction::Pause | ScheduleAction::PauseAll => {
                         self.global_paused = true;
                         self.scheduled_pause = true;
                         self.shared_state.set_paused(true);
                         // The Scheduled kind now falls out of global_pause(), so
                         // any later block-state refresh keeps reporting it
                         // instead of reclassifying the pause as manual.
-                        self.shared_state.set_download_block(
-                            self.bandwidth_cap
-                                .to_download_block_state(self.global_pause()),
-                        );
+                        let _ = self.refresh_bandwidth_cap_window();
                         info!("schedule: paused downloads");
                     }
                     ScheduleAction::Resume => {
@@ -532,16 +571,32 @@ impl Pipeline {
                         self.shared_state.set_download_block(block);
                         info!(bytes_per_sec, "schedule: set speed limit");
                     }
+                    ScheduleAction::ConfiguredSpeedLimit => {
+                        self.scheduled_rate_limit = None;
+                        self.rate_limiter.set_rate(self.configured_rate_limit);
+                        let _ = self.refresh_bandwidth_cap_window();
+                        info!("schedule: restored configured speed limit");
+                    }
+                    ScheduleAction::SetQuotaMetering { enabled } => {
+                        self.bandwidth_cap.set_metering_enabled(enabled);
+                        let _ = self.refresh_bandwidth_cap_window();
+                    }
                     ScheduleAction::PauseWatchFolderScanning
-                    | ScheduleAction::ResumeWatchFolderScanning => {
+                    | ScheduleAction::ResumeWatchFolderScanning
+                    | ScheduleAction::SetServerActive { .. }
+                    | ScheduleAction::ScanWatchFolder
+                    | ScheduleAction::FetchRss { .. }
+                    | ScheduleAction::PruneHistory { .. } => {
                         let _ = self.refresh_bandwidth_cap_window();
                         warn!(
                             action = ?action,
-                            "watch folder schedule action reached download pipeline"
+                            "service schedule action reached download pipeline"
                         );
                     }
                     // Taken by the arm above.
-                    ScheduleAction::HardwareProfile { .. } => {}
+                    ScheduleAction::HardwareProfile { .. }
+                    | ScheduleAction::PausePostProcessing
+                    | ScheduleAction::ResumePostProcessing => {}
                 }
                 let _ = reply.send(());
             }

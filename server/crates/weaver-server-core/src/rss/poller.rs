@@ -61,6 +61,9 @@ impl RssService {
     }
 
     pub(crate) async fn try_run_due_sync(&self) -> Result<DueSyncOutcome, RssServiceError> {
+        if self.is_scheduled_paused() {
+            return Ok(DueSyncOutcome::NoFeedsDue);
+        }
         let Ok(_guard) = self.inner.sync_lock.try_lock() else {
             return Ok(DueSyncOutcome::SkippedActiveSync);
         };
@@ -72,6 +75,39 @@ impl RssService {
         } else {
             Ok(DueSyncOutcome::Completed(report))
         }
+    }
+
+    /// Additional scheduled fetch; the regular poller keeps its own cadence.
+    pub async fn run_scheduled_sync(
+        &self,
+        feed_id: Option<u32>,
+    ) -> Result<RssSyncReport, RssServiceError> {
+        self.run_scheduled_sync_cancellable(
+            feed_id,
+            crate::bandwidth::schedule::ScheduleCancellation::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_scheduled_sync_cancellable(
+        &self,
+        feed_id: Option<u32>,
+        cancellation: crate::bandwidth::schedule::ScheduleCancellation,
+    ) -> Result<RssSyncReport, RssServiceError> {
+        let _guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(RssSyncReport::default()),
+            guard = self.inner.sync_lock.lock() => guard,
+        };
+        if self.is_scheduled_paused() {
+            return Ok(RssSyncReport::default());
+        }
+        self.run_sync_inner_cancellable(
+            feed_id.map_or(RssSyncTarget::AllEnabledFeeds, RssSyncTarget::Feed),
+            false,
+            cancellation,
+        )
+        .await
     }
 
     /// Fire-and-forget trigger used by the NZBGet `fetchfeeds` facade.
@@ -101,6 +137,20 @@ impl RssService {
         target: RssSyncTarget,
         due_only: bool,
     ) -> Result<RssSyncReport, RssServiceError> {
+        self.run_sync_inner_cancellable(
+            target,
+            due_only,
+            crate::bandwidth::schedule::ScheduleCancellation::new(),
+        )
+        .await
+    }
+
+    async fn run_sync_inner_cancellable(
+        &self,
+        target: RssSyncTarget,
+        due_only: bool,
+        cancellation: crate::bandwidth::schedule::ScheduleCancellation,
+    ) -> Result<RssSyncReport, RssServiceError> {
         let feeds = self.load_target_feeds(target, due_only)?;
         if feeds.is_empty() {
             return Ok(RssSyncReport::default());
@@ -108,7 +158,13 @@ impl RssService {
 
         let mut report = RssSyncReport::default();
         for feed in feeds {
-            let feed_report = self.sync_feed(&feed).await;
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let feed_report = self.sync_feed(&feed, &cancellation).await;
+            if cancellation.is_cancelled() {
+                break;
+            }
             match feed_report {
                 Ok(feed_report) => {
                     report.feeds_polled += 1;
@@ -182,9 +238,17 @@ impl RssService {
         Ok(feeds.into_iter().filter(|feed| is_due(feed, now)).collect())
     }
 
-    async fn sync_feed(&self, feed: &RssFeedRow) -> Result<RssFeedSyncReport, RssServiceError> {
+    async fn sync_feed(
+        &self,
+        feed: &RssFeedRow,
+        cancellation: &crate::bandwidth::schedule::ScheduleCancellation,
+    ) -> Result<RssFeedSyncReport, RssServiceError> {
         let now = unix_now_secs();
-        let response = self.fetch_feed_response(feed).await?;
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(RssFeedSyncReport::default()),
+            result = self.fetch_feed_response(feed) => result?,
+        };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             self.inner
                 .db
@@ -221,9 +285,11 @@ impl RssService {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
             .or_else(|| feed.last_modified.clone());
-        let body = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES)
-            .await
-            .map_err(RssServiceError::Http)?;
+        let body = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(RssFeedSyncReport::default()),
+            result = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES) => result.map_err(RssServiceError::Http)?,
+        };
         let items = parse_feed_items(&body).map_err(RssServiceError::Parse)?;
 
         let rules = self
@@ -241,6 +307,9 @@ impl RssService {
         };
 
         for item in items {
+            if cancellation.is_cancelled() {
+                return Ok(report);
+            }
             if self
                 .inner
                 .db
@@ -259,12 +328,18 @@ impl RssService {
                 }
                 Some(rule) => {
                     report.items_accepted += 1;
-                    match self.accept_item(feed, &rule.row, &item).await {
+                    match self
+                        .accept_item_cancellable(feed, &rule.row, &item, cancellation)
+                        .await
+                    {
                         Ok(job_id) => {
                             report.items_submitted += 1;
                             self.record_seen(feed.id, &item, "submitted", Some(job_id), None)?;
                         }
                         Err(error) => {
+                            if cancellation.is_cancelled() {
+                                return Ok(report);
+                            }
                             report.items_ignored += 1;
                             report.errors.push(error.clone());
                             self.record_seen(feed.id, &item, "error", None, Some(&error))?;

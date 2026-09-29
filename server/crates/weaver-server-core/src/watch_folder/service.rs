@@ -85,6 +85,11 @@ impl WatchFolderService {
     }
 
     pub async fn set_scanning_paused(&self, paused: bool) -> Result<(), WatchFolderServiceError> {
+        if paused {
+            // A failed persistence write must not admit intake while the schedule
+            // evaluator retries the hold or exposes the failure through the UI.
+            self.pause_scanning_runtime().await;
+        }
         let db = self.inner.db.clone();
         tokio::task::spawn_blocking(move || {
             db.set_setting("watch_folder.scanning_paused", &paused.to_string())
@@ -97,6 +102,46 @@ impl WatchFolderService {
             cfg.watch_folder.scanning_paused = paused;
         }
         self.reconcile_from_config().await
+    }
+
+    pub(crate) async fn pause_scanning_runtime(&self) {
+        self.inner.config.write().await.watch_folder.scanning_paused = true;
+        self.stop().await;
+    }
+
+    pub(crate) async fn scanning_paused(&self) -> bool {
+        self.inner.config.read().await.watch_folder.scanning_paused
+    }
+
+    pub(crate) async fn restore_scanning_runtime(
+        &self,
+        paused: bool,
+    ) -> Result<(), WatchFolderServiceError> {
+        self.inner.config.write().await.watch_folder.scanning_paused = paused;
+        self.reconcile_from_config().await
+    }
+
+    pub async fn scan_scheduled(
+        &self,
+    ) -> Result<Option<WatchFolderScanReport>, WatchFolderServiceError> {
+        self.scan_scheduled_cancellable(crate::bandwidth::schedule::ScheduleCancellation::new())
+            .await
+    }
+
+    pub(crate) async fn scan_scheduled_cancellable(
+        &self,
+        cancellation: crate::bandwidth::schedule::ScheduleCancellation,
+    ) -> Result<Option<WatchFolderScanReport>, WatchFolderServiceError> {
+        let settings = self.inner.config.read().await.watch_folder.clone();
+        if !settings.automatic_scanning_enabled() {
+            return Ok(None);
+        }
+        self.inner
+            .scanner
+            .scan_once_cancellable(settings, cancellation)
+            .await
+            .map(Some)
+            .map_err(Into::into)
     }
 
     pub async fn configure(
@@ -534,5 +579,28 @@ mod tests {
         assert!(!enqueue_scan_signal(&tx, Ok(second)));
         assert_eq!(rx.try_recv().unwrap(), ());
         assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn scheduled_scans_respect_off_and_paused_while_manual_scans_remain_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = shared_config(WatchFolderConfig {
+            path: Some(dir.path().display().to_string()),
+            ..Default::default()
+        });
+        let service = WatchFolderService::new(
+            Database::open_in_memory().unwrap(),
+            test_scheduler_handle(),
+            config.clone(),
+        );
+        assert!(service.scan_scheduled().await.unwrap().is_none());
+        {
+            let mut cfg = config.write().await;
+            cfg.watch_folder.mode = WatchFolderMode::Polling;
+            cfg.watch_folder.scanning_paused = true;
+        }
+        assert!(service.scan_scheduled().await.unwrap().is_none());
+        service.scan_now().await.unwrap();
+        config.write().await.watch_folder.scanning_paused = false;
+        assert!(service.scan_scheduled().await.unwrap().is_some());
     }
 }

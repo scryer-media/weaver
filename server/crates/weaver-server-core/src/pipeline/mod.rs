@@ -2857,6 +2857,10 @@ pub struct Pipeline {
     pub(super) body_fetch_failure_log_throttle: download::JobLogThrottle,
     /// Jobs currently performing their final move into the complete directory.
     pub(super) inflight_moves: HashSet<JobId>,
+    /// Final moves admitted after the post-processing hold is lifted.
+    pub(super) deferred_moves: HashSet<JobId>,
+    /// Jobs whose post-processing admission was refused by the global hold.
+    pub(super) deferred_post_processing: HashSet<JobId>,
     /// Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
     pub(super) reserved_complete_destinations: HashMap<JobId, PathBuf>,
     /// Members whose incremental extraction failed (corrupt volume, CRC error, etc).

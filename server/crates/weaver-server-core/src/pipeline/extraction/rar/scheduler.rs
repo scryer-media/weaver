@@ -477,6 +477,10 @@ impl Pipeline {
     }
 
     async fn try_batch_extraction(&mut self, job_id: JobId) {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return;
+        }
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
