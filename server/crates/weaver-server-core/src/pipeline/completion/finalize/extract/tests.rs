@@ -1018,12 +1018,13 @@ fn conventional_7z_measured_dictionary_may_exceed_profile_allowance() {
     assert_eq!(budget.memory_reserved_bytes(), 0);
 }
 
-/// An encoded end header decodes under the reader's limits, which reach the
-/// ceiling, before anything about the archive has been measured. The
-/// conventional metadata pass never parks, so it is admitted up to the
-/// ceiling rather than on a header-sized allowance.
+/// Listing an archive allocates the end header and, for an encoded one, its
+/// decoders and what it decodes to, all of which the listing's reader limits.
+/// The conventional metadata pass reserves that and no more, so it does not
+/// wait for every other decoder in the process to finish.
 #[test]
-fn conventional_7z_metadata_pass_is_admitted_up_to_the_ceiling() {
+fn conventional_7z_metadata_pass_reserves_what_its_reader_is_limited_to() {
+    const MIB: u64 = 1024 * 1024;
     let temp = TempDir::new().unwrap();
     let archive_path = temp.path().join("wide_dictionary.7z");
     let out_dir = temp.path().join("out");
@@ -1033,10 +1034,9 @@ fn conventional_7z_metadata_pass_is_admitted_up_to_the_ceiling() {
         &[("Wide.Dictionary/episode.txt", b"wide dictionary")],
     );
     fs::write(&archive_path, &archive).unwrap();
-    let header_floor =
-        chase_header_pass_memory_bytes(sevenz_end_header_bytes(&archive), 512 * 1024 * 1024);
+    let end_header = sevenz_end_header_bytes(&archive);
 
-    let (root, budget) = test_extraction_security_with_memory(&out_dir, 512 * 1024 * 1024);
+    let (root, budget) = test_extraction_security_with_memory(&out_dir, 512 * MIB);
     let context = conventional_7z_context(&out_dir, root, Arc::clone(&budget), &archive, 1);
     let reserved_at_open = std::sync::Mutex::new(Vec::new());
     extract_7z_stream(&context, || {
@@ -1048,12 +1048,233 @@ fn conventional_7z_metadata_pass_is_admitted_up_to_the_ceiling() {
     })
     .expect("7z extraction");
 
-    let metadata_pass = reserved_at_open.lock().unwrap()[0];
-    assert!(
-        metadata_pass > header_floor,
-        "the metadata pass held {metadata_pass} bytes, no more than the header-sized \
-         {header_floor}"
+    let reserved_at_open = reserved_at_open.into_inner().unwrap();
+    assert_eq!(reserved_at_open.len(), 2, "one listing, one decode");
+    assert_eq!(
+        reserved_at_open[0],
+        end_header
+            + HEADER_PASS_UNPACKED_BYTES
+            + HEADER_PASS_DECODER_BYTES
+            + CHASE_HEADER_PASS_ALLOWANCE_BYTES
     );
+    assert_eq!(
+        fixed_header_pass_memory_bytes(end_header, 32 * MIB),
+        32 * MIB,
+        "the listing never reserves past the ceiling"
+    );
+    let limits = header_pass_archive_limits(&budget);
+    assert_eq!(limits.memory_limit_bytes, HEADER_PASS_DECODER_BYTES);
+    assert_eq!(limits.max_header_unpacked_bytes, HEADER_PASS_UNPACKED_BYTES);
+    assert_eq!(limits.max_end_header_bytes, 512 * MIB);
+}
+
+/// A listing is not held behind decoders it has no need of: with most of the
+/// process limit reserved by another extraction, it lists and extracts in the
+/// room that is left. Reserved up to the ceiling, it waited for that
+/// extraction to finish, and this test would not return.
+#[test]
+fn conventional_7z_extraction_runs_beside_another_extractions_decoder() {
+    use crate::pipeline::extraction::ProcessMemoryBudget;
+
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let archive =
+        sevenz_archive_with_dictionary(1024 * 1024, &[("episode.txt", b"beside a decoder")]);
+
+    let limit = 1024 * MIB;
+    let pool = Arc::new(ProcessMemoryBudget::new(limit));
+    let budget_for = |job: u64, root: &Path| {
+        JobExtractionBudget::new_with_process_memory(
+            Arc::new(ExtractionLimits {
+                max_job_bytes: 2 * 1024 * 1024 * 1024 * 1024,
+                max_member_bytes: 1024 * 1024 * 1024 * 1024,
+                max_entries: 100_000,
+                max_ratio: 100,
+                max_seconds: 43_200,
+                min_free_bytes: 1,
+                max_memory_bytes: limit,
+            }),
+            pool.for_job(job),
+            root.to_path_buf(),
+            limit,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap()
+    };
+    let other = budget_for(2, temp.path());
+    let other_decoder = other.reserve_memory_wait(768 * MIB).unwrap();
+
+    let budget = budget_for(1, &out_dir);
+    let root = ExtractionRoot::open(&out_dir).unwrap();
+    let context = conventional_7z_context(&out_dir, root, Arc::clone(&budget), &archive, 1);
+    extract_7z_stream(&context, || Ok(Cursor::new(archive.clone())))
+        .expect("the extraction fits beside the other decoder");
+
+    assert_eq!(
+        fs::read(out_dir.join("episode.txt")).unwrap(),
+        b"beside a decoder"
+    );
+    assert_eq!(pool.reserved_bytes(), 768 * MIB);
+    assert!(!pool.has_waiters());
+    drop(other_decoder);
+    assert_eq!(pool.reserved_bytes(), 0);
+}
+
+/// A chase parked on its download keeps its decoder through any number of
+/// conventional extractions that fit beside it: none of them waits, so none
+/// of them asks it to yield.
+#[test]
+fn conventional_7z_extractions_leave_a_parked_chase_its_decoder() {
+    use crate::pipeline::direct_unpack::coverage::SetCoverage;
+    use crate::pipeline::extraction::ProcessMemoryBudget;
+
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    let archive =
+        sevenz_archive_with_dictionary(1024 * 1024, &[("episode.txt", b"beside a chase")]);
+
+    let limit = 1024 * MIB;
+    let pool = Arc::new(ProcessMemoryBudget::new(limit));
+    let budget_for = |job: u64, root: &Path| {
+        JobExtractionBudget::new_with_process_memory(
+            Arc::new(ExtractionLimits {
+                max_job_bytes: 2 * 1024 * 1024 * 1024 * 1024,
+                max_member_bytes: 1024 * 1024 * 1024 * 1024,
+                max_entries: 100_000,
+                max_ratio: 100,
+                max_seconds: 43_200,
+                min_free_bytes: 1,
+                max_memory_bytes: limit,
+            }),
+            pool.for_job(job),
+            root.to_path_buf(),
+            limit,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap()
+    };
+
+    let chase_budget = budget_for(1, temp.path());
+    let coverage = Arc::new(SetCoverage::new(1));
+    let held = Arc::clone(&chase_budget);
+    coverage.yield_to_memory_pressure(Arc::clone(&pool), move || held.memory_reserved_bytes());
+    let chase_decoder = chase_budget.reserve_memory_wait(512 * MIB).unwrap();
+    let chase_coverage = Arc::clone(&coverage);
+    let chase = std::thread::spawn(move || {
+        let _decoder = chase_decoder;
+        chase_coverage.resolve_position(0, 0)
+    });
+    while pool.parked_bytes() == 0 {
+        std::thread::yield_now();
+    }
+
+    std::thread::scope(|scope| {
+        for job in 2..6u64 {
+            let out_dir = temp.path().join(format!("out-{job}"));
+            fs::create_dir_all(&out_dir).unwrap();
+            let budget = budget_for(job, &out_dir);
+            let archive = &archive;
+            scope.spawn(move || {
+                let root = ExtractionRoot::open(&out_dir).unwrap();
+                let context =
+                    conventional_7z_context(&out_dir, root, Arc::clone(&budget), archive, 1);
+                extract_7z_stream(&context, || Ok(Cursor::new(archive.clone())))
+                    .expect("the extraction fits beside the parked chase");
+                assert_eq!(
+                    fs::read(out_dir.join("episode.txt")).unwrap(),
+                    b"beside a chase"
+                );
+            });
+        }
+    });
+
+    assert_eq!(pool.yield_tickets(), 0);
+    coverage.abort("test teardown");
+    let outcome = chase.join().unwrap().unwrap_err().to_string();
+    assert!(
+        outcome.contains("test teardown"),
+        "the chase kept its decoder until teardown: {outcome}"
+    );
+    assert_eq!(pool.reserved_bytes(), 0);
+}
+
+/// An encoded header whose coders need more than a listing allows them is
+/// listed again admitted up to the ceiling, which is what the job's own
+/// limits let that decode allocate, and the archive is read all the same.
+#[test]
+fn conventional_7z_listing_goes_up_to_the_ceiling_for_a_header_it_cannot_decode() {
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    // Enough members that the writer stores the header compressed.
+    let names: Vec<String> = (0..256)
+        .map(|index| format!("Listing.Fixture/member-{index:04}.txt"))
+        .collect();
+    let members: Vec<(&str, &[u8])> = names
+        .iter()
+        .map(|name| (name.as_str(), b"content".as_slice()))
+        .collect();
+    let archive = sevenz_archive_with_dictionary(1024 * 1024, &members);
+    let end_header = sevenz_end_header_bytes(&archive);
+    let (_root, budget) = test_extraction_security_with_memory(temp.path(), 512 * MIB);
+    let decode_memory = SevenZipDecodeMemory::ReservedForFixedThreads {
+        end_header_bytes: end_header,
+        allowance_cap: u64::MAX,
+    };
+    // No encoded header's coders fit a kilobyte.
+    let starved = sevenz_turbo::ArchiveLimits {
+        memory_limit_bytes: 1024,
+        ..header_pass_archive_limits(&budget)
+    };
+
+    let reserved_at_open = std::sync::Mutex::new(Vec::new());
+    let (listed, permit) = read_sevenz_archive_for_listing(
+        &decode_memory,
+        end_header,
+        &budget,
+        &sevenz_turbo::Password::empty(),
+        &starved,
+        &mut || {
+            reserved_at_open
+                .lock()
+                .unwrap()
+                .push(budget.memory_reserved_bytes());
+            Ok(Cursor::new(archive.clone()))
+        },
+    )
+    .expect("the listing is admitted up to the ceiling");
+
+    assert_eq!(listed.files.len(), 256);
+    let reserved_at_open = reserved_at_open.into_inner().unwrap();
+    assert_eq!(
+        reserved_at_open,
+        vec![
+            fixed_header_pass_memory_bytes(end_header, 512 * MIB),
+            permit.bytes()
+        ],
+        "one listing under the header reservation, one under the ceiling's"
+    );
+    assert!(permit.bytes() > fixed_header_pass_memory_bytes(end_header, 512 * MIB));
+    drop(permit);
+    assert_eq!(budget.memory_reserved_bytes(), 0);
+
+    assert!(header_coders_exceeded_memory(
+        &sevenz_turbo::Error::MaxMemLimited {
+            max_kb: 1,
+            actaul_kb: 2
+        }
+    ));
+    assert!(!header_coders_exceeded_memory(
+        &sevenz_turbo::Error::EndHeaderTooLarge {
+            limit_bytes: 1,
+            declared_bytes: 2
+        }
+    ));
 }
 
 /// The dictionary an archive declares is allocated on the archive's say-so.
