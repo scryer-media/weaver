@@ -83,6 +83,31 @@ async fn downloaded_barrier_persists_and_mark_bad_prevents_native_finalization()
         .unwrap();
     pipeline.check_job_completion(job_id).await;
     assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Downloading);
+    // Holding the barrier, before admission: the download is complete, so the
+    // job neither pauses nor accepts a semantic cancel, and reports waiting.
+    assert!(matches!(
+        pipeline.pause_job_runtime(job_id),
+        Err(crate::SchedulerError::Conflict(_))
+    ));
+    let (reply, cancelled) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::CancelJob {
+            job_id,
+            origin: crate::jobs::handle::CancellationOrigin::SemanticSuperseded,
+            reply,
+        })
+        .await;
+    assert!(matches!(
+        cancelled.await.unwrap(),
+        Err(crate::SchedulerError::Conflict(_))
+    ));
+    let listed = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .unwrap();
+    assert_eq!(listed.status, JobStatus::AwaitingQueueScripts);
+    assert_eq!(listed.run_state, crate::jobs::model::RunState::Active);
     let TerminalPostProcessingEvent::QueueAdmitted(id) = pipeline
         .terminal_post_processing_done_rx
         .recv()
@@ -92,12 +117,7 @@ async fn downloaded_barrier_persists_and_mark_bad_prevents_native_finalization()
         panic!("expected queue admission");
     };
     assert_eq!(id, job_id);
-    pipeline.transition_postprocessing_status(
-        job_id,
-        JobStatus::AwaitingQueueScripts,
-        Some("waiting for queue scripts"),
-    );
-    pipeline.persist_active_runtime(job_id);
+    pipeline.handle_queue_scripts_admitted(id);
     assert_eq!(
         pipeline.jobs[&job_id].status,
         JobStatus::AwaitingQueueScripts
@@ -145,10 +165,10 @@ async fn downloaded_barrier_persists_and_mark_bad_prevents_native_finalization()
         panic!("expected queue completion");
     };
     assert_eq!(id, job_id);
-    result.unwrap();
-    pipeline.queue_script_waiters.remove(&job_id);
-    pipeline.queue_scripts_completed.insert(job_id);
-    assert!(pipeline.apply_queue_script_effects(job_id));
+    result.as_ref().unwrap();
+    pipeline.handle_queue_scripts_done(id, result).await;
+    assert!(!pipeline.queue_script_waiters.contains(&job_id));
+    assert!(pipeline.queue_scripts_completed.contains(&job_id));
     assert!(!pipeline.par2_verified.contains(&job_id));
     assert!(!pipeline.inflight_moves.contains(&job_id));
     assert!(pipeline.inflight_terminal_post_processing.contains(&job_id));
@@ -308,4 +328,48 @@ async fn cancellation_cleanup_waits_for_the_jobs_deletion_event() {
     cleanup.await.unwrap();
     assert!(!working_dir.exists());
     assert!(!staging_dir.exists());
+}
+
+#[tokio::test]
+async fn queue_scripts_that_cannot_run_do_not_fail_the_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_queue_script(&pipeline.db, temp.path());
+    let job_id = JobId(169);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("script-infrastructure", &[]),
+    )
+    .await;
+    pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.queue_script_waiters.contains(&job_id));
+    pipeline
+        .handle_queue_scripts_done(
+            job_id,
+            Err(crate::StateError::Database("settings unavailable".into())),
+        )
+        .await;
+    assert!(!pipeline.queue_script_waiters.contains(&job_id));
+    assert!(pipeline.queue_scripts_completed.contains(&job_id));
+    assert!(
+        !matches!(pipeline.jobs[&job_id].status, JobStatus::Failed { .. }),
+        "{:?}",
+        pipeline.jobs[&job_id].status
+    );
+}
+
+#[tokio::test]
+async fn a_late_queue_event_leaves_a_job_that_moved_on_alone() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(170);
+    insert_active_job(&mut pipeline, job_id, standalone_job_spec("moved-on", &[])).await;
+    set_job_status_for_test(&mut pipeline, job_id, JobStatus::Verifying);
+    pipeline.queue_script_waiters.insert(job_id);
+    pipeline.handle_queue_scripts_admitted(job_id);
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Verifying);
+    pipeline.handle_queue_scripts_done(job_id, Ok(())).await;
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Verifying);
+    assert!(!pipeline.queue_scripts_completed.contains(&job_id));
 }

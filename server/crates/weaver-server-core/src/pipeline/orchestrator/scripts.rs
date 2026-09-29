@@ -125,6 +125,66 @@ impl Pipeline {
         true
     }
 
+    /// A job whose download is complete and that holds the queue-script
+    /// barrier. Until the scripts finish it is not downloading: it cannot be
+    /// paused, a semantic cancel is not safe, and it reports as waiting.
+    pub(crate) fn awaiting_queue_script_barrier(&self, job_id: JobId) -> bool {
+        self.queue_script_waiters.contains(&job_id)
+    }
+
+    pub(crate) fn handle_queue_scripts_admitted(&mut self, job_id: JobId) {
+        if self.queue_script_waiters.contains(&job_id)
+            && self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|job| queue_barrier_status(&job.status))
+        {
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::AwaitingQueueScripts,
+                Some("waiting for queue scripts"),
+            );
+            self.persist_active_runtime(job_id);
+            self.publish_snapshot();
+        }
+    }
+
+    pub(crate) async fn handle_queue_scripts_done(
+        &mut self,
+        job_id: JobId,
+        result: Result<(), crate::StateError>,
+    ) {
+        let was_waiting = self.queue_script_waiters.remove(&job_id);
+        if !was_waiting
+            || !self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|job| queue_barrier_status(&job.status))
+        {
+            return;
+        }
+        // The scripts' own outcomes are recorded with their runs. A failure to
+        // run them at all (a lost admission, an unreadable setting) is not the
+        // job's fault, so the job carries on.
+        if let Err(error) = result {
+            tracing::warn!(job_id = job_id.0, %error, "queue scripts could not run; continuing the job");
+        }
+        self.queue_scripts_completed
+            .retain(|id| self.jobs.contains_key(id));
+        self.queue_scripts_completed.insert(job_id);
+        if self.apply_queue_script_effects(job_id) {
+            return;
+        }
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|job| job.status == JobStatus::AwaitingQueueScripts)
+        {
+            self.transition_postprocessing_status(job_id, JobStatus::Downloading, None);
+        }
+        self.check_job_completion(job_id).await;
+    }
+
     pub(crate) fn apply_queue_script_effects(&mut self, job_id: JobId) -> bool {
         if !self.jobs.contains_key(&job_id) {
             return false;
@@ -159,4 +219,13 @@ impl Pipeline {
         }
         false
     }
+}
+
+/// The statuses a job holding the queue-script barrier can be in. Anything
+/// else means the job moved on, and a late event must not act on it.
+fn queue_barrier_status(status: &JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::AwaitingQueueScripts | JobStatus::Downloading | JobStatus::Queued
+    )
 }

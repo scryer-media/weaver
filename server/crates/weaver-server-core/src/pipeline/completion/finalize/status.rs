@@ -578,6 +578,11 @@ impl Pipeline {
         if matches!(previous_run_state, crate::jobs::model::RunState::Paused) {
             return Ok(());
         }
+        if self.awaiting_queue_script_barrier(job_id) {
+            return Err(crate::SchedulerError::Conflict(
+                "the download is complete and waiting for queue scripts".into(),
+            ));
+        }
         // A pause stops new dispatch but never resumes on a schedule, so a
         // parked chase would hold a blocking thread for as long as the operator
         // leaves the job paused. Retryable: nothing about the archive was

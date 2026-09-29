@@ -1081,30 +1081,10 @@ impl Pipeline {
                                 self.handle_history_delete_done(done);
                             }
                             TerminalPostProcessingEvent::QueueAdmitted(job_id) => {
-                                if self.queue_script_waiters.contains(&job_id)
-                                    && self.jobs.get(&job_id).is_some_and(|job| !matches!(job.status, JobStatus::Paused | JobStatus::Checking | JobStatus::Moving | JobStatus::Complete | JobStatus::Failed { .. }))
-                                {
-                                    self.transition_postprocessing_status(job_id, JobStatus::AwaitingQueueScripts, Some("waiting for queue scripts"));
-                                    self.persist_active_runtime(job_id);
-                                    self.publish_snapshot();
-                                }
+                                self.handle_queue_scripts_admitted(job_id);
                             }
                             TerminalPostProcessingEvent::QueueDone(job_id, result) => {
-                                let was_waiting = self.queue_script_waiters.remove(&job_id);
-                                if was_waiting && self.jobs.get(&job_id).is_some_and(|job| !matches!(job.status, JobStatus::Paused | JobStatus::Checking | JobStatus::Moving | JobStatus::Complete | JobStatus::Failed { .. })) {
-                                    match result {
-                                        Ok(()) => {
-                                            self.queue_scripts_completed.retain(|id| self.jobs.contains_key(id));
-                                            self.queue_scripts_completed.insert(job_id);
-                                            if self.apply_queue_script_effects(job_id) { continue; }
-                                            if self.jobs.get(&job_id).is_some_and(|job| job.status == JobStatus::AwaitingQueueScripts) {
-                                                self.transition_postprocessing_status(job_id, JobStatus::Downloading, None);
-                                            }
-                                            self.check_job_completion(job_id).await;
-                                        }
-                                        Err(error) => self.fail_job(job_id, format!("queue scripts failed: {error}")),
-                                    }
-                                }
+                                self.handle_queue_scripts_done(job_id, result).await;
                             }
                             TerminalPostProcessingEvent::Started(job_id) => {
                                 self.handle_terminal_post_processing_started(job_id);

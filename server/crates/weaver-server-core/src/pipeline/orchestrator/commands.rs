@@ -48,16 +48,17 @@ impl Pipeline {
                 origin,
                 reply,
             } => {
-                let semantic_cancel_is_safe = self.jobs.get(&job_id).is_some_and(|state| {
-                    matches!(
-                        (state.download_state, state.post_state),
-                        (
-                            crate::jobs::model::DownloadState::Queued
-                                | crate::jobs::model::DownloadState::Downloading,
-                            crate::jobs::model::PostState::Idle
+                let semantic_cancel_is_safe = !self.awaiting_queue_script_barrier(job_id)
+                    && self.jobs.get(&job_id).is_some_and(|state| {
+                        matches!(
+                            (state.download_state, state.post_state),
+                            (
+                                crate::jobs::model::DownloadState::Queued
+                                    | crate::jobs::model::DownloadState::Downloading,
+                                crate::jobs::model::PostState::Idle
+                            )
                         )
-                    )
-                });
+                    });
                 let result = if !matches!(origin, crate::jobs::handle::CancellationOrigin::User)
                     && !semantic_cancel_is_safe
                 {

@@ -1352,6 +1352,11 @@ impl Pipeline {
             let native_verifying = self.show_par3_verification_wait(state.job_id);
             let status = if native_verifying {
                 JobStatus::Verifying
+            } else if self.awaiting_queue_script_barrier(state.job_id)
+                && state.status == JobStatus::Downloading
+            {
+                // The download is complete; its queue scripts are being admitted.
+                JobStatus::AwaitingQueueScripts
             } else {
                 state.status.clone()
             };
