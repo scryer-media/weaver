@@ -9,7 +9,6 @@ use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::events::publish::should_record_job_event;
 use weaver_server_core::runtime::buffers::{BufferPool, BufferPoolConfig};
 use weaver_server_core::runtime::system_profile::SystemProfile;
-use weaver_server_core::servers::ServerConfig;
 use weaver_server_core::settings::Config;
 
 pub(crate) struct RuntimeContext {
@@ -63,15 +62,10 @@ pub(crate) fn build_nntp_client(
     policy_registry: &weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
     proxies: &weaver_server_core::proxies::ProxyRuntime,
 ) -> Result<NntpClient, String> {
-    let transfer_registry = policy_registry.transfer_registry();
-    let mut active: Vec<&ServerConfig> = config
+    let total_connections: usize = config
         .servers
         .iter()
         .filter(|server| server.active)
-        .collect();
-    active.sort_by_key(|server| (server.priority, server.id));
-    let total_connections: usize = active
-        .iter()
         .map(|server| server.connections as usize)
         .sum();
     let effective_memory = profile
@@ -80,43 +74,13 @@ pub(crate) fn build_nntp_client(
         .unwrap_or(profile.memory.available_bytes);
     let buffer_profile =
         weaver_nntp::connection::NntpBufferProfile::adaptive(effective_memory, total_connections);
-    let servers = active
-        .iter()
-        .map(|server| {
-            Ok::<_, String>(weaver_nntp::pool::ServerPoolConfig {
-                server: weaver_nntp::ServerConfig {
-                    proxy: proxies.nntp_bridge(server.id)?,
-                    revocation: Some(proxies.nntp_sockets(server.id)?),
-                    host: server.host.clone(),
-                    port: server.port,
-                    tls: server.tls,
-                    username: server.username.clone(),
-                    password: server.password.clone(),
-                    tls_ca_cert: server.tls_ca_cert.clone(),
-                    buffer_profile,
-                    pipelining: weaver_nntp::PipeliningCapability::Known(
-                        server.supports_pipelining,
-                    ),
-                    ..Default::default()
-                },
-                max_connections: server.connections as usize,
-                group: server.priority,
-                backfill: server.backfill,
-                retention_days: server.retention_days,
-                stable_id: weaver_nntp::transfer::StableServerId(server.id),
-                transfer_control: Some(
-                    transfer_registry.control(weaver_nntp::transfer::StableServerId(server.id)),
-                ),
-            })
-        })
-        .collect::<Result<_, _>>()?;
-
-    Ok(NntpClient::new(weaver_nntp::client::NntpClientConfig {
-        servers,
-        max_idle_age: std::time::Duration::from_secs(300),
-        max_retries_per_server: 1,
-        soft_timeout: std::time::Duration::from_secs(15),
-    }))
+    let servers = weaver_server_core::runtime::reload::nntp_server_pool_configs(
+        &config.servers,
+        Some(proxies),
+        &policy_registry.transfer_registry(),
+        buffer_profile,
+    )?;
+    Ok(weaver_server_core::runtime::reload::nntp_client(servers))
 }
 
 pub(crate) async fn flush_server_transfer_usage(
@@ -242,6 +206,124 @@ mod tests {
     use super::*;
 
     use weaver_server_core::jobs::ids::JobId;
+
+    fn test_profile() -> SystemProfile {
+        use weaver_server_core::runtime::system_profile::{
+            CpuProfile, DiskProfile, FilesystemType, MemoryProfile, StorageClass,
+        };
+        SystemProfile {
+            cpu: CpuProfile {
+                physical_cores: 2,
+                logical_cores: 2,
+                simd: Default::default(),
+                cgroup_limit: None,
+            },
+            memory: MemoryProfile {
+                total_bytes: 1024 * 1024 * 1024,
+                available_bytes: 1024 * 1024 * 1024,
+                cgroup_limit: None,
+            },
+            disk: DiskProfile {
+                storage_class: StorageClass::Unknown,
+                filesystem: FilesystemType::Unknown("test".into()),
+                sequential_write_mbps: 0.0,
+                random_read_iops: 0.0,
+                same_filesystem: true,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_client_dials_through_the_server_route() {
+        use tokio::io::AsyncWriteExt;
+        use weaver_server_core::proxies::{
+            Consumer, EgressBinding, EgressInterface, LegPath, ProxyRuntime, RouteLeg,
+            RoutingPolicy,
+        };
+
+        // A reachable server: a client that ignored the route would connect
+        // here on the system route and read the greeting.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = socket.write_all(b"200 ready\r\n").await;
+            }
+        });
+
+        let db = Database::open_in_memory().unwrap();
+        db.insert_server(&weaver_server_core::servers::ServerConfig {
+            id: 7,
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            username: None,
+            password: None,
+            connections: 2,
+            active: true,
+            supports_pipelining: true,
+            pipelining_depth: Some(4),
+            tls_name_mismatch_certificate_der: Some(vec![1, 2, 3]),
+            priority: 0,
+            backfill: false,
+            retention_days: 0,
+            max_download_speed: 0,
+            download_quota: Default::default(),
+            tls_ca_cert: None,
+        })
+        .unwrap();
+        // The only leg leaves through an interface this host does not have.
+        let egress = db
+            .create_egress_interface(&EgressInterface {
+                id: 0,
+                name: "tunnel".into(),
+                binding: EgressBinding::Interface {
+                    name: "weaver-absent0".into(),
+                },
+                enabled: true,
+                max_download_speed: 0,
+            })
+            .unwrap();
+        db.save_proxy_routing_policy(
+            Consumer::Server(7),
+            &RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: egress.id,
+                    weight: 100,
+                    path: LegPath::Direct,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let config = db.load_config().unwrap();
+        let registry =
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                db.clone(),
+                &config.servers,
+            )
+            .unwrap();
+        let proxies = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+        let client = build_nntp_client(&config, &test_profile(), &registry, &proxies).unwrap();
+
+        let server = &client.pool().server_configs()[0];
+        assert!(server.dialer.is_some(), "startup must use the route dialer");
+        assert!(server.proxy.is_none());
+        assert_eq!(server.pipelining_depth, Some(4));
+        assert_eq!(
+            server.tls_name_mismatch_certificate_der.as_deref(),
+            Some(&[1, 2, 3][..])
+        );
+        assert!(
+            weaver_nntp::connection::NntpConnection::connect(server)
+                .await
+                .is_err(),
+            "a server whose route cannot leave must not fall back to the system route"
+        );
+        accept.abort();
+    }
 
     #[tokio::test]
     async fn persist_events_keeps_job_events_and_skips_integration_events() {

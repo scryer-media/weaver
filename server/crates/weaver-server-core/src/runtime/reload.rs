@@ -15,14 +15,80 @@ pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+/// Pool settings for every active server, in dial order. Startup and every
+/// rebuild take their NNTP client from here, so a server's route, adopted
+/// certificate and proven pipelining depth apply from the first connection
+/// after a restart exactly as they do after a change.
+pub fn nntp_server_pool_configs(
+    configured_servers: &[crate::servers::ServerConfig],
+    proxy_runtime: Option<&crate::proxies::ProxyRuntime>,
+    transfer_registry: &weaver_nntp::transfer::ServerTransferRegistry,
+    buffer_profile: weaver_nntp::connection::NntpBufferProfile,
+) -> Result<Vec<weaver_nntp::pool::ServerPoolConfig>, String> {
+    use weaver_nntp::transfer::StableServerId;
+
+    let mut active: Vec<&crate::servers::ServerConfig> = configured_servers
+        .iter()
+        .filter(|server| server.active)
+        .collect();
+    active.sort_by_key(|server| (server.priority, server.id));
+    active
+        .iter()
+        .map(|server| {
+            Ok(weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    dialer: proxy_runtime
+                        .map(|runtime| {
+                            runtime.network.nntp_dialer(
+                                server.id,
+                                server.connections,
+                                std::time::Duration::from_secs(30),
+                            )
+                        })
+                        .transpose()?,
+                    host: server.host.clone(),
+                    port: server.port,
+                    tls: server.tls,
+                    username: server.username.clone(),
+                    password: server.password.clone(),
+                    tls_ca_cert: server.tls_ca_cert.clone(),
+                    tls_name_mismatch_certificate_der: server
+                        .tls_name_mismatch_certificate_der
+                        .clone(),
+                    buffer_profile,
+                    pipelining: weaver_nntp::PipeliningCapability::Known(
+                        server.supports_pipelining,
+                    ),
+                    pipelining_depth: server.pipelining_depth,
+                    ..Default::default()
+                },
+                max_connections: server.connections as usize,
+                group: server.priority,
+                backfill: server.backfill,
+                retention_days: server.retention_days,
+                stable_id: StableServerId(server.id),
+                transfer_control: Some(transfer_registry.control(StableServerId(server.id))),
+            })
+        })
+        .collect()
+}
+
+/// The NNTP client for one generation of pool settings.
+pub fn nntp_client(
+    servers: Vec<weaver_nntp::pool::ServerPoolConfig>,
+) -> weaver_nntp::client::NntpClient {
+    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+        servers,
+        max_idle_age: std::time::Duration::from_mins(5),
+        max_retries_per_server: 1,
+        soft_timeout: std::time::Duration::from_secs(15),
+    })
+}
+
 pub async fn rebuild_nntp_from_config(
     config: &SharedConfig,
     handle: &SchedulerHandle,
 ) -> Result<NntpRuntimeActivation, SchedulerError> {
-    use weaver_nntp::client::{NntpClient, NntpClientConfig};
-    use weaver_nntp::pool::ServerPoolConfig;
-    use weaver_nntp::transfer::StableServerId;
-
     let policy_registry = handle.server_transfer_policy().ok_or_else(|| {
         SchedulerError::Internal("server transfer policy registry unavailable".to_string())
     })?;
@@ -45,67 +111,20 @@ pub async fn rebuild_nntp_from_config(
             ))
         })?;
 
-    let (client, total) = {
-        let mut active: Vec<&crate::servers::ServerConfig> = configured_servers
-            .iter()
-            .filter(|server| server.active)
-            .collect();
-        active.sort_by_key(|server| (server.priority, server.id));
-        let servers: Vec<ServerPoolConfig> = active
-            .iter()
-            .map(|server| {
-                Ok::<_, SchedulerError>(ServerPoolConfig {
-                    server: weaver_nntp::ServerConfig {
-                        dialer: proxy_runtime
-                            .as_ref()
-                            .map(|runtime| {
-                                runtime.network.nntp_dialer(
-                                    server.id,
-                                    server.connections,
-                                    std::time::Duration::from_secs(30),
-                                )
-                            })
-                            .transpose()
-                            .map_err(SchedulerError::Internal)?,
-                        host: server.host.clone(),
-                        port: server.port,
-                        tls: server.tls,
-                        username: server.username.clone(),
-                        password: server.password.clone(),
-                        tls_ca_cert: server.tls_ca_cert.clone(),
-                        tls_name_mismatch_certificate_der: server
-                            .tls_name_mismatch_certificate_der
-                            .clone(),
-                        pipelining: weaver_nntp::PipeliningCapability::Known(
-                            server.supports_pipelining,
-                        ),
-                        pipelining_depth: server.pipelining_depth,
-                        ..Default::default()
-                    },
-                    max_connections: server.connections as usize,
-                    group: server.priority,
-                    backfill: server.backfill,
-                    retention_days: server.retention_days,
-                    stable_id: StableServerId(server.id),
-                    transfer_control: Some(transfer_registry.control(StableServerId(server.id))),
-                })
-            })
-            .collect::<Result<_, _>>()?;
-
-        let total: usize = servers.iter().map(|server| server.max_connections).sum();
-        tracing::info!(
-            active_server_count = servers.len(),
-            total_connections = total,
-            "building NNTP runtime generation"
-        );
-        let client = NntpClient::new(NntpClientConfig {
-            servers,
-            max_idle_age: std::time::Duration::from_mins(5),
-            max_retries_per_server: 1,
-            soft_timeout: std::time::Duration::from_secs(15),
-        });
-        (client, total)
-    };
+    let servers = nntp_server_pool_configs(
+        &configured_servers,
+        proxy_runtime.as_deref(),
+        &transfer_registry,
+        Default::default(),
+    )
+    .map_err(SchedulerError::Internal)?;
+    let total: usize = servers.iter().map(|server| server.max_connections).sum();
+    tracing::info!(
+        active_server_count = servers.len(),
+        total_connections = total,
+        "building NNTP runtime generation"
+    );
+    let client = nntp_client(servers);
 
     let pool = std::sync::Arc::clone(client.pool());
     let activation = handle.rebuild_nntp(client, total).await?;
