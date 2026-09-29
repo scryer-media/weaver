@@ -371,13 +371,22 @@ async fn validate_script_move_destination(
     context: crate::post_processing::runner::JobExecutionContext,
     expected: &std::path::Path,
 ) -> Result<(), MoveToCompleteFailure> {
+    // A missing directory is an operational failure, not unsafe content.
+    if let Err(error) = tokio::fs::symlink_metadata(expected).await
+        && error.kind() == std::io::ErrorKind::NotFound
+    {
+        return Err(MoveToCompleteFailure::Operational(format!(
+            "script final directory {} does not exist",
+            expected.display()
+        )));
+    }
     let path = expected.to_path_buf();
     let validated = tokio::task::spawn_blocking(move || {
         crate::post_processing::effects::validate_directory(&db, &context, &path)
     })
     .await
     .map_err(|error| {
-        MoveToCompleteFailure::Security(format!(
+        MoveToCompleteFailure::Operational(format!(
             "script destination validation worker failed: {error}"
         ))
     })?
@@ -442,12 +451,12 @@ async fn run_move_to_claimed_destination(
             tokio::task::spawn_blocking(move || database.post_processing_settings())
                 .await
                 .map_err(|error| {
-                    MoveToCompleteFailure::Security(format!(
+                    MoveToCompleteFailure::Operational(format!(
                         "could not load unacceptable extension policy: {error}"
                     ))
                 })?
                 .map_err(|error| {
-                    MoveToCompleteFailure::Security(format!(
+                    MoveToCompleteFailure::Operational(format!(
                         "could not load unacceptable extension policy: {error}"
                     ))
                 })?
@@ -463,7 +472,7 @@ async fn run_move_to_claimed_destination(
         })
         .await
         .map_err(|error| {
-            MoveToCompleteFailure::Security(format!(
+            MoveToCompleteFailure::Operational(format!(
                 "delivery security scan worker failed: {error}"
             ))
         })?
@@ -807,6 +816,13 @@ mod category_destination_tests {
         validate_script_move_destination(db.clone(), context.clone(), &destination)
             .await
             .unwrap();
+        let missing = complete.join("missing");
+        let error = validate_script_move_destination(db.clone(), context.clone(), &missing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MoveToCompleteFailure::Operational(message) if message.contains("does not exist"))
+        );
         crate::jobs::working_dir::mark_weaver_owned_working_dir(&complete, &destination, JobId(2))
             .unwrap();
         std::fs::write(destination.join("foreign.bin"), b"foreign").unwrap();
