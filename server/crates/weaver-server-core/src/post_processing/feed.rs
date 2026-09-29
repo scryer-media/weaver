@@ -132,6 +132,24 @@ pub async fn transform_feed(
     .map_err(|error| error.to_string())
 }
 
+pub fn validate_feed_script_selection(
+    db: &Database,
+    names: &[String],
+) -> Result<(), crate::StateError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let entries = names
+        .iter()
+        .map(|name| ScriptName::new(name.clone()).map(ScriptListEntry::new))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| crate::StateError::Database(error.to_string()))?;
+    let scripts =
+        ScriptList::new(entries).map_err(|error| crate::StateError::Database(error.to_string()))?;
+    let root = db.post_processing_script_directory()?;
+    validate_explicit_feed_scripts(&root, &scripts).map_err(crate::StateError::Database)
+}
+
 fn validate_explicit_feed_scripts(root: &Path, scripts: &ScriptList) -> Result<(), String> {
     for entry in scripts.enabled_entries() {
         let script = super::listing::resolve_script(root, &entry.script)

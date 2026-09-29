@@ -459,6 +459,83 @@ fn archive_job_moves_to_history() {
 }
 
 #[test]
+fn postprocessing_relocation_replaces_the_earlier_queue_destination() {
+    use crate::post_processing::directives::Directive;
+    use crate::post_processing::effects::{apply_job_directive, apply_queue_directive};
+    use crate::post_processing::model::PipelineOutcome;
+    use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
+
+    let temp = tempfile::tempdir().unwrap();
+    let complete = temp.path().canonicalize().unwrap();
+    let first = complete.join("first");
+    let relocated = complete.join("relocated");
+    std::fs::create_dir(&first).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let mut active = sample_job(1);
+    active.output_dir = first.clone();
+    db.create_active_job(&active).unwrap();
+    let mut context = JobExecutionContext {
+        job_id: 1,
+        name: "relocation".into(),
+        nzb_filename: "relocation.nzb".into(),
+        category: None,
+        group: None,
+        source_url: None,
+        working_directory: first.clone(),
+        final_directory: first.clone(),
+        pipeline_outcome: PipelineOutcome::Succeeded,
+        par_status: 0,
+        unpack_status: 0,
+        compatibility: CompatibilityFacts {
+            complete_dir: Some(complete),
+            ..Default::default()
+        },
+    };
+    apply_queue_directive(
+        &db,
+        &mut context,
+        Directive::FinalDirectory(first.to_string_lossy().into_owned()),
+    )
+    .unwrap();
+    std::fs::write(first.join("payload.bin"), b"payload").unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_output_dir(&first).unwrap();
+    std::fs::rename(&first, &relocated).unwrap();
+    apply_job_directive(
+        &db,
+        &mut context,
+        Directive::Directory(relocated.to_string_lossy().into_owned()),
+    )
+    .unwrap();
+    apply_job_directive(
+        &db,
+        &mut context,
+        Directive::Parameter {
+            name: "later".into(),
+            value: "value".into(),
+        },
+    )
+    .unwrap();
+    let effects = db.job_script_effects(1).unwrap();
+    assert_eq!(effects.directory, Some(relocated.clone()));
+    assert!(effects.final_directory.is_none());
+    assert_eq!(context.working_directory, relocated);
+    assert_eq!(context.final_directory, relocated);
+    assert!(context.compatibility.final_directory_override.is_none());
+    assert_eq!(
+        db.load_active_jobs().unwrap()[&JobId(1)].output_dir,
+        relocated
+    );
+    assert!(crate::jobs::working_dir::is_weaver_owned_output_dir(
+        &relocated
+    ));
+    assert_eq!(
+        std::fs::read(relocated.join("payload.bin")).unwrap(),
+        b"payload"
+    );
+    assert!(!first.exists());
+}
+
+#[test]
 fn script_parameter_budget_refuses_growth_without_partial_persistence() {
     use crate::post_processing::effects::JobScriptEffects;
     let db = Database::open_in_memory().unwrap();

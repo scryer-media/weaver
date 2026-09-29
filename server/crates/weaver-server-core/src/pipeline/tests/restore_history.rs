@@ -940,6 +940,7 @@ async fn history_deletion_waits_for_scripts_without_blocking_commands() {
         }
         assert!(!output_dir.exists());
         assert!(pipeline.jobs.contains_key(&newer_job));
+        assert!(pipeline.pending_history_deletions.is_empty());
     }
 }
 

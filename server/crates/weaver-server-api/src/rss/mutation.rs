@@ -51,6 +51,10 @@ impl RssMutation {
 
         let db = ctx.data::<Database>()?.clone();
         let feed = tokio::task::spawn_blocking(move || {
+            weaver_server_core::post_processing::feed::validate_feed_script_selection(
+                &db,
+                input.scripts.as_deref().unwrap_or_default(),
+            )?;
             let id = db.next_rss_feed_id()?;
             let row = rss_feed_row_from_create(id, input);
             db.insert_rss_feed_with_routing(&row, routing.as_ref())?;
@@ -100,6 +104,10 @@ impl RssMutation {
                 )));
             };
             let row = rss_feed_row_from_update(existing, input);
+            weaver_server_core::post_processing::feed::validate_feed_script_selection(
+                &db,
+                &row.scripts,
+            )?;
             db.update_rss_feed_with_routing(&row, routing.as_ref())?;
             let rules = db
                 .list_rss_rules(row.id)?

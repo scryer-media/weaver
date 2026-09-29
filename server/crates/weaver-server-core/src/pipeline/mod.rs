@@ -1455,6 +1455,7 @@ pub(super) struct MoveToCompleteDone {
 
 pub(super) enum TerminalPostProcessingEvent {
     HistoryDeleteDone(orchestrator::HistoryDeleteDone),
+    QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),

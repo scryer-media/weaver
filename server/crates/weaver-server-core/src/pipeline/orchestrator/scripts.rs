@@ -102,13 +102,6 @@ impl Pipeline {
         };
         let admission = self.db.admit_queue_script_event(context, true);
         self.queue_script_waiters.insert(job_id);
-        self.transition_postprocessing_status(
-            job_id,
-            JobStatus::AwaitingQueueScripts,
-            Some("waiting for queue scripts"),
-        );
-        self.persist_active_runtime(job_id);
-        self.publish_snapshot();
         let db = self.db.clone();
         let sender = self.terminal_post_processing_done_tx.clone();
         tokio::spawn(async move {
@@ -116,6 +109,10 @@ impl Pipeline {
                 if let Some(run_id) = admission.await.map_err(|error| {
                     crate::StateError::Database(format!("queue script admission lost: {error}"))
                 })?? {
+                    sender
+                        .send(TerminalPostProcessingEvent::QueueAdmitted(job_id))
+                        .await
+                        .map_err(|error| crate::StateError::Database(error.to_string()))?;
                     wait_for_event(&db, &run_id).await?;
                 }
                 Ok(())

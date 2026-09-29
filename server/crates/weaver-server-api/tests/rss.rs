@@ -40,6 +40,58 @@ async fn add_feed() {
 }
 
 #[tokio::test]
+async fn feed_script_selection_is_validated_before_persistence() {
+    let h = TestHarness::new().await;
+    let data = tempfile::tempdir().unwrap();
+    let root =
+        h.db.initialize_post_processing_script_directory(data.path(), None)
+            .unwrap();
+    std::fs::write(
+        root.join("post.sh"),
+        "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\nexit 93\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("feed.sh"),
+        "#!/bin/sh\n### NZBGET FEED SCRIPT ###\nexit 93\n",
+    )
+    .unwrap();
+    for script in ["missing.sh", "post.sh"] {
+        let response = h
+            .execute(&format!(
+                r#"mutation {{ addRssFeed(input: {{
+            name: "invalid", url: "https://example.com/rss", enabled: false, scripts: ["{script}"]
+        }}) {{ id }} }}"#
+            ))
+            .await;
+        assert_has_errors(&response);
+        assert!(h.db.list_rss_feeds().unwrap().is_empty());
+    }
+    let response = h
+        .execute(
+            r#"mutation { addRssFeed(input: {
+        name: "valid", url: "https://example.com/rss", enabled: false, scripts: ["feed.sh"]
+    }) { id } }"#,
+        )
+        .await;
+    assert_no_errors(&response);
+    let id = response_data(&response)["addRssFeed"]["id"]
+        .as_u64()
+        .unwrap();
+    let response = h
+        .execute(&format!(
+            r#"mutation {{ updateRssFeed(id: {id}, input: {{
+        name: "invalid update", url: "https://example.com/rss", enabled: false, scripts: ["post.sh"]
+    }}) {{ id }} }}"#
+        ))
+        .await;
+    assert_has_errors(&response);
+    let saved = h.db.get_rss_feed(id as u32).unwrap().unwrap();
+    assert_eq!(saved.name, "valid");
+    assert_eq!(saved.scripts, vec!["feed.sh"]);
+}
+
+#[tokio::test]
 async fn add_feed_invalid_url() {
     let h = TestHarness::new().await;
     let resp = h

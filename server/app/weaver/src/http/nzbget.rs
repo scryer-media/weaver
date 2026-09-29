@@ -865,7 +865,9 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
             &request.content_or_url,
             request.category.as_deref(),
             fetched.is_ok(),
-        ) {
+        )
+        .await
+        {
             tracing::warn!(%error, "could not raise URL script event");
         }
         match fetched {

@@ -35,23 +35,32 @@ fn context(
     ))
 }
 
-pub fn url_completed(
+pub async fn url_completed(
     db: &Database,
     url: &str,
     category: Option<&str>,
     success: bool,
 ) -> Result<(), StateError> {
-    let mut context = context(db, category.map(str::to_string), QueueEvent::UrlCompleted)?;
-    context.job_id = None;
-    context.env.insert("NZBNA_URL".into(), url.into());
-    context.env.insert(
-        "NZBNA_URLSTATUS".into(),
-        if success { "SUCCESS" } else { "FAILURE" }.into(),
-    );
-    if db
-        .enqueue_script_event(&context, chrono::Utc::now().timestamp_millis())?
-        .is_some()
-    {
+    let worker_db = db.clone();
+    let category = category.map(str::to_string);
+    let url = url.to_string();
+    let admitted = tokio::task::spawn_blocking(move || {
+        let mut context = context(&worker_db, category, QueueEvent::UrlCompleted)?;
+        context.job_id = None;
+        context.env.insert("NZBNA_URL".into(), url);
+        context.env.insert(
+            "NZBNA_URLSTATUS".into(),
+            if success { "SUCCESS" } else { "FAILURE" }.into(),
+        );
+        Ok::<_, StateError>(
+            worker_db
+                .enqueue_script_event(&context, chrono::Utc::now().timestamp_millis())?
+                .is_some(),
+        )
+    })
+    .await
+    .map_err(|error| StateError::Database(error.to_string()))??;
+    if admitted {
         wake_queue(db.clone());
     }
     Ok(())

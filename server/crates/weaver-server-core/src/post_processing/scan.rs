@@ -40,15 +40,16 @@ fn context(category: Option<String>, parameters: Vec<(String, String)>) -> Event
     }
 }
 
-pub fn enabled(
+pub async fn enabled(
     db: &Database,
     category: Option<&str>,
     metadata: &[(String, String)],
 ) -> Result<bool, crate::StateError> {
-    has_subscriber(
-        db,
-        &context(category.map(str::to_string), metadata.to_vec()),
-    )
+    let db = db.clone();
+    let context = context(category.map(str::to_string), metadata.to_vec());
+    tokio::task::spawn_blocking(move || has_subscriber(&db, &context))
+        .await
+        .map_err(|error| crate::StateError::Database(error.to_string()))?
 }
 
 pub struct ScannedSubmission {
@@ -407,7 +408,7 @@ mod tests {
             SOURCE_URL_KEY.into(),
             "https://source.test/invalid\0nzb".into(),
         )];
-        assert!(enabled(&db, None, &metadata).unwrap());
+        assert!(enabled(&db, None, &metadata).await.unwrap());
         let mut config = db.load_config().unwrap();
         config.data_dir = data.path().to_string_lossy().into_owned();
         let config = std::sync::Arc::new(tokio::sync::RwLock::new(config));

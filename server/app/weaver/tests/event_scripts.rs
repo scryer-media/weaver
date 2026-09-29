@@ -9,11 +9,13 @@ use std::time::Duration;
 use weaver_server_core::jobs::record::ActiveJob;
 use weaver_server_core::post_processing::directives::{Directive, ScriptOutputEvent};
 use weaver_server_core::post_processing::effects::apply_job_directive;
-use weaver_server_core::post_processing::events::{EventContext, run_event};
+use weaver_server_core::post_processing::events::{
+    EventContext, drain_queue, run_event, wait_for_event,
+};
 use weaver_server_core::post_processing::listing::resolve_script;
 use weaver_server_core::post_processing::model::{
-    PipelineOutcome, PostProcessingSettings, QueueEvent, ScriptEventLabel, ScriptList,
-    ScriptListEntry, ScriptLists, ScriptName, ScriptStatus,
+    OptionName, OptionValue, PipelineOutcome, PostProcessingSettings, QueueEvent, ResolvedOption,
+    ScriptEventLabel, ScriptList, ScriptListEntry, ScriptLists, ScriptName, ScriptStatus,
 };
 use weaver_server_core::post_processing::runner::{
     CompatibilityFacts, ExecutionDisposition, ExecutionSpec, InterpreterConfig,
@@ -191,6 +193,69 @@ async fn queue_parameters_stream_to_persistence_and_the_next_script() {
 }
 
 #[tokio::test]
+async fn invalid_queue_script_options_record_failure_and_release_downloaded_barrier() {
+    let (db, data) = setup();
+    let context = job(&db, data.path());
+    let invalid = script(
+        &db,
+        "invalid.sh",
+        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '[NZB] NZBPR_Invalid=executed\\n'\nexit 0\n",
+    );
+    let next = script(
+        &db,
+        "next.sh",
+        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '[NZB] NZBPR_Next=executed\\n'\nexit 0\n",
+    );
+    db.save_post_processing_script_options(
+        &invalid,
+        &[ResolvedOption::new(
+            OptionName::new("RemovedOption").unwrap(),
+            OptionValue::String("old configuration".into()),
+        )],
+    )
+    .unwrap();
+    select(&db, &[invalid.clone(), next.clone()]);
+    let mut event = EventContext::from_job(&context, QueueEvent::NzbDownloaded);
+    let results = run_event(&db, &mut event, "invalid-queue-options", None, supervisor())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].script, invalid);
+    assert_eq!(results[0].status, ScriptStatus::Failed);
+    assert_eq!(results[0].exit_code, None);
+    assert!(
+        results[0]
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("script configuration is invalid")
+    );
+    assert_eq!(results[1].script, next);
+    assert_eq!(results[1].status, ScriptStatus::Succeeded);
+    let effects = db.job_script_effects(42).unwrap();
+    assert!(!effects.parameters.contains_key("Invalid"));
+    assert_eq!(effects.parameters["Next"], "executed");
+    assert!(!effects.marked_bad);
+
+    // A configuration failure is a completed queue run, so native completion
+    // can continue after the durable downloaded barrier.
+    select(&db, &[invalid]);
+    let run_id = db.enqueue_script_event(&event, 1).unwrap().unwrap();
+    drain_queue(db.clone()).await.unwrap();
+    wait_for_event(&db, &run_id).await.unwrap();
+    assert!(db.script_event_finished(&run_id).unwrap());
+    assert_eq!(db.queue_script_count().unwrap(), 0);
+    let retained = db.event_script_results(42).unwrap();
+    assert_eq!(
+        retained
+            .iter()
+            .filter(|result| result.status == ScriptStatus::Failed)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn cancellation_keeps_redacted_directives_emitted_before_the_kill() {
     let (db, data) = setup();
     let mut context = job(&db, data.path());
@@ -283,6 +348,45 @@ async fn scan_rewrites_input_and_category_reselects_the_remaining_scripts() {
             .parameters
             .contains(&("Category".into(), "movies".into()))
     );
+}
+
+#[tokio::test]
+async fn scan_names_and_categories_reach_the_existing_filesystem_guards() {
+    let (db, data) = setup();
+    let path = data.path().join("input.nzb");
+    fs::write(&path, "original").unwrap();
+    let scan = script(
+        &db,
+        "names.sh",
+        "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nprintf '[NZB] NZBNAME=../bad/name\\tpart\\n[NZB] CATEGORY=../escape\\n'\nexit 0\n",
+    );
+    select(&db, &[scan]);
+    let mut context = jobless(
+        data.path(),
+        ScriptEventLabel::Scan,
+        &[("NZBNP_FILENAME", path.to_string_lossy().into_owned())],
+    );
+    let results = run_event(&db, &mut context, "scan-name-guards", None, supervisor())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(
+        weaver_server_core::categories::resolve_submission_category(
+            &[],
+            context.category.as_deref()
+        )
+        .is_err()
+    );
+    let name = &context.env["NZBNP_NZBNAME"];
+    assert_eq!(name, "../bad/name\tpart");
+    let component = weaver_server_core::jobs::working_dir::sanitize_dirname(name);
+    assert_eq!(Path::new(&component).components().count(), 1);
+    assert!(
+        !component
+            .chars()
+            .any(|character| character.is_control() || character == '/' || character == '\\')
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), "original");
 }
 
 #[tokio::test]

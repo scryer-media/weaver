@@ -1501,6 +1501,29 @@ mod capture_tests {
     use crate::post_processing::directives::Directive;
 
     #[tokio::test]
+    async fn capture_without_event_policy_retains_redacted_lines_without_structured_events() {
+        let output = Arc::new(Mutex::new(BoundedOutput::default()));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let policy = CapturePolicy {
+            secrets: Arc::new(vec![b"private-value".to_vec()]),
+            event: None,
+            events: Some(sender),
+            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
+        };
+        let input = b"ordinary private-value\r\n[INFO] private-value\n[NZB] NZBPR_Token=private-value\nunterminated private-value";
+        capture_stream(input.as_slice(), output.clone(), policy)
+            .await
+            .unwrap();
+        assert!(receiver.recv().await.is_none());
+        let captured = Arc::try_unwrap(output).ok().unwrap().into_inner().unwrap();
+        assert!(!captured.truncated);
+        assert_eq!(
+            String::from_utf8(captured.into_bytes()).unwrap(),
+            "ordinary [REDACTED]\r\n[INFO] [REDACTED]\n[NZB] NZBPR_Token=[REDACTED]\nunterminated [REDACTED]"
+        );
+    }
+
+    #[tokio::test]
     async fn credential_bearing_source_urls_are_redacted_before_log_emission() {
         let url = "https://account:password123@example.invalid/file?api_key=token123";
         let aws_url = "https://example.invalid/file?X-Amz-Signature=awssecret123";

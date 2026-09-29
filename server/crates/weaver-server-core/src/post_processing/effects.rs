@@ -78,7 +78,10 @@ impl Database {
                     let change: JobScriptEffects = serde_json::from_str(&state).map_err(|error| StateError::Database(error.to_string()))?;
                     current.parameters.extend(change.parameters);
                     super::directives::validate_parameter_size(current.parameters.iter().map(|(name, value)| (name.as_str(), value.as_str()))).map_err(StateError::Database)?;
-                    current.directory = change.directory.or(current.directory);
+                    if let Some(directory) = change.directory {
+                        current.directory = Some(directory);
+                        current.final_directory = None;
+                    }
                     current.final_directory = change.final_directory.or(current.final_directory);
                     current.marked_bad |= change.marked_bad;
                     let mut metadata: Vec<(String, String)> = active.opt_text("metadata")?.map(|value| serde_json::from_str(&value).map_err(|error| StateError::Database(error.to_string()))).transpose()?.unwrap_or_default();

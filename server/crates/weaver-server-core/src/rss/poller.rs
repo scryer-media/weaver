@@ -22,10 +22,10 @@ impl RssService {
         &self,
         feed_id: u32,
     ) -> Result<Vec<crate::RssSeenItemRow>, RssServiceError> {
-        let mut feed = self
-            .inner
-            .db
-            .get_rss_feed(feed_id)
+        let db = self.inner.db.clone();
+        let mut feed = tokio::task::spawn_blocking(move || db.get_rss_feed(feed_id))
+            .await
+            .map_err(|error| RssServiceError::Http(error.to_string()))?
             .map_err(|error| RssServiceError::Http(error.to_string()))?
             .ok_or(RssServiceError::FeedNotFound(feed_id))?;
         feed.etag = None;
@@ -53,12 +53,12 @@ impl RssService {
         .await
         .map_err(RssServiceError::Parse)?;
         let items = parse_feed_items(&body).map_err(RssServiceError::Parse)?;
-        let rules = compile_rules(
-            self.inner
-                .db
-                .list_rss_rules(feed.id)
-                .map_err(|error| RssServiceError::Http(error.to_string()))?,
-        );
+        let db = self.inner.db.clone();
+        let rules =
+            tokio::task::spawn_blocking(move || db.list_rss_rules(feed_id).map(compile_rules))
+                .await
+                .map_err(|error| RssServiceError::Http(error.to_string()))?
+                .map_err(|error| RssServiceError::Http(error.to_string()))?;
         Ok(items
             .into_iter()
             .map(|item| {

@@ -90,21 +90,27 @@ impl JobsMutation {
             }
         };
 
-        let db = ctx.data::<Database>()?;
-        let settings = db.post_processing_settings()?;
-        let scan_before_parse = settings.execution_enabled
-            && !weaver_server_core::post_processing::executor::strict_security_enabled()
-            && weaver_server_core::post_processing::listing::list_scripts(
-                &db.post_processing_script_directory()?,
-            )?
-            .scripts
-            .iter()
-            .any(|script| {
-                script
-                    .manifest
-                    .kinds()
-                    .contains(&weaver_server_core::post_processing::model::ScriptKind::Scan)
-            });
+        let db = ctx.data::<Database>()?.clone();
+        let scan_before_parse = tokio::task::spawn_blocking(move || {
+            let settings = db.post_processing_settings()?;
+            Ok::<_, weaver_server_core::StateError>(
+                settings.execution_enabled
+                    && !weaver_server_core::post_processing::executor::strict_security_enabled()
+                    && weaver_server_core::post_processing::listing::list_scripts(
+                        &db.post_processing_script_directory()?,
+                    )
+                    .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
+                    .scripts
+                    .iter()
+                    .any(|script| {
+                        script
+                            .manifest
+                            .kinds()
+                            .contains(&weaver_server_core::post_processing::model::ScriptKind::Scan)
+                    }),
+            )
+        })
+        .await??;
         match manager
             .stage_upload(caller_identity, upload, input.filename, scan_before_parse)
             .await
@@ -1091,7 +1097,9 @@ async fn submit_from_facade_input(
                 &url,
                 input.category.as_deref(),
                 fetched.is_ok(),
-            ) {
+            )
+            .await
+            {
                 tracing::warn!(%error, "could not raise URL script event");
             }
             let (bytes, url_filename) =

@@ -331,7 +331,7 @@ pub async fn run_event(
     };
     let cancellation = Some(cancel_rx.clone());
     let root = db.post_processing_script_directory()?;
-    let options = db.post_processing_script_options_snapshot()?;
+    let options = db.post_processing_script_options_snapshot();
     let mut visited = BTreeSet::<ScriptName>::new();
     let mut results = Vec::new();
     loop {
@@ -384,40 +384,54 @@ pub async fn run_event(
         }
         let started = Instant::now();
         let adapter = script.manifest.adapter();
-        let supplied = db.resolve_post_processing_script_options(&options, &entry.script)?;
-        let resolved = script
-            .manifest
-            .resolve_options(&supplied)
-            .map_err(|error| StateError::Database(error.to_string()))?;
-        let spec = ExecutionSpec {
-            manifest: script.manifest,
-            root: script.root,
-            options: resolved,
-            cwd: context.cwd.clone(),
-            env: context.env.clone(),
-            argv: Vec::new(),
-            timeout: Some(Duration::from_secs(
-                entry
-                    .timeout_seconds
-                    .unwrap_or(settings.event_scripts.event_script_timeout_seconds),
-            )),
-            termination_grace: Duration::from_secs(settings.termination_grace_seconds),
-            kind: context.event.clone(),
-            run_id: run_id.into(),
-            facts: context.facts.clone(),
-            interpreters: InterpreterConfig {
-                python: settings.python_interpreter.as_ref().map(PathBuf::from),
-                powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
-                batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
-            },
-            supervisor_executable: supervisor_executable.clone(),
-            output_ceiling: settings.event_scripts.script_output_ceiling_bytes,
+        let resolved = options
+            .as_ref()
+            .map_err(ToString::to_string)
+            .and_then(|options| {
+                db.resolve_post_processing_script_options(options, &entry.script)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|supplied| {
+                script
+                    .manifest
+                    .resolve_options(&supplied)
+                    .map_err(|error| error.to_string())
+            });
+        let execution = match resolved {
+            Err(error) => Err(format!("script configuration is invalid: {error}")),
+            Ok(resolved) => {
+                let spec = ExecutionSpec {
+                    manifest: script.manifest,
+                    root: script.root,
+                    options: resolved,
+                    cwd: context.cwd.clone(),
+                    env: context.env.clone(),
+                    argv: Vec::new(),
+                    timeout: Some(Duration::from_secs(
+                        entry
+                            .timeout_seconds
+                            .unwrap_or(settings.event_scripts.event_script_timeout_seconds),
+                    )),
+                    termination_grace: Duration::from_secs(settings.termination_grace_seconds),
+                    kind: context.event.clone(),
+                    run_id: run_id.into(),
+                    facts: context.facts.clone(),
+                    interpreters: InterpreterConfig {
+                        python: settings.python_interpreter.as_ref().map(PathBuf::from),
+                        powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
+                        batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
+                    },
+                    supervisor_executable: supervisor_executable.clone(),
+                    output_ceiling: settings.event_scripts.script_output_ceiling_bytes,
+                };
+                let (sender, receiver) = mpsc::channel(64);
+                let (execution, ()) = tokio::join!(
+                    execute_spec(spec, cancellation.clone(), Some(sender)),
+                    consume_events(db, context, receiver),
+                );
+                execution.map_err(|error| error.to_string())
+            }
         };
-        let (sender, receiver) = mpsc::channel(64);
-        let (execution, ()) = tokio::join!(
-            execute_spec(spec, cancellation.clone(), Some(sender)),
-            consume_events(db, context, receiver),
-        );
         let (status, exit_code, output, output_truncated, error_message) = match execution {
             Ok(result) => (
                 match result.disposition {

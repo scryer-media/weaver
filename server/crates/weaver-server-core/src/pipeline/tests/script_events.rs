@@ -82,6 +82,22 @@ async fn downloaded_barrier_persists_and_mark_bad_prevents_native_finalization()
         })
         .unwrap();
     pipeline.check_job_completion(job_id).await;
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Downloading);
+    let TerminalPostProcessingEvent::QueueAdmitted(id) = pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    else {
+        panic!("expected queue admission");
+    };
+    assert_eq!(id, job_id);
+    pipeline.transition_postprocessing_status(
+        job_id,
+        JobStatus::AwaitingQueueScripts,
+        Some("waiting for queue scripts"),
+    );
+    pipeline.persist_active_runtime(job_id);
     assert_eq!(
         pipeline.jobs[&job_id].status,
         JobStatus::AwaitingQueueScripts
@@ -162,6 +178,54 @@ async fn downloaded_barrier_persists_and_mark_bad_prevents_native_finalization()
     pipeline.db.flush_write_queue().await.unwrap();
     let history = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
     assert!(history.error_message.unwrap().contains("FAILURE/BAD"));
+}
+
+#[tokio::test]
+async fn non_queue_script_does_not_publish_queue_wait_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let scripts = pipeline
+        .db
+        .initialize_post_processing_script_directory(temp.path(), None)
+        .unwrap();
+    std::fs::write(
+        scripts.join("post.sh"),
+        "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\nexit 93\n",
+    )
+    .unwrap();
+    pipeline
+        .db
+        .save_post_processing_settings(&PostProcessingSettings {
+            execution_enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+    pipeline
+        .db
+        .save_post_processing_script_lists(&ScriptLists {
+            global: ScriptList::new(vec![ScriptListEntry::new(
+                ScriptName::new("post.sh").unwrap(),
+            )])
+            .unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+    let job_id = JobId(168);
+    insert_active_job(&mut pipeline, job_id, standalone_job_spec("no-queue", &[])).await;
+
+    pipeline.check_job_completion(job_id).await;
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Downloading);
+    let TerminalPostProcessingEvent::QueueDone(id, result) = pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    else {
+        panic!("no queue script should be admitted");
+    };
+    assert_eq!(id, job_id);
+    result.unwrap();
+    assert_eq!(pipeline.db.queue_script_count().unwrap(), 0);
 }
 
 #[tokio::test]

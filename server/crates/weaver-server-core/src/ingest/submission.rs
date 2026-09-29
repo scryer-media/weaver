@@ -843,7 +843,7 @@ pub async fn submit_nzb_bytes_with_options(
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let submit_started = Instant::now();
-    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata)? {
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata).await? {
         let scanned = crate::post_processing::scan::scan_reader(
             db,
             config,
@@ -1041,7 +1041,7 @@ where
     R: Read + Send + 'static,
 {
     let submit_started = Instant::now();
-    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata)? {
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata).await? {
         let scanned = crate::post_processing::scan::scan_reader(
             db,
             config,
@@ -1127,7 +1127,7 @@ pub async fn submit_staged_nzb_zstd_with_options(
     metadata: Vec<(String, String)>,
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
-    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata)? {
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata).await? {
         let source = zstd::stream::read::Decoder::new(Cursor::new(nzb_zstd))
             .map_err(SubmitNzbError::Save)?;
         return submit_uploaded_nzb_reader_with_options(
@@ -1204,7 +1204,7 @@ async fn submit_staged_parsed_nzb_with_hash(
     metadata: Vec<(String, String)>,
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
-    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata)? {
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata).await? {
         let source = zstd::stream::read::Decoder::new(Cursor::new(nzb_zstd))
             .map_err(SubmitNzbError::Save)?;
         return submit_uploaded_nzb_reader_with_options(
@@ -1243,7 +1243,9 @@ pub async fn submit_staged_prepared_nzb_with_options(
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let category = preparation.spec.category.clone();
-    if crate::post_processing::scan::enabled(db, category.as_deref(), &preparation.spec.metadata)? {
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &preparation.spec.metadata)
+        .await?
+    {
         let source = zstd::stream::read::Decoder::new(Cursor::new(nzb_zstd))
             .map_err(SubmitNzbError::Save)?;
         return submit_uploaded_nzb_reader_with_options(

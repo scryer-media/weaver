@@ -366,6 +366,30 @@ where
     }
 }
 
+async fn validate_script_move_destination(
+    db: crate::Database,
+    context: crate::post_processing::runner::JobExecutionContext,
+    expected: &std::path::Path,
+) -> Result<(), MoveToCompleteFailure> {
+    let path = expected.to_path_buf();
+    let validated = tokio::task::spawn_blocking(move || {
+        crate::post_processing::effects::validate_directory(&db, &context, &path)
+    })
+    .await
+    .map_err(|error| {
+        MoveToCompleteFailure::Security(format!(
+            "script destination validation worker failed: {error}"
+        ))
+    })?
+    .map_err(MoveToCompleteFailure::Security)?;
+    if validated != expected {
+        return Err(MoveToCompleteFailure::Security(
+            "script final directory changed after reservation".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
@@ -750,6 +774,80 @@ mod category_destination_tests {
         assert!(collision.starts_with(complete));
     }
 
+    #[tokio::test]
+    async fn script_destination_worker_refuses_foreign_ownership_and_path_changes() {
+        use crate::post_processing::model::PipelineOutcome;
+        use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
+
+        let temp = tempfile::tempdir().unwrap();
+        let complete = temp.path().canonicalize().unwrap();
+        let source = complete.join("source");
+        let destination = complete.join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("payload.bin"), b"payload").unwrap();
+        let db = crate::Database::open_in_memory().unwrap();
+        let context = JobExecutionContext {
+            job_id: 1,
+            name: "destination-check".into(),
+            nzb_filename: "destination-check.nzb".into(),
+            category: None,
+            group: None,
+            source_url: None,
+            working_directory: source.clone(),
+            final_directory: destination.clone(),
+            pipeline_outcome: PipelineOutcome::Succeeded,
+            par_status: 0,
+            unpack_status: 0,
+            compatibility: CompatibilityFacts {
+                complete_dir: Some(complete.clone()),
+                ..Default::default()
+            },
+        };
+        validate_script_move_destination(db.clone(), context.clone(), &destination)
+            .await
+            .unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(&complete, &destination, JobId(2))
+            .unwrap();
+        std::fs::write(destination.join("foreign.bin"), b"foreign").unwrap();
+        let error = validate_script_move_destination(db.clone(), context.clone(), &destination)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MoveToCompleteFailure::Security(message) if message.contains("foreign ownership marker"))
+        );
+        assert_eq!(
+            std::fs::read(source.join("payload.bin")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("foreign.bin")).unwrap(),
+            b"foreign"
+        );
+        assert!(!destination.join("payload.bin").exists());
+
+        #[cfg(unix)]
+        {
+            let actual = complete.join("actual");
+            let alias = complete.join("alias");
+            std::fs::create_dir(&actual).unwrap();
+            std::os::unix::fs::symlink(&actual, &alias).unwrap();
+            let error = validate_script_move_destination(db, context, &alias)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, MoveToCompleteFailure::Security(message) if message.contains("changed after reservation"))
+            );
+            assert!(actual.exists());
+            assert!(
+                std::fs::symlink_metadata(alias)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
     #[test]
     fn configured_destination_override_remains_trusted_admin_input() {
         let complete = std::path::Path::new("/downloads/complete");
@@ -937,7 +1035,7 @@ impl Pipeline {
             .job_script_effects(job_id.0)
             .map_err(|error| error.to_string())?
             .final_directory;
-        let dest = if let Some(path) = requested {
+        let (dest, script_validation) = if let Some(path) = requested {
             let event = self
                 .queue_script_context(
                     job_id,
@@ -958,8 +1056,6 @@ impl Pipeline {
                 unpack_status: 0,
                 compatibility: event.facts,
             };
-            let path =
-                crate::post_processing::effects::validate_directory(&self.db, &context, &path)?;
             if self
                 .reserved_complete_destinations
                 .iter()
@@ -967,10 +1063,13 @@ impl Pipeline {
             {
                 return Err("script final directory is reserved by another job".into());
             }
-            path
+            (path, Some((self.db.clone(), context)))
         } else {
-            self.claim_complete_destination(job_id, &job_name, category.as_deref())
-                .await?
+            (
+                self.claim_complete_destination(job_id, &job_name, category.as_deref())
+                    .await?,
+                None,
+            )
         };
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
@@ -992,15 +1091,21 @@ impl Pipeline {
         );
         tokio::spawn(async move {
             let move_started = Instant::now();
-            let result = run_move_to_complete(
-                job_id,
-                working_dir,
-                staging_dir,
-                dest.clone(),
-                phase_counters,
-                naming,
-                policy_source,
-            )
+            let result = async {
+                if let Some((db, context)) = script_validation {
+                    validate_script_move_destination(db, context, &dest).await?;
+                }
+                run_move_to_complete(
+                    job_id,
+                    working_dir,
+                    staging_dir,
+                    dest.clone(),
+                    phase_counters,
+                    naming,
+                    policy_source,
+                )
+                .await
+            }
             .await;
             match &result {
                 Ok(outcome) => info!(

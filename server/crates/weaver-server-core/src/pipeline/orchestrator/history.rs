@@ -18,9 +18,24 @@ pub(super) enum HistoryDeleteReply {
 
 pub(crate) struct HistoryDeleteDone {
     job_ids: BTreeSet<JobId>,
-    scripts_ready: bool,
     result: Result<Vec<PathBuf>, crate::SchedulerError>,
     reply: HistoryDeleteReply,
+}
+
+async fn retry_script_stop_wait<F, W>(job_id: JobId, mut wait: W)
+where
+    F: std::future::Future<Output = Result<(), crate::StateError>>,
+    W: FnMut() -> F,
+{
+    loop {
+        match wait().await {
+            Ok(()) => return,
+            Err(error) => {
+                warn!(job_id = job_id.0, %error, "could not confirm scripts stopped; retrying history cleanup barrier");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 impl HistoryCleanupDirs {
@@ -63,18 +78,13 @@ impl Pipeline {
         let completed = self.terminal_post_processing_done_tx.clone();
         tokio::spawn(async move {
             let job_ids = dirs.job_ids.clone();
-            let mut scripts_ready = false;
             let result = async {
                 for job_id in &dirs.job_ids {
-                    if let Err(error) =
+                    retry_script_stop_wait(*job_id, || {
                         crate::post_processing::events::wait_for_job_events_stopped(&db, job_id.0)
-                            .await
-                    {
-                        // A failed barrier must not release runtime ownership.
-                        return Err(crate::SchedulerError::State(error));
-                    }
+                    })
+                    .await;
                 }
-                scripts_ready = true;
                 let cleanup =
                     Self::cleanup_history_intermediate_dirs_at(&intermediate_dir, &dirs).await;
                 for dir in &output_dirs {
@@ -87,7 +97,6 @@ impl Pipeline {
                 .send(TerminalPostProcessingEvent::HistoryDeleteDone(
                     HistoryDeleteDone {
                         job_ids,
-                        scripts_ready,
                         result,
                         reply,
                     },
@@ -98,22 +107,17 @@ impl Pipeline {
 
     pub(in crate::pipeline) fn handle_history_delete_done(&mut self, done: HistoryDeleteDone) {
         for job_id in &done.job_ids {
-            if done.scripts_ready {
-                self.pending_history_deletions.remove(job_id);
-            }
-            if done.scripts_ready
-                && self
-                    .jobs
-                    .get(job_id)
-                    .is_some_and(|state| is_terminal_status(&state.status))
+            self.pending_history_deletions.remove(job_id);
+            if self
+                .jobs
+                .get(job_id)
+                .is_some_and(|state| is_terminal_status(&state.status))
             {
                 self.purge_terminal_job_runtime(*job_id);
             }
         }
-        if done.scripts_ready {
-            self.finished_jobs
-                .retain(|job| !done.job_ids.contains(&job.job_id));
-        }
+        self.finished_jobs
+            .retain(|job| !done.job_ids.contains(&job.job_id));
         self.publish_snapshot();
         match done.reply {
             HistoryDeleteReply::One(reply) => {
@@ -594,5 +598,51 @@ impl Pipeline {
             let _ = archived.await;
             let _ = event_tx.send(event);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn history_cleanup_retries_uncertain_wait_and_still_waits_for_active_script() {
+        let db = crate::Database::open_in_memory().unwrap();
+        let job_id = JobId(41);
+        let active =
+            crate::post_processing::events::hold_test_event_run(&db, job_id.0, "cleanup-retry");
+        let (failed, failure_seen) = oneshot::channel();
+        let (retried, retry_seen) = oneshot::channel();
+        let cleanup = tokio::spawn(async move {
+            let mut failed = Some(failed);
+            let mut retried = Some(retried);
+            retry_script_stop_wait(job_id, || {
+                let failed = failed.take();
+                let retried = if failed.is_none() {
+                    retried.take()
+                } else {
+                    None
+                };
+                let db = db.clone();
+                async move {
+                    if let Some(failed) = failed {
+                        let _ = failed.send(());
+                        return Err(crate::StateError::Database(
+                            "injected transient read failure".into(),
+                        ));
+                    }
+                    let _ = retried.unwrap().send(());
+                    crate::post_processing::events::wait_for_job_events_stopped(&db, job_id.0).await
+                }
+            })
+            .await;
+        });
+        failure_seen.await.unwrap();
+        assert!(!cleanup.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        retry_seen.await.unwrap();
+        assert!(!cleanup.is_finished());
+        drop(active);
+        cleanup.await.unwrap();
     }
 }
