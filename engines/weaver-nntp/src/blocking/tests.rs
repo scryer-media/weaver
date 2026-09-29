@@ -325,6 +325,7 @@ fn spawn_tls_nntp_server_with_upgrade(
 
     let config = ServerConfig {
         proxy: None,
+        dialer: None,
         revocation: None,
         host: "localhost".to_string(),
         port,
@@ -2044,4 +2045,47 @@ fn a_480_mid_batch_is_a_session_expiry_not_an_auth_failure() {
             .any(|line| line.to_ascii_uppercase().starts_with("AUTHINFO PASS")),
         "the connection authenticated before the batch; saw {seen:?}"
     );
+}
+
+#[test]
+fn routed_socket_preserves_implicit_tls_and_starttls_body_delivery() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for upgrade in [false, true] {
+        let (mut config, server, ca) = spawn_tls_nntp_server_with_upgrade(
+            vec![(
+                "<routed@test>",
+                TestArticle::Body(b"routed encrypted body".to_vec()),
+            )],
+            upgrade,
+        );
+        let egress = std::sync::Arc::new(weaver_tunnel::pipe::Egress {
+            id: 0,
+            binding: weaver_tunnel::egress::SocketEgress::System,
+            timeout: config.connect_timeout,
+        });
+        config.dialer = Some(std::sync::Arc::new(crate::route_dialer::RouteDialer {
+            inner: std::sync::Arc::new(crate::route_dialer::AddressPlanned::new(
+                "fixture".into(),
+                egress,
+            )),
+            egress_controls: std::sync::Arc::new(crate::transfer::ServerTransferRegistry::new()),
+            runtime: runtime.handle().clone(),
+            server: 1,
+        }));
+        let mut connection = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
+        connection.select_group("alt.test").unwrap();
+        assert_eq!(
+            connection
+                .stream_yenc_article("<routed@test>")
+                .unwrap()
+                .into_data(),
+            b"routed encrypted body"
+        );
+        connection.quit().unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(ca).unwrap();
+    }
 }

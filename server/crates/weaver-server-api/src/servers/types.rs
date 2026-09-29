@@ -315,6 +315,7 @@ impl From<&weaver_server_core::servers::ServerConfig> for ServerDetails {
 #[derive(Debug, InputObject)]
 pub struct ServerInput {
     pub routing: Option<crate::proxies::RoutingPolicyInput>,
+    pub route: Option<crate::networking::RouteInput>,
     pub host: String,
     pub port: u16,
     pub tls: bool,
@@ -351,7 +352,16 @@ pub struct AdoptableTlsNameMismatchCertificate {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+pub struct LegConnectionTest {
+    pub position: usize,
+    pub success: bool,
+    pub message: String,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
 pub struct TestConnectionResult {
+    pub legs: Vec<LegConnectionTest>,
     pub success: bool,
     pub message: String,
     pub latency_ms: Option<u64>,
@@ -373,6 +383,7 @@ pub struct TestConnectionResult {
 impl From<weaver_server_core::servers::ServerConnectivityResult> for TestConnectionResult {
     fn from(result: weaver_server_core::servers::ServerConnectivityResult) -> Self {
         Self {
+            legs: Vec::new(),
             success: result.success,
             message: result.message,
             latency_ms: result.latency_ms,

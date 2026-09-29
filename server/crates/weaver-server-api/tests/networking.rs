@@ -1,0 +1,287 @@
+mod common;
+use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
+use weaver_server_api::auth::CallerScope;
+use weaver_server_core::proxies::ProxyRuntime;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the frontend dependencies and Playwright runtime"]
+async fn networking_browser_against_isolated_graphql() {
+    use axum::{Json, Router, routing::post};
+    use std::sync::Arc;
+    let h = Arc::new(harness().await);
+    let response = h.execute(r#"mutation {addServer(input:{host:"news.fixture.invalid",port:119,tls:false,connections:20,active:false}){id}}"#).await;
+    assert_no_errors(&response);
+    let id = response_data(&response)["addServer"]["id"]
+        .as_u64()
+        .unwrap() as u32;
+    h.handle
+        .proxy_runtime()
+        .unwrap()
+        .network
+        .route(
+            weaver_server_core::proxies::Consumer::Server(id),
+            20,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+    let handler = h.clone();
+    let subscriptions = h.clone();
+    let app = Router::new().route(
+        "/graphql",
+        post(move |Json(request): Json<async_graphql::Request>| {
+            let h = handler.clone();
+            async move {
+                Json(
+                    h.schema
+                        .execute(
+                            request
+                                .data(CallerScope::Local)
+                                .data(weaver_server_api::auth::CallerIdentity::Local([7; 32])),
+                        )
+                        .await,
+                )
+            }
+        })
+        .get(move |ws: axum::extract::WebSocketUpgrade| {
+            use async_graphql::futures_util::{SinkExt, StreamExt};
+            let h = subscriptions.clone();
+            async move {
+                ws.protocols(["graphql-transport-ws"])
+                    .on_upgrade(move |socket| async move {
+                        let (mut sender, receiver) = socket.split();
+                        let input = receiver.filter_map(|message| async move {
+                            match message {
+                                Ok(axum::extract::ws::Message::Text(text)) => Some(
+                                    serde_json::from_str::<async_graphql::http::ClientMessage>(
+                                        &text,
+                                    ),
+                                ),
+                                _ => None,
+                            }
+                        });
+                        let mut data = async_graphql::Data::default();
+                        data.insert(CallerScope::Local);
+                        data.insert(weaver_server_api::auth::CallerIdentity::Local([7; 32]));
+                        let mut output = Box::pin(
+                            async_graphql::http::WebSocket::from_message_stream(
+                                h.schema.clone(),
+                                input,
+                                async_graphql::http::WebSocketProtocols::GraphQLWS,
+                            )
+                            .connection_data(data),
+                        );
+                        while let Some(message) = output.next().await {
+                            match message {
+                                async_graphql::http::WsMessage::Text(text) => {
+                                    if sender
+                                        .send(axum::extract::ws::Message::Text(text.into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                async_graphql::http::WsMessage::Close(_, _) => break,
+                            }
+                        }
+                    })
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("node")
+            .current_dir(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../apps/weaver-web"),
+            )
+            .args(["--test", "tests/browser/networking.test.mjs"])
+            .env("NETWORKING_FIXTURE_API", format!("http://{address}"))
+            .status()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let _ = stop.send(());
+    serving.await.unwrap();
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+    assert!(status.success());
+}
+
+async fn harness() -> TestHarness {
+    let h = TestHarness::new().await;
+    h.handle.set_proxy_runtime(
+        ProxyRuntime::new(h.db.clone(), tokio::runtime::Handle::current()).unwrap(),
+    );
+    h
+}
+#[tokio::test]
+async fn advanced_route_round_trip_refuses_lossy_legacy_writes_and_preserves_unrelated_edits() {
+    let h = harness().await;
+    let create = r#"mutation {createEgressInterface(input:{name:"Loopback source",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1"}){id}}"#;
+    assert_has_errors(&h.execute_as(create, CallerScope::Control).await);
+    let response = h.execute(create).await;
+    assert_no_errors(&response);
+    let egress = response_data(&response)["createEgressInterface"]["id"]
+        .as_u64()
+        .unwrap();
+    let response=h.execute(&format!(r#"mutation {{addRssFeed(input:{{name:"Two paths",url:"https://feed.invalid/rss",enabled:false,route:{{failover:HOLD,legs:[{{egressId:0,weight:60,path:{{direct:true}}}},{{egressId:{egress},weight:40,path:{{direct:true}}}}]}}}}){{id route{{failover legs{{egressId weight path{{kind}}}}}} routing{{proxyIds allowDirect}}}}}}"#)).await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let feed = data["addRssFeed"]["id"].as_u64().unwrap();
+    assert_eq!(
+        data["addRssFeed"]["route"]["legs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(data["addRssFeed"]["routing"]["allowDirect"], true);
+    assert_has_errors(
+        &h.execute(&format!("mutation{{deleteEgressInterface(id:{egress})}}"))
+            .await,
+    );
+    let before =
+        h.db.proxy_routing_policy(weaver_server_core::proxies::Consumer::Rss(feed as u32))
+            .unwrap();
+    assert_has_errors(&h.execute(&format!(r#"mutation{{updateRssFeed(id:{feed},input:{{name:"Must not save",url:"https://feed.invalid/rss",enabled:false,routing:{{proxyIds:[],allowDirect:true}}}}){{id}}}}"#)).await);
+    assert_eq!(
+        h.db.get_rss_feed(feed as u32).unwrap().unwrap().name,
+        "Two paths"
+    );
+    let response=h.execute(&format!(r#"mutation{{updateRssFeed(id:{feed},input:{{name:"Renamed",url:"https://feed.invalid/rss",enabled:false}}){{route{{failover legs{{weight}}}}}}}}"#)).await;
+    assert_no_errors(&response);
+    assert_eq!(
+        h.db.proxy_routing_policy(weaver_server_core::proxies::Consumer::Rss(feed as u32))
+            .unwrap(),
+        before
+    );
+    assert_has_errors(&h.execute(&format!(r#"mutation{{updateRssFeed(id:{feed},input:{{name:"Must not save",url:"https://feed.invalid/rss",routing:{{proxyIds:[],allowDirect:true}},route:{{legs:[{{egressId:0,weight:100,path:{{direct:true}}}}]}}}}){{id}}}}"#)).await);
+    let query=h.execute("{egressInterfaces{id name health} platformNetworking{egressBindingKinds} networkFlow{consumers{key id name kind cap route{failover legs{egressId weight}}} legs{consumer state} pools{poolId}}}").await;
+    assert_no_errors(&query);
+    let graph = response_data(&query);
+    let consumer = &graph["networkFlow"]["consumers"][0];
+    assert_eq!(consumer["key"], format!("rss:{feed}"));
+    assert_eq!(consumer["name"], "Renamed");
+    assert_eq!(consumer["route"]["failover"], "HOLD");
+    assert_eq!(consumer["route"]["legs"].as_array().unwrap().len(), 2);
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
+async fn route_input_union_and_system_invariants_are_enforced() {
+    let h = harness().await;
+    for path in [
+        "{direct:false}",
+        "{direct:true,ladder:{rungs:[],directFallback:false}}",
+        "{ladder:{rungs:[],directFallback:true}}",
+    ] {
+        assert_has_errors(&h.execute(&format!(r#"mutation{{addRssFeed(input:{{name:"Invalid",url:"https://feed.invalid/rss",enabled:false,route:{{legs:[{{egressId:0,weight:100,path:{path}}}]}}}}){{id}}}}"#)).await);
+    }
+    assert_has_errors(&h.execute("mutation{deleteEgressInterface(id:0)}").await);
+    assert_has_errors(&h.execute(r#"mutation{updateEgressInterface(id:0,input:{name:"Renamed",bindingKind:SYSTEM}){id}}"#).await);
+    assert_no_errors(&h.execute(r#"mutation{updateEgressInterface(id:0,input:{name:"System",bindingKind:SYSTEM,maxDownloadSpeed:1024}){id maxDownloadSpeed}}"#).await);
+    assert!(h.db.list_rss_feeds().unwrap().is_empty());
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
+async fn pool_route_keeps_member_projection_and_prevents_pool_deletion() {
+    let h = harness().await;
+    let mut ids = Vec::new();
+    for name in ["Primary", "Secondary"] {
+        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}}){{id}}}}"#)).await;
+        assert_no_errors(&result);
+        ids.push(
+            response_data(&result)["saveProxyProfile"]["id"]
+                .as_u64()
+                .unwrap(),
+        );
+    }
+    let result=h.execute(&format!(r#"mutation{{createProxyPool(input:{{name:"POP pool",kind:SOCKS5,memberIds:[{},{}]}}){{id}}}}"#,ids[0],ids[1])).await;
+    assert_no_errors(&result);
+    let pool = response_data(&result)["createProxyPool"]["id"]
+        .as_u64()
+        .unwrap();
+    let result=h.execute(&format!(r#"mutation{{addRssFeed(input:{{name:"Pool feed",url:"https://feed.invalid/rss",enabled:false,route:{{legs:[{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{pool:{pool}}}],directFallback:false}}}}}}]}}}}){{route{{legs{{path{{rungs{{kind poolId}}}}}}}} routing{{proxyIds allowDirect}}}}}}"#)).await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["addRssFeed"]["routing"]["proxyIds"],
+        serde_json::json!(ids)
+    );
+    assert_has_errors(
+        &h.execute(&format!("mutation{{deleteProxyPool(id:{pool})}}"))
+            .await,
+    );
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
+async fn topology_queries_and_subscription_require_admin_scope() {
+    use async_graphql::futures_util::StreamExt;
+    let h = harness().await;
+    let queries = [
+        "{ egressInterfaces { id } }",
+        "{ discoverNetworkInterfaces { name } }",
+        "{ platformNetworking { egressBindingKinds } }",
+        "{ proxyPools { id } }",
+        "{ networkRoutes { consumer } }",
+        "{ networkFlow { legs { consumer } } }",
+    ];
+    for scope in [
+        CallerScope::Read,
+        CallerScope::Control,
+        CallerScope::Admin,
+        CallerScope::Local,
+    ] {
+        for query in queries {
+            let response = h.execute_as(query, scope).await;
+            if matches!(scope, CallerScope::Read | CallerScope::Control) {
+                assert!(
+                    format!("{:?}", response.errors).contains("FORBIDDEN"),
+                    "{query}: {:?}",
+                    response.errors
+                );
+            } else {
+                assert_no_errors(&response);
+            }
+        }
+        let request =
+            async_graphql::Request::new("subscription { networkFlow { legs { consumer } } }")
+                .data(scope);
+        let response = h.schema.execute_stream(request).next().await.unwrap();
+        if matches!(scope, CallerScope::Read | CallerScope::Control) {
+            assert!(format!("{:?}", response.errors).contains("FORBIDDEN"));
+        } else {
+            assert_no_errors(&response);
+        }
+    }
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
+async fn route_save_rejects_missing_consumers_without_persisting() {
+    let h = harness().await;
+    for kind in ["SERVER", "RSS"] {
+        let response = h.execute(&format!("mutation {{ saveNetworkRoute(kind:{kind}, id:999, input:{{legs:[{{egressId:0,weight:100,path:{{direct:true}}}}]}}) {{ consumer }} }}")).await;
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|e| e.message.contains("consumer no longer exists")),
+            "{:?}",
+            response.errors
+        );
+    }
+    assert!(h.db.list_proxy_routes().unwrap().is_empty());
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}

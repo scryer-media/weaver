@@ -17,6 +17,8 @@ fn acquire_timeout_message(seconds: u64) -> String {
 /// Errors that can occur during NNTP operations.
 #[derive(Debug, Error)]
 pub enum NntpError {
+    #[error("route: {0}")]
+    Route(std::sync::Arc<weaver_tunnel::pipe::DialError>),
     // --- Transport errors ---
     /// An I/O error occurred on the underlying transport.
     #[error("I/O error: {0}")]

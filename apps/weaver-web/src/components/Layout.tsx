@@ -493,11 +493,13 @@ export function Layout() {
                           const EntryIcon = entry.icon;
                           const childActive = location.pathname === entry.to;
                           return (
+                            <div key={entry.to}>
+                            {entry.to === "/settings/networking/overview" && <div className="px-2.5 pt-3 pb-1 text-xs font-semibold text-muted-foreground">{t("settings.networking")}</div>}
                             <Link
-                              key={entry.to}
                               to={entry.to}
                               className={cn(
                                 "flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[13px] transition-colors",
+                                entry.to.startsWith("/settings/networking/") && "ml-3",
                                 childActive
                                   ? "bg-accent font-semibold text-foreground"
                                   : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
@@ -513,6 +515,7 @@ export function Layout() {
                                 </Badge>
                               ) : null}
                             </Link>
+                            </div>
                           );
                         })}
                       </div>
@@ -643,12 +646,14 @@ export function Layout() {
                             const EntryIcon = entry.icon;
                             const childActive = location.pathname === entry.to;
                             return (
+                              <div key={entry.to}>
+                              {entry.to === "/settings/networking/overview" && <div className="px-3 pt-3 pb-1 text-xs font-semibold text-muted-foreground">{t("settings.networking")}</div>}
                               <Link
-                                key={entry.to}
                                 to={entry.to}
                                 onClick={() => setMobileNavOpen(false)}
                                 className={cn(
                                   "flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-[13px] transition-colors",
+                                  entry.to.startsWith("/settings/networking/") && "ml-3",
                                   childActive
                                     ? "bg-accent font-semibold text-foreground"
                                     : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
@@ -664,6 +669,7 @@ export function Layout() {
                                   </Badge>
                                 ) : null}
                               </Link>
+                              </div>
                             );
                           })}
                         </div>

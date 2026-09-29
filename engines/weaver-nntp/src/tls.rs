@@ -1374,7 +1374,7 @@ pub(crate) async fn dial_direct(
 async fn connect_first_answering(addrs: &[SocketAddr]) -> Result<TcpStream, NntpError> {
     let mut last_error = None;
     for addr in addrs {
-        match TcpStream::connect(addr).await {
+        match crate::egress::SocketEgress::System.connect(*addr).await {
             Ok(tcp) => return Ok(tcp),
             Err(error) => last_error = Some(error),
         }

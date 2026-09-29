@@ -34,6 +34,17 @@ impl From<DirectStream> for RouteStream {
         }
     }
 }
+impl From<weaver_tunnel::pipe::DialedStream> for RouteStream {
+    fn from(stream: weaver_tunnel::pipe::DialedStream) -> Self {
+        match stream {
+            weaver_tunnel::pipe::DialedStream::Socket(socket) => Self::Tcp(socket),
+            weaver_tunnel::pipe::DialedStream::Tunnel(stream) => Self::Tunnel {
+                stream: DirectStream::from_stream(stream),
+                peeked: None,
+            },
+        }
+    }
+}
 impl RouteStream {
     pub(crate) fn begin_inspection(&mut self) {
         let inner = std::mem::replace(
@@ -177,8 +188,15 @@ impl BlockingSocket {
         runtime: tokio::runtime::Handle,
         timeout: Duration,
     ) -> Self {
+        Self::tunnel_boxed(Box::new(stream), runtime, timeout)
+    }
+    pub(crate) fn tunnel_boxed(
+        stream: Box<dyn weaver_tunnel::TunnelStream>,
+        runtime: tokio::runtime::Handle,
+        timeout: Duration,
+    ) -> Self {
         Self::Tunnel {
-            stream,
+            stream: DirectStream::from_stream(stream),
             runtime,
             read_timeout: std::cell::Cell::new(Some(timeout)),
             write_timeout: std::cell::Cell::new(Some(timeout)),

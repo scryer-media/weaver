@@ -3,6 +3,11 @@ import { duplicateLocaleEntries } from "../duplicate-locales";
 import { nextEn } from "@/next/i18n/en";
 
 const en: LocaleDictionary = {
+  "settings.networking": "Networking",
+  "settings.networkOverview": "Overview",
+  "settings.networkEgress": "Egress interfaces",
+  "settings.networkRoutes": "Routes",
+  "settings.networkingDesc": "Egress interfaces, proxy pools and consumer routes",
   "settings.proxies": "Proxies",
   "settings.proxiesDesc": "Reusable proxy profiles and private routes for servers and RSS feeds.",
   // Brand

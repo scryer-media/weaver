@@ -313,8 +313,11 @@ impl FetchAttemptOutcome {
     }
 }
 
+pub type RouteFeedback = Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>;
+
 #[derive(Debug, Clone)]
 pub struct FetchAttemptTrace {
+    pub route_feedback: RouteFeedback,
     pub connection_health: Option<Arc<crate::recovery::ConnectionHealth>>,
     pub server_idx: usize,
     pub remote_ip: Option<IpAddr>,
@@ -427,6 +430,7 @@ pub struct BodyLaneLease {
     conn: Option<PooledConnection>,
     health_lease: Option<Arc<crate::recovery::ConnectionHealthLease>>,
     remote_ip: Option<IpAddr>,
+    route_feedback: RouteFeedback,
     groups: Vec<String>,
     mode: BodyLaneMode,
     /// Command-to-status-line wait, sampled only when nothing else was
@@ -905,6 +909,7 @@ impl BodyLaneLease {
                 self.server_id.0,
                 self.health_lease.as_ref().map(|lease| &*lease.0),
                 self.remote_ip,
+                self.route_feedback.clone(),
                 message_id,
                 item,
                 &mut attempts,
@@ -964,8 +969,10 @@ impl NntpClient {
             ..PoolConfig::default()
         });
 
+        let pool = Arc::new(pool);
+        pool.start_route_probes();
         NntpClient {
-            pool: Arc::new(pool),
+            pool,
             max_retries_per_server,
             soft_timeout,
         }
@@ -973,6 +980,7 @@ impl NntpClient {
 
     /// Create a client wrapping an existing pool.
     pub fn from_pool(pool: Arc<NntpPool>) -> Self {
+        pool.start_route_probes();
         NntpClient {
             pool,
             max_retries_per_server: 1,
@@ -1112,6 +1120,7 @@ impl NntpClient {
                 server_id: server,
                 health_lease: conn.health_lease.clone(),
                 remote_ip: conn.remote_ip(),
+                route_feedback: conn.route_outcome.clone(),
                 conn: Some(conn),
                 groups: groups.to_vec(),
                 mode: BodyLaneMode::Sequential,
@@ -1128,6 +1137,7 @@ impl NntpClient {
                 server_id: server,
                 health_lease: conn.health_lease.clone(),
                 remote_ip: conn.remote_ip(),
+                route_feedback: conn.route_outcome.clone(),
                 conn: Some(conn),
                 groups: groups.to_vec(),
                 mode: BodyLaneMode::Sequential,
@@ -1434,10 +1444,11 @@ impl NntpClient {
                 .fetch_from_server_with_groups(server, message_id, groups)
                 .await
             {
-                Ok((data, remote_ip)) => {
+                Ok((data, remote_ip, route_feedback)) => {
                     let elapsed = start.elapsed();
                     self.record_server_success(idx, elapsed).await;
                     attempts.push(FetchAttemptTrace {
+                        route_feedback,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip,
@@ -1454,6 +1465,7 @@ impl NntpClient {
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -1468,6 +1480,7 @@ impl NntpClient {
                 }
                 Err(e @ NntpError::QuotaBlocked(_)) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -1482,6 +1495,7 @@ impl NntpClient {
                 | Err(NntpError::AuthenticationRejected)
                 | Err(NntpError::AccessDenied) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -1494,6 +1508,7 @@ impl NntpClient {
                 }
                 Err(e) if is_transient(&e) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -1506,6 +1521,7 @@ impl NntpClient {
                 }
                 Err(e) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -1717,6 +1733,7 @@ impl NntpClient {
                                 idx,
                                 None,
                                 None,
+                                None,
                                 message_ids[message_idx],
                                 item,
                                 &mut attempts_by_index[message_idx],
@@ -1743,6 +1760,7 @@ impl NntpClient {
                 }
             };
             let remote_ip = conn.remote_ip();
+            let route_feedback = conn.route_outcome.clone();
             let health_lease = conn.health_lease.clone();
 
             let group_result = match tokio::time::timeout_at(
@@ -1766,6 +1784,7 @@ impl NntpClient {
                                 idx,
                                 health_lease.as_ref().map(|lease| &*lease.0),
                                 remote_ip,
+                                route_feedback.clone(),
                                 message_ids[message_idx],
                                 item,
                                 &mut attempts_by_index[message_idx],
@@ -1807,6 +1826,7 @@ impl NntpClient {
                             idx,
                             health_lease.as_ref().map(|lease| &*lease.0),
                             remote_ip,
+                            route_feedback.clone(),
                             message_ids[message_idx],
                             item,
                             &mut attempts_by_index[message_idx],
@@ -1877,6 +1897,7 @@ impl NntpClient {
                             idx,
                             health_lease.as_ref().map(|lease| &*lease.0),
                             remote_ip,
+                            route_feedback.clone(),
                             message_ids[message_idx],
                             item,
                             &mut attempts_by_index[message_idx],
@@ -1911,6 +1932,7 @@ impl NntpClient {
                         idx,
                         health_lease.as_ref().map(|lease| &*lease.0),
                         remote_ip,
+                        route_feedback.clone(),
                         message_ids[message_idx],
                         item,
                         &mut attempts_by_index[message_idx],
@@ -1965,6 +1987,7 @@ impl NntpClient {
                         idx,
                         health_lease.as_ref().map(|lease| &*lease.0),
                         remote_ip,
+                        route_feedback.clone(),
                         message_ids[message_idx],
                         item,
                         &mut attempts_by_index[message_idx],
@@ -2008,6 +2031,7 @@ impl NntpClient {
                                 idx,
                                 health_lease.as_ref().map(|lease| &*lease.0),
                                 remote_ip,
+                                route_feedback.clone(),
                                 message_ids[unread_idx],
                                 item,
                                 &mut attempts_by_index[unread_idx],
@@ -2079,6 +2103,7 @@ impl NntpClient {
         server_idx: usize,
         ticket: Option<&crate::recovery::ConnectionHealth>,
         remote_ip: Option<IpAddr>,
+        route_feedback: RouteFeedback,
         message_id: &str,
         item: DecodedBatchItem,
         attempts: &mut Vec<FetchAttemptTrace>,
@@ -2092,6 +2117,7 @@ impl NntpClient {
         match item.result {
             Ok(decoded) => {
                 attempts.push(FetchAttemptTrace {
+                    route_feedback: route_feedback.clone(),
                     connection_health: None,
                     server_idx,
                     remote_ip,
@@ -2103,6 +2129,7 @@ impl NntpClient {
             }
             Err(DecodedBodyError::Decode { raw_size, error }) => {
                 attempts.push(FetchAttemptTrace {
+                    route_feedback: route_feedback.clone(),
                     connection_health: None,
                     server_idx,
                     remote_ip,
@@ -2118,6 +2145,7 @@ impl NntpClient {
                 | NntpError::NoArticleWithNumber,
             )) => {
                 attempts.push(FetchAttemptTrace {
+                    route_feedback: route_feedback.clone(),
                     connection_health: None,
                     server_idx,
                     remote_ip,
@@ -2132,6 +2160,7 @@ impl NntpClient {
             }
             Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(rejection))) => {
                 attempts.push(FetchAttemptTrace {
+                    route_feedback: route_feedback.clone(),
                     connection_health: None,
                     server_idx,
                     remote_ip,
@@ -2144,6 +2173,7 @@ impl NntpClient {
             }
             Err(DecodedBodyError::Nntp(error @ NntpError::BodyNotRequestedDueToQuota { .. })) => {
                 attempts.push(FetchAttemptTrace {
+                    route_feedback: route_feedback.clone(),
                     connection_health: None,
                     server_idx,
                     remote_ip,
@@ -2160,6 +2190,7 @@ impl NntpClient {
                 | NntpError::AccessDenied,
             )) => {
                 attempts.push(FetchAttemptTrace {
+                    route_feedback: route_feedback.clone(),
                     connection_health: None,
                     server_idx,
                     remote_ip,
@@ -2172,6 +2203,7 @@ impl NntpClient {
             }
             Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
                 attempts.push(FetchAttemptTrace {
+                    route_feedback: route_feedback.clone(),
                     connection_health: None,
                     server_idx,
                     remote_ip,
@@ -2184,6 +2216,7 @@ impl NntpClient {
             }
             Err(other) => {
                 attempts.push(FetchAttemptTrace {
+                    route_feedback: route_feedback.clone(),
                     connection_health: None,
                     server_idx,
                     remote_ip,
@@ -2223,13 +2256,14 @@ impl NntpClient {
                 .fetch_decoded_from_server_with_groups(server, message_id, groups)
                 .await
             {
-                Ok(decoded) => {
+                Ok((decoded, remote_ip, route_feedback)) => {
                     let elapsed = start.elapsed().saturating_sub(decoded.io.throttle_wait);
                     self.record_server_success(idx, elapsed).await;
                     attempts.push(FetchAttemptTrace {
+                        route_feedback,
                         connection_health: None,
                         server_idx: idx,
-                        remote_ip: None,
+                        remote_ip,
                         elapsed,
                         outcome: FetchAttemptOutcome::Success,
                         error: None,
@@ -2241,6 +2275,7 @@ impl NntpClient {
                 }
                 Err(DecodedBodyError::Decode { raw_size, error }) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -2259,6 +2294,7 @@ impl NntpClient {
                     | NntpError::NoArticleWithNumber,
                 )) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -2273,6 +2309,7 @@ impl NntpClient {
                 }
                 Err(DecodedBodyError::Nntp(e @ NntpError::QuotaBlocked(_))) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -2289,6 +2326,7 @@ impl NntpClient {
                     | NntpError::AccessDenied,
                 )) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -2301,6 +2339,7 @@ impl NntpClient {
                 }
                 Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -2313,6 +2352,7 @@ impl NntpClient {
                 }
                 Err(other) => {
                     attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
                         connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
@@ -2364,6 +2404,9 @@ impl NntpClient {
             if attempt.outcome != FetchAttemptOutcome::Success {
                 continue;
             }
+            if let Some(feedback) = &attempt.route_feedback {
+                feedback.body_latency(attempt.elapsed);
+            }
             if let Some(ip) = attempt.remote_ip {
                 self.pool.record_address_body_latency(
                     ServerId(attempt.server_idx),
@@ -2392,6 +2435,9 @@ impl NntpClient {
         else {
             return;
         };
+        if let Some(feedback) = &served.route_feedback {
+            feedback.delivered(payload_bytes, wire);
+        }
         if let Some(ip) = served.remote_ip {
             self.pool
                 .record_address_delivery(ServerId(served.server_idx), ip, payload_bytes, wire);
@@ -2725,7 +2771,10 @@ impl NntpClient {
         let mut candidates = Vec::with_capacity(server_count);
         let mut quota_blocked = None;
         for (idx, group) in server_groups.iter().copied().enumerate().take(server_count) {
-            if exclude.contains(&idx) || !health.is_available(idx) {
+            if exclude.contains(&idx)
+                || !health.is_available(idx)
+                || !self.pool.route_available(idx)
+            {
                 continue;
             }
             // Backfill servers only serve requests whose fill tier is
@@ -3025,7 +3074,10 @@ impl NntpClient {
         let mut backfill_groups: std::collections::BTreeMap<u32, GroupCandidates> =
             std::collections::BTreeMap::new();
         for idx in 0..server_count {
-            if exclude.contains(&idx) || !health.is_available(idx) {
+            if exclude.contains(&idx)
+                || !health.is_available(idx)
+                || !self.pool.route_available(idx)
+            {
                 continue;
             }
             if backfill_flags[idx] && !backfill_unlocked {
@@ -3264,7 +3316,7 @@ impl NntpClient {
         server: ServerId,
         message_id: &str,
         groups: &[String],
-    ) -> Result<(Bytes, Option<IpAddr>)> {
+    ) -> Result<(Bytes, Option<IpAddr>, RouteFeedback)> {
         let mut attempts = 0u32;
 
         loop {
@@ -3329,7 +3381,7 @@ impl NntpClient {
                     .await;
             }
             match result {
-                Ok(response) => return Ok((response.data, remote_ip)),
+                Ok(response) => return Ok((response.data, remote_ip, conn.route_outcome.clone())),
                 Err(NntpError::ArticleNotFound)
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
@@ -3372,7 +3424,7 @@ impl NntpClient {
         server: ServerId,
         message_id: &str,
         groups: &[String],
-    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
+    ) -> std::result::Result<(DecodedBody, Option<IpAddr>, RouteFeedback), DecodedBodyError> {
         let mut attempts = 0u32;
 
         loop {
@@ -3430,13 +3482,17 @@ impl NntpClient {
             }
             match stream_result {
                 Ok(article) => {
-                    return Ok(DecodedBody {
-                        raw_size: decoded_raw_size_from_fused_stats(&article.stats),
-                        cpu: decoded_cpu_from_fused_stats(&article.stats),
-                        io: decoded_io_from_fused_stats(&article.stats),
-                        decoded: article.chunks,
-                        body: article.body,
-                    });
+                    return Ok((
+                        DecodedBody {
+                            raw_size: decoded_raw_size_from_fused_stats(&article.stats),
+                            cpu: decoded_cpu_from_fused_stats(&article.stats),
+                            io: decoded_io_from_fused_stats(&article.stats),
+                            decoded: article.chunks,
+                            body: article.body,
+                        },
+                        conn.remote_ip(),
+                        conn.route_outcome.clone(),
+                    ));
                 }
                 Err(FusedYencError::Yenc(error)) => {
                     return Err(DecodedBodyError::Decode { raw_size: 0, error });

@@ -56,15 +56,15 @@ pub async fn rebuild_nntp_from_config(
             .map(|server| {
                 Ok::<_, SchedulerError>(ServerPoolConfig {
                     server: weaver_nntp::ServerConfig {
-                        proxy: proxy_runtime
+                        dialer: proxy_runtime
                             .as_ref()
-                            .map(|runtime| runtime.nntp_bridge(server.id))
-                            .transpose()
-                            .map_err(SchedulerError::Internal)?
-                            .flatten(),
-                        revocation: proxy_runtime
-                            .as_ref()
-                            .map(|runtime| runtime.nntp_sockets(server.id))
+                            .map(|runtime| {
+                                runtime.network.nntp_dialer(
+                                    server.id,
+                                    server.connections,
+                                    std::time::Duration::from_secs(30),
+                                )
+                            })
                             .transpose()
                             .map_err(SchedulerError::Internal)?,
                         host: server.host.clone(),

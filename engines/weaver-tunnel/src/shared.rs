@@ -42,6 +42,15 @@ pub struct SharedProvider<T>(pub(crate) T);
 
 #[async_trait::async_trait]
 impl<T: proxy_tunnels::TunnelProvider> TunnelProvider for SharedProvider<T> {
+    async fn prepare(&self) -> Result<(), TunnelError> {
+        self.0.prepare().await
+    }
+    async fn retire(&self) {
+        self.0.retire().await;
+    }
+    fn source_address(&self) -> Option<std::net::SocketAddr> {
+        self.0.source_address()
+    }
     async fn shutdown(&self) {
         self.0.shutdown().await;
     }

@@ -2377,6 +2377,7 @@ mod tests {
             JobId(42),
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                    route_feedback: None,
                     connection_health: None,
                     server_idx: 0,
                     remote_ip: None,

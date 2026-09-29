@@ -124,6 +124,22 @@ pub struct DirectStream {
     state: Arc<Mutex<State>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
+impl DirectStream {
+    /// Serialize access to a pipe-owned stream without a forwarding task.
+    pub fn from_stream(stream: Box<dyn TunnelStream>) -> Self {
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("new stream permit");
+        Self {
+            state: Arc::new(Mutex::new(State {
+                stream: Some(stream),
+                reader: None,
+                writer: None,
+            })),
+            _permit: permit,
+        }
+    }
+}
 impl AsyncRead for DirectStream {
     fn poll_read(
         self: Pin<&mut Self>,

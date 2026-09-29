@@ -194,6 +194,8 @@ pub struct BlockingBodyLane {
 }
 
 pub struct BlockingNntpConnection {
+    pub route_path: Option<weaver_tunnel::pipe::DialPath>,
+    egress_control: Option<Arc<ServerTransferControl>>,
     route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
     _route_socket: Option<Arc<socket2::Socket>>,
     transport: BlockingTransport,
@@ -261,6 +263,10 @@ impl BlockingBodyLane {
             groups.first().map(String::as_str),
         )?;
         conn.set_transfer_control(transfer_control);
+        permit.socket_slot.set_path(conn.route_path.as_ref());
+        permit
+            .socket_slot
+            .observe_outcome(conn.route_outcome.as_ref());
         // A body lane only ever fetches by message-id, which RFC 3977 serves
         // without a selected group. Walking the candidate groups costs a round
         // trip each before the first article can be asked for, so it runs only
@@ -460,7 +466,7 @@ impl BlockingBodyLane {
     }
 
     pub fn accepts_new_work(&self) -> bool {
-        self._permit.health_lease.0.current() && !self._permit.socket_slot.retiring()
+        self._permit.health_lease.0.current() && self._permit.socket_slot.reusable()
     }
 
     /// Answer an existence probe on this lane's connection.
@@ -988,6 +994,7 @@ impl BlockingBodyLane {
 
         DecodedBodyTrace {
             attempts: vec![FetchAttemptTrace {
+                route_feedback: self.conn.route_outcome.clone(),
                 connection_health: Some(Arc::clone(&self._permit.health_lease.0)),
                 server_idx: self.server_id.0,
                 remote_ip: self.remote_ip,
@@ -1105,6 +1112,32 @@ impl BlockingNntpConnection {
     ) -> Result<Self> {
         if let Some(registry) = &config.revocation {
             registry.check()?;
+        }
+        if let Some(dialer) = &config.dialer {
+            let dialed = dialer.runtime.block_on(dialer.dial(config))?;
+            let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
+            let socket = dialer.blocking_stream(dialed.stream, config)?;
+            let mut result = Self::from_tcp(
+                config,
+                socket,
+                remote_addr,
+                backend_override,
+                initial_group,
+                Some(dialed.outcome),
+                None,
+            );
+            if let Some(setup) = dialed.setup {
+                setup.complete(result.is_ok());
+            }
+            if let Ok(connection) = &mut result {
+                connection.egress_control = Some(
+                    dialer
+                        .egress_controls
+                        .control(crate::transfer::StableServerId(dialed.path.egress)),
+                );
+                connection.route_path = Some(dialed.path);
+            }
+            return result;
         }
         if config.proxy.is_some() {
             let (tcp, outcome) = crate::proxy::connect_blocking(config)?;
@@ -1227,6 +1260,8 @@ impl BlockingNntpConnection {
 
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
         let mut conn = Self {
+            route_path: None,
+            egress_control: None,
             route_outcome,
             _route_socket: route_socket,
             transport,
@@ -1564,7 +1599,14 @@ impl BlockingNntpConnection {
     }
 
     fn charge_active_body(&mut self, bytes: usize) -> Duration {
-        match self.body_accounting.front_mut() {
+        if let Some(outcome) = &self.route_outcome {
+            outcome.read(bytes);
+        }
+        let egress_wait = match &self.egress_control {
+            Some(control) => control.pace_read_blocking(bytes),
+            None => Duration::ZERO,
+        };
+        let server_wait = match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
                 if let Some(control) = &self.transfer_control {
                     control.record_unlimited_body_bytes(bytes);
@@ -1573,10 +1615,17 @@ impl BlockingNntpConnection {
             }
             Some(BodyTransferAccounting::Tracked(permit)) => permit.record_blocking(bytes),
             None => Duration::ZERO,
-        }
+        };
+        egress_wait.saturating_add(server_wait)
     }
 
     fn charge_active_body_without_wait(&mut self, bytes: usize) {
+        if let Some(outcome) = &self.route_outcome {
+            outcome.read(bytes);
+        }
+        if let Some(control) = &self.egress_control {
+            control.pace_read_without_wait(bytes);
+        }
         match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
                 if let Some(control) = &self.transfer_control {
@@ -3007,7 +3056,7 @@ fn connect_first_answering(
 ) -> Result<(TcpStream, SocketAddr)> {
     let mut last_error = None;
     for addr in (host, port).to_socket_addrs().map_err(NntpError::Io)? {
-        match TcpStream::connect_timeout(&addr, timeout) {
+        match crate::egress::SocketEgress::System.connect_blocking(addr, timeout) {
             Ok(tcp) => return Ok((tcp, addr)),
             Err(error) => last_error = Some(error),
         }
@@ -3080,6 +3129,7 @@ fn profile_cpu_timings_enabled() -> bool {
 
 fn clone_nntp_error(error: &NntpError) -> NntpError {
     match error {
+        NntpError::Route(error) => NntpError::Route(error.clone()),
         NntpError::Timeout => NntpError::Timeout,
         NntpError::ConnectionClosed => NntpError::ConnectionClosed,
         NntpError::TruncatedMultilineBody => NntpError::TruncatedMultilineBody,

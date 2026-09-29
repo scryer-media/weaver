@@ -108,6 +108,7 @@ fn route(modes: &[Mode], timeout: Duration) -> Arc<ConsumerRoute> {
             RoutingPolicy {
                 proxy_ids: (1..=modes.len() as u32).collect(),
                 allow_direct: false,
+                ..Default::default()
             },
             timeout,
         )

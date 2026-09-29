@@ -1,6 +1,97 @@
 use super::*;
 
 #[test]
+fn leg_rebalance_recalls_idle_excess_without_interrupting_active_work() {
+    let budget = SocketBudget::new(3);
+    let busy = budget.try_acquire().unwrap();
+    let idle = budget.try_acquire().unwrap();
+    let healthy = budget.try_acquire().unwrap();
+    for (slot, leg) in [(&busy, 0), (&idle, 0), (&healthy, 1)] {
+        slot.set_path(Some(&weaver_tunnel::pipe::DialPath {
+            leg: Some(leg),
+            ..Default::default()
+        }));
+        slot.active();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    idle.idle(
+        SocketPhase::OwnedIdle,
+        Arc::new(move |id| tx.send(id).unwrap()),
+    );
+    budget.configure_legs(&[1, 2]);
+    assert!(
+        rx.try_recv().is_err(),
+        "weight changes preserve idle sockets until demand"
+    );
+    assert!(budget.recall_idle());
+    assert_eq!(rx.try_recv().unwrap(), idle.id());
+    assert!(!busy.retiring());
+    assert!(busy.reusable());
+    assert!(healthy.reusable());
+    assert!(
+        budget.try_acquire().is_none(),
+        "recall does not refund a physical slot"
+    );
+    drop(idle);
+    let moved = budget.try_acquire().unwrap();
+    moved.set_path(Some(&weaver_tunnel::pipe::DialPath {
+        leg: Some(1),
+        ..Default::default()
+    }));
+    assert_eq!(budget.snapshot().physical, 3);
+    budget.configure_legs(&[0, 2]);
+    assert_eq!(budget.snapshot().limit, 2);
+    assert!(!busy.retiring(), "an active article must finish");
+    assert!(!busy.reusable(), "a down leg cannot take another article");
+    assert!(budget.try_acquire().is_none());
+    drop(busy);
+    assert_eq!(budget.snapshot().physical, 2);
+}
+
+#[test]
+fn recall_filter_preserves_other_legs_and_path_metadata() {
+    let budget = SocketBudget::new(2);
+    let slots: Vec<_> = (0..2)
+        .map(|leg| {
+            let slot = budget.try_acquire().unwrap();
+            slot.set_path(Some(&weaver_tunnel::pipe::DialPath {
+                egress: 7,
+                leg: Some(leg),
+                rung: Some(2),
+                pool: Some(4),
+                member: Some(8),
+                proxies: vec![8],
+            }));
+            slot
+        })
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for slot in &slots {
+        let tx = tx.clone();
+        slot.idle(
+            SocketPhase::AsyncIdle,
+            Arc::new(move |id| tx.send(id).unwrap()),
+        );
+    }
+    assert!(budget.recall_idle_for_leg(Some(1)));
+    assert_eq!(rx.try_recv().unwrap(), slots[1].id());
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        budget.state.lock().unwrap().entries[&slots[0].id()]
+            .path
+            .as_ref()
+            .unwrap()
+            .member,
+        Some(8)
+    );
+    assert!(!budget.recall_idle_for_leg(Some(1)));
+    budget.configure_legs(&[0, 0]);
+    assert_eq!(budget.snapshot().limit, 0);
+    assert_eq!(rx.try_recv().unwrap(), slots[0].id());
+    assert!(budget.try_acquire().is_none());
+}
+
+#[test]
 fn recall_is_not_a_refund_and_only_targets_one_socket() {
     let budget = SocketBudget::new(2);
     let first = budget.try_acquire().unwrap();
@@ -113,4 +204,49 @@ fn retirement_is_visible_without_waiting_for_the_registry() {
     drop(worker.join().unwrap());
     assert_eq!(result.unwrap(), (false, true));
     assert_eq!(budget.snapshot().physical, 0);
+}
+
+#[test]
+fn member_retirement_recalls_idle_and_drains_busy_at_boundary() {
+    for phase in [SocketPhase::AsyncIdle, SocketPhase::OwnedIdle] {
+        let budget = SocketBudget::new(2);
+        let idle = budget.try_acquire().unwrap();
+        let busy = budget.try_acquire().unwrap();
+        let outcome = Arc::new(weaver_tunnel::bridge::ConnectionOutcome::default());
+        idle.observe_outcome(Some(&outcome));
+        busy.observe_outcome(Some(&outcome));
+        busy.active();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let report = tx.clone();
+        idle.idle(phase, Arc::new(move |id| report.send(id).unwrap()));
+        outcome.retire();
+        assert_eq!(rx.try_recv().unwrap(), idle.id());
+        assert!(rx.try_recv().is_err());
+        assert!(!busy.reusable());
+        assert_eq!(budget.snapshot().physical, 2);
+        busy.idle(phase, Arc::new(move |id| tx.send(id).unwrap()));
+        assert_eq!(rx.try_recv().unwrap(), busy.id());
+        assert_eq!(budget.snapshot().closing, 2);
+        outcome.retire();
+        assert!(rx.try_recv().is_err(), "retirement must be idempotent");
+        drop((idle, busy));
+        assert_eq!(budget.snapshot().physical, 0);
+    }
+}
+
+#[test]
+fn retirement_before_socket_registration_is_not_lost() {
+    let budget = SocketBudget::new(1);
+    let slot = budget.try_acquire().unwrap();
+    let outcome = Arc::new(weaver_tunnel::bridge::ConnectionOutcome::default());
+    outcome.retire();
+    slot.observe_outcome(Some(&outcome));
+    slot.active();
+    assert!(!slot.reusable());
+    let (tx, rx) = std::sync::mpsc::channel();
+    slot.idle(
+        SocketPhase::AsyncIdle,
+        Arc::new(move |id| tx.send(id).unwrap()),
+    );
+    assert_eq!(rx.try_recv().unwrap(), slot.id());
 }

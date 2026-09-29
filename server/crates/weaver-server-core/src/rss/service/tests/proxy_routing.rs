@@ -196,6 +196,7 @@ pub(super) fn service(
         Some(&RoutingPolicy {
             proxy_ids: vec![1],
             allow_direct: false,
+            ..Default::default()
         }),
     )
     .unwrap();
@@ -434,6 +435,7 @@ async fn blocked_feed_never_contacts_live_host_destination() {
             &RoutingPolicy {
                 proxy_ids: vec![],
                 allow_direct: false,
+                ..Default::default()
             },
         )
         .unwrap();

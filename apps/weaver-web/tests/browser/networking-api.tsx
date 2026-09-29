@@ -1,0 +1,10 @@
+import { createRoot } from "react-dom/client";
+import { MemoryRouter } from "react-router";
+import { cacheExchange, createClient, fetchExchange, subscriptionExchange, Provider } from "urql";
+import { createClient as createWSClient } from "graphql-ws";
+import { NetworkingWorkspace } from "@/components/networking/NetworkingWorkspace";
+import "@/fonts.css";
+import "@/globals.css";
+const ws=createWSClient({url:`ws://${window.location.host}/graphql`});
+const client=createClient({url:"/graphql",preferGetMethod:false,requestPolicy:"cache-and-network",exchanges:[cacheExchange,fetchExchange,subscriptionExchange({forwardSubscription(operation){return {subscribe(sink){return {unsubscribe:ws.subscribe({...operation,query:operation.query!},sink)};}};}})]});
+createRoot(document.getElementById("root")!).render(<Provider value={client}><MemoryRouter initialEntries={["/settings/networking/egress"]}><main style={{padding:24}}><NetworkingWorkspace proxies={null} bandwidth={null}/></main></MemoryRouter></Provider>);

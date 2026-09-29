@@ -38,11 +38,11 @@ impl ServersMutation {
             None => None,
         };
         let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
-            input.routing.clone().map(Into::into);
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?;
         let route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Server(0),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
         let normalized =
             NormalizedServerInput::from_input(input, None).map_err(async_graphql::Error::new)?;
@@ -123,11 +123,11 @@ impl ServersMutation {
             None => None,
         };
         let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
-            input.routing.clone().map(Into::into);
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?;
         let route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Server(id),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
 
         let existing =
@@ -379,12 +379,13 @@ impl ServersMutation {
         let route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Server(0),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
         let normalized = match NormalizedServerInput::from_input(input, None) {
             Ok(normalized) => normalized,
             Err(message) => {
                 return Ok(TestConnectionResult {
+                    legs: Vec::new(),
                     success: false,
                     message,
                     latency_ms: None,
@@ -545,26 +546,73 @@ fn note_probe_first_byte_latency(
     }
 }
 
-/// Probe an active server before it is saved. `None` means the server is
+struct RoutedProbe {
+    summary: ServerConnectivityResult,
+    legs: Vec<crate::servers::types::LegConnectionTest>,
+}
+impl std::ops::Deref for RoutedProbe {
+    type Target = ServerConnectivityResult;
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+impl From<RoutedProbe> for TestConnectionResult {
+    fn from(probe: RoutedProbe) -> Self {
+        let mut result = Self::from(probe.summary);
+        result.legs = probe.legs;
+        result
+    }
+}
+
+/// Probe every draft leg without changing live selection or tunnel sessions.
 fn probe_through_route<'a>(
     server: &'a weaver_server_core::servers::ServerConfig,
-    route: Option<&'a std::sync::Arc<weaver_server_core::proxies::ConsumerRoute>>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<ServerConnectivityResult>> + Send + 'a>,
-> {
+    route: Option<&'a std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoutedProbe>> + Send + 'a>> {
     Box::pin(async move {
-        let proxy = match route {
-            Some(route) if !route.policy.is_direct() => {
-                Some(route.bridge().map_err(async_graphql::Error::new)?)
-            }
-            _ => None,
-        };
-        let result =
-            weaver_server_core::servers::probe_server_connection_with_proxy(server, proxy).await;
+        let mut results = Vec::new();
+        for position in 0..route.map_or(1, |route| route.leg_count()) {
+            let proxy = match route {
+                Some(route) => match route.bridge_for_leg(position) {
+                    Ok(bridge) => Some(bridge),
+                    Err(error) => {
+                        route.revoke().await;
+                        return Err(async_graphql::Error::new(error));
+                    }
+                },
+                None => None,
+            };
+            results.push(
+                weaver_server_core::servers::probe_server_connection_with_proxy(server, proxy)
+                    .await,
+            );
+        }
         if let Some(route) = route {
             route.revoke().await;
         }
-        Ok(result)
+        let legs = results
+            .iter()
+            .enumerate()
+            .map(
+                |(position, result)| crate::servers::types::LegConnectionTest {
+                    position,
+                    success: result.success,
+                    message: result.message.clone(),
+                    latency_ms: result.latency_ms,
+                },
+            )
+            .collect();
+        let selected = results
+            .iter()
+            .position(|result| result.success)
+            .unwrap_or(0);
+        if results.is_empty() {
+            return Err("route has no legs to test".into());
+        }
+        Ok(RoutedProbe {
+            summary: results.swap_remove(selected),
+            legs,
+        })
     })
 }
 
@@ -572,17 +620,19 @@ fn probe_through_route<'a>(
 /// inactive and no probe ran, so previously learned facts are kept.
 async fn validate_server_before_save(
     input: &NormalizedServerInput,
-    route: Option<&std::sync::Arc<weaver_server_core::proxies::ConsumerRoute>>,
+    route: Option<&std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>>,
 ) -> Result<Option<ServerConnectivityResult>> {
     if !input.active
-        || route.is_some_and(|r| r.policy.proxy_ids.is_empty() && !r.policy.allow_direct)
+        || route.is_some_and(|r| {
+            r.policy.legs.is_empty() && r.policy.proxy_ids.is_empty() && !r.policy.allow_direct
+        })
     {
         return Ok(None);
     }
 
     let result = probe_through_route(&input.as_runtime_server_config(0), route).await?;
     if result.success {
-        Ok(Some(result))
+        Ok(Some(result.summary))
     } else {
         Err(async_graphql::Error::new(format!(
             "server connection test failed: {}",
@@ -713,6 +763,7 @@ mod tests {
 
     fn inactive_server_input() -> ServerInput {
         ServerInput {
+            route: None,
             routing: None,
             host: "news.example.com".to_string(),
             port: 119,

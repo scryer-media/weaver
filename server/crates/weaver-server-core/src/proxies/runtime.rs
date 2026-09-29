@@ -25,10 +25,10 @@ fn bridge_credentials() -> Result<(String, String), String> {
     Ok(("weaver".into(), hex::encode(secret)))
 }
 
-struct Observer {
-    db: Database,
-    id: u32,
-    revision: u64,
+pub(super) struct Observer {
+    pub(super) db: Database,
+    pub(super) id: u32,
+    pub(super) revision: u64,
 }
 impl TunnelObserver for Observer {
     fn tunnel_dial_failed(&self, _: &str, _: &str) {}
@@ -390,6 +390,7 @@ impl TunnelProvider for Ladder {
 }
 
 pub struct ProxyRuntime {
+    pub network: Arc<NetworkRuntime>,
     db: Database,
     handle: tokio::runtime::Handle,
     profiles: RwLock<HashMap<u32, Arc<ProxyHop>>>,
@@ -403,6 +404,7 @@ pub struct ProxyRuntime {
 impl ProxyRuntime {
     #[cfg(test)]
     pub(crate) fn install_http3_fixture(&self, id: u32, provider: Arc<dyn TunnelProvider>) {
+        self.network.install_fixture(id, provider.clone());
         assert!(self.routes.lock().unwrap().is_empty());
         let mut profiles = self.profiles.write().unwrap();
         let profile = profiles.get(&id).unwrap().profile.clone();
@@ -448,6 +450,7 @@ impl ProxyRuntime {
             .collect();
         let consumers = Self::load_consumers(&db).map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {
+            network: NetworkRuntime::new(db.clone(), handle.clone())?,
             db,
             handle,
             profiles: RwLock::new(profiles),
@@ -459,7 +462,7 @@ impl ProxyRuntime {
             stopped: AtomicBool::new(false),
         }))
     }
-    fn load_consumers(
+    pub(super) fn load_consumers(
         db: &Database,
     ) -> Result<std::collections::HashSet<String>, crate::StateError> {
         Ok(db
@@ -637,9 +640,11 @@ impl ProxyRuntime {
         for hop in stale_profiles {
             hop.provider.shutdown().await;
         }
+        self.network.reload().await?;
         Ok(())
     }
     pub async fn stop_all(&self) {
+        self.network.shutdown().await;
         self.stopped.store(true, Ordering::Release);
         let routes = std::mem::take(&mut *self.routes.lock().expect("proxy routes"));
         for (_, route) in routes {

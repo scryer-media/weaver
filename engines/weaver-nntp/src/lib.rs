@@ -40,10 +40,12 @@
 
 mod address_plan;
 pub mod blocking;
+pub mod candidate_plan;
 pub mod client;
 pub mod codec;
 pub mod commands;
 pub mod connection;
+pub mod egress;
 pub mod error;
 pub mod fused_yenc;
 pub mod health;
@@ -52,6 +54,7 @@ mod proxy;
 pub mod recovery;
 pub mod response;
 pub mod revocation;
+pub mod route_dialer;
 mod route_stream;
 pub mod server_caps;
 pub mod socket_budget;
@@ -65,7 +68,8 @@ mod test_support;
 
 // Re-export primary types for convenience.
 pub use address_plan::{
-    ADDRESS_REPLAN_INTERVAL, AddressPlanSnapshot, AddressRoute, AddressSnapshot, RaceReason,
+    ADDRESS_ATTEMPT_LIMIT, ADDRESS_REPLAN_INTERVAL, AddressPlanSnapshot, AddressRoute,
+    AddressSnapshot, RaceReason,
 };
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{

@@ -52,6 +52,7 @@ impl From<RoutingPolicyInput> for RoutingPolicy {
         Self {
             proxy_ids: v.proxy_ids,
             allow_direct: v.allow_direct,
+            ..Default::default()
         }
     }
 }
@@ -84,6 +85,7 @@ pub struct RoutingFailure {
 }
 #[derive(SimpleObject)]
 pub struct RoutingStatus {
+    pub legs: Vec<crate::networking::NetworkLegFlow>,
     pub state: RoutingState,
     pub selected_proxy_id: Option<u32>,
     pub failures: Vec<RoutingFailure>,
@@ -223,26 +225,19 @@ pub(crate) fn runtime(ctx: &Context<'_>) -> Result<Arc<ProxyRuntime>> {
 pub(crate) fn draft_route(
     ctx: &Context<'_>,
     consumer: Consumer,
-    input: Option<RoutingPolicyInput>,
-) -> Result<Option<Arc<proxies::ConsumerRoute>>> {
+    input: Option<RoutingPolicy>,
+) -> Result<Option<Arc<proxies::DraftNetworkRoute>>> {
     let handle = ctx.data::<SchedulerHandle>()?;
     let Some(runtime) = handle.proxy_runtime() else {
-        if input
-            .as_ref()
-            .is_none_or(|p| p.proxy_ids.is_empty() && p.allow_direct)
-        {
+        if input.as_ref().is_none_or(RoutingPolicy::is_direct) {
             return Ok(None);
         }
         return Err("proxy runtime unavailable".into());
     };
-    let policy = input
-        .map(Into::into)
-        .unwrap_or_else(|| runtime.policy(consumer));
+    let policy = input.unwrap_or_else(|| runtime.policy(consumer));
     runtime
-        .validate_policy(consumer, &policy)
-        .map_err(async_graphql::Error::new)?;
-    runtime
-        .draft_route(policy, Duration::from_secs(30))
+        .network
+        .draft_route(consumer, policy, Duration::from_secs(30))
         .map(Some)
         .map_err(async_graphql::Error::new)
 }
@@ -423,6 +418,17 @@ async fn policy_for(ctx: &Context<'_>, consumer: Consumer) -> Result<RoutingPoli
     )
 }
 fn status_for(ctx: &Context<'_>, consumer: Consumer) -> Result<RoutingStatus> {
+    let legs = ctx
+        .data::<SchedulerHandle>()?
+        .proxy_runtime()
+        .map(|runtime| {
+            crate::networking::flow(&runtime)
+                .legs
+                .into_iter()
+                .filter(|leg| leg.consumer == consumer.key())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let status = match ctx.data::<SchedulerHandle>()?.proxy_runtime() {
         Some(runtime) => runtime
             .route(consumer, Duration::from_secs(30))
@@ -430,14 +436,32 @@ fn status_for(ctx: &Context<'_>, consumer: Consumer) -> Result<RoutingStatus> {
             .status(),
         None => proxies::RoutingStatus::default(),
     };
-    Ok(RoutingStatus {
-        state: match status.state {
+    let active = legs.iter().find(|leg| leg.state == "UP");
+    let selected_proxy_id = active.map_or(status.selected_proxy_id, |leg| leg.selected_proxy_id);
+    let state = if let Some(leg) = active {
+        if leg.selected_proxy_id.is_some() {
+            RoutingState::Proxy
+        } else {
+            RoutingState::Direct
+        }
+    } else if !legs.is_empty()
+        && legs
+            .iter()
+            .all(|leg| matches!(leg.state.as_str(), "DOWN" | "BLOCKED"))
+    {
+        RoutingState::Blocked
+    } else {
+        match status.state {
             proxies::RouteState::Idle => RoutingState::Idle,
             proxies::RouteState::Proxy => RoutingState::Proxy,
             proxies::RouteState::Direct => RoutingState::Direct,
             proxies::RouteState::Blocked => RoutingState::Blocked,
-        },
-        selected_proxy_id: status.selected_proxy_id,
+        }
+    };
+    Ok(RoutingStatus {
+        legs,
+        state,
+        selected_proxy_id,
         failures: status
             .failures
             .into_iter()
@@ -447,6 +471,16 @@ fn status_for(ctx: &Context<'_>, consumer: Consumer) -> Result<RoutingStatus> {
 }
 #[ComplexObject]
 impl crate::servers::types::Server {
+    async fn route(&self, ctx: &Context<'_>) -> Result<crate::networking::RouteGql> {
+        let db = ctx.data::<Database>()?.clone();
+        let id = self.id;
+        Ok(spawn_blocking_db("network.consumer_route", move || {
+            db.proxy_routing_policy(Consumer::Server(id))
+        })
+        .await?
+        .into())
+    }
+    #[graphql(deprecation = "Use route for the full route; routing is the first-leg projection.")]
     async fn routing(&self, ctx: &Context<'_>) -> Result<RoutingPolicyGql> {
         policy_for(ctx, Consumer::Server(self.id)).await
     }
@@ -456,6 +490,16 @@ impl crate::servers::types::Server {
 }
 #[ComplexObject]
 impl crate::rss::types::RssFeed {
+    async fn route(&self, ctx: &Context<'_>) -> Result<crate::networking::RouteGql> {
+        let db = ctx.data::<Database>()?.clone();
+        let id = self.id;
+        Ok(spawn_blocking_db("network.consumer_route", move || {
+            db.proxy_routing_policy(Consumer::Rss(id))
+        })
+        .await?
+        .into())
+    }
+    #[graphql(deprecation = "Use route for the full route; routing is the first-leg projection.")]
     async fn routing(&self, ctx: &Context<'_>) -> Result<RoutingPolicyGql> {
         policy_for(ctx, Consumer::Rss(self.id)).await
     }
@@ -466,6 +510,16 @@ impl crate::rss::types::RssFeed {
 
 #[ComplexObject]
 impl crate::servers::types::ServerDetails {
+    async fn route(&self, ctx: &Context<'_>) -> Result<crate::networking::RouteGql> {
+        let db = ctx.data::<Database>()?.clone();
+        let id = self.id;
+        Ok(spawn_blocking_db("network.consumer_route", move || {
+            db.proxy_routing_policy(Consumer::Server(id))
+        })
+        .await?
+        .into())
+    }
+    #[graphql(deprecation = "Use route for the full route; routing is the first-leg projection.")]
     async fn routing(&self, ctx: &Context<'_>) -> Result<RoutingPolicyGql> {
         policy_for(ctx, Consumer::Server(self.id)).await
     }

@@ -23,7 +23,8 @@ const CLEAN: PanelFlags = { dirty: false, busy: false, status: null, failed: fal
 
 export function SettingsPage() {
   const t = useTranslate();
-  const { panel: slug } = useParams();
+  const { panel: root, "*": nested } = useParams();
+  const slug = nested ? `${root}/${nested}` : root;
   const panel = findPanel(slug);
   const { providers } = useNextData();
 
@@ -50,6 +51,7 @@ export function SettingsPage() {
       SETTINGS_PANELS.map((entry) => ({
         to: `/settings/${entry.slug}`,
         label: t(entry.label),
+        group: entry.group ? t("settings.networking") : undefined,
         icon: entry.icon,
         tag:
           entry.tag === "beta"

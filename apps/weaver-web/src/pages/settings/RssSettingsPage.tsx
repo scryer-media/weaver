@@ -1,5 +1,5 @@
 import { ProxyRoutingEditor, ProxyRoutingStatus } from "@/components/ProxyRoutingEditor";
-import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import { directRouting, policyInput, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
@@ -287,7 +287,7 @@ export function RssSettingsPage() {
   const handleFeedSave = async (values: FeedFormValues) => {
     resetFeedback();
     const input = {
-      routing: values.routing,
+      route: policyInput(values.routing),
       name: values.name.trim(),
       url: values.url.trim(),
       enabled: values.enabled,
@@ -450,6 +450,7 @@ export function RssSettingsPage() {
 
       {showFeedForm ? (
         <FeedFormCard
+          consumer={editingFeed ? `rss:${editingFeed.id}` : undefined}
           categories={categories}
           editing={!!editingFeed}
           initialValues={
@@ -715,6 +716,7 @@ export function RssSettingsPage() {
 }
 
 function FeedFormCard({
+  consumer,
   categories,
   editing,
   initialValues,
@@ -722,6 +724,7 @@ function FeedFormCard({
   onSave,
   onCancel,
 }: {
+  consumer?: string;
   categories: Category[];
   editing: boolean;
   initialValues: FeedFormValues;
@@ -861,7 +864,7 @@ function FeedFormCard({
           />
         </div>
 
-        <ProxyRoutingEditor value={values.routing} onChange={routing => setValues(current => ({ ...current, routing }))} />
+        <ProxyRoutingEditor consumer={consumer} rss value={values.routing} onChange={routing => setValues(current => ({ ...current, routing }))} />
         <MetadataEditor
           entries={values.defaultMetadata}
           label={t("rss.defaultMetadata")}
@@ -900,6 +903,7 @@ function RuleFormCard({
   onSave,
   onCancel,
 }: {
+  consumer?: string;
   categories: Category[];
   editing: boolean;
   initialValues: RuleFormValues;

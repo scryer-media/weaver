@@ -33,4 +33,18 @@ echo "
 ───────────────────────────────────
 "
 
-exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups "$RUNTIME_BIN" "$@"
+# Retaining NET_RAW is opt-in even when the container runtime grants it by default.
+retain_net_raw=false
+if [ "${WEAVER_RETAIN_NET_RAW:-false}" = "true" ] && [ -r /proc/self/status ]; then
+    while read -r capability_key capability_value capability_rest; do
+        if [ "$capability_key" = "CapPrm:" ] && [ "$((0x$capability_value & 8192))" -ne 0 ]; then
+            retain_net_raw=true
+            break
+        fi
+    done < /proc/self/status
+fi
+if [ "$retain_net_raw" = "true" ]; then
+    exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups \
+        --inh-caps=-all,+net_raw --ambient-caps=-all,+net_raw "$RUNTIME_BIN" "$@" </dev/null
+fi
+exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups "$RUNTIME_BIN" "$@" </dev/null

@@ -42,11 +42,11 @@ impl RssMutation {
             None => None,
         };
         let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
-            input.routing.clone().map(Into::into);
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?;
         let _route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Rss(0),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
 
         let db = ctx.data::<Database>()?.clone();
@@ -89,11 +89,11 @@ impl RssMutation {
             None => None,
         };
         let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
-            input.routing.clone().map(Into::into);
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?;
         let _route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Rss(id),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
 
         let db = ctx.data::<Database>()?.clone();

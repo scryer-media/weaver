@@ -51,13 +51,14 @@
 //! added or withdrew. A server that never gathers the evidence — an idle one,
 //! or one whose connections never turned over — only ever races.
 
-use std::collections::HashMap;
+use crate::candidate_plan::{CandidatePlan, Next};
+type PlanState = CandidatePlan<SocketAddr>;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// How old a pin may get before the next connect races the server's
 /// addresses again. Every race, won or failed, restarts the pin's age, so this
@@ -91,9 +92,6 @@ pub const SUSPECT_AFTER_FAILURES: u32 = 2;
 /// beyond it are raced in further batches of this many, in the order they
 /// resolved.
 const MAX_RACE_CANDIDATES: usize = 256;
-
-/// Weight of a new sample in the per-address averages.
-const EWMA_WEIGHT: f64 = 0.25;
 
 /// Warm article fetches an address must have served since the pin was last
 /// judged before its delivery rate counts as evidence, for the pin and for a
@@ -176,7 +174,7 @@ impl RaceReason {
         }
     }
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             RaceReason::Initial => 0,
             RaceReason::Interval => 1,
@@ -232,6 +230,7 @@ pub(crate) struct TcpDialer {
     host: String,
     port: u16,
     timeout: Duration,
+    egress: crate::egress::SocketEgress,
 }
 
 impl TcpDialer {
@@ -240,7 +239,12 @@ impl TcpDialer {
             host: host.to_string(),
             port,
             timeout: timeout.min(ADDRESS_ATTEMPT_LIMIT),
+            egress: crate::egress::SocketEgress::System,
         }
+    }
+    pub(crate) fn with_egress(mut self, egress: crate::egress::SocketEgress) -> Self {
+        self.egress = egress;
+        self
     }
 }
 
@@ -248,11 +252,14 @@ impl AddressDialer for TcpDialer {
     type Stream = TcpStream;
 
     fn resolve(&self) -> io::Result<Vec<SocketAddr>> {
-        Ok((self.host.as_str(), self.port).to_socket_addrs()?.collect())
+        Ok((self.host.as_str(), self.port)
+            .to_socket_addrs()?
+            .filter(|a| self.egress.supports_address(a.ip()))
+            .collect())
     }
 
     fn dial(&self, addr: SocketAddr) -> io::Result<TcpStream> {
-        TcpStream::connect_timeout(&addr, self.timeout)
+        self.egress.connect_blocking(addr, self.timeout)
     }
 }
 
@@ -310,203 +317,6 @@ impl Drop for SetupWatch {
             self.plan.record_setup(self.addr, false);
         }
     }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct AddrStats {
-    connect_ewma: Option<Duration>,
-    consecutive_failures: u32,
-    /// Sessions in a row that connected and then never heard from the
-    /// server. A connect does not clear it; only a session that did hear
-    /// from the server does.
-    setup_failures: u32,
-    body_latency_ewma: Option<Duration>,
-    delivery: Delivery,
-}
-
-impl AddrStats {
-    /// The address last refused a connect, or last connected without the
-    /// server answering.
-    fn failing(self) -> bool {
-        self.consecutive_failures > 0 || self.setup_failures > 0
-    }
-}
-
-/// What one address's connections delivered since the pin was last judged:
-/// warm fetches only, each booked as its bytes and its own wire time, so the
-/// quotient is what one connection to the address moves per second whatever
-/// the number of connections that happened to land there.
-#[derive(Debug, Default, Clone, Copy)]
-struct Delivery {
-    bytes: u64,
-    wire: Duration,
-    samples: u32,
-    last_at: Option<Instant>,
-}
-
-impl Delivery {
-    fn book(&mut self, bytes: u64, wire: Duration, now: Instant) {
-        self.bytes = self.bytes.saturating_add(bytes);
-        self.wire = self.wire.saturating_add(wire);
-        self.samples = self.samples.saturating_add(1);
-        self.last_at = Some(now);
-    }
-
-    fn bytes_per_second(self) -> Option<f64> {
-        (self.samples > 0 && !self.wire.is_zero())
-            .then(|| self.bytes as f64 / self.wire.as_secs_f64())
-    }
-
-    /// The rate, once enough fetches and enough wire time stand behind it to
-    /// be evidence and while the latest of them is recent enough to still
-    /// describe the address.
-    fn measured_rate(self, now: Instant) -> Option<f64> {
-        let fresh = self
-            .last_at
-            .is_some_and(|at| now.saturating_duration_since(at) < DELIVERY_EVIDENCE_AGE);
-        (fresh && self.samples >= DELIVERY_MIN_SAMPLES && self.wire >= DELIVERY_MIN_WIRE)
-            .then(|| self.bytes_per_second())
-            .flatten()
-    }
-}
-
-/// What the delivery booked since the pin was last judged says about it.
-enum DeliveryVerdict {
-    /// A challenger out-delivered the pin by [`DELIVERY_REPIN_RATIO`].
-    Challenged {
-        challenger: SocketAddr,
-        challenger_rate: f64,
-        pin_rate: f64,
-    },
-    /// The best measured challenger did not.
-    Keep {
-        best: SocketAddr,
-        best_rate: f64,
-        pin_rate: f64,
-    },
-    /// The pin or every challenger is short of [`DELIVERY_MIN_SAMPLES`] or
-    /// [`DELIVERY_MIN_WIRE`], or its evidence has gone stale.
-    Unmeasured,
-}
-
-/// What a connect decided, told once the plan's lock is released.
-enum Announce {
-    Repinned {
-        challenger: SocketAddr,
-        challenger_rate: f64,
-        pin: SocketAddr,
-        pin_rate: f64,
-    },
-    Leading {
-        challenger: SocketAddr,
-        challenger_rate: f64,
-        pin: SocketAddr,
-        pin_rate: f64,
-    },
-    Kept {
-        pin: SocketAddr,
-        pin_rate: f64,
-        best: SocketAddr,
-        best_rate: f64,
-    },
-    Shadow {
-        challenger: SocketAddr,
-        pin: SocketAddr,
-    },
-}
-
-impl Announce {
-    fn log(&self, label: &str) {
-        match self {
-            Announce::Repinned {
-                challenger,
-                challenger_rate,
-                pin,
-                pin_rate,
-            } => info!(
-                server = label,
-                reason = RaceReason::Delivery.as_str(),
-                address = %challenger,
-                previous = %pin,
-                bytes_per_second = *challenger_rate as u64,
-                previous_bytes_per_second = *pin_rate as u64,
-                "pinned the address that delivered faster"
-            ),
-            Announce::Leading {
-                challenger,
-                challenger_rate,
-                pin,
-                pin_rate,
-            } => debug!(
-                server = label,
-                address = %pin,
-                bytes_per_second = *pin_rate as u64,
-                challenger = %challenger,
-                challenger_bytes_per_second = *challenger_rate as u64,
-                "a challenger out-delivered the pinned address; confirming at the next verdict"
-            ),
-            Announce::Kept {
-                pin,
-                pin_rate,
-                best,
-                best_rate,
-            } => debug!(
-                server = label,
-                address = %pin,
-                bytes_per_second = *pin_rate as u64,
-                challenger = %best,
-                challenger_bytes_per_second = *best_rate as u64,
-                "kept the pinned address on delivery"
-            ),
-            Announce::Shadow { challenger, pin } => debug!(
-                server = label,
-                address = %challenger,
-                pinned = %pin,
-                "pointing a reconnect at a challenger address to measure its delivery"
-            ),
-        }
-    }
-}
-
-#[derive(Default)]
-struct PlanState {
-    candidates: Vec<SocketAddr>,
-    pinned: Option<SocketAddr>,
-    chosen_at: Option<Instant>,
-    per_addr: HashMap<IpAddr, AddrStats>,
-    /// When a reconnect was last pointed at a challenger.
-    last_shadow_at: Option<Instant>,
-    /// Reconnects handed out since then.
-    connects_since_shadow: u32,
-    /// The challenger the last verdict found faster than the pin. It takes
-    /// the pin only if the next verdict finds the same, so one verdict's
-    /// worth of samples from one connection never moves the pin by itself.
-    delivery_leader: Option<SocketAddr>,
-    /// When delivery was last judged, since the last race. The next verdict
-    /// waits [`DELIVERY_VERDICT_INTERVAL`] from it, or from the pin's choice
-    /// when there has been none.
-    last_verdict_at: Option<Instant>,
-    /// Bumped whenever a race finishes, so a caller waiting on one can tell
-    /// that it did.
-    generation: u64,
-    racing: bool,
-    /// A race some event asked for, still to run.
-    pending: Option<RaceReason>,
-    /// Why the last race found nothing, handed to callers that waited on it.
-    last_race_error: Option<(io::ErrorKind, String)>,
-    /// When a race last found no address while nothing was pinned. Holds
-    /// further races off for [`FAILED_RACE_HOLDOFF`].
-    last_race_failed_at: Option<Instant>,
-    races_won: u64,
-    races_failed: u64,
-    repins: [u64; RaceReason::ALL.len()],
-}
-
-enum Next {
-    Dial(Vec<SocketAddr>, Option<Announce>),
-    Race(RaceReason),
-    Wait(u64),
-    Fail(io::ErrorKind, String),
 }
 
 /// The address state of one server. See the module docs.
@@ -645,10 +455,7 @@ impl AddressPlan {
             resolved.clone()
         };
         if candidates.is_empty() {
-            let error = io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "no address resolved for the server",
-            );
+            let error = io::Error::other(weaver_tunnel::pipe::ResolutionFailed);
             ticket.finish(Err(&error), None, Vec::new());
             return Err(error);
         }
@@ -729,55 +536,34 @@ impl AddressPlan {
     /// Book one finished connect to `addr`: its time when it connected,
     /// `None` when it failed.
     fn record_connect(&self, addr: SocketAddr, connected_in: Option<Duration>) {
+        let now = self.now();
         let mut state = self.state();
-        let pinned = state.pinned;
-        let stats = state.per_addr.entry(addr.ip()).or_default();
+        let pending = state.pending;
         match connected_in {
-            Some(elapsed) => {
-                stats.connect_ewma = Some(ewma(stats.connect_ewma, elapsed));
-                stats.consecutive_failures = 0;
-            }
-            None => {
-                stats.consecutive_failures = stats.consecutive_failures.saturating_add(1);
-                if pinned == Some(addr)
-                    && stats.consecutive_failures >= SUSPECT_AFTER_FAILURES
-                    && state.pending != Some(RaceReason::Suspect)
-                {
-                    state.pending = Some(RaceReason::Suspect);
-                    warn!(
-                        server = %self.label,
-                        address = %addr,
-                        failures = SUSPECT_AFTER_FAILURES,
-                        "pinned address keeps refusing connections; racing the addresses again"
-                    );
-                }
-            }
+            Some(elapsed) => state.connected(addr, elapsed, now),
+            None => state.failed(addr, now),
+        }
+        let suspect =
+            pending != Some(RaceReason::Suspect) && state.pending == Some(RaceReason::Suspect);
+        drop(state);
+        if suspect {
+            tracing::warn!(server = %self.label, address = %addr, failures = SUSPECT_AFTER_FAILURES,
+                "pinned address keeps refusing connections; racing the addresses again");
         }
     }
 
     /// Book one session's setup on a socket connected to `addr`: whether the
     /// server answered over it.
-    fn record_setup(&self, addr: SocketAddr, reached: bool) {
+    pub(crate) fn record_setup(&self, addr: SocketAddr, reached: bool) {
         let mut state = self.state();
-        let pinned = state.pinned;
-        let stats = state.per_addr.entry(addr.ip()).or_default();
-        if reached {
-            stats.setup_failures = 0;
-            return;
-        }
-        stats.setup_failures = stats.setup_failures.saturating_add(1);
-        let failures = stats.setup_failures;
-        if pinned == Some(addr)
-            && failures >= SUSPECT_AFTER_FAILURES
-            && state.pending != Some(RaceReason::Suspect)
-        {
-            state.pending = Some(RaceReason::Suspect);
-            warn!(
-                server = %self.label,
-                address = %addr,
-                failures = SUSPECT_AFTER_FAILURES,
-                "pinned address connects but the server does not answer; racing the addresses again"
-            );
+        let pending = state.pending;
+        state.setup(addr, reached, self.now());
+        let suspect =
+            pending != Some(RaceReason::Suspect) && state.pending == Some(RaceReason::Suspect);
+        drop(state);
+        if suspect {
+            tracing::warn!(server = %self.label, address = %addr, failures = SUSPECT_AFTER_FAILURES,
+                "pinned address connects but the server does not answer; racing the addresses again");
         }
     }
 
@@ -785,11 +571,14 @@ impl AddressPlan {
     /// for an address the plan does not know.
     pub(crate) fn record_body_latency(&self, ip: IpAddr, elapsed: Duration) {
         let mut state = self.state();
-        if !state.candidates.iter().any(|addr| addr.ip() == ip) {
-            return;
+        let candidate = state
+            .candidates
+            .iter()
+            .find(|addr| addr.ip() == ip)
+            .copied();
+        if let Some(candidate) = candidate {
+            state.body_latency(candidate, elapsed, self.now());
         }
-        let stats = state.per_addr.entry(ip).or_default();
-        stats.body_latency_ewma = Some(ewma(stats.body_latency_ewma, elapsed));
     }
 
     /// Book one warm article fetch on a connection to `ip`: its decoded bytes
@@ -801,20 +590,15 @@ impl AddressPlan {
     /// opening, and would count against whichever address was connected to
     /// most recently.
     pub(crate) fn record_delivery(&self, ip: IpAddr, bytes: u64, wire: Duration) {
-        if bytes == 0 || wire.is_zero() {
-            return;
-        }
-        let now = self.now();
         let mut state = self.state();
-        if !state.candidates.iter().any(|addr| addr.ip() == ip) {
-            return;
+        let candidate = state
+            .candidates
+            .iter()
+            .find(|addr| addr.ip() == ip)
+            .copied();
+        if let Some(candidate) = candidate {
+            state.delivered(candidate, bytes, wire, self.now());
         }
-        state
-            .per_addr
-            .entry(ip)
-            .or_default()
-            .delivery
-            .book(bytes, wire, now);
     }
 
     /// The provider accepts new connections again after refusing them. Its
@@ -822,10 +606,7 @@ impl AddressPlan {
     /// again, busy or not: this is exactly when a fresh look is worth the
     /// losing handshakes.
     pub(crate) fn note_over_limit_cleared(&self) {
-        let mut state = self.state();
-        if state.pinned.is_some() && state.pending.is_none() {
-            state.pending = Some(RaceReason::OverLimitCleared);
-        }
+        self.state().over_limit_cleared(self.now());
     }
 
     pub fn snapshot(&self) -> AddressPlanSnapshot {
@@ -888,233 +669,6 @@ impl AddressPlan {
         let mut clock = self.frozen_clock.lock().unwrap();
         let frozen = clock.expect("advance needs a frozen clock");
         *clock = Some(frozen + by);
-    }
-}
-
-impl PlanState {
-    fn next(&mut self, now: Instant) -> Next {
-        if self.racing {
-            return Next::Wait(self.generation);
-        }
-        let mut announce = None;
-        let reason = match (self.pinned, self.pending) {
-            (None, _) if self.failed_race_is_recent(now) => {
-                if self.candidates.is_empty() {
-                    let (kind, message) = self.last_race_error.clone().unwrap_or((
-                        io::ErrorKind::AddrNotAvailable,
-                        "no address answered".to_string(),
-                    ));
-                    return Next::Fail(kind, message);
-                }
-                None
-            }
-            (None, _) => Some(RaceReason::Initial),
-            (Some(_), Some(pending)) => Some(pending),
-            (Some(_), None) if self.pin_is_due(now) => Some(RaceReason::Interval),
-            (Some(pin), None) if self.verdict_is_allowed(now) => {
-                announce = self.judge_on_delivery(now, pin);
-                None
-            }
-            _ => None,
-        };
-        match reason {
-            Some(reason) => {
-                self.racing = true;
-                Next::Race(reason)
-            }
-            None => {
-                let (order, shadow) = self.dial_order_for_connect(now);
-                Next::Dial(order, announce.or(shadow))
-            }
-        }
-    }
-
-    fn stats(&self, addr: SocketAddr) -> AddrStats {
-        self.per_addr.get(&addr.ip()).copied().unwrap_or_default()
-    }
-
-    /// A verdict may run: the pin was chosen, or last judged, at least
-    /// [`DELIVERY_VERDICT_INTERVAL`] ago.
-    fn verdict_is_allowed(&self, now: Instant) -> bool {
-        self.last_verdict_at
-            .or(self.chosen_at)
-            .is_some_and(|at| now.saturating_duration_since(at) >= DELIVERY_VERDICT_INTERVAL)
-    }
-
-    /// Judge the pin on the delivery booked since it was last judged, when
-    /// there is enough of it. Leaves the pin's age alone, and leaves the
-    /// samples to keep gathering when there is not enough.
-    fn judge_on_delivery(&mut self, now: Instant, pin: SocketAddr) -> Option<Announce> {
-        let announce = match self.delivery_verdict(now, pin) {
-            DeliveryVerdict::Challenged {
-                challenger,
-                challenger_rate,
-                pin_rate,
-            } if self.delivery_leader == Some(challenger) => {
-                self.pinned = Some(challenger);
-                self.delivery_leader = None;
-                self.repins[RaceReason::Delivery.index()] += 1;
-                Announce::Repinned {
-                    challenger,
-                    challenger_rate,
-                    pin,
-                    pin_rate,
-                }
-            }
-            DeliveryVerdict::Challenged {
-                challenger,
-                challenger_rate,
-                pin_rate,
-            } => {
-                self.delivery_leader = Some(challenger);
-                Announce::Leading {
-                    challenger,
-                    challenger_rate,
-                    pin,
-                    pin_rate,
-                }
-            }
-            DeliveryVerdict::Keep {
-                best,
-                best_rate,
-                pin_rate,
-            } => {
-                self.delivery_leader = None;
-                Announce::Kept {
-                    pin,
-                    pin_rate,
-                    best,
-                    best_rate,
-                }
-            }
-            DeliveryVerdict::Unmeasured => return None,
-        };
-        self.last_verdict_at = Some(now);
-        self.reset_delivery();
-        Some(announce)
-    }
-
-    /// Compare the pin with the best measured challenger that is not
-    /// currently refusing connections: a pin should never move to an address
-    /// the next connect would fail on.
-    fn delivery_verdict(&self, now: Instant, pin: SocketAddr) -> DeliveryVerdict {
-        let Some(pin_rate) = self.stats(pin).delivery.measured_rate(now) else {
-            return DeliveryVerdict::Unmeasured;
-        };
-        let best = self
-            .candidates
-            .iter()
-            .copied()
-            .filter(|addr| *addr != pin)
-            .map(|addr| (addr, self.stats(addr)))
-            .filter(|(_, stats)| !stats.failing())
-            .filter_map(|(addr, stats)| Some((addr, stats.delivery.measured_rate(now)?)))
-            .max_by(|left, right| left.1.total_cmp(&right.1));
-        match best {
-            Some((challenger, challenger_rate))
-                if challenger_rate >= pin_rate * DELIVERY_REPIN_RATIO =>
-            {
-                DeliveryVerdict::Challenged {
-                    challenger,
-                    challenger_rate,
-                    pin_rate,
-                }
-            }
-            Some((best, best_rate)) => DeliveryVerdict::Keep {
-                best,
-                best_rate,
-                pin_rate,
-            },
-            None => DeliveryVerdict::Unmeasured,
-        }
-    }
-
-    /// Every verdict, and every race, judges the pin afresh from here.
-    fn reset_delivery(&mut self) {
-        for stats in self.per_addr.values_mut() {
-            stats.delivery = Delivery::default();
-        }
-    }
-
-    /// The order one connect dials: the usual order, or a challenger ahead of
-    /// it when this reconnect is the one to point at a challenger.
-    fn dial_order_for_connect(&mut self, now: Instant) -> (Vec<SocketAddr>, Option<Announce>) {
-        let order = self.dial_order();
-        self.connects_since_shadow = self.connects_since_shadow.saturating_add(1);
-        let Some((challenger, pin)) = self.shadow_candidate(now) else {
-            return (order, None);
-        };
-        self.last_shadow_at = Some(now);
-        self.connects_since_shadow = 0;
-        let order = std::iter::once(challenger)
-            .chain(order.into_iter().filter(|addr| *addr != challenger))
-            .collect();
-        (order, Some(Announce::Shadow { challenger, pin }))
-    }
-
-    /// The challenger this reconnect goes to, and the pin it stands in for,
-    /// if it is time for one: the candidate with the fewest fetches booked
-    /// among those not yet measured, by the same measure a verdict holds
-    /// them to, so a challenger whose connection closed short of it is given
-    /// another rather than left unjudged; never one that last refused and never
-    /// one that has yet to connect at all — an address that swallows packets
-    /// would hold this reconnect for the whole attempt limit. `None` while
-    /// the pin is too young, too recently or too often shadowed, not yet
-    /// measured itself, or already judged against every challenger.
-    fn shadow_candidate(&self, now: Instant) -> Option<(SocketAddr, SocketAddr)> {
-        let pin = self.pinned?;
-        if now.saturating_duration_since(self.chosen_at?) < SHADOW_MIN_PIN_AGE {
-            return None;
-        }
-        if self
-            .last_shadow_at
-            .is_some_and(|at| now.saturating_duration_since(at) < SHADOW_INTERVAL)
-        {
-            return None;
-        }
-        if self.connects_since_shadow < SHADOW_EVERY_CONNECTS {
-            return None;
-        }
-        // The pin must be measured before any challenger is worth a look.
-        self.stats(pin).delivery.measured_rate(now)?;
-        self.candidates
-            .iter()
-            .copied()
-            .filter(|addr| *addr != pin)
-            .map(|addr| (addr, self.stats(addr)))
-            .filter(|(_, stats)| {
-                !stats.failing()
-                    && stats.connect_ewma.is_some()
-                    && stats.delivery.measured_rate(now).is_none()
-            })
-            .min_by_key(|(_, stats)| (stats.delivery.samples, stats.connect_ewma))
-            .map(|(addr, _)| (addr, pin))
-    }
-
-    fn failed_race_is_recent(&self, now: Instant) -> bool {
-        self.last_race_failed_at
-            .is_some_and(|at| now.saturating_duration_since(at) < FAILED_RACE_HOLDOFF)
-    }
-
-    fn pin_is_due(&self, now: Instant) -> bool {
-        self.chosen_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= ADDRESS_REPLAN_INTERVAL)
-    }
-
-    /// The pin first, then every other candidate: the ones that last
-    /// connected before the ones that last failed, faster before slower.
-    fn dial_order(&self) -> Vec<SocketAddr> {
-        let mut others: Vec<SocketAddr> = self
-            .candidates
-            .iter()
-            .copied()
-            .filter(|addr| Some(*addr) != self.pinned)
-            .collect();
-        others.sort_by_key(|addr| {
-            let stats = self.per_addr.get(&addr.ip()).copied().unwrap_or_default();
-            (stats.failing(), stats.connect_ewma.unwrap_or(Duration::MAX))
-        });
-        self.pinned.into_iter().chain(others).collect()
     }
 }
 
@@ -1239,13 +793,6 @@ fn distinct_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
         }
     }
     distinct
-}
-
-fn ewma(previous: Option<Duration>, sample: Duration) -> Duration {
-    match previous {
-        None => sample,
-        Some(previous) => previous.mul_f64(1.0 - EWMA_WEIGHT) + sample.mul_f64(EWMA_WEIGHT),
-    }
 }
 
 #[cfg(test)]

@@ -638,6 +638,7 @@ async fn group_requirement_discovery_retries_the_decoded_batch_item() {
             0,
             None,
             None,
+            None,
             "<group-required@example.com>",
             DecodedBatchItem {
                 elapsed: Duration::ZERO,

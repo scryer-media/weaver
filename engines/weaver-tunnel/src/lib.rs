@@ -9,6 +9,10 @@
 pub mod bridge;
 pub mod direct;
 pub mod dns;
+pub mod egress;
+pub mod pipe;
+pub mod revocation;
+pub use proxy_tunnels::endpoint;
 mod error;
 #[path = "shared_http3.rs"]
 mod http3;

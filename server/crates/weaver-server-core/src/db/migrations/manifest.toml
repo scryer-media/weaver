@@ -522,3 +522,20 @@ kind = "sql"
 file = "migrations/0052_script_events/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 53
+description = "egress interfaces and proxy pools"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0053_egress_interfaces/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0053_egress_interfaces/schema.sql"
+engine = "postgres"
+scope = "all"

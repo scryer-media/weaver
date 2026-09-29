@@ -12,7 +12,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
-import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import { directRouting, policyInput, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
@@ -254,7 +254,7 @@ function formToState(server: ServerDetails | Server, username: string): ServerFo
 function serverInput(form: ServerForm) {
   const quotaUnitBytes = form.quotaUnit === "TB" ? TIB : GIB;
   return {
-    routing: { proxyIds: form.routing.proxyIds, allowDirect: form.routing.allowDirect },
+    route: policyInput(form.routing),
     host: normalizeHost(form.host),
     port: form.port,
     tls: form.tls,
@@ -718,6 +718,8 @@ export function ProvidersPanel() {
                 kind: "custom",
                 control: (
                   <RoutingEditor
+                    consumer={typeof editingId === "number" ? `server:${editingId}` : undefined}
+                    cap={values.connections}
                     value={values.routing}
                     onChange={(next) => patch({ routing: next })}
                   />

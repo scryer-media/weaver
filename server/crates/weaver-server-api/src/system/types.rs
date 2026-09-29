@@ -1249,10 +1249,47 @@ pub struct ServerHealth {
 
 #[ComplexObject]
 impl ServerHealth {
+    async fn legs(&self, ctx: &Context<'_>) -> Vec<crate::networking::NetworkLegFlow> {
+        let Some(handle) = ctx.data_opt::<weaver_server_core::SchedulerHandle>() else {
+            return Vec::new();
+        };
+        let Some(pool) = handle.nntp_pool() else {
+            return Vec::new();
+        };
+        let Some(config) = pool.server_configs().get(self.pool_index) else {
+            return Vec::new();
+        };
+        if config.host != self.host || config.port != self.port {
+            return Vec::new();
+        }
+        let Some(dialer) = &config.dialer else {
+            return Vec::new();
+        };
+        let consumer = format!("server:{}", dialer.server);
+        handle
+            .proxy_runtime()
+            .map(|runtime| {
+                crate::networking::flow(&runtime)
+                    .legs
+                    .into_iter()
+                    .filter(|leg| leg.consumer == consumer)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     /// The resolved address new connections to this server dial, once an
     /// address race has picked one. Absent before the first connect and for
     /// a server reached through a proxy.
     async fn pinned_address(&self, ctx: &Context<'_>) -> Option<String> {
+        if let Some(leg) = self
+            .legs(ctx)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|leg| leg.path.kind == crate::networking::LegPathKind::Direct)
+        {
+            return leg.pinned_address;
+        }
         let live_pool = ctx
             .data_opt::<weaver_server_core::SchedulerHandle>()
             .and_then(|handle| handle.nntp_pool());

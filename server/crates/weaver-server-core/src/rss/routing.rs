@@ -1,25 +1,30 @@
 use super::{RssFeedRow, RssService, RssServiceError, model::apply_basic_auth};
 use crate::{
-    proxies::{Consumer, ConsumerRoute, ProxyHop},
+    proxies::FeedAttempt,
     security::{ResolvedFetchTarget, is_blocked_egress_ip, resolve_fetch_target},
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 enum AttemptError {
     Route,
+    Routed(Arc<weaver_tunnel::pipe::DialError>),
     Destination(String),
 }
 
 #[derive(Clone)]
 pub(super) struct RoutedBodyContext {
-    route: std::sync::Weak<ConsumerRoute>,
-    id: u32,
+    attempt: Arc<FeedAttempt>,
+    _bridge: Arc<weaver_tunnel::bridge::Bridge>,
 }
 impl RoutedBodyContext {
     pub fn failed(&self) {
-        if let Some(route) = self.route.upgrade().filter(|r| !r.is_revoked()) {
-            route.fail(self.id, "RSS response transport failed");
-        }
+        self.attempt
+            .report(Some(&weaver_tunnel::pipe::DialError::Destination(
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "RSS response transport failed",
+                ),
+            )));
     }
 }
 
@@ -38,96 +43,74 @@ impl RssService {
         >,
     > {
         Box::pin(async move {
-            let route = self
-                .inner
-                .handle
-                .proxy_runtime()
-                .map(|runtime| runtime.route(Consumer::Rss(feed.id), Duration::from_secs(30)))
-                .transpose()
-                .map_err(RssServiceError::Http)?;
-            if let Some(route) = &route {
-                for (id, hop) in route.policy.proxy_ids.iter().zip(&route.hops) {
-                    let Some(attempt) = route.begin(*id) else {
-                        continue;
-                    };
-                    let Some(hop) = hop.as_ref().filter(|h| h.profile.enabled) else {
-                        attempt.fail("proxy is disabled or unavailable");
-                        continue;
-                    };
-                    match tokio::time::timeout(
+            if let Some(runtime) = self.inner.handle.proxy_runtime() {
+                let status = runtime
+                    .route(
+                        crate::proxies::Consumer::Rss(feed.id),
                         Duration::from_secs(30),
-                        self.request_on_route(
-                            feed,
-                            url,
-                            feed_url,
-                            conditional,
-                            Some(route),
-                            Some(hop),
-                        ),
                     )
-                    .await
-                    {
-                        Ok(Ok(mut response)) => {
-                            attempt.success();
-                            response.extensions_mut().insert(RoutedBodyContext {
-                                route: Arc::downgrade(route),
-                                id: *id,
-                            });
+                    .map_err(RssServiceError::Http)?;
+                let attempts = runtime
+                    .network
+                    .feed_attempts(feed.id, status)
+                    .map_err(RssServiceError::Http)?;
+                for attempt in attempts {
+                    let request = self.request_on_route_inner(
+                        feed,
+                        url,
+                        feed_url,
+                        conditional,
+                        Some(&attempt),
+                    );
+                    let result = tokio::select! {
+                        biased;
+                        _ = attempt.cancelled() => continue,
+                        result = tokio::time::timeout(Duration::from_secs(30), request) => result,
+                    };
+                    if let Some(error) = attempt.take_transport_error() {
+                        attempt.report(Some(&error));
+                        if matches!(error.as_ref(), weaver_tunnel::pipe::DialError::Fatal(_)) {
+                            return Err(RssServiceError::Http(error.to_string()));
+                        }
+                        continue;
+                    }
+                    match result {
+                        Ok(Ok(response)) => {
+                            attempt.report(None);
                             return Ok(response);
                         }
                         Ok(Err(AttemptError::Destination(message))) => {
                             return Err(RssServiceError::Http(message));
                         }
-                        _ => attempt.fail("RSS proxy transport or routed DNS failed"),
+                        Ok(Err(AttemptError::Routed(error))) => {
+                            attempt.report(Some(&error));
+                            if matches!(error.as_ref(), weaver_tunnel::pipe::DialError::Fatal(_)) {
+                                return Err(RssServiceError::Http(error.to_string()));
+                            }
+                        }
+                        _ => attempt.report(Some(&weaver_tunnel::pipe::DialError::Destination(
+                            std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "RSS transport or routed DNS failed",
+                            ),
+                        ))),
                     }
                 }
-                if !route.policy.allow_direct || route.is_revoked() {
-                    route.blocked();
-                    return Err(RssServiceError::Http(
-                        "RSS routing ladder exhausted; direct access is blocked".into(),
-                    ));
-                }
+                return Err(RssServiceError::Http(
+                    "RSS request failed on all permitted routes".into(),
+                ));
             }
             match tokio::time::timeout(
                 Duration::from_secs(30),
-                self.request_on_route(feed, url, feed_url, conditional, route.as_ref(), None),
+                self.request_on_route_inner(feed, url, feed_url, conditional, None),
             )
             .await
             {
-                Ok(Ok(response)) => {
-                    if let Some(route) = route {
-                        route.success(None);
-                    }
-                    Ok(response)
-                }
+                Ok(Ok(response)) => Ok(response),
                 Ok(Err(AttemptError::Destination(message))) => Err(RssServiceError::Http(message)),
-                _ => {
-                    if let Some(route) = route {
-                        route.blocked();
-                    }
-                    Err(RssServiceError::Http(
-                        "RSS request failed on all permitted routes".into(),
-                    ))
-                }
+                _ => Err(RssServiceError::Http("RSS request failed".into())),
             }
         })
-    }
-
-    async fn request_on_route(
-        &self,
-        feed: &RssFeedRow,
-        url: &reqwest::Url,
-        feed_url: &reqwest::Url,
-        conditional: bool,
-        route: Option<&Arc<ConsumerRoute>>,
-        hop: Option<&Arc<ProxyHop>>,
-    ) -> Result<reqwest::Response, AttemptError> {
-        let request = self.request_on_route_inner(feed, url, feed_url, conditional, route, hop);
-        if let Some(route) = route {
-            tokio::select! { biased; _ = route.cancelled() => Err(AttemptError::Route), result = request => result }
-        } else {
-            request.await
-        }
     }
 
     async fn request_on_route_inner(
@@ -136,25 +119,24 @@ impl RssService {
         url: &reqwest::Url,
         feed_url: &reqwest::Url,
         conditional: bool,
-        route: Option<&Arc<ConsumerRoute>>,
-        hop: Option<&Arc<ProxyHop>>,
+        attempt: Option<&Arc<FeedAttempt>>,
     ) -> Result<reqwest::Response, AttemptError> {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(AttemptError::Destination(
                 "URL must use http or https".into(),
             ));
         }
-        let target = if let Some(hop) = hop {
+        let target = if let Some(attempt) = attempt {
             let host = url
                 .host_str()
                 .ok_or_else(|| AttemptError::Destination("URL must include a host".into()))?;
             let port = url
                 .port_or_known_default()
                 .ok_or_else(|| AttemptError::Destination("invalid URL port".into()))?;
-            let addresses = hop
+            let addresses = attempt
                 .resolve(host.trim_matches(['[', ']']))
                 .await
-                .map_err(|_| AttemptError::Route)?;
+                .map_err(|error| AttemptError::Routed(Arc::new(error)))?;
             if addresses.is_empty() {
                 return Err(AttemptError::Route);
             }
@@ -185,12 +167,11 @@ impl RssService {
             .user_agent("weaver-rss/0.1")
             .redirect(reqwest::redirect::Policy::none())
             .gzip(true);
-        if let Some(route) = route {
-            let bridge = match hop {
-                Some(hop) => route.hop_bridge(hop),
-                None => route.direct_bridge(),
-            }
+        let bridge = attempt
+            .map(|attempt| attempt.bridge())
+            .transpose()
             .map_err(|_| AttemptError::Route)?;
+        if let Some(bridge) = &bridge {
             let addr = bridge.addr().map_err(|_| AttemptError::Route)?;
             // socks5 (not socks5h) uses exactly the checked addresses below.
             builder = builder.proxy(
@@ -215,12 +196,19 @@ impl RssService {
                 request = request.header(reqwest::header::IF_MODIFIED_SINCE, modified);
             }
         }
-        request.send().await.map_err(|error| {
+        let mut response = request.send().await.map_err(|error| {
             if weaver_nntp::tls::is_tls_error(&error) {
                 AttemptError::Destination("RSS TLS verification failed".into())
             } else {
                 AttemptError::Route
             }
-        })
+        })?;
+        if let (Some(attempt), Some(bridge)) = (attempt, bridge) {
+            response.extensions_mut().insert(RoutedBodyContext {
+                attempt: attempt.clone(),
+                _bridge: bridge,
+            });
+        }
+        Ok(response)
     }
 }

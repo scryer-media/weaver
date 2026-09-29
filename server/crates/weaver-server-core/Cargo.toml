@@ -90,6 +90,7 @@ argon2 = { workspace = true }
 getrandom = { workspace = true, default-features = false }
 hex = { workspace = true }
 pbkdf2 = { workspace = true }
+if-addrs = "0.15.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { workspace = true }

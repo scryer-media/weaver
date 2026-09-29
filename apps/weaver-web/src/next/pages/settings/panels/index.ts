@@ -1,12 +1,11 @@
 import type { ComponentType } from "react";
 import type { IconName } from "../../../components/icons";
 import { BackupPanel } from "./BackupPanel";
-import { BandwidthPanel } from "./BandwidthPanel";
 import { CategoriesPanel } from "./CategoriesPanel";
 import { GeneralPanel } from "./GeneralPanel";
 import { PostProcessingPanel } from "./PostProcessingPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
-import { ProxiesPanel } from "./ProxiesPanel";
+import { NetworkingPanel } from "./NetworkingPanel";
 import { RssPanel } from "./RssPanel";
 import { SchedulesPanel } from "./SchedulesPanel";
 import { SecurityPanel } from "./SecurityPanel";
@@ -15,14 +14,13 @@ import { WatchFolderPanel } from "./WatchFolderPanel";
 /**
  * The settings panels, in rail order.
  *
- * The list is weaver's, not the prototype's: the handoff draws eight invented
- * panels (Queue, Storage, Notifications …) against a daemon that has eleven
- * real ones, so the slugs below match the classic interface's routes and a
- * bookmarked `/settings/<panel>` keeps working across the switch.
+ * Both interfaces share these routes. The former proxies and bandwidth
+ * slugs redirect into Networking so existing bookmarks keep working.
  */
 
 export interface PanelDefinition {
   slug: string;
+  group?: "networking";
   /** Translation key of the panel's name. */
   label: string;
   /** Translation key of the mono subtitle beside the panel's title in the top bar. */
@@ -72,20 +70,18 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     Component: CategoriesPanel,
   },
   {
-    slug: "proxies",
-    label: "next.settings.panel.proxies",
-    note: "next.settings.panel.proxiesNote",
+    slug: "networking/overview",
+    group: "networking",
+    label: "settings.networkOverview",
+    note: "settings.networkingDesc",
     tag: "beta",
     icon: "proxies",
-    Component: ProxiesPanel,
+    Component: NetworkingPanel,
   },
-  {
-    slug: "bandwidth",
-    label: "next.settings.panel.bandwidth",
-    note: "next.settings.panel.bandwidthNote",
-    icon: "bandwidth",
-    Component: BandwidthPanel,
-  },
+  {slug:"networking/egress",group:"networking",label:"settings.networkEgress",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
+  {slug:"networking/proxies",group:"networking",label:"settings.proxies",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
+  {slug:"networking/routes",group:"networking",label:"settings.networkRoutes",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
+  {slug:"networking/bandwidth",group:"networking",label:"settings.bandwidth",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
   {
     slug: "schedules",
     label: "next.settings.panel.schedules",
