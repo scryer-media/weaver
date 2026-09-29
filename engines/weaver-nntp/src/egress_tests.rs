@@ -104,7 +104,15 @@ async fn linux_device_binding_uses_loopback() {
 #[tokio::test]
 async fn macos_device_binding_uses_loopback() {
     for address in ["127.0.0.1:0", "[::1]:0"] {
-        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let listener = match tokio::net::TcpListener::bind(address).await {
+            Ok(listener) => listener,
+            // A host with IPv6 disabled has no [::1] to listen on.
+            Err(error) if address.starts_with('[') => {
+                assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+                continue;
+            }
+            Err(error) => panic!("bind {address}: {error}"),
+        };
         let binding = SocketEgress::Interface("lo0".into());
         let client = binding
             .connect(listener.local_addr().unwrap())
