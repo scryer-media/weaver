@@ -676,7 +676,11 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) we
 			cmd := exec.CommandContext(ctx, exe, "release-flow", phase.Flow, phase.Datastore)
 			configureWeaverReleaseCommandCancellation(cmd)
 			cmd.Dir = e2eDir()
-			cmd.Env = mergeChildEnv(os.Environ(), phase.env())
+			env := phase.env()
+			if deadline, ok := ctx.Deadline(); ok {
+				env[weaverReleaseFlowDeadlineEnv] = deadline.UTC().Format(time.RFC3339Nano)
+			}
+			cmd.Env = mergeChildEnv(os.Environ(), env)
 			cmd.Stdout = io.MultiWriter(logFile, os.Stdout)
 			cmd.Stderr = io.MultiWriter(logFile, os.Stderr)
 			err = cmd.Run()
@@ -2163,9 +2167,50 @@ func runWeaverReleasePlaywright(ctx context.Context, script string) error {
 	return runWeaverReleasePlaywrightOnce(ctx, script)
 }
 
+// weaverReleaseFlowDeadlineEnv carries the instant the gate kills a flow's
+// process group, so the flow can stop Playwright before that.
+const weaverReleaseFlowDeadlineEnv = "E2E_WEAVER_RELEASE_FLOW_DEADLINE"
+
+// weaverReleaseFlowWindup is what a flow needs after Playwright stops:
+// Playwright writing traces, videos and its report, the container exiting,
+// and the flow capturing diagnostics and tearing its stack down.
+const weaverReleaseFlowWindup = 90 * time.Second
+
+// weaverPlaywrightBudgetEnv tells Playwright how long it may run; the
+// Playwright config caps each test's timeout and the run's global timeout
+// by it.
+const weaverPlaywrightBudgetEnv = "E2E_WEAVER_PLAYWRIGHT_BUDGET_MS"
+
+// weaverReleasePlaywrightBudget is how long Playwright may run so that the
+// flow still winds up before the gate's kill. A killed Playwright leaves no
+// trace, video or report, so a stuck test must end through Playwright's own
+// timeouts instead. ok is false when no deadline was passed down.
+func weaverReleasePlaywrightBudget(now time.Time, getenv func(string) string) (budget time.Duration, ok bool, err error) {
+	value := strings.TrimSpace(getenv(weaverReleaseFlowDeadlineEnv))
+	if value == "" {
+		return 0, false, nil
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return 0, false, fmt.Errorf("%s=%q: %w", weaverReleaseFlowDeadlineEnv, value, err)
+	}
+	return deadline.Sub(now) - weaverReleaseFlowWindup, true, nil
+}
+
 func runWeaverReleasePlaywrightOnce(ctx context.Context, script string) error {
+	run := []string{"run", "--rm", "--no-deps"}
+	budget, bounded, err := weaverReleasePlaywrightBudget(time.Now(), os.Getenv)
+	if err != nil {
+		return err
+	}
+	if bounded {
+		if budget < time.Second {
+			return fmt.Errorf("the flow deadline leaves no time to run Playwright %s and keep its evidence", script)
+		}
+		run = append(run, "-e", fmt.Sprintf("%s=%d", weaverPlaywrightBudgetEnv, budget.Milliseconds()))
+	}
 	args := append(
-		dockerComposeArgs("run", "--rm", "--no-deps", "weaver-playwright"),
+		dockerComposeArgs(append(run, "weaver-playwright")...),
 		"npm", "run", "test:"+script,
 	)
 	cmd := containerengine.CommandContext(ctx, args...)

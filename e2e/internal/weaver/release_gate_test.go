@@ -634,3 +634,24 @@ func TestCanonicalContainerImageIDAcceptsBothEngineForms(t *testing.T) {
 		}
 	}
 }
+
+func TestWeaverReleasePlaywrightBudgetLeavesTheWindupBeforeTheKill(t *testing.T) {
+	now := time.Date(2026, 9, 29, 17, 21, 2, 0, time.UTC)
+	deadline := now.Add(5 * time.Minute)
+	env := map[string]string{weaverReleaseFlowDeadlineEnv: deadline.Format(time.RFC3339Nano)}
+	budget, ok, err := weaverReleasePlaywrightBudget(now, func(key string) string { return env[key] })
+	if err != nil || !ok {
+		t.Fatalf("budget: ok=%v err=%v", ok, err)
+	}
+	if want := 5*time.Minute - weaverReleaseFlowWindup; budget != want {
+		t.Fatalf("budget = %s, want %s", budget, want)
+	}
+
+	if _, ok, err := weaverReleasePlaywrightBudget(now, func(string) string { return "" }); ok || err != nil {
+		t.Fatalf("no deadline: ok=%v err=%v", ok, err)
+	}
+	if _, _, err := weaverReleasePlaywrightBudget(now, func(string) string { return "soon" }); err == nil {
+		t.Fatal("an unparseable deadline must be an error")
+	}
+}
+
