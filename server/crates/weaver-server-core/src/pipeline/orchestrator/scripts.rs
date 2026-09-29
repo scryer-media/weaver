@@ -204,7 +204,8 @@ impl Pipeline {
                         .get(&job_id)
                         .is_some_and(|state| !matches!(state.status, JobStatus::Failed { .. }))
                 {
-                    self.raise_queue_script_event(job_id, QueueEvent::NzbDeleted, Some("BAD"));
+                    // No NZB_DELETED event: a job a script marked bad runs no
+                    // further queue scripts except NZB_MARKED.
                     self.fail_job(job_id, "FAILURE/BAD: marked bad by script".into());
                     return true;
                 }
