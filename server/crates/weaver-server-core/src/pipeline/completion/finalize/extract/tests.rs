@@ -1062,7 +1062,7 @@ fn conventional_7z_metadata_pass_reserves_what_its_reader_is_limited_to() {
         32 * MIB,
         "the listing never reserves past the ceiling"
     );
-    let limits = header_pass_archive_limits(&budget);
+    let limits = header_pass_archive_limits(&budget, reserved_at_open[0], end_header);
     assert_eq!(limits.memory_limit_bytes, HEADER_PASS_DECODER_BYTES);
     assert_eq!(limits.max_header_unpacked_bytes, HEADER_PASS_UNPACKED_BYTES);
     assert_eq!(limits.max_end_header_bytes, 512 * MIB);
@@ -1124,6 +1124,85 @@ fn conventional_7z_extraction_runs_beside_another_extractions_decoder() {
     assert_eq!(pool.reserved_bytes(), 0);
 }
 
+/// Another job's retained state is released only when that job ends, so a
+/// listing takes what is left beside it instead of waiting for room the
+/// state leaves no space for, and holds its reader to what it was granted.
+#[test]
+fn conventional_7z_listing_shrinks_beside_another_jobs_retained_state() {
+    use crate::pipeline::extraction::ProcessMemoryBudget;
+
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    let archive =
+        sevenz_archive_with_dictionary(1024 * 1024, &[("episode.txt", b"beside retained state")]);
+    let end_header = sevenz_end_header_bytes(&archive);
+
+    let limit = 512 * MIB;
+    let pool = Arc::new(ProcessMemoryBudget::new(limit));
+    let peer_state = pool.for_job(2).try_reserve_retained(400 * MIB).unwrap();
+    let budget = JobExtractionBudget::new_with_process_memory(
+        Arc::new(ExtractionLimits {
+            max_job_bytes: 2 * 1024 * 1024 * 1024 * 1024,
+            max_member_bytes: 1024 * 1024 * 1024 * 1024,
+            max_entries: 100_000,
+            max_ratio: 100,
+            max_seconds: 43_200,
+            min_free_bytes: 1,
+            max_memory_bytes: limit,
+        }),
+        pool.for_job(1),
+        temp.path().to_path_buf(),
+        limit,
+        0,
+        0,
+        PipelineMetrics::new(),
+    )
+    .unwrap();
+    let decode_memory = SevenZipDecodeMemory::ReservedForFixedThreads {
+        end_header_bytes: end_header,
+        allowance_cap: u64::MAX,
+    };
+
+    let read_under = std::sync::Mutex::new(Vec::new());
+    let (listed, permit) = read_sevenz_archive_for_listing(
+        &decode_memory,
+        end_header,
+        &budget,
+        &sevenz_turbo::Password::empty(),
+        &|granted| {
+            let limits = header_pass_archive_limits(&budget, granted, end_header);
+            read_under.lock().unwrap().push((granted, limits));
+            limits
+        },
+        &mut || Ok(Cursor::new(archive.clone())),
+    )
+    .expect("the listing fits beside the retained state");
+
+    assert_eq!(listed.files.len(), 1);
+    let read_under = read_under.into_inner().unwrap();
+    let [(granted, limits)] = read_under[..] else {
+        panic!("one listing: {read_under:?}");
+    };
+    assert_eq!(granted, permit.bytes());
+    assert!(
+        granted >= chase_header_pass_memory_bytes(end_header, limit),
+        "never less than the end header and the entry table: {granted}"
+    );
+    assert!(
+        granted <= limit - 400 * MIB,
+        "only what the retained state leaves: {granted}"
+    );
+    assert_eq!(
+        limits.memory_limit_bytes + limits.max_header_unpacked_bytes,
+        granted - end_header - CHASE_HEADER_PASS_ALLOWANCE_BYTES,
+        "the reader is held to the grant"
+    );
+    assert!(!pool.has_waiters());
+    drop(permit);
+    drop(peer_state);
+    assert_eq!(pool.reserved_bytes(), 0);
+}
+
 /// A chase parked on its download keeps its decoder through any number of
 /// conventional extractions that fit beside it: none of them waits, so none
 /// of them asks it to yield.
@@ -1137,7 +1216,8 @@ fn conventional_7z_extractions_leave_a_parked_chase_its_decoder() {
     let archive =
         sevenz_archive_with_dictionary(1024 * 1024, &[("episode.txt", b"beside a chase")]);
 
-    let limit = 1024 * MIB;
+    // Room for every extraction at once beside the chase, however they overlap.
+    let limit = 4096 * MIB;
     let pool = Arc::new(ProcessMemoryBudget::new(limit));
     let budget_for = |job: u64, root: &Path| {
         JobExtractionBudget::new_with_process_memory(
@@ -1229,7 +1309,7 @@ fn conventional_7z_listing_goes_up_to_the_ceiling_for_a_header_it_cannot_decode(
     // No encoded header's coders fit a kilobyte.
     let starved = sevenz_turbo::ArchiveLimits {
         memory_limit_bytes: 1024,
-        ..header_pass_archive_limits(&budget)
+        ..header_pass_archive_limits(&budget, u64::MAX, end_header)
     };
 
     let reserved_at_open = std::sync::Mutex::new(Vec::new());
@@ -1238,7 +1318,7 @@ fn conventional_7z_listing_goes_up_to_the_ceiling_for_a_header_it_cannot_decode(
         end_header,
         &budget,
         &sevenz_turbo::Password::empty(),
-        &starved,
+        &|_| starved,
         &mut || {
             reserved_at_open
                 .lock()
@@ -1263,13 +1343,20 @@ fn conventional_7z_listing_goes_up_to_the_ceiling_for_a_header_it_cannot_decode(
     drop(permit);
     assert_eq!(budget.memory_reserved_bytes(), 0);
 
-    assert!(header_coders_exceeded_memory(
+    assert!(header_exceeded_listing_memory(
         &sevenz_turbo::Error::MaxMemLimited {
             max_kb: 1,
             actaul_kb: 2
         }
     ));
-    assert!(!header_coders_exceeded_memory(
+    assert!(header_exceeded_listing_memory(&sevenz_turbo::Error::Io(
+        std::io::Error::other("Frame requires too much memory for decoding"),
+        "".into(),
+    )));
+    assert!(!header_exceeded_listing_memory(
+        &sevenz_turbo::Error::MaybeBadPassword(std::io::Error::other("corrupt input"))
+    ));
+    assert!(!header_exceeded_listing_memory(
         &sevenz_turbo::Error::EndHeaderTooLarge {
             limit_bytes: 1,
             declared_bytes: 2

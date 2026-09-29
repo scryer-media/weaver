@@ -188,11 +188,13 @@ pub(in crate::pipeline) const CHASE_HEADER_PASS_ALLOWANCE_BYTES: u64 = 16 * 1024
 /// The largest header a conventional listing lets an encoded header decode
 /// to, which is also the reader's own default.
 const HEADER_PASS_UNPACKED_BYTES: u64 = 64 * 1024 * 1024;
-/// The decoder memory a conventional listing allows an encoded header's
-/// coders before it lists the archive again under the ceiling. The reader
-/// holds an LZMA dictionary to the size of what it decodes, so this covers
-/// the dictionary of the largest header the listing accepts and the decoder's
-/// state; only a coder that declares its memory some other way needs more.
+/// The decoder memory a conventional listing allows each of an encoded
+/// header's coders before it lists the archive again under the ceiling. The
+/// reader holds an LZMA dictionary to the size of what it decodes, so this
+/// covers the dictionary of the largest header the listing accepts and the
+/// decoder's state; only a coder that declares its memory some other way
+/// needs more. The reader checks each coder against it alone, so a header
+/// that chains several sized coders can hold more than the listing reserved.
 const HEADER_PASS_DECODER_BYTES: u64 = 80 * 1024 * 1024;
 /// Everything the chase's decode pass holds beyond the decoders and the end
 /// header: the gated reader's buffer, a member's output writer, the CRC
@@ -297,24 +299,54 @@ fn sevenz_archive_limits(budget: &JobExtractionBudget) -> sevenz_turbo::ArchiveL
 }
 
 /// The limits a conventional listing reads the archive under: the job's,
-/// with an encoded header's coders and decoded size held to what
-/// [`fixed_header_pass_memory_bytes`] reserves.
-fn header_pass_archive_limits(budget: &JobExtractionBudget) -> sevenz_turbo::ArchiveLimits {
+/// with an encoded header's coders and decoded size held to what the listing
+/// was granted of [`fixed_header_pass_memory_bytes`]. A grant that other
+/// jobs' retained state shrank divides what is left over the end header and
+/// the entry table between the two in the proportion of the full amounts.
+fn header_pass_archive_limits(
+    budget: &JobExtractionBudget,
+    granted_bytes: u64,
+    end_header_bytes: u64,
+) -> sevenz_turbo::ArchiveLimits {
     let limits = sevenz_archive_limits(budget);
+    let for_header = granted_bytes
+        .saturating_sub(end_header_bytes)
+        .saturating_sub(CHASE_HEADER_PASS_ALLOWANCE_BYTES)
+        .min(HEADER_PASS_UNPACKED_BYTES + HEADER_PASS_DECODER_BYTES);
+    let unpacked = (u128::from(for_header) * u128::from(HEADER_PASS_UNPACKED_BYTES)
+        / u128::from(HEADER_PASS_UNPACKED_BYTES + HEADER_PASS_DECODER_BYTES))
+        as u64;
     sevenz_turbo::ArchiveLimits {
-        memory_limit_bytes: limits.memory_limit_bytes.min(HEADER_PASS_DECODER_BYTES),
-        max_header_unpacked_bytes: limits
-            .max_header_unpacked_bytes
-            .min(HEADER_PASS_UNPACKED_BYTES),
+        memory_limit_bytes: limits.memory_limit_bytes.min(for_header - unpacked),
+        max_header_unpacked_bytes: limits.max_header_unpacked_bytes.min(unpacked),
         ..limits
     }
 }
 
-/// Whether listing failed because an encoded header's coders need more
-/// memory than the listing allowed them, which the ceiling may still admit.
-fn header_coders_exceeded_memory(error: &sevenz_turbo::Error) -> bool {
-    matches!(error, sevenz_turbo::Error::MaxMemLimited { .. })
-        || error.limit_hit() == Some(sevenz_turbo::Limit::MemoryBytes)
+/// Whether `listing` held an encoded header to less than `job` does, so a
+/// header it refused may still be listed under the job's limits.
+fn header_limits_are_lowered(
+    listing: &sevenz_turbo::ArchiveLimits,
+    job: &sevenz_turbo::ArchiveLimits,
+) -> bool {
+    listing.memory_limit_bytes < job.memory_limit_bytes
+        || listing.max_header_unpacked_bytes < job.max_header_unpacked_bytes
+}
+
+/// Whether listing failed because an encoded header needs more memory than
+/// the listing allowed it, which the ceiling may still admit.
+///
+/// An LZMA coder reports its own shortfall and the reader reports a header
+/// that decodes past its limit. A Zstandard coder is only told its largest
+/// window, so a frame past it fails as the decoder's read error.
+fn header_exceeded_listing_memory(error: &sevenz_turbo::Error) -> bool {
+    match error {
+        sevenz_turbo::Error::MaxMemLimited { .. } => true,
+        sevenz_turbo::Error::Io(error, _) | sevenz_turbo::Error::MaybeBadPassword(error) => {
+            error.to_string().contains("too much memory")
+        }
+        error => error.limit_hit() == Some(sevenz_turbo::Limit::HeaderUnpackedBytes),
+    }
 }
 
 /// Refuse an archive whose decoders cannot run under `limits`, as
@@ -343,17 +375,19 @@ fn check_sevenz_decoder_memory(
 /// A chase holds a header-sized permit: on its gated reader the listing parks
 /// until the archive's tail arrives, and a park must not sit under the
 /// ceiling. The conventional reader never parks. It reserves what its reader
-/// is limited to for the header, and only when an encoded header's coders
-/// need more than that does it list again admitted up to the ceiling, which
-/// is what that decode may allocate under the job's limits. Reserving the
-/// ceiling for every listing made each one wait for every decoder in the
-/// process to finish.
+/// is limited to for the header, less whatever other jobs' retained state
+/// leaves no room for, and only when an encoded header needs more than it was
+/// granted does it list again admitted up to the ceiling, which is what that
+/// decode may allocate under the job's limits. Reserving the ceiling for
+/// every listing made each one wait for every decoder in the process to
+/// finish; reserving the full amount exactly made it wait for retained state
+/// that is released only when its job ends.
 fn read_sevenz_archive_for_listing<R, F>(
     decode_memory: &SevenZipDecodeMemory,
     end_header_bytes: u64,
     budget: &Arc<JobExtractionBudget>,
     password: &sevenz_turbo::Password,
-    header_limits: &sevenz_turbo::ArchiveLimits,
+    header_limits: &dyn Fn(u64) -> sevenz_turbo::ArchiveLimits,
     open_reader: &mut F,
 ) -> Result<(sevenz_turbo::Archive, MemoryPermit), String>
 where
@@ -377,15 +411,21 @@ where
             (read(&job_limits)?, permit)
         }
         SevenZipDecodeMemory::ReservedForFixedThreads { .. } => {
-            let permit = budget
-                .reserve_memory_wait(fixed_header_pass_memory_bytes(end_header_bytes, ceiling))?;
-            match read(header_limits)? {
-                Err(error) if header_coders_exceeded_memory(&error) => {
+            let permit = budget.reserve_memory_up_to_ceiling_wait_capped(
+                chase_header_pass_memory_bytes(end_header_bytes, ceiling),
+                fixed_header_pass_memory_bytes(end_header_bytes, ceiling),
+            )?;
+            let header_limits = header_limits(permit.bytes());
+            match read(&header_limits)? {
+                Err(error)
+                    if header_limits_are_lowered(&header_limits, &job_limits)
+                        && header_exceeded_listing_memory(&error) =>
+                {
                     drop(permit);
                     tracing::info!(
                         %error,
                         ceiling_bytes = ceiling,
-                        "7z header needs more decoder memory than a listing reserves; \
+                        "7z header needs more memory than its listing was granted; \
                          listing again up to the ceiling"
                     );
                     let permit = budget.reserve_memory_up_to_ceiling_wait(
@@ -958,7 +998,7 @@ where
             end_header_bytes,
             budget,
             password,
-            &header_pass_archive_limits(budget),
+            &|granted| header_pass_archive_limits(budget, granted, end_header_bytes),
             &mut open_reader,
         )?;
         for entry in &archive.files {
