@@ -572,13 +572,15 @@ async fn apply_schedule_action(
         let watch_folder = services
             .watch_folder
             .ok_or("watch folder service is not available")?;
-        let result = watch_folder
-            .set_scanning_paused(matches!(
-                action,
-                ScheduleAction::PauseAll | ScheduleAction::PauseWatchFolderScanning
-            ))
-            .await;
-        if result.is_err() {
+        let pausing = matches!(
+            action,
+            ScheduleAction::PauseAll | ScheduleAction::PauseWatchFolderScanning
+        );
+        let result = watch_folder.set_scanning_paused(pausing).await;
+        // A failed pause holds scanning stopped until the retry lands. A failed
+        // resume leaves scanning as it was, so removing the rule cannot strand
+        // an in-memory pause the stored setting does not record.
+        if result.is_err() && pausing {
             watch_folder.pause_scanning_runtime().await;
         }
         return result.map_err(|error| ScheduleApplyError::Failed(error.to_string()));

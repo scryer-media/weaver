@@ -990,6 +990,53 @@ async fn failed_initial_hold_reports_readiness_and_retries_after_repair() {
 }
 
 #[tokio::test]
+async fn failed_watch_folder_resume_does_not_pause_scanning() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+    let (commands, _) = tokio::sync::mpsc::channel(1);
+    let (events, _) = tokio::sync::broadcast::channel(1);
+    let handle = SchedulerHandle::new(
+        commands,
+        events,
+        crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
+    );
+    let watch_folder = WatchFolderService::new(db.clone(), handle.clone(), config.clone());
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        crate::persistence::sql_runtime::SqlRuntime::execute(datastore.read_exec(),
+            "CREATE TRIGGER reject_watch_pause BEFORE INSERT ON settings WHEN NEW.key = 'watch_folder.scanning_paused' BEGIN SELECT RAISE(FAIL, 'injected write failure'); END", &[]).await?;
+        Ok(())
+    }).unwrap();
+    let services = ScheduleServices {
+        watch_folder: Some(watch_folder),
+        db: Some(db.clone()),
+        ..Default::default()
+    };
+    assert!(
+        apply_schedule_action(
+            handle.clone(),
+            services.clone(),
+            ScheduleAction::Resume,
+            Some(ScheduleTrack::WatchFolder),
+        )
+        .await
+        .is_err()
+    );
+    assert!(!config.read().await.watch_folder.scanning_paused);
+    assert!(
+        apply_schedule_action(
+            handle,
+            services,
+            ScheduleAction::PauseWatchFolderScanning,
+            Some(ScheduleTrack::WatchFolder),
+        )
+        .await
+        .is_err()
+    );
+    assert!(config.read().await.watch_folder.scanning_paused);
+}
+
+#[tokio::test]
 async fn failed_scheduled_server_activation_restores_persisted_state() {
     let db = crate::Database::open_in_memory().unwrap();
     let server: crate::servers::ServerConfig = serde_json::from_value(serde_json::json!({
