@@ -12,6 +12,13 @@ pub const MASKED_SECRET: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct PostProcessingSettingsGql {
+    pub event_script_concurrency: u8,
+    pub event_script_timeout_seconds: u64,
+    pub file_downloaded_event_interval: i64,
+    pub script_output_ceiling_bytes: u64,
+    pub script_output_runs_per_job: u32,
+    pub script_output_ring_bytes: u64,
+    pub script_output_run_cap_bytes: u64,
     pub script_directory: String,
     pub execution_enabled: bool,
     pub concurrency: u8,
@@ -35,6 +42,13 @@ impl PostProcessingSettingsGql {
     ) -> Self {
         Self {
             script_directory: script_directory.into(),
+            event_script_concurrency: value.event_scripts.event_script_concurrency,
+            event_script_timeout_seconds: value.event_scripts.event_script_timeout_seconds,
+            file_downloaded_event_interval: value.event_scripts.file_downloaded_event_interval,
+            script_output_ceiling_bytes: value.event_scripts.script_output_ceiling_bytes,
+            script_output_runs_per_job: value.event_scripts.script_output_runs_per_job,
+            script_output_ring_bytes: value.event_scripts.script_output_ring_bytes,
+            script_output_run_cap_bytes: value.event_scripts.script_output_run_cap_bytes,
             execution_enabled: value.execution_enabled,
             concurrency: value.concurrency,
             termination_grace_seconds: value.termination_grace_seconds,
@@ -50,6 +64,13 @@ impl PostProcessingSettingsGql {
 
 #[derive(Debug, Clone, InputObject)]
 pub struct PostProcessingSettingsInput {
+    pub event_script_concurrency: Option<u8>,
+    pub event_script_timeout_seconds: Option<u64>,
+    pub file_downloaded_event_interval: Option<i64>,
+    pub script_output_ceiling_bytes: Option<u64>,
+    pub script_output_runs_per_job: Option<u32>,
+    pub script_output_ring_bytes: Option<u64>,
+    pub script_output_run_cap_bytes: Option<u64>,
     pub execution_enabled: bool,
     pub concurrency: u8,
     pub termination_grace_seconds: u64,
@@ -152,6 +173,9 @@ pub struct ScriptGql {
     pub name: String,
     pub display_name: String,
     pub adapter: ScriptAdapterGql,
+    pub kinds: Vec<ScriptKindGql>,
+    pub queue_events: Vec<QueueEventGql>,
+    pub task_times: Vec<String>,
     pub version: Option<String>,
     pub options: Vec<ScriptOptionGql>,
 }
@@ -162,6 +186,26 @@ impl ScriptGql {
             name: script.name.as_str().to_string(),
             display_name: script.manifest.display_name().to_string(),
             adapter: script.manifest.adapter().into(),
+            kinds: script
+                .manifest
+                .kinds()
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+            queue_events: script
+                .manifest
+                .queue_events()
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+            task_times: script
+                .manifest
+                .task_times()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             version: script.manifest.version().map(str::to_string),
             options: script
                 .manifest
@@ -360,7 +404,10 @@ impl From<weaver_server_core::post_processing::model::ScriptStatus> for ScriptSt
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct ScriptResultGql {
+    pub output_id: Option<String>,
+    pub output_retained: bool,
     pub script: String,
+    pub event: String,
     pub adapter: ScriptAdapterGql,
     pub status: ScriptStatusGql,
     pub exit_code: Option<i32>,
@@ -374,7 +421,10 @@ pub struct ScriptResultGql {
 impl From<ScriptResult> for ScriptResultGql {
     fn from(value: ScriptResult) -> Self {
         Self {
+            output_id: value.output_id,
+            output_retained: false,
             script: value.script.as_str().to_string(),
+            event: value.event.to_string(),
             adapter: value.adapter.into(),
             status: value.status.into(),
             exit_code: value.exit_code,
@@ -383,6 +433,56 @@ impl From<ScriptResult> for ScriptResultGql {
             output_truncated: value.output_truncated,
             error_message: value.error_message,
             finished_at_epoch_ms: value.finished_at_epoch_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
+#[graphql(name = "ScriptKind")]
+pub enum ScriptKindGql {
+    PostProcessing,
+    Queue,
+    Scan,
+    Scheduler,
+    Feed,
+}
+
+impl From<weaver_server_core::post_processing::model::ScriptKind> for ScriptKindGql {
+    fn from(value: weaver_server_core::post_processing::model::ScriptKind) -> Self {
+        use weaver_server_core::post_processing::model::ScriptKind;
+        match value {
+            ScriptKind::PostProcessing => Self::PostProcessing,
+            ScriptKind::Queue => Self::Queue,
+            ScriptKind::Scan => Self::Scan,
+            ScriptKind::Scheduler => Self::Scheduler,
+            ScriptKind::Feed => Self::Feed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
+#[graphql(name = "ScriptQueueEvent")]
+pub enum QueueEventGql {
+    FileDownloaded,
+    UrlCompleted,
+    NzbMarked,
+    NzbAdded,
+    NzbNamed,
+    NzbDownloaded,
+    NzbDeleted,
+}
+
+impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEventGql {
+    fn from(value: weaver_server_core::post_processing::model::QueueEvent) -> Self {
+        use weaver_server_core::post_processing::model::QueueEvent;
+        match value {
+            QueueEvent::FileDownloaded => Self::FileDownloaded,
+            QueueEvent::UrlCompleted => Self::UrlCompleted,
+            QueueEvent::NzbMarked => Self::NzbMarked,
+            QueueEvent::NzbAdded => Self::NzbAdded,
+            QueueEvent::NzbNamed => Self::NzbNamed,
+            QueueEvent::NzbDownloaded => Self::NzbDownloaded,
+            QueueEvent::NzbDeleted => Self::NzbDeleted,
         }
     }
 }

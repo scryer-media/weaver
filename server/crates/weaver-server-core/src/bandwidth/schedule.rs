@@ -712,6 +712,7 @@ impl OneShotEvaluator {
             for entry in entries.iter().filter(|entry| {
                 entry.enabled
                     && entry.action.track().is_none()
+                    && !entry.action.is_script()
                     && (entry.days.is_empty() || entry.days.contains(&day))
             }) {
                 for time in entry_times(entry) {

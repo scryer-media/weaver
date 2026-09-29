@@ -28,6 +28,13 @@ impl PostProcessingMutation {
         input: PostProcessingSettingsInput,
     ) -> Result<PostProcessingSettingsGql> {
         let PostProcessingSettingsInput {
+            event_script_concurrency,
+            event_script_timeout_seconds,
+            file_downloaded_event_interval,
+            script_output_ceiling_bytes,
+            script_output_runs_per_job,
+            script_output_ring_bytes,
+            script_output_run_cap_bytes,
             execution_enabled,
             concurrency,
             termination_grace_seconds,
@@ -56,7 +63,30 @@ impl PostProcessingMutation {
                 async_graphql::MaybeUndefined::Value(extensions) => (extensions, false),
                 async_graphql::MaybeUndefined::Null => unreachable!("checked before worker"),
             };
+            let mut event_scripts = db.post_processing_settings()?.event_scripts;
+            if let Some(value) = event_script_concurrency {
+                event_scripts.event_script_concurrency = value;
+            }
+            if let Some(value) = event_script_timeout_seconds {
+                event_scripts.event_script_timeout_seconds = value;
+            }
+            if let Some(value) = file_downloaded_event_interval {
+                event_scripts.file_downloaded_event_interval = value;
+            }
+            if let Some(value) = script_output_ceiling_bytes {
+                event_scripts.script_output_ceiling_bytes = value;
+            }
+            if let Some(value) = script_output_runs_per_job {
+                event_scripts.script_output_runs_per_job = value;
+            }
+            if let Some(value) = script_output_ring_bytes {
+                event_scripts.script_output_ring_bytes = value;
+            }
+            if let Some(value) = script_output_run_cap_bytes {
+                event_scripts.script_output_run_cap_bytes = value;
+            }
             let settings = PostProcessingSettings {
+                event_scripts,
                 execution_enabled,
                 concurrency,
                 termination_grace_seconds,
@@ -252,6 +282,9 @@ impl PostProcessingMutation {
                     .ok()
                     .and_then(|path| path.parent().map(PathBuf::from)),
                 previous_script_status: Default::default(),
+                parameters: metadata,
+                marked_bad: false,
+                final_directory_override: None,
             },
         };
         tokio::spawn(async move {

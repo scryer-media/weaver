@@ -460,6 +460,9 @@ impl From<SchedulePruneFiles> for weaver_server_core::bandwidth::PruneFiles {
 
 #[derive(SimpleObject)]
 pub struct Schedule {
+    pub script: Option<String>,
+    pub run_at_startup: bool,
+    pub implicit: bool,
     pub id: String,
     pub enabled: bool,
     pub label: String,
@@ -525,7 +528,17 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             _ => (None, None, None),
         };
         let mut hardware_profile = None;
+        let mut script = None;
+        let mut run_at_startup = false;
         let (action_type, speed_limit_bytes) = match &e.action {
+            weaver_server_core::bandwidth::ScheduleAction::RunScript {
+                script: name,
+                run_at_startup: startup,
+            } => {
+                script = Some(name.clone());
+                run_at_startup = *startup;
+                ("run_script".into(), None)
+            }
             weaver_server_core::bandwidth::ScheduleAction::Pause => ("pause".into(), None),
             weaver_server_core::bandwidth::ScheduleAction::Resume => ("resume".into(), None),
             ScheduleAction::PauseAll => ("pause_all".into(), None),
@@ -554,6 +567,9 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             }
         };
         Self {
+            implicit: e.id.starts_with("implicit-script:"),
+            script,
+            run_at_startup,
             id: e.id,
             track,
             enabled: e.enabled,
@@ -582,6 +598,8 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
 
 #[derive(InputObject)]
 pub struct ScheduleInput {
+    pub script: Option<String>,
+    pub run_at_startup: Option<bool>,
     pub enabled: Option<bool>,
     pub label: Option<String>,
     pub days: Option<Vec<String>>,
@@ -607,6 +625,33 @@ impl ScheduleInput {
     /// honour: a rule that could never apply is refused by name here rather
     /// than saved and skipped every time it fires.
     pub fn validate(&self, probe: &SystemProfile) -> Result<(), String> {
+        if self.action_type == "run_script" {
+            // Script rules keep their own time list (`HH:MM`, `*:MM` or
+            // `startup`) in `time`, read by the script evaluator.
+            if self.every_hour_at_minute.is_some()
+                || self.times.as_ref().is_some_and(|times| !times.is_empty())
+            {
+                return Err("a run_script schedule lists its times in time".into());
+            }
+            let script = self
+                .script
+                .as_ref()
+                .ok_or("a run_script schedule needs a script")?;
+            weaver_server_core::post_processing::model::ScriptName::new(script.clone())
+                .map_err(|error| error.to_string())?;
+            for time in self.time.split([',', ';']) {
+                let time = time
+                    .trim()
+                    .parse::<weaver_server_core::post_processing::model::ScriptTaskTime>()
+                    .map_err(str::to_string)?;
+                if time == weaver_server_core::post_processing::model::ScriptTaskTime::Startup
+                    && !self.run_at_startup.unwrap_or(false)
+                {
+                    return Err("startup scripts require runAtStartup".into());
+                }
+            }
+            return Ok(());
+        }
         if !matches!(
             self.action_type.as_str(),
             "pause"
@@ -683,6 +728,10 @@ impl ScheduleInput {
         use weaver_server_core::bandwidth::{ScheduleAction, Weekday};
 
         let action = match self.action_type.as_str() {
+            "run_script" => ScheduleAction::RunScript {
+                script: self.script.unwrap_or_default(),
+                run_at_startup: self.run_at_startup.unwrap_or(false),
+            },
             "pause" => ScheduleAction::Pause,
             "resume" => ScheduleAction::Resume,
             "pause_all" => ScheduleAction::PauseAll,
@@ -760,5 +809,66 @@ impl ScheduleInput {
             every_hour_at_minute: self.every_hour_at_minute,
             action,
         })
+    }
+}
+
+#[cfg(test)]
+mod schedule_script_tests {
+    use super::*;
+
+    fn script_input(time: &str, startup: bool) -> ScheduleInput {
+        ScheduleInput {
+            script: Some("scheduler.sh".into()),
+            run_at_startup: Some(startup),
+            enabled: Some(true),
+            label: None,
+            days: None,
+            time: time.into(),
+            times: None,
+            every_hour_at_minute: None,
+            server_id: None,
+            server_active: None,
+            feed_id: None,
+            quota_metering_enabled: None,
+            prune_failed: None,
+            prune_completed: None,
+            prune_cancelled: None,
+            action_type: "run_script".into(),
+            speed_limit_bytes: None,
+            hardware_profile: None,
+        }
+    }
+
+    #[test]
+    fn script_schedule_accepts_hourly_lists_and_requires_startup_opt_in() {
+        use weaver_server_core::runtime::system_profile::{
+            CpuProfile, DiskProfile, FilesystemType, MemoryProfile, StorageClass,
+        };
+        let probe = SystemProfile {
+            cpu: CpuProfile {
+                physical_cores: 2,
+                logical_cores: 2,
+                simd: Default::default(),
+                cgroup_limit: None,
+            },
+            memory: MemoryProfile {
+                total_bytes: 1024 * 1024 * 1024,
+                available_bytes: 1024 * 1024 * 1024,
+                cgroup_limit: None,
+            },
+            disk: DiskProfile {
+                storage_class: StorageClass::Unknown,
+                filesystem: FilesystemType::Unknown("test".into()),
+                sequential_write_mbps: 0.0,
+                random_read_iops: 0.0,
+                same_filesystem: true,
+            },
+        };
+        for time in ["*:15", "*:15, 03:00;04:30", "*"] {
+            assert!(script_input(time, true).validate(&probe).is_ok(), "{time}");
+        }
+        assert!(script_input("*", false).validate(&probe).is_err());
+        assert!(script_input("*:60", true).validate(&probe).is_err());
+        assert!(script_input("01:00,", true).validate(&probe).is_err());
     }
 }

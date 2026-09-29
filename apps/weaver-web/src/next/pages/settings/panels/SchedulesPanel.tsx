@@ -34,6 +34,9 @@ import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, optionsFromSchedule,
  */
 
 interface Schedule extends ScheduleOptions {
+  script: string | null;
+  runAtStartup: boolean;
+  implicit: boolean;
   id: string;
   enabled: boolean;
   label: string | null;
@@ -47,6 +50,8 @@ interface Schedule extends ScheduleOptions {
 
 interface ScheduleForm {
   options: ScheduleOptionsForm;
+  script: string;
+  runAtStartup: boolean;
   enabled: boolean;
   label: string;
   days: string[];
@@ -73,6 +78,7 @@ const DAYS = [
 
 const ACTIONS: { value: string; label: string }[] = [
   ...ADDITIONAL_SCHEDULE_ACTIONS,
+  { value: "run_script", label: "Run script" },
   { value: "pause", label: "next.schedules.pause" },
   { value: "resume", label: "next.schedules.resume" },
   { value: "speed_limit", label: "next.schedules.setLimit" },
@@ -84,6 +90,8 @@ const ACTIONS: { value: string; label: string }[] = [
 
 const NEW_SCHEDULE: ScheduleForm = {
   options: NEW_SCHEDULE_OPTIONS,
+  script: "",
+  runAtStartup: false,
   enabled: true,
   label: "",
   days: [],
@@ -95,6 +103,7 @@ const NEW_SCHEDULE: ScheduleForm = {
 };
 
 function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets): string {
+  if (schedule.actionType === "run_script") return `Run ${schedule.script}${schedule.implicit ? " (manifest)" : ""}`;
   const details = scheduleActionDetails(t, schedule, targets);
   if (details) return details;
   if (schedule.actionType === "speed_limit") {
@@ -149,11 +158,14 @@ export function SchedulesPanel() {
         null;
 
   const open = (schedule: Schedule | null) => {
+    if (schedule?.implicit) return;
     setError(null);
     setForm(
       schedule
         ? {
             enabled: schedule.enabled,
+            script: schedule.script ?? "",
+            runAtStartup: schedule.runAtStartup,
             label: schedule.label ?? "",
             days: schedule.days,
             time: schedule.time,
@@ -187,6 +199,7 @@ export function SchedulesPanel() {
     if (form.actionType === "hardware_profile") {
       input.hardwareProfile = formProfile;
     }
+    if (form.actionType === "run_script") { input.script = form.script; input.runAtStartup = form.runAtStartup; }
     const result =
       editingId === "new"
         ? await createSchedule({ input })
@@ -248,7 +261,7 @@ export function SchedulesPanel() {
             {schedule.label || "—"}
           </Cell>,
           <span key="enabled" onClick={(event) => event.stopPropagation()}>
-            <Toggle
+            {schedule.implicit ? <span className="text-xs">Manifest</span> : <Toggle
               size="table"
               checked={schedule.enabled}
               label={t("next.schedules.enabledAria", { time: schedule.time })}
@@ -257,7 +270,7 @@ export function SchedulesPanel() {
                   reexecute({ requestPolicy: "network-only" }),
                 );
               }}
-            />
+            />}
           </span>,
         ],
       })),
@@ -295,7 +308,7 @@ export function SchedulesPanel() {
                 label: t("next.schedules.time"),
                 help: t("next.schedules.timeHelp"),
                 control: {
-                  kind: "time",
+                  kind: form.actionType === "run_script" ? "text" : "time",
                   value: form.time,
                   onChange: (next) => setForm((current) => ({ ...current, time: next })),
                 },
@@ -349,10 +362,18 @@ export function SchedulesPanel() {
                 control: {
                   kind: "select",
                   value: form.actionType,
-                  options: ACTIONS.map((option) => ({ ...option, label: t(option.label) })),
+                  options: ACTIONS.map((option) => ({ ...option, label: option.value === "run_script" ? option.label : t(option.label) })),
                   onChange: (next) => setForm((current) => ({ ...current, actionType: next })),
                 },
               },
+              ...(form.actionType === "run_script" ? [
+                { id: "script", label: "Script name", help: "Use a Scheduler script. Time accepts HH:MM, *:MM, or * for startup only.", control: {
+                  kind: "text" as const, value: form.script, onChange: (script: string) => setForm((current) => ({ ...current, script })),
+                } },
+                { id: "runAtStartup", label: "Also run at startup", control: {
+                  kind: "toggle" as const, value: form.runAtStartup, onChange: (runAtStartup: boolean) => setForm((current) => ({ ...current, runAtStartup })),
+                } },
+              ] : []),
               ...(form.actionType === "speed_limit"
                 ? [
                     {

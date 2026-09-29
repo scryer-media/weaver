@@ -181,6 +181,7 @@ impl Database {
         });
         if result.as_ref().is_ok_and(|changed| *changed) {
             self.invalidate_job_history_cache(job_id);
+            self.notify_script_events_changed();
         }
         result
     }
@@ -215,6 +216,7 @@ impl Database {
         });
         if result.as_ref().is_ok_and(|changed| *changed) {
             self.invalidate_job_history_cache(job_id);
+            self.notify_script_events_changed();
         }
         result
     }
@@ -229,6 +231,7 @@ impl Database {
         });
         if result.as_ref().is_ok_and(|job_ids| !job_ids.is_empty()) {
             self.clear_job_history_cache();
+            self.notify_script_events_changed();
         }
         result.map(|job_ids| job_ids.len())
     }
@@ -261,6 +264,7 @@ impl Database {
         });
         if result.as_ref().is_ok_and(|changed| *changed > 0) {
             self.clear_job_history_cache();
+            self.notify_script_events_changed();
         }
         result
     }
@@ -330,6 +334,11 @@ async fn delete_job_history_bundle_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
 ) -> Result<bool, StateError> {
+    tx.execute(
+        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
+        &[],
+    )
+    .await?;
     let job_id =
         i64::try_from(job_id.0).map_err(|_| StateError::Database("job id is too large".into()))?;
     let lock_sql = match tx {
@@ -353,6 +362,7 @@ async fn delete_job_history_bundle_tx(
         &[SqlArg::I64(job_id)],
     )
     .await?;
+    crate::post_processing::output::delete_script_state_tx(tx, job_id).await?;
     Ok(tx
         .execute(
             "DELETE FROM job_history WHERE job_id = {}",
@@ -363,6 +373,11 @@ async fn delete_job_history_bundle_tx(
 }
 
 async fn delete_all_job_history_bundles_tx(tx: &mut SqlTx<'_>) -> Result<Vec<JobId>, StateError> {
+    tx.execute(
+        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
+        &[],
+    )
+    .await?;
     let lock_sql = match tx {
         SqlTx::Postgres(_) => "SELECT job_id FROM job_history FOR UPDATE",
         SqlTx::Sqlite(_) => "SELECT job_id FROM job_history",
@@ -399,6 +414,9 @@ async fn delete_all_job_history_bundles_tx(tx: &mut SqlTx<'_>) -> Result<Vec<Job
         &[],
     )
     .await?;
+    for job_id in &job_ids {
+        crate::post_processing::output::delete_script_state_tx(tx, job_id.0 as i64).await?;
+    }
     tx.execute("DELETE FROM job_history", &[]).await?;
     Ok(job_ids)
 }

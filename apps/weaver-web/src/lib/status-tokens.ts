@@ -36,6 +36,7 @@ const STATUS_TO_TOKEN: Record<string, StatusToken> = {
   REPAIRING: "repairing",
   EXTRACTING: "extracting",
   POST_PROCESSING: "copying",
+  AWAITING_QUEUE_SCRIPTS: "queued",
   MOVING: "copying",
   FINALIZING: "copying",
   COMPLETE: "completed",
@@ -60,6 +61,7 @@ const STATUS_TO_I18N_KEY: Record<string, string> = {
   REPAIRING: "status.repairing",
   EXTRACTING: "status.extracting",
   POST_PROCESSING: "status.postProcessing",
+  AWAITING_QUEUE_SCRIPTS: "status.awaitingQueueScripts",
   MOVING: "status.moving",
   FINALIZING: "status.finalizing",
   COMPLETE: "status.complete",
@@ -83,6 +85,7 @@ const ACTIVE_STATUSES = new Set([
 ]);
 
 const INDETERMINATE_STATUSES = new Set([
+  "AWAITING_QUEUE_SCRIPTS",
   "CHECKING",
   "FETCHING_REPAIR_DATA",
   "VERIFYING",

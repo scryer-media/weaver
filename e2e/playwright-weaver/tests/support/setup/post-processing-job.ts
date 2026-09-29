@@ -58,10 +58,15 @@ export async function runJobThroughPostProcessing(
   request: APIRequestContext,
   name: string,
 ): Promise<HistoryItem> {
+  return waitForTerminalJob(request, await submitPostProcessingJob(request, name));
+}
+
+/** Submit the fixture separately when a test controls its script barrier. */
+export async function submitPostProcessingJob(request: APIRequestContext, name: string): Promise<number> {
   const messageId = `${name}@post-processing.e2e.invalid`;
   await postProbeArticle(messageId, 1024);
   const submission = await submitProbeNzb(request, name, [{ messageId, bytes: 1024 }]);
   expect(submission.accepted, JSON.stringify(submission)).toBeTruthy();
   expect(submission.jobId).not.toBeNull();
-  return waitForTerminalJob(request, submission.jobId!);
+  return submission.jobId!;
 }

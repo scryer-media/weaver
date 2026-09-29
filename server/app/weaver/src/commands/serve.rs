@@ -246,6 +246,11 @@ pub(crate) async fn run(
                 db: Some(db.clone()),
             },
         );
+    weaver_server_core::post_processing::scheduler::spawn_script_evaluator(
+        db.clone(),
+        shared_config.clone(),
+        shared_schedules.clone(),
+    );
 
     let pipeline_config = shared_config.clone();
 

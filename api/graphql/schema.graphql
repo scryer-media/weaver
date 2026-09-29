@@ -994,6 +994,7 @@ GraphQL job statuses collapse the internal `Checking` phase into
 extraction begins.
 """
 enum JobStatusGql {
+	AWAITING_QUEUE_SCRIPTS
 	QUEUED
 	DOWNLOADING
 	CHECKING
@@ -1275,6 +1276,7 @@ type MutationRoot {
 	Revoke every durable browser session after a recent password check.
 	"""
 	signOutAll: Boolean!
+	previewRssFeed(id: Int!): [RssSeenItem!]!
 	"""
 	Add a new RSS feed.
 	"""
@@ -1685,6 +1687,13 @@ type PipelineEventGql {
 }
 
 type PostProcessingSettingsGql {
+	eventScriptConcurrency: Int!
+	eventScriptTimeoutSeconds: Int!
+	fileDownloadedEventInterval: Int!
+	scriptOutputCeilingBytes: Int!
+	scriptOutputRunsPerJob: Int!
+	scriptOutputRingBytes: Int!
+	scriptOutputRunCapBytes: Int!
 	scriptDirectory: String!
 	executionEnabled: Boolean!
 	concurrency: Int!
@@ -1704,6 +1713,13 @@ type PostProcessingSettingsGql {
 }
 
 input PostProcessingSettingsInput {
+	eventScriptConcurrency: Int
+	eventScriptTimeoutSeconds: Int
+	fileDownloadedEventInterval: Int
+	scriptOutputCeilingBytes: Int
+	scriptOutputRunsPerJob: Int
+	scriptOutputRingBytes: Int
+	scriptOutputRunCapBytes: Int
 	executionEnabled: Boolean!
 	concurrency: Int!
 	terminationGraceSeconds: Int!
@@ -1954,6 +1970,7 @@ type QueryRoot {
 	Script results recorded for a job, from the live row or from history.
 	"""
 	postProcessingResults(jobId: Int!): [ScriptResultGql!]!
+	scriptOutput(outputId: String!): String
 	"""
 	List configured RSS feeds.
 	"""
@@ -2178,6 +2195,7 @@ Public queue states collapse the internal `Checking` phase into
 extraction begins.
 """
 enum QueueItemState {
+	AWAITING_QUEUE_SCRIPTS
 	QUEUED
 	DOWNLOADING
 	FETCHING_REPAIR_DATA
@@ -2244,6 +2262,7 @@ type QueuePhaseProgress {
 }
 
 enum QueuePostState {
+	AWAITING_QUEUE_SCRIPTS
 	IDLE
 	QUEUED_REPAIR
 	REPAIRING
@@ -2337,6 +2356,7 @@ type RoutingStatus {
 }
 
 type RssFeed {
+	scripts: [String!]!
 	id: Int!
 	name: String!
 	url: String!
@@ -2358,6 +2378,7 @@ type RssFeed {
 }
 
 input RssFeedInput {
+	scripts: [String!]
 	routing: RoutingPolicyInput
 	name: String!
 	url: String!
@@ -2436,6 +2457,9 @@ type RssSyncReport {
 }
 
 type Schedule {
+	script: String
+	runAtStartup: Boolean!
+	implicit: Boolean!
 	id: String!
 	enabled: Boolean!
 	label: String!
@@ -2464,6 +2488,8 @@ type Schedule {
 }
 
 input ScheduleInput {
+	script: String
+	runAtStartup: Boolean
 	enabled: Boolean
 	label: String
 	days: [String!]
@@ -2524,8 +2550,19 @@ type ScriptGql {
 	name: String!
 	displayName: String!
 	adapter: ScriptAdapterGql!
+	kinds: [ScriptKind!]!
+	queueEvents: [ScriptQueueEvent!]!
+	taskTimes: [String!]!
 	version: String
 	options: [ScriptOptionGql!]!
+}
+
+enum ScriptKind {
+	POST_PROCESSING
+	QUEUE
+	SCAN
+	SCHEDULER
+	FEED
 }
 
 type ScriptListEntryGql {
@@ -2596,8 +2633,21 @@ type ScriptProblemGql {
 	message: String!
 }
 
+enum ScriptQueueEvent {
+	FILE_DOWNLOADED
+	URL_COMPLETED
+	NZB_MARKED
+	NZB_ADDED
+	NZB_NAMED
+	NZB_DOWNLOADED
+	NZB_DELETED
+}
+
 type ScriptResultGql {
+	outputId: String
+	outputRetained: Boolean!
 	script: String!
+	event: String!
 	adapter: ScriptAdapterGql!
 	status: ScriptStatusGql!
 	exitCode: Int

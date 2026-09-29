@@ -35,7 +35,7 @@ pub(super) fn encrypt_archive_password(
         .map_err(StateError::Database)
 }
 
-pub(super) fn decrypt_archive_password(
+pub(crate) fn decrypt_archive_password(
     key: Option<&crate::persistence::encryption::EncryptionKey>,
     password: Option<String>,
 ) -> Result<Option<String>, StateError> {
@@ -839,6 +839,32 @@ impl Database {
         })
     }
 
+    pub(crate) fn refresh_script_job_inputs(
+        &self,
+        job_id: u64,
+        facts: &mut crate::post_processing::runner::CompatibilityFacts,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let row = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT metadata, password FROM active_jobs WHERE job_id = {}",
+                &[SqlArg::I64(job_id as i64)],
+            )
+            .await
+        })?;
+        if let Some(row) = row {
+            facts.parameters = row
+                .opt_text("metadata")?
+                .map(|text| serde_json::from_str(&text).map_err(db_err))
+                .transpose()?
+                .unwrap_or_default();
+            facts.password =
+                decrypt_archive_password(self.encryption_key(), row.opt_text("password")?)?;
+        }
+        Ok(())
+    }
+
     pub fn update_active_job(&self, job_id: JobId, update: &JobUpdate) -> Result<(), StateError> {
         let datastore = self.datastore();
         let mut update = update.clone();
@@ -850,6 +876,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "update_active_job", |tx| {
                 let update = update.clone();
                 Box::pin(async move {
+                    tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
                     match update.category {
                         FieldUpdate::Unchanged => {}
                         FieldUpdate::Clear => {
@@ -868,6 +895,16 @@ impl Database {
                         }
                     }
 
+                    if !matches!(update.metadata, FieldUpdate::Unchanged) {
+                        tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
+                        if let Some(row) = tx.fetch_optional("SELECT state FROM script_job_state WHERE job_id = {}", &[SqlArg::I64(job_id.0 as i64)]).await? {
+                            let mut effects: crate::post_processing::effects::JobScriptEffects = serde_json::from_str(&row.text("state")?).map_err(|error| StateError::Database(error.to_string()))?;
+                            let metadata = match &update.metadata { FieldUpdate::Set(values) => values.clone(), _ => Vec::new() };
+                            for value in effects.parameters.values_mut() { value.clear(); }
+                            effects.parameters.extend(metadata);
+                            tx.execute("UPDATE script_job_state SET state = {} WHERE job_id = {}", &[SqlArg::Text(serde_json::to_string(&effects).map_err(|error| StateError::Database(error.to_string()))?), SqlArg::I64(job_id.0 as i64)]).await?;
+                        }
+                    }
                     match update.metadata {
                         FieldUpdate::Unchanged => {}
                         FieldUpdate::Clear => {

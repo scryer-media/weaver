@@ -17,6 +17,72 @@ enum RssSyncTarget {
 }
 
 impl RssService {
+    /// Fetch and filter without recording seen items or submitting downloads.
+    pub async fn preview_feed(
+        &self,
+        feed_id: u32,
+    ) -> Result<Vec<crate::RssSeenItemRow>, RssServiceError> {
+        let db = self.inner.db.clone();
+        let mut feed = tokio::task::spawn_blocking(move || db.get_rss_feed(feed_id))
+            .await
+            .map_err(|error| RssServiceError::Http(error.to_string()))?
+            .map_err(|error| RssServiceError::Http(error.to_string()))?
+            .ok_or(RssServiceError::FeedNotFound(feed_id))?;
+        feed.etag = None;
+        feed.last_modified = None;
+        let response = self.fetch_feed_response(&feed).await?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Vec::new());
+        }
+        if !response.status().is_success() {
+            return Err(RssServiceError::Http(format!(
+                "feed returned HTTP {}",
+                response.status()
+            )));
+        }
+        let body = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES)
+            .await
+            .map_err(RssServiceError::Http)?;
+        let body = crate::post_processing::feed::transform_feed(
+            &self.inner.db,
+            &self.inner.config,
+            &feed,
+            body,
+            MAX_RSS_FEED_BODY_BYTES,
+        )
+        .await
+        .map_err(RssServiceError::Parse)?;
+        let items = parse_feed_items(&body).map_err(RssServiceError::Parse)?;
+        let db = self.inner.db.clone();
+        let rules =
+            tokio::task::spawn_blocking(move || db.list_rss_rules(feed_id).map(compile_rules))
+                .await
+                .map_err(|error| RssServiceError::Http(error.to_string()))?
+                .map_err(|error| RssServiceError::Http(error.to_string()))?;
+        Ok(items
+            .into_iter()
+            .map(|item| {
+                let decision =
+                    evaluate_item(&rules, &item).map_or("ignored", |rule| match rule.row.action {
+                        RssRuleAction::Accept => "accepted",
+                        RssRuleAction::Reject => "rejected",
+                    });
+                crate::RssSeenItemRow {
+                    feed_id,
+                    item_id: item.item_id,
+                    item_title: item.title,
+                    published_at: item.published_at,
+                    size_bytes: item.size_bytes,
+                    decision: decision.into(),
+                    seen_at: unix_now_secs(),
+                    job_id: None,
+                    item_url: item.download_url.or(item.display_url),
+                    error: None,
+                }
+            })
+            .collect())
+    }
+
     pub fn start_background_loop(&self) -> tokio::task::JoinHandle<()> {
         let service = self.clone();
         tokio::spawn(async move {
@@ -290,6 +356,15 @@ impl RssService {
             _ = cancellation.cancelled() => return Ok(RssFeedSyncReport::default()),
             result = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES) => result.map_err(RssServiceError::Http)?,
         };
+        let body = crate::post_processing::feed::transform_feed(
+            &self.inner.db,
+            &self.inner.config,
+            feed,
+            body,
+            MAX_RSS_FEED_BODY_BYTES,
+        )
+        .await
+        .map_err(RssServiceError::Parse)?;
         let items = parse_feed_items(&body).map_err(RssServiceError::Parse)?;
 
         let rules = self

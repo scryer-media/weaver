@@ -2747,6 +2747,7 @@ async fn postgres_runtime_smoke_when_configured() {
     assert!(!db.delete_server_tls_diagnostics(8).unwrap());
 
     let rss_feed = RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "Feed 1".to_string(),
         url: "https://example.com/feed.xml".to_string(),
@@ -3054,11 +3055,13 @@ async fn postgres_post_processing_roundtrip_when_configured() {
     .unwrap();
     let results = vec![crate::post_processing::model::ScriptResult {
         script,
+        event: Default::default(),
         adapter: crate::post_processing::model::ScriptAdapter::Nzbget,
         status: crate::post_processing::model::ScriptStatus::Succeeded,
         exit_code: Some(93),
         duration_ms: 5,
         output_tail: "postgres-log".into(),
+        output_id: None,
         output_truncated: true,
         error_message: None,
         finished_at_epoch_ms: 3,

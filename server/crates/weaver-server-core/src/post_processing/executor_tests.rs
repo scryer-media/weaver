@@ -256,11 +256,13 @@ fn job_results_and_summary_are_stored_on_the_job_and_read_back() {
     let db = Database::open_in_memory().unwrap();
     let results = vec![ScriptResult {
         script: script("notify.sh"),
+        event: Default::default(),
         adapter: ScriptAdapter::Sabnzbd,
         status: ScriptStatus::Warning,
         exit_code: Some(3),
         duration_ms: 12,
         output_tail: "tail".into(),
+        output_id: None,
         output_truncated: false,
         error_message: Some("exited 3".into()),
         finished_at_epoch_ms: 1_000,

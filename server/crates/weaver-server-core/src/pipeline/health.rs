@@ -741,6 +741,11 @@ impl Pipeline {
                 "aborting job: health below critical threshold"
             );
             let error = self.health_abort_error(job_id, health, critical);
+            self.raise_queue_script_event(
+                job_id,
+                crate::post_processing::model::QueueEvent::NzbDeleted,
+                Some("HEALTH"),
+            );
             self.fail_job(job_id, error);
             return;
         }
@@ -790,6 +795,11 @@ impl Pipeline {
                 "aborting job: health below critical threshold"
             );
             let error = self.health_abort_error(job_id, health, critical);
+            self.raise_queue_script_event(
+                job_id,
+                crate::post_processing::model::QueueEvent::NzbDeleted,
+                Some("HEALTH"),
+            );
             self.fail_job(job_id, error);
         }
     }
@@ -890,6 +900,11 @@ impl Pipeline {
                 total
             );
             warn!(job_id = job_id.0, "{error}");
+            self.raise_queue_script_event(
+                job_id,
+                crate::post_processing::model::QueueEvent::NzbDeleted,
+                Some("HEALTH"),
+            );
             self.fail_job(job_id, error);
             return;
         }
@@ -1106,6 +1121,11 @@ impl Pipeline {
             if self.first_article_losses_recoverable(job_id) {
                 return;
             }
+            self.raise_queue_script_event(
+                job_id,
+                crate::post_processing::model::QueueEvent::NzbDeleted,
+                Some("HEALTH"),
+            );
             self.fail_job(job_id, Self::first_article_verdict_error(missing, total));
         }
     }

@@ -4,8 +4,10 @@ mod commands;
 mod hardware_profile;
 mod history;
 mod runtime;
+mod scripts;
 mod state;
 
+pub(crate) use history::HistoryDeleteDone;
 pub(crate) use runtime::check_disk_space;
 pub(super) use runtime::timestamp_secs;
 pub(crate) use runtime::{

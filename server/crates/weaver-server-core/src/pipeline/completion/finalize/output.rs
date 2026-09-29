@@ -366,6 +366,30 @@ where
     }
 }
 
+async fn validate_script_move_destination(
+    db: crate::Database,
+    context: crate::post_processing::runner::JobExecutionContext,
+    expected: &std::path::Path,
+) -> Result<(), MoveToCompleteFailure> {
+    let path = expected.to_path_buf();
+    let validated = tokio::task::spawn_blocking(move || {
+        crate::post_processing::effects::validate_directory(&db, &context, &path)
+    })
+    .await
+    .map_err(|error| {
+        MoveToCompleteFailure::Security(format!(
+            "script destination validation worker failed: {error}"
+        ))
+    })?
+    .map_err(MoveToCompleteFailure::Security)?;
+    if validated != expected {
+        return Err(MoveToCompleteFailure::Security(
+            "script final directory changed after reservation".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
@@ -750,6 +774,80 @@ mod category_destination_tests {
         assert!(collision.starts_with(complete));
     }
 
+    #[tokio::test]
+    async fn script_destination_worker_refuses_foreign_ownership_and_path_changes() {
+        use crate::post_processing::model::PipelineOutcome;
+        use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
+
+        let temp = tempfile::tempdir().unwrap();
+        let complete = temp.path().canonicalize().unwrap();
+        let source = complete.join("source");
+        let destination = complete.join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("payload.bin"), b"payload").unwrap();
+        let db = crate::Database::open_in_memory().unwrap();
+        let context = JobExecutionContext {
+            job_id: 1,
+            name: "destination-check".into(),
+            nzb_filename: "destination-check.nzb".into(),
+            category: None,
+            group: None,
+            source_url: None,
+            working_directory: source.clone(),
+            final_directory: destination.clone(),
+            pipeline_outcome: PipelineOutcome::Succeeded,
+            par_status: 0,
+            unpack_status: 0,
+            compatibility: CompatibilityFacts {
+                complete_dir: Some(complete.clone()),
+                ..Default::default()
+            },
+        };
+        validate_script_move_destination(db.clone(), context.clone(), &destination)
+            .await
+            .unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(&complete, &destination, JobId(2))
+            .unwrap();
+        std::fs::write(destination.join("foreign.bin"), b"foreign").unwrap();
+        let error = validate_script_move_destination(db.clone(), context.clone(), &destination)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MoveToCompleteFailure::Security(message) if message.contains("foreign ownership marker"))
+        );
+        assert_eq!(
+            std::fs::read(source.join("payload.bin")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("foreign.bin")).unwrap(),
+            b"foreign"
+        );
+        assert!(!destination.join("payload.bin").exists());
+
+        #[cfg(unix)]
+        {
+            let actual = complete.join("actual");
+            let alias = complete.join("alias");
+            std::fs::create_dir(&actual).unwrap();
+            std::os::unix::fs::symlink(&actual, &alias).unwrap();
+            let error = validate_script_move_destination(db, context, &alias)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, MoveToCompleteFailure::Security(message) if message.contains("changed after reservation"))
+            );
+            assert!(actual.exists());
+            assert!(
+                std::fs::symlink_metadata(alias)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
     #[test]
     fn configured_destination_override_remains_trusted_admin_input() {
         let complete = std::path::Path::new("/downloads/complete");
@@ -939,9 +1037,47 @@ impl Pipeline {
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
         self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
 
-        let dest = self
-            .claim_complete_destination(job_id, &job_name, category.as_deref())
-            .await?;
+        let requested = self
+            .db
+            .job_script_effects(job_id.0)
+            .map_err(|error| error.to_string())?
+            .final_directory;
+        let (dest, script_validation) = if let Some(path) = requested {
+            let event = self
+                .queue_script_context(
+                    job_id,
+                    crate::post_processing::model::QueueEvent::NzbDownloaded,
+                )
+                .ok_or("script job disappeared before final move")?;
+            let context = crate::post_processing::runner::JobExecutionContext {
+                job_id: job_id.0,
+                name: job_name.clone(),
+                nzb_filename: format!("{job_name}.nzb"),
+                category: category.clone(),
+                group: None,
+                source_url: None,
+                working_directory: working_dir.clone(),
+                final_directory: path.clone(),
+                pipeline_outcome: crate::post_processing::model::PipelineOutcome::Succeeded,
+                par_status: 0,
+                unpack_status: 0,
+                compatibility: event.facts,
+            };
+            if self
+                .reserved_complete_destinations
+                .iter()
+                .any(|(owner, reserved)| *owner != job_id && reserved == &path)
+            {
+                return Err("script final directory is reserved by another job".into());
+            }
+            (path, Some((self.db.clone(), context)))
+        } else {
+            (
+                self.claim_complete_destination(job_id, &job_name, category.as_deref())
+                    .await?,
+                None,
+            )
+        };
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);
@@ -962,15 +1098,21 @@ impl Pipeline {
         );
         tokio::spawn(async move {
             let move_started = Instant::now();
-            let result = run_move_to_complete(
-                job_id,
-                working_dir,
-                staging_dir,
-                dest.clone(),
-                phase_counters,
-                naming,
-                policy_source,
-            )
+            let result = async {
+                if let Some((db, context)) = script_validation {
+                    validate_script_move_destination(db, context, &dest).await?;
+                }
+                run_move_to_complete(
+                    job_id,
+                    working_dir,
+                    staging_dir,
+                    dest.clone(),
+                    phase_counters,
+                    naming,
+                    policy_source,
+                )
+                .await
+            }
             .await;
             match &result {
                 Ok(outcome) => info!(
@@ -1232,6 +1374,9 @@ impl Pipeline {
                     .ok()
                     .and_then(|path| path.parent().map(std::path::PathBuf::from)),
                 previous_script_status: Default::default(),
+                parameters: state.spec.metadata.clone(),
+                marked_bad: false,
+                final_directory_override: None,
             },
         };
         self.transition_postprocessing_status(
@@ -1245,15 +1390,27 @@ impl Pipeline {
             .insert(job_id, cancellation_tx);
         let executor = self.terminal_post_processing_executor.clone();
         let done_tx = self.terminal_post_processing_done_tx.clone();
+        let db = self.db.clone();
         tokio::spawn(async move {
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let execution = executor.execute_admitted_job(
-                job_id.0,
-                admission,
-                context,
-                Some(cancellation_rx),
-                Some(started_tx),
-            );
+            let execution = async {
+                let mut cancellation_wait = cancellation_rx.clone();
+                if !*cancellation_wait.borrow() {
+                    tokio::select! {
+                        result = crate::post_processing::events::wait_for_job_events(&db, job_id.0) => result?,
+                        _ = cancellation_wait.changed() => {},
+                    }
+                }
+                executor
+                    .execute_admitted_job(
+                        job_id.0,
+                        admission,
+                        context,
+                        Some(cancellation_rx),
+                        Some(started_tx),
+                    )
+                    .await
+            };
             tokio::pin!(execution);
             tokio::pin!(started_rx);
             let result = tokio::select! {
@@ -1366,6 +1523,33 @@ impl Pipeline {
         // recreate or overwrite that cancelled job history.
         if !self.jobs.contains_key(&done.job_id) {
             return;
+        }
+        match self.db.job_script_effects(done.job_id.0) {
+            Ok(effects) => {
+                if let Some(state) = self.jobs.get_mut(&done.job_id) {
+                    effects.merge_parameters(&mut state.spec.metadata);
+                    if let Some(directory) = effects.directory {
+                        state.working_dir = directory;
+                    }
+                    if let Some(directory) = effects.final_directory {
+                        state.working_dir = directory;
+                    }
+                }
+                if effects.marked_bad {
+                    self.finalize_failed_job_after_terminal_post_processing(
+                        done.job_id,
+                        "FAILURE/BAD: marked bad by script".into(),
+                    );
+                    return;
+                }
+            }
+            Err(error) => {
+                self.finalize_failed_job_after_terminal_post_processing(
+                    done.job_id,
+                    format!("could not restore applied script directives: {error}"),
+                );
+                return;
+            }
         }
         if let Some(primary_failure) = done.primary_failure {
             match &done.result {

@@ -597,6 +597,7 @@ const RSS_FEED_FIELDS = `
     url
     enabled
     pollIntervalSecs
+    scripts
     username
     hasPassword
     defaultCategory
@@ -1813,6 +1814,9 @@ export const SCHEDULES_QUERY = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
+      script
+      runAtStartup
+      implicit
     }
   }
 `;
@@ -1838,6 +1842,9 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
+      script
+      runAtStartup
+      implicit
     }
   }
 `;
@@ -1863,6 +1870,9 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
+      script
+      runAtStartup
+      implicit
     }
   }
 `;
@@ -1888,6 +1898,9 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
+      script
+      runAtStartup
+      implicit
     }
   }
 `;
@@ -1913,6 +1926,9 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
+      script
+      runAtStartup
+      implicit
     }
   }
 `;
@@ -1922,6 +1938,13 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     scriptDirectory
     executionEnabled
     concurrency
+    eventScriptConcurrency
+    eventScriptTimeoutSeconds
+    fileDownloadedEventInterval
+    scriptOutputCeilingBytes
+    scriptOutputRunsPerJob
+    scriptOutputRingBytes
+    scriptOutputRunCapBytes
     terminationGraceSeconds
     pythonInterpreter
     powershellInterpreter
@@ -1956,6 +1979,9 @@ export const POST_PROCESSING_SETTINGS_QUERY = gql`
         name
         displayName
         adapter
+        kinds
+        queueEvents
+        taskTimes
         version
         options {
           name
@@ -2037,11 +2063,14 @@ export const POST_PROCESSING_RESULTS_QUERY = gql`
   query PostProcessingResults($jobId: Int!) {
     postProcessingResults(jobId: $jobId) {
       script
+      event
       adapter
       status
       exitCode
       durationMs
       outputTail
+      outputId
+      outputRetained
       outputTruncated
       errorMessage
       finishedAtEpochMs

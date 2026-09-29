@@ -46,6 +46,9 @@ type Schedule = ScheduleOptions & {
   track: ScheduleTrack;
   speedLimitBytes: number | null;
   hardwareProfile: HardwareProfileName | null;
+  script: string | null;
+  runAtStartup: boolean;
+  implicit: boolean;
 };
 
 const ALL_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
@@ -78,6 +81,8 @@ export function ScheduleSettingsPage() {
   const [formEnabled, setFormEnabled] = useState(true);
   const [formTime, setFormTime] = useState("08:00");
   const [formAction, setFormAction] = useState("pause");
+  const [formScript, setFormScript] = useState("");
+  const [runAtStartup, setRunAtStartup] = useState(false);
   const [formDays, setFormDays] = useState<string[]>([]);
   const [formLabel, setFormLabel] = useState("");
   const [formSpeed, setFormSpeed] = useState("5");
@@ -106,6 +111,8 @@ export function ScheduleSettingsPage() {
     setFormEnabled(true);
     setFormTime("08:00");
     setFormAction("pause");
+    setFormScript("");
+    setRunAtStartup(false);
     setFormLabel("");
     setFormDays([]);
     setFormSpeed("5");
@@ -125,6 +132,8 @@ export function ScheduleSettingsPage() {
     setFormEnabled(entry.enabled);
     setFormTime(entry.time);
     setFormAction(entry.actionType);
+    setFormScript(entry.script ?? "");
+    setRunAtStartup(entry.runAtStartup);
     setFormDays(entry.days);
     setFormLabel(entry.label ?? "");
     setFormProfile(entry.hardwareProfile);
@@ -158,6 +167,7 @@ export function ScheduleSettingsPage() {
     if (formAction === "hardware_profile") {
       input.hardwareProfile = chosenProfile;
     }
+    if (formAction === "run_script") { input.script = formScript; input.runAtStartup = runAtStartup; }
     return input;
   };
 
@@ -211,7 +221,7 @@ export function ScheduleSettingsPage() {
                   </Label>
                   <Input
                     id="schedule-time"
-                    type="time"
+                    type={formAction === "run_script" ? "text" : "time"}
                     value={formTime}
                     onChange={(e) => setFormTime(e.target.value)}
                   />
@@ -225,6 +235,7 @@ export function ScheduleSettingsPage() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
+                      <SelectItem value="run_script">Run script</SelectItem>
                       {ADDITIONAL_SCHEDULE_ACTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}
                       <SelectItem value="pause">{t("schedule.actionPause")}</SelectItem>
                       <SelectItem value="resume">{t("schedule.actionResume")}</SelectItem>
@@ -247,6 +258,11 @@ export function ScheduleSettingsPage() {
               </div>
 
               {error && <p role="alert">{error}</p>}
+              {formAction === "run_script" && <div className="space-y-3">
+                <Label>Script name<Input value={formScript} onChange={(event) => setFormScript(event.target.value)} /></Label>
+                <p className="text-sm">Time accepts HH:MM, *:MM, or * for startup only.</p>
+                <Label className="flex gap-2"><Checkbox checked={runAtStartup} onCheckedChange={(value) => setRunAtStartup(value === true)} />Also run at startup</Label>
+              </div>}
               <ScheduleOptionsFields action={formAction} value={options} onChange={setOptions} />
               {formAction === "speed_limit" && (
                 <div className="space-y-2">
@@ -381,7 +397,7 @@ export function ScheduleSettingsPage() {
                   <div className="flex items-center gap-2 text-sm font-semibold">
                     <span className="font-mono">{scheduleTimeLabel(entry)}</span>
                     <span className="capitalize">
-                      {scheduleActionDetails(t, entry, targets) ?? (entry.actionType === "speed_limit"
+                      {entry.actionType === "run_script" ? `Run ${entry.script}${entry.implicit ? " (manifest schedule)" : ""}` : scheduleActionDetails(t, entry, targets) ?? (entry.actionType === "speed_limit"
                         ? `${t("schedule.actionSpeedLimit")}: ${entry.speedLimitBytes === 0 || entry.speedLimitBytes == null ? t("settings.unlimited") : formatSpeed(entry.speedLimitBytes)}`
                         : entry.actionType === "configured_speed_limit"
                           ? t("next.schedules.useConfiguredLimit")
@@ -407,6 +423,7 @@ export function ScheduleSettingsPage() {
               </div>
               <div className="flex items-center gap-1">
                 <Switch
+                  disabled={entry.implicit}
                   aria-label={entry.label || entry.time}
                   checked={entry.enabled}
                   onCheckedChange={(checked) =>
@@ -418,6 +435,7 @@ export function ScheduleSettingsPage() {
                   size="icon"
                   variant="ghost"
                   onClick={() => openEdit(entry)}
+                  disabled={entry.implicit}
                 >
                   <Pencil className="h-4 w-4" />
                 </Button>
@@ -426,6 +444,7 @@ export function ScheduleSettingsPage() {
                   size="icon"
                   variant="ghost"
                   onClick={() => handleDelete(entry.id)}
+                  disabled={entry.implicit}
                 >
                   <Trash2 className="h-4 w-4" />
                 </Button>

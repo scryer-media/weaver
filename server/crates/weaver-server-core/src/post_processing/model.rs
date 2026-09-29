@@ -4,7 +4,7 @@
 //! there are no revisions, digests, or trust states, so nothing here models
 //! package identity.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -547,6 +547,10 @@ impl<'de> Deserialize<'de> for ScriptOption {
     }
 }
 
+#[path = "script_events.rs"]
+mod script_events;
+pub use script_events::{QueueEvent, ScriptEventLabel, ScriptKind, ScriptTaskTime};
+
 /// Validated internal representation of a discovered script manifest.
 ///
 /// A bare executable synthesizes one of these with no options and the file name
@@ -554,6 +558,10 @@ impl<'de> Deserialize<'de> for ScriptOption {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ScriptManifest {
     adapter: ScriptAdapter,
+    kinds: BTreeSet<ScriptKind>,
+    queue_events: BTreeSet<QueueEvent>,
+    task_times: Vec<ScriptTaskTime>,
+    declaration_problems: Vec<String>,
     compatibility_name: Option<NzbgetCompatibilityName>,
     display_name: String,
     version: Option<String>,
@@ -586,6 +594,10 @@ impl ScriptManifest {
         validate_unique_option_names(&options)?;
         Ok(Self {
             adapter,
+            kinds: BTreeSet::from([ScriptKind::PostProcessing]),
+            queue_events: BTreeSet::new(),
+            task_times: Vec::new(),
+            declaration_problems: Vec::new(),
             compatibility_name,
             display_name,
             version,
@@ -597,6 +609,38 @@ impl ScriptManifest {
 
     pub fn adapter(&self) -> ScriptAdapter {
         self.adapter
+    }
+
+    pub(crate) fn with_declarations(
+        mut self,
+        kinds: BTreeSet<ScriptKind>,
+        queue_events: BTreeSet<QueueEvent>,
+        task_times: Vec<ScriptTaskTime>,
+        declaration_problems: Vec<String>,
+    ) -> Self {
+        self.kinds = kinds;
+        self.queue_events = queue_events;
+        self.task_times = task_times;
+        self.declaration_problems = declaration_problems;
+        self
+    }
+
+    /// Recognised kinds; unknown-only declarations are listed with a problem and cannot run.
+    pub fn kinds(&self) -> &BTreeSet<ScriptKind> {
+        &self.kinds
+    }
+
+    /// Explicit subscriptions. An empty NZBGet declaration is expanded to every event on parse.
+    pub fn queue_events(&self) -> &BTreeSet<QueueEvent> {
+        &self.queue_events
+    }
+
+    pub fn task_times(&self) -> &[ScriptTaskTime] {
+        &self.task_times
+    }
+
+    pub fn declaration_problems(&self) -> &[String] {
+        &self.declaration_problems
     }
 
     pub fn compatibility_name(&self) -> Option<&NzbgetCompatibilityName> {
@@ -885,10 +929,54 @@ impl ScriptLists {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EventScriptSettings {
+    pub event_script_concurrency: u8,
+    pub event_script_timeout_seconds: u64,
+    pub file_downloaded_event_interval: i64,
+    pub script_output_ceiling_bytes: u64,
+    pub script_output_runs_per_job: u32,
+    pub script_output_ring_bytes: u64,
+    pub script_output_run_cap_bytes: u64,
+}
+
+impl Default for EventScriptSettings {
+    fn default() -> Self {
+        Self {
+            event_script_concurrency: 1,
+            event_script_timeout_seconds: 300,
+            file_downloaded_event_interval: 0,
+            script_output_ceiling_bytes: 1024 * 1024,
+            script_output_runs_per_job: 32,
+            script_output_ring_bytes: 64 * 1024 * 1024,
+            script_output_run_cap_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl EventScriptSettings {
+    pub fn validate(&self) -> Result<(), PostProcessingValidationError> {
+        if !(1..=8).contains(&self.event_script_concurrency)
+            || !(1..=86_400).contains(&self.event_script_timeout_seconds)
+            || !(-1..=86_400).contains(&self.file_downloaded_event_interval)
+            || !(65_536..=8 * 1024 * 1024).contains(&self.script_output_ceiling_bytes)
+            || !(1..=128).contains(&self.script_output_runs_per_job)
+            || !(1024 * 1024..=1024 * 1024 * 1024).contains(&self.script_output_ring_bytes)
+            || !(65_536..=8 * 1024 * 1024).contains(&self.script_output_run_cap_bytes)
+        {
+            return Err(PostProcessingValidationError::InvalidPolicy);
+        }
+        Ok(())
+    }
+}
+
 /// Settings the operator controls. Execution is off until it is explicitly turned on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostProcessingSettings {
+    #[serde(flatten)]
+    pub event_scripts: EventScriptSettings,
     pub execution_enabled: bool,
     pub concurrency: u8,
     pub termination_grace_seconds: u64,
@@ -905,6 +993,7 @@ impl Default for PostProcessingSettings {
     fn default() -> Self {
         Self {
             execution_enabled: false,
+            event_scripts: EventScriptSettings::default(),
             concurrency: 1,
             termination_grace_seconds: 10,
             python_interpreter: None,
@@ -933,6 +1022,7 @@ impl PostProcessingSettings {
     }
 
     pub fn validate(&self) -> Result<(), PostProcessingValidationError> {
+        self.event_scripts.validate()?;
         if !(1..=8).contains(&self.concurrency) || self.termination_grace_seconds == 0 {
             return Err(PostProcessingValidationError::InvalidPolicy);
         }
@@ -1080,6 +1170,10 @@ impl ScriptStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ScriptResult {
     pub script: ScriptName,
+    #[serde(default)]
+    pub event: ScriptEventLabel,
+    #[serde(default)]
+    pub output_id: Option<String>,
     pub adapter: ScriptAdapter,
     pub status: ScriptStatus,
     pub exit_code: Option<i32>,

@@ -39,6 +39,12 @@ fn runtime_lanes_for_status(
     Option<String>,
 ) {
     match status {
+        JobStatus::AwaitingQueueScripts => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::AwaitingQueueScripts,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
         JobStatus::Queued => (
             weaver_server_core::DownloadState::Queued,
             weaver_server_core::PostState::Idle,

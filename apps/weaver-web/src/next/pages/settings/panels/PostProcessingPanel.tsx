@@ -1,5 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
+import { ScriptKinds, type ScriptDeclarations } from "@/components/ScriptKinds";
+import { EventScriptSettings, eventScriptDefaults, eventScriptOptions, type EventScriptOptions } from "@/components/EventScriptSettings";
 import {
   POST_PROCESSING_SETTINGS_QUERY,
   SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION,
@@ -51,7 +53,7 @@ interface ScriptOption {
   value?: string | null;
 }
 
-interface Script {
+interface Script extends ScriptDeclarations {
   name: string;
   displayName: string;
   adapter: "SABNZBD" | "NZBGET";
@@ -70,7 +72,7 @@ interface ScriptLists {
   categories: { category: string; entries: ListEntry[] }[];
 }
 
-interface PostProcessingSettings {
+interface PostProcessingSettings extends EventScriptOptions {
   scriptDirectory: string;
   executionEnabled: boolean;
   concurrency: number;
@@ -89,7 +91,7 @@ interface PostProcessingData {
   categories: { id: number; name: string }[];
 }
 
-interface ExecutionForm {
+interface ExecutionForm extends EventScriptOptions {
   executionEnabled: boolean;
   concurrency: number;
   terminationGraceSeconds: number;
@@ -105,6 +107,7 @@ const CONCURRENCY_MAX = 8;
 const EMPTY_LISTS: ScriptLists = { global: [], categories: [] };
 
 const DEFAULTS: ExecutionForm = {
+  ...eventScriptDefaults,
   executionEnabled: false,
   concurrency: 1,
   terminationGraceSeconds: 10,
@@ -191,6 +194,7 @@ export function PostProcessingPanel() {
       settings
         ? {
             executionEnabled: settings.executionEnabled,
+            ...eventScriptOptions(settings),
             concurrency: settings.concurrency,
             terminationGraceSeconds: settings.terminationGraceSeconds,
             pythonInterpreter: settings.pythonInterpreter ?? "",
@@ -222,6 +226,7 @@ export function PostProcessingPanel() {
       setError(null);
       void saveSettings({
         input: {
+          ...eventScriptOptions(values),
           executionEnabled: values.executionEnabled,
           concurrency: Math.min(CONCURRENCY_MAX, Math.max(1, Math.round(values.concurrency || 1))),
           terminationGraceSeconds: Math.max(0, Math.round(values.terminationGraceSeconds || 0)),
@@ -682,7 +687,10 @@ export function PostProcessingPanel() {
         searchText: `${script.name} ${script.displayName} ${script.adapter}`,
         cells: [
           <Cell key="name" className="text-wv-fg" title={script.name}>
-            {script.displayName}
+            <div className="flex min-w-0 flex-col gap-1">
+              <span>{script.displayName}</span>
+              <ScriptKinds script={script} />
+            </div>
           </Cell>,
           <Cell key="adapter" mono className="text-wv-secondary">
             {script.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet"}
@@ -738,6 +746,7 @@ export function PostProcessingPanel() {
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
+      <EventScriptSettings value={values} onChange={patch} />
 
       <ConfirmDialog
         open={confirmDirectory}

@@ -2630,6 +2630,7 @@ async fn nzbget_scheduleresume_persists_and_recovers_across_restart() {
 async fn nzbget_feed_bridge_exposes_weaver_rss() {
     let db = Database::open_in_memory().unwrap();
     db.insert_rss_feed(&weaver_server_core::RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "indexer".into(),
         url: "https://indexer.example/rss".into(),
@@ -3615,4 +3616,66 @@ async fn job_output_file_download_handler_streams_history_file() {
     assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body, Bytes::from_static(b"video-bytes"));
+}
+
+#[tokio::test]
+async fn loadextensions_reports_all_declared_kinds_and_event_metadata() {
+    let db = Database::open_in_memory().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = db
+        .initialize_post_processing_script_directory(temp.path(), None)
+        .unwrap();
+    let package = root.join("events");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(package.join("run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(
+        package.join("manifest.json"),
+        serde_json::json!({
+        "name": "events", "main": "run.sh", "kind": "POST-PROCESSING/QUEUE/SCAN/SCHEDULER/FEED",
+        "displayName": "Events", "version": "1.0", "author": "Test fixture",
+        "homepage": "https://example.invalid", "license": "MIT", "about": "Event declarations",
+        "description": [], "requirements": [], "options": [],
+            "queueEvents": "NZB_DOWNLOADED,NZB_DELETED", "taskTime": "*:30;04:15"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("extension-key", "admin"),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, basic_auth("extension-key"))
+                .body(Body::from(
+                    serde_json::json!({"method": "loadextensions", "params": [true]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(payload["error"].is_null(), "{payload}");
+    let scripts = payload["result"].as_array().unwrap();
+    assert_eq!(scripts.len(), 1);
+    let script = &scripts[0];
+    for key in [
+        "PostScript",
+        "QueueScript",
+        "ScanScript",
+        "SchedulerScript",
+        "FeedScript",
+    ] {
+        assert_eq!(script[key], true, "{key}");
+    }
+    assert_eq!(script["QueueEvents"], "NZB_DOWNLOADED,NZB_DELETED");
+    assert_eq!(script["TaskTime"], "*:30;04:15");
 }

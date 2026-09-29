@@ -4127,6 +4127,11 @@ impl Pipeline {
                     }
 
                     debug!(file_id = %file_id, filename = %filename, "file complete");
+                    self.raise_queue_script_event(
+                        job_id,
+                        crate::post_processing::model::QueueEvent::FileDownloaded,
+                        None,
+                    );
                     let _ = self.event_tx.send(PipelineEvent::FileComplete {
                         file_id,
                         filename: filename.to_string(),

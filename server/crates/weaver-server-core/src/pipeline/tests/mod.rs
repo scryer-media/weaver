@@ -61,6 +61,7 @@ mod post_processing_pause;
 mod rar_extraction;
 mod restart_resume_floor;
 mod restore_history;
+mod script_events;
 mod sequential_unpack;
 mod server_attribution;
 mod sfv_completion;

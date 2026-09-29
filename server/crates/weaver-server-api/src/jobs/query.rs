@@ -39,6 +39,7 @@ fn queue_page_job_display_name(info: &weaver_server_core::JobInfo) -> String {
 
 fn queue_display_state(state: QueueItemState) -> &'static str {
     match state {
+        QueueItemState::AwaitingQueueScripts => "AWAITING_QUEUE_SCRIPTS",
         QueueItemState::Queued => "QUEUED",
         QueueItemState::Downloading => "DOWNLOADING",
         QueueItemState::FetchingRepairData => "FETCHING_REPAIR_DATA",
@@ -199,6 +200,7 @@ fn queue_page_summary(
 
     for job in jobs {
         match queue_item_state_from_job_info(job) {
+            QueueItemState::AwaitingQueueScripts => summary.active_items += 1,
             QueueItemState::Queued => summary.queued_items += 1,
             QueueItemState::Paused => summary.paused_items += 1,
             QueueItemState::Failed => summary.failed_items += 1,

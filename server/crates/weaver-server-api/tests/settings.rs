@@ -4,6 +4,39 @@ use common::{BlockingDbOperation, TestHarness, assert_no_errors, local_request, 
 use weaver_server_core::auth::CallerScope;
 
 #[tokio::test]
+async fn create_schedule_rejects_client_supplied_implicit_id_and_generates_explicit_id() {
+    let h = TestHarness::new().await;
+    let data_dir = std::path::PathBuf::from(&h.config.read().await.data_dir);
+    h.db.initialize_post_processing_script_directory(&data_dir, None)
+        .unwrap();
+    let rejected = h.execute(r#"mutation {
+        createSchedule(input: { id: "implicit-script:task.sh:12:00", time: "12:00", actionType: "pause" }) { id implicit }
+    }"#).await;
+    assert!(
+        rejected.errors.iter().any(|error| error
+            .message
+            .contains("unknown field \"id\" of type \"ScheduleInput\"")),
+        "unexpected schema errors: {:?}",
+        rejected.errors
+    );
+    assert!(h.db.list_schedules().unwrap().is_empty());
+
+    let created = h.execute(r#"mutation {
+        createSchedule(input: { label: "implicit-script:display-only", time: "12:00", actionType: "pause" }) { id implicit label }
+    }"#).await;
+    assert_no_errors(&created);
+    let data = response_data(&created);
+    let entry = &data["createSchedule"][0];
+    assert!(entry["id"].as_str().unwrap().starts_with("sched-"));
+    assert_eq!(entry["implicit"], false);
+    assert_eq!(entry["label"], "implicit-script:display-only");
+    assert_eq!(
+        h.db.list_schedules().unwrap()[0].id,
+        entry["id"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
 async fn get_settings_defaults() {
     let h = TestHarness::new().await;
     let resp = h

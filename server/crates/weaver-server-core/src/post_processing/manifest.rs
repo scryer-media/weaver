@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use super::model::{
     NzbgetCompatibilityName, NzbgetSection, OptionName, OptionValue, PostProcessingValidationError,
-    ScriptAdapter, ScriptManifest, ScriptOption, ScriptOptionType, ScriptSelectValue,
+    QueueEvent, ScriptAdapter, ScriptKind, ScriptManifest, ScriptOption, ScriptOptionType,
+    ScriptSelectValue, ScriptTaskTime,
 };
 
 /// Manifest parse failure without leaking manifest contents.
@@ -18,7 +19,6 @@ use super::model::{
 pub enum ManifestError {
     InvalidJson,
     InvalidShape,
-    UnsupportedKind,
     Validation(PostProcessingValidationError),
 }
 
@@ -27,7 +27,6 @@ impl std::fmt::Display for ManifestError {
         let message = match self {
             Self::InvalidJson => "invalid script manifest JSON",
             Self::InvalidShape => "invalid script manifest shape",
-            Self::UnsupportedKind => "manifest does not declare a POST-PROCESSING script",
             Self::Validation(error) => return error.fmt(f),
         };
         f.write_str(message)
@@ -45,12 +44,21 @@ impl From<PostProcessingValidationError> for ManifestError {
 /// The NZBGet manifest file name looked for inside a package directory.
 pub const NZBGET_MANIFEST_FILE: &str = "manifest.json";
 
-const LEGACY_NZBGET_HEADER: &str = "### NZBGET POST-PROCESSING SCRIPT";
+const LEGACY_NZBGET_HEADER: &str = "### NZBGET ";
 const MAX_LEGACY_PREAMBLE_LINES: usize = 64;
 const MAX_LEGACY_PREAMBLE_BYTES: usize = 8 * 1024;
+pub const MAX_LEGACY_METADATA_BYTES: usize = 1024 * 1024;
 
-/// Detects only the exact NZBGet comment header in an initial blank/shebang/comment preamble.
+/// Detect NZBGet kind declarations only in the initial comment preamble.
 pub fn detect_bare_script_adapter(script: &str) -> ScriptAdapter {
+    if bare_script_kind_header(script).is_some() {
+        ScriptAdapter::Nzbget
+    } else {
+        ScriptAdapter::Sabnzbd
+    }
+}
+
+fn bare_script_kind_header(script: &str) -> Option<&str> {
     let script = script.strip_prefix('\u{feff}').unwrap_or(script);
     let mut inspected_bytes = 0;
     let mut saw_nonblank = false;
@@ -71,15 +79,90 @@ pub fn detect_bare_script_adapter(script: &str) -> ScriptAdapter {
         if !trimmed.starts_with('#') {
             break;
         }
-        if let Some(suffix) = trimmed.strip_prefix(LEGACY_NZBGET_HEADER)
+        if let Some(header) = trimmed.strip_prefix(LEGACY_NZBGET_HEADER)
+            && let Some((kinds, suffix)) = header.split_once(" SCRIPT")
             && suffix
                 .chars()
                 .all(|character| character == '#' || character.is_ascii_whitespace())
         {
-            return ScriptAdapter::Nzbget;
+            return Some(kinds);
         }
     }
-    ScriptAdapter::Sabnzbd
+    None
+}
+
+pub fn apply_bare_script_declarations(manifest: ScriptManifest, script: &str) -> ScriptManifest {
+    let Some(kinds) = bare_script_kind_header(script) else {
+        return manifest;
+    };
+    let mut queue_events = "";
+    let mut task_times = "";
+    let mut bytes = 0;
+    for line in script.split_inclusive('\n') {
+        bytes += line.len();
+        if bytes > MAX_LEGACY_METADATA_BYTES {
+            break;
+        }
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("### QUEUE EVENTS:") {
+            queue_events = value.trim().trim_end_matches('#').trim();
+        }
+        if let Some(value) = line.strip_prefix("### TASK TIME:") {
+            task_times = value.trim().trim_end_matches('#').trim();
+        }
+    }
+    apply_declarations(manifest, kinds, queue_events, task_times)
+}
+
+fn apply_declarations(
+    manifest: ScriptManifest,
+    kind: &str,
+    queue_events: &str,
+    task_times: &str,
+) -> ScriptManifest {
+    let kinds = ScriptKind::ALL
+        .into_iter()
+        .filter(|value| kind.contains(value.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut problems = Vec::new();
+    if kinds.is_empty()
+        || kind.split('/').any(|member| {
+            !ScriptKind::ALL
+                .iter()
+                .any(|value| member.contains(value.as_str()))
+        })
+    {
+        problems.push("manifest contains an unrecognised script kind".to_string());
+    }
+    let events = if kinds.contains(&ScriptKind::Queue) {
+        // Expand the empty wildcard here: an unknown-only or NZB_NAMED-only
+        // declaration must never accidentally subscribe to every raised event.
+        QueueEvent::ALL
+            .into_iter()
+            .filter(|event| queue_events.is_empty() || queue_events.contains(event.as_str()))
+            .collect()
+    } else {
+        Default::default()
+    };
+    let times = if kinds.contains(&ScriptKind::Scheduler) {
+        task_times
+            .split([';', ','])
+            .map(str::trim)
+            .filter(|time| !time.is_empty())
+            .filter_map(|time| match time.parse::<ScriptTaskTime>() {
+                Ok(time) => Some(time),
+                Err(error) => {
+                    if !problems.iter().any(|problem| problem == error) {
+                        problems.push(error.to_string());
+                    }
+                    None
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    manifest.with_declarations(kinds, events, times, problems)
 }
 
 /// Parses the NZBGet v24+/v2 manifest contract.
@@ -90,15 +173,8 @@ pub fn parse_nzbget_manifest(input: &str) -> Result<ScriptManifest, ManifestErro
     }
     let raw: NzbgetManifestRaw =
         serde_json::from_value(value).map_err(|_| ManifestError::InvalidShape)?;
-    if !raw
-        .kind
-        .split('/')
-        .any(|kind| kind.trim().eq_ignore_ascii_case("POST-PROCESSING"))
-    {
-        return Err(ManifestError::UnsupportedKind);
-    }
     let compatibility_name = NzbgetCompatibilityName::new(raw.name)?;
-    ScriptManifest::new(
+    let manifest = ScriptManifest::new(
         ScriptAdapter::Nzbget,
         Some(compatibility_name),
         raw.display_name,
@@ -112,8 +188,13 @@ pub fn parse_nzbget_manifest(input: &str) -> Result<ScriptManifest, ManifestErro
             .into_iter()
             .filter_map(parse_nzbget_option)
             .collect(),
-    )
-    .map_err(Into::into)
+    )?;
+    Ok(apply_declarations(
+        manifest,
+        &raw.kind,
+        &raw.queue_events,
+        &raw.task_time,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -133,9 +214,9 @@ struct NzbgetManifestRaw {
     #[serde(rename = "about")]
     _about: String,
     #[serde(rename = "queueEvents")]
-    _queue_events: String,
+    queue_events: String,
     #[serde(rename = "taskTime")]
-    _task_time: String,
+    task_time: String,
     #[serde(rename = "description")]
     _description: Vec<Value>,
     #[serde(rename = "requirements")]

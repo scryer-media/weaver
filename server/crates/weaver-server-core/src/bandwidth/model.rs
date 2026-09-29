@@ -25,6 +25,11 @@ pub struct ScheduleEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduleAction {
+    RunScript {
+        script: String,
+        #[serde(default)]
+        run_at_startup: bool,
+    },
     Pause,
     Resume,
     PauseAll,
@@ -93,7 +98,10 @@ impl ScheduleAction {
             Self::HardwareProfile { .. } => ScheduleTrack::Profile,
             Self::SetQuotaMetering { .. } => ScheduleTrack::Quota,
             Self::SetServerActive { server_id, .. } => ScheduleTrack::Server(*server_id),
-            Self::ScanWatchFolder | Self::FetchRss { .. } | Self::PruneHistory { .. } => {
+            Self::ScanWatchFolder
+            | Self::FetchRss { .. }
+            | Self::PruneHistory { .. }
+            | Self::RunScript { .. } => {
                 return None;
             }
         })
@@ -109,6 +117,13 @@ impl ScheduleAction {
         } else {
             self.track().into_iter().collect()
         }
+    }
+
+    /// A script rule is a one-shot with its own time syntax (`*:MM`,
+    /// `startup`). The script evaluator fires it; the schedule evaluator
+    /// neither holds nor dispatches it.
+    pub const fn is_script(&self) -> bool {
+        matches!(self, Self::RunScript { .. })
     }
 
     pub const fn is_hardware_profile(&self) -> bool {

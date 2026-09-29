@@ -70,6 +70,14 @@ impl Pipeline {
                         "cancel is not supported while the final move is running".to_string(),
                     ))
                 } else if self.jobs.contains_key(&job_id) {
+                    self.db.cancel_event_scripts(job_id.0);
+                    if matches!(origin, crate::jobs::handle::CancellationOrigin::User) {
+                        self.raise_queue_script_event(
+                            job_id,
+                            crate::post_processing::model::QueueEvent::NzbDeleted,
+                            Some("MANUAL"),
+                        );
+                    }
                     // Normal job cancellation must also interrupt terminal
                     // post-processing. The pipeline-level signal covers a run
                     // waiting for admission; the executor-level signal covers a
@@ -230,6 +238,7 @@ impl Pipeline {
 
                         let working_dir = state.working_dir.clone();
                         let staging_dir = state.staging_dir.clone();
+                        let cleanup_db = self.db.clone();
                         tokio::spawn(async move {
                             // Let a cancelled post-processing script leave its
                             // process group before its working directory is
@@ -244,35 +253,15 @@ impl Pipeline {
                                 })
                                 .await;
                             }
-                            // Close cached write handles first: the working-dir
-                            // path may be reused verbatim by a re-added job, and a
-                            // stale handle would swallow its writes. The staging
-                            // root gets the same treatment — direct-store writes
-                            // member payload there through the same pool, and its
-                            // path is deterministic per job id, so a re-added job
-                            // can reuse that one verbatim too.
-                            crate::pipeline::close_cached_write_handles_under(&working_dir).await;
-                            if let Some(staging) = staging_dir.as_deref() {
-                                crate::pipeline::close_cached_write_handles_under(staging).await;
-                            }
-                            if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
-                                && e.kind() != std::io::ErrorKind::NotFound
+                            if let Err(error) = Self::cleanup_cancelled_job_directories(
+                                &cleanup_db,
+                                job_id,
+                                &working_dir,
+                                staging_dir.as_deref(),
+                            )
+                            .await
                             {
-                                tracing::warn!(
-                                    dir = %working_dir.display(),
-                                    error = %e,
-                                    "failed to clean up cancelled job directory"
-                                );
-                            }
-                            if let Some(staging) = staging_dir
-                                && let Err(e) = tokio::fs::remove_dir_all(&staging).await
-                                && e.kind() != std::io::ErrorKind::NotFound
-                            {
-                                tracing::warn!(
-                                    dir = %staging.display(),
-                                    error = %e,
-                                    "failed to clean up cancelled job staging directory"
-                                );
+                                tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
                             }
                         });
 
@@ -586,7 +575,8 @@ impl Pipeline {
                     | ScheduleAction::SetServerActive { .. }
                     | ScheduleAction::ScanWatchFolder
                     | ScheduleAction::FetchRss { .. }
-                    | ScheduleAction::PruneHistory { .. } => {
+                    | ScheduleAction::PruneHistory { .. }
+                    | ScheduleAction::RunScript { .. } => {
                         let _ = self.refresh_bandwidth_cap_window();
                         warn!(
                             action = ?action,
@@ -729,6 +719,12 @@ impl Pipeline {
                 let _ = reply.send(result);
             }
             SchedulerCommand::ReprocessJob { job_id, reply } => {
+                if self.pending_history_deletions.contains(&job_id) {
+                    let _ = reply.send(Err(SchedulerError::Conflict(
+                        "history deletion is still running".into(),
+                    )));
+                    return;
+                }
                 let result = self.reprocess_job(job_id).await;
                 if result.is_ok() {
                     self.publish_snapshot();
@@ -736,6 +732,12 @@ impl Pipeline {
                 let _ = reply.send(result);
             }
             SchedulerCommand::RedownloadJob { job_id, reply } => {
+                if self.pending_history_deletions.contains(&job_id) {
+                    let _ = reply.send(Err(SchedulerError::Conflict(
+                        "history deletion is still running".into(),
+                    )));
+                    return;
+                }
                 let result = self.redownload_job(job_id).await;
                 if result.is_ok() {
                     self.publish_snapshot();
@@ -747,6 +749,12 @@ impl Pipeline {
                 delete_files,
                 reply,
             } => {
+                if self.pending_history_deletions.contains(&job_id) {
+                    let _ = reply.send(Err(SchedulerError::Conflict(
+                        "history deletion is still running".into(),
+                    )));
+                    return;
+                }
                 let history_cleanup_dirs = match self.history_cleanup_dirs_for_job(job_id).await {
                     Ok(dirs) => dirs,
                     Err(error) => {
@@ -793,23 +801,22 @@ impl Pipeline {
                         return;
                     }
                 }
-                let cleanup = self
-                    .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
-                    .await;
-                self.cleanup_output_dir(output_dir.as_deref()).await;
-                if self.jobs.contains_key(&job_id) {
-                    self.purge_terminal_job_runtime(job_id);
-                }
-                self.finished_jobs.retain(|job| job.job_id != job_id);
-                self.publish_snapshot();
-                let result =
-                    cleanup.map(|left_in_place| crate::HistoryDeleteOutcome { left_in_place });
-                let _ = reply.send(result);
+                self.start_history_delete_cleanup(
+                    history_cleanup_dirs,
+                    output_dir.into_iter().collect(),
+                    super::history::HistoryDeleteReply::One(reply),
+                );
             }
             SchedulerCommand::DeleteAllHistory {
                 delete_files,
                 reply,
             } => {
+                if !self.pending_history_deletions.is_empty() {
+                    let _ = reply.send(Err(SchedulerError::Conflict(
+                        "history deletion is still running".into(),
+                    )));
+                    return;
+                }
                 let history_cleanup_dirs = match self.all_history_cleanup_dirs().await {
                     Ok(dirs) => dirs,
                     Err(error) => {
@@ -846,26 +853,11 @@ impl Pipeline {
                         return;
                     }
                 }
-                let cleanup_error = self
-                    .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
-                    .await
-                    .err();
-                for dir in &output_dirs {
-                    self.cleanup_output_dir(Some(dir)).await;
-                }
-                let terminal_job_ids: Vec<JobId> = self
-                    .jobs
-                    .iter()
-                    .filter_map(|(job_id, state)| {
-                        is_terminal_status(&state.status).then_some(*job_id)
-                    })
-                    .collect();
-                for job_id in terminal_job_ids {
-                    self.purge_terminal_job_runtime(job_id);
-                }
-                self.finished_jobs.clear();
-                self.publish_snapshot();
-                let _ = reply.send(cleanup_error.map_or(Ok(()), Err));
+                self.start_history_delete_cleanup(
+                    history_cleanup_dirs,
+                    output_dirs,
+                    super::history::HistoryDeleteReply::All(reply),
+                );
             }
             SchedulerCommand::PipelineDiagnostics { reply } => {
                 let _ = reply.send(Box::new(self.diagnostics_snapshot()));
@@ -876,6 +868,35 @@ impl Pipeline {
 }
 
 impl Pipeline {
+    pub(crate) async fn cleanup_cancelled_job_directories(
+        db: &crate::Database,
+        job_id: JobId,
+        working_dir: &std::path::Path,
+        staging_dir: Option<&std::path::Path>,
+    ) -> Result<(), crate::StateError> {
+        // Deletion scripts still need this cwd after archival. A cancelled
+        // queue run must also leave its process group before files disappear.
+        crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0).await?;
+        // A re-added job may reuse either path, so release cached handles before
+        // removing its previous working and direct-store staging directories.
+        crate::pipeline::close_cached_write_handles_under(working_dir).await;
+        if let Some(staging) = staging_dir {
+            crate::pipeline::close_cached_write_handles_under(staging).await;
+        }
+        if let Err(error) = tokio::fs::remove_dir_all(working_dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %working_dir.display(), %error, "failed to clean up cancelled job directory");
+        }
+        if let Some(staging) = staging_dir
+            && let Err(error) = tokio::fs::remove_dir_all(staging).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %staging.display(), %error, "failed to clean up cancelled job staging directory");
+        }
+        Ok(())
+    }
+
     /// The pool replaced by generation `generation` has drained its sockets,
     /// so the new pool may dial without competing for the provider allowance.
     ///
