@@ -1,6 +1,16 @@
+import { directLeg, routeInput, type NetworkRoute } from "./networking.ts";
 export type ProxyKind = "HTTP_CONNECT" | "HTTP3_CONNECT" | "SOCKS5" | "SSH" | "WIRE_GUARD";
 export const proxyLabels: Record<ProxyKind, string> = { HTTP_CONNECT: "HTTP CONNECT", HTTP3_CONNECT: "HTTP/3 CONNECT", SOCKS5: "SOCKS5", SSH: "SSH", WIRE_GUARD: "WireGuard" };
-export type RoutingPolicy = { proxyIds: number[]; allowDirect: boolean };
+export type RoutingPolicy = { proxyIds: number[]; allowDirect: boolean; legs?: NetworkRoute["legs"]; failover?: NetworkRoute["failover"] };
+export function policyAsRoute(policy: RoutingPolicy): NetworkRoute {
+  return {failover:policy.failover??"REDISTRIBUTE",legs:policy.legs??[{...directLeg(),path:policy.proxyIds.length===0&&policy.allowDirect?directLeg().path:{kind:"LADDER",directFallback:policy.allowDirect,rungs:policy.proxyIds.map(id=>({kind:"PROXY",proxyId:id,poolId:null,chainIds:[]}))}}]};
+}
+export function policyInput(policy: RoutingPolicy) {
+  const route=policyAsRoute(policy);
+  // Preserve an existing legacy blocked route when saving unrelated consumer fields.
+  if(route.legs.length===1&&route.legs[0]!.path.kind==="LADDER"&&!route.legs[0]!.path.rungs.length&&!route.legs[0]!.path.directFallback)return undefined;
+  return routeInput(route);
+}
 export type RoutingStatus = { state: string; selectedProxyId: number | null; failures: { proxyId: number; message: string }[] };
 export const directRouting: RoutingPolicy = { proxyIds: [], allowDirect: true };
 /** The daemon accepts at most this many proxy routes in one policy. */

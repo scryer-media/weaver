@@ -40,6 +40,18 @@ function changesFor(newSchema) {
   return findSchemaCompatibilityChanges(BASE_SCHEMA, newSchema);
 }
 
+test("first use of a specified directive does not compare exporter spec versions", () => {
+  const declaration='directive @deprecated(reason:String="No longer supported") on FIELD_DEFINITION | ARGUMENT_DEFINITION | INPUT_FIELD_DEFINITION | ENUM_VALUE';
+  const changes=changesFor(`${BASE_SCHEMA.replace("name: String!",'name: String! @deprecated(reason:"Use displayName")')}\n${declaration}`);
+  assert.equal(hasSchemaCompatibilityFailure(changes),false);
+});
+
+test("explicit directive restrictions and custom directive removals still fail", () => {
+  const old=`${BASE_SCHEMA}\ndirective @deprecated(reason:String="No longer supported") on FIELD_DEFINITION | ENUM_VALUE`;
+  assert.equal(hasSchemaCompatibilityFailure(findSchemaCompatibilityChanges(old,old.replace(" | ENUM_VALUE",""))),true);
+  assert.equal(hasSchemaCompatibilityFailure(findSchemaCompatibilityChanges(`${BASE_SCHEMA}\ndirective @audit on FIELD`,BASE_SCHEMA)),true);
+});
+
 test("allows additive nullable fields", () => {
   const changes = changesFor(`
     type Query {

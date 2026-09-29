@@ -94,7 +94,9 @@ export const router = createBrowserRouter([
         ...lazyNamedRoute(() => import("@/pages/settings/SettingsLayout"), "SettingsLayout"),
         children: [
           { index: true, element: <Navigate to="general" replace /> },
-          { path: "proxies", ...lazyNamedRoute(() => import("@/pages/settings/ProxiesSettingsPage"), "ProxiesSettingsPage") },
+          { path: "proxies", element: <Navigate to="/settings/networking/proxies" replace /> },
+          { path: "networking", element: <Navigate to="/settings/networking/overview" replace /> },
+          { path: "networking/*", ...lazyNamedRoute(() => import("@/pages/settings/NetworkingSettingsPage"), "NetworkingSettingsPage") },
           {
             path: "general",
             ...lazyNamedRoute(
@@ -104,10 +106,7 @@ export const router = createBrowserRouter([
           },
           {
             path: "bandwidth",
-            ...lazyNamedRoute(
-              () => import("@/pages/settings/BandwidthCapSettingsPage"),
-              "BandwidthCapSettingsPage",
-            ),
+            element: <Navigate to="/settings/networking/bandwidth" replace />,
           },
           {
             path: "security",

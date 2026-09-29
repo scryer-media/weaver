@@ -228,7 +228,7 @@ fn memory_profile_from_facts(facts: &ProcessMemoryFacts) -> MemoryProfile {
     }
 }
 
-fn detect_memory() -> MemoryProfile {
+pub(crate) fn detect_memory() -> MemoryProfile {
     memory_profile_from_facts(process_memory_facts())
 }
 

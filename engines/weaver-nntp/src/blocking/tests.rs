@@ -325,6 +325,7 @@ fn spawn_tls_nntp_server_with_upgrade(
 
     let config = ServerConfig {
         proxy: None,
+        dialer: None,
         revocation: None,
         host: "localhost".to_string(),
         port,

@@ -1,11 +1,8 @@
-# Proxy profiles and consumer routing
+# Proxy engine details
 
-Settings → Proxies manages HTTP CONNECT, HTTP/3 CONNECT, SOCKS5, SSH and userspace WireGuard
-profiles. Server and RSS editors assign up to eight distinct profiles in order.
-Direct access is a separate final fallback. Assigning the first profile in the
-UI turns that fallback off. Existing consumers retain direct access, and API
-updates that omit `routing` preserve the saved policy. An empty ladder with
-direct access disabled is blocked.
+Settings → Networking → Proxies manages HTTP CONNECT, HTTP/3 CONNECT, SOCKS5,
+SSH and userspace WireGuard profiles. See [outbound networking](networking.md)
+for egress bindings, weighted legs, ladders, pools, chains, failover and limits.
 
 Profiles can be disabled without removing their assignments. Referenced
 profiles cannot be deleted. SSH requires an Ed25519 private key, including
@@ -28,7 +25,7 @@ health, cooldowns and one explicitly initialized application runtime. Source
 provenance and dependency features are recorded in
 `engines/weaver-tunnel/PROVENANCE.md`.
 
-SSH, WireGuard and HTTP/3 sessions are reused per profile revision. Async and blocking
+SSH, WireGuard and HTTP/3 sessions are reused per canonical path and profile revision. Async and blocking
 NNTP use revocable in-process streams. Async s2n accepts the routed stream
 directly; blocking s2n uses synchronous receive/send callbacks over that stream,
 with a stable boxed callback context and bounded I/O waits on the owned runtime.
@@ -45,12 +42,11 @@ hold an internal route handle. Credentials stay in memory and are excluded from 
 SOCKS negotiation is limited to five seconds; cancellation during dialing
 stops the pending ladder and preserves at most 8 KiB of pipelined client data.
 
-Each connection tries permitted routes sequentially. Transport failures cool a
-consumer/profile pair for 30 seconds; one recovery probe is admitted after the
-deadline. Destination authentication, certificate errors and missing articles
-keep their existing NNTP semantics. Failed transfers are discarded before an
-article retry. Healthy connections continue until their own policy or profile
-changes.
+Each connection is assigned to an available leg, then tries that leg's ladder
+in order. Transport failures cool the rung and exhausted leg; probes recover
+them after cooldown. Destination authentication, certificate errors and missing
+articles keep their existing NNTP semantics. Failed transfers are discarded
+before an article retry. Weight-only changes preserve healthy connections.
 
 NNTP reports unexpected response loss through a per-connection callback for
 the selected route. Orderly QUIT, authentication rejection and certificate

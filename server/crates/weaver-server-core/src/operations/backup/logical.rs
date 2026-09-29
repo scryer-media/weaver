@@ -750,6 +750,16 @@ async fn import_sqlite(
             )
             .await?;
         }
+        let system_egress: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM egress_interfaces WHERE id = 0")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(db_err)?;
+        if system_egress != 1 {
+            return Err(StateError::Database(
+                "restored networking configuration is missing the System egress".into(),
+            ));
+        }
         repair_sqlite_sequences(&mut conn).await?;
         let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
             .fetch_one(&mut *conn)
@@ -815,6 +825,16 @@ async fn import_postgres(
             allow_older_catalog,
         )
         .await?;
+    }
+    let system_egress: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM egress_interfaces WHERE id = 0")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    if system_egress != 1 {
+        return Err(StateError::Database(
+            "restored networking configuration is missing the System egress".into(),
+        ));
     }
     validate_postgres_counts(&mut tx, expected).await?;
     repair_postgres_sequences(&mut tx).await?;

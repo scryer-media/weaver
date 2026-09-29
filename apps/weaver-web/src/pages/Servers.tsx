@@ -1,5 +1,5 @@
 import { ProxyRoutingEditor, ProxyRoutingStatus } from "@/components/ProxyRoutingEditor";
-import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import { directRouting, policyInput, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { FilePenLine, Trash2 } from "lucide-react";
 import { useMutation, useQuery } from "urql";
@@ -343,7 +343,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     setTestResult(null);
     const result = await testConnection({
       input: {
-        routing: values.routing,
+        route: policyInput(values.routing),
         host: normalizeServerHost(values.host),
         port: values.port,
         tls: values.tls,
@@ -364,7 +364,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   const handleSave = async (values: ServerFormValues) => {
     setSaveError(null);
     const input = {
-      routing: values.routing,
+      route: policyInput(values.routing),
         host: normalizeServerHost(values.host),
       port: values.port,
       tls: values.tls,
@@ -823,7 +823,7 @@ function ServerFormCard({
       description={t("settings.serversDesc")}
     >
       <div className="space-y-5">
-        <ProxyRoutingEditor value={values.routing} onChange={routing => setValues(current => ({ ...current, routing }))} />
+        <ProxyRoutingEditor consumer={runtimeServer ? `server:${runtimeServer.id}` : undefined} cap={values.connections} value={values.routing} onChange={routing => setValues(current => ({ ...current, routing }))} />
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           <Field label={t("servers.host")} htmlFor="server-host">
             <Input

@@ -120,6 +120,8 @@ async fn connect_tls_drain_client(
     let now = Instant::now();
 
     NntpConnection {
+        route_path: None,
+        egress_control: None,
         _route_socket: None,
         route_outcome: None,
         transport: Some(NntpTransport::Tls {

@@ -2,7 +2,7 @@
 use crate::{TunnelError, TunnelProvider, TunnelStream};
 use base64::Engine;
 use std::net::{IpAddr, SocketAddr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[derive(Clone, Copy, Debug)]
@@ -25,8 +25,8 @@ fn failure(message: &'static str) -> TunnelError {
 }
 
 /// Establish a SOCKS5 CONNECT without resolving the destination locally.
-pub async fn socks_connect(
-    stream: &mut TcpStream,
+pub async fn socks_connect<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+    stream: &mut S,
     host: &str,
     port: u16,
     credentials: Option<(&str, &str)>,
@@ -117,19 +117,18 @@ pub fn socks_request(host: &str, port: u16) -> Result<Vec<u8>, TunnelError> {
     Ok(request)
 }
 
-#[async_trait::async_trait]
-impl TunnelProvider for TransportProxy {
-    async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .map_err(|_| failure("proxy endpoint is unreachable"))?;
-        stream
-            .set_nodelay(true)
-            .map_err(|_| failure("proxy socket setup failed"))?;
+impl TransportProxy {
+    /// Negotiate over the inner stage's stream, preserving its egress binding.
+    pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+        &self,
+        stream: &mut S,
+        host: &str,
+        port: u16,
+    ) -> Result<(), TunnelError> {
         match self.kind {
             TransportKind::Socks5 => {
                 socks_connect(
-                    &mut stream,
+                    stream,
                     host,
                     port,
                     self.username
@@ -189,9 +188,27 @@ impl TunnelProvider for TransportProxy {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TunnelProvider for TransportProxy {
+    async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        let mut stream = TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .map_err(|_| failure("proxy endpoint is unreachable"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|_| failure("proxy socket setup failed"))?;
+        self.negotiate(&mut stream, host, port).await?;
         Ok(Box::new(stream))
     }
     fn describe(&self) -> String {
         format!("{:?} {}:{}", self.kind, self.host, self.port)
     }
 }
+
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod tests;

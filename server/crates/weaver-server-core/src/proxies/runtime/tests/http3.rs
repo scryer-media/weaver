@@ -37,6 +37,7 @@ async fn http3_failure_blocks_direct_destination_and_preserves_policy() {
     let policy = RoutingPolicy {
         proxy_ids: vec![1],
         allow_direct: false,
+        ..Default::default()
     };
     let route = runtime
         .draft_route(policy.clone(), Duration::from_millis(100))

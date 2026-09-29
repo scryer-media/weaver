@@ -10,6 +10,13 @@ pub use proxy_tunnels::{ED25519_ONLY_PRIVATE_KEY_MESSAGE, TunnelSpec, TunnelStre
 /// consumer without another line changing.
 #[async_trait::async_trait]
 pub trait TunnelProvider: Send + Sync {
+    async fn prepare(&self) -> Result<(), TunnelError> {
+        Ok(())
+    }
+    async fn retire(&self) {}
+    fn source_address(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
     /// Stop the owned session. Callers close their streams before awaiting this.
     async fn shutdown(&self) {}
     /// Open a stream to `host:port`, resolving `host` **on the far side**.

@@ -99,6 +99,7 @@ fn controlled_route() -> ControlledRoute {
             RoutingPolicy {
                 proxy_ids: vec![1, 2, 3],
                 allow_direct: false,
+                ..Default::default()
             },
             Duration::from_secs(1),
         )
@@ -173,6 +174,7 @@ async fn blocked_ladder_and_disabled_profile_never_dial_host_destination() {
         let policy = RoutingPolicy {
             proxy_ids: ids,
             allow_direct: false,
+            ..Default::default()
         };
         let route = runtime
             .draft_route(policy.clone(), Duration::from_millis(30))
@@ -206,6 +208,7 @@ async fn direct_fallback_is_only_used_when_permitted() {
             RoutingPolicy {
                 proxy_ids: vec![1],
                 allow_direct: true,
+                ..Default::default()
             },
             Duration::from_millis(30),
         )
@@ -250,6 +253,7 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
         &RoutingPolicy {
             proxy_ids: vec![],
             allow_direct: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -272,6 +276,7 @@ async fn reload_preserves_unaffected_sessions_and_revokes_changed_profile() {
         &RoutingPolicy {
             proxy_ids: vec![1],
             allow_direct: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -318,6 +323,7 @@ async fn deleting_consumer_revokes_routes_and_releases_profile_reference() {
         &RoutingPolicy {
             proxy_ids: vec![1],
             allow_direct: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -349,6 +355,7 @@ fn routing_validation_and_atomic_consumer_save_preserve_existing_policy() {
     let policy = RoutingPolicy {
         proxy_ids: vec![1],
         allow_direct: false,
+        ..Default::default()
     };
     db.insert_server_with_routing(&server, Some(&policy))
         .unwrap();
@@ -365,7 +372,8 @@ fn routing_validation_and_atomic_consumer_save_preserve_existing_policy() {
                 &server,
                 Some(&RoutingPolicy {
                     proxy_ids: ids,
-                    allow_direct: true
+                    allow_direct: true,
+                    ..Default::default()
                 })
             )
             .is_err()
@@ -430,6 +438,7 @@ fn backup_restores_encrypted_profiles_ordered_routes_and_host_trust() {
     let policy = RoutingPolicy {
         proxy_ids: vec![2, 1],
         allow_direct: false,
+        ..Default::default()
     };
     source
         .save_proxy_routing_policy(Consumer::Server(1), &policy)

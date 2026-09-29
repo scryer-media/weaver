@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import { Link, NavLink } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
@@ -357,18 +357,22 @@ export function PanelListBlock({
   items,
 }: {
   eyebrow: string;
-  items: readonly { to: string; label: string; icon?: IconName; tag?: ReactNode }[];
+  items: readonly { to: string; label: string; icon?: IconName; tag?: ReactNode; group?: string }[];
 }) {
   return (
     <RailBlock eyebrow={eyebrow} position="middle" className="gap-0">
       <nav aria-label={eyebrow} className="flex flex-col">
-        {items.map((item) => (
+        {items.map((item,index) => (
+          <Fragment key={item.to}>
+          {item.group && items[index-1]?.group!==item.group && <div className="pt-4 pb-2 font-wv-mono text-[10px] uppercase tracking-widest text-wv-faint">{item.group}</div>}
           <NavLink
             key={item.to}
             to={item.to}
+            end
             className={({ isActive }) =>
               cn(
                 "-mx-[10px] flex h-[30px] items-center gap-[10px] px-[10px] text-[12.5px] hover:bg-wv-nav-hover",
+                item.group && "pl-5",
                 isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
               )
             }
@@ -395,6 +399,7 @@ export function PanelListBlock({
               </>
             )}
           </NavLink>
+          </Fragment>
         ))}
       </nav>
     </RailBlock>

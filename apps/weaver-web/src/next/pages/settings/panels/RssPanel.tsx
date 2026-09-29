@@ -13,7 +13,7 @@ import {
   UPDATE_RSS_RULE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import { directRouting, policyInput, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
@@ -379,7 +379,7 @@ export function RssPanel() {
       return;
     }
     const input = {
-      routing: { proxyIds: feedForm.routing.proxyIds, allowDirect: feedForm.routing.allowDirect },
+      route: policyInput(feedForm.routing),
       name: feedForm.name.trim(),
       url: feedForm.url.trim(),
       enabled: feedForm.enabled,
@@ -732,6 +732,8 @@ export function RssPanel() {
             kind: "custom",
             control: (
               <RoutingEditor
+                consumer={editingFeed ? `rss:${editingFeed.id}` : undefined}
+                rss
                 value={feedForm.routing}
                 onChange={(next) => patchFeed({ routing: next })}
               />

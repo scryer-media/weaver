@@ -42,6 +42,8 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("servers", Export, Replace),
     table!("proxy_profiles", Export, RequireEmpty),
     table!("proxy_routes", Export, RequireEmpty),
+    table!("egress_interfaces", Export, Replace),
+    table!("proxy_pools", Export, RequireEmpty),
     table!("server_download_usage", Export, RequireZeroUsage),
     table!("server_tls_diagnostics", Export, Replace),
     table!("categories", Export, Replace),

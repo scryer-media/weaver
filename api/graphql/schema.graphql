@@ -280,6 +280,13 @@ type DirectoryBrowseResult {
 	entries: [DirectoryBrowseEntry!]!
 }
 
+type DiscoveredNetworkInterface {
+	name: String!
+	index: Int
+	up: Boolean!
+	addresses: [String!]!
+}
+
 type DiskCapacity {
 	totalBytes: Int!
 	usedBytes: Int!
@@ -427,6 +434,42 @@ type DuplicateSummaryInfo {
 	action: DuplicateActionGql!
 	primaryReason: DuplicateFingerprintKindGql
 	semantic: SemanticCandidateSnapshotInfo
+}
+
+enum EgressBindingKind {
+	SYSTEM
+	INTERFACE
+	SOURCE_ADDRESS
+}
+
+type EgressInterface {
+	id: Int!
+	name: String!
+	bindingKind: EgressBindingKind!
+	interfaceName: String
+	sourceAddress: String
+	addresses: [String!]!
+	enabled: Boolean!
+	maxDownloadSpeed: Int!
+	health: String!
+	reason: String
+}
+
+input EgressInterfaceInput {
+	name: String!
+	bindingKind: EgressBindingKind!
+	interfaceName: String
+	sourceAddress: String
+	enabled: Boolean! = true
+	maxDownloadSpeed: Int! = 0
+}
+
+type EgressTestResult {
+	success: Boolean!
+	message: String!
+	sourceAddress: String
+	connectMillis: Float
+	proxyId: Int
 }
 
 enum EventKind {
@@ -1022,6 +1065,29 @@ type KernelSelectionInfo {
 	pinnedBy: String
 }
 
+type LegConnectionTest {
+	position: Int!
+	success: Boolean!
+	message: String!
+	latencyMs: Int
+}
+
+type LegPath {
+	kind: LegPathKind!
+	rungs: [RouteRung!]!
+	directFallback: Boolean!
+}
+
+input LegPathInput @oneOf {
+	direct: Boolean
+	ladder: RouteLadderInput
+}
+
+enum LegPathKind {
+	DIRECT
+	LADDER
+}
+
 """
 The live log filter. Changes last until the process exits.
 """
@@ -1177,6 +1243,15 @@ type MetricsHistoryResult {
 }
 
 type MutationRoot {
+	createEgressInterface(input: EgressInterfaceInput!): EgressInterface!
+	updateEgressInterface(id: Int!, input: EgressInterfaceInput!): EgressInterface!
+	deleteEgressInterface(id: Int!): Boolean!
+	createProxyPool(input: ProxyPoolInput!): ProxyPool!
+	updateProxyPool(id: Int!, input: ProxyPoolInput!): ProxyPool!
+	deleteProxyPool(id: Int!): Boolean!
+	saveNetworkRoute(kind: NetworkConsumerKind!, id: Int!, input: RouteInput!): NetworkRoute!
+	testEgressInterface(id: Int!, proxyId: Int, host: String!, port: Int!): EgressTestResult!
+	testProxyPool(id: Int!, egressId: Int!, host: String, port: Int): [EgressTestResult!]!
 	saveProxyProfile(id: Int, input: ProxyProfileInput!): ProxyProfile!
 	deleteProxyProfile(id: Int!): Boolean!
 	resetProxyHostKey(id: Int!): ProxyProfile!
@@ -1577,6 +1652,76 @@ type NetworkClientDiagnostics {
 	rememberedClientAllowed: Boolean
 }
 
+type NetworkConsumerFlow {
+	key: String!
+	id: Int!
+	name: String!
+	kind: NetworkConsumerKind!
+	cap: Int!
+	route: Route!
+}
+
+enum NetworkConsumerKind {
+	SERVER
+	RSS
+}
+
+type NetworkFlow {
+	consumers: [NetworkConsumerFlow!]!
+	legs: [NetworkLegFlow!]!
+	pools: [NetworkPoolFlow!]!
+	egresses: [EgressInterface!]!
+	proxies: [ProxyProfile!]!
+	proxyPools: [ProxyPool!]!
+	sampledAt: Float!
+}
+
+type NetworkLegFlow {
+	consumer: String!
+	position: Int!
+	egressId: Int!
+	weight: Int!
+	target: Int!
+	open: Int!
+	opening: Int!
+	state: String!
+	reason: String
+	path: LegPath!
+	pinnedAddress: String
+	sourceAddress: String
+	bytesPerSecond: Int!
+	selectedRung: Int
+	selectedProxyId: Int
+	rungStates: [String!]!
+}
+
+type NetworkPoolFlow {
+	poolId: Int!
+	egressId: Int!
+	pinnedMember: Int
+	members: [NetworkPoolMemberFlow!]!
+}
+
+type NetworkPoolMemberFlow {
+	id: Int!
+	state: String!
+	open: Int!
+	opening: Int!
+	warmed: Boolean!
+	blocked: String
+	handshakeMs: Float
+	connectMs: Float
+	bytesPerSecond: Float
+	samples: Int!
+	failures: Int!
+}
+
+type NetworkRoute {
+	consumer: String!
+	legs: [RouteLeg!]!
+	failover: RouteFailover!
+}
+
 enum OperatingSystemGql {
 	LINUX
 	MACOS
@@ -1629,6 +1774,16 @@ type PipelineEventGql {
 	jobId: Int
 	fileId: String
 	message: String!
+}
+
+type PlatformNetworking {
+	platform: String!
+	egressBindingKinds: [EgressBindingKind!]!
+	sourceAddressHint: String!
+	container: Boolean!
+	bridgeNetworkSuspected: Boolean!
+	maxWireguardInstances: Int!
+	notes: [String!]!
 }
 
 type PostProcessingSettingsGql {
@@ -1712,6 +1867,21 @@ enum ProxyKind {
 	WIRE_GUARD
 }
 
+type ProxyPool {
+	id: Int!
+	name: String!
+	kind: ProxyKind!
+	memberIds: [Int!]!
+	enabled: Boolean!
+}
+
+input ProxyPoolInput {
+	name: String!
+	kind: ProxyKind!
+	memberIds: [Int!]!
+	enabled: Boolean! = true
+}
+
 type ProxyProfile {
 	id: Int!
 	name: String!
@@ -1759,6 +1929,12 @@ type ProxyTestResult {
 }
 
 type QueryRoot {
+	egressInterfaces: [EgressInterface!]!
+	discoverNetworkInterfaces: [DiscoveredNetworkInterface!]!
+	platformNetworking: PlatformNetworking!
+	proxyPools: [ProxyPool!]!
+	networkRoutes: [NetworkRoute!]!
+	networkFlow: NetworkFlow!
 	proxyProfiles: [ProxyProfile!]!
 	"""
 	Admin-facing auth status moved to query semantics.
@@ -2252,6 +2428,51 @@ enum QueueWaitReason {
 	POST_PROCESSING_CAPACITY
 }
 
+type Route {
+	legs: [RouteLeg!]!
+	failover: RouteFailover!
+}
+
+enum RouteFailover {
+	REDISTRIBUTE
+	HOLD
+}
+
+input RouteInput {
+	legs: [RouteLegInput!]!
+	failover: RouteFailover! = REDISTRIBUTE
+}
+
+input RouteLadderInput {
+	rungs: [RouteRungInput!]!
+	directFallback: Boolean!
+}
+
+type RouteLeg {
+	egressId: Int!
+	weight: Int!
+	path: LegPath!
+}
+
+input RouteLegInput {
+	egressId: Int!
+	weight: Int!
+	path: LegPathInput!
+}
+
+type RouteRung {
+	kind: RungKind!
+	proxyId: Int
+	poolId: Int
+	chainIds: [Int!]!
+}
+
+input RouteRungInput @oneOf {
+	proxy: Int
+	pool: Int
+	chain: [Int!]
+}
+
 type RoutingFailure {
 	proxyId: Int!
 	message: String!
@@ -2275,6 +2496,7 @@ enum RoutingState {
 }
 
 type RoutingStatus {
+	legs: [NetworkLegFlow!]!
 	state: RoutingState!
 	selectedProxyId: Int
 	failures: [RoutingFailure!]!
@@ -2297,12 +2519,14 @@ type RssFeed {
 	lastError: String
 	consecutiveFailures: Int!
 	rules: [RssRule!]!
-	routing: RoutingPolicy!
+	route: Route!
+	routing: RoutingPolicy! @deprecated(reason: "Use route for the full route; routing is the first-leg projection.")
 	routingStatus: RoutingStatus!
 }
 
 input RssFeedInput {
 	routing: RoutingPolicyInput
+	route: RouteInput
 	name: String!
 	url: String!
 	enabled: Boolean! = true
@@ -2377,6 +2601,12 @@ type RssSyncReport {
 	itemsIgnored: Int!
 	errors: [String!]!
 	feedResults: [RssFeedSyncResult!]!
+}
+
+enum RungKind {
+	PROXY
+	POOL
+	CHAIN
 }
 
 type Schedule {
@@ -2611,7 +2841,8 @@ type Server {
 	Whether that server follows the client's cipher order (null when unknown).
 	"""
 	tlsHonorsClientCipherOrder: Boolean
-	routing: RoutingPolicy!
+	route: Route!
+	routing: RoutingPolicy! @deprecated(reason: "Use route for the full route; routing is the first-leg projection.")
 	routingStatus: RoutingStatus!
 }
 
@@ -2640,7 +2871,8 @@ type ServerDetails {
 	Whether that server follows the client's cipher order (null when unknown).
 	"""
 	tlsHonorsClientCipherOrder: Boolean
-	routing: RoutingPolicy!
+	route: Route!
+	routing: RoutingPolicy! @deprecated(reason: "Use route for the full route; routing is the first-leg projection.")
 	routingStatus: RoutingStatus!
 }
 
@@ -2782,6 +3014,7 @@ type ServerHealth {
 	Connections that died before reaching a healthy age, recently.
 	"""
 	prematureDeaths: Int!
+	legs: [NetworkLegFlow!]!
 	"""
 	The resolved address new connections to this server dial, once an
 	address race has picked one. Absent before the first connect and for
@@ -2792,6 +3025,7 @@ type ServerHealth {
 
 input ServerInput {
 	routing: RoutingPolicyInput
+	route: RouteInput
 	host: String!
 	port: Int!
 	tls: Boolean!
@@ -2946,6 +3180,7 @@ type SubmitStagedNzbsResult {
 }
 
 type SubscriptionRoot {
+	networkFlow: NetworkFlow!
 	"""
 	Subscribe to all pipeline events.
 	"""
@@ -3063,6 +3298,7 @@ type SystemStorageProfile {
 }
 
 type TestConnectionResult {
+	legs: [LegConnectionTest!]!
 	success: Boolean!
 	message: String!
 	latencyMs: Int
@@ -3166,9 +3402,17 @@ input WatchFolderSettingsInput {
 }
 
 """
+Marks an element of a GraphQL schema as no longer supported.
+"""
+directive @deprecated(reason: String = "No longer supported") on FIELD_DEFINITION | ARGUMENT_DEFINITION | INPUT_FIELD_DEFINITION | ENUM_VALUE
+"""
 Directs the executor to include this field or fragment only when the `if` argument is true.
 """
 directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Indicates that an Input Object is a OneOf Input Object (and thus requires exactly one of its field be provided)
+"""
+directive @oneOf on INPUT_OBJECT
 """
 Directs the executor to skip this field or fragment when the `if` argument is true.
 """

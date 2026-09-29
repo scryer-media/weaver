@@ -6,6 +6,9 @@ use std::sync::Arc;
 pub type WireGuardTunnelProvider = SharedProvider<proxy_tunnels::WireGuardTunnelProvider>;
 
 impl WireGuardTunnelProvider {
+    pub fn with_udp_factory(self, factory: Arc<dyn crate::endpoint::UdpSocketFactory>) -> Self {
+        Self(self.0.with_udp_factory(factory))
+    }
     pub fn new(spec: WireGuardSpec, observer: Arc<dyn TunnelObserver>) -> Self {
         Self(
             proxy_tunnels::WireGuardTunnelProvider::new(spec, Arc::new(Observer(observer, None)))

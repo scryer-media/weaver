@@ -31,6 +31,7 @@ pub struct SocketBudgetSnapshot {
 }
 
 struct Entry {
+    path: Option<weaver_tunnel::pipe::DialPath>,
     phase: SocketPhase,
     recall: Option<Recall>,
     retiring: Arc<AtomicBool>,
@@ -40,6 +41,7 @@ struct Entry {
 #[derive(Default)]
 struct State {
     limit: usize,
+    leg_targets: Option<Vec<u16>>,
     next_id: u64,
     entries: BTreeMap<u64, Entry>,
     local_denials: u64,
@@ -95,6 +97,68 @@ impl SocketBudget {
         self.publish();
     }
 
+    /// Withdraw unavailable idle paths immediately. Other weight changes drain
+    /// on demand, preserving warm sockets while there is no replacement work.
+    pub(crate) fn configure_legs(&self, targets: &[u16]) {
+        let (changed, recalls) = {
+            let mut state = self.state.lock().expect("socket budget poisoned");
+            let limit = targets.iter().map(|target| usize::from(*target)).sum();
+            let changed = state.limit != limit || state.leg_targets.as_deref() != Some(targets);
+            // Socket phase notifications need no entry scan while every leg is available.
+            if !changed && targets.iter().all(|target| *target > 0) {
+                return;
+            }
+            state.limit = limit;
+            if changed {
+                state.leg_targets = Some(targets.to_vec());
+            }
+            let mut counts = vec![0_usize; targets.len()];
+            for entry in state
+                .entries
+                .values()
+                .filter(|entry| entry.phase != SocketPhase::Closing)
+            {
+                if let Some(count) = entry
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.leg)
+                    .and_then(|leg| counts.get_mut(leg))
+                {
+                    *count += 1;
+                }
+            }
+            let mut recalls = Vec::new();
+            for (&id, entry) in &mut state.entries {
+                let Some(leg) = entry.path.as_ref().and_then(|p| p.leg) else {
+                    continue;
+                };
+                let target = usize::from(targets.get(leg).copied().unwrap_or(0));
+                if target > 0 {
+                    continue;
+                }
+                if counts.get(leg).copied().unwrap_or(1) <= target {
+                    continue;
+                }
+                if let Some(recall) = entry.recall.take() {
+                    entry.phase = SocketPhase::Closing;
+                    entry.retiring.store(true, Ordering::Release);
+                    if let Some(count) = counts.get_mut(leg) {
+                        *count -= 1;
+                    }
+                    recalls.push((id, recall));
+                }
+            }
+            (changed, recalls)
+        };
+        let recalled = !recalls.is_empty();
+        for (id, recall) in recalls {
+            recall(id);
+        }
+        if changed || recalled {
+            self.publish();
+        }
+    }
+
     pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<SocketSlot> {
         self.acquire(false)
     }
@@ -132,6 +196,7 @@ impl SocketBudget {
         state.entries.insert(
             id,
             Entry {
+                path: None,
                 phase: SocketPhase::Dialing,
                 recall: None,
                 retiring: Arc::clone(&retiring),
@@ -148,9 +213,40 @@ impl SocketBudget {
     /// Ask one idle owner to close its exact socket. Removing the entry in
     /// `SocketSlot::drop` acknowledges closure; a recall never refunds a slot.
     pub(crate) fn recall_idle(&self) -> bool {
+        let excess = {
+            let state = self.state.lock().expect("socket budget poisoned");
+            state.leg_targets.as_ref().and_then(|targets| {
+                targets.iter().enumerate().find_map(|(leg, target)| {
+                    let count = state
+                        .entries
+                        .values()
+                        .filter(|entry| {
+                            entry.phase != SocketPhase::Closing
+                                && entry.path.as_ref().and_then(|path| path.leg) == Some(leg)
+                        })
+                        .count();
+                    (count > usize::from(*target)
+                        && state.entries.values().any(|entry| {
+                            entry.recall.is_some()
+                                && entry.path.as_ref().and_then(|path| path.leg) == Some(leg)
+                        }))
+                    .then_some(leg)
+                })
+            })
+        };
+        if let Some(leg) = excess {
+            return self.recall_idle_for_leg(Some(leg));
+        }
+        self.recall_idle_for_leg(None)
+    }
+
+    pub(crate) fn recall_idle_for_leg(&self, leg: Option<usize>) -> bool {
         let recalled = {
             let mut state = self.state.lock().expect("socket budget poisoned");
             state.entries.iter_mut().find_map(|(&id, entry)| {
+                if leg.is_some() && entry.path.as_ref().and_then(|path| path.leg) != leg {
+                    return None;
+                }
                 let recall = entry.recall.take()?;
                 entry.phase = SocketPhase::Closing;
                 Some((id, recall))
@@ -207,6 +303,78 @@ impl SocketSlot {
         self.set_phase(SocketPhase::Active, None);
     }
 
+    pub(crate) fn set_path(&self, path: Option<&weaver_tunnel::pipe::DialPath>) {
+        let mut state = self.budget.state.lock().expect("socket budget poisoned");
+        state
+            .entries
+            .get_mut(&self.id)
+            .expect("live socket slot")
+            .path = path.cloned();
+        drop(state);
+        self.budget.publish();
+    }
+
+    pub(crate) fn observe_outcome(
+        &self,
+        outcome: Option<&Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+    ) {
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let budget = Arc::downgrade(&self.budget);
+        let id = self.id;
+        outcome.on_retire(move || {
+            let Some(budget) = budget.upgrade() else {
+                return;
+            };
+            let recall = {
+                let mut state = budget.state.lock().expect("socket budget poisoned");
+                let Some(entry) = state.entries.get_mut(&id) else {
+                    return;
+                };
+                entry.retiring.store(true, Ordering::Release);
+                if matches!(entry.phase, SocketPhase::AsyncIdle | SocketPhase::OwnedIdle) {
+                    entry.phase = SocketPhase::Closing;
+                    entry.recall.take()
+                } else {
+                    None
+                }
+            };
+            budget.publish();
+            if let Some(recall) = recall {
+                recall(id);
+            }
+        });
+    }
+
+    pub(crate) fn reusable(&self) -> bool {
+        if self.retiring() {
+            return false;
+        }
+        let state = self.budget.state.lock().expect("socket budget poisoned");
+        let Some(targets) = &state.leg_targets else {
+            return true;
+        };
+        let Some(leg) = state
+            .entries
+            .get(&self.id)
+            .and_then(|entry| entry.path.as_ref())
+            .and_then(|path| path.leg)
+        else {
+            return true;
+        };
+        let target = usize::from(targets.get(leg).copied().unwrap_or(0));
+        let count = state
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.phase != SocketPhase::Closing
+                    && entry.path.as_ref().and_then(|path| path.leg) == Some(leg)
+            })
+            .count();
+        count <= target && target > 0
+    }
+
     pub(crate) fn idle(&self, phase: SocketPhase, recall: Recall) {
         self.set_phase(phase, Some(recall));
     }
@@ -216,8 +384,19 @@ impl SocketSlot {
         let entry = state.entries.get_mut(&self.id).expect("live socket slot");
         entry.phase = phase;
         entry.recall = recall;
+        let recalled = if entry.retiring.load(Ordering::Acquire)
+            && matches!(phase, SocketPhase::AsyncIdle | SocketPhase::OwnedIdle)
+        {
+            entry.phase = SocketPhase::Closing;
+            entry.recall.take()
+        } else {
+            None
+        };
         drop(state);
         self.budget.publish();
+        if let Some(recall) = recalled {
+            recall(self.id);
+        }
     }
 }
 

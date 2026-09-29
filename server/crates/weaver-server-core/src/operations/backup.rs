@@ -66,6 +66,7 @@ const LEGACY_V1_STABLE_TABLES: &[&str] = &[
 
 const LEGACY_V1_CLEAR_IMPORT_TABLES: &[&str] = &[
     "proxy_routes",
+    "proxy_pools",
     "proxy_profiles",
     "metrics_history_chunks",
     "rss_seen_items",

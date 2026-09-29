@@ -6,6 +6,9 @@ use std::sync::Arc;
 pub type SshTunnelProvider = SharedProvider<proxy_tunnels::SshTunnelProvider>;
 
 impl SshTunnelProvider {
+    pub fn with_transport(self, transport: Arc<dyn crate::endpoint::EndpointTransport>) -> Self {
+        Self(self.0.with_transport(transport))
+    }
     pub fn new(spec: TunnelSpec, observer: Arc<dyn TunnelObserver>) -> Self {
         let observer = Arc::new(Observer(observer, Some((spec.host.clone(), spec.port))));
         Self(proxy_tunnels::SshTunnelProvider::new(spec, observer))

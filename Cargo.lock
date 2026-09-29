@@ -2179,7 +2179,6 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.2.1#2e61a4a2da2f40b215299297add509fbcbd445cf"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2192,7 +2191,6 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.2.1#2e61a4a2da2f40b215299297add509fbcbd445cf"
 dependencies = [
  "bytes",
  "futures",
@@ -2561,6 +2559,16 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3701,7 +3709,6 @@ dependencies = [
 [[package]]
 name = "proxy-tunnels"
 version = "0.2.1"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.2.1#2e61a4a2da2f40b215299297add509fbcbd445cf"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3715,6 +3722,7 @@ dependencies = [
  "russh",
  "rustls",
  "smoltcp",
+ "socket2",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -5986,6 +5994,7 @@ dependencies = [
 name = "weaver-nntp"
 version = "0.14.1"
 dependencies = [
+ "async-trait",
  "bytes",
  "criterion",
  "libc",
@@ -6081,6 +6090,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "httpdate",
+ "if-addrs",
  "ipnet",
  "keyring",
  "keyring-core",
@@ -6136,13 +6146,17 @@ dependencies = [
  "h3",
  "h3-quinn",
  "http",
+ "if-addrs",
+ "libc",
  "proxy-tunnels",
  "quinn",
  "rcgen",
+ "socket2",
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

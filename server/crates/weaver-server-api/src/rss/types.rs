@@ -134,6 +134,7 @@ impl RssFeed {
 #[derive(Debug, InputObject)]
 pub struct RssFeedInput {
     pub routing: Option<crate::proxies::RoutingPolicyInput>,
+    pub route: Option<crate::networking::RouteInput>,
     pub name: String,
     pub url: String,
     #[graphql(default = true)]

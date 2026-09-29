@@ -250,6 +250,7 @@ pub enum PipeliningCapability {
 /// Configuration for connecting to a single NNTP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub dialer: Option<Arc<crate::route_dialer::RouteDialer>>,
     /// Revocable route transport. None retains the direct socket path.
     pub proxy: Option<Arc<weaver_tunnel::bridge::Bridge>>,
     pub revocation: Option<Arc<crate::revocation::SocketRegistry>>,
@@ -292,6 +293,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
+            dialer: None,
             proxy: None,
             revocation: None,
             host: String::new(),
@@ -318,7 +320,9 @@ impl Default for ServerConfig {
 /// to avoid borrow-checker issues when we need simultaneous access to the codec,
 /// buffer, and transport.
 pub struct NntpConnection {
-    route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+    pub route_path: Option<weaver_tunnel::pipe::DialPath>,
+    egress_control: Option<Arc<ServerTransferControl>>,
+    pub(crate) route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
     _route_socket: Option<Arc<socket2::Socket>>,
     /// Wrapped in Option to allow taking ownership during STARTTLS upgrade.
     transport: Option<NntpTransport>,
@@ -402,10 +406,15 @@ impl NntpConnection {
         initial_group: Option<&str>,
     ) -> Result<Self> {
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT)
-            + config
-                .proxy
-                .as_ref()
-                .map_or(Duration::ZERO, |p| p.connect_timeout);
+            + config.dialer.as_ref().map_or_else(
+                || {
+                    config
+                        .proxy
+                        .as_ref()
+                        .map_or(Duration::ZERO, |p| p.connect_timeout)
+                },
+                |d| d.inner.budget(),
+            );
         let result = tokio::time::timeout(connect_timeout, async {
             Self::connect_inner(config, route, initial_group).await
         })
@@ -429,9 +438,33 @@ impl NntpConnection {
         }
         let mut route_socket = None;
         let mut route_outcome = None;
+        let mut route_path = None;
+        let mut pipe_setup = None;
         let mut setup = None;
         // Register direct sockets before TLS so revocation also interrupts handshakes.
-        let transport = if config.proxy.is_some() {
+        let transport = if let Some(dialer) = &config.dialer {
+            let dialed = dialer.dial(config).await?;
+            let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
+            route_path = Some(dialed.path);
+            route_outcome = Some(dialed.outcome);
+            pipe_setup = dialed.setup;
+            let plain = NntpTransport::Plain {
+                inner: dialed.stream.into(),
+                remote_addr,
+            };
+            if config.tls {
+                crate::tls::upgrade_starttls(
+                    plain,
+                    &config.host,
+                    config.tls_ca_cert.as_deref(),
+                    config.tls_name_mismatch_certificate_der.as_deref(),
+                    config.tls_cipher_preference,
+                )
+                .await?
+            } else {
+                plain
+            }
+        } else if config.proxy.is_some() {
             let (transport, outcome) = crate::proxy::connect(config).await?;
             route_outcome = Some(outcome);
             transport
@@ -494,6 +527,13 @@ impl NntpConnection {
         let remote_addr = transport.remote_addr();
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
         let mut conn = NntpConnection {
+            egress_control: route_path.as_ref().and_then(|path| {
+                config.dialer.as_ref().map(|d| {
+                    d.egress_controls
+                        .control(crate::transfer::StableServerId(path.egress))
+                })
+            }),
+            route_path,
             route_outcome,
             _route_socket: route_socket,
             transport: Some(transport),
@@ -528,7 +568,14 @@ impl NntpConnection {
         };
 
         // 2. Read greeting
-        let greeting = conn.read_response().await?;
+        let greeting = conn.read_response().await.inspect_err(|_| {
+            if let Some(setup) = pipe_setup.take() {
+                setup.complete(false);
+            }
+        })?;
+        if let Some(setup) = pipe_setup.take() {
+            setup.complete(true);
+        }
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received greeting");
         let upgrades = config.starttls && !conn.transport.as_ref().unwrap().is_tls();
         if (!upgrades || !matches!(greeting.code.raw(), 200 | 201))
@@ -808,7 +855,14 @@ impl NntpConnection {
     }
 
     async fn charge_active_body(&mut self, bytes: usize) -> Duration {
-        match self.body_accounting.front_mut() {
+        if let Some(outcome) = &self.route_outcome {
+            outcome.read(bytes);
+        }
+        let egress_wait = match &self.egress_control {
+            Some(control) => control.pace_read_async(bytes).await,
+            None => Duration::ZERO,
+        };
+        let server_wait = match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
                 if let Some(control) = &self.transfer_control {
                     control.record_unlimited_body_bytes(bytes);
@@ -817,10 +871,17 @@ impl NntpConnection {
             }
             Some(BodyTransferAccounting::Tracked(permit)) => permit.record_async(bytes).await,
             None => Duration::ZERO,
-        }
+        };
+        egress_wait.saturating_add(server_wait)
     }
 
     fn charge_active_body_without_wait(&mut self, bytes: usize) {
+        if let Some(outcome) = &self.route_outcome {
+            outcome.read(bytes);
+        }
+        if let Some(control) = &self.egress_control {
+            control.pace_read_without_wait(bytes);
+        }
         match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
                 if let Some(control) = &self.transfer_control {
@@ -2066,10 +2127,7 @@ impl NntpConnection {
         self.health_lease
             .as_ref()
             .is_none_or(|lease| lease.0.current())
-            && self
-                .socket_slot
-                .as_ref()
-                .is_none_or(|slot| !slot.retiring())
+            && self.socket_slot.as_ref().is_none_or(|slot| slot.reusable())
     }
 
     /// The server's advertised capabilities.

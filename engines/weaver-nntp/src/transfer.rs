@@ -564,6 +564,26 @@ impl ServerTransferControl {
         self.record_lifetime_bytes(bytes as u64);
     }
 
+    /// Read-path pacing without quota admission, shared by all connections on an egress.
+    pub async fn pace_read_async(&self, bytes: usize) -> Duration {
+        self.record_lifetime_bytes(bytes as u64);
+        match self.reserve_rate(bytes as u64) {
+            Some(ticket) => self.wait_async(ticket).await,
+            None => Duration::ZERO,
+        }
+    }
+    pub fn pace_read_blocking(&self, bytes: usize) -> Duration {
+        self.record_lifetime_bytes(bytes as u64);
+        match self.reserve_rate(bytes as u64) {
+            Some(ticket) => self.wait_blocking(ticket),
+            None => Duration::ZERO,
+        }
+    }
+    pub fn pace_read_without_wait(&self, bytes: usize) {
+        self.record_lifetime_bytes(bytes as u64);
+        let _ = self.reserve_rate(bytes as u64);
+    }
+
     /// Reserve the estimated raw BODY payload before issuing `BODY`.
     pub fn try_reserve(
         self: &Arc<Self>,
