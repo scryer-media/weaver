@@ -48,18 +48,28 @@ impl Member {
         }
     }
     async fn warm(&self) -> Result<(), DialError> {
-        tokio::time::timeout(self.dialer.budget(), self.warm_inner())
-            .await
-            .unwrap_or_else(|_| {
+        match tokio::time::timeout(self.dialer.budget(), self.warm_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.dialer.retire_idle().await;
                 Err(DialError::Timeout {
                     stage: format!("pool member {} preparation", self.id),
                 })
-            })
+            }
+        }
     }
     async fn warm_inner(&self) -> Result<(), DialError> {
         let _gate = self.session_gate.lock().await;
-        if self.status.lock().expect("pool member").warmed {
-            return Ok(());
+        {
+            let status = self.status.lock().expect("pool member");
+            if let Some(reason) = &status.blocked {
+                return Err(DialError::Fatal(weaver_tunnel::TunnelError::Engine(
+                    reason.clone(),
+                )));
+            }
+            if status.warmed {
+                return Ok(());
+            }
         }
         let started = Instant::now();
         let result = self.dialer.prepare().await;
@@ -210,6 +220,22 @@ impl PoolState {
         });
         dialed
     }
+    fn pool_error(&self, error: DialError) -> DialError {
+        let members = self.members.read().expect("pool members");
+        let all_blocked = !members.is_empty()
+            && members
+                .values()
+                .all(|member| member.status.lock().expect("pool member").blocked.is_some());
+        if all_blocked {
+            DialError::Fatal(weaver_tunnel::TunnelError::Engine(
+                "all pool members are blocked".into(),
+            ))
+        } else if matches!(error, DialError::Fatal(_)) {
+            DialError::Egress(std::io::Error::other(error))
+        } else {
+            error
+        }
+    }
     async fn run(
         self: Arc<Self>,
         target: Target,
@@ -223,6 +249,22 @@ impl PoolState {
             if self.stopped.load(Ordering::Acquire) {
                 return;
             }
+            {
+                let members = self.members.read().expect("pool members");
+                let mut plan = self.plan.lock().expect("pool plan");
+                let eligible = plan
+                    .snapshot()
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| candidate.candidate)
+                    .filter(|id| {
+                        members.get(id).is_some_and(|member| {
+                            member.status.lock().expect("pool member").blocked.is_none()
+                        })
+                    })
+                    .collect();
+                plan.set_candidates(eligible, Instant::now().into_std());
+            }
             let action = self
                 .plan
                 .lock()
@@ -231,7 +273,10 @@ impl PoolState {
             match action {
                 Attempt::Wait(_) => notified.await,
                 Attempt::Fail(_, message) => {
-                    let _ = reply.take().unwrap().send(Err(DialError::Skipped(message)));
+                    let _ = reply
+                        .take()
+                        .unwrap()
+                        .send(Err(self.pool_error(DialError::Skipped(message))));
                     return;
                 }
                 Attempt::Dial(order) => {
@@ -260,15 +305,11 @@ impl PoolState {
                                         plan.failed(id, Instant::now().into_std())
                                     });
                                 }
-                                let fatal = matches!(error, DialError::Fatal(_));
                                 last = error;
-                                if fatal {
-                                    break;
-                                }
                             }
                         }
                     }
-                    let _ = reply.take().unwrap().send(Err(last));
+                    let _ = reply.take().unwrap().send(Err(self.pool_error(last)));
                     return;
                 }
                 Attempt::Race { candidates, reason } => {
@@ -280,48 +321,12 @@ impl PoolState {
                             .filter_map(|id| members.get(id).cloned())
                             .collect()
                     };
-                    let mut warm = JoinSet::new();
-                    for member in &members {
-                        let member = member.clone();
-                        warm.spawn(async move {
-                            let result = member.warm().await;
-                            (member, result)
-                        });
-                    }
-                    let mut fatal = None;
-                    let mut ready = Vec::new();
                     let mut last = DialError::Skipped("no enabled pool member".into());
-                    while let Some(result) = warm.join_next().await {
-                        match result {
-                            Ok((member, Ok(()))) => ready.push(member),
-                            Ok((_, Err(error @ DialError::Fatal(_)))) => fatal = Some(error),
-                            Ok((member, Err(error))) => {
-                                if error.is_evidence() {
-                                    self.record(&member, |plan| {
-                                        plan.failed(member.id, Instant::now().into_std())
-                                    });
-                                }
-                                last = error;
-                            }
-                            Err(error) => last = DialError::Egress(std::io::Error::other(error)),
-                        }
-                    }
-                    if let Some(error) = fatal {
-                        let members = self.members.read().expect("pool members");
-                        if revision == self.revision.load(Ordering::Acquire) {
-                            self.plan.lock().expect("pool plan").race_finished(
-                                Err((std::io::ErrorKind::PermissionDenied, error.to_string())),
-                                reason,
-                                Instant::now().into_std(),
-                            );
-                        }
-                        drop(members);
-                        self.changed.notify_waiters();
-                        let _ = reply.take().unwrap().send(Err(error));
-                        return;
-                    }
                     let mut race = JoinSet::new();
-                    for member in ready {
+                    for member in members {
+                        if member.status.lock().expect("pool member").blocked.is_some() {
+                            continue;
+                        }
                         let target = target.clone();
                         race.spawn(async move {
                             let result = member.dial(&target).await;
@@ -354,20 +359,15 @@ impl PoolState {
                                 }
                             }
                             Err(error) => {
-                                if matches!(error, DialError::Timeout { .. }) {
+                                if matches!(&error, DialError::Timeout { stage } if !stage.ends_with("preparation"))
+                                {
                                     slow.push(id);
                                 } else if error.is_evidence() {
                                     self.record(&member, |plan| {
                                         plan.failed(id, Instant::now().into_std())
                                     });
                                 }
-                                if matches!(error, DialError::Fatal(_)) {
-                                    if let Some(reply) = reply.take() {
-                                        let _ = reply.send(Err(error));
-                                    }
-                                } else {
-                                    last = error;
-                                }
+                                last = error;
                             }
                         }
                     }
@@ -394,7 +394,7 @@ impl PoolState {
                         continue;
                     }
                     if let Some(reply) = reply {
-                        let _ = reply.send(Err(last));
+                        let _ = reply.send(Err(self.pool_error(last)));
                     }
                     return;
                 }
@@ -603,13 +603,14 @@ impl PoolStage {
         order
             .into_iter()
             .filter_map(|id| members.get(&id))
+            .filter(|member| member.status.lock().expect("pool member").blocked.is_none())
             .map(|member| {
                 (
                     member.id,
                     Arc::new(MemberLease {
                         member: member.clone(),
                         state: self.state.clone(),
-                        _reservation: MemberOpening::new(member.clone()),
+                        reservation: Mutex::new(None),
                     }) as Arc<dyn Dialer>,
                 )
             })
@@ -628,7 +629,15 @@ impl PoolStage {
 struct MemberLease {
     member: Arc<Member>,
     state: Arc<PoolState>,
-    _reservation: MemberOpening,
+    reservation: Mutex<Option<MemberOpening>>,
+}
+impl MemberLease {
+    fn reserve(&self) {
+        self.reservation
+            .lock()
+            .expect("member lease")
+            .get_or_insert_with(|| MemberOpening::new(self.member.clone()));
+    }
 }
 #[async_trait::async_trait]
 impl Dialer for MemberLease {
@@ -654,7 +663,12 @@ impl Dialer for MemberLease {
         {
             return Err(DialError::Skipped("pool member changed".into()));
         }
-        let (dialed, elapsed) = self.member.dial(target).await?;
+        self.reserve();
+        let (dialed, elapsed) = self
+            .member
+            .dial(target)
+            .await
+            .map_err(|error| self.state.pool_error(error))?;
         if !self.state.record(&self.member, |plan| {
             plan.connected(self.member.id, elapsed, Instant::now().into_std())
         }) {
@@ -663,6 +677,7 @@ impl Dialer for MemberLease {
         Ok(self.state.decorate(self.member.clone(), dialed))
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.reserve();
         self.member.dialer.resolve(host).await
     }
     fn budget(&self) -> Duration {

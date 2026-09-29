@@ -349,7 +349,7 @@ fn a_first_race_with_nothing_resolved_fails_the_connect() {
 
     let error = plan.connect(&dialer).unwrap_err();
 
-    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+    assert_eq!(error.kind(), io::ErrorKind::Other);
     let snapshot = plan.snapshot();
     assert_eq!(snapshot.pinned, None);
     assert_eq!(snapshot.races_failed, 1);
@@ -935,7 +935,7 @@ fn a_failed_first_race_with_nothing_resolved_fails_later_connects_without_dialli
 
     let error = plan.connect(&dialer).unwrap_err();
 
-    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+    assert_eq!(error.kind(), io::ErrorKind::Other);
     assert!(dialer.take_dialled().is_empty());
     assert_eq!(plan.snapshot().races_failed, 1);
 }
@@ -1066,4 +1066,20 @@ fn a_session_that_reaches_the_server_clears_the_pins_failed_setups() {
     assert_eq!(next, pinned);
     assert_eq!(dialer.take_dialled(), vec![pinned]);
     assert_eq!(plan.snapshot().races_won, 1);
+}
+
+#[test]
+fn unresolved_server_is_destination_evidence_even_without_cached_candidates() {
+    let dialer = ScriptedDialer::new(&[]);
+    dialer.resolve_to_nothing();
+    let plan = plan();
+    for _ in 0..2 {
+        let error = weaver_tunnel::pipe::DialError::destination(plan.connect(&dialer).unwrap_err());
+        assert!(matches!(
+            error,
+            weaver_tunnel::pipe::DialError::Destination(_)
+        ));
+        assert!(!error.is_path_evidence());
+    }
+    assert!(dialer.take_dialled().is_empty());
 }

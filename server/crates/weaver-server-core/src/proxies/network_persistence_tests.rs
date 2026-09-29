@@ -233,7 +233,7 @@ fn unused_resources_can_be_updated_and_deleted_without_affecting_system() {
 }
 
 #[tokio::test]
-async fn restored_missing_egress_uses_system_and_keeps_a_warning_until_edited() {
+async fn restored_missing_egress_stays_down_until_explicitly_repaired() {
     let source = Database::open_in_memory().unwrap();
     source
         .insert_server(&crate::servers::ServerConfig {
@@ -290,8 +290,13 @@ async fn restored_missing_egress_uses_system_and_keeps_a_warning_until_edited() 
     for _ in 0..2 {
         {
             let legs = route.legs.read().unwrap();
-            assert_eq!(legs[0].definition.egress_id, 0);
+            assert_eq!(legs[0].definition.egress_id, 91);
             assert!(legs[0].warning.as_ref().unwrap().contains("91"));
+            assert_eq!(route.weighted.allocations()[0].target, 0);
+            assert!(matches!(
+                route.weighted.allocations()[0].health,
+                crate::proxies::LegHealthState::Down(_)
+            ));
         }
         runtime.reload().await.unwrap();
     }
@@ -311,4 +316,34 @@ async fn restored_missing_egress_uses_system_and_keeps_a_warning_until_edited() 
     runtime.reload().await.unwrap();
     assert!(route.legs.read().unwrap()[0].warning.is_none());
     runtime.stop_all().await;
+}
+
+#[test]
+fn logical_backup_before_egress_catalog_restores_system_defaults() {
+    let source = Database::open_in_memory().unwrap();
+    source.save_proxy_profile(&profile(7)).unwrap();
+    let mut archive = source.export_logical_backup().unwrap();
+    for table in ["egress_interfaces", "proxy_pools"] {
+        archive.tables.remove(table);
+    }
+    let mut target = Database::open_in_memory().unwrap();
+    target.set_encryption_key(source.encryption_key().unwrap().clone());
+    assert!(
+        target
+            .import_logical_backup(
+                &archive.staging.path().join("tables"),
+                &archive.tables,
+                archive.schema_version
+            )
+            .is_err()
+    );
+    target
+        .import_logical_backup(&archive.staging.path().join("tables"), &archive.tables, 50)
+        .unwrap();
+    assert_eq!(
+        target.list_egress_interfaces().unwrap(),
+        [EgressInterface::system()]
+    );
+    assert!(target.list_proxy_pools().unwrap().is_empty());
+    assert_eq!(target.list_proxy_profiles().unwrap().len(), 1);
 }

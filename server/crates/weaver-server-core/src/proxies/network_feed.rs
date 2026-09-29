@@ -185,12 +185,14 @@ impl tokio::io::AsyncRead for FeedStream {
                 }
                 return Poll::Ready(Ok(()));
             }
-            let mut bytes = [0u8; 8192];
-            let mut read = tokio::io::ReadBuf::new(&mut bytes);
-            match std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut read) {
-                Poll::Ready(Ok(())) if !read.filled().is_empty() => {
-                    let count = read.filled().len();
-                    self.pending.extend_from_slice(read.filled());
+            let this = self.as_mut().get_mut();
+            this.pending.resize(8192, 0);
+            let mut read = tokio::io::ReadBuf::new(&mut this.pending);
+            let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read);
+            let count = read.filled().len();
+            this.pending.truncate(count);
+            match result {
+                Poll::Ready(Ok(())) if count > 0 => {
                     self.outcome.read(count);
                     if let Some(pacing) = self.pacing.clone() {
                         self.waiting =

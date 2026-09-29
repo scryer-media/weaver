@@ -20,6 +20,7 @@ pub enum SocketEgress {
 #[derive(Default)]
 struct InterfaceFamilies {
     at: Option<std::time::Instant>,
+    monitored: bool,
     families: std::collections::HashSet<(String, bool)>,
 }
 static INTERFACE_FAMILIES: std::sync::OnceLock<std::sync::RwLock<InterfaceFamilies>> =
@@ -30,15 +31,17 @@ pub fn cache_interface_families(families: impl IntoIterator<Item = (String, bool
     let cache = INTERFACE_FAMILIES.get_or_init(Default::default);
     *cache.write().expect("interface families") = InterfaceFamilies {
         at: Some(std::time::Instant::now()),
+        monitored: true,
         families: families.into_iter().collect(),
     };
 }
 fn interface_supports(name: &str, ipv4: bool) -> bool {
     let cache = INTERFACE_FAMILIES.get_or_init(Default::default);
     let snapshot = cache.read().expect("interface families");
-    if snapshot
-        .at
-        .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+    if snapshot.monitored
+        || snapshot
+            .at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
     {
         return snapshot
             .families
@@ -219,7 +222,7 @@ pub fn usable_address(address: IpAddr) -> bool {
             !ip.is_unspecified()
                 && !ip.is_multicast()
                 && !ip.is_unicast_link_local()
-                && ip.octets()[0] != 0xfd
+                && !ip.is_unique_local()
         }
     }
 }

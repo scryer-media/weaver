@@ -58,6 +58,8 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
       : name === "Job" ? { jobDetailSnapshot: snapshot(id) }
       : name === "JobOutputFiles" ? { jobOutputFiles: { outputDir: `/job-${id}`, files: [], totalBytes: 0 } }
       : name === "DuplicateSnapshot" ? { duplicateSnapshot: null }
+      : name === "Networking" ? { egressInterfaces: [{ id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, addresses: [], enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null }], proxyProfiles: [], proxyPools: [], servers: [], rssFeeds: [], discoverNetworkInterfaces: [], platformNetworking: { platform: "fixture", egressBindingKinds: ["SYSTEM"], sourceAddressHint: null, container: false, bridgeNetworkSuspected: false, maxWireguardInstances: 1, notes: [] } }
+      : name === "NetworkFlow" || name === "NetworkFlowUpdates" ? { networkFlow: { legs: [], sampledAt: 1767225600, consumers: [], proxies: [], proxyPools: [], egresses: [], pools: [] } }
       : { servers, proxies: [], categories: [], schedules: [], generalSettings: {} };
     // Real urql hooks receive no new result until the test explicitly delivers it.
     if (held.has(name) || (id === 2 && ["Server", "Job", "JobDetailUpdates", "JobOutputFiles", "DuplicateSnapshot"].includes(name))) {

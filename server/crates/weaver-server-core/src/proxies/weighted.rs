@@ -154,6 +154,12 @@ impl AllocationState {
     }
 }
 
+pub(super) struct PreparedUpdate {
+    route: Route,
+    legs: Vec<Arc<dyn Dialer>>,
+    cap: u16,
+}
+
 struct Shared {
     state: Mutex<AllocationState>,
     changed: Arc<Notify>,
@@ -235,14 +241,19 @@ impl Weighted {
                 }
                 let next = state.snapshot();
                 let previous = route.shared.targets.borrow();
-                let changed = next.iter().zip(previous.iter()).any(|(a, b)| {
-                    a.target != b.target
-                        || a.health != b.health
-                        || a.bytes_per_second != b.bytes_per_second
-                });
+                let capacity_changed = next
+                    .iter()
+                    .zip(previous.iter())
+                    .any(|(a, b)| a.target != b.target || a.health != b.health);
+                let metrics_changed = next
+                    .iter()
+                    .zip(previous.iter())
+                    .any(|(a, b)| a.bytes_per_second != b.bytes_per_second);
                 drop(previous);
-                if changed {
+                if capacity_changed {
                     route.shared.publish(&state);
+                } else if metrics_changed {
+                    route.shared.targets.send_replace(next);
                 }
             }
         }));
@@ -336,10 +347,22 @@ impl Weighted {
         }
     }
     pub fn update(&self, route: Route, legs: Vec<Arc<dyn Dialer>>, cap: u16) -> Result<(), String> {
+        self.apply_update(Self::prepare_update(route, legs, cap)?);
+        Ok(())
+    }
+    pub(super) fn prepare_update(
+        route: Route,
+        legs: Vec<Arc<dyn Dialer>>,
+        cap: u16,
+    ) -> Result<PreparedUpdate, String> {
         route.validate_allocation()?;
         if route.legs.len() != legs.len() {
             return Err("a dialer is required for every leg".into());
         }
+        Ok(PreparedUpdate { route, legs, cap })
+    }
+    pub(super) fn apply_update(&self, update: PreparedUpdate) {
+        let PreparedUpdate { route, legs, cap } = update;
         let mut state = self.shared.state.lock().expect("leg allocation");
         let mut old = self.legs.write().expect("route stages");
         state.generation = state.generation.wrapping_add(1);
@@ -365,7 +388,6 @@ impl Weighted {
         state.route = route;
         state.cap = cap;
         self.shared.publish(&state);
-        Ok(())
     }
     fn begin(&self) -> Result<Opening, DialError> {
         let mut state = self.shared.state.lock().expect("leg allocation");

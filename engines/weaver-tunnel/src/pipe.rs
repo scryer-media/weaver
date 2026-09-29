@@ -151,9 +151,14 @@ impl Dialed {
             stream: self.stream,
             outcome: self.outcome,
             _session: None,
+            _capacity: None,
         })
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("no address resolved for the destination")]
+pub struct ResolutionFailed;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DialError {
@@ -193,6 +198,12 @@ impl DialError {
         )
     }
     pub fn destination(error: io::Error) -> Self {
+        if error
+            .get_ref()
+            .is_some_and(|source| source.is::<ResolutionFailed>())
+        {
+            return Self::Destination(error);
+        }
         match error.kind() {
             io::ErrorKind::AddrNotAvailable
             | io::ErrorKind::NotFound
@@ -259,6 +270,25 @@ pub struct Egress {
 }
 
 impl Egress {
+    pub fn connect_error(&self, error: io::Error) -> DialError {
+        if !matches!(self.binding, SocketEgress::System)
+            && matches!(
+                error.kind(),
+                io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable
+            )
+        {
+            let via = match &self.binding {
+                SocketEgress::Interface(name) => name.clone(),
+                SocketEgress::SourceAddress(address) => address.to_string(),
+                SocketEgress::System => String::new(),
+            };
+            return DialError::Egress(io::Error::new(
+                error.kind(),
+                format!("no route via {via}: {error}"),
+            ));
+        }
+        DialError::destination(error)
+    }
     pub async fn connect_address(&self, peer: SocketAddr) -> Result<Dialed, DialError> {
         let stream = tokio::time::timeout(self.timeout, self.binding.connect(peer))
             .await
@@ -268,7 +298,7 @@ impl Egress {
                     "destination connect timed out",
                 ))
             })?
-            .map_err(DialError::destination)?;
+            .map_err(|error| self.connect_error(error))?;
         let source = stream.local_addr().ok();
         Ok(Dialed {
             stream: DialedStream::Socket(stream),
@@ -437,6 +467,7 @@ impl EndpointTransport for InnerTransport {
                 stream: dialed.stream,
                 outcome: dialed.outcome,
                 _session: None,
+                _capacity: None,
             }),
         })
     }
@@ -446,6 +477,7 @@ struct OutcomeStream {
     stream: DialedStream,
     outcome: Arc<ConnectionOutcome>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 impl Drop for OutcomeStream {
     fn drop(&mut self) {
@@ -485,7 +517,37 @@ impl AsyncWrite for OutcomeStream {
     }
 }
 
+#[derive(Default)]
+pub struct SessionCapacity {
+    pub budget: Option<Arc<tokio::sync::Semaphore>>,
+    permit: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
+}
+impl SessionCapacity {
+    fn acquire(&self) -> Result<Option<Arc<tokio::sync::OwnedSemaphorePermit>>, DialError> {
+        let Some(budget) = &self.budget else {
+            return Ok(None);
+        };
+        let mut permit = self.permit.lock().expect("session capacity");
+        if permit.is_none() {
+            *permit = Some(Arc::new(budget.clone().try_acquire_owned().map_err(|_| {
+                DialError::Skipped("WireGuard session budget is exhausted; retry after an idle session retires".into())
+            })?));
+        }
+        Ok(permit.clone())
+    }
+    fn release(&self) {
+        self.permit.lock().expect("session capacity").take();
+    }
+    pub fn new(budget: Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            budget: Some(budget),
+            permit: Mutex::new(None),
+        }
+    }
+}
+
 pub struct SessionHop {
+    pub capacity: SessionCapacity,
     /// Shared by every use of this canonical session path.
     pub activity: Arc<tokio::sync::RwLock<()>>,
     pub id: u32,
@@ -501,11 +563,19 @@ pub struct SessionHop {
 #[async_trait::async_trait]
 impl Dialer for SessionHop {
     async fn prepare(&self) -> Result<(), DialError> {
-        let _activity = self.activity.read().await;
-        self.provider
+        let activity = self.activity.read().await;
+        let capacity = self.capacity.acquire()?;
+        let result = self
+            .provider
             .prepare()
             .await
-            .map_err(|e| DialError::hop(self.id, e))
+            .map_err(|e| DialError::hop(self.id, e));
+        drop(capacity);
+        drop(activity);
+        if result.is_err() {
+            self.retire_idle().await;
+        }
+        result
     }
     async fn retire(&self) {
         // Another pool or direct rung can share this session. An idle member
@@ -515,6 +585,7 @@ impl Dialer for SessionHop {
     async fn retire_idle(&self) -> bool {
         if let Ok(_activity) = self.activity.try_write() {
             self.provider.retire().await;
+            self.capacity.release();
             true
         } else {
             false
@@ -522,8 +593,9 @@ impl Dialer for SessionHop {
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let activity = self.activity.clone().read_owned().await;
+        let capacity = self.capacity.acquire()?;
         let outcome = Arc::new(ConnectionOutcome::default());
-        let stream = tokio::time::timeout(
+        let connected = tokio::time::timeout(
             self.budget(),
             self.provider
                 .dial_observed(&target.host, target.port, outcome.clone()),
@@ -531,8 +603,17 @@ impl Dialer for SessionHop {
         .await
         .map_err(|_| DialError::Timeout {
             stage: self.describe(),
-        })?
-        .map_err(|error| DialError::hop(self.id, error))?;
+        })
+        .and_then(|result| result.map_err(|error| DialError::hop(self.id, error)));
+        let stream = match connected {
+            Ok(stream) => stream,
+            Err(error) => {
+                drop(capacity);
+                drop(activity);
+                self.retire_idle().await;
+                return Err(error);
+            }
+        };
         let metadata = self
             .transport
             .as_ref()
@@ -550,6 +631,7 @@ impl Dialer for SessionHop {
                 stream: DialedStream::Tunnel(stream),
                 outcome: outcome.clone(),
                 _session: Some(activity),
+                _capacity: capacity,
             })),
             outcome,
             path,
@@ -560,6 +642,7 @@ impl Dialer for SessionHop {
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
         let _activity = self.activity.read().await;
+        let _capacity = self.capacity.acquire()?;
         match &self.resolver {
             Some(provider) => provider
                 .resolve_host(host)
@@ -574,6 +657,7 @@ impl Dialer for SessionHop {
     }
     async fn shutdown(&self) {
         self.provider.shutdown().await;
+        self.capacity.release();
         self.inner.shutdown().await;
     }
     fn describe(&self) -> String {

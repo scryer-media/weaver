@@ -29,6 +29,14 @@ pub fn max_wireguard_instances() -> usize {
     })
 }
 
+pub(super) fn wireguard_session_budget() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static BUDGET: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    BUDGET
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(max_wireguard_instances())))
+        .clone()
+}
+
 pub fn validate_instance_budget(
     routes: &[Route],
     profiles: &HashMap<u32, ProxyProfile>,

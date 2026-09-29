@@ -116,7 +116,9 @@ impl NetworkRuntime {
             sessions: Mutex::new(HashMap::new()),
             pools: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
-            interfaces: InterfaceMonitor::start(Arc::new(SystemInterfaceSource), &self.handle),
+            interfaces: self.interfaces.clone(),
+            compiling: false,
+            pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
             egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::new()),
             #[cfg(test)]

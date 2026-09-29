@@ -455,10 +455,7 @@ impl AddressPlan {
             resolved.clone()
         };
         if candidates.is_empty() {
-            let error = io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "no address resolved for the server",
-            );
+            let error = io::Error::other(weaver_tunnel::pipe::ResolutionFailed);
             ticket.finish(Err(&error), None, Vec::new());
             return Err(error);
         }

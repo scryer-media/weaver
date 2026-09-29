@@ -168,18 +168,27 @@ pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), St
         .fetch_all("SELECT consumer, policy FROM proxy_routes", &[])
         .await?
     {
-        let mut route = stored_route(&row.text("policy")?)?;
-        // Match restore-time runtime normalization without rewriting the saved warning.
-        // New route writes still reject missing references in validate_policy.
-        for leg in &mut route.legs {
-            if !egresses.contains_key(&leg.egress_id) {
-                leg.egress_id = 0;
-            }
+        let route = stored_route(&row.text("policy")?)?;
+        // Missing restored egresses remain disabled in the runtime. Validate the other
+        // references against placeholders without changing their persisted identity.
+        let mut restored_egresses = egresses.clone();
+        for leg in &route.legs {
+            restored_egresses
+                .entry(leg.egress_id)
+                .or_insert_with(|| EgressInterface {
+                    id: leg.egress_id,
+                    name: "Missing restored egress".into(),
+                    binding: EgressBinding::Interface {
+                        name: "missing-restored-egress".into(),
+                    },
+                    enabled: true,
+                    max_download_speed: 0,
+                });
         }
         if route.legacy_policy().is_none() {
             route
                 .validate_references(
-                    &egresses,
+                    &restored_egresses,
                     &profiles,
                     &pools,
                     row.text("consumer")?.starts_with("rss:"),

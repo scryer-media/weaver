@@ -78,8 +78,10 @@ impl Configuration {
         for (consumer, policy) in &mut configuration.policies {
             for (position, leg) in policy.legs.iter_mut().enumerate() {
                 if !configuration.egresses.contains_key(&leg.egress_id) {
-                    configuration.warnings.insert((consumer.clone(),position),format!("Restored egress {} is missing; using System. Edit this route to choose an egress.",leg.egress_id));
-                    leg.egress_id = 0;
+                    configuration.warnings.insert(
+                        (consumer.clone(), position),
+                        format!("Restored egress {} is missing; this leg is Down until its egress is repaired.", leg.egress_id),
+                    );
                 }
             }
         }
@@ -115,6 +117,8 @@ pub struct NetworkProbe {
     pub elapsed: Duration,
 }
 
+type StagedPoolMembers = HashMap<(u32, u32), Vec<(u32, Arc<dyn Dialer>)>>;
+
 pub struct NetworkRuntime {
     pub egress_controls: Arc<weaver_nntp::transfer::ServerTransferRegistry>,
     #[cfg(test)]
@@ -125,14 +129,19 @@ pub struct NetworkRuntime {
     sessions: Mutex<HashMap<String, Arc<dyn Dialer>>>,
     pools: Mutex<HashMap<(u32, u32), Arc<PoolStage>>>,
     routes: Mutex<HashMap<String, Arc<LiveNetworkRoute>>>,
-    interfaces: InterfaceMonitor,
+    interfaces: Arc<InterfaceMonitor>,
+    compiling: bool,
+    pool_updates: Mutex<StagedPoolMembers>,
     poll: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl NetworkRuntime {
     pub fn new(db: Database, handle: tokio::runtime::Handle) -> Result<Arc<Self>, String> {
         let configuration = Configuration::load(&db)?;
-        let interfaces = InterfaceMonitor::start(Arc::new(SystemInterfaceSource), &handle);
+        let interfaces = Arc::new(InterfaceMonitor::start(
+            Arc::new(SystemInterfaceSource),
+            &handle,
+        ));
         let egress_controls = Arc::new(weaver_nntp::transfer::ServerTransferRegistry::new());
         for egress in configuration.egresses.values() {
             egress_controls.configure(
@@ -154,6 +163,8 @@ impl NetworkRuntime {
             pools: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             interfaces,
+            compiling: false,
+            pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
         });
         let weak = Arc::downgrade(&runtime);
@@ -364,6 +375,11 @@ impl NetworkRuntime {
                     .cloned()
                     .unwrap_or(provider);
                 Arc::new(SessionHop {
+                    capacity: if profile.kind == ProxyKind::WireGuard {
+                        weaver_tunnel::pipe::SessionCapacity::new(wireguard_session_budget())
+                    } else {
+                        Default::default()
+                    },
                     activity: Default::default(),
                     id,
                     provider,
@@ -401,7 +417,14 @@ impl NetworkRuntime {
                 .expect("network pools")
                 .get(&(id, bottom.id))
             {
-                stage.set_members(Vec::new());
+                if self.compiling {
+                    self.pool_updates
+                        .lock()
+                        .expect("staged pools")
+                        .insert((id, bottom.id), Vec::new());
+                } else {
+                    stage.set_members(Vec::new());
+                }
             }
             return Ok(Arc::new(Unavailable(format!("pool {id} is disabled"))));
         }
@@ -418,16 +441,25 @@ impl NetworkRuntime {
             .collect::<Result<Vec<_>, String>>()?;
         let mut pools = self.pools.lock().expect("network pools");
         let stage = if let Some(stage) = pools.get(&(id, bottom.id)) {
-            let revision = stage.revision();
-            stage.set_members(members);
-            if stage.revision() != revision {
-                stage.prewarm();
+            if self.compiling {
+                self.pool_updates
+                    .lock()
+                    .expect("staged pools")
+                    .insert((id, bottom.id), members);
+            } else {
+                let revision = stage.revision();
+                stage.set_members(members);
+                if stage.revision() != revision {
+                    stage.prewarm();
+                }
             }
             stage.clone()
         } else {
             let stage = PoolStage::new(id, members, self.handle.clone());
             pools.insert((id, bottom.id), stage.clone());
-            stage.prewarm();
+            if !self.compiling {
+                stage.prewarm();
+            }
             stage
         };
         Ok(stage)
@@ -440,10 +472,25 @@ impl NetworkRuntime {
         leg: &RouteLeg,
         timeout: Duration,
     ) -> Result<LiveLeg, String> {
+        if !config.egresses.contains_key(&leg.egress_id) {
+            let warning = format!(
+                "Egress {} is missing; this leg is Down until repaired",
+                leg.egress_id
+            );
+            return Ok(LiveLeg {
+                definition: leg.clone(),
+                warning: Some(warning.clone()),
+                stage: Arc::new(Revocable::new(Arc::new(Unavailable(warning)))),
+                address_plan: None,
+                ladder: None,
+                signature: format!("missing:{}", leg.egress_id),
+            });
+        }
         let bottom = Self::bottom(config, leg.egress_id, timeout)?;
         let mut address_plan = None;
         let mut ladder = None;
         let mut versions = Vec::new();
+        let mut pool_versions = Vec::new();
         let stage: Arc<dyn Dialer> = match &leg.path {
             LegPath::Direct => {
                 if matches!(consumer, Consumer::Server(_)) {
@@ -468,7 +515,17 @@ impl NetworkRuntime {
                             versions.push((*id, config.profiles.get(id).map(|p| p.revision)));
                             self.hop(config, *id, bottom.clone(), bottom.clone(), &[])?
                         }
-                        Rung::Pool { id } => self.pool(config, *id, bottom.clone())?,
+                        Rung::Pool { id } => {
+                            let pool = config.pools.get(id).ok_or("proxy pool does not exist")?;
+                            pool_versions.push((pool.id, pool.enabled, pool.member_ids.clone()));
+                            for member in &pool.member_ids {
+                                versions.push((
+                                    *member,
+                                    config.profiles.get(member).map(|p| p.revision),
+                                ));
+                            }
+                            self.pool(config, *id, bottom.clone())?
+                        }
                         Rung::Chain { ids } => {
                             let mut stage: Arc<dyn Dialer> = bottom.clone();
                             for (index, id) in ids.iter().enumerate() {
@@ -489,7 +546,7 @@ impl NetworkRuntime {
             }
         };
         let signature = format!(
-            "{}:{:?}:{}:{versions:?}",
+            "{}:{:?}:{}:{versions:?}:{pool_versions:?}",
             leg.egress_id,
             bottom.binding,
             serde_json::to_string(&leg.path).map_err(|e| e.to_string())?
@@ -549,7 +606,10 @@ impl NetworkRuntime {
         for (position, leg) in legs.iter().enumerate() {
             weighted.set_egress_health(
                 position,
-                snapshot.health(&config.egresses[&leg.definition.egress_id], None),
+                config.egresses.get(&leg.definition.egress_id).map_or_else(
+                    || EgressHealth::Down("Egress is missing".into()),
+                    |egress| snapshot.health(egress, None),
+                ),
             );
         }
         let route = Arc::new(LiveNetworkRoute {
@@ -589,15 +649,33 @@ impl NetworkRuntime {
     fn apply_configuration(&self, next: Configuration) -> Result<(), String> {
         // Route lookups must see configuration and compiled paths from the same reload.
         let mut configuration = self.configuration.write().expect("network configuration");
-        for route in self.live_routes() {
-            if !next.consumers.contains(&route.consumer.key()) {
-                for leg in route.legs.read().expect("route legs").iter() {
-                    leg.stage.revoke();
-                }
-                self.routes
+        let mut staging = Self {
+            db: self.db.clone(),
+            handle: self.handle.clone(),
+            configuration: RwLock::new(next.clone()),
+            sessions: Mutex::new(self.sessions.lock().expect("network sessions").clone()),
+            pools: Mutex::new(self.pools.lock().expect("network pools").clone()),
+            routes: Mutex::new(HashMap::new()),
+            interfaces: self.interfaces.clone(),
+            compiling: true,
+            pool_updates: Mutex::new(HashMap::new()),
+            poll: Mutex::new(None),
+            egress_controls: self.egress_controls.clone(),
+            #[cfg(test)]
+            fixture_providers: Mutex::new(
+                self.fixture_providers
                     .lock()
-                    .expect("network routes")
-                    .remove(&route.consumer.key());
+                    .expect("fixture providers")
+                    .clone(),
+            ),
+        };
+        let mut updates = Vec::new();
+        let mut removed = Vec::new();
+        let mut routes = self.live_routes();
+        routes.sort_by_key(|route| route.consumer.key());
+        for route in routes {
+            if !next.consumers.contains(&route.consumer.key()) {
+                removed.push(route);
                 continue;
             }
             let definition = next
@@ -611,21 +689,23 @@ impl NetworkRuntime {
                 .iter()
                 .enumerate()
                 .map(|(position, leg)| {
-                    self.leg(&next, route.consumer, position, leg, route.timeout)
+                    staging.leg(&next, route.consumer, position, leg, route.timeout)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut old = route.legs.write().expect("route legs");
-            for (position, new) in fresh.iter_mut().enumerate() {
-                if let Some(prior) = old
-                    .get(position)
-                    .filter(|prior| prior.signature == new.signature)
-                {
-                    new.stage = prior.stage.clone();
-                    new.address_plan = prior.address_plan.clone();
-                    new.ladder = prior.ladder.clone();
+            {
+                let old = route.legs.read().expect("route legs");
+                for (position, new) in fresh.iter_mut().enumerate() {
+                    if let Some(prior) = old
+                        .get(position)
+                        .filter(|prior| prior.signature == new.signature)
+                    {
+                        new.stage = prior.stage.clone();
+                        new.address_plan = prior.address_plan.clone();
+                        new.ladder = prior.ladder.clone();
+                    }
                 }
             }
-            route.weighted.update(
+            let allocation = Weighted::prepare_update(
                 definition,
                 fresh
                     .iter()
@@ -633,6 +713,31 @@ impl NetworkRuntime {
                     .collect(),
                 route.cap.load(std::sync::atomic::Ordering::Acquire),
             )?;
+            updates.push((route, fresh, allocation));
+        }
+        // Everything below commits already validated objects; preparation above never
+        // changes live membership, allocations, sessions, or revocation state.
+        *self.sessions.lock().expect("network sessions") =
+            std::mem::take(staging.sessions.get_mut().expect("staged sessions"));
+        *self.pools.lock().expect("network pools") =
+            std::mem::take(staging.pools.get_mut().expect("staged pools"));
+        for (key, members) in std::mem::take(staging.pool_updates.get_mut().expect("staged pools"))
+        {
+            self.pools.lock().expect("network pools")[&key].set_members(members);
+        }
+        let snapshot = self.interfaces();
+        for (route, fresh, allocation) in updates {
+            let mut old = route.legs.write().expect("route legs");
+            route.weighted.apply_update(allocation);
+            for (position, leg) in fresh.iter().enumerate() {
+                route.weighted.set_egress_health(
+                    position,
+                    next.egresses.get(&leg.definition.egress_id).map_or_else(
+                        || EgressHealth::Down("Egress is missing".into()),
+                        |egress| snapshot.health(egress, None),
+                    ),
+                );
+            }
             for (position, prior) in old.iter().enumerate() {
                 if fresh
                     .get(position)
@@ -642,6 +747,15 @@ impl NetworkRuntime {
                 }
             }
             *old = fresh;
+        }
+        for route in removed {
+            for leg in route.legs.read().expect("route legs").iter() {
+                leg.stage.revoke();
+            }
+            self.routes
+                .lock()
+                .expect("network routes")
+                .remove(&route.consumer.key());
         }
         for egress in next.egresses.values() {
             self.egress_controls.configure(
@@ -669,26 +783,38 @@ impl NetworkRuntime {
             pool.set_members(Vec::new());
         }
         *configuration = next;
+        for pool in self.pools.lock().expect("network pools").values() {
+            pool.prewarm();
+        }
         Ok(())
     }
     async fn retire_unused_sessions(&self) {
         loop {
-            let retired = {
+            let candidates: Vec<_> = self
+                .sessions
+                .lock()
+                .expect("network sessions")
+                .iter()
+                .filter(|(_, stage)| Arc::strong_count(stage) == 1)
+                .map(|(key, stage)| (key.clone(), stage.clone()))
+                .collect();
+            let mut removed = false;
+            for (key, stage) in candidates {
+                if !stage.retire_idle().await {
+                    continue;
+                }
                 let mut sessions = self.sessions.lock().expect("network sessions");
-                let keys: Vec<_> = sessions
-                    .iter()
-                    .filter(|(_, stage)| Arc::strong_count(stage) == 1)
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                keys.into_iter()
-                    .filter_map(|key| sessions.remove(&key))
-                    .collect::<Vec<_>>()
-            };
-            if retired.is_empty() {
-                break;
+                if sessions
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &stage))
+                    && Arc::strong_count(&stage) == 2
+                {
+                    sessions.remove(&key);
+                    removed = true;
+                }
             }
-            for stage in retired {
-                stage.retire().await;
+            if !removed {
+                break;
             }
         }
     }
@@ -808,3 +934,7 @@ impl Dialer for Unavailable {
         self.0.clone()
     }
 }
+
+#[cfg(test)]
+#[path = "network_runtime_tests.rs"]
+mod tests;

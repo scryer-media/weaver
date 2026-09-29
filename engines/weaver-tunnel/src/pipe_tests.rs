@@ -209,6 +209,7 @@ async fn idle_retirement_preserves_channels_shared_by_other_consumers() {
     }
     let provider = Arc::new(Provider::default());
     let hop = SessionHop {
+        capacity: Default::default(),
         activity: Default::default(),
         id: 3,
         provider: provider.clone(),
@@ -273,5 +274,70 @@ async fn fallback_keeps_real_error_before_a_skipped_rung() {
     assert!(matches!(
         ladder.dial(&target("127.0.0.1:119".parse().unwrap())).await,
         Err(DialError::Egress(_))
+    ));
+}
+
+#[test]
+fn unresolved_destination_and_bound_route_failures_have_distinct_evidence() {
+    let unresolved = DialError::destination(io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        ResolutionFailed,
+    ));
+    assert!(matches!(unresolved, DialError::Destination(_)));
+    assert!(!unresolved.is_path_evidence());
+    for kind in [
+        io::ErrorKind::NetworkUnreachable,
+        io::ErrorKind::HostUnreachable,
+    ] {
+        for binding in [
+            SocketEgress::Interface("fixture-link".into()),
+            SocketEgress::SourceAddress("192.0.2.1".parse().unwrap()),
+        ] {
+            let egress = Egress {
+                id: 1,
+                binding,
+                timeout: Duration::from_secs(1),
+            };
+            let failure = egress.connect_error(io::Error::from(kind));
+            assert!(failure.is_path_evidence());
+            assert!(failure.to_string().contains("no route via"));
+        }
+        let system = Egress {
+            id: 0,
+            binding: SocketEgress::System,
+            timeout: Duration::from_secs(1),
+        };
+        assert!(
+            !system
+                .connect_error(io::Error::from(kind))
+                .is_path_evidence()
+        );
+    }
+}
+
+#[test]
+fn session_budget_counts_probes_and_keeps_live_stream_reservations() {
+    let budget = Arc::new(tokio::sync::Semaphore::new(1));
+    let live = SessionCapacity::new(budget.clone());
+    let probe = SessionCapacity::new(budget.clone());
+    let stream = live.acquire().unwrap();
+    assert!(matches!(probe.acquire(), Err(DialError::Skipped(_))));
+    live.release();
+    assert!(matches!(probe.acquire(), Err(DialError::Skipped(_))));
+    drop(stream);
+    let probe_stream = probe.acquire().unwrap();
+    assert_eq!(budget.available_permits(), 0);
+    drop(probe_stream);
+    probe.release();
+    assert_eq!(budget.available_permits(), 1);
+}
+
+#[test]
+fn both_unique_local_ipv6_prefixes_are_filtered_consistently() {
+    for ip in ["fc00::1", "fd00::1"] {
+        assert!(!crate::egress::usable_address(ip.parse().unwrap()));
+    }
+    assert!(crate::egress::usable_address(
+        "2001:db8::1".parse().unwrap()
     ));
 }

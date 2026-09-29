@@ -124,14 +124,28 @@ impl Database {
                 let tables_dir = tables_dir.to_path_buf();
                 let expected = expected.clone();
                 self.run_sql_blocking_local(move || async move {
-                    import_sqlite(pool, &tables_dir, &expected, allow_older_catalog).await
+                    import_sqlite(
+                        pool,
+                        &tables_dir,
+                        &expected,
+                        allow_older_catalog,
+                        source_schema_version,
+                    )
+                    .await
                 })
             }
             StoreDatastore::Postgres { pool } => {
                 let tables_dir = tables_dir.to_path_buf();
                 let expected = expected.clone();
                 self.run_sql_blocking_read(async move {
-                    import_postgres(pool, &tables_dir, &expected, allow_older_catalog).await
+                    import_postgres(
+                        pool,
+                        &tables_dir,
+                        &expected,
+                        allow_older_catalog,
+                        source_schema_version,
+                    )
+                    .await
                 })
             }
         }
@@ -707,6 +721,7 @@ async fn import_sqlite(
     tables_dir: &Path,
     expected: &BTreeMap<String, TablePartMetadata>,
     allow_older_catalog: bool,
+    source_schema_version: i64,
 ) -> Result<(), StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_sqlite_catalog(&mut conn).await?;
@@ -722,8 +737,7 @@ async fn import_sqlite(
     .await?;
     let export =
         ordered_sqlite_tables(&mut conn, &actual, &[BackupTableClassification::Export]).await?;
-    validate_manifest_tables(expected, &export)?;
-    let import = export;
+    let import = import_table_order(expected, &export, source_schema_version)?;
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *conn)
         .await
@@ -749,6 +763,14 @@ async fn import_sqlite(
                 allow_older_catalog,
             )
             .await?;
+        }
+        if source_schema_version < EGRESS_CATALOG_SCHEMA_VERSION
+            && !expected.contains_key("egress_interfaces")
+        {
+            sqlx::query(SYSTEM_EGRESS_SEED)
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
         }
         let system_egress: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM egress_interfaces WHERE id = 0")
@@ -791,6 +813,7 @@ async fn import_postgres(
     tables_dir: &Path,
     expected: &BTreeMap<String, TablePartMetadata>,
     allow_older_catalog: bool,
+    source_schema_version: i64,
 ) -> Result<(), StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_postgres_catalog(&mut conn).await?;
@@ -807,8 +830,7 @@ async fn import_postgres(
     .await?;
     let export =
         ordered_postgres_tables(&mut tx, &actual, &[BackupTableClassification::Export]).await?;
-    validate_manifest_tables(expected, &export)?;
-    let import = export;
+    let import = import_table_order(expected, &export, source_schema_version)?;
     for table in clear.iter().rev() {
         let query = format!("DELETE FROM {}", quote_identifier(table));
         sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
@@ -826,6 +848,14 @@ async fn import_postgres(
         )
         .await?;
     }
+    if source_schema_version < EGRESS_CATALOG_SCHEMA_VERSION
+        && !expected.contains_key("egress_interfaces")
+    {
+        sqlx::query(SYSTEM_EGRESS_SEED)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
     let system_egress: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM egress_interfaces WHERE id = 0")
             .fetch_one(&mut *tx)
@@ -839,6 +869,27 @@ async fn import_postgres(
     validate_postgres_counts(&mut tx, expected).await?;
     repair_postgres_sequences(&mut tx).await?;
     tx.commit().await.map_err(db_err)
+}
+
+const EGRESS_CATALOG_SCHEMA_VERSION: i64 = 51;
+const SYSTEM_EGRESS_SEED: &str = "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, created_at, updated_at) VALUES (0, 'System', 'system', NULL, 1, 0, 0, 0)";
+
+fn import_table_order(
+    expected: &BTreeMap<String, TablePartMetadata>,
+    export: &[String],
+    source_schema_version: i64,
+) -> Result<Vec<String>, StateError> {
+    let import: Vec<_> = export
+        .iter()
+        .filter(|table| {
+            !(source_schema_version < EGRESS_CATALOG_SCHEMA_VERSION
+                && matches!(table.as_str(), "egress_interfaces" | "proxy_pools")
+                && !expected.contains_key(*table))
+        })
+        .cloned()
+        .collect();
+    validate_manifest_tables(expected, &import)?;
+    Ok(import)
 }
 
 fn validate_manifest_tables(

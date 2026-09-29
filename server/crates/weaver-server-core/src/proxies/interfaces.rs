@@ -20,17 +20,7 @@ pub struct InterfaceAddress {
 
 impl InterfaceAddress {
     pub fn usable(&self) -> bool {
-        !self.deprecated
-            && !self.tentative
-            && match self.address {
-                IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_link_local(),
-                IpAddr::V6(ip) => {
-                    !ip.is_unspecified()
-                        && !ip.is_multicast()
-                        && !ip.is_unicast_link_local()
-                        && ip.octets()[0] != 0xfd
-                }
-            }
+        !self.deprecated && !self.tentative && weaver_tunnel::egress::usable_address(self.address)
     }
 }
 

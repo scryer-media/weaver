@@ -227,3 +227,32 @@ async fn destination_errors_and_untyped_stream_failures_leave_legs_up() {
             .all(|leg| leg.health == LegHealthState::Up)
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn throughput_publish_does_not_wake_capacity_waiters() {
+    use std::future::Future;
+    let (weighted, _) = create(5);
+    let dialed = weighted.dial(&target()).await.unwrap();
+    let changed = weighted.budget_changed();
+    let waiting = changed.notified();
+    tokio::pin!(waiting);
+    waiting.as_mut().enable();
+    let mut updates = weighted.subscribe();
+    dialed.outcome.read(1024);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    while updates
+        .borrow_and_update()
+        .iter()
+        .all(|leg| leg.bytes_per_second == 0)
+    {
+        updates.changed().await.unwrap();
+    }
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    drop(dialed);
+    waiting.await;
+}

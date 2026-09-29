@@ -103,11 +103,14 @@ async fn linux_device_binding_uses_loopback() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn macos_device_binding_uses_loopback() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let binding = SocketEgress::Interface("lo0".into());
-    let (client, accepted) = tokio::join!(
-        binding.connect(listener.local_addr().unwrap()),
-        listener.accept()
-    );
-    assert_eq!(client.unwrap().local_addr().unwrap(), accepted.unwrap().1);
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let binding = SocketEgress::Interface("lo0".into());
+        let client = binding
+            .connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert_eq!(client.local_addr().unwrap(), peer);
+    }
 }

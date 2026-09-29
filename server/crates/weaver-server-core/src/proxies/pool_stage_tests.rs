@@ -163,6 +163,10 @@ async fn feed_lease_prevents_idle_retirement_until_released() {
     let lease = pool.lease().unwrap();
     let member = pool.state.members.read().unwrap()[&1].clone();
     member.warm().await.unwrap();
+    assert_eq!(pool.snapshot().1[0].opening, 0);
+    lease.resolve("news.invalid").await.unwrap();
+    assert_eq!(pool.snapshot().1[0].opening, 1);
+    assert_eq!(pool.snapshot().1[1].opening, 0);
     tokio::time::advance(POOL_IDLE_RETIRE).await;
     member.retire_if_idle().await;
     assert_eq!(members[0].retired.load(Ordering::SeqCst), 0);
@@ -231,24 +235,66 @@ impl Dialer for FatalMember {
     }
 }
 #[tokio::test]
-async fn fatal_member_stops_pool_and_fallback_without_opening_another_channel() {
+async fn fatal_member_is_isolated_and_profile_replacement_clears_its_block() {
     let (_, members, mut started) = fixtures();
     let pool = PoolStage::new(
         7,
         vec![(1, Arc::new(FatalMember)), (2, members[1].clone())],
         tokio::runtime::Handle::current(),
     );
-    let fallback = weaver_tunnel::pipe::Fallback::new(vec![pool.clone(), members[0].clone()]);
-    assert!(matches!(
-        fallback.dial(&target()).await,
-        Err(DialError::Fatal(_))
-    ));
-    assert!(started.try_recv().is_err());
-    assert_eq!(pool.snapshot().0.races_failed, 1);
-    assert_eq!(
-        pool.snapshot().1[0].blocked.as_deref(),
-        Some("tunnel engine unavailable: trust rejected")
+    let feed_pool = PoolStage::new(
+        8,
+        vec![(1, Arc::new(FatalMember)), (2, members[1].clone())],
+        tokio::runtime::Handle::current(),
     );
+    let failed_feed_member = feed_pool
+        .lease_members()
+        .into_iter()
+        .find(|(id, _)| *id == 1)
+        .unwrap()
+        .1;
+    assert!(matches!(
+        failed_feed_member.dial(&target()).await,
+        Err(DialError::Egress(_))
+    ));
+    for _ in 0..2 {
+        members[1].gate.add_permits(1);
+        let dialed = pool.dial(&target()).await.unwrap();
+        assert_eq!(dialed.path.member, Some(2));
+        assert_eq!(started.recv().await.unwrap(), 2);
+    }
+    assert!(pool.snapshot().1[0].blocked.is_some());
+    assert!(pool.lease_members().iter().all(|(id, _)| *id == 2));
+    pool.set_members(vec![(1, members[0].clone()), (2, members[1].clone())]);
+    assert!(
+        pool.snapshot()
+            .1
+            .iter()
+            .all(|member| member.blocked.is_none())
+    );
+    let lease = pool
+        .lease_members()
+        .into_iter()
+        .find(|(id, _)| *id == 1)
+        .unwrap()
+        .1;
+    members[0].gate.add_permits(1);
+    assert_eq!(lease.dial(&target()).await.unwrap().path.member, Some(1));
+}
+
+#[tokio::test]
+async fn all_blocked_members_preserve_fatal_trust_failure() {
+    let pool = PoolStage::new(
+        7,
+        vec![(1, Arc::new(FatalMember))],
+        tokio::runtime::Handle::current(),
+    );
+    for _ in 0..2 {
+        assert!(matches!(
+            pool.dial(&target()).await,
+            Err(DialError::Fatal(_))
+        ));
+    }
 }
 
 #[tokio::test]
@@ -314,11 +360,16 @@ async fn hung_preparation_is_bounded_and_other_member_can_win() {
         async move { pool.dial(&target()).await }
     });
     prepared.recv().await.unwrap();
-    tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(started.recv().await.unwrap(), 2);
     members[1].gate.add_permits(1);
     let winner = caller.await.unwrap().unwrap();
     assert_eq!(winner.path.member, Some(2));
+    assert_eq!(pool.snapshot().0.races_won, 0);
+    let finished = pool.state.changed.notified();
+    tokio::pin!(finished);
+    finished.as_mut().enable();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    finished.await;
     assert_eq!(
         pool.snapshot()
             .0
