@@ -294,7 +294,10 @@ export function ProvidersPanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<TestResult | null>(null);
+  const [submittedTestResult, setTestResult] = useState<(TestResult & { values: ServerForm }) | null>(null);
+  const testResult = submittedTestResult && JSON.stringify(submittedTestResult.values) === JSON.stringify(form)
+    ? submittedTestResult
+    : null;
   const [confirmRemove, setConfirmRemove] = useState<Server | null>(null);
   const [confirmTrust, setConfirmTrust] = useState<{ derBase64: string; fingerprint: string; names: string[] } | null>(null);
 
@@ -357,6 +360,7 @@ export function ProvidersPanel() {
 
   const patch = (next: Partial<ServerForm>) => {
     if (values) {
+      setConfirmTrust(null);
       setForm({ ...values, ...next });
     }
   };
@@ -442,11 +446,11 @@ export function ProvidersPanel() {
     const result = await testConnection({ input: serverInput(provider) });
     if (session !== editorSession.current) return;
     setTesting(false);
-    setTestResult((result.data?.testConnection as TestResult) ?? null);
+    setTestResult(result.data?.testConnection ? { ...(result.data.testConnection as TestResult), values: provider } : null);
   };
 
   const trust = () => {
-    if (!values || !confirmTrust) {
+    if (!values || !confirmTrust || !testResult) {
       return;
     }
     const next = {

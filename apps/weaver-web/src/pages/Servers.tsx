@@ -279,6 +279,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   const [testing, setTesting] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{
+    values: ServerFormValues;
     success: boolean;
     message: string;
     latencyMs?: number;
@@ -367,7 +368,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       },
     });
     if (session !== editorSession.current) return;
-    setTestResult(result.data?.testConnection ?? null);
+    setTestResult(result.data?.testConnection ? { ...result.data.testConnection, values } : null);
     setTesting(false);
   }
 
@@ -737,7 +738,7 @@ function ServerFormCard({
   testing,
   resettingQuota,
   saveError,
-  testResult,
+  testResult: submittedTestResult,
   onSave,
   onTest,
   onRequestQuotaReset,
@@ -751,6 +752,7 @@ function ServerFormCard({
   resettingQuota: boolean;
   saveError: string | null;
   testResult: {
+    values: ServerFormValues;
     success: boolean;
     message: string;
     latencyMs?: number;
@@ -769,6 +771,9 @@ function ServerFormCard({
 }) {
   const t = useTranslate();
   const [values, setValues] = useState(initialValues);
+  const testResult = submittedTestResult && JSON.stringify(submittedTestResult.values) === JSON.stringify(values)
+    ? submittedTestResult
+    : null;
   const [showTlsWarning, setShowTlsWarning] = useState(false);
   const [pendingCertificateAdoption, setPendingCertificateAdoption] = useState<{
     derBase64: string;
@@ -852,7 +857,8 @@ function ServerFormCard({
               id="server-host"
               value={values.host}
               placeholder="news.example.com"
-              onChange={(event) => setValues((current) => ({ ...current, host: event.target.value }))}
+              onChange={(event) => setValues((current) => ({ ...current, host: event.target.value,
+                tlsNameMismatchCertificateDerBase64: null, tlsNameMismatchCertificateFingerprint: null }))}
               onBlur={() =>
                 setValues((current) => ({ ...current, host: normalizeServerHost(current.host) }))
               }
@@ -863,7 +869,8 @@ function ServerFormCard({
               id="server-port"
               type="number"
               value={values.port}
-              onChange={(event) => setValues((current) => ({ ...current, port: Number(event.target.value) }))}
+              onChange={(event) => setValues((current) => ({ ...current, port: Number(event.target.value),
+                tlsNameMismatchCertificateDerBase64: null, tlsNameMismatchCertificateFingerprint: null }))}
             />
           </Field>
           <Field label={t("servers.username")} htmlFor="server-username">
@@ -1219,12 +1226,12 @@ function ServerFormCard({
         />
 
         <ConfirmDialog
-          open={pendingCertificateAdoption != null}
+          open={pendingCertificateAdoption != null && testResult != null}
           title="Adopt hostname-mismatched certificate?"
           message="This is dangerous. Normal TLS verification remains required first; this certificate is accepted only when hostname validation fails. A different hostname-mismatched certificate will be rejected."
           confirmLabel="Adopt certificate"
           onConfirm={() => {
-            if (!pendingCertificateAdoption) return;
+            if (!pendingCertificateAdoption || !testResult) return;
             setValues((current) => ({
               ...current,
               tlsNameMismatchCertificateDerBase64: pendingCertificateAdoption.derBase64,

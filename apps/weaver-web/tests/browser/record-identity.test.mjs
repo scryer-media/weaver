@@ -100,6 +100,51 @@ for (const variant of ["legacy", "next"]) {
     } finally { await page.close(); }
   });
 
+  test(`${variant}: connection changes hide a previous test certificate`, RUNNER_BOUND, async () => {
+    const page = await open(variant);
+    try {
+      await edit(page, variant, 1);
+      await host(page, variant).waitFor();
+      await page.getByRole("button", { name: /^Test connection$/i }).click();
+      await page.getByText("old-fingerprint", { exact: false }).waitFor();
+      await host(page, variant).fill("changed-provider.example");
+      assert.equal(await page.getByText("old-fingerprint", { exact: false }).count(), 0);
+      assert.equal(await page.getByText("Result for provider 1", { exact: true }).count(), 0);
+    } finally { await page.close(); }
+  });
+
+  if (variant === "legacy") for (const field of ["host", "port"]) test(`legacy: changing ${field} clears an adopted certificate`, RUNNER_BOUND, async () => {
+    const page = await open(variant);
+    try {
+      await edit(page, variant, 1);
+      await host(page, variant).waitFor();
+      await page.getByRole("button", { name: /^Test connection$/i }).click();
+      await page.getByRole("button", { name: "Adopt presented certificate", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Adopt certificate", exact: true }).click();
+      await page.getByText("Adopted hostname-mismatched certificate:", { exact: true }).waitFor();
+      await page.locator(`#server-${field}`).fill(field === "host" ? "changed-provider.example" : "443");
+      assert.equal(await page.getByText("old-fingerprint", { exact: false }).count(), 0);
+      await page.getByRole("button", { name: /^(Save|Save changes)$/i }).click();
+      await page.waitForFunction(() => window.recordFixture.mutations.some((m) => m.name === "UpdateServer"));
+      const input = await page.evaluate(() => window.recordFixture.mutations.find((m) => m.name === "UpdateServer").variables.input);
+      assert.equal(input.tlsNameMismatchCertificateDerBase64, null);
+    } finally { await page.close(); }
+  });
+
+  if (variant === "legacy") test("legacy: editing during a test cannot expose the old certificate", RUNNER_BOUND, async () => {
+    const page = await open(variant);
+    try {
+      await edit(page, variant, 1);
+      await host(page, variant).waitFor();
+      await page.evaluate(() => window.recordFixture.hold("TestConnection"));
+      await page.getByRole("button", { name: /^Test connection$/i }).click();
+      await pending(page, "TestConnection");
+      await host(page, variant).fill("changed-provider.example");
+      await release(page, "TestConnection");
+      assert.equal(await page.getByText("old-fingerprint", { exact: false }).count(), 0);
+    } finally { await page.close(); }
+  });
+
   test(`${variant}: a late save cannot close a reopened editor`, RUNNER_BOUND, async () => {
     const page = await open(variant);
     try {
@@ -154,6 +199,23 @@ for (const variant of ["legacy", "next"]) {
       await page.getByRole("heading", { name: "Job-2", exact: true }).waitFor();
       assert.equal(await page.getByRole("dialog").count(), 0);
       assert.equal(await page.evaluate(() => window.recordFixture.mutations.length), 0);
+    } finally { await page.close(); }
+  });
+
+  test(`${variant}: a completed deletion cannot navigate away from another job`, RUNNER_BOUND, async () => {
+    const page = await open(variant, "jobs");
+    try {
+      await page.getByRole("heading", { name: "Job-1", exact: true }).waitFor();
+      await page.evaluate(() => window.recordFixture.hold("AcceptHistoryDelete"));
+      await page.getByRole("button", { name: variant === "next" ? /Delete.*keep/i : /^Delete$/ }).first().click();
+      await page.getByRole("dialog").getByRole("button", { name: /Delete/i }).click();
+      await pending(page, "AcceptHistoryDelete");
+      await page.evaluate(() => window.recordFixture.navigate("/jobs/2"));
+      await pending(page, "Job");
+      await release(page, "Job");
+      await page.getByRole("heading", { name: "Job-2", exact: true }).waitFor();
+      await release(page, "AcceptHistoryDelete");
+      assert.equal(await page.getByRole("heading", { name: "Job-2", exact: true }).count(), 1);
     } finally { await page.close(); }
   });
 

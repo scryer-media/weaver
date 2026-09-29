@@ -165,6 +165,11 @@ function JobDetailContent() {
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
+  const active = useRef(false);
+  useEffect(() => {
+    active.current = true;
+    return () => { active.current = false; };
+  }, []);
   const statusLabel = useStatusLabel();
   const { connection } = useNextData();
   const variables = useMemo(() => ({ id: jobId }), [jobId]);
@@ -921,7 +926,7 @@ function JobDetailContent() {
                 const result = await acceptHistoryDelete({
                   input: { mode: "IDS", ids: [job.id], deleteFiles },
                 });
-                if (!result.error) {
+                if (!result.error && active.current) {
                   navigate("/history");
                 }
                 return result;
