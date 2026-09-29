@@ -3,6 +3,7 @@ package weaver
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -655,3 +656,49 @@ func TestWeaverReleasePlaywrightBudgetLeavesTheWindupBeforeTheKill(t *testing.T)
 	}
 }
 
+func TestWaitForReleaseHostPortsWaitsOutThePreviousStack(t *testing.T) {
+	env := map[string]string{
+		"E2E_NNTP_PORT":     "55830",
+		"E2E_NNTP_TLS_PORT": "55831",
+		"E2E_NNTP2_PORT":    "55832",
+		"E2E_WEAVER_PORT":   "55836",
+		"E2E_NZBGET_PORT":   "55838",
+	}
+	// The previous stack's forwarder still holds nntp2's port for two probes.
+	stillHeld := 2
+	var probed []int
+	held := func(port int) error {
+		probed = append(probed, port)
+		if port == 55832 && stillHeld > 0 {
+			stillHeld--
+			return syscall.EADDRINUSE
+		}
+		return nil
+	}
+	polls := 0
+	waitForReleaseHostPorts([]string{"nntp", "nntp2", "weaver"}, func(key string) string { return env[key] }, held, func() { polls++ })
+
+	if want := []int{55830, 55831, 55832, 55832, 55832, 55836}; !slices.Equal(probed, want) {
+		t.Fatalf("probed %v, want %v", probed, want)
+	}
+	if polls != 2 {
+		t.Fatalf("polled %d times, want 2", polls)
+	}
+}
+
+func TestProbeHostPortHeldSeesAListener(t *testing.T) {
+	listener, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := probeHostPortHeld(port); err == nil {
+		t.Fatal("a listened port must read as held")
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeHostPortHeld(port); err != nil {
+		t.Fatalf("a released port must read as free: %v", err)
+	}
+}
