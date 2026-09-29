@@ -27,10 +27,10 @@ pub struct ProfileTuning {
     pub decode_threads: usize,
     /// Threads in the post-processing and chase pools: 7z and xz decode
     /// threads, PAR2 verify and repair, and concurrent chases all come from
-    /// these. Fixed when the pools are built, so a profile change reaches them
-    /// at the next start.
+    /// these. A profile change builds new pools for the work that starts after
+    /// it; work already running finishes on the pool it started on.
     pub extract_threads: usize,
-    /// A startup cap on concurrent downloads, chosen by the profile rather
+    /// A cap on concurrent downloads, chosen by the profile rather
     /// than derived from pressure. Per-job live memory scales with the number
     /// of downloads in flight, which is the whole point of the efficient
     /// profile; `None` leaves the configured connection count alone.
@@ -126,11 +126,18 @@ impl HardwareProfile {
         }
     }
 
-    /// Physical cores this machine can actually use. A fractional cgroup quota
-    /// rounds down but never to zero: half a core is still one thread's worth
-    /// of work, and a zero here would divide by nothing downstream.
+    /// Physical cores this machine can actually use. The physical count is
+    /// read host-wide, so it is capped by the CPUs this process may run on,
+    /// which an affinity mask or cpuset narrows without any quota. A
+    /// fractional cgroup quota rounds down but never to zero: half a core is
+    /// still one thread's worth of work, and a zero here would divide by
+    /// nothing downstream.
     pub fn effective_cores(probe: &SystemProfile) -> usize {
-        let cores = probe.cpu.physical_cores.max(1);
+        let cores = probe
+            .cpu
+            .physical_cores
+            .max(1)
+            .min(probe.cpu.logical_cores.max(1));
         match probe.cpu.cgroup_limit {
             Some(limit) if limit > 0.0 => cores.min((limit as usize).max(1)),
             _ => cores,

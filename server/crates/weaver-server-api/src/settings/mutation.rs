@@ -13,6 +13,21 @@ use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
 use weaver_server_core::{Database, SchedulerHandle};
 
+/// Refuse a schedule rule this machine could never apply, judged against the
+/// live probe as the hardware-profile choice is.
+fn validate_schedule_input(
+    ctx: &Context<'_>,
+    input: &crate::settings::types::ScheduleInput,
+) -> Result<()> {
+    let system = ctx.data::<crate::context::SystemRuntimeContext>()?;
+    let probe = system
+        .profile
+        .read()
+        .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
+        .clone();
+    input.validate(&probe).map_err(async_graphql::Error::new)
+}
+
 static SETTINGS_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -74,14 +89,16 @@ impl SettingsMutation {
         )
         .await?;
 
-        // Memory limits reach the next job that starts; the thread pools were
-        // sized at startup and keep their size until the next one.
-        handle.set_sevenz_decode_memory_bytes(chosen.tuning(&detected).sevenz_decode_memory_bytes);
+        // Every limit the profile decides, thread pools included, applies to
+        // the next download, decode and extraction that starts; work already
+        // running finishes under the limits it started with. A schedule rule
+        // with a profile in force keeps it until the schedule lets go.
+        handle.set_hardware_profile(chosen).await?;
 
-        Ok(crate::settings::types::HardwareProfileSettings::resolve(
-            Some(chosen),
-            &detected,
-        ))
+        Ok(
+            crate::settings::types::HardwareProfileSettings::resolve(Some(chosen), &detected)
+                .with_in_force(handle.hardware_profile_in_force()),
+        )
     }
 
     /// Update general settings.
@@ -442,6 +459,7 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
+        validate_schedule_input(ctx, &input)?;
         let entry = input.into_entry();
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
@@ -468,6 +486,7 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
+        validate_schedule_input(ctx, &input)?;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()

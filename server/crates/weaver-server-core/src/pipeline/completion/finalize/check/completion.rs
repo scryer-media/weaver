@@ -674,15 +674,42 @@ impl Pipeline {
                 clean_par2_integrity_gate,
                 CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
             );
+        // A damaged-path analysis this gate submitted, finished and parked for
+        // the served set, that found damage. It answers the question the
+        // strong-decode claim only guesses at, and it has already been paid
+        // for. The reason it was asked for can be gone by the time it lands —
+        // a gated chase that has since been demoted takes its gate with it —
+        // and the skip below would then settle a set this verdict calls
+        // damaged as clean, leaving the verdict parked and unread.
+        let parked_damaged_par2_verdict = self.par2_served_set_id(job_id).is_some_and(|set_id| {
+            self.par2_analysis_results
+                .get(&job_id)
+                .is_some_and(|(parked_set_id, result)| {
+                    *parked_set_id == set_id
+                        && result.as_ref().is_ok_and(|outcome| {
+                            par2_verification_needs_repair(&outcome.verification)
+                        })
+                })
+        });
         let authoritative_par2_verification_needed = par2_validation_needed
-            && (authoritative_par2_verification_owed || !direct_unpack_gated_sets.is_empty());
+            && (authoritative_par2_verification_owed
+                || !direct_unpack_gated_sets.is_empty()
+                || parked_damaged_par2_verdict);
         if authoritative_par2_verification_needed && !authoritative_par2_verification_owed {
-            info!(
-                job_id = job_id.0,
-                gated_sets = ?direct_unpack_gated_sets,
-                "a gated direct unpack chase forces the authoritative PAR2 pass — recovery data \
-                 reported damage, so the clean strong-decode verdict cannot stand"
-            );
+            if direct_unpack_gated_sets.is_empty() {
+                info!(
+                    job_id = job_id.0,
+                    "a finished PAR2 analysis found damage — the clean strong-decode verdict \
+                     cannot stand"
+                );
+            } else {
+                info!(
+                    job_id = job_id.0,
+                    gated_sets = ?direct_unpack_gated_sets,
+                    "a gated direct unpack chase forces the authoritative PAR2 pass — recovery \
+                     data reported damage, so the clean strong-decode verdict cannot stand"
+                );
+            }
         }
         // Shared by every fast path that skips the authoritative pass, so the
         // live short-circuit can never fire where the quick path would be

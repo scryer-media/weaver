@@ -19,9 +19,10 @@ pub struct TunedParameters {
     pub extract_thread_count: usize,
 }
 
-/// Holds the system profile and the limits derived from it. The only value
-/// that moves at runtime is the extraction concurrency, which follows the
-/// measured disk once the startup benchmark lands.
+/// Holds the system profile and the limits derived from it. They move at
+/// runtime when the hardware profile in force changes, and the extraction
+/// concurrency also follows the measured disk once the startup benchmark
+/// lands.
 pub struct RuntimeTuner {
     profile: SystemProfile,
     current: TunedParameters,
@@ -102,6 +103,28 @@ impl RuntimeTuner {
         self.current.max_concurrent_downloads = limit;
     }
 
+    /// Put another hardware profile's limits in force. Every limit here is read
+    /// where it is used, so work already running keeps what it started with
+    /// and the next download, decode or pool build sees the new values.
+    pub fn set_profile_tuning(&mut self, tuning: ProfileTuning) {
+        self.tuning = tuning;
+        self.current = TunedParameters {
+            max_concurrent_downloads: self.max_downloads_limit(),
+            decode_thread_count: tuning.decode_threads.max(1),
+            extract_thread_count: tuning.extract_threads.max(1),
+        };
+    }
+
+    /// The hardware profile limits in force.
+    pub fn profile_tuning(&self) -> ProfileTuning {
+        self.tuning
+    }
+
+    /// The machine the limits are resolved against.
+    pub fn system_profile(&self) -> &SystemProfile {
+        &self.profile
+    }
+
     /// Apply the asynchronous startup disk measurement without disrupting
     /// active work. Extraction admission reads this value on each promotion.
     pub fn set_random_read_iops(&mut self, random_read_iops: f64) {
@@ -119,7 +142,7 @@ impl RuntimeTuner {
         }
         if self.is_fast_storage() {
             // Fast storage: bottleneck is CPU decompression, not I/O.
-            let cores = self.profile.cpu.physical_cores;
+            let cores = HardwareProfile::effective_cores(&self.profile);
             cores.clamp(2, 6)
         } else {
             // Slow storage: head seeks between concurrent streams hurt.
@@ -141,11 +164,11 @@ impl RuntimeTuner {
 /// pressure turns a transient backlog into a lasting speed loss that only a
 /// restart undoes.
 ///
-/// A profile's cap is not that. It is a startup value the operator chose along
-/// with the profile — live per-job memory scales with the number of downloads
-/// in flight, so a machine that asked for the smallest footprint gets fewer of
-/// them — and it never moves in response to pressure. Only the efficient
-/// profile sets one.
+/// A profile's cap is not that. It is a value the operator chose along with
+/// the profile — live per-job memory scales with the number of downloads in
+/// flight, so a machine that asked for the smallest footprint gets fewer of
+/// them — and it moves only when the profile in force does, never in response
+/// to pressure. Only the efficient profile sets one.
 fn profile_download_limit(total_connections: usize, tuning: &ProfileTuning) -> usize {
     match tuning.max_concurrent_downloads_cap {
         Some(cap) => total_connections.min(cap),

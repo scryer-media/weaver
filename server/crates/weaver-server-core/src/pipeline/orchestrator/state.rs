@@ -293,9 +293,10 @@ impl Pipeline {
 
     /// Record that an archive set's source bytes are known wrong.
     ///
-    /// The one seam that records this today is a direct-store demotion whose
-    /// reason is damage (`DemotionReason::is_source_damage`), but the fact is
-    /// deliberately not tied to demotion: any path that establishes a volume
+    /// Two seams record this today: a direct-store demotion whose reason is
+    /// damage (`DemotionReason::is_source_damage`), and a direct-unpack part
+    /// completing with in-stream damage reported against it. The fact is
+    /// deliberately not tied to either: any path that establishes a volume
     /// is damaged before a recovery set has ruled — an in-place repair of a
     /// mismatched part included — records it here, and the completion gate
     /// keeps answering correctly without learning a new vocabulary.

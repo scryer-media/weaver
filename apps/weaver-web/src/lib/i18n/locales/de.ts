@@ -602,6 +602,8 @@ const de: LocaleDictionary = {
   "schedule.actionSpeedLimit": "Geschwindigkeitslimit",
   "schedule.actionPauseWatchFolder": "Watch-Folder-Scan pausieren",
   "schedule.actionResumeWatchFolder": "Watch-Folder-Scan fortsetzen",
+  "schedule.actionHardwareProfile": "Hardwareprofil",
+  "schedule.hardwareProfile": "Profil",
   "schedule.speedLimit": "Geschwindigkeitslimit",
   "schedule.days": "Tage",
   "schedule.daysHint": "Alle deaktiviert lassen für jeden Tag.",

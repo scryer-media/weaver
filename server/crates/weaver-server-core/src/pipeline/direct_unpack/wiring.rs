@@ -208,6 +208,11 @@ pub struct ChaseOutcome {
     /// and the verdict for it. Its members are built on bytes the recovery data
     /// calls wrong, and the report is still evidence finalize has to weigh once
     /// the worker is gone.
+    ///
+    /// A chase that failed on those bytes carries the report the same way. Its
+    /// failure says the decoder could not use them, not that the set has been
+    /// answered for, and without the report the conventional extraction that
+    /// follows a demotion would read the same damage unrepaired.
     pub damage_reported: bool,
 }
 
@@ -2444,7 +2449,7 @@ impl Pipeline {
             // Read after the worker is gone, so the answer cannot change under
             // it: the gate only lifts through a repair or a clean verdict, and
             // both act on armed sets.
-            let damage_reported = result.is_ok() && armed.coverage.is_gated();
+            let damage_reported = armed.coverage.is_gated();
 
             match &result {
                 Ok(outcome) => {
@@ -2498,6 +2503,14 @@ impl Pipeline {
                         elapsed_ms = elapsed.as_millis() as u64,
                         "direct unpack demoted"
                     );
+                    if damage_reported {
+                        info!(
+                            job_id = key.0.0,
+                            set_name = %key.1,
+                            "direct unpack failed under a standing damage report, so the \
+                             report outlives it"
+                        );
+                    }
                 }
             }
 
@@ -2652,12 +2665,20 @@ impl Pipeline {
     /// extraction ready: the completion check reads the gate from armed sets
     /// only, and a gate it sees is what turns a clean strong-decode claim into
     /// the authoritative PAR2 pass that repairs the part and resumes the chase.
+    ///
+    /// The damage is also put on record against the set itself, where the
+    /// completion check finds it whatever becomes of the chase: a worker that
+    /// fails, is reaped or is demoted takes its gate with it, and the bytes it
+    /// was gated on are just as wrong for the conventional extraction that
+    /// follows. So a part of a chased set is published even when nothing is
+    /// armed any more.
     pub(in crate::pipeline) fn publish_completed_part_to_chase(
         &mut self,
         job_id: JobId,
         file_id: crate::jobs::ids::NzbFileId,
     ) {
-        if self.direct_unpack.idle() {
+        if self.direct_unpack.idle() && !self.direct_unpack.watermark_targets.contains_key(&job_id)
+        {
             return;
         }
         let Some(state) = self.jobs.get(&job_id) else {
@@ -2673,6 +2694,58 @@ impl Pipeline {
         let received = file_asm.received_bytes();
         self.direct_unpack_note_commit(file_id, &filename, received, true);
         self.refresh_chased_part_by_filename(file_id, &filename, false);
+        let Some(set_name) = self
+            .direct_unpack
+            .watermark_targets
+            .get(&job_id)
+            .and_then(|targets| targets.get(&filename))
+            .map(|(set_name, _)| set_name.clone())
+        else {
+            return;
+        };
+        let damaged = self
+            .in_stream_chase_evidence(file_id)
+            .is_some_and(|(floor, _)| floor.is_some());
+        if damaged {
+            self.note_known_archive_set_damage(job_id, &set_name);
+            self.note_damage_on_reaped_chase(job_id, &filename);
+        }
+    }
+
+    /// Record recovery-reported damage in `filename` against a chase that has
+    /// already been reaped.
+    ///
+    /// A worker that returns in the gap between a part's last commit and its
+    /// completion can be reaped inside that gap too. The report then finds no
+    /// armed set to gate, and the outcome would stand as if no damage had
+    /// been reported at all.
+    pub(in crate::pipeline) fn note_damage_on_reaped_chase(
+        &mut self,
+        job_id: JobId,
+        filename: &str,
+    ) {
+        let Some((set_name, _)) = self
+            .direct_unpack
+            .watermark_targets
+            .get(&job_id)
+            .and_then(|targets| targets.get(filename))
+            .cloned()
+        else {
+            return;
+        };
+        let key = (job_id, set_name);
+        let Some(outcome) = self.direct_unpack.outcomes.get_mut(&key) else {
+            return;
+        };
+        if outcome.tainted || std::mem::replace(&mut outcome.damage_reported, true) {
+            return;
+        }
+        info!(
+            job_id = job_id.0,
+            set_name = %key.1,
+            "recovery data reports damage in a set whose direct unpack already returned, so \
+             the report stands against its outcome"
+        );
     }
 
     /// Mark a set's chase unusable because repair replaced bytes it read.
@@ -3057,10 +3130,12 @@ impl Pipeline {
     /// failed extraction and takes the repair path finalize already has for
     /// that.
     ///
-    /// A *finished* set counts for as long as its outcome is still installable:
-    /// one that completed under a standing report decoded the damaged range, and
-    /// dropping the report with the worker would let those members be installed
-    /// on the strength of the archive's type alone.
+    /// A *finished* set counts until a repair or a clean verdict retires its
+    /// outcome: one that completed under a standing report decoded the damaged
+    /// range, and dropping the report with the worker would let those members
+    /// be installed on the strength of the archive's type alone. One that
+    /// failed under it would hand the same damage to the conventional
+    /// extraction unrepaired.
     pub(in crate::pipeline) fn direct_unpack_gated_sets(&self, job_id: JobId) -> Vec<String> {
         if self.direct_unpack.armed.is_empty() && self.direct_unpack.outcomes.is_empty() {
             return Vec::new();

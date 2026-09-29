@@ -602,6 +602,8 @@ const it: LocaleDictionary = {
   "schedule.actionSpeedLimit": "Limite di Velocità",
   "schedule.actionPauseWatchFolder": "Pausa scansione cartella monitorata",
   "schedule.actionResumeWatchFolder": "Riprendi scansione cartella monitorata",
+  "schedule.actionHardwareProfile": "Profilo hardware",
+  "schedule.hardwareProfile": "Profilo",
   "schedule.speedLimit": "Limite di Velocità",
   "schedule.days": "Giorni",
   "schedule.daysHint": "Lascia tutti deselezionati per tutti i giorni.",

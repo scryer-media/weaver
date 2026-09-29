@@ -28,14 +28,15 @@ impl SettingsQuery {
         )
     }
     /// The hardware profile in force, and the profiles this machine can
-    /// honour. Judged against the live probe, so a container that was given
-    /// more memory since startup is offered what it has now.
+    /// honour. Judged against the machine as probed at startup, the same
+    /// probe the running limits were derived from.
     #[graphql(guard = "AdminGuard")]
     async fn hardware_profile(
         &self,
         ctx: &Context<'_>,
     ) -> Result<crate::settings::types::HardwareProfileSettings> {
         let config = ctx.data::<SharedConfig>()?;
+        let handle = ctx.data::<SchedulerHandle>()?;
         let system = ctx.data::<crate::context::SystemRuntimeContext>()?;
         let probe = system
             .profile
@@ -48,9 +49,10 @@ impl SettingsQuery {
         })
         .await;
 
-        Ok(crate::settings::types::HardwareProfileSettings::resolve(
-            selected, &probe,
-        ))
+        Ok(
+            crate::settings::types::HardwareProfileSettings::resolve(selected, &probe)
+                .with_in_force(handle.hardware_profile_in_force()),
+        )
     }
 
     /// Whether first-run setup is still owed to this install.

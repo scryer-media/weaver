@@ -20,6 +20,7 @@ import {
   initialProfile,
   offersProfileChoice,
   profileName,
+  scheduledProfileNotice,
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
@@ -347,6 +348,7 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
   // asking the daemon again.
   const saved = (state.data?.setHardwareProfile as HardwareProfileSettings | undefined) ?? settings;
   const value = chosen ?? initialProfile(saved);
+  const scheduledNotice = scheduledProfileNotice(t, saved);
 
   const pick = (next: HardwareProfileName) => {
     setChosen(next);
@@ -380,6 +382,8 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
       {saved.selected === null ? (
         <p className="text-[11.5px] text-wv-dim">{t("next.performance.notConfirmed")}</p>
       ) : null}
+      {scheduledNotice ? <p className="text-[11.5px] text-wv-dim">{scheduledNotice}</p> : null}
+      <p className="text-[11.5px] text-wv-dim">{t("next.performance.timing")}</p>
       {error ? (
         <p role="alert" className="text-[12.5px] text-wv-error-text">
           {error}

@@ -634,6 +634,27 @@ async fn a_profile_the_machine_cannot_honour_is_refused_by_name() {
     assert!(h.db.load_config().unwrap().hardware_profile.is_none());
 }
 
+/// A choice saved on a machine that could honour it, read back on one that no
+/// longer can, is not what runs: startup falls back to the recommendation, and
+/// the answer says so rather than naming a profile it does not offer.
+#[tokio::test]
+async fn a_saved_profile_the_machine_can_no_longer_honour_reads_as_not_chosen() {
+    let h = TestHarness::new().await;
+    h.config.write().await.hardware_profile =
+        Some(weaver_server_core::runtime::HardwareProfile::Performance);
+
+    let resp = h
+        .execute(&format!("{{ hardwareProfile {HARDWARE_PROFILE_FIELDS} }}"))
+        .await;
+    assert_no_errors(&resp);
+    let profile = &response_data(&resp)["hardwareProfile"];
+    assert!(
+        profile["selected"].is_null(),
+        "an unavailable saved profile is not reported as selected: {profile}"
+    );
+    assert_eq!(profile["recommended"], "BALANCED");
+}
+
 #[tokio::test]
 async fn the_hardware_profile_is_an_administrator_surface() {
     let h = TestHarness::new().await;
@@ -648,4 +669,29 @@ async fn the_hardware_profile_is_an_administrator_surface() {
         );
     }
     assert!(h.config.read().await.hardware_profile.is_none());
+}
+
+#[tokio::test]
+async fn the_profile_in_force_is_reported_beside_the_choice() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute("{ hardwareProfile { selected active scheduled } }")
+        .await;
+    assert_no_errors(&resp);
+    let profile = &response_data(&resp)["hardwareProfile"];
+    // Never chosen: the recommendation is what is in force.
+    assert!(profile["selected"].is_null());
+    assert_eq!(profile["active"], "BALANCED");
+    assert!(profile["scheduled"].is_null());
+
+    let resp = h
+        .execute(
+            "mutation { setHardwareProfile(profile: EFFICIENT) { selected active scheduled } }",
+        )
+        .await;
+    assert_no_errors(&resp);
+    let profile = &response_data(&resp)["setHardwareProfile"];
+    assert_eq!(profile["selected"], "EFFICIENT");
+    assert_eq!(profile["active"], "EFFICIENT");
+    assert!(profile["scheduled"].is_null());
 }

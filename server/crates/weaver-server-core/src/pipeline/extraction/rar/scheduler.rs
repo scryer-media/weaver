@@ -1775,7 +1775,14 @@ impl Pipeline {
                         return;
                     }
                     self.purge_empty_rar_set_if_idle(job_id, &set_name);
-                    if Self::is_recoverable_full_set_extraction_error(&e) {
+                    // Asked first and whatever the error: a claim the failure
+                    // contradicts is reopened even when the error is one the
+                    // retry route already recognises.
+                    let strong_decode_claim_reopened =
+                        self.reopen_strong_decode_claim_after_failed_extraction(job_id, &set_name);
+                    if strong_decode_claim_reopened
+                        || Self::is_recoverable_full_set_extraction_error(&e)
+                    {
                         self.phase_end_extracting_if_idle(job_id);
                         self.set_failed_extraction_member(job_id, &set_name);
                         self.check_job_completion(job_id).await;

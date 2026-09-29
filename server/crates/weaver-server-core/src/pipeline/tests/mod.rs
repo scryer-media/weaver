@@ -49,6 +49,7 @@ mod decode_and_files;
 mod direct_store;
 mod direct_unpack;
 mod download_dispatch;
+mod hardware_profile;
 mod health_probe;
 mod par2_completion;
 mod par2_multiset_binding;
@@ -465,6 +466,51 @@ async fn new_direct_pipeline_at_roots(
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
+    new_direct_pipeline_on_machine(
+        data_dir,
+        intermediate_dir,
+        complete_dir,
+        db_path,
+        buffer_config,
+        total_connections,
+        direct_store,
+        SystemProfile {
+            cpu: CpuProfile {
+                physical_cores: 4,
+                logical_cores: 4,
+                simd: SimdSupport::default(),
+                cgroup_limit: None,
+            },
+            memory: MemoryProfile {
+                total_bytes: 8 * 1024 * 1024 * 1024,
+                available_bytes: 8 * 1024 * 1024 * 1024,
+                cgroup_limit: None,
+            },
+            disk: DiskProfile {
+                storage_class: StorageClass::Ssd,
+                filesystem: FilesystemType::Apfs,
+                sequential_write_mbps: 1000.0,
+                random_read_iops: 50_000.0,
+                same_filesystem: true,
+            },
+        },
+    )
+    .await
+}
+
+/// [`new_direct_pipeline_at_roots`] on a machine the test describes, for the
+/// tests whose subject is what the machine can honour.
+#[allow(clippy::too_many_arguments)]
+async fn new_direct_pipeline_on_machine(
+    data_dir: PathBuf,
+    intermediate_dir: PathBuf,
+    complete_dir: PathBuf,
+    db_path: PathBuf,
+    buffer_config: BufferPoolConfig,
+    total_connections: usize,
+    direct_store: Option<crate::settings::DirectStoreOverrides>,
+    profile: SystemProfile,
+) -> (Pipeline, PathBuf, PathBuf) {
     let mut db = Database::open(&db_path).unwrap();
     // Jobs added through the handle persist their archive password, which
     // needs a key, exactly as a running server has one.
@@ -523,26 +569,6 @@ async fn new_direct_pipeline_at_roots(
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     });
-    let profile = SystemProfile {
-        cpu: CpuProfile {
-            physical_cores: 4,
-            logical_cores: 4,
-            simd: SimdSupport::default(),
-            cgroup_limit: None,
-        },
-        memory: MemoryProfile {
-            total_bytes: 8 * 1024 * 1024 * 1024,
-            available_bytes: 8 * 1024 * 1024 * 1024,
-            cgroup_limit: None,
-        },
-        disk: DiskProfile {
-            storage_class: StorageClass::Ssd,
-            filesystem: FilesystemType::Apfs,
-            sequential_write_mbps: 1000.0,
-            random_read_iops: 50_000.0,
-            same_filesystem: true,
-        },
-    };
     let buffers = BufferPool::new(buffer_config);
 
     let pipeline = Pipeline::new(

@@ -1,6 +1,7 @@
 use super::*;
 
 mod commands;
+mod hardware_profile;
 mod history;
 mod runtime;
 mod state;

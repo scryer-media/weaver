@@ -3,6 +3,12 @@
 //! Every 60 seconds, evaluates all enabled schedule entries against the current
 //! local time and day-of-week. When the most recent applicable entry changes,
 //! sends the appropriate command to the scheduler.
+//!
+//! A rule stays in force until the next one fires, across midnight and across
+//! days the rules skip, so "pause at 23:00, resume at 06:00" pauses all night.
+//!
+//! Hardware-profile entries are a second, independent track: a profile rule
+//! never ends a pause or speed limit, and neither of those ends it.
 
 use std::sync::Arc;
 
@@ -11,6 +17,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::bandwidth::{ScheduleAction, ScheduleEntry, Weekday};
+use crate::runtime::HardwareProfile;
 
 use crate::jobs::handle::SchedulerHandle;
 use crate::watch_folder::WatchFolderService;
@@ -34,6 +41,7 @@ pub fn spawn_evaluator_with_watch_folder(
 ) {
     tokio::spawn(async move {
         let mut last_action: Option<ScheduleAction> = None;
+        let mut last_profile: Option<HardwareProfile> = None;
         let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
 
         loop {
@@ -43,6 +51,7 @@ pub fn spawn_evaluator_with_watch_folder(
             let handle = handle.clone();
             let watch_folder = watch_folder.clone();
             let prev_action = last_action.clone();
+            let prev_profile = last_profile;
 
             let result = tokio::spawn(async move {
                 let entries = schedules.read().await;
@@ -50,11 +59,22 @@ pub fn spawn_evaluator_with_watch_folder(
                 let current_day = Weekday::from_chrono(now.weekday());
                 let current_time = now.time();
 
+                let desired_profile = find_active_profile(&entries, current_day, current_time);
+                if desired_profile != prev_profile {
+                    info!(
+                        profile = desired_profile.map(HardwareProfile::as_str),
+                        "schedule transition: hardware profile"
+                    );
+                    if let Err(e) = handle.set_scheduled_hardware_profile(desired_profile).await {
+                        warn!(error = %e, "failed to apply the scheduled hardware profile");
+                    }
+                }
+
                 let active = find_active_entry(&entries, current_day, current_time);
                 let desired_action = active.map(|e| e.action.clone());
 
                 if desired_action == prev_action {
-                    return desired_action; // no transition
+                    return (desired_action, desired_profile); // no transition
                 }
 
                 match &desired_action {
@@ -83,12 +103,15 @@ pub fn spawn_evaluator_with_watch_folder(
                     }
                 }
 
-                desired_action
+                (desired_action, desired_profile)
             })
             .await;
 
             match result {
-                Ok(action) => last_action = action,
+                Ok((action, profile)) => {
+                    last_action = action;
+                    last_profile = profile;
+                }
                 Err(panic) => {
                     tracing::error!(error = %panic, "CRITICAL: schedule evaluator tick panicked — loop continues");
                 }
@@ -121,6 +144,10 @@ async fn apply_schedule_action(
                 .await
                 .map_err(|error| error.to_string())
         }
+        ScheduleAction::HardwareProfile { profile } => handle
+            .set_scheduled_hardware_profile(Some(profile))
+            .await
+            .map_err(|error| error.to_string()),
         other => handle
             .apply_schedule_action(other)
             .await
@@ -128,49 +155,84 @@ async fn apply_schedule_action(
     }
 }
 
-/// Find the most recently applicable schedule entry for the given time.
-///
-/// Returns the entry whose `time` is closest to (but not after) `current_time`
-/// on the current day. If multiple entries have the same time, the last one wins.
+/// The pause, resume, speed-limit or watch-folder rule in force, or `None`
+/// when no such rule is enabled. Hardware-profile rules are not candidates;
+/// see [`find_active_profile`].
 fn find_active_entry(
     entries: &[ScheduleEntry],
     current_day: Weekday,
     current_time: NaiveTime,
 ) -> Option<&ScheduleEntry> {
-    let mut best: Option<&ScheduleEntry> = None;
-    let mut best_time: Option<NaiveTime> = None;
+    most_recently_fired(entries, current_day, current_time, |entry| {
+        !entry.action.is_hardware_profile()
+    })
+}
 
-    for entry in entries {
-        if !entry.enabled {
-            continue;
-        }
+/// The hardware profile the schedule has in force, or `None` when no enabled
+/// profile rule exists.
+fn find_active_profile(
+    entries: &[ScheduleEntry],
+    current_day: Weekday,
+    current_time: NaiveTime,
+) -> Option<HardwareProfile> {
+    most_recently_fired(entries, current_day, current_time, |entry| {
+        entry.action.is_hardware_profile()
+    })
+    .and_then(|entry| match entry.action {
+        ScheduleAction::HardwareProfile { profile } => Some(profile),
+        _ => None,
+    })
+}
 
-        // Day filter: empty means every day
-        if !entry.days.is_empty() && !entry.days.contains(&current_day) {
-            continue;
-        }
-
-        let entry_time = match parse_time(&entry.time) {
-            Some(t) => t,
+/// The enabled rule among `candidate`s that fired most recently.
+///
+/// A rule stays in force until the next one fires, however long that takes:
+/// today's rules up to now are considered first, then each earlier day's in
+/// turn, back to the rest of this weekday a week ago. A pause set at 23:00 is
+/// therefore still in force at 00:05, and a rule that runs on Fridays only is
+/// still in force on Sunday. Among rules at the same minute the last one
+/// wins.
+fn most_recently_fired(
+    entries: &[ScheduleEntry],
+    current_day: Weekday,
+    current_time: NaiveTime,
+    candidate: impl Fn(&ScheduleEntry) -> bool,
+) -> Option<&ScheduleEntry> {
+    let rules: Vec<(&ScheduleEntry, NaiveTime)> = entries
+        .iter()
+        .filter(|entry| entry.enabled && candidate(entry))
+        .filter_map(|entry| match parse_time(&entry.time) {
+            Some(time) => Some((entry, time)),
             None => {
                 debug!(time = %entry.time, id = %entry.id, "invalid schedule time, skipping");
-                continue;
+                None
             }
-        };
+        })
+        .collect();
 
-        // Only consider entries at or before the current time
-        if entry_time > current_time {
-            continue;
+    let mut day = current_day;
+    for days_back in 0..=7 {
+        let fired = rules
+            .iter()
+            .filter(|(entry, _)| entry.days.is_empty() || entry.days.contains(&day))
+            .filter(|(_, time)| match days_back {
+                0 => *time <= current_time,
+                7 => *time > current_time,
+                _ => true,
+            })
+            .fold(
+                None,
+                |best: Option<(&ScheduleEntry, NaiveTime)>, (entry, time)| match best {
+                    Some((_, best_time)) if best_time > *time => best,
+                    _ => Some((*entry, *time)),
+                },
+            );
+        if let Some((entry, _)) = fired {
+            return Some(entry);
         }
-
-        // Pick the most recent (latest time) entry
-        if best_time.is_none() || entry_time >= best_time.unwrap() {
-            best = Some(entry);
-            best_time = Some(entry_time);
-        }
+        day = day.previous();
     }
-
-    best
+    None
 }
 
 fn parse_time(s: &str) -> Option<NaiveTime> {

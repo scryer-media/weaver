@@ -221,7 +221,13 @@ test("schedule rules support create, toggle, edit, and delete", async ({ cleanPa
   await expect(persistedEnabled).not.toBeChecked();
 });
 
-test("the performance profile saves the moment a card is picked and keeps it", async ({ cleanPage: page, request }) => {
+const profileNames: Record<string, string> = {
+  EFFICIENT: "Efficient",
+  BALANCED: "Balanced",
+  PERFORMANCE: "Performance",
+};
+
+test("the performance profile saves the moment one is picked and keeps it", async ({ cleanPage: page, request }) => {
   const offered = await introspectHardwareProfile(request);
   test.skip(
     offered.available.length < 2,
@@ -229,13 +235,14 @@ test("the performance profile saves the moment a card is picked and keeps it", a
   );
 
   await page.goto("/settings/general");
-  const recommended = page
-    .getByRole("radiogroup", { name: "Performance", exact: true })
-    .getByRole("radio")
-    .filter({ has: page.getByText("Recommended", { exact: true }) });
+  const recommendedName = profileNames[offered.recommended];
+  expect(recommendedName, `unknown profile ${offered.recommended}`).toBeTruthy();
+  const profile = page
+    .getByRole("region", { name: "Performance", exact: true })
+    .getByRole("button", { name: "Profile", exact: true });
   const unconfirmed = page.getByText("Running the recommended profile, not yet confirmed.", { exact: true });
   if (afterRestart) {
-    await expect(recommended).toHaveAttribute("aria-checked", "true");
+    await expect(profile).toHaveText(recommendedName);
     await expect(unconfirmed).toBeHidden();
     return;
   }
@@ -246,17 +253,21 @@ test("the performance profile saves the moment a card is picked and keeps it", a
       && response.request().method() === "POST"
       && response.request().postData()?.includes("mutation SetHardwareProfile") === true,
   );
-  await recommended.click();
+  await profile.click();
+  await page
+    .getByRole("menu", { name: "Profile", exact: true })
+    .getByRole("menuitemradio", { name: recommendedName, exact: true })
+    .click();
   const response = await saved;
   expect(response.ok()).toBeTruthy();
   const payload = await response.json();
   expect(payload.errors ?? [], JSON.stringify(payload.errors ?? [])).toEqual([]);
-  await expect(recommended).toHaveAttribute("aria-checked", "true");
+  await expect(profile).toHaveText(recommendedName);
   await expect(unconfirmed).toBeHidden();
   await expect(page.getByRole("alert")).toBeHidden();
 
   await page.reload();
-  await expect(recommended).toHaveAttribute("aria-checked", "true");
+  await expect(profile).toHaveText(recommendedName);
   await expect(unconfirmed).toBeHidden();
 });
 

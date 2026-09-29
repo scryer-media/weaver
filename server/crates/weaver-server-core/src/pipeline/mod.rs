@@ -2245,6 +2245,13 @@ pub struct Pipeline {
     pub(super) buffers: Arc<BufferPool>,
     /// Runtime tuner for adaptive concurrency.
     pub(super) tuner: RuntimeTuner,
+    /// The operator's hardware profile, or the recommendation standing in
+    /// for one never chosen. In force whenever no schedule rule is.
+    pub(super) configured_hardware_profile: crate::runtime::HardwareProfile,
+    /// The profile the schedule has in force over the operator's choice, as
+    /// the schedule asked for it. It governs only while this machine can
+    /// honour it.
+    pub(super) scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
     /// Shared atomic metrics.
     pub(super) metrics: Arc<PipelineMetrics>,
     /// Per-job state.
