@@ -32,8 +32,8 @@ impl MetricKind {
 
 /// One metric family: the unit that owns a `# HELP` and a `# TYPE` line.
 ///
-/// `labels` is the declared label set. It is documentation for `docs/metrics.md`
-/// and the thing the catalogue test checks the rendered output against; the
+/// `labels` is the declared label set. It documents the family and is the
+/// thing the catalogue test checks the rendered output against; the
 /// encoder does not enforce it, because state-set families legitimately vary
 /// which label values appear.
 #[derive(Debug)]

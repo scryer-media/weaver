@@ -5,7 +5,7 @@
 //!   through a [`encode::MetricFamily`], which is what makes "sample with no
 //!   HELP/TYPE" impossible to express.
 //! - [`catalog`] is the catalogue of every family the exporter can emit. It is
-//!   data, not code, and `docs/metrics.md` is checked against it.
+//!   data, not code.
 //! - [`render`] turns a runtime snapshot into exposition text.
 //!
 //! Everything here runs at scrape time. Nothing in this module may add work to

@@ -2,8 +2,7 @@
 //!
 //! Nothing outside this file may invent a metric name. Because the encoder
 //! only accepts a [`MetricFamily`], adding a series means adding an entry here,
-//! which in turn means it gets a HELP, a TYPE, a declared label set, and a row
-//! in `docs/metrics.md` — the doc test fails otherwise.
+//! which in turn means it gets a HELP, a TYPE and a declared label set.
 
 use super::encode::{MetricFamily, MetricKind};
 

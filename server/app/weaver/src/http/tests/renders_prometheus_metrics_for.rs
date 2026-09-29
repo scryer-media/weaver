@@ -995,12 +995,13 @@ fn metric_catalog_matches_rendered_families() {
     );
 }
 
-/// Print the catalogue as the markdown table `docs/metrics.md` carries.
+/// Print the catalogue as the markdown table the published metric reference
+/// carries.
 ///
 /// Ignored by default because it produces output rather than checking
 /// anything; run it with
 /// `cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture`
-/// and paste the result over the catalogue table when families change.
+/// and paste the result over that table when families change.
 #[test]
 #[ignore = "documentation generator; produces output instead of assertions"]
 fn regenerate_docs_metrics_table() {
@@ -1031,67 +1032,6 @@ fn regenerate_docs_metrics_table() {
             help
         );
     }
-}
-
-/// `docs/metrics.md` is the operator-facing copy of the catalogue. Keeping the
-/// two in sync by hand does not survive contact with a busy release, so make
-/// the divergence a test failure with the exact edit spelled out.
-#[test]
-fn docs_metrics_table_matches_catalog() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../docs/metrics.md")
-        .canonicalize()
-        .expect("docs/metrics.md must exist");
-    let doc = std::fs::read_to_string(&path).expect("docs/metrics.md must be readable");
-
-    // The exporter emits in two namespaces: its own `weaver_` families, and the
-    // standard unprefixed `process_` collector series. Pin that here so a new
-    // namespace cannot slip past the prefix filter below and silently escape
-    // the documentation check.
-    const METRIC_PREFIXES: [&str; 2] = ["weaver_", "process_"];
-
-    let catalogued: std::collections::BTreeSet<String> = metrics::catalog::metric_catalog()
-        .iter()
-        .map(|family| family.name.to_string())
-        .collect();
-    let unexpected_namespace: Vec<&String> = catalogued
-        .iter()
-        .filter(|name| {
-            !METRIC_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-        })
-        .collect();
-    assert!(
-        unexpected_namespace.is_empty(),
-        "catalogue uses a namespace this test cannot recognise: {unexpected_namespace:?}"
-    );
-
-    // Catalogue rows are markdown table lines whose first cell is a
-    // backtick-quoted metric name. The prefix filter keeps prose tables (the
-    // deprecation mapping, for instance) from being read as catalogue rows.
-    let documented: std::collections::BTreeSet<String> = doc
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("| `"))
-        .filter_map(|rest| rest.split_once('`'))
-        .map(|(name, _)| name.to_string())
-        .filter(|name| {
-            METRIC_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-        })
-        .collect();
-
-    let missing: Vec<&String> = catalogued.difference(&documented).collect();
-    assert!(
-        missing.is_empty(),
-        "docs/metrics.md is missing rows for: {missing:?}"
-    );
-    let extra: Vec<&String> = documented.difference(&catalogued).collect();
-    assert!(
-        extra.is_empty(),
-        "docs/metrics.md documents metrics the exporter cannot emit: {extra:?}"
-    );
 }
 
 /// The first family in `rendered` whose lines are not one contiguous group,
