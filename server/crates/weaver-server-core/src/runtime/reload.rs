@@ -304,10 +304,11 @@ mod tests {
         );
         let service =
             crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
-        // No transfer-policy registry: activation must fail before a new generation.
+        // No transfer-policy registry: activation must fail before a new generation,
+        // and the stored row is put back so a restart retries the same change.
         for _ in 0..2 {
             assert!(service.set_active(42, false).await.is_err());
-            assert!(!db.load_config().unwrap().servers[0].active);
+            assert!(db.load_config().unwrap().servers[0].active);
             assert!(config.read().await.servers[0].active);
         }
     }
