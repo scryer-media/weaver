@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { JobScriptResults } from "@/components/JobScriptResults";
 import { Link, useNavigate, useParams } from "react-router";
 import { ChevronRight, Download } from "lucide-react";
 import { useMutation, useQuery, useSubscription } from "urql";
@@ -532,6 +533,7 @@ export function JobDetail() {
 
       {/* Output files */}
       <JobOutputFilesCard jobId={job.id} status={job.status} />
+      <JobScriptResults key={`${job.id}-${job.status}`} jobId={job.id} />
 
       {/* Timeline */}
       <PipelineTimelineCard timeline={timeline} propagating={job.status === "PROPAGATING"} />

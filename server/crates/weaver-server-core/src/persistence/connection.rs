@@ -1091,6 +1091,7 @@ impl JobHistoryCache {
 /// SQL-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
+    pub(crate) script_runtime: Arc<crate::post_processing::events::ScriptRuntime>,
     target: DatabaseTarget,
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
@@ -1128,6 +1129,7 @@ impl Database {
 
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
+            script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             target,
             sql_services,
             sql_worker,
@@ -1161,6 +1163,7 @@ impl Database {
             pending_write_notify: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: Some(crate::persistence::encryption::EncryptionKey::generate()),
+            script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             _ephemeral_dir: Some(tempdir),
         };
         db.spawn_writer_task(writer_rx);
@@ -1373,6 +1376,7 @@ impl Database {
             pending_write_notify: self.pending_write_notify.clone(),
             job_history_cache: self.job_history_cache.clone(),
             encryption_key: self.encryption_key.clone(),
+            script_runtime: self.script_runtime.clone(),
             _ephemeral_dir: self._ephemeral_dir.clone(),
         }
     }

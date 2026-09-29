@@ -165,6 +165,7 @@ fn find_active_entry(
 ) -> Option<&ScheduleEntry> {
     most_recently_fired(entries, current_day, current_time, |entry| {
         !entry.action.is_hardware_profile()
+            && !matches!(entry.action, ScheduleAction::RunScript { .. })
     })
 }
 

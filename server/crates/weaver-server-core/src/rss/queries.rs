@@ -8,7 +8,7 @@ use super::repository::{decode_categories, decode_metadata, map_seen_item_row, p
 const RSS_FEED_SELECT: &str =
     "SELECT id, name, url, enabled, poll_interval_secs, username, password,
         default_category, default_metadata, etag, last_modified, last_polled_at,
-        last_success_at, last_error, consecutive_failures
+        last_success_at, last_error, consecutive_failures, scripts
    FROM rss_feeds";
 
 const RSS_RULE_SELECT: &str =
@@ -184,6 +184,7 @@ fn rss_feed_from_sql(row: SqlRow) -> Result<RssFeedRow, StateError> {
         last_success_at: row.opt_i64("last_success_at")?,
         last_error: row.opt_text("last_error")?,
         consecutive_failures: row.i32("consecutive_failures")? as u32,
+        scripts: serde_json::from_str(&row.text("scripts")?).map_err(super::repository::db_err)?,
     })
 }
 

@@ -623,6 +623,7 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
+        self.queue_scripts_completed.remove(&job_id);
 
         let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
         if let Some(generation) = options.semantic_materialization_generation {
@@ -871,6 +872,11 @@ impl Pipeline {
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
+        self.raise_queue_script_event(
+            job_id,
+            crate::post_processing::model::QueueEvent::NzbAdded,
+            None,
+        );
 
         crate::runtime::perf_probe::record(
             "pipeline.add_job.runtime_state_inserted",
@@ -1298,6 +1304,7 @@ impl Pipeline {
             self.persist_file_identities(job_id, &file_identities).await;
         }
 
+        self.queue_scripts_completed.remove(&job_id);
         self.delete_failed_history_entry(job_id).await;
         // Reprocess replaces the assembly and file identities wholesale, so a
         // chase describing the old ones has to go with them.
@@ -1983,6 +1990,9 @@ impl Pipeline {
                 &recovery_queue,
             ),
             post_state: post_state.unwrap_or(match &status {
+                JobStatus::AwaitingQueueScripts => {
+                    crate::jobs::model::PostState::AwaitingQueueScripts
+                }
                 JobStatus::Queued => crate::jobs::model::PostState::Idle,
                 JobStatus::Verifying => crate::jobs::model::PostState::Verifying,
                 JobStatus::QueuedRepair => crate::jobs::model::PostState::QueuedRepair,

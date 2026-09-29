@@ -750,6 +750,12 @@ async fn import_sqlite(
             )
             .await?;
         }
+        sqlx::query(
+            "INSERT INTO script_output_state (singleton, next_seq, used_bytes) VALUES (1, 0, 0)",
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
         repair_sqlite_sequences(&mut conn).await?;
         let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
             .fetch_one(&mut *conn)
@@ -816,6 +822,12 @@ async fn import_postgres(
         )
         .await?;
     }
+    sqlx::query(
+        "INSERT INTO script_output_state (singleton, next_seq, used_bytes) VALUES (1, 0, 0)",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
     validate_postgres_counts(&mut tx, expected).await?;
     repair_postgres_sequences(&mut tx).await?;
     tx.commit().await.map_err(db_err)

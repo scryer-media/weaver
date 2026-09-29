@@ -21,6 +21,11 @@ pub struct ScheduleEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduleAction {
+    RunScript {
+        script: String,
+        #[serde(default)]
+        run_at_startup: bool,
+    },
     Pause,
     Resume,
     PauseWatchFolderScanning,

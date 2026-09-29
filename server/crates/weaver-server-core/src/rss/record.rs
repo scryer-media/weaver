@@ -27,6 +27,7 @@ impl RssRuleAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RssFeedRow {
+    pub scripts: Vec<String>,
     pub id: u32,
     pub name: String,
     pub url: String,

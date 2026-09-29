@@ -28,6 +28,20 @@ fn validate_schedule_input(
     input.validate(&probe).map_err(async_graphql::Error::new)
 }
 
+async fn schedule_response(
+    ctx: &Context<'_>,
+    mut entries: Vec<weaver_server_core::bandwidth::ScheduleEntry>,
+) -> Result<Vec<crate::settings::types::Schedule>> {
+    let db = ctx.data::<Database>()?.clone();
+    entries.extend(
+        tokio::task::spawn_blocking(move || {
+            weaver_server_core::post_processing::scheduler::implicit_schedules(&db)
+        })
+        .await??,
+    );
+    Ok(entries.into_iter().map(Into::into).collect())
+}
+
 static SETTINGS_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -470,10 +484,7 @@ impl SettingsMutation {
         let entries_for_save = entries.clone();
         tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
         *schedules_state.write().await = entries.clone();
-        Ok(entries
-            .into_iter()
-            .map(crate::settings::types::Schedule::from)
-            .collect())
+        schedule_response(ctx, entries).await
     }
     #[graphql(guard = "AdminGuard")]
     async fn update_schedule(
@@ -482,6 +493,11 @@ impl SettingsMutation {
         id: String,
         input: crate::settings::types::ScheduleInput,
     ) -> Result<Vec<crate::settings::types::Schedule>> {
+        if id.starts_with("implicit-script:") {
+            return Err(async_graphql::Error::new(
+                "manifest schedules are read-only; create an explicit rule to opt into startup",
+            ));
+        }
         let db = ctx.data::<Database>()?.clone();
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
@@ -503,10 +519,7 @@ impl SettingsMutation {
         let entries_for_save = entries.clone();
         tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
         *schedules_state.write().await = entries.clone();
-        Ok(entries
-            .into_iter()
-            .map(crate::settings::types::Schedule::from)
-            .collect())
+        schedule_response(ctx, entries).await
     }
     #[graphql(guard = "AdminGuard")]
     async fn delete_schedule(
@@ -514,6 +527,11 @@ impl SettingsMutation {
         ctx: &Context<'_>,
         id: String,
     ) -> Result<Vec<crate::settings::types::Schedule>> {
+        if id.starts_with("implicit-script:") {
+            return Err(async_graphql::Error::new(
+                "manifest schedules are read-only; create an explicit rule to opt into startup",
+            ));
+        }
         let db = ctx.data::<Database>()?.clone();
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
@@ -527,10 +545,7 @@ impl SettingsMutation {
         let entries_for_save = entries.clone();
         tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
         *schedules_state.write().await = entries.clone();
-        Ok(entries
-            .into_iter()
-            .map(crate::settings::types::Schedule::from)
-            .collect())
+        schedule_response(ctx, entries).await
     }
     #[graphql(guard = "AdminGuard")]
     async fn toggle_schedule(
@@ -539,6 +554,11 @@ impl SettingsMutation {
         id: String,
         enabled: bool,
     ) -> Result<Vec<crate::settings::types::Schedule>> {
+        if id.starts_with("implicit-script:") {
+            return Err(async_graphql::Error::new(
+                "manifest schedules are read-only; create an explicit rule to opt into startup",
+            ));
+        }
         let db = ctx.data::<Database>()?.clone();
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
@@ -554,10 +574,7 @@ impl SettingsMutation {
         let entries_for_save = entries.clone();
         tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
         *schedules_state.write().await = entries.clone();
-        Ok(entries
-            .into_iter()
-            .map(crate::settings::types::Schedule::from)
-            .collect())
+        schedule_response(ctx, entries).await
     }
 }
 

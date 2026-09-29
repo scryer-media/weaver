@@ -105,6 +105,95 @@ fn set_global_list(db: &Database, entries: Vec<ScriptListEntry>) {
 }
 
 #[tokio::test]
+async fn event_only_scripts_are_listed_but_never_executed_as_terminal_scripts() {
+    use weaver_server_core::post_processing::listing::list_scripts;
+    use weaver_server_core::post_processing::model::{ScriptEventLabel, ScriptKind};
+
+    let data = tempfile::tempdir().unwrap();
+    let working = data.path().join("work");
+    fs::create_dir(&working).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    enable_execution(&db);
+    let mut entries = Vec::new();
+    for kind in [
+        ScriptKind::Queue,
+        ScriptKind::Scan,
+        ScriptKind::Scheduler,
+        ScriptKind::Feed,
+    ] {
+        let name = format!("{}.sh", kind.as_str());
+        let script = write_script(
+            data.path(),
+            &name,
+            &format!(
+                "#!/bin/sh\n### NZBGET {} SCRIPT ###\nprintf ran > unexpected\nexit 94\n",
+                kind.as_str()
+            ),
+        );
+        entries.push(ScriptListEntry::new(script));
+    }
+    let listing = list_scripts(&data.path().join("scripts")).unwrap();
+    assert_eq!(listing.scripts.len(), 4);
+    assert!(listing.problems.is_empty());
+    let report = executor(&db, data.path())
+        .execute_job(
+            901,
+            ScriptList::new(entries).unwrap(),
+            context(901, working.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.results.len(), 4);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.status == ScriptStatus::Skipped
+                && result.exit_code.is_none()
+                && result.event == ScriptEventLabel::PostProcessing)
+    );
+    assert!(!working.join("unexpected").exists());
+}
+
+#[tokio::test]
+async fn combined_legacy_kinds_keep_the_terminal_post_processing_contract() {
+    let data = tempfile::tempdir().unwrap();
+    let working = data.path().join("work");
+    fs::create_dir(&working).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    enable_execution(&db);
+    let script = write_script(
+        data.path(),
+        "combined.sh",
+        "#!/bin/sh\n### NZBGET POST-PROCESSING/QUEUE SCRIPT ###\nprintf '%s/%s' \"$NZBPP_TOTALSTATUS\" \"$NZBPP_SCRIPTSTATUS\"\nexit 93\n",
+    );
+    let queue = write_script(
+        data.path(),
+        "queue.sh",
+        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 94\n",
+    );
+    let report = executor(&db, data.path())
+        .execute_job(
+            902,
+            ScriptList::new(vec![
+                ScriptListEntry::new(queue),
+                ScriptListEntry::new(script),
+            ])
+            .unwrap(),
+            context(902, working),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.results[0].status, ScriptStatus::Skipped);
+    assert_eq!(report.results[1].status, ScriptStatus::Succeeded);
+    assert_eq!(report.results[1].output_tail, "SUCCESS/NONE");
+}
+
+#[tokio::test]
 async fn the_same_binary_supervisor_delivers_a_clean_sab_environment_and_redacts_secrets() {
     let data = tempfile::tempdir().unwrap();
     let working_directory = data.path().join("work dir ✓");
@@ -243,7 +332,7 @@ async fn output_beyond_the_cap_keeps_the_tail_and_reports_truncation() {
         r#"#!/bin/sh
 i=0
 payload=$(printf 'x%.0s' $(seq 1 1024))
-while [ "$i" -lt 400 ]; do
+while [ "$i" -lt 2048 ]; do
   printf 'line-%s %s\n' "$i" "$payload"
   i=$((i + 1))
 done

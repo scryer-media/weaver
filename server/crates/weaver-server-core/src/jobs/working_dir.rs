@@ -35,6 +35,29 @@ pub fn is_weaver_owned_working_dir(dir: &Path) -> bool {
         .is_some_and(|root| owned_working_directory(root, dir).is_ok())
 }
 
+pub(crate) fn check_script_directory_owner(path: &Path, job_id: JobId) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("directory has no parent"))?;
+    let dir = open_working_directory(parent, path)?;
+    match read_working_marker(&dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(stored)
+            if marker_job_id(&stored) == Some(job_id)
+                && !matches!(
+                    match_marker(&dir, path, &stored, job_id)?,
+                    MarkerMatch::Mismatch
+                ) =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(std::io::Error::other(
+            "script directory has a foreign ownership marker",
+        )),
+    }
+}
+
 fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
     let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
     let mut components = relative.components();
@@ -361,6 +384,39 @@ pub fn is_weaver_owned_output_dir(dir: &Path) -> bool {
         return false;
     };
     std::fs::read(&marker).is_ok_and(|stored| stored == expected)
+}
+
+pub(crate) fn is_relocated_output_dir(dir: &Path, previous: &Path) -> bool {
+    if !matches!(std::fs::symlink_metadata(previous), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return false;
+    }
+    let Some(parent) = previous
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+    else {
+        return false;
+    };
+    let Some(name) = previous.file_name() else {
+        return false;
+    };
+    let previous = parent.join(name);
+    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let marker = dir.join(OUTPUT_DIR_MARKER);
+    let Ok(metadata) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let digest = blake3::hash(previous.as_os_str().as_encoded_bytes());
+    let expected = format!("weaver-output-v1:{}\n", digest.to_hex());
+    std::fs::read(&marker).is_ok_and(|stored| stored == expected.as_bytes())
 }
 
 fn output_marker_value(dir: &Path) -> std::io::Result<Vec<u8>> {

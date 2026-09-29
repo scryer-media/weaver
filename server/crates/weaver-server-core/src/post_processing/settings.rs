@@ -112,7 +112,7 @@ impl Database {
     ) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let directory = directory.to_string_lossy().to_string();
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
                 &datastore,
                 "replace_post_processing_script_directory",
@@ -151,7 +151,9 @@ impl Database {
                 },
             )
             .await
-        })
+        });
+        self.invalidate_queue_script_admission();
+        result
     }
 
     pub fn post_processing_settings(&self) -> Result<PostProcessingSettings, StateError> {
@@ -233,7 +235,9 @@ impl Database {
         settings: &PostProcessingSettings,
     ) -> Result<(), StateError> {
         let settings = settings.clone().normalized().map_err(state_err)?;
-        self.set_setting(SETTINGS_KEY, &to_json(&settings)?)
+        let result = self.set_setting(SETTINGS_KEY, &to_json(&settings)?);
+        self.invalidate_queue_script_admission();
+        result
     }
 
     /// Save a full settings update while optionally retaining the extension
@@ -247,7 +251,7 @@ impl Database {
     ) -> Result<PostProcessingSettings, StateError> {
         let datastore = self.datastore();
         let default_settings = to_json(&PostProcessingSettings::default())?;
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
                 &datastore,
                 "save_post_processing_settings_preserving_extensions",
@@ -297,7 +301,9 @@ impl Database {
                 },
             )
             .await
-        })
+        });
+        self.invalidate_queue_script_admission();
+        result
     }
 
     pub fn post_processing_script_lists(&self) -> Result<ScriptLists, StateError> {
@@ -308,7 +314,9 @@ impl Database {
     }
 
     pub fn save_post_processing_script_lists(&self, lists: &ScriptLists) -> Result<(), StateError> {
-        self.set_setting(SCRIPT_LISTS_KEY, &to_json(lists)?)
+        let result = self.set_setting(SCRIPT_LISTS_KEY, &to_json(lists)?);
+        self.invalidate_queue_script_admission();
+        result
     }
 
     /// Options for `script`, with secrets decrypted for execution.

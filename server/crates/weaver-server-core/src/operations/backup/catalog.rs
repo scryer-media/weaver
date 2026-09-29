@@ -57,6 +57,12 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("job_history", Export, RequireEmpty),
     table!("job_history_attributes", Export, RequireEmpty),
     table!("job_events", Export, RequireEmpty),
+    // Execution queues and output caches cannot be resumed from a logical
+    // configuration backup. History keeps its result excerpts.
+    table!("script_event_queue", ResetOnRestore, RequireEmpty),
+    table!("script_job_state", ResetOnRestore, RequireEmpty),
+    table!("script_outputs", ResetOnRestore, Replace),
+    table!("script_output_state", Rebuild, Replace),
     table!("duplicate_job_snapshots", Export, RequireEmpty),
     table!("job_fingerprints", Export, RequireEmpty),
     table!("duplicate_admission_claims", Export, RequireEmpty),

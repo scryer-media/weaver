@@ -62,6 +62,7 @@ interface RssRule {
 }
 
 interface RssFeed {
+  scripts: string[];
   routing: RoutingPolicy | null;
   routingStatus?: RoutingStatus;
   id: number;
@@ -110,6 +111,7 @@ interface RssData {
 }
 
 interface FeedForm {
+  scripts: string;
   routing: RoutingPolicy;
   name: string;
   url: string;
@@ -138,6 +140,7 @@ interface RuleForm {
 const NO_CATEGORY = "";
 
 const NEW_FEED: FeedForm = {
+  scripts: "",
   routing: directRouting,
   name: "",
   url: "",
@@ -330,6 +333,7 @@ export function RssPanel() {
             url: feed.url,
             enabled: feed.enabled,
             pollIntervalSecs: feed.pollIntervalSecs,
+            scripts: (feed.scripts ?? []).join(", "),
             username: feed.username ?? "",
             password: "",
             clearPassword: false,
@@ -384,6 +388,7 @@ export function RssPanel() {
       url: feedForm.url.trim(),
       enabled: feedForm.enabled,
       pollIntervalSecs: Math.max(30, Math.round(feedForm.pollIntervalSecs || 900)),
+      scripts: splitCommaList(feedForm.scripts),
       username: feedForm.username.trim(),
       // A blank password keeps the stored one; clearing it is explicit.
       password: feedForm.clearPassword ? "" : feedForm.password.trim() || null,
@@ -663,6 +668,9 @@ export function RssPanel() {
             onChange: (next) => patchFeed({ defaultCategory: next }),
           },
         },
+        { id: "scripts", label: "Feed scripts", help: "Comma-separated script names in execution order. Empty uses the global script list.", control: {
+          kind: "text", value: feedForm.scripts, onChange: (scripts) => patchFeed({ scripts }),
+        } },
         {
           id: "metadata",
           label: t("next.rss.defaultMetadata"),

@@ -6,8 +6,21 @@ use super::*;
 /// leave on disk because their ownership marker no longer matches them.
 #[derive(Debug, Default)]
 pub(crate) struct HistoryCleanupDirs {
+    pub(crate) job_ids: BTreeSet<JobId>,
     pub(crate) owned: BTreeSet<(JobId, PathBuf)>,
     pub(crate) left_in_place: Vec<PathBuf>,
+}
+
+pub(super) enum HistoryDeleteReply {
+    One(oneshot::Sender<Result<crate::HistoryDeleteOutcome, crate::SchedulerError>>),
+    All(oneshot::Sender<Result<(), crate::SchedulerError>>),
+}
+
+pub(crate) struct HistoryDeleteDone {
+    job_ids: BTreeSet<JobId>,
+    scripts_ready: bool,
+    result: Result<Vec<PathBuf>, crate::SchedulerError>,
+    reply: HistoryDeleteReply,
 }
 
 impl HistoryCleanupDirs {
@@ -34,6 +47,87 @@ impl HistoryCleanupDirs {
 }
 
 impl Pipeline {
+    pub(super) fn start_history_delete_cleanup(
+        &mut self,
+        dirs: HistoryCleanupDirs,
+        output_dirs: Vec<PathBuf>,
+        reply: HistoryDeleteReply,
+    ) {
+        self.pending_history_deletions
+            .extend(dirs.job_ids.iter().copied());
+        for job_id in &dirs.job_ids {
+            self.db.cancel_event_scripts(job_id.0);
+        }
+        let db = self.db.clone();
+        let intermediate_dir = self.intermediate_dir.clone();
+        let completed = self.terminal_post_processing_done_tx.clone();
+        tokio::spawn(async move {
+            let job_ids = dirs.job_ids.clone();
+            let mut scripts_ready = false;
+            let result = async {
+                for job_id in &dirs.job_ids {
+                    if let Err(error) =
+                        crate::post_processing::events::wait_for_job_events_stopped(&db, job_id.0)
+                            .await
+                    {
+                        // A failed barrier must not release runtime ownership.
+                        return Err(crate::SchedulerError::State(error));
+                    }
+                }
+                scripts_ready = true;
+                let cleanup =
+                    Self::cleanup_history_intermediate_dirs_at(&intermediate_dir, &dirs).await;
+                for dir in &output_dirs {
+                    Self::cleanup_owned_output_dir(Some(dir)).await;
+                }
+                cleanup
+            }
+            .await;
+            let _ = completed
+                .send(TerminalPostProcessingEvent::HistoryDeleteDone(
+                    HistoryDeleteDone {
+                        job_ids,
+                        scripts_ready,
+                        result,
+                        reply,
+                    },
+                ))
+                .await;
+        });
+    }
+
+    pub(in crate::pipeline) fn handle_history_delete_done(&mut self, done: HistoryDeleteDone) {
+        for job_id in &done.job_ids {
+            if done.scripts_ready {
+                self.pending_history_deletions.remove(job_id);
+            }
+            if done.scripts_ready
+                && self
+                    .jobs
+                    .get(job_id)
+                    .is_some_and(|state| is_terminal_status(&state.status))
+            {
+                self.purge_terminal_job_runtime(*job_id);
+            }
+        }
+        if done.scripts_ready {
+            self.finished_jobs
+                .retain(|job| !done.job_ids.contains(&job.job_id));
+        }
+        self.publish_snapshot();
+        match done.reply {
+            HistoryDeleteReply::One(reply) => {
+                let _ = reply.send(
+                    done.result
+                        .map(|left_in_place| crate::HistoryDeleteOutcome { left_in_place }),
+                );
+            }
+            HistoryDeleteReply::All(reply) => {
+                let _ = reply.send(done.result.map(|_| ()));
+            }
+        }
+    }
+
     fn cleanupable_history_output_dir(&self, output_dir: &std::path::Path) -> Option<PathBuf> {
         output_dir
             .strip_prefix(&self.intermediate_dir)
@@ -51,6 +145,7 @@ impl Pipeline {
         job_id: JobId,
     ) -> Result<HistoryCleanupDirs, crate::SchedulerError> {
         let mut dirs = HistoryCleanupDirs::default();
+        dirs.job_ids.insert(job_id);
         if let Some(state) = self.jobs.get(&job_id)
             && is_terminal_status(&state.status)
             && let Some(path) = self.cleanupable_history_output_dir(&state.working_dir)
@@ -86,6 +181,9 @@ impl Pipeline {
     ) -> Result<HistoryCleanupDirs, crate::SchedulerError> {
         let mut dirs = HistoryCleanupDirs::default();
         for (job_id, state) in &self.jobs {
+            if is_terminal_status(&state.status) {
+                dirs.job_ids.insert(*job_id);
+            }
             if is_terminal_status(&state.status)
                 && let Some(path) = self.cleanupable_history_output_dir(&state.working_dir)
             {
@@ -103,6 +201,7 @@ impl Pipeline {
         })?
         .map_err(crate::SchedulerError::State)?;
         for row in rows {
+            dirs.job_ids.insert(JobId(row.job_id));
             if let Some(output_dir) = row.output_dir
                 && let Some(path) =
                     self.cleanupable_history_output_dir(std::path::Path::new(&output_dir))
@@ -118,8 +217,8 @@ impl Pipeline {
     /// Removes every owned directory in `dirs`, and returns every directory
     /// left on disk — the ones `dirs` already set aside plus any whose marker
     /// stopped matching between the two looks.
-    pub(crate) async fn cleanup_history_intermediate_dirs(
-        &self,
+    async fn cleanup_history_intermediate_dirs_at(
+        intermediate_dir: &std::path::Path,
         dirs: &HistoryCleanupDirs,
     ) -> Result<Vec<PathBuf>, crate::SchedulerError> {
         let mut left_in_place = dirs.left_in_place.clone();
@@ -128,7 +227,7 @@ impl Pipeline {
             // cached write handles before their dirs (and paths) are freed
             // for reuse.
             crate::pipeline::close_cached_write_handles_under(dir).await;
-            let root = self.intermediate_dir.clone();
+            let root = intermediate_dir.to_path_buf();
             let target = dir.clone();
             let expected_job = *job_id;
             let removal = tokio::task::spawn_blocking(move || {
@@ -210,7 +309,7 @@ impl Pipeline {
         dirs
     }
 
-    pub(crate) async fn cleanup_output_dir(&self, dir: Option<&std::path::Path>) {
+    async fn cleanup_owned_output_dir(dir: Option<&std::path::Path>) {
         let Some(dir) = dir else { return };
         match tokio::fs::symlink_metadata(dir).await {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -249,6 +348,7 @@ impl Pipeline {
     }
 
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
+        self.queue_scripts_completed.remove(&job_id);
         self.jobs.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
         self.posted_name_disagreement_logged.remove(&job_id);

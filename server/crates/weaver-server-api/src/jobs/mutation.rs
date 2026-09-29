@@ -22,7 +22,8 @@ use weaver_server_core::ingest::{
     ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError,
     SubmittedJob, fetch_nzb_from_url, materialize_semantic_promotion,
     normalize_archive_password_candidate, submit_nzb_bytes_with_options,
-    submit_staged_prepared_nzb_with_options, submit_uploaded_nzb_reader_with_options,
+    submit_staged_nzb_zstd_with_options, submit_staged_prepared_nzb_with_options,
+    submit_uploaded_nzb_reader_with_options,
 };
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{
@@ -89,8 +90,23 @@ impl JobsMutation {
             }
         };
 
+        let db = ctx.data::<Database>()?;
+        let settings = db.post_processing_settings()?;
+        let scan_before_parse = settings.execution_enabled
+            && !weaver_server_core::post_processing::executor::strict_security_enabled()
+            && weaver_server_core::post_processing::listing::list_scripts(
+                &db.post_processing_script_directory()?,
+            )?
+            .scripts
+            .iter()
+            .any(|script| {
+                script
+                    .manifest
+                    .kinds()
+                    .contains(&weaver_server_core::post_processing::model::ScriptKind::Scan)
+            });
         match manager
-            .stage_upload(caller_identity, upload, input.filename)
+            .stage_upload(caller_identity, upload, input.filename, scan_before_parse)
             .await
         {
             Ok(staged) => Ok(StagedNzbUploadResult {
@@ -98,8 +114,8 @@ impl JobsMutation {
                 staged_upload_id: Some(staged.staged_upload_id),
                 filename: Some(staged.filename),
                 display_name: Some(staged.display_name),
-                total_files: Some(staged.total_files),
-                total_bytes: Some(staged.total_bytes),
+                total_files: staged.total_files,
+                total_bytes: staged.total_bytes,
                 error: None,
             }),
             Err(error) => Ok(rejected_stage_upload_result(filename, error.to_string())),
@@ -184,7 +200,8 @@ impl JobsMutation {
                     .find(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
                     .cloned()
             });
-            let Some(mut preparation) = entry.preparation.take() else {
+            let mut preparation = entry.preparation.take();
+            if preparation.is_none() && !entry.scan_before_parse {
                 manager.restore_entry(entry);
                 results.push(StagedNzbSubmissionResult {
                     staged_upload_id,
@@ -196,34 +213,52 @@ impl JobsMutation {
                     error: Some("staged upload is unavailable; re-add file".to_string()),
                 });
                 continue;
-            };
-            preparation.spec.password = normalize_archive_password_candidate(password.as_deref())
-                .or(preparation.spec.password);
-            preparation.spec.category = category.clone();
-            preparation.spec.metadata = metadata.clone();
-            if !preparation
-                .spec
-                .metadata
-                .iter()
-                .any(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
-                && let Some(original_title) = original_title
-            {
-                preparation.spec.metadata.push(original_title);
+            }
+            if let Some(preparation) = &mut preparation {
+                preparation.spec.password =
+                    normalize_archive_password_candidate(password.as_deref())
+                        .or(preparation.spec.password.take());
+                preparation.spec.category = category.clone();
+                preparation.spec.metadata = metadata.clone();
+                if !preparation
+                    .spec
+                    .metadata
+                    .iter()
+                    .any(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
+                    && let Some(original_title) = original_title
+                {
+                    preparation.spec.metadata.push(original_title);
+                }
             }
             let nzb_zstd = std::mem::take(&mut entry.nzb_zstd);
             let restore_nzb_zstd = nzb_zstd.clone();
 
-            match submit_staged_prepared_nzb_with_options(
-                db,
-                handle,
-                config,
-                preparation,
-                nzb_zstd,
-                Some(entry.filename.clone()),
-                options,
-            )
-            .await
-            {
+            let submitted = if let Some(preparation) = preparation {
+                submit_staged_prepared_nzb_with_options(
+                    db,
+                    handle,
+                    config,
+                    preparation,
+                    nzb_zstd,
+                    Some(entry.filename.clone()),
+                    options,
+                )
+                .await
+            } else {
+                submit_staged_nzb_zstd_with_options(
+                    db,
+                    handle,
+                    config,
+                    nzb_zstd,
+                    Some(entry.filename.clone()),
+                    password.clone(),
+                    category.clone(),
+                    metadata.clone(),
+                    options,
+                )
+                .await
+            };
+            match submitted {
                 Ok(submitted) => {
                     let result = submission_result_from_submitted(
                         handle,
@@ -373,10 +408,12 @@ impl JobsMutation {
     #[graphql(guard = "ControlGuard")]
     async fn mark_duplicate_good(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.mark_semantic_candidate_good(JobId(id)))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+        tokio::task::spawn_blocking(move || {
+            weaver_server_core::post_processing::hooks::mark_history_good(&db, JobId(id))
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
 
     #[graphql(guard = "ControlGuard")]
@@ -1038,6 +1075,7 @@ async fn submit_from_facade_input(
     let db = ctx.data::<Database>()?;
     let config = ctx.data::<SharedConfig>()?;
     let caller = caller_identity(ctx)?;
+    let source_url = input.url.clone();
     let (nzb_bytes, upload, filename) = match (input.nzb_base64, input.url, input.nzb_upload) {
         (Some(b64), None, None) => {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -1047,9 +1085,17 @@ async fn submit_from_facade_input(
         }
         (None, Some(url), None) => {
             let client = ctx.data::<reqwest::Client>()?;
-            let (bytes, url_filename) = fetch_nzb_from_url(client, &url)
-                .await
-                .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+            let fetched = fetch_nzb_from_url(client, &url).await;
+            if let Err(error) = weaver_server_core::post_processing::hooks::url_completed(
+                db,
+                &url,
+                input.category.as_deref(),
+                fetched.is_ok(),
+            ) {
+                tracing::warn!(%error, "could not raise URL script event");
+            }
+            let (bytes, url_filename) =
+                fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
             (Some(bytes), None, input.filename.or(url_filename))
         }
         (None, None, Some(upload)) => {
@@ -1079,8 +1125,14 @@ async fn submit_from_facade_input(
         input.dupe_score,
         input.dupe_mode,
     );
-    let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
+    let mut metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+    if let Some(url) = source_url {
+        metadata.push((
+            weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
+            url,
+        ));
+    }
 
     let submitted = if let Some(upload) = upload {
         submit_uploaded_nzb(

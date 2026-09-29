@@ -7,7 +7,8 @@ pub fn parse_history_metadata(metadata: Option<&str>) -> Vec<(String, String)> {
 }
 
 pub fn is_public_history_attribute_key(key: &str) -> bool {
-    key != CLIENT_REQUEST_ID_ATTRIBUTE_KEY
+    let key = key.to_ascii_lowercase();
+    !key.starts_with("weaver.") && !key.starts_with("__weaver_")
 }
 
 pub fn public_history_attributes(metadata: &[(String, String)]) -> Vec<(String, String)> {
@@ -26,4 +27,24 @@ pub fn split_history_metadata(
         .find(|(key, _)| key == CLIENT_REQUEST_ID_ATTRIBUTE_KEY)
         .map(|(_, value)| value.clone());
     (client_request_id, public_history_attributes(metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_metadata_is_hidden_from_history_attributes() {
+        let metadata = vec![
+            ("source".into(), "api".into()),
+            (
+                "weaver.submission.source_url".into(),
+                "https://example.invalid/nzb?token=private".into(),
+            ),
+            (CLIENT_REQUEST_ID_ATTRIBUTE_KEY.into(), "request-1".into()),
+        ];
+        let (request_id, attributes) = split_history_metadata(&metadata);
+        assert_eq!(request_id.as_deref(), Some("request-1"));
+        assert_eq!(attributes, vec![("source".into(), "api".into())]);
+    }
 }

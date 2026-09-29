@@ -9,12 +9,12 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use super::manifest::{
-    ManifestError, NZBGET_MANIFEST_FILE, detect_bare_script_adapter, parse_nzbget_manifest,
+    MAX_LEGACY_METADATA_BYTES, ManifestError, NZBGET_MANIFEST_FILE, apply_bare_script_declarations,
+    detect_bare_script_adapter, parse_nzbget_manifest,
 };
 use super::model::{PostProcessingValidationError, ScriptAdapter, ScriptManifest, ScriptName};
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-const SHEBANG_PREFIX_BYTES: u64 = 8 * 1024;
 
 /// A script that is present and parseable right now.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -100,6 +100,14 @@ pub fn list_scripts(root: &Path) -> Result<ScriptListing, ListingError> {
             }
         }
     }
+    for script in &listing.scripts {
+        if !script.manifest.declaration_problems().is_empty() {
+            listing.problems.push(ScriptProblem {
+                name: script.name.to_string(),
+                message: script.manifest.declaration_problems().join("; "),
+            });
+        }
+    }
     Ok(listing)
 }
 
@@ -143,7 +151,7 @@ fn read_bare_script(
     path: &Path,
     name: &ScriptName,
 ) -> Result<DiscoveredScript, ListingError> {
-    let preamble = read_utf8_prefix(path, SHEBANG_PREFIX_BYTES)?;
+    let preamble = read_utf8_prefix(path, MAX_LEGACY_METADATA_BYTES as u64)?;
     let adapter = detect_bare_script_adapter(&preamble);
     let compatibility_name = match adapter {
         ScriptAdapter::Nzbget => Some(super::model::NzbgetCompatibilityName::new(
@@ -163,7 +171,7 @@ fn read_bare_script(
     Ok(DiscoveredScript {
         name: name.clone(),
         root: root.to_path_buf(),
-        manifest,
+        manifest: apply_bare_script_declarations(manifest, &preamble),
     })
 }
 
@@ -206,6 +214,15 @@ fn read_utf8_limited(path: &Path, limit: u64) -> Result<String, ListingError> {
 
 fn read_utf8_prefix(path: &Path, limit: u64) -> Result<String, ListingError> {
     let mut bytes = Vec::with_capacity(limit as usize);
-    File::open(path)?.take(limit).read_to_end(&mut bytes)?;
+    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit as usize {
+        bytes.truncate(limit as usize);
+        // Do not interpret a declaration cut off by the metadata byte bound.
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |i| i + 1);
+        bytes.truncate(complete);
+    }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }

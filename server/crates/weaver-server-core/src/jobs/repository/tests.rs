@@ -376,6 +376,16 @@ fn detected_archive_identities_roundtrip() {
 fn archive_job_moves_to_history() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
+    db.save_job_script_effects(
+        1,
+        &crate::post_processing::effects::JobScriptEffects {
+            parameters: [("script_key".into(), "script-value".into())].into(),
+            directory: Some("/tmp/script-working".into()),
+            final_directory: Some("/tmp/script-final".into()),
+            marked_bad: true,
+        },
+    )
+    .unwrap();
 
     let history = JobHistoryRow {
         job_id: 1,
@@ -416,6 +426,9 @@ fn archive_job_moves_to_history() {
     let hist = db.list_job_history(&HistoryFilter::default()).unwrap();
     assert_eq!(hist.len(), 1);
     assert_eq!(hist[0].name, "test.nzb");
+    assert_eq!(hist[0].output_dir, history.output_dir);
+    assert!(hist[0].metadata.as_ref().unwrap().contains("script-value"));
+    assert!(db.job_script_effects(1).unwrap().marked_bad);
     assert_eq!(
         db.count_job_history(&HistoryFilter {
             metadata_equals: Some(HistoryMetadataEquals {
@@ -435,6 +448,90 @@ fn archive_job_moves_to_history() {
         .unwrap(),
         0
     );
+    // Restart removes the old history bundle before running the new attempt.
+    db.delete_job_history(1).unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    let effects = db.job_script_effects(1).unwrap();
+    assert!(effects.parameters.is_empty());
+    assert!(effects.directory.is_none());
+    assert!(effects.final_directory.is_none());
+    assert!(!effects.marked_bad);
+}
+
+#[test]
+fn script_parameter_budget_refuses_growth_without_partial_persistence() {
+    use crate::post_processing::effects::JobScriptEffects;
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    let initial = JobScriptEffects {
+        parameters: [("first".into(), "a".repeat(512 * 1024))].into(),
+        ..Default::default()
+    };
+    db.save_job_script_effects(1, &initial).unwrap();
+    let excess = JobScriptEffects {
+        parameters: [("second".into(), "b".repeat(512 * 1024))].into(),
+        ..Default::default()
+    };
+    assert!(
+        db.save_job_script_effects(1, &excess)
+            .unwrap_err()
+            .to_string()
+            .contains("1 MiB")
+    );
+    assert_eq!(
+        db.job_script_effects(1).unwrap().parameters,
+        initial.parameters
+    );
+    assert!(
+        !db.load_active_jobs().unwrap()[&JobId(1)]
+            .metadata
+            .iter()
+            .any(|(name, _)| name == "second")
+    );
+}
+
+#[test]
+fn cancellation_archive_preserves_directives_newer_than_the_runtime_snapshot() {
+    use crate::post_processing::effects::JobScriptEffects;
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(42)).unwrap();
+    let history = JobHistoryRow {
+        job_id: 42,
+        job_hash: None,
+        name: "cancelled-script".into(),
+        status: "cancelled".into(),
+        error_message: None,
+        total_bytes: 10,
+        downloaded_bytes: 10,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: Some("/tmp/old-output".into()),
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata: Some(r#"[["chain","stale"],["keep","input"]]"#.into()),
+        server_attribution: None,
+    };
+    let effects = JobScriptEffects {
+        parameters: [("chain".into(), "emitted".into())].into_iter().collect(),
+        directory: Some(PathBuf::from("/tmp/moved-output")),
+        ..Default::default()
+    };
+    db.save_job_script_effects(42, &effects).unwrap();
+    db.archive_job(JobId(42), &history).unwrap();
+    let archived = db.get_job_history(42).unwrap().unwrap();
+    let parameters: HashMap<String, String> =
+        serde_json::from_str::<Vec<(String, String)>>(&archived.metadata.unwrap())
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert_eq!(parameters["chain"], "emitted");
+    assert_eq!(parameters["keep"], "input");
+    assert_eq!(archived.output_dir.as_deref(), Some("/tmp/moved-output"));
+    assert!(db.save_job_script_effects(42, &effects).is_err());
 }
 
 #[test]

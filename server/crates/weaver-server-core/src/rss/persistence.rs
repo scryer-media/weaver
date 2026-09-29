@@ -32,8 +32,8 @@ impl Database {
                 "INSERT INTO rss_feeds
                     (id, name, url, enabled, poll_interval_secs, username, password, default_category,
                      default_metadata, etag, last_modified, last_polled_at, last_success_at, last_error,
-                     consecutive_failures)
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                     consecutive_failures, scripts)
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 &args,
             )
             .await?;
@@ -74,7 +74,7 @@ impl Database {
                     SET name = {}, url = {}, enabled = {}, poll_interval_secs = {}, username = {},
                         password = {}, default_category = {}, default_metadata = {}, etag = {},
                         last_modified = {}, last_polled_at = {}, last_success_at = {},
-                        last_error = {}, consecutive_failures = {}
+                        last_error = {}, consecutive_failures = {}, scripts = {}
                   WHERE id = {}",
                         &args,
                     )
@@ -313,6 +313,7 @@ fn rss_feed_args(
         SqlArg::OptI64(feed.last_success_at),
         SqlArg::OptText(feed.last_error.clone()),
         SqlArg::I64(i64::from(feed.consecutive_failures)),
+        SqlArg::Text(serde_json::to_string(&feed.scripts).expect("script names serialize")),
     ]
 }
 

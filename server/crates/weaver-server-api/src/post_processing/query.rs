@@ -68,10 +68,35 @@ impl PostProcessingQuery {
         job_id: u64,
     ) -> Result<Vec<ScriptResultGql>> {
         let db = ctx.data::<Database>()?.clone();
-        let results = tokio::task::spawn_blocking(move || db.job_post_processing_results(job_id))
+        tokio::task::spawn_blocking(move || {
+            let mut results = db.job_post_processing_results(job_id)?;
+            results.extend(db.event_script_results(job_id)?);
+            let retained_ids = db.retained_script_output_ids(job_id)?;
+            results
+                .into_iter()
+                .map(|result| {
+                    let retained = result
+                        .output_id
+                        .as_deref()
+                        .map(|id| retained_ids.contains(id))
+                        .unwrap_or(false);
+                    let mut result = ScriptResultGql::from(result);
+                    result.output_retained = retained;
+                    Ok::<_, weaver_server_core::StateError>(result)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        .map_err(|error| async_graphql::Error::new(error.to_string()))
+    }
+
+    #[graphql(guard = "ReadGuard")]
+    async fn script_output(&self, ctx: &Context<'_>, output_id: String) -> Result<Option<String>> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || db.script_output(&output_id))
             .await
             .map_err(|error| async_graphql::Error::new(error.to_string()))?
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-        Ok(results.into_iter().map(Into::into).collect())
+            .map_err(|error| async_graphql::Error::new(error.to_string()))
     }
 }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { JobScriptResults } from "@/components/JobScriptResults";
 import { Link, useNavigate, useParams } from "react-router";
 import { useMutation, useQuery, useSubscription } from "urql";
 import {
@@ -893,6 +894,7 @@ export function JobDetailPage() {
             />
           </DetailBlock>
         </PanelGrid>
+        <JobScriptResults key={`${job.id}-${job.status}`} jobId={job.id} />
       </div>
 
       {(["delete", "deleteAll"] as const).map((kind) => {

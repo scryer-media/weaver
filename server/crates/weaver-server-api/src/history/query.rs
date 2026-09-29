@@ -725,7 +725,8 @@ fn history_query_plan(
                     statuses.push("cancelled".to_string());
                 }
                 QueueItemState::Paused => statuses.push("paused".to_string()),
-                QueueItemState::Queued
+                QueueItemState::AwaitingQueueScripts
+                | QueueItemState::Queued
                 | QueueItemState::Downloading
                 | QueueItemState::FetchingRepairData
                 | QueueItemState::FinalizingDownload
@@ -956,6 +957,7 @@ fn normalized_history_name(item: &HistoryItem) -> String {
 
 fn history_state_key(state: QueueItemState) -> &'static str {
     match state {
+        QueueItemState::AwaitingQueueScripts => "awaiting_queue_scripts",
         QueueItemState::Completed => "completed",
         QueueItemState::Failed => "failed",
         QueueItemState::Paused => "paused",

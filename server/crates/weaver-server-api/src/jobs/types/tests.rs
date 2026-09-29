@@ -4,6 +4,12 @@ use weaver_server_core::jobs::ids::JobId;
 
 fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
     let (download_state, post_state, run_state, error) = match &status {
+        JobStatus::AwaitingQueueScripts => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::AwaitingQueueScripts,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
         JobStatus::Queued => (
             weaver_server_core::DownloadState::Queued,
             weaver_server_core::PostState::Idle,
@@ -167,6 +173,47 @@ fn queue_item_maps_moving_to_finalizing() {
     assert_eq!(item.client_request_id.as_deref(), Some("req-42"));
     assert_eq!(item.attributes.len(), 1);
     assert_eq!(item.attributes[0].key, "source");
+}
+
+#[test]
+fn internal_metadata_is_not_projected_to_readers() {
+    let mut info = base_job(JobStatus::Queued);
+    info.metadata.extend([
+        (
+            "weaver.submission.source_url".into(),
+            "https://example.invalid/nzb?token=private".into(),
+        ),
+        (
+            "weaver.post_processing.script_override".into(),
+            "disabled.sh".into(),
+        ),
+    ]);
+    let detail = Job::from(&info);
+    assert_eq!(detail.metadata.len(), 1);
+    assert_eq!(detail.metadata[0].key, "source");
+    let item = queue_item_from_job(&info);
+    assert_eq!(item.attributes.len(), 1);
+    assert_eq!(item.attributes[0].key, "source");
+}
+
+#[test]
+fn submission_rejects_internal_attribute_keys() {
+    for key in [
+        "weaver.post_processing.script_override",
+        "WEAVER.submission.add_to_top",
+        CLIENT_REQUEST_ID_ATTRIBUTE_KEY,
+    ] {
+        assert!(
+            submit_metadata(
+                Some(vec![AttributeInput {
+                    key: key.into(),
+                    value: "disabled.sh".into(),
+                }]),
+                None,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

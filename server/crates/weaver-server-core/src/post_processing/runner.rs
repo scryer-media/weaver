@@ -18,20 +18,24 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
-use super::model::{OptionValue, PipelineOutcome, ResolvedOption, ScriptAdapter, ScriptManifest};
+use super::directives::{ScriptOutputEvent, parse_line, valid_parameter_name};
+use super::model::{
+    OptionValue, PipelineOutcome, ResolvedOption, ScriptAdapter, ScriptEventLabel, ScriptManifest,
+};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(10);
 /// A user cancellation must not inherit an arbitrarily long script shutdown grace.
 const MAX_USER_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 /// Per-script output retained on the job. Anything beyond this keeps the tail.
-pub const MAX_SCRIPT_OUTPUT_BYTES: u64 = 256 * 1024;
+pub const MAX_SCRIPT_OUTPUT_BYTES: u64 = 1024 * 1024;
 pub const MAX_LOGICAL_LINE_BYTES: usize = 64 * 1024;
 
 const SUPERVISOR_ARG: &str = "__post-processing-supervisor";
 const MAX_SUPERVISOR_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
+const SUPERVISOR_LAUNCHED: &[u8] = b"weaver-script-launched-v1\n";
 
 fn user_cancellation_grace(grace: Duration) -> Duration {
     grace.min(MAX_USER_CANCELLATION_GRACE)
@@ -60,7 +64,7 @@ pub struct JobExecutionContext {
     pub compatibility: CompatibilityFacts,
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum NzbgetScriptStatus {
     #[default]
     None,
@@ -78,12 +82,16 @@ impl NzbgetScriptStatus {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CompatibilityFacts {
+    pub parameters: Vec<(String, String)>,
+    pub marked_bad: bool,
+    pub final_directory_override: Option<PathBuf>,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
     pub health_milli: u32,
     pub critical_health_milli: u32,
+    #[serde(skip)]
     pub password: Option<String>,
     pub failure_message: Option<String>,
     pub data_dir: Option<PathBuf>,
@@ -174,6 +182,15 @@ pub async fn execute_script(
     request: ScriptExecutionRequest,
     cancellation: Option<watch::Receiver<bool>>,
 ) -> Result<ScriptExecutionResult, RunnerError> {
+    execute_script_observed(request, cancellation, None, MAX_SCRIPT_OUTPUT_BYTES).await
+}
+
+pub async fn execute_script_observed(
+    request: ScriptExecutionRequest,
+    cancellation: Option<watch::Receiver<bool>>,
+    events: Option<mpsc::Sender<ScriptOutputEvent>>,
+    output_ceiling: u64,
+) -> Result<ScriptExecutionResult, RunnerError> {
     let mut secrets = request
         .options
         .iter()
@@ -193,6 +210,9 @@ pub async fn execute_script(
     {
         secrets.push(password.as_bytes().to_vec());
     }
+    if let Some(source_url) = request.context.source_url.as_deref() {
+        append_source_url_secrets(&mut secrets, source_url);
+    }
 
     let adapter = request.manifest.adapter();
     let display_name = request.manifest.display_name().to_string();
@@ -209,7 +229,13 @@ pub async fn execute_script(
         return Err(RunnerError::InvalidTimeout);
     }
 
-    let prepared = prepare_execution(&request)?;
+    let mut prepared = prepare_execution(&request)?;
+    prepared.capture = CapturePolicy {
+        secrets: Arc::new(secrets.clone()),
+        event: (adapter == ScriptAdapter::Nzbget).then_some(ScriptEventLabel::PostProcessing),
+        events,
+        ceiling: output_ceiling.clamp(MAX_LOGICAL_LINE_BYTES as u64, 8 * 1024 * 1024),
+    };
     tracing::info!(
         script = %display_name,
         adapter = adapter.as_str(),
@@ -244,10 +270,144 @@ pub async fn execute_script(
     result.map_err(|error| redact_runner_error(error, &secrets))
 }
 
+/// An invocation without job lifecycle authority. All kinds share this runner.
+pub struct ExecutionSpec {
+    pub manifest: ScriptManifest,
+    pub root: PathBuf,
+    pub options: Vec<ResolvedOption>,
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub argv: Vec<OsString>,
+    pub timeout: Option<Duration>,
+    pub termination_grace: Duration,
+    pub kind: ScriptEventLabel,
+    pub run_id: String,
+    pub facts: CompatibilityFacts,
+    pub interpreters: InterpreterConfig,
+    pub supervisor_executable: Option<PathBuf>,
+    pub output_ceiling: u64,
+}
+
+pub async fn execute_spec(
+    spec: ExecutionSpec,
+    cancellation: Option<watch::Receiver<bool>>,
+    events: Option<mpsc::Sender<ScriptOutputEvent>>,
+) -> Result<ScriptExecutionResult, RunnerError> {
+    let root = fs::canonicalize(&spec.root)?;
+    let entrypoint = fs::canonicalize(root.join(spec.manifest.entrypoint()))?;
+    if !entrypoint.starts_with(&root) || !entrypoint.is_file() {
+        return Err(RunnerError::InvalidEntrypoint);
+    }
+    let (program, mut args) = resolve_program(&entrypoint, &spec.interpreters)?;
+    args.extend(spec.argv);
+    let mut env = sanitized_platform_environment()?;
+    insert_nzbget_global_options(&mut env, &spec.facts)?;
+    insert_compat_options(&mut env, "NZBPO", &spec.options)?;
+    insert_parameters(&mut env, &spec.facts.parameters, &spec.manifest)?;
+    let source_url = spec
+        .env
+        .get("NZBNA_URL")
+        .or_else(|| spec.env.get("NZBNP_URL"))
+        .cloned();
+    for (name, value) in spec.env {
+        insert_env(&mut env, &name, &value)?;
+    }
+    let mut secrets = spec
+        .options
+        .iter()
+        .filter_map(|option| match option.value() {
+            OptionValue::Secret(value) if !value.expose_for_execution().is_empty() => {
+                Some(value.expose_for_execution().as_bytes().to_vec())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(password) = spec.facts.password.filter(|value| !value.is_empty()) {
+        secrets.push(password.into_bytes());
+    }
+    if let Some(source_url) = source_url.as_deref() {
+        append_source_url_secrets(&mut secrets, source_url);
+    }
+    let prepared = PreparedExecution {
+        supervisor_executable: spec.supervisor_executable,
+        supervisor: SupervisorRequest {
+            program,
+            args: args
+                .into_iter()
+                .map(OsStringWire::from_os)
+                .collect::<Result<_, _>>()?,
+            env,
+            cwd: fs::canonicalize(spec.cwd)?,
+        },
+        adapter: spec.manifest.adapter(),
+        capture: CapturePolicy {
+            secrets: Arc::new(secrets.clone()),
+            event: Some(spec.kind.clone()),
+            events,
+            ceiling: spec
+                .output_ceiling
+                .clamp(MAX_LOGICAL_LINE_BYTES as u64, 8 * 1024 * 1024),
+        },
+    };
+    tracing::info!(run_id = %spec.run_id, event = %spec.kind, "starting script");
+    let mut result = execute_supervised(
+        prepared,
+        spec.timeout,
+        spec.termination_grace.max(Duration::from_millis(1)),
+        cancellation,
+    )
+    .await
+    .map_err(|error| redact_runner_error(error, &secrets))?;
+    if result.exit_code.is_some()
+        && !matches!(
+            result.disposition,
+            ExecutionDisposition::Cancelled | ExecutionDisposition::TimedOut
+        )
+    {
+        result.disposition = match spec.kind {
+            ScriptEventLabel::Feed(_) if result.exit_code != Some(93) => {
+                ExecutionDisposition::Failed
+            }
+            ScriptEventLabel::Feed(_)
+            | ScriptEventLabel::Queue(_)
+            | ScriptEventLabel::Scan
+            | ScriptEventLabel::Scheduler(_) => ExecutionDisposition::Succeeded,
+            ScriptEventLabel::PostProcessing => result.disposition,
+        };
+        if result.disposition == ExecutionDisposition::Succeeded {
+            result.error_message = None;
+        }
+    }
+    if let Some(message) = &mut result.error_message {
+        *message = redact_string(message, &secrets);
+    }
+    Ok(result)
+}
+
+#[derive(Clone)]
+struct CapturePolicy {
+    secrets: Arc<Vec<Vec<u8>>>,
+    event: Option<ScriptEventLabel>,
+    events: Option<mpsc::Sender<ScriptOutputEvent>>,
+    ceiling: u64,
+}
+
+impl Default for CapturePolicy {
+    fn default() -> Self {
+        Self {
+            secrets: Arc::new(Vec::new()),
+            event: None,
+            events: None,
+            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
+        }
+    }
+}
+
 struct PreparedExecution {
     supervisor_executable: Option<PathBuf>,
     supervisor: SupervisorRequest,
     adapter: ScriptAdapter,
+    capture: CapturePolicy,
 }
 
 fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecution, RunnerError> {
@@ -276,6 +436,7 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
             cwd: final_directory,
         },
         adapter: request.manifest.adapter(),
+        capture: CapturePolicy::default(),
     })
 }
 
@@ -462,7 +623,17 @@ fn adapter_environment_and_args(
                 "NZBPP_URL",
                 context.source_url.as_deref().unwrap_or_default(),
             )?;
-            insert_env(env, "NZBPP_FINALDIR", path_text(&context.final_directory)?)?;
+            insert_env(
+                env,
+                "NZBPP_FINALDIR",
+                path_text(
+                    context
+                        .compatibility
+                        .final_directory_override
+                        .as_deref()
+                        .unwrap_or(&context.final_directory),
+                )?,
+            )?;
             insert_env(
                 env,
                 "NZBPP_CATEGORY",
@@ -493,6 +664,7 @@ fn adapter_environment_and_args(
             )?;
             insert_compat_options(env, "NZBPO", &request.options)?;
             insert_nzbget_global_options(env, &context.compatibility)?;
+            insert_parameters(env, &context.compatibility.parameters, &request.manifest)?;
             Ok(vec![])
         }
     }
@@ -512,6 +684,9 @@ fn sab_pipeline_status(outcome: &PipelineOutcome) -> i32 {
 }
 
 fn nzbget_pipeline_status(context: &JobExecutionContext) -> &'static str {
+    if context.compatibility.marked_bad {
+        return "FAILURE/BAD";
+    }
     match &context.pipeline_outcome {
         PipelineOutcome::Succeeded if context.par_status == 2 || context.unpack_status == 2 => {
             "SUCCESS/ALL"
@@ -525,6 +700,30 @@ fn nzbget_pipeline_status(context: &JobExecutionContext) -> &'static str {
             super::model::PipelineFailureStage::Move => "FAILURE/MOVE",
         },
     }
+}
+
+fn insert_parameters(
+    env: &mut BTreeMap<OsStringWire, OsStringWire>,
+    parameters: &[(String, String)],
+    manifest: &ScriptManifest,
+) -> Result<(), RunnerError> {
+    let script = manifest
+        .compatibility_name()
+        .map(|name| name.as_str())
+        .unwrap_or(manifest.entrypoint());
+    for (name, value) in parameters {
+        if !valid_parameter_name(name) || value.contains('\0') {
+            continue;
+        }
+        insert_special_env(env, "NZBPR", name, value)?;
+        if let Some((prefix, option)) = name.split_once(':')
+            && prefix.eq_ignore_ascii_case(script)
+            && !option.is_empty()
+        {
+            insert_special_env(env, "NZBPR", option, value)?;
+        }
+    }
+    Ok(())
 }
 
 fn insert_nzbget_global_options(
@@ -636,14 +835,105 @@ fn option_value_text(value: &OptionValue) -> String {
     }
 }
 
+/// A fetched URL can carry a credential in userinfo or a query parameter.
+/// Keep ordinary source URLs visible, but protect credential-bearing ones before
+/// their script output is parsed into logs, directives or retained output.
+fn append_source_url_secrets(secrets: &mut Vec<Vec<u8>>, source_url: &str) {
+    let Ok(url) = reqwest::Url::parse(source_url) else {
+        return;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
+    let mut components = Vec::new();
+    let mut sensitive = false;
+    if !url.username().is_empty() {
+        sensitive = true;
+        if url.password().is_none() && url.username().len() >= 4 {
+            components.push(url.username().as_bytes().to_vec());
+        }
+    }
+    if let Some(password) = url.password().filter(|password| !password.is_empty()) {
+        sensitive = true;
+        if password.len() >= 4 {
+            components.push(password.as_bytes().to_vec());
+        }
+    }
+    if let Some(query) = url.query() {
+        for pair in query.split('&') {
+            if let Some((key, value)) = pair.split_once('=')
+                && sensitive_url_query_key(key)
+                && !value.is_empty()
+            {
+                sensitive = true;
+                if value.len() >= 4 {
+                    components.push(value.as_bytes().to_vec());
+                }
+            }
+        }
+        for (key, value) in url.query_pairs() {
+            if sensitive_url_query_key(&key) && !value.is_empty() {
+                sensitive = true;
+                if value.len() >= 4 {
+                    components.push(value.as_bytes().to_vec());
+                }
+            }
+        }
+    }
+    if sensitive {
+        secrets.push(source_url.as_bytes().to_vec());
+        secrets.extend(components);
+    }
+}
+
+fn sensitive_url_query_key(key: &str) -> bool {
+    let key = key.replace(['_', '-'], "").to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "apikey"
+            | "accesstoken"
+            | "token"
+            | "auth"
+            | "authorization"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "signature"
+            | "sig"
+            | "key"
+            | "xamzsignature"
+            | "xamzcredential"
+            | "xamzsecuritytoken"
+            | "xgoogsignature"
+            | "xgoogcredential"
+            | "xgoogsecuritytoken"
+    )
+}
+
 fn redact_bytes(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
+    // Capture emits complete lines independently. Multiline credentials must
+    // therefore also redact each nonempty line before logs or directives leave
+    // the capture task. Prefer longer matches when secret values overlap.
+    let mut patterns: Vec<&[u8]> = secrets
+        .iter()
+        .flat_map(|secret| {
+            std::iter::once(secret.as_slice()).chain(
+                secret
+                    .split(|byte| *byte == b'\n')
+                    .map(|line| line.strip_suffix(b"\r").unwrap_or(line)),
+            )
+        })
+        .filter(|secret| !secret.is_empty())
+        .collect();
+    patterns.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+    patterns.dedup();
     let mut output = input.to_vec();
-    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+    for secret in patterns {
         let mut cursor = 0;
         while cursor + secret.len() <= output.len() {
             let Some(offset) = output[cursor..]
                 .windows(secret.len())
-                .position(|candidate| candidate == secret.as_slice())
+                .position(|candidate| candidate == secret)
             else {
                 break;
             };
@@ -733,15 +1023,26 @@ async fn execute_supervised(
     stdin.write_all(&request_length.to_le_bytes()).await?;
     stdin.write_all(&request_json).await?;
 
-    let output = Arc::new(Mutex::new(BoundedOutput::default()));
+    let output = Arc::new(Mutex::new(BoundedOutput {
+        ceiling: prepared.capture.ceiling,
+        ..Default::default()
+    }));
     let stdout = child.stdout.take().ok_or_else(|| {
         RunnerError::SupervisorProtocol("supervisor stdout was unavailable".into())
     })?;
     let stderr = child.stderr.take().ok_or_else(|| {
         RunnerError::SupervisorProtocol("supervisor stderr was unavailable".into())
     })?;
-    let stdout_task = tokio::spawn(capture_stream(stdout, output.clone()));
-    let stderr_task = tokio::spawn(capture_stream(stderr, output.clone()));
+    let stdout_task = tokio::spawn(capture_supervised_stdout(
+        stdout,
+        output.clone(),
+        prepared.capture.clone(),
+    ));
+    let stderr_task = tokio::spawn(capture_stream(
+        stderr,
+        output.clone(),
+        prepared.capture.clone(),
+    ));
 
     let deadline = timeout
         .map(|timeout| {
@@ -795,12 +1096,15 @@ async fn execute_supervised(
         }
     };
     drop(stdin);
-    stdout_task
-        .await
-        .map_err(|error| RunnerError::SupervisorProtocol(error.to_string()))??;
-    stderr_task
-        .await
-        .map_err(|error| RunnerError::SupervisorProtocol(error.to_string()))??;
+    let (stdout_result, stderr_result) = tokio::join!(stdout_task, stderr_task);
+    let launched =
+        stdout_result.map_err(|error| RunnerError::SupervisorProtocol(error.to_string()))??;
+    stderr_result.map_err(|error| RunnerError::SupervisorProtocol(error.to_string()))??;
+    if !launched && forced.is_none() {
+        return Err(RunnerError::SupervisorProtocol(
+            "supervisor did not confirm script launch".into(),
+        ));
+    }
     let captured = Arc::try_unwrap(output)
         .map_err(|_| RunnerError::SupervisorProtocol("output collector remained shared".into()))?
         .into_inner()
@@ -832,18 +1136,29 @@ async fn execute_supervised(
     })
 }
 
-#[derive(Default)]
 struct BoundedOutput {
     lines: VecDeque<Vec<u8>>,
     bytes: u64,
     truncated: bool,
+    ceiling: u64,
+}
+
+impl Default for BoundedOutput {
+    fn default() -> Self {
+        Self {
+            lines: VecDeque::new(),
+            bytes: 0,
+            truncated: false,
+            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
+        }
+    }
 }
 
 impl BoundedOutput {
     fn push(&mut self, line: Vec<u8>) {
         self.bytes = self.bytes.saturating_add(line.len() as u64);
         self.lines.push_back(line);
-        while self.bytes > MAX_SCRIPT_OUTPUT_BYTES && self.lines.len() > 1 {
+        while self.bytes > self.ceiling && self.lines.len() > 1 {
             let removed = self.lines.pop_front().expect("non-empty");
             self.bytes = self.bytes.saturating_sub(removed.len() as u64);
             self.truncated = true;
@@ -855,34 +1170,86 @@ impl BoundedOutput {
     }
 }
 
+async fn capture_supervised_stdout<R: AsyncRead + Unpin>(
+    mut reader: R,
+    output: Arc<Mutex<BoundedOutput>>,
+    policy: CapturePolicy,
+) -> Result<bool, io::Error> {
+    let mut preamble = vec![0; SUPERVISOR_LAUNCHED.len()];
+    let launched = match reader.read_exact(&mut preamble).await {
+        Ok(_) => preamble == SUPERVISOR_LAUNCHED,
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => false,
+        Err(error) => return Err(error),
+    };
+    if launched {
+        capture_stream(reader, output, policy).await?;
+    } else {
+        // Always drain the pipe, even when a failed supervisor never launched
+        // the script. Its exit status must not masquerade as a script exit.
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+    }
+    Ok(launched)
+}
+
 async fn capture_stream<R: AsyncRead + Unpin>(
     mut reader: R,
     output: Arc<Mutex<BoundedOutput>>,
+    policy: CapturePolicy,
 ) -> Result<(), io::Error> {
     let mut pending = Vec::new();
+    let mut oversized = false;
     let mut buffer = [0_u8; 8192];
     loop {
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
             break;
         }
-        pending.extend_from_slice(&buffer[..count]);
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let line = pending.drain(..=newline).collect::<Vec<_>>();
-            output.lock().expect("output collector poisoned").push(line);
-        }
-        while pending.len() > MAX_LOGICAL_LINE_BYTES {
-            let line = pending.drain(..MAX_LOGICAL_LINE_BYTES).collect::<Vec<_>>();
-            output.lock().expect("output collector poisoned").push(line);
+        for part in buffer[..count].split_inclusive(|byte| *byte == b'\n') {
+            if !oversized {
+                if pending.len() + part.len() > MAX_LOGICAL_LINE_BYTES {
+                    // Discard a fragmented logical line in full. This also prevents
+                    // secrets spanning a chunk boundary from escaping redaction.
+                    pending.clear();
+                    oversized = true;
+                    let mut output = output.lock().expect("output collector poisoned");
+                    output.truncated = true;
+                    output.push(b"[oversized script line omitted]\n".to_vec());
+                } else {
+                    pending.extend_from_slice(part);
+                }
+            }
+            if part.last() == Some(&b'\n') {
+                if !oversized {
+                    capture_line(std::mem::take(&mut pending), &output, &policy).await;
+                }
+                oversized = false;
+            }
         }
     }
     if !pending.is_empty() {
-        output
-            .lock()
-            .expect("output collector poisoned")
-            .push(std::mem::take(&mut pending));
+        capture_line(pending, &output, &policy).await;
     }
     Ok(())
+}
+
+async fn capture_line(line: Vec<u8>, output: &Arc<Mutex<BoundedOutput>>, policy: &CapturePolicy) {
+    let newline = line.last() == Some(&b'\n');
+    let redacted = redact_bytes(&line, &policy.secrets);
+    let (tail, event) = if let Some(kind) = &policy.event {
+        let (mut tail, event) = parse_line(kind, &String::from_utf8_lossy(&redacted));
+        if !tail.is_empty() && newline {
+            tail.push('\n');
+        }
+        (tail.into_bytes(), event)
+    } else {
+        (redacted, None)
+    };
+    if !tail.is_empty() {
+        output.lock().expect("output collector poisoned").push(tail);
+    }
+    if let (Some(sender), Some(event)) = (&policy.events, event) {
+        let _ = sender.send(event).await;
+    }
 }
 
 /// SABnzbd records any nonzero exit as a warning; NZBGet defines 93/94/95.
@@ -908,16 +1275,14 @@ async fn terminate_supervisor(
         unsafe {
             libc::kill(-pid, libc::SIGTERM);
         }
-        let deadline = Instant::now()
+        let deadline = tokio::time::Instant::now()
             .checked_add(grace)
             .ok_or(RunnerError::InvalidTimeout)?;
-        while Instant::now() < deadline {
-            if child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        // SAFETY: same process-group contract as above.
+        // Do not reap the leader during the grace period. It can exit on TERM
+        // while a descendant ignores the signal. Keeping its PID reserved also
+        // prevents the process-group identity from being reused before KILL.
+        tokio::time::sleep_until(deadline).await;
+        // SAFETY: the unreaped leader still reserves this process-group ID.
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
@@ -988,6 +1353,16 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
             }
         }
     });
+    let announced = {
+        let mut output = io::stdout().lock();
+        output
+            .write_all(SUPERVISOR_LAUNCHED)
+            .and_then(|()| output.flush())
+    };
+    if announced.is_err() {
+        terminate_on_parent_pipe_loss(&mut child);
+        return Ok(125);
+    }
     let stdout_thread = relay_thread(stdout, io::stdout(), parent_pipe_lost.clone());
     let stderr_thread = relay_thread(stderr, io::stderr(), parent_pipe_lost.clone());
     let status = loop {
@@ -1118,6 +1493,188 @@ pub(crate) fn redact_bytes_for_test(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8
 #[cfg(test)]
 pub(crate) fn cancellation_grace_for_test(grace: Duration) -> Duration {
     user_cancellation_grace(grace)
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::post_processing::directives::Directive;
+
+    #[tokio::test]
+    async fn credential_bearing_source_urls_are_redacted_before_log_emission() {
+        let url = "https://account:password123@example.invalid/file?api_key=token123";
+        let aws_url = "https://example.invalid/file?X-Amz-Signature=awssecret123";
+        let google_url = "https://example.invalid/file?X-Goog-Signature=googsecret123";
+        let mut secrets = Vec::new();
+        append_source_url_secrets(&mut secrets, url);
+        append_source_url_secrets(&mut secrets, aws_url);
+        append_source_url_secrets(&mut secrets, google_url);
+        let output = Arc::new(Mutex::new(BoundedOutput::default()));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let policy = CapturePolicy {
+            secrets: Arc::new(secrets),
+            event: Some(ScriptEventLabel::Scan),
+            events: Some(sender),
+            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
+        };
+        let lines = format!(
+            "[INFO] {url}\n[WARNING] password123 token123 awssecret123 googsecret123\n[INFO] {aws_url}\n[INFO] {google_url}\n"
+        );
+        capture_stream(lines.as_bytes(), output.clone(), policy)
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await,
+            Some(ScriptOutputEvent::Log {
+                level: crate::post_processing::directives::ScriptLogLevel::Info,
+                text: "[REDACTED]".into(),
+            })
+        );
+        assert_eq!(
+            receiver.recv().await,
+            Some(ScriptOutputEvent::Log {
+                level: crate::post_processing::directives::ScriptLogLevel::Warning,
+                text: "[REDACTED] [REDACTED] [REDACTED] [REDACTED]".into(),
+            })
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                receiver.recv().await,
+                Some(ScriptOutputEvent::Log {
+                    level: crate::post_processing::directives::ScriptLogLevel::Info,
+                    text: "[REDACTED]".into(),
+                })
+            );
+        }
+        assert!(receiver.recv().await.is_none());
+        let captured = Arc::try_unwrap(output).ok().unwrap().into_inner().unwrap();
+        let text = String::from_utf8(captured.into_bytes()).unwrap();
+        assert!(!text.contains(url));
+        assert!(!text.contains("password123"));
+        assert!(!text.contains("token123"));
+        assert!(!text.contains("awssecret123"));
+        assert!(!text.contains("googsecret123"));
+
+        let benign = "https://example.invalid/file?page=2";
+        let mut secrets = Vec::new();
+        append_source_url_secrets(&mut secrets, benign);
+        assert!(secrets.is_empty());
+        assert_eq!(redact_string(benign, &secrets), benign);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_kills_a_descendant_that_ignores_term() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(r#"sh -c 'trap "" TERM; printf ready; while :; do :; done' & wait"#)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
+        let mut supervisor = command.spawn().unwrap();
+        let pid = supervisor.id();
+        let mut output = supervisor.stdout.take().unwrap();
+        let mut ready = [0; 5];
+        output.read_exact(&mut ready).await.unwrap();
+        assert_eq!(&ready, b"ready");
+
+        terminate_supervisor(&mut supervisor, pid, Duration::from_secs(1))
+            .await
+            .unwrap();
+        // The descendant holds this pipe directly. EOF proves it exited;
+        // merely observing the supervisor exit cannot establish that.
+        let mut remainder = Vec::new();
+        output.read_to_end(&mut remainder).await.unwrap();
+        assert!(remainder.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multiline_secrets_are_redacted_before_capture_events_leave() {
+        let output = Arc::new(Mutex::new(BoundedOutput::default()));
+        let (sender, mut receiver) = mpsc::channel(8);
+        let policy = CapturePolicy {
+            secrets: Arc::new(vec![b"secret-alpha\r\n\r\nsecret-beta".to_vec()]),
+            event: Some(ScriptEventLabel::Scan),
+            events: Some(sender),
+            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
+        };
+        let input = b"secret-alpha\r\n\r\nsecret-beta\n[INFO] secret-alpha\n[NZB] NZBPR_Token=secret-beta\n";
+        capture_stream(input.as_slice(), output.clone(), policy)
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await,
+            Some(ScriptOutputEvent::Log {
+                level: crate::post_processing::directives::ScriptLogLevel::Info,
+                text: "[REDACTED]".into(),
+            })
+        );
+        assert_eq!(
+            receiver.recv().await,
+            Some(ScriptOutputEvent::Directive(Directive::Parameter {
+                name: "Token".into(),
+                value: "[REDACTED]".into(),
+            }))
+        );
+        assert!(receiver.recv().await.is_none());
+        let captured = Arc::try_unwrap(output).ok().unwrap().into_inner().unwrap();
+        let text = String::from_utf8(captured.into_bytes()).unwrap();
+        assert!(!text.contains("secret-alpha"));
+        assert!(!text.contains("secret-beta"));
+        assert!(text.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn capture_redacts_before_directives_and_omits_oversized_lines() {
+        let output = Arc::new(Mutex::new(BoundedOutput::default()));
+        let (sender, mut receiver) = mpsc::channel(8);
+        let policy = CapturePolicy {
+            secrets: Arc::new(vec![b"sensitive-value".to_vec()]),
+            event: Some(ScriptEventLabel::Scan),
+            events: Some(sender),
+            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
+        };
+        let mut input = b"[NZB] NZBPR_Token=sensitive-value\n[INFO] sensitive-value\r\n".to_vec();
+        input.extend_from_slice(b"[NZB] NZBPR_TooLong=");
+        input.extend(vec![b'x'; MAX_LOGICAL_LINE_BYTES]);
+        input.extend_from_slice(b"\n[NZB] NZBPR_After=yes\n");
+        capture_stream(input.as_slice(), output.clone(), policy)
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await,
+            Some(ScriptOutputEvent::Directive(Directive::Parameter {
+                name: "Token".into(),
+                value: "[REDACTED]".into()
+            }))
+        );
+        assert_eq!(
+            receiver.recv().await,
+            Some(ScriptOutputEvent::Log {
+                level: crate::post_processing::directives::ScriptLogLevel::Info,
+                text: "[REDACTED]".into()
+            })
+        );
+        assert_eq!(
+            receiver.recv().await,
+            Some(ScriptOutputEvent::Directive(Directive::Parameter {
+                name: "After".into(),
+                value: "yes".into()
+            }))
+        );
+        assert!(receiver.recv().await.is_none());
+        let captured = Arc::try_unwrap(output).ok().unwrap().into_inner().unwrap();
+        assert!(captured.truncated);
+        let text = String::from_utf8(captured.into_bytes()).unwrap();
+        assert!(!text.contains("sensitive-value"));
+        assert!(!text.contains("[INFO]"));
+        assert!(!text.contains("TooLong"));
+    }
 }
 
 #[cfg(windows)]

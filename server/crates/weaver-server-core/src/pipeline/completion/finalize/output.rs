@@ -932,9 +932,46 @@ impl Pipeline {
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
         self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
 
-        let dest = self
-            .claim_complete_destination(job_id, &job_name, category.as_deref())
-            .await?;
+        let requested = self
+            .db
+            .job_script_effects(job_id.0)
+            .map_err(|error| error.to_string())?
+            .final_directory;
+        let dest = if let Some(path) = requested {
+            let event = self
+                .queue_script_context(
+                    job_id,
+                    crate::post_processing::model::QueueEvent::NzbDownloaded,
+                )
+                .ok_or("script job disappeared before final move")?;
+            let context = crate::post_processing::runner::JobExecutionContext {
+                job_id: job_id.0,
+                name: job_name.clone(),
+                nzb_filename: format!("{job_name}.nzb"),
+                category: category.clone(),
+                group: None,
+                source_url: None,
+                working_directory: working_dir.clone(),
+                final_directory: path.clone(),
+                pipeline_outcome: crate::post_processing::model::PipelineOutcome::Succeeded,
+                par_status: 0,
+                unpack_status: 0,
+                compatibility: event.facts,
+            };
+            let path =
+                crate::post_processing::effects::validate_directory(&self.db, &context, &path)?;
+            if self
+                .reserved_complete_destinations
+                .iter()
+                .any(|(owner, reserved)| *owner != job_id && reserved == &path)
+            {
+                return Err("script final directory is reserved by another job".into());
+            }
+            path
+        } else {
+            self.claim_complete_destination(job_id, &job_name, category.as_deref())
+                .await?
+        };
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);
@@ -1225,6 +1262,9 @@ impl Pipeline {
                     .ok()
                     .and_then(|path| path.parent().map(std::path::PathBuf::from)),
                 previous_script_status: Default::default(),
+                parameters: state.spec.metadata.clone(),
+                marked_bad: false,
+                final_directory_override: None,
             },
         };
         self.transition_postprocessing_status(
@@ -1238,15 +1278,27 @@ impl Pipeline {
             .insert(job_id, cancellation_tx);
         let executor = self.terminal_post_processing_executor.clone();
         let done_tx = self.terminal_post_processing_done_tx.clone();
+        let db = self.db.clone();
         tokio::spawn(async move {
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let execution = executor.execute_admitted_job(
-                job_id.0,
-                admission,
-                context,
-                Some(cancellation_rx),
-                Some(started_tx),
-            );
+            let execution = async {
+                let mut cancellation_wait = cancellation_rx.clone();
+                if !*cancellation_wait.borrow() {
+                    tokio::select! {
+                        result = crate::post_processing::events::wait_for_job_events(&db, job_id.0) => result?,
+                        _ = cancellation_wait.changed() => {},
+                    }
+                }
+                executor
+                    .execute_admitted_job(
+                        job_id.0,
+                        admission,
+                        context,
+                        Some(cancellation_rx),
+                        Some(started_tx),
+                    )
+                    .await
+            };
             tokio::pin!(execution);
             tokio::pin!(started_rx);
             let result = tokio::select! {
@@ -1359,6 +1411,33 @@ impl Pipeline {
         // recreate or overwrite that cancelled job history.
         if !self.jobs.contains_key(&done.job_id) {
             return;
+        }
+        match self.db.job_script_effects(done.job_id.0) {
+            Ok(effects) => {
+                if let Some(state) = self.jobs.get_mut(&done.job_id) {
+                    effects.merge_parameters(&mut state.spec.metadata);
+                    if let Some(directory) = effects.directory {
+                        state.working_dir = directory;
+                    }
+                    if let Some(directory) = effects.final_directory {
+                        state.working_dir = directory;
+                    }
+                }
+                if effects.marked_bad {
+                    self.finalize_failed_job_after_terminal_post_processing(
+                        done.job_id,
+                        "FAILURE/BAD: marked bad by script".into(),
+                    );
+                    return;
+                }
+            }
+            Err(error) => {
+                self.finalize_failed_job_after_terminal_post_processing(
+                    done.job_id,
+                    format!("could not restore applied script directives: {error}"),
+                );
+                return;
+            }
         }
         if let Some(primary_failure) = done.primary_failure {
             match &done.result {

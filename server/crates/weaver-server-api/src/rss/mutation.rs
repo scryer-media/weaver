@@ -14,6 +14,22 @@ pub(crate) struct RssMutation;
 
 #[Object]
 impl RssMutation {
+    #[graphql(guard = "AdminGuard")]
+    async fn preview_rss_feed(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<Vec<crate::rss::types::RssSeenItem>> {
+        let rows = ctx
+            .data::<RssService>()?
+            .preview_feed(id)
+            .await
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(crate::rss::types::RssSeenItem::from_row)
+            .collect())
+    }
     /// Add a new RSS feed.
     #[graphql(guard = "AdminGuard")]
     async fn add_rss_feed(&self, ctx: &Context<'_>, input: RssFeedInput) -> Result<RssFeed> {
@@ -218,6 +234,10 @@ impl RssMutation {
 }
 
 fn validate_feed_input(input: &RssFeedInput) -> Result<()> {
+    for script in input.scripts.iter().flatten() {
+        weaver_server_core::post_processing::model::ScriptName::new(script.clone())
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+    }
     let url = reqwest::Url::parse(&input.url)
         .map_err(|e| async_graphql::Error::new(format!("invalid RSS feed URL: {e}")))?;
     match url.scheme() {
@@ -255,6 +275,7 @@ fn validate_rule_input(input: &RssRuleInput) -> Result<()> {
 
 fn rss_feed_row_from_create(id: u32, input: RssFeedInput) -> RssFeedRow {
     RssFeedRow {
+        scripts: input.scripts.unwrap_or_default(),
         id,
         name: input.name,
         url: input.url,
@@ -275,6 +296,7 @@ fn rss_feed_row_from_create(id: u32, input: RssFeedInput) -> RssFeedRow {
 
 fn rss_feed_row_from_update(existing: RssFeedRow, input: RssFeedInput) -> RssFeedRow {
     RssFeedRow {
+        scripts: input.scripts.unwrap_or(existing.scripts),
         id: existing.id,
         name: input.name,
         url: input.url,

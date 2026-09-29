@@ -20,16 +20,12 @@ use super::model::{
 };
 use super::runner::{
     DEFAULT_TIMEOUT, ExecutionDisposition, InterpreterConfig, JobExecutionContext,
-    NzbgetScriptStatus, ScriptExecutionRequest, execute_script,
+    NzbgetScriptStatus, ScriptExecutionRequest, execute_script_observed,
 };
 use super::settings::ScriptOptionsSnapshot;
 use crate::persistence::{Database, StateError};
 
 const MAX_CONCURRENCY: usize = 8;
-/// Output carried inline on the job's event stream. The full tail stays on the
-/// job row, so the event log remains readable when a script is chatty.
-const MAX_EVENT_OUTPUT_BYTES: usize = 8 * 1024;
-
 pub const SCRIPT_EVENT_KIND: &str = "PostProcessingScript";
 pub const SCRIPT_OUTPUT_EVENT_KIND: &str = "PostProcessingScriptOutput";
 
@@ -465,7 +461,7 @@ impl PostProcessingExecutor {
                 self.execute_one(
                     &admission,
                     entry,
-                    &context,
+                    &mut context,
                     &interpreters,
                     termination_grace,
                     Some(cancel_rx.clone()),
@@ -474,6 +470,9 @@ impl PostProcessingExecutor {
             };
             record_script_metrics(&result);
             context.compatibility.previous_script_status = match result.status {
+                ScriptStatus::Skipped if result.exit_code.is_none() => {
+                    context.compatibility.previous_script_status
+                }
                 ScriptStatus::Succeeded | ScriptStatus::Skipped => {
                     if context.compatibility.previous_script_status == NzbgetScriptStatus::Failure {
                         NzbgetScriptStatus::Failure
@@ -510,7 +509,7 @@ impl PostProcessingExecutor {
         &self,
         admission: &PostProcessingJobAdmission,
         entry: &ScriptListEntry,
-        context: &JobExecutionContext,
+        context: &mut JobExecutionContext,
         interpreters: &InterpreterConfig,
         termination_grace: Duration,
         cancellation: Option<watch::Receiver<bool>>,
@@ -522,6 +521,20 @@ impl PostProcessingExecutor {
                 return unavailable_result(entry, started, &error);
             }
         };
+        if !script
+            .manifest
+            .kinds()
+            .contains(&super::model::ScriptKind::PostProcessing)
+        {
+            let mut result = failed_result(
+                entry,
+                script.manifest.adapter(),
+                started,
+                "script does not declare post-processing".to_string(),
+            );
+            result.status = ScriptStatus::Skipped;
+            return result;
+        }
         let supplied = match self
             .db
             .resolve_post_processing_script_options(&admission.options, &entry.script)
@@ -538,6 +551,23 @@ impl PostProcessingExecutor {
             }
         };
         let adapter = script.manifest.adapter();
+        let settings = match self.db.post_processing_settings() {
+            Ok(settings) => settings,
+            Err(error) => return failed_result(entry, adapter, started, error.to_string()),
+        };
+        if let Err(error) = self
+            .db
+            .refresh_script_job_inputs(context.job_id, &mut context.compatibility)
+        {
+            return failed_result(entry, adapter, started, error.to_string());
+        }
+        if let Err(error) = self
+            .db
+            .job_script_effects(context.job_id)
+            .map(|effects| effects.apply_to_context(context))
+        {
+            return failed_result(entry, adapter, started, error.to_string());
+        }
         let request = ScriptExecutionRequest {
             manifest: script.manifest,
             root: script.root,
@@ -553,25 +583,54 @@ impl PostProcessingExecutor {
             interpreters: interpreters.clone(),
             supervisor_executable: self.supervisor_executable.clone(),
         };
-        match execute_script(request, cancellation).await {
-            Ok(result) => ScriptResult {
-                script: entry.script.clone(),
-                adapter,
-                status: match result.disposition {
-                    ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
-                    ExecutionDisposition::Skipped => ScriptStatus::Skipped,
-                    ExecutionDisposition::Warned => ScriptStatus::Warning,
-                    ExecutionDisposition::Failed => ScriptStatus::Failed,
-                    ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
-                    ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
-                },
-                exit_code: result.exit_code,
-                duration_ms: started.elapsed().as_millis() as u64,
-                output_tail: String::from_utf8_lossy(&result.output).into_owned(),
-                output_truncated: result.output_truncated,
-                error_message: result.error_message,
-                finished_at_epoch_ms: now_epoch_ms(),
-            },
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let (execution, ()) = tokio::join!(
+            execute_script_observed(
+                request,
+                cancellation,
+                Some(sender),
+                settings.event_scripts.script_output_ceiling_bytes
+            ),
+            self.consume_script_events(context, receiver),
+        );
+        match execution {
+            Ok(result) => {
+                let record = ScriptResult {
+                    script: entry.script.clone(),
+                    event: Default::default(),
+                    output_id: None,
+                    adapter,
+                    status: match result.disposition {
+                        ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
+                        ExecutionDisposition::Skipped => ScriptStatus::Skipped,
+                        ExecutionDisposition::Warned => ScriptStatus::Warning,
+                        ExecutionDisposition::Failed => ScriptStatus::Failed,
+                        ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
+                        ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
+                    },
+                    exit_code: result.exit_code,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    output_tail: super::output::excerpt(&result.output),
+                    output_truncated: result.output_truncated,
+                    error_message: result.error_message,
+                    finished_at_epoch_ms: now_epoch_ms(),
+                };
+                match super::output::retain_output(
+                    self.db.clone(),
+                    Some(context.job_id),
+                    record.clone(),
+                    result.output,
+                    settings.event_scripts,
+                )
+                .await
+                {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::warn!(job_id = context.job_id, %error, "could not retain script output");
+                        record
+                    }
+                }
+            }
             Err(error) => failed_result(entry, adapter, started, error.to_string()),
         }
     }
@@ -590,12 +649,51 @@ impl PostProcessingExecutor {
             message.push_str(&format!(": {error}"));
         }
         self.record_job_event(job_id, SCRIPT_EVENT_KIND, &message);
-        if !result.output_tail.trim().is_empty() {
-            self.record_job_event(
-                job_id,
-                SCRIPT_OUTPUT_EVENT_KIND,
-                &event_output_excerpt(&result.output_tail),
-            );
+    }
+
+    async fn consume_script_events(
+        &self,
+        context: &mut JobExecutionContext,
+        mut receiver: tokio::sync::mpsc::Receiver<super::directives::ScriptOutputEvent>,
+    ) {
+        use super::directives::{ScriptLogLevel, ScriptOutputEvent};
+        let mut buffer = String::new();
+        let mut severity = ScriptLogLevel::Debug;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                event = receiver.recv() => match event {
+                    Some(ScriptOutputEvent::Directive(directive)) => {
+                        let db = self.db.clone();
+                        let mut next_context = context.clone();
+                        let applied = tokio::task::spawn_blocking(move || {
+                            super::effects::apply_job_directive(&db, &mut next_context, directive)?;
+                            Ok::<_, String>(next_context)
+                        }).await.map_err(|error| error.to_string()).and_then(std::convert::identity);
+                        if let Err(error) = &applied {
+                            severity = severity.max(ScriptLogLevel::Warning);
+                            super::events::append_log(&mut buffer, &format!("Invalid command: {error}"));
+                        } else if let Ok(next_context) = applied {
+                            *context = next_context;
+                        }
+                    }
+                    Some(ScriptOutputEvent::Log { level, text }) => {
+                        severity = severity.max(level);
+                        super::events::append_log(&mut buffer, &format!("{level:?}: {text}"));
+                    }
+                    None => break,
+                },
+                _ = interval.tick(), if !buffer.is_empty() => {
+                    super::events::record_log_batch(&self.db, context.job_id, std::mem::take(&mut buffer), severity).await;
+                    severity = ScriptLogLevel::Debug;
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            interval.tick().await;
+            super::events::record_log_batch(&self.db, context.job_id, buffer, severity).await;
         }
     }
 
@@ -638,17 +736,6 @@ pub fn strict_security_enabled() -> bool {
     crate::security::parse_bool_env(crate::security::ENV_STRICT_SECURITY, false).unwrap_or(false)
 }
 
-fn event_output_excerpt(output: &str) -> String {
-    if output.len() <= MAX_EVENT_OUTPUT_BYTES {
-        return output.to_string();
-    }
-    let mut start = output.len() - MAX_EVENT_OUTPUT_BYTES;
-    while start < output.len() && !output.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &output[start..])
-}
-
 fn unavailable_result(
     entry: &ScriptListEntry,
     started: Instant,
@@ -658,7 +745,9 @@ fn unavailable_result(
     // warning and an event, which is what both oracles do with a missing script.
     ScriptResult {
         script: entry.script.clone(),
+        event: Default::default(),
         adapter: ScriptAdapter::Sabnzbd,
+        output_id: None,
         status: ScriptStatus::Warning,
         exit_code: None,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -677,8 +766,10 @@ fn failed_result(
 ) -> ScriptResult {
     ScriptResult {
         script: entry.script.clone(),
+        event: Default::default(),
         adapter,
         status: ScriptStatus::Failed,
+        output_id: None,
         exit_code: None,
         duration_ms: started.elapsed().as_millis() as u64,
         output_tail: String::new(),

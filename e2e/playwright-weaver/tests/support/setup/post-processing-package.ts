@@ -13,6 +13,7 @@ const WEAVER_OUTPUTS_DIR = "/data/complete";
 const PLAYWRIGHT_OUTPUTS_DIR = "/weaver-downloads";
 
 export const POST_PROCESSING_NOTIFY_SCRIPT = "e2e-notify.sh";
+export const EVENT_SCRIPT = "e2e-event-script.sh";
 export const POST_PROCESSING_FAILING_SCRIPT = "e2e-failing.sh";
 export const POST_PROCESSING_NZBGET_PACKAGE = "e2e-nzbget-package";
 export const POST_PROCESSING_NZBGET_DISPLAY_NAME = "E2E NZBGet Package";
@@ -116,6 +117,7 @@ exit 93
 /** Remove every fixture, so a rerun of the flow starts from a clean directory. */
 export function removePostProcessingScripts(): void {
   for (const name of [
+    EVENT_SCRIPT,
     POST_PROCESSING_NOTIFY_SCRIPT,
     POST_PROCESSING_FAILING_SCRIPT,
     POST_PROCESSING_NZBGET_PACKAGE,
@@ -138,4 +140,30 @@ export function postProcessingMarker(outputDir: string): string {
   }
   const marker = path.join(PLAYWRIGHT_OUTPUTS_DIR, relative, POST_PROCESSING_MARKER);
   return fs.existsSync(marker) ? fs.readFileSync(marker, "utf8") : "";
+}
+
+export function seedEventScript(): void {
+  writeScript(EVENT_SCRIPT, `#!/bin/sh
+### NZBGET POST-PROCESSING/QUEUE SCRIPT ###
+### QUEUE EVENTS: NZB_DOWNLOADED
+if [ "$NZBNA_EVENT" = NZB_DOWNLOADED ]; then
+  gate="$(dirname "$0")/e2e-event-gate-$NZBNA_NZBID"
+  mkfifo "$gate"
+  printf '[NZB] NZBPR_Detector=queue-event\\n'
+  read -r release < "$gate"
+  rm "$gate"
+  printf '[NZB] MARK=BAD\\n'
+  exit 0
+fi
+printf '[INFO] terminal status=%s parameter=%s\\n' "$NZBPP_STATUS" "$NZBPR_DETECTOR"
+exit 93
+`);
+}
+
+export function eventScriptWaiting(jobId: number): boolean {
+  return fs.existsSync(path.join(SCRIPTS_DIR, `e2e-event-gate-${jobId}`));
+}
+
+export async function releaseEventScript(jobId: number): Promise<void> {
+  await fs.promises.writeFile(path.join(SCRIPTS_DIR, `e2e-event-gate-${jobId}`), "continue\n");
 }

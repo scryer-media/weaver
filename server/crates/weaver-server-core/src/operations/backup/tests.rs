@@ -150,6 +150,7 @@ async fn export_and_import_stable_state_roundtrip() {
     }])
     .unwrap();
     src.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "feed".into(),
         url: "https://example.com/rss".into(),

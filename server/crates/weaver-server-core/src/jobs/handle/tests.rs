@@ -22,6 +22,12 @@ fn runtime_lanes_for_status(
     Option<String>,
 ) {
     match status {
+        JobStatus::AwaitingQueueScripts => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::AwaitingQueueScripts,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
         JobStatus::Queued => (
             crate::jobs::model::DownloadState::Queued,
             crate::jobs::model::PostState::Idle,

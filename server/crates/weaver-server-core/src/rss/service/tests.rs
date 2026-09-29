@@ -158,6 +158,7 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
 
     let db = Database::open(&db_path).unwrap();
     let feed = RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "Test Feed".to_string(),
         url: format!("{base_url}/feed"),
@@ -238,6 +239,7 @@ async fn run_sync_uses_conditional_get_and_basic_auth() {
     let (base_url, server_task) = start_test_server(state.clone()).await;
 
     db.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "Auth Feed".to_string(),
         url: format!("{base_url}/feed"),
@@ -298,6 +300,7 @@ async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
     };
     let (base_url, server_task) = start_test_server(state.clone()).await;
     db.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "Broken Feed".to_string(),
         url: format!("{base_url}/feed"),
@@ -361,6 +364,7 @@ async fn background_due_sync_skips_when_manual_sync_is_active() {
     };
     let (base_url, server_task) = start_test_server(state).await;
     db.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "Due Feed".to_string(),
         url: format!("{base_url}/feed"),
@@ -473,6 +477,7 @@ async fn start_auth_origin_server(state: AuthOriginState) -> (String, tokio::tas
 
 fn basic_auth_feed(url: String) -> RssFeedRow {
     RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "Basic Auth Feed".to_string(),
         url,

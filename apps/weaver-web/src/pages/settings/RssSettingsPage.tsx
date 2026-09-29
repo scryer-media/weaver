@@ -64,6 +64,7 @@ type RssRule = {
 };
 
 type RssFeed = {
+  scripts: string[];
   routingStatus?: RoutingStatus;
   routing: RoutingPolicy;
   id: number;
@@ -126,6 +127,7 @@ type RssSeenItem = {
 };
 
 type FeedFormValues = {
+  scripts: string;
   routing: RoutingPolicy;
   name: string;
   url: string;
@@ -153,6 +155,7 @@ type RuleFormValues = {
 const NONE_VALUE = "__none__";
 
 const defaultFeedForm: FeedFormValues = {
+  scripts: "",
   routing: directRouting,
   name: "",
   url: "",
@@ -289,6 +292,7 @@ export function RssSettingsPage() {
       url: values.url.trim(),
       enabled: values.enabled,
       pollIntervalSecs: values.pollIntervalSecs,
+      scripts: values.scripts.split(",").map((name) => name.trim()).filter(Boolean),
       username: values.username,
       password: editingFeed
         ? values.clearPassword
@@ -456,6 +460,7 @@ export function RssSettingsPage() {
                   url: editingFeed.url,
                   enabled: editingFeed.enabled,
                   pollIntervalSecs: editingFeed.pollIntervalSecs,
+                  scripts: (editingFeed.scripts ?? []).join(", "),
                   username: editingFeed.username ?? "",
                   password: "",
                   clearPassword: false,
@@ -776,6 +781,9 @@ function FeedFormCard({
           </Field>
 
           <Field label={t("rss.defaultCategory")}>
+            <label className="mb-4 block">Feed scripts (comma-separated; empty uses global list)
+              <Input value={values.scripts} onChange={(event) => setValues((current) => ({ ...current, scripts: event.target.value }))} />
+            </label>
             <Select
               value={values.defaultCategory || NONE_VALUE}
               onValueChange={(value) =>

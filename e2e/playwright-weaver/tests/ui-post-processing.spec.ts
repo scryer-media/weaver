@@ -9,6 +9,10 @@ import {
   POST_PROCESSING_NZBGET_DISPLAY_NAME,
   POST_PROCESSING_NZBGET_PACKAGE,
   POST_PROCESSING_SECRET,
+  EVENT_SCRIPT,
+  eventScriptWaiting,
+  releaseEventScript,
+  seedEventScript,
   postProcessingMarker,
   removePostProcessingScripts,
   seedPostProcessingScripts,
@@ -16,6 +20,8 @@ import {
 import {
   runJobThroughPostProcessing,
   scriptResults,
+  waitForTerminalJob,
+  submitPostProcessingJob,
 } from "./support/setup/post-processing-job";
 
 function operationResponse(page: Page, operation: string) {
@@ -223,4 +229,37 @@ test("a disabled entry stays in the list without running", async ({
   await expect(notifyEntry).toBeVisible();
   await expect(notifyEntry).not.toBeChecked();
   expect(POST_PROCESSING_MARKER).toBeTruthy();
+});
+
+test("queue barrier, marked-bad history and event result groups are visible", async ({ cleanPage: page, request }) => {
+  seedEventScript();
+  await page.goto("/settings/post-processing");
+  const executionToggle = page.getByRole("switch", { name: "Run scripts", exact: true });
+  if (!(await executionToggle.isChecked())) {
+    await executionToggle.click();
+    await saveSettings(page);
+  }
+  const runList = page.getByRole("region", { name: "Run list", exact: true });
+  for (const script of [POST_PROCESSING_NOTIFY_SCRIPT, POST_PROCESSING_FAILING_SCRIPT, POST_PROCESSING_NZBGET_PACKAGE]) {
+    const entry = runList.getByRole("switch", { name: `Run ${script}`, exact: true });
+    if ((await entry.count()) > 0 && (await entry.isChecked())) {
+      await waitForScriptListSave(page, () => entry.click());
+    }
+  }
+  await addScriptToRunList(page, EVENT_SCRIPT);
+  const discovered = discoveredScript(page, EVENT_SCRIPT);
+  await expect(discovered.getByText("Post-processing", { exact: true })).toBeVisible();
+  await expect(discovered.getByText("Queue", { exact: true })).toBeVisible();
+  await expect(discovered).toContainText("NZB_DOWNLOADED");
+
+  const jobId = await submitPostProcessingJob(request, "event-barrier");
+  await expect.poll(() => eventScriptWaiting(jobId)).toBe(true);
+  await page.goto(`/jobs/${jobId}`);
+  await expect(page.getByRole("main")).toContainText("Waiting for queue scripts");
+  await releaseEventScript(jobId);
+  expect((await waitForTerminalJob(request, jobId)).state).toBe("FAILED");
+  await page.reload();
+  await expect(page.getByText("queue:NZB_DOWNLOADED (1)", { exact: true })).toBeVisible();
+  await expect(page.getByText("post_processing (1)", { exact: true })).toBeVisible();
+  await expect(page.getByText("terminal status=FAILURE/BAD parameter=queue-event", { exact: false })).toBeVisible();
 });

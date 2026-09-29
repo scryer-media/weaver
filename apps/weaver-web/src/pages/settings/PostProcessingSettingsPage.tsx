@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { PageHeader } from "@/components/PageHeader";
+import { ScriptKinds, type ScriptDeclarations } from "@/components/ScriptKinds";
+import { EventScriptSettings, eventScriptOptions, type EventScriptOptions } from "@/components/EventScriptSettings";
 import { SectionCard } from "@/components/SectionCard";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { FolderPathInput } from "@/components/FolderPathInput";
@@ -39,7 +41,7 @@ type ScriptOption = {
   value?: string | null;
 };
 
-type Script = {
+type Script = ScriptDeclarations & {
   name: string;
   displayName: string;
   adapter: "SABNZBD" | "NZBGET";
@@ -60,7 +62,7 @@ type ScriptLists = {
   categories: { category: string; entries: ScriptListEntry[] }[];
 };
 
-type Settings = {
+type Settings = EventScriptOptions & {
   scriptDirectory: string;
   executionEnabled: boolean;
   concurrency: number;
@@ -79,7 +81,7 @@ type QueryData = {
   categories: { id: number; name: string }[];
 };
 
-type SettingsDraft = {
+type SettingsDraft = EventScriptOptions & {
   executionEnabled: boolean;
   concurrency: string;
   terminationGraceSeconds: string;
@@ -92,6 +94,7 @@ type SettingsDraft = {
 function settingsDraft(settings: Settings): SettingsDraft {
   return {
     executionEnabled: settings.executionEnabled,
+    ...eventScriptOptions(settings),
     concurrency: String(settings.concurrency),
     terminationGraceSeconds: String(settings.terminationGraceSeconds),
     pythonInterpreter: settings.pythonInterpreter ?? "",
@@ -190,6 +193,7 @@ export function PostProcessingSettingsPage() {
     const result = await saveSettings({
       input: {
         executionEnabled: next.executionEnabled,
+        ...eventScriptOptions(next),
         concurrency,
         terminationGraceSeconds: grace,
         pythonInterpreter: next.pythonInterpreter.trim() || null,
@@ -291,7 +295,7 @@ export function PostProcessingSettingsPage() {
     <div className="space-y-6">
       <PageHeader
         title="Post-processing"
-        description="Run scripts from a configured host folder when a job finishes."
+        description="Run scripts for post-processing, queue events, submissions, schedules, and feeds."
       />
 
       {error ? (
@@ -389,21 +393,20 @@ export function PostProcessingSettingsPage() {
         <div className="space-y-6">
           {settings?.strictSecurityRefusesExecution ? (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm">
-              WEAVER_STRICT_SECURITY=1 refuses post-processing script execution.
+              WEAVER_STRICT_SECURITY=1 refuses script execution for every kind.
             </div>
           ) : null}
 
           <div className="flex items-center justify-between gap-4">
             <div>
-              <Label htmlFor="pp-execution">Run post-processing scripts</Label>
+              <Label htmlFor="pp-execution">Run scripts</Label>
               <p className="text-sm text-muted-foreground">
-                Off by default. Turning this on means files in the scripts folder run when a
-                job finishes.
+                Off by default. Enabled scripts run for every kind they declare.
               </p>
             </div>
             <Switch
               id="pp-execution"
-              aria-label="Run post-processing scripts"
+              aria-label="Run scripts"
               checked={draft?.executionEnabled ?? false}
               disabled={!draft || settings?.strictSecurityRefusesExecution}
               onCheckedChange={(checked) => {
@@ -416,6 +419,7 @@ export function PostProcessingSettingsPage() {
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
+            {draft && <div className="sm:col-span-2"><EventScriptSettings value={draft} onChange={(patch) => setDraft((current) => current ? { ...current, ...patch } : current)} /></div>}
             <div className="space-y-2">
               <Label htmlFor="pp-concurrency">Concurrent jobs (1-8)</Label>
               <Input
@@ -535,6 +539,9 @@ export function PostProcessingSettingsPage() {
                     {scripts.find((script) => script.name === entry.script)?.adapter ??
                       "MISSING"}
                   </Badge>
+                  {scripts.filter((script) => script.name === entry.script).map((script) => (
+                    <ScriptKinds key={script.name} script={script} />
+                  ))}
                   <div className="flex items-center gap-2">
                     <Switch
                       aria-label={`Enable ${entry.script}`}

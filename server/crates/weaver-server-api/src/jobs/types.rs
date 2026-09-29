@@ -12,7 +12,7 @@ use weaver_server_core::jobs::{
     SemanticCandidateState, SemanticPromotionState, SemanticTerminalCause,
 };
 use weaver_server_core::operations::metrics::MetricsSnapshot;
-use weaver_server_core::split_history_metadata;
+use weaver_server_core::{is_public_history_attribute_key, split_history_metadata};
 
 use super::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::system::types::{DownloadBlock, Metrics};
@@ -57,6 +57,7 @@ pub struct AttributeInput {
 /// extraction begins.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Enum)]
 pub enum QueueItemState {
+    AwaitingQueueScripts,
     Queued,
     Downloading,
     FetchingRepairData,
@@ -75,6 +76,7 @@ pub enum QueueItemState {
 impl From<&weaver_server_core::JobStatus> for QueueItemState {
     fn from(value: &weaver_server_core::JobStatus) -> Self {
         match value {
+            weaver_server_core::JobStatus::AwaitingQueueScripts => Self::AwaitingQueueScripts,
             weaver_server_core::JobStatus::Queued
             | weaver_server_core::JobStatus::QueuedRepair
             | weaver_server_core::JobStatus::QueuedExtract
@@ -116,6 +118,7 @@ impl From<weaver_server_core::DownloadState> for QueueDownloadState {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
 pub enum QueuePostState {
+    AwaitingQueueScripts,
     Idle,
     QueuedRepair,
     Repairing,
@@ -134,6 +137,7 @@ pub enum QueuePostState {
 impl From<weaver_server_core::PostState> for QueuePostState {
     fn from(value: weaver_server_core::PostState) -> Self {
         match value {
+            weaver_server_core::PostState::AwaitingQueueScripts => Self::AwaitingQueueScripts,
             weaver_server_core::PostState::Idle => Self::Idle,
             weaver_server_core::PostState::QueuedRepair => Self::QueuedRepair,
             weaver_server_core::PostState::Repairing => Self::Repairing,
@@ -1008,6 +1012,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
             metadata: info
                 .metadata
                 .iter()
+                .filter(|(key, _)| is_public_history_attribute_key(key))
                 .map(|(k, v)| MetadataEntry {
                     key: k.clone(),
                     value: v.clone(),
@@ -1024,6 +1029,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
 /// extraction begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
 pub enum JobStatusGql {
+    AwaitingQueueScripts,
     Queued,
     Downloading,
     Checking,
@@ -1043,6 +1049,7 @@ pub enum JobStatusGql {
 impl From<&weaver_server_core::JobStatus> for JobStatusGql {
     fn from(status: &weaver_server_core::JobStatus) -> Self {
         match status {
+            weaver_server_core::JobStatus::AwaitingQueueScripts => Self::AwaitingQueueScripts,
             weaver_server_core::JobStatus::Queued => Self::Queued,
             weaver_server_core::JobStatus::Downloading => Self::Downloading,
             weaver_server_core::JobStatus::Checking => Self::Verifying,
@@ -1128,6 +1135,9 @@ pub fn submit_metadata(
 ) -> std::result::Result<Vec<(String, String)>, String> {
     let mut metadata: Vec<(String, String)> = Vec::new();
     for entry in attributes.unwrap_or_default() {
+        if !is_public_history_attribute_key(&entry.key) {
+            return Err("reserved attribute key".to_string());
+        }
         if entry.key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY) {
             metadata.retain(|(key, _)| !key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY));
             metadata.push((
@@ -1379,6 +1389,7 @@ pub fn queue_summary(items: &[QueueItem], metrics: &MetricsSnapshot) -> QueueSum
 
     for item in items {
         match item.state {
+            QueueItemState::AwaitingQueueScripts => summary.active_items += 1,
             QueueItemState::Queued => summary.queued_items += 1,
             QueueItemState::Paused => summary.paused_items += 1,
             QueueItemState::Failed => summary.failed_items += 1,
@@ -1608,6 +1619,7 @@ fn resolve_queue_item_state(
     }
 
     match info.post_state {
+        weaver_server_core::PostState::AwaitingQueueScripts => QueueItemState::AwaitingQueueScripts,
         weaver_server_core::PostState::Verifying
         | weaver_server_core::PostState::AwaitingRepair => QueueItemState::Verifying,
         weaver_server_core::PostState::Repairing => QueueItemState::Repairing,

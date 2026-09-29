@@ -83,10 +83,16 @@ impl SettingsQuery {
     async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::settings::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();
         let entries: Vec<weaver_server_core::bandwidth::ScheduleEntry> =
-            tokio::task::spawn_blocking(move || db.list_schedules())
-                .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            tokio::task::spawn_blocking(move || {
+                let mut entries = db.list_schedules()?;
+                entries.extend(
+                    weaver_server_core::post_processing::scheduler::implicit_schedules(&db)?,
+                );
+                Ok::<_, weaver_server_core::StateError>(entries)
+            })
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(entries
             .into_iter()
             .map(crate::settings::types::Schedule::from)

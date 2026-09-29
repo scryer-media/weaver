@@ -1454,6 +1454,8 @@ pub(super) struct MoveToCompleteDone {
 }
 
 pub(super) enum TerminalPostProcessingEvent {
+    HistoryDeleteDone(orchestrator::HistoryDeleteDone),
+    QueueDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),
 }
@@ -2560,9 +2562,14 @@ pub struct Pipeline {
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
     pub(super) terminal_post_processing_done_tx: mpsc::Sender<TerminalPostProcessingEvent>,
     pub(super) terminal_post_processing_done_rx: mpsc::Receiver<TerminalPostProcessingEvent>,
+    pub(super) script_effects_rx: tokio::sync::watch::Receiver<()>,
     pub(super) terminal_post_processing_executor:
         crate::post_processing::executor::PostProcessingExecutor,
     pub(super) inflight_terminal_post_processing: HashSet<JobId>,
+    pub(super) queue_script_waiters: HashSet<JobId>,
+    pub(super) queue_scripts_completed: HashSet<JobId>,
+    pub(super) script_data_dir: PathBuf,
+    pub(super) pending_history_deletions: HashSet<JobId>,
     pub(super) terminal_post_processing_cancellations:
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
     /// Cooperative cancellation tokens for PAR2 verification and repair work.

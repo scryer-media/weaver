@@ -261,6 +261,7 @@ pub struct SegmentSpec {
 /// Status of a job in the scheduler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStatus {
+    AwaitingQueueScripts,
     Queued,
     Downloading,
     /// Health probe in progress — checking article availability.
@@ -284,6 +285,7 @@ pub enum JobStatus {
 impl JobStatus {
     pub fn persisted_status(&self) -> &'static str {
         match self {
+            Self::AwaitingQueueScripts => "awaiting_queue_scripts",
             Self::Queued => "queued",
             Self::Downloading => "downloading",
             Self::Checking => "checking",
@@ -337,6 +339,7 @@ impl DownloadState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PostState {
+    AwaitingQueueScripts,
     Idle,
     QueuedRepair,
     Repairing,
@@ -355,6 +358,7 @@ pub enum PostState {
 impl PostState {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AwaitingQueueScripts => "awaiting_queue_scripts",
             Self::Idle => "idle",
             Self::QueuedRepair => "queued_repair",
             Self::Repairing => "repairing",
@@ -373,6 +377,7 @@ impl PostState {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "awaiting_queue_scripts" => Some(Self::AwaitingQueueScripts),
             "idle" => Some(Self::Idle),
             "queued_repair" => Some(Self::QueuedRepair),
             "repairing" => Some(Self::Repairing),
@@ -437,6 +442,7 @@ pub fn derive_legacy_job_status(
     }
 
     match post_state {
+        PostState::AwaitingQueueScripts => JobStatus::AwaitingQueueScripts,
         PostState::Finalizing => JobStatus::Moving,
         PostState::QueuedPostProcessing => JobStatus::QueuedPostProcessing,
         PostState::PostProcessing => JobStatus::PostProcessing,
@@ -460,6 +466,7 @@ pub fn derive_legacy_job_status(
 
 pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobStatus {
     match status {
+        "awaiting_queue_scripts" => JobStatus::AwaitingQueueScripts,
         "queued" => JobStatus::Queued,
         "downloading" => JobStatus::Downloading,
         "checking" => JobStatus::Checking,
@@ -489,6 +496,11 @@ pub fn runtime_lanes_from_status_snapshot(
     status: &JobStatus,
 ) -> (DownloadState, PostState, RunState) {
     match status {
+        JobStatus::AwaitingQueueScripts => (
+            DownloadState::Complete,
+            PostState::AwaitingQueueScripts,
+            RunState::Active,
+        ),
         JobStatus::Queued => (DownloadState::Queued, PostState::Idle, RunState::Active),
         JobStatus::Downloading => (
             DownloadState::Downloading,

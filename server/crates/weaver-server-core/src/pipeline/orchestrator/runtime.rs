@@ -164,6 +164,7 @@ impl Pipeline {
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
+        let script_effects_rx = db.subscribe_script_effects();
         let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
         let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
@@ -190,6 +191,13 @@ impl Pipeline {
         if let Err(error) = terminal_post_processing_executor.recover_interrupted() {
             warn!(error = %error, "failed to mark interrupted post-processing jobs");
         }
+        if let Err(error) = db.recover_script_events() {
+            warn!(%error, "failed to mark interrupted queue scripts");
+        }
+        if let Err(error) = crate::post_processing::events::refresh_admission_hint(&db) {
+            warn!(%error, "failed to initialize queue script admission hint");
+        }
+        crate::post_processing::events::wake_queue(db.clone());
         let nntp = Arc::new(nntp);
         shared_state.set_nntp_runtime_activation(NntpRuntimeActivation {
             generation: 0,
@@ -361,8 +369,13 @@ impl Pipeline {
             move_done_rx,
             terminal_post_processing_done_tx,
             terminal_post_processing_done_rx,
+            script_effects_rx,
             terminal_post_processing_executor,
             inflight_terminal_post_processing: HashSet::new(),
+            queue_script_waiters: HashSet::new(),
+            queue_scripts_completed: HashSet::new(),
+            script_data_dir: data_dir.clone(),
+            pending_history_deletions: HashSet::new(),
             terminal_post_processing_cancellations: HashMap::new(),
             global_paused: initial_global_paused,
             scheduled_pause: false,
@@ -1054,8 +1067,32 @@ impl Pipeline {
                     Some(done) = self.direct_demotion_done_rx.recv() => {
                         self.handle_direct_demotion_done(done).await;
                     }
+                    Ok(()) = self.script_effects_rx.changed() => {
+                        for job_id in self.db.take_script_effects() {
+                            self.apply_queue_script_effects(JobId(job_id));
+                        }
+                        self.publish_snapshot();
+                    }
                     Some(event) = self.terminal_post_processing_done_rx.recv() => {
                         match event {
+                            TerminalPostProcessingEvent::HistoryDeleteDone(done) => {
+                                self.handle_history_delete_done(done);
+                            }
+                            TerminalPostProcessingEvent::QueueDone(job_id, result) => {
+                                self.queue_script_waiters.remove(&job_id);
+                                if self.jobs.get(&job_id).is_some_and(|job| job.status == JobStatus::AwaitingQueueScripts) {
+                                    match result {
+                                        Ok(()) => {
+                                            self.queue_scripts_completed.retain(|id| self.jobs.contains_key(id));
+                                            self.queue_scripts_completed.insert(job_id);
+                                            if self.apply_queue_script_effects(job_id) { continue; }
+                                            self.transition_postprocessing_status(job_id, JobStatus::Downloading, None);
+                                            self.check_job_completion(job_id).await;
+                                        }
+                                        Err(error) => self.fail_job(job_id, format!("queue scripts failed: {error}")),
+                                    }
+                                }
+                            }
                             TerminalPostProcessingEvent::Started(job_id) => {
                                 self.handle_terminal_post_processing_started(job_id);
                             }

@@ -85,11 +85,12 @@ pub const JOB_STATUS_KEYS: [&str; NUM_JOB_STATUS_METRICS] = [
     "post_processing",
     "failed",
     "complete",
+    "awaiting_queue_scripts",
 ];
 
 const NUM_COUNTER_METRICS: usize = 19;
 const NUM_GAUGE_METRICS: usize = 27;
-const NUM_JOB_STATUS_METRICS: usize = 14;
+const NUM_JOB_STATUS_METRICS: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricsHistoryTier {
@@ -1017,6 +1018,7 @@ fn job_status_counts(jobs: &[JobInfo]) -> [f64; NUM_JOB_STATUS_METRICS] {
 
 fn job_status_index(status: &JobStatus) -> Option<usize> {
     let label = match status {
+        JobStatus::AwaitingQueueScripts => "awaiting_queue_scripts",
         JobStatus::Queued => "queued",
         JobStatus::Downloading => "downloading",
         JobStatus::Paused => "paused",

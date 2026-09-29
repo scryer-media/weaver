@@ -271,7 +271,8 @@ async fn dispatch_method(
         "postqueue" => postqueue(ctx).await,
         "urlqueue" => Ok(Value::Array(Vec::new())),
         "servervolumes" => servervolumes(ctx).await,
-        "viewfeed" | "previewfeed" => viewfeed(ctx, params).await,
+        "viewfeed" => viewfeed(ctx, params, false).await,
+        "previewfeed" => viewfeed(ctx, params, true).await,
         "fetchfeeds" => fetch_feeds(ctx),
         "pausedownload" | "pausedownload2" => pause_download(ctx).await,
         "resumedownload" | "resumedownload2" => resume_download(ctx).await,
@@ -843,6 +844,7 @@ struct AppendRequest {
     content_or_url: String,
     category: Option<String>,
     priority: i64,
+    add_to_top: bool,
     add_paused: bool,
     dupe_key: Option<String>,
     dupe_score: Option<i64>,
@@ -857,7 +859,16 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         .await
         .map_err(|error| append_refused(&requested_name, error))?;
     let (nzb_bytes, fetched_filename) = if is_http_url(&request.content_or_url) {
-        match fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await {
+        let fetched = fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await;
+        if let Err(error) = weaver_server_core::post_processing::hooks::url_completed(
+            &ctx.db,
+            &request.content_or_url,
+            request.category.as_deref(),
+            fetched.is_ok(),
+        ) {
+            tracing::warn!(%error, "could not raise URL script event");
+        }
+        match fetched {
             Ok(fetched) => fetched,
             Err(error) => return append_rejection_result(&requested_name, error),
         }
@@ -928,11 +939,30 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
 
     let mut metadata = submit_metadata(Some(attributes), client_request_id)
         .map_err(|error| append_refused(&requested_name, RpcError::invalid_parameter(error)))?;
+    metadata.push((
+        weaver_server_core::post_processing::scan::ADD_TO_TOP_KEY.into(),
+        i32::from(request.add_to_top).to_string(),
+    ));
+    for (name, value) in &request.parameters {
+        if weaver_server_core::post_processing::directives::valid_parameter_name(name)
+            && weaver_server_core::is_public_history_attribute_key(name)
+            && !name.eq_ignore_ascii_case("*Unpack:Password")
+        {
+            metadata.retain(|(key, _)| key != name);
+            metadata.push((name.clone(), value.clone()));
+        }
+    }
     if let Some(scripts) = script_override {
         metadata.push((
             weaver_server_core::post_processing::settings::JOB_SCRIPT_OVERRIDE_METADATA_KEY
                 .to_string(),
             scripts,
+        ));
+    }
+    if is_http_url(&request.content_or_url) {
+        metadata.push((
+            weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
+            request.content_or_url.clone(),
         ));
     }
     let filename = request.filename.or(fetched_filename);
@@ -943,7 +973,12 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         &ctx.config,
         &nzb_bytes,
         filename,
-        None,
+        request
+            .parameters
+            .iter()
+            .rev()
+            .find(|(name, _)| name.eq_ignore_ascii_case("*Unpack:Password"))
+            .map(|(_, value)| value.clone()),
         request.category.clone(),
         metadata,
         SubmissionOptions {
@@ -1313,6 +1348,7 @@ fn parse_append_params(params: Option<Value>) -> Result<AppendRequest, RpcError>
         content_or_url: required_string_param(&params, 1)?,
         category: optional_string_param(&params, 2)?,
         priority: optional_i64_param(&params, 3)?.unwrap_or(0),
+        add_to_top: optional_bool_param(&params, 4)?.unwrap_or(false),
         add_paused: optional_bool_param(&params, 5)?.unwrap_or(false),
         dupe_key: optional_string_param(&params, 6)?,
         dupe_score: optional_i64_param(&params, 7)?,
@@ -1503,7 +1539,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "ScanPaused": scan_paused,
         "QuotaReached": quota_reached,
         "FeedActive": false,
-        "QueueScriptCount": 0,
+        "QueueScriptCount": ctx.db.queue_script_count().unwrap_or(0),
         "NewsServers": news_servers,
         "FreeDiskSpaceLo": free_disk_lo,
         "FreeDiskSpaceHi": free_disk_hi,
@@ -2124,27 +2160,41 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .map(|(name, _, _)| name.clone())
         .collect::<Vec<_>>();
     let db = ctx.db.clone();
-    let category_default_scripts = tokio::task::spawn_blocking(move || {
-        let settings = db.post_processing_settings()?;
-        let mut defaults = HashMap::new();
-        if settings.execution_enabled {
+    let (category_default_scripts, global_scripts, event_interval) =
+        tokio::task::spawn_blocking(move || {
+            let settings = db.post_processing_settings()?;
             let lists = db.post_processing_script_lists()?;
-            for category in category_names {
-                let scripts = lists
-                    .resolve(Some(&category))
-                    .enabled_entries()
-                    .map(|entry| entry.script.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                defaults.insert(category, scripts);
+            let global = lists
+                .global
+                .enabled_entries()
+                .map(|entry| entry.script.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut defaults = HashMap::new();
+            if settings.execution_enabled {
+                for category in category_names {
+                    let scripts = lists
+                        .resolve(Some(&category))
+                        .enabled_entries()
+                        .map(|entry| entry.script.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    defaults.insert(category, scripts);
+                }
             }
-        }
-        Ok::<_, weaver_server_core::StateError>(defaults)
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("config unavailable: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("config unavailable: {error}")))?;
+            Ok::<_, weaver_server_core::StateError>((
+                defaults,
+                global,
+                settings.event_scripts.file_downloaded_event_interval,
+            ))
+        })
+        .await
+        .map_err(|error| RpcError::invalid_parameter(format!("config unavailable: {error}")))?
+        .map_err(|error| RpcError::invalid_parameter(format!("config unavailable: {error}")))?;
 
+    entries.push(config_entry("Extensions", &global_scripts));
+    entries.push(config_entry("ScriptOrder", &global_scripts));
+    entries.push(config_entry("EventInterval", &event_interval.to_string()));
     for (index, (name, dest_dir, aliases)) in categories.iter().enumerate() {
         let prefix = format!("Category{}.", index + 1);
         entries.push(config_entry(&format!("{prefix}Name"), name));
@@ -2158,6 +2208,13 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 .unwrap_or_default(),
         ));
         entries.push(config_entry(&format!("{prefix}Aliases"), aliases));
+        entries.push(config_entry(
+            &format!("{prefix}Extensions"),
+            category_default_scripts
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ));
     }
 
     // Expose weaver's RSS feeds as sequential NZBGet FeedN entries (Feed1..N).
@@ -2544,6 +2601,11 @@ async fn set_job_parameter(
     let key = if name.eq_ignore_ascii_case("drone") {
         CLIENT_REQUEST_ID_ATTRIBUTE_KEY
     } else {
+        if !weaver_server_core::is_public_history_attribute_key(name) {
+            return Err(SchedulerError::InvalidInput(
+                "reserved parameter name".into(),
+            ));
+        }
         name
     };
     let value = if name.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY) {
@@ -2579,10 +2641,12 @@ async fn mark_history_good(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(
     let db = ctx.db.clone();
     // A missing semantic candidate is not an error: NZBGet lets any history
     // item be marked good, and for ordinary items there is nothing to record.
-    tokio::task::spawn_blocking(move || db.mark_semantic_candidate_good(job_id))
-        .await
-        .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
-        .map_err(SchedulerError::from)?;
+    tokio::task::spawn_blocking(move || {
+        weaver_server_core::post_processing::hooks::mark_history_good(&db, job_id)
+    })
+    .await
+    .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
+    .map_err(SchedulerError::from)?;
     Ok(())
 }
 
@@ -2765,7 +2829,11 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
 /// NZBGet feed listing backed by weaver's RSS seen-item store. Items weaver's
 /// filter rules grabbed report FETCHED; everything else the poller has
 /// already evaluated is BACKLOG.
-async fn viewfeed(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
+async fn viewfeed(
+    ctx: &NzbgetFacadeContext,
+    params: Option<Value>,
+    preview: bool,
+) -> Result<Value, RpcError> {
     let params = positional_params(params)?;
     let feed_number = params
         .iter()
@@ -2787,11 +2855,17 @@ async fn viewfeed(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Va
         .ok_or_else(|| RpcError::invalid_parameter("nzb feed not found"))?;
 
     let db = ctx.db.clone();
-    let items =
+    let items = if preview {
+        ctx.rss
+            .preview_feed(feed_id)
+            .await
+            .map_err(|error| RpcError::invalid_parameter(format!("previewfeed failed: {error}")))?
+    } else {
         tokio::task::spawn_blocking(move || db.list_rss_seen_items(Some(feed_id), Some(500)))
             .await
             .map_err(|error| RpcError::invalid_parameter(format!("viewfeed failed: {error}")))?
-            .map_err(|error| RpcError::invalid_parameter(format!("viewfeed failed: {error}")))?;
+            .map_err(|error| RpcError::invalid_parameter(format!("viewfeed failed: {error}")))?
+    };
 
     let entries = items
         .iter()
@@ -2801,7 +2875,7 @@ async fn viewfeed(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Va
             let (size_lo, size_hi) = size_parts(size);
             let fetched = item.decision == "submitted" && item.job_id.is_some();
             let match_status = match item.decision.as_str() {
-                "submitted" => "ACCEPTED",
+                "submitted" | "accepted" => "ACCEPTED",
                 "rejected" => "REJECTED",
                 _ => "IGNORED",
             };
@@ -2927,6 +3001,10 @@ fn log_entry_kind(kind: &str) -> &'static str {
         "ERROR"
     } else if lowered.contains("warn") || lowered.contains("attention") {
         "WARNING"
+    } else if lowered == "scriptdetail" {
+        "DETAIL"
+    } else if lowered == "scriptdebug" {
+        "DEBUG"
     } else {
         "INFO"
     }
@@ -3080,8 +3158,7 @@ async fn resume_post_processing(ctx: &NzbgetFacadeContext) -> Result<Value, RpcE
     Ok(json!(true))
 }
 
-/// NZBGet reloads extensions from disk on demand. Weaver lists the scripts
-/// directory live on every use, so this only has to confirm the directory reads.
+/// Return the live NZBGet extension declarations, including every supported kind.
 async fn loadextensions(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let db = ctx.db.clone();
     let listing = tokio::task::spawn_blocking(move || {
@@ -3098,7 +3175,25 @@ async fn loadextensions(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         problems = listing.problems.len(),
         "NZBGet facade listed the scripts directory"
     );
-    Ok(json!(true))
+    use weaver_server_core::post_processing::model::ScriptKind;
+    Ok(Value::Array(listing.scripts.into_iter().map(|script| {
+        let manifest = &script.manifest;
+        json!({
+            "Name": script.name.as_str(),
+            "DisplayName": manifest.display_name(),
+            "Entry": manifest.entrypoint(),
+            "Location": script.root.join(manifest.entrypoint()).to_string_lossy(),
+            "RootDir": script.root.to_string_lossy(),
+            "Version": manifest.version().unwrap_or_default(),
+            "PostScript": manifest.kinds().contains(&ScriptKind::PostProcessing),
+            "QueueScript": manifest.kinds().contains(&ScriptKind::Queue),
+            "ScanScript": manifest.kinds().contains(&ScriptKind::Scan),
+            "SchedulerScript": manifest.kinds().contains(&ScriptKind::Scheduler),
+            "FeedScript": manifest.kinds().contains(&ScriptKind::Feed),
+            "QueueEvents": manifest.queue_events().iter().map(|event| event.as_str()).collect::<Vec<_>>().join(","),
+            "TaskTime": manifest.task_times().iter().map(ToString::to_string).collect::<Vec<_>>().join(";"),
+        })
+    }).collect()))
 }
 
 async fn set_scan_paused(ctx: &NzbgetFacadeContext, paused: bool) -> Result<Value, RpcError> {
@@ -3376,6 +3471,7 @@ fn nzbget_has_active_download(state: QueueItemState) -> bool {
 
 fn nzbget_queue_status(state: QueueItemState) -> &'static str {
     match state {
+        QueueItemState::AwaitingQueueScripts => "EXECUTING_SCRIPT",
         QueueItemState::Queued => "QUEUED",
         QueueItemState::Downloading
         | QueueItemState::FetchingRepairData

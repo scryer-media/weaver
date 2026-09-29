@@ -1566,6 +1566,7 @@ fn observed_download_limiter(
 
 pub(crate) fn job_status_label(status: &JobStatus) -> &'static str {
     match status {
+        JobStatus::AwaitingQueueScripts => "awaiting_queue_scripts",
         JobStatus::Queued => "queued",
         JobStatus::Downloading => "downloading",
         JobStatus::Checking => "checking",

@@ -637,6 +637,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
 #[test]
 fn job_status_labels_cover_every_variant() {
     let statuses = [
+        JobStatus::AwaitingQueueScripts,
         JobStatus::Queued,
         JobStatus::Downloading,
         JobStatus::Checking,

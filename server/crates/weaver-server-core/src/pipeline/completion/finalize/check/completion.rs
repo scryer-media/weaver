@@ -328,6 +328,9 @@ impl Pipeline {
             }
         }
 
+        if self.queue_script_completion_gate(job_id) {
+            return;
+        }
         self.maybe_prefetch_par3_recovery(job_id);
         let working_dir = self.jobs[&job_id].working_dir.clone();
         match self

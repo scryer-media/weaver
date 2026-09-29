@@ -223,6 +223,7 @@ impl Pipeline {
 
     pub(crate) fn persist_active_status_for(status: &JobStatus) -> &'static str {
         match status {
+            JobStatus::AwaitingQueueScripts => "awaiting_queue_scripts",
             JobStatus::Queued => "queued",
             JobStatus::Downloading => "downloading",
             JobStatus::Checking => "checking",
