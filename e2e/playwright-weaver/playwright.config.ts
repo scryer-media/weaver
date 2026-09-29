@@ -8,10 +8,22 @@ const runArtifactsDir = artifactStage
   ? `${artifactsDir}/${artifactStage}`
   : artifactsDir;
 
+// The release gate kills a flow at its deadline, and a killed run keeps no
+// trace, video or report. The gate passes the time Playwright may use; the run
+// stops at that deadline through the global timeout, and the helpers fixture
+// ends each test before it so a stuck test fails with its evidence. Workers
+// load this file too and inherit the deadline the runner fixed.
+const budgetMs = Number(process.env.E2E_WEAVER_PLAYWRIGHT_BUDGET_MS) || 0;
+if (budgetMs > 0 && !process.env.E2E_WEAVER_PLAYWRIGHT_DEADLINE_MS) {
+  process.env.E2E_WEAVER_PLAYWRIGHT_DEADLINE_MS = String(Date.now() + budgetMs);
+}
+const deadlineMs = Number(process.env.E2E_WEAVER_PLAYWRIGHT_DEADLINE_MS) || 0;
+
 export default defineConfig({
   testDir: "./tests",
   outputDir: `${runArtifactsDir}/test-results`,
   timeout: 5 * 60 * 1000,
+  globalTimeout: deadlineMs > 0 ? Math.max(1, deadlineMs - Date.now()) : 0,
   expect: { timeout: 20 * 1000 },
   fullyParallel: false,
   workers: 1,

@@ -59,13 +59,19 @@ const podmanInfoRootless = `{
   "version": {"Version": "5.4.2"}
 }`
 
+const dockerServerJSON = `{"Version":"29.8.0","Components":[{"Name":"Engine"},{"Name":"containerd"},{"Name":"runc"}]}`
+
+// podmanServerJSON is `docker version`'s server block when the Docker CLI's
+// context points at Podman's Docker-compatible API.
+const podmanServerJSON = `{"Version":"6.0.2","Components":[{"Name":"Podman Engine"},{"Name":"Conmon"},{"Name":"OCI Runtime (crun)"}]}`
+
 func dockerReplies() map[string]fakeReply {
 	return map[string]fakeReply{
-		"docker --version": {stdout: "Docker version 29.8.0, build 88096ef\n"},
-		"docker version --format {{.Server.Version}}": {stdout: "29.8.0\n"},
-		"docker compose version --short":              {stdout: "5.5.1\n"},
-		"podman info --format json":                   {stdout: podmanInfoRootless},
-		"podman compose version":                      {stdout: "Docker Compose version v2.39.1\n", stderr: ">>>> Executing external compose provider \"/usr/local/bin/docker-compose\". Please see podman-compose(1) for how to disable this message. <<<<\n"},
+		"docker --version":                         {stdout: "Docker version 29.8.0, build 88096ef\n"},
+		"docker version --format {{json .Server}}": {stdout: dockerServerJSON},
+		"docker compose version --short":           {stdout: "5.5.1\n"},
+		"podman info --format json":                {stdout: podmanInfoRootless},
+		"podman compose version":                   {stdout: "Docker Compose version v2.39.1\n", stderr: ">>>> Executing external compose provider \"/usr/local/bin/docker-compose\". Please see podman-compose(1) for how to disable this message. <<<<\n"},
 	}
 }
 
@@ -87,7 +93,7 @@ func TestResolveAutoPrefersAnsweringDocker(t *testing.T) {
 
 func TestResolveAutoFallsBackToPodmanWhenDockerDaemonIsDown(t *testing.T) {
 	replies := dockerReplies()
-	replies["docker version --format {{.Server.Version}}"] = fakeReply{stderr: "Cannot connect to the Docker daemon", fail: true}
+	replies["docker version --format {{json .Server}}"] = fakeReply{stderr: "Cannot connect to the Docker daemon", fail: true}
 	host := &fakeHost{onPath: map[string]bool{"docker": true, "podman": true}, replies: replies}
 	engine, err := Resolve(context.Background(), host.system())
 	if err != nil {
@@ -104,6 +110,19 @@ func TestResolveAutoFallsBackToPodmanWhenDockerDaemonIsDown(t *testing.T) {
 	}
 	if engine.HostGateway() != PodmanHostGateway {
 		t.Fatalf("host gateway = %q", engine.HostGateway())
+	}
+}
+
+func TestResolveAutoTreatsADockerCLIOnPodmanAsPodman(t *testing.T) {
+	replies := dockerReplies()
+	replies["docker version --format {{json .Server}}"] = fakeReply{stdout: podmanServerJSON}
+	host := &fakeHost{onPath: map[string]bool{"docker": true, "podman": true}, replies: replies}
+	engine, err := Resolve(context.Background(), host.system())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine.Kind != Podman || engine.Binary != "podman" {
+		t.Fatalf("engine = %+v", engine)
 	}
 }
 
@@ -130,7 +149,7 @@ func TestResolveExplicitChoiceNamesTheMissingPiece(t *testing.T) {
 	}{
 		{"docker cli", "docker", map[string]bool{"podman": true}, nil, "docker CLI is not on PATH"},
 		{"docker daemon", "docker", map[string]bool{"docker": true}, func(r map[string]fakeReply) {
-			r["docker version --format {{.Server.Version}}"] = fakeReply{fail: true}
+			r["docker version --format {{json .Server}}"] = fakeReply{fail: true}
 		}, "Docker daemon is not answering"},
 		{"docker compose", "docker", map[string]bool{"docker": true}, func(r map[string]fakeReply) {
 			r["docker compose version --short"] = fakeReply{fail: true}
@@ -138,6 +157,9 @@ func TestResolveExplicitChoiceNamesTheMissingPiece(t *testing.T) {
 		{"docker is podman", "docker", map[string]bool{"docker": true}, func(r map[string]fakeReply) {
 			r["docker --version"] = fakeReply{stdout: "podman version 5.4.2\n"}
 		}, "Podman's docker wrapper"},
+		{"docker reaches podman", "docker", map[string]bool{"docker": true}, func(r map[string]fakeReply) {
+			r["docker version --format {{json .Server}}"] = fakeReply{stdout: podmanServerJSON}
+		}, "connected to a Podman 6.0.2 engine; set E2E_CONTAINER_ENGINE=podman"},
 		{"podman cli", "podman", map[string]bool{"docker": true}, nil, "podman CLI is not on PATH"},
 		{"podman machine", "podman", map[string]bool{"podman": true}, func(r map[string]fakeReply) {
 			r["podman info --format json"] = fakeReply{fail: true}

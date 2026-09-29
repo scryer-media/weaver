@@ -20,7 +20,13 @@ type RecordedHttpError = Omit<ExpectedHttpError, "count"> & {
 
 type WeaverFixtures = {
   cleanPage: Page;
+  withinRunDeadline: void;
 };
+
+/// A test that is still running this close to the run's deadline fails
+/// through its own timeout, which keeps its trace and video; the global
+/// timeout that stops the run at the deadline keeps neither.
+const testEvidenceMarginMs = 15_000;
 
 const expectedHttpErrorsByPage = new WeakMap<Page, ExpectedHttpError[]>();
 
@@ -41,6 +47,15 @@ export function expectHttpErrors(
 }
 
 export const test = base.extend<WeaverFixtures>({
+  withinRunDeadline: [async ({}, use, testInfo) => {
+    const deadlineMs = Number(process.env.E2E_WEAVER_PLAYWRIGHT_DEADLINE_MS) || 0;
+    if (deadlineMs > 0) {
+      const remainingMs = deadlineMs - testEvidenceMarginMs - Date.now();
+      const configuredMs = testInfo.timeout > 0 ? testInfo.timeout : Infinity;
+      testInfo.setTimeout(Math.max(1, Math.min(configuredMs, remainingMs)));
+    }
+    await use();
+  }, { auto: true }],
   cleanPage: async ({ page }, use) => {
     const failures: string[] = [];
     const httpErrors: RecordedHttpError[] = [];
