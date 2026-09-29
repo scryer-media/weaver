@@ -1054,7 +1054,9 @@ impl PlanState {
 
     /// The challenger this reconnect goes to, and the pin it stands in for,
     /// if it is time for one: the candidate with the fewest fetches booked
-    /// among those not yet measured, never one that last refused and never
+    /// among those not yet measured, by the same measure a verdict holds
+    /// them to, so a challenger whose connection closed short of it is given
+    /// another rather than left unjudged; never one that last refused and never
     /// one that has yet to connect at all — an address that swallows packets
     /// would hold this reconnect for the whole attempt limit. `None` while
     /// the pin is too young, too recently or too often shadowed, not yet
@@ -1083,7 +1085,7 @@ impl PlanState {
             .filter(|(_, stats)| {
                 !stats.failing()
                     && stats.connect_ewma.is_some()
-                    && stats.delivery.samples < DELIVERY_MIN_SAMPLES
+                    && stats.delivery.measured_rate(now).is_none()
             })
             .min_by_key(|(_, stats)| (stats.delivery.samples, stats.connect_ewma))
             .map(|(addr, _)| (addr, pin))

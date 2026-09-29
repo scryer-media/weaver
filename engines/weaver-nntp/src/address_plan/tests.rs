@@ -532,6 +532,44 @@ fn a_measured_challenger_is_not_shadowed_again_before_the_pin_is_judged() {
     connects_all_dial(&plan, &dialer, SHADOW_EVERY_CONNECTS, pinned);
 }
 
+#[test]
+fn a_challenger_short_of_the_least_wire_time_is_shadowed_again() {
+    let (pinned, challenger) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, challenger]);
+    let plan = plan();
+    pin_and_freeze(&plan, &dialer, pinned, &[challenger]);
+    deliver(&plan, pinned, DELIVERY_MIN_SAMPLES, PIN_WIRE);
+    plan.advance(SHADOW_MIN_PIN_AGE);
+    connects_all_dial(&plan, &dialer, SHADOW_EVERY_CONNECTS - 1, pinned);
+    let (_, shadowed) = plan.connect(&dialer).unwrap();
+    assert_eq!(shadowed, challenger);
+    dialer.take_dialled();
+
+    // The challenger's connection closes after enough small fetches to fill
+    // the count, but far short of the wire time that makes them evidence.
+    let small = Duration::from_millis(100);
+    deliver(&plan, challenger, DELIVERY_MIN_SAMPLES, small);
+
+    // It is still unmeasured, so the next reconnect due one goes to it.
+    plan.advance(SHADOW_INTERVAL);
+    connects_all_dial(&plan, &dialer, SHADOW_EVERY_CONNECTS - 1, pinned);
+    let (_, shadowed) = plan.connect(&dialer).unwrap();
+    assert_eq!(shadowed, challenger);
+    dialer.take_dialled();
+
+    // That connection brings its fetches up to the least wire time, and the
+    // next connect judges it.
+    let short = DELIVERY_MIN_WIRE - small * DELIVERY_MIN_SAMPLES;
+    deliver(
+        &plan,
+        challenger,
+        (short.as_millis() / small.as_millis()) as u32,
+        small,
+    );
+    connects_all_dial(&plan, &dialer, 1, pinned);
+    assert_eq!(delivery_samples(&plan, challenger), 0);
+}
+
 /// Let the next verdict come due and deliver the evidence it judges.
 fn verdict_with(
     plan: &AddressPlan,
