@@ -29,6 +29,7 @@ use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{
     CallerScopedIdempotency, DuplicateAction, DuplicateMode, SemanticDuplicate, SubmissionOrigin,
 };
+use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{
     Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
@@ -1092,15 +1093,8 @@ async fn submit_from_facade_input(
         (None, Some(url), None) => {
             let client = ctx.data::<reqwest::Client>()?;
             let fetched = fetch_nzb_from_url(client, &url).await;
-            if let Err(error) = weaver_server_core::post_processing::hooks::url_completed(
-                db,
-                &url,
-                input.category.as_deref(),
-                fetched.is_ok(),
-            )
-            .await
-            {
-                tracing::warn!(%error, "could not raise URL script event");
+            if fetched.is_err() {
+                raise_url_completed(db, &url, input.category.as_deref(), UrlStatus::Failure).await;
             }
             let (bytes, url_filename) =
                 fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
@@ -1124,6 +1118,7 @@ async fn submit_from_facade_input(
 
     let client_request_id = input.client_request_id.clone();
     let category = input.category.clone();
+    let url_event = source_url.clone().map(|url| (url, category.clone()));
     let options = graphql_submission_options(
         &caller,
         client_request_id.as_deref(),
@@ -1169,6 +1164,15 @@ async fn submit_from_facade_input(
         )
         .await
     };
+    // The URL outcome is known only once its NZB has been accepted or refused.
+    if let Some((url, category)) = url_event {
+        let status = if submitted.is_ok() {
+            UrlStatus::Success
+        } else {
+            UrlStatus::ScanFailure
+        };
+        raise_url_completed(db, &url, category.as_deref(), status).await;
+    }
 
     match submitted {
         Ok(submitted) => {
@@ -1176,6 +1180,14 @@ async fn submit_from_facade_input(
         }
         Err(error) => submission_result_from_error(client_request_id, error)
             .map_err(|e| graphql_error("INVALID_INPUT", e.to_string())),
+    }
+}
+
+async fn raise_url_completed(db: &Database, url: &str, category: Option<&str>, status: UrlStatus) {
+    if let Err(error) =
+        weaver_server_core::post_processing::hooks::url_completed(db, url, category, status).await
+    {
+        tracing::warn!(%error, "could not raise URL script event");
     }
 }
 

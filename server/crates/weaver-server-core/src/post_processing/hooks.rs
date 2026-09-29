@@ -35,11 +35,32 @@ fn context(
     ))
 }
 
+/// How a URL submission ended, as reported to URL_COMPLETED scripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UrlStatus {
+    /// The NZB was fetched and accepted into the queue.
+    Success,
+    /// The NZB could not be fetched.
+    Failure,
+    /// The NZB was fetched but rejected on submission.
+    ScanFailure,
+}
+
+impl UrlStatus {
+    fn as_env(self) -> &'static str {
+        match self {
+            Self::Success => "SUCCESS",
+            Self::Failure => "FAILURE",
+            Self::ScanFailure => "SCAN_FAILURE",
+        }
+    }
+}
+
 pub async fn url_completed(
     db: &Database,
     url: &str,
     category: Option<&str>,
-    success: bool,
+    status: UrlStatus,
 ) -> Result<(), StateError> {
     let worker_db = db.clone();
     let category = category.map(str::to_string);
@@ -48,10 +69,9 @@ pub async fn url_completed(
         let mut context = context(&worker_db, category, QueueEvent::UrlCompleted)?;
         context.job_id = None;
         context.env.insert("NZBNA_URL".into(), url);
-        context.env.insert(
-            "NZBNA_URLSTATUS".into(),
-            if success { "SUCCESS" } else { "FAILURE" }.into(),
-        );
+        context
+            .env
+            .insert("NZBNA_URLSTATUS".into(), status.as_env().into());
         Ok::<_, StateError>(
             worker_db
                 .enqueue_script_event(&context, chrono::Utc::now().timestamp_millis())?
