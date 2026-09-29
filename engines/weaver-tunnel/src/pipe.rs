@@ -610,7 +610,10 @@ impl Dialer for SessionHop {
             Err(error) => {
                 drop(capacity);
                 drop(activity);
-                self.retire_idle().await;
+                // A destination that refuses says nothing about the tunnel.
+                if error.is_path_evidence() {
+                    self.retire_idle().await;
+                }
                 return Err(error);
             }
         };

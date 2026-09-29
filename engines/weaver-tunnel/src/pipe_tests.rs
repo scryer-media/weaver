@@ -238,6 +238,61 @@ async fn idle_retirement_preserves_channels_shared_by_other_consumers() {
     assert_eq!(provider.0.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn only_a_path_failure_retires_an_idle_session() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[derive(Default)]
+    struct Provider {
+        retired: AtomicUsize,
+        path_down: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl TunnelProvider for Provider {
+        async fn retire(&self) {
+            self.retired.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            Err(if self.path_down.load(Ordering::SeqCst) {
+                TunnelError::Configuration("session lost".into())
+            } else {
+                TunnelError::Dial {
+                    host: host.into(),
+                    port,
+                    detail: "ConnectFailed".into(),
+                }
+            })
+        }
+        fn describe(&self) -> String {
+            "refusing fixture".into()
+        }
+    }
+    let provider = Arc::new(Provider::default());
+    let hop = SessionHop {
+        capacity: Default::default(),
+        activity: Default::default(),
+        id: 3,
+        provider: provider.clone(),
+        inner: bottom(),
+        transport: None,
+        path: DialPath::default(),
+        endpoint: Some("127.0.0.1:22".parse().unwrap()),
+        timeout: Duration::from_secs(30),
+        resolver: None,
+    };
+    let target = target(hop.endpoint.unwrap());
+    assert!(matches!(
+        hop.dial(&target).await,
+        Err(DialError::Destination(_))
+    ));
+    assert_eq!(provider.retired.load(Ordering::SeqCst), 0);
+    provider.path_down.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        hop.dial(&target).await,
+        Err(DialError::Hop { .. })
+    ));
+    assert_eq!(provider.retired.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn destination_failures_do_not_cool_rungs_and_path_cooldown_is_flat() {
     let ladder = Fallback::new(vec![bottom()]);
