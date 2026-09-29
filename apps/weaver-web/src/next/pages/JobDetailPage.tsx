@@ -155,10 +155,21 @@ function sentenceCase(value: string): string {
 }
 
 export function JobDetailPage() {
+  const { id } = useParams();
+  // Reset retained results and destructive confirmations on job navigation.
+  return <JobDetailContent key={id} />;
+}
+
+function JobDetailContent() {
   const t = useTranslate();
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
+  const active = useRef(false);
+  useEffect(() => {
+    active.current = true;
+    return () => { active.current = false; };
+  }, []);
   const statusLabel = useStatusLabel();
   const { connection } = useNextData();
   const variables = useMemo(() => ({ id: jobId }), [jobId]);
@@ -915,7 +926,7 @@ export function JobDetailPage() {
                 const result = await acceptHistoryDelete({
                   input: { mode: "IDS", ids: [job.id], deleteFiles },
                 });
-                if (!result.error) {
+                if (!result.error && active.current) {
                   navigate("/history");
                 }
                 return result;

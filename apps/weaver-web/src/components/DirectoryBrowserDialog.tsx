@@ -35,19 +35,20 @@ function errorMessage(error: { graphQLErrors: { message: string }[]; message: st
   return error.graphQLErrors[0]?.message ?? error.message;
 }
 
-export function DirectoryBrowserDialog({
-  open,
-  path,
-  onPathChange,
-  onClose,
-  onChoose,
-}: {
+type DirectoryBrowserProps = {
   open: boolean;
   path: string | null;
   onPathChange: (path: string | null) => void;
   onClose: () => void;
   onChoose: (path: string) => void;
-}) {
+};
+
+export function DirectoryBrowserDialog(props: DirectoryBrowserProps) {
+  // Late browse/create responses must stay with the picker that issued them.
+  return props.open ? <DirectoryBrowserSession key={props.path} {...props} /> : null;
+}
+
+function DirectoryBrowserSession({ open, path, onPathChange, onClose, onChoose }: DirectoryBrowserProps) {
   const t = useTranslate();
   const client = useClient();
   const [createState, createDirectory] = useMutation<{

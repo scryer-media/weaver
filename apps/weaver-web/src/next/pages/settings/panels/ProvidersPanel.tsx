@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router";
 import { useClient, useMutation, useQuery } from "urql";
 import {
@@ -289,11 +289,15 @@ export function ProvidersPanel() {
   const client = useClient();
 
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
+  const editorSession = useRef(0);
   const [form, setForm] = useState<ServerForm | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<TestResult | null>(null);
+  const [submittedTestResult, setTestResult] = useState<(TestResult & { values: ServerForm }) | null>(null);
+  const testResult = submittedTestResult && JSON.stringify(submittedTestResult.values) === JSON.stringify(form)
+    ? submittedTestResult
+    : null;
   const [confirmRemove, setConfirmRemove] = useState<Server | null>(null);
   const [confirmTrust, setConfirmTrust] = useState<{ derBase64: string; fingerprint: string; names: string[] } | null>(null);
 
@@ -312,7 +316,10 @@ export function ProvidersPanel() {
     [data?.servers],
   );
 
-  const details = typeof editingId === "number" ? detailsData?.server : null;
+  // urql retains the previous result while a different provider is loading.
+  const details = typeof editingId === "number" && detailsData?.server?.id === editingId
+    ? detailsData.server
+    : null;
   const editing = typeof editingId === "number" ? servers.find((s) => s.id === editingId) : null;
 
   // `updateServer` keeps a password it is not given but clears a username it is
@@ -333,6 +340,10 @@ export function ProvidersPanel() {
     if (!askedToAdd) {
       return;
     }
+    editorSession.current += 1;
+    setTesting(false);
+    setBusy(false);
+    setConfirmTrust(null);
     setForm(NEW_SERVER);
     setTestResult(null);
     setEditingId("new");
@@ -349,11 +360,17 @@ export function ProvidersPanel() {
 
   const patch = (next: Partial<ServerForm>) => {
     if (values) {
+      setConfirmTrust(null);
       setForm({ ...values, ...next });
     }
   };
 
   const closeEditor = () => {
+    editorSession.current += 1;
+    setTesting(false);
+    setBusy(false);
+    setConfirmTrust(null);
+    setConfirmRemove(null);
     setEditingId(null);
     setForm(null);
     setError(null);
@@ -394,10 +411,15 @@ export function ProvidersPanel() {
     setBusy(true);
     setError(null);
     const input = serverInput(values);
+    const session = editorSession.current;
     const result =
       editingId === "new"
         ? await addServer({ input })
         : await updateServer({ id: editingId, input });
+    if (session !== editorSession.current) {
+      void reexecute({ requestPolicy: "network-only" });
+      return;
+    }
     setBusy(false);
     if (result.error) {
       const message = result.error.graphQLErrors[0]?.message ?? result.error.message;
@@ -420,13 +442,15 @@ export function ProvidersPanel() {
     setTesting(true);
     setTestResult(null);
     setError(null);
+    const session = editorSession.current;
     const result = await testConnection({ input: serverInput(provider) });
+    if (session !== editorSession.current) return;
     setTesting(false);
-    setTestResult((result.data?.testConnection as TestResult) ?? null);
+    setTestResult(result.data?.testConnection ? { ...(result.data.testConnection as TestResult), values: provider } : null);
   };
 
   const trust = () => {
-    if (!values || !confirmTrust) {
+    if (!values || !confirmTrust || !testResult) {
       return;
     }
     const next = {
@@ -449,8 +473,13 @@ export function ProvidersPanel() {
     if (!confirmRemove) {
       return;
     }
+    const session = editorSession.current;
     setBusy(true);
     await removeServer({ id: confirmRemove.id });
+    if (session !== editorSession.current) {
+      void reexecute({ requestPolicy: "network-only" });
+      return;
+    }
     setBusy(false);
     setConfirmRemove(null);
     closeEditor();
@@ -458,6 +487,7 @@ export function ProvidersPanel() {
   };
 
   const addProvider = () => {
+    closeEditor();
     setForm(NEW_SERVER);
     setTestResult(null);
     setEditingId("new");
@@ -480,6 +510,7 @@ export function ProvidersPanel() {
       empty: t("next.providers.empty"),
       emptyAction: { label: t("next.providers.add"), onClick: addProvider },
       onRowClick: (id) => {
+        closeEditor();
         setForm(null);
         setTestResult(null);
         setEditingId(Number(id));
