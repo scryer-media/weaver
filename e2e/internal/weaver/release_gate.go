@@ -676,7 +676,11 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) we
 			cmd := exec.CommandContext(ctx, exe, "release-flow", phase.Flow, phase.Datastore)
 			configureWeaverReleaseCommandCancellation(cmd)
 			cmd.Dir = e2eDir()
-			cmd.Env = mergeChildEnv(os.Environ(), phase.env())
+			env := phase.env()
+			if deadline, ok := ctx.Deadline(); ok {
+				env[weaverReleaseFlowDeadlineEnv] = deadline.UTC().Format(time.RFC3339Nano)
+			}
+			cmd.Env = mergeChildEnv(os.Environ(), env)
 			cmd.Stdout = io.MultiWriter(logFile, os.Stdout)
 			cmd.Stderr = io.MultiWriter(logFile, os.Stderr)
 			err = cmd.Run()
@@ -1161,6 +1165,7 @@ func startWeaverReleaseStack(spec weaverReleaseFlowSpec, datastore weaverDatasto
 	}
 	if datastore == weaverDatastorePostgres {
 		setEnv("E2E_WEAVER_DATABASE_URL", weaverComposePostgresURL())
+		waitForReleaseHostPorts([]string{"weaver-postgres"}, os.Getenv, probeHostPortHeld, releaseHostPortPoll)
 		if err := dockerComposeUp("weaver-postgres"); err != nil {
 			return err
 		}
@@ -1170,6 +1175,7 @@ func startWeaverReleaseStack(spec weaverReleaseFlowSpec, datastore weaverDatasto
 	} else {
 		setEnv("E2E_WEAVER_DATABASE_URL", "")
 	}
+	waitForReleaseHostPorts(spec.Services, os.Getenv, probeHostPortHeld, releaseHostPortPoll)
 	if err := dockerComposeUp(spec.Services...); err != nil {
 		return err
 	}
@@ -1184,6 +1190,62 @@ func startWeaverReleaseStack(spec weaverReleaseFlowSpec, datastore weaverDatasto
 	waitForHTTP(defaultWeaverURL(), 90*time.Second)
 	return nil
 }
+
+// releaseServiceHostPorts names the variables that publish each service's
+// host ports in docker-compose.yml.
+var releaseServiceHostPorts = map[string][]string{
+	"nntp":            {"E2E_NNTP_PORT", "E2E_NNTP_TLS_PORT"},
+	"nntp2":           {"E2E_NNTP2_PORT"},
+	"toxiproxy":       {"E2E_TOXIPROXY_API_PORT", "E2E_TOXIPROXY_NNTP1_PORT", "E2E_TOXIPROXY_NNTP2_PORT"},
+	"weaver":          {"E2E_WEAVER_PORT"},
+	"nzbget":          {"E2E_NZBGET_PORT"},
+	"sabnzbd":         {"E2E_SABNZBD_PORT"},
+	"weaver-postgres": {"E2E_WEAVER_POSTGRES_PORT"},
+}
+
+// waitForReleaseHostPorts waits until every host port the services publish
+// can be bound. A flow that brings its stack down and up again reuses its
+// ports, and `compose down` can return before the engine's port forwarder
+// lets go of them (Podman's gvproxy does), which fails the next `up` with
+// "address already in use". The gate's flow deadline bounds the wait.
+func waitForReleaseHostPorts(
+	services []string,
+	getenv func(string) string,
+	held func(port int) error,
+	poll func(),
+) {
+	for _, service := range services {
+		for _, variable := range releaseServiceHostPorts[service] {
+			port, err := strconv.Atoi(strings.TrimSpace(getenv(variable)))
+			if err != nil || port <= 0 {
+				continue
+			}
+			for waited := false; ; waited = true {
+				err := held(port)
+				if err == nil {
+					break
+				}
+				if !waited {
+					log.Printf("waiting for host port %d (%s) to be released by the previous stack: %v", port, service, err)
+				}
+				poll()
+			}
+		}
+	}
+}
+
+// probeHostPortHeld returns why the port cannot be bound, or nil when it can.
+// It binds the IPv4 wildcard, which a forwarder listening on the port through
+// either stack refuses.
+func probeHostPortHeld(port int) error {
+	listener, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		return err
+	}
+	return listener.Close()
+}
+
+func releaseHostPortPoll() { time.Sleep(250 * time.Millisecond) }
 
 func initializeWeaverE2EClock() error {
 	args := dockerComposeArgs(
@@ -2163,9 +2225,50 @@ func runWeaverReleasePlaywright(ctx context.Context, script string) error {
 	return runWeaverReleasePlaywrightOnce(ctx, script)
 }
 
+// weaverReleaseFlowDeadlineEnv carries the instant the gate kills a flow's
+// process group, so the flow can stop Playwright before that.
+const weaverReleaseFlowDeadlineEnv = "E2E_WEAVER_RELEASE_FLOW_DEADLINE"
+
+// weaverReleaseFlowWindup is what a flow needs after Playwright stops:
+// Playwright writing traces, videos and its report, the container exiting,
+// and the flow capturing diagnostics and tearing its stack down.
+const weaverReleaseFlowWindup = 90 * time.Second
+
+// weaverPlaywrightBudgetEnv tells Playwright how long it may run; the
+// Playwright config caps each test's timeout and the run's global timeout
+// by it.
+const weaverPlaywrightBudgetEnv = "E2E_WEAVER_PLAYWRIGHT_BUDGET_MS"
+
+// weaverReleasePlaywrightBudget is how long Playwright may run so that the
+// flow still winds up before the gate's kill. A killed Playwright leaves no
+// trace, video or report, so a stuck test must end through Playwright's own
+// timeouts instead. ok is false when no deadline was passed down.
+func weaverReleasePlaywrightBudget(now time.Time, getenv func(string) string) (budget time.Duration, ok bool, err error) {
+	value := strings.TrimSpace(getenv(weaverReleaseFlowDeadlineEnv))
+	if value == "" {
+		return 0, false, nil
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return 0, false, fmt.Errorf("%s=%q: %w", weaverReleaseFlowDeadlineEnv, value, err)
+	}
+	return deadline.Sub(now) - weaverReleaseFlowWindup, true, nil
+}
+
 func runWeaverReleasePlaywrightOnce(ctx context.Context, script string) error {
+	run := []string{"run", "--rm", "--no-deps"}
+	budget, bounded, err := weaverReleasePlaywrightBudget(time.Now(), os.Getenv)
+	if err != nil {
+		return err
+	}
+	if bounded {
+		if budget < time.Second {
+			return fmt.Errorf("the flow deadline leaves no time to run Playwright %s and keep its evidence", script)
+		}
+		run = append(run, "-e", fmt.Sprintf("%s=%d", weaverPlaywrightBudgetEnv, budget.Milliseconds()))
+	}
 	args := append(
-		dockerComposeArgs("run", "--rm", "--no-deps", "weaver-playwright"),
+		dockerComposeArgs(append(run, "weaver-playwright")...),
 		"npm", "run", "test:"+script,
 	)
 	cmd := containerengine.CommandContext(ctx, args...)

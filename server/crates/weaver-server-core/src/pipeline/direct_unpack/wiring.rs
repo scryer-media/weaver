@@ -157,6 +157,9 @@ pub enum DemotionReason {
     PartUnreadable,
     /// The decoder rejected the archive.
     DecodeFailed,
+    /// The chase was parked holding decoder memory that a waiting extraction
+    /// needed, and gave it up. Nothing is wrong with the archive.
+    MemoryYielded,
     /// PAR2 repair replaced bytes the chase had already read.
     RepairRewrote,
     /// The chase was parked through a PAR2 repair, and the repair did not
@@ -175,6 +178,7 @@ impl DemotionReason {
             Self::DownloadEnded => "download_ended",
             Self::PartUnreadable => "part_unreadable",
             Self::DecodeFailed => "decode_failed",
+            Self::MemoryYielded => "memory_yielded",
             Self::RepairRewrote => "repair_rewrote",
             Self::RepairFailed => "repair_failed",
             Self::GatedStall => "gated_stall",
@@ -252,6 +256,7 @@ pub struct DirectUnpackCounters {
     pub demoted_download_ended: u64,
     pub demoted_part_unreadable: u64,
     pub demoted_decode_failed: u64,
+    pub demoted_memory_yielded: u64,
     pub demoted_repair_rewrote: u64,
     pub demoted_repair_failed: u64,
     pub demoted_gated_stall: u64,
@@ -295,6 +300,7 @@ impl DirectUnpackCounters {
             DemotionReason::DownloadEnded => self.demoted_download_ended += 1,
             DemotionReason::PartUnreadable => self.demoted_part_unreadable += 1,
             DemotionReason::DecodeFailed => self.demoted_decode_failed += 1,
+            DemotionReason::MemoryYielded => self.demoted_memory_yielded += 1,
             DemotionReason::RepairRewrote => self.demoted_repair_rewrote += 1,
             DemotionReason::RepairFailed => self.demoted_repair_failed += 1,
             DemotionReason::GatedStall => self.demoted_gated_stall += 1,
@@ -1647,7 +1653,10 @@ impl Pipeline {
         let decode_threads = u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
         let db = self.db.clone();
         let cached_policy = self.unacceptable_extension_policies.get(&job_id).cloned();
-        coverage.yield_to_memory_pressure(Arc::clone(&self.process_memory_budget));
+        let chase_budget = Arc::clone(&budget);
+        coverage.yield_to_memory_pressure(Arc::clone(&self.process_memory_budget), move || {
+            chase_budget.memory_reserved_bytes()
+        });
         tokio::task::spawn_blocking(move || {
             // Resolve the policy off the actor, before a parked decoder can
             // occupy a chase thread. Loading failure refuses speculation.
@@ -2482,6 +2491,8 @@ impl Pipeline {
                         || error.contains("No such file or directory")
                     {
                         DemotionReason::PartUnreadable
+                    } else if error.contains(super::coverage::MEMORY_YIELD_ABORT) {
+                        DemotionReason::MemoryYielded
                     } else {
                         DemotionReason::DecodeFailed
                     };

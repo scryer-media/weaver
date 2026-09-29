@@ -1035,6 +1035,30 @@ fn regenerate_docs_metrics_table() {
     }
 }
 
+#[test]
+fn metric_catalog_uses_exporter_namespaces() {
+    // The exporter emits in two namespaces: its own `weaver_` families, and the
+    // standard unprefixed `process_` collector series.
+    const METRIC_PREFIXES: [&str; 2] = ["weaver_", "process_"];
+
+    let catalogued: std::collections::BTreeSet<String> = metrics::catalog::metric_catalog()
+        .iter()
+        .map(|family| family.name.to_string())
+        .collect();
+    let unexpected_namespace: Vec<&String> = catalogued
+        .iter()
+        .filter(|name| {
+            !METRIC_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    assert!(
+        unexpected_namespace.is_empty(),
+        "catalogue uses a namespace this test cannot recognise: {unexpected_namespace:?}"
+    );
+}
+
 /// The first family in `rendered` whose lines are not one contiguous group,
 /// or `None` when every family is emitted once, start to finish.
 ///

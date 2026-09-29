@@ -51,8 +51,8 @@ func Choice(getenv func(string) string) (string, error) {
 }
 
 // Resolve probes the host and returns the engine this run uses. With auto,
-// Docker wins when its CLI is on PATH and its daemon answers; otherwise Podman
-// is used. An explicit choice that cannot be used is an error naming what is
+// Docker wins when its CLI is on PATH and a Docker daemon answers it;
+// otherwise, including when that CLI reaches a Podman engine, Podman is used. An explicit choice that cannot be used is an error naming what is
 // missing.
 func Resolve(ctx context.Context, system System) (*Engine, error) {
 	choice, err := Choice(system.Getenv)
@@ -85,11 +85,21 @@ func resolveDocker(ctx context.Context, system System) (*Engine, error) {
 		strings.HasPrefix(strings.ToLower(strings.TrimSpace(string(out))), "podman") {
 		return nil, errors.New("the docker CLI on PATH is Podman's docker wrapper; set " + EnvVar + "=podman")
 	}
-	out, stderr, err := system.Run(ctx, "docker", "version", "--format", "{{.Server.Version}}")
+	out, stderr, err := system.Run(ctx, "docker", "version", "--format", "{{json .Server}}")
 	if err != nil {
 		return nil, fmt.Errorf("the Docker daemon is not answering (docker version: %v: %s)", err, firstLine(stderr))
 	}
-	engine := &Engine{Kind: Docker, Binary: "docker", Version: strings.TrimSpace(string(out)), Probed: true}
+	var server dockerServer
+	if err := json.Unmarshal(out, &server); err != nil {
+		return nil, fmt.Errorf("decode docker version: %w", err)
+	}
+	// The Docker CLI can talk to Podman's Docker-compatible API through a
+	// context or DOCKER_HOST. Driven as Docker, Podman runs without the
+	// overlay it needs, so its volumes and browsers misbehave mid-run.
+	if server.isPodman() {
+		return nil, fmt.Errorf("the docker CLI is connected to a Podman %s engine; set %s=podman", server.Version, EnvVar)
+	}
+	engine := &Engine{Kind: Docker, Binary: "docker", Version: strings.TrimSpace(server.Version), Probed: true}
 	out, stderr, err = system.Run(ctx, "docker", "compose", "version", "--short")
 	if err != nil {
 		return nil, fmt.Errorf("the Docker Compose v2 plugin is missing (docker compose version: %v: %s)", err, firstLine(stderr))
@@ -121,6 +131,26 @@ func resolvePodman(ctx context.Context, system System) (*Engine, error) {
 	}
 	engine.ComposeProvider, engine.ComposeVersion = provider, version
 	return engine, nil
+}
+
+// dockerServer is the part of `docker version`'s server block that tells
+// Docker from Podman's compatible API.
+type dockerServer struct {
+	Version    string `json:"Version"`
+	Components []struct {
+		Name string `json:"Name"`
+	} `json:"Components"`
+}
+
+// isPodman reports whether the server names a Podman engine among its
+// components, which Podman's Docker-compatible API always does.
+func (server dockerServer) isPodman() bool {
+	for _, component := range server.Components {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(component.Name)), "podman") {
+			return true
+		}
+	}
+	return false
 }
 
 type podmanInfo struct {
