@@ -135,7 +135,11 @@ pub(crate) fn extract(
                     .to_string());
                 }
                 if needed > reserved {
-                    reservations.push(budget.reserve_memory_wait(needed - reserved)?);
+                    reservations.push(if reserved == 0 {
+                        budget.reserve_memory_wait(needed)?
+                    } else {
+                        budget.reserve_more_memory_wait(needed - reserved)?
+                    });
                     reserved = needed;
                 }
                 if info.is_directory {

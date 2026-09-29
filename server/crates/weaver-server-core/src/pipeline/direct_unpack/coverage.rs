@@ -152,7 +152,27 @@ pub struct SetCoverage {
     /// immediately do not count, so a test can tell parking apart from
     /// spinning without timing anything.
     parks: AtomicU64,
-    memory: std::sync::OnceLock<std::sync::Arc<crate::pipeline::extraction::ProcessMemoryBudget>>,
+    memory: std::sync::OnceLock<MemoryPressure>,
+}
+
+/// What an aborted set reports when its chase gave its decoder up to a
+/// request waiting for memory. Nothing is wrong with the archive.
+pub(crate) const MEMORY_YIELD_ABORT: &str =
+    "direct unpack yielded its decoder to process memory pressure";
+
+/// The pool a parked chase answers to, and what the chase holds in it.
+struct MemoryPressure {
+    memory: std::sync::Arc<crate::pipeline::extraction::ProcessMemoryBudget>,
+    held_bytes: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl std::fmt::Debug for MemoryPressure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryPressure")
+            .field("held_bytes", &(self.held_bytes)())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SetCoverage {
@@ -178,12 +198,19 @@ impl SetCoverage {
     /// memory back. Under contention a parked chase claims a waiter's yield
     /// ticket and yields to it, one chase per ticket;
     /// finalization retries from the original archive under a fresh permit.
+    /// `held_bytes` is the decoder memory the chase holds when asked: a chase
+    /// holding none has nothing to give and never yields, and what parked
+    /// chases hold is what a waiter weighs before it asks for a yield.
     /// Reads with available coverage do not consult the memory pool.
     pub(crate) fn yield_to_memory_pressure(
         &self,
         memory: std::sync::Arc<crate::pipeline::extraction::ProcessMemoryBudget>,
+        held_bytes: impl Fn() -> u64 + Send + Sync + 'static,
     ) {
-        let _ = self.memory.set(memory);
+        let _ = self.memory.set(MemoryPressure {
+            memory,
+            held_bytes: Box::new(held_bytes),
+        });
     }
 
     /// Number of parts this set was created with.
@@ -789,17 +816,20 @@ impl SetCoverage {
         state: std::sync::MutexGuard<'a, CoverageState>,
     ) -> std::sync::MutexGuard<'a, CoverageState> {
         self.parks.fetch_add(1, Ordering::Relaxed);
-        if let Some(memory) = self.memory.get() {
+        if let Some(pressure) = self.memory.get() {
             let mut state = state;
+            let held = (pressure.held_bytes)();
             // One waiter's ticket unwinds one parked chase, not all of them;
-            // a chase already aborted leaves the ticket for another.
-            if state.aborted.is_none() && memory.claim_yield() {
-                state.aborted = Some(
-                    "direct unpack yielded its decoder to process memory pressure".to_string(),
-                );
+            // a chase already aborted, or holding nothing a waiter could use,
+            // leaves the ticket for another.
+            if state.aborted.is_none() && held != 0 && pressure.memory.claim_yield() {
+                state.aborted = Some(MEMORY_YIELD_ABORT.to_string());
                 self.advanced.notify_all();
                 return state;
             }
+            // Counted while this chase is parked, so a waiter asks for a
+            // yield only when parked chases hold what it is short of.
+            let _parked = (held != 0).then(|| pressure.memory.park_holding(held));
             return self
                 .advanced
                 .wait_timeout(state, std::time::Duration::from_millis(250))
