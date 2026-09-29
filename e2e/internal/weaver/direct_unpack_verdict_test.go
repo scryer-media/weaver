@@ -22,6 +22,9 @@ func TestDirectUnpackVerdictRequiresConsumptionUnlessTheChaseYieldedItsMemory(t 
 		{name: "consumed", lines: []string{armed, consumed}},
 		{name: "yielded its memory", lines: []string{armed, demoted("memory_yielded"), otherJob}},
 		{name: "decode failed", lines: []string{armed, demoted("decode_failed"), otherJob}, wantErr: "did not install its members"},
+		{name: "failed after an earlier yield", lines: []string{armed, demoted("memory_yielded"), armed, demoted("decode_failed")}, wantErr: "did not install its members"},
+		{name: "armed again after a yield and never finished", lines: []string{armed, demoted("memory_yielded"), armed}, wantErr: "did not install its members"},
+		{name: "yielded after an earlier failure", lines: []string{armed, demoted("decode_failed"), armed, demoted("memory_yielded")}},
 		{name: "never finished", lines: []string{armed}, wantErr: "did not install its members"},
 		{name: "never armed", lines: []string{demoted("memory_yielded")}, wantErr: "never armed"},
 	}

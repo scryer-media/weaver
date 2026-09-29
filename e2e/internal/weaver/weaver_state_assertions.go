@@ -936,6 +936,7 @@ func directUnpackVerdict(log string, jobID int, assertion *ScenarioDirectUnpackA
 		switch {
 		case strings.Contains(line, directUnpackArmedMessage):
 			armed++
+			yielded = false
 			anyActivity = true
 		case strings.Contains(line, directUnpackConsumedMessage):
 			consumed = true
@@ -943,9 +944,7 @@ func directUnpackVerdict(log string, jobID int, assertion *ScenarioDirectUnpackA
 		case strings.Contains(line, directUnpackDemotedMessage):
 			anyActivity = true
 			reason := directDemotionReason(line)
-			if reason == directUnpackMemoryYielded {
-				yielded = true
-			}
+			yielded = reason == directUnpackMemoryYielded
 			if assertion.ExpectedDemotionReason != "" && reason == assertion.ExpectedDemotionReason {
 				seenDemotion = true
 			}
@@ -970,7 +969,9 @@ func directUnpackVerdict(log string, jobID int, assertion *ScenarioDirectUnpackA
 		return errors.New("direct unpack never armed this set")
 	}
 	// A chase that yielded its decoder was extracted conventionally by
-	// design, so its members were never there to install.
+	// design, so its members were never there to install. Only the job's
+	// last chase counts: a yield does not excuse one that armed or failed
+	// after it.
 	if assertion.RequireConsumed && !consumed && !yielded {
 		return errors.New("direct unpack did not install its members; the set was extracted conventionally")
 	}
