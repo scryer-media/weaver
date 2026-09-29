@@ -726,6 +726,13 @@ impl NetworkRuntime {
         }
         // Everything below commits already validated objects; preparation above never
         // changes live membership, allocations, sessions, or revocation state.
+        let prior_revisions: HashMap<(u32, u32), u64> = self
+            .pools
+            .lock()
+            .expect("network pools")
+            .iter()
+            .map(|(key, stage)| (*key, stage.revision()))
+            .collect();
         *self.sessions.lock().expect("network sessions") =
             std::mem::take(staging.sessions.get_mut().expect("staged sessions"));
         *self.pools.lock().expect("network pools") =
@@ -792,8 +799,12 @@ impl NetworkRuntime {
             pool.set_members(Vec::new());
         }
         *configuration = next;
-        for pool in self.pools.lock().expect("network pools").values() {
-            pool.prewarm();
+        // Only new or re-membered pools warm up; an unchanged idle member must
+        // not handshake again on every reload.
+        for (key, pool) in self.pools.lock().expect("network pools").iter() {
+            if prior_revisions.get(key) != Some(&pool.revision()) {
+                pool.prewarm();
+            }
         }
         Ok(())
     }
