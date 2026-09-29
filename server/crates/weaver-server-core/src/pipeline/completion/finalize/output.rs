@@ -1397,7 +1397,13 @@ impl Pipeline {
                 let mut cancellation_wait = cancellation_rx.clone();
                 if !*cancellation_wait.borrow() {
                     tokio::select! {
-                        result = crate::post_processing::events::wait_for_job_events(&db, job_id.0) => result?,
+                        result = crate::post_processing::events::wait_for_job_events(&db, job_id.0) => {
+                            // A queue event whose scripts could not run is recorded
+                            // with that run; it does not fail post-processing.
+                            if let Err(error) = result {
+                                tracing::warn!(job_id = job_id.0, %error, "queue scripts could not run before post-processing");
+                            }
+                        }
                         _ = cancellation_wait.changed() => {},
                     }
                 }

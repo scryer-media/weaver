@@ -480,8 +480,8 @@ pub async fn run_event(
             result.status,
             ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled
         ) {
-            if let Some(job_id) = context.job_id {
-                db.insert_job_event(
+            if let Some(job_id) = context.job_id
+                && let Err(error) = db.insert_job_event(
                     job_id,
                     result.finished_at_epoch_ms,
                     "ScriptWarning",
@@ -492,7 +492,11 @@ pub async fn run_event(
                         result.status.as_str()
                     ),
                     None,
-                )?;
+                )
+            {
+                // The result itself is retained; a missed timeline entry must
+                // not stop the scripts after this one.
+                tracing::warn!(%error, "could not record a script warning");
             }
             results.push(result);
         } else {
@@ -1310,6 +1314,24 @@ pub async fn drain_queue(db: Database) -> Result<(), StateError> {
         let error = execution.err().map(|error| error.to_string());
         if let Some(error) = &error {
             tracing::warn!(%run_id, %error, "queue script run failed");
+            // Keep the failure on the job's timeline; the job itself carries on.
+            if let Some(job_id) = context.job_id {
+                let worker_db = db.clone();
+                let message = format!("{}: scripts could not run: {error}", context.event);
+                let recorded = tokio::task::spawn_blocking(move || {
+                    worker_db.insert_job_event(
+                        job_id,
+                        chrono::Utc::now().timestamp_millis(),
+                        "ScriptWarning",
+                        &message,
+                        None,
+                    )
+                })
+                .await;
+                if !matches!(recorded, Ok(Ok(()))) {
+                    tracing::warn!(%run_id, ?recorded, "could not record the queue script failure");
+                }
+            }
         }
         let worker_db = db.clone();
         tokio::task::spawn_blocking(move || match error {
