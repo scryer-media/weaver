@@ -63,8 +63,15 @@ struct LoadedBackup {
     warnings: Vec<String>,
 }
 
+/// How long cancelled backup work may take to stop before it is abandoned.
+pub(super) const BACKUP_CANCEL_DRAIN: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Cancellation is cooperative: retain and drain the future so its blocking writers
-/// have exited before reporting failure or releasing the execution lock.
+/// have exited before reporting failure. Work that does not stop within
+/// [`BACKUP_CANCEL_DRAIN`] (a query waiting on a lock, a hung file system) is
+/// abandoned so the caller is not held behind it. Blocking writers keep the
+/// execution guard they own until they exit, so no second backup can start
+/// over one that is still writing.
 pub(super) async fn run_backup_work<T>(
     work: impl std::future::Future<Output = Result<T, BackupServiceError>>,
     cancellation: super::archive::BackupCancellation,
@@ -81,7 +88,12 @@ pub(super) async fn run_backup_work<T>(
         _ = shutdown.cancelled() => BackupServiceError::Io("backup cancelled during shutdown".into()),
     };
     cancellation.cancel();
-    let _ = work.await;
+    if tokio::time::timeout(BACKUP_CANCEL_DRAIN, work)
+        .await
+        .is_err()
+    {
+        tracing::warn!(%error, "cancelled backup work did not stop; abandoning it");
+    }
     Err(error)
 }
 
@@ -781,5 +793,19 @@ mod cancellation_tests {
         let error = task.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("shutdown"));
         assert_eq!(std::fs::read(path).unwrap(), b"finished");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_that_ignores_cancellation_is_abandoned() {
+        let cancellation = super::super::archive::BackupCancellation::new();
+        let shutdown = super::super::archive::BackupCancellation::new();
+        // Stands in for a query stuck on a lock: it never observes cancellation.
+        let work = std::future::pending::<Result<(), BackupServiceError>>();
+        shutdown.cancel();
+        let error = run_backup_work(work, cancellation.clone(), shutdown)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown"));
+        assert!(cancellation.is_cancelled());
     }
 }

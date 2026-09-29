@@ -270,6 +270,11 @@ async fn export_postgres(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+    // A table held exclusively elsewhere fails the export instead of stalling it.
+    sqlx::query("SET LOCAL lock_timeout = '60s'")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
     let mut tables =
         ordered_postgres_tables(&mut tx, &actual, &[BackupTableClassification::Export]).await?;
     if allow_older_catalog {
