@@ -199,3 +199,39 @@ async fn unused_session_is_kept_until_live_streams_allow_retirement() {
     assert!(runtime.sessions.lock().unwrap().is_empty());
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn probe_of_a_saved_profile_shares_the_live_session() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.profiles.insert(1, proxy());
+    runtime.apply_configuration(config.clone()).unwrap();
+    let bottom = NetworkRuntime::bottom(&config, SYSTEM_EGRESS_ID, Duration::from_secs(1)).unwrap();
+    let live = runtime
+        .hop(&config, 1, bottom.clone(), bottom.clone(), &[])
+        .unwrap();
+
+    // The probe reuses the session that already holds the budget.
+    let isolated = runtime.isolated_probe_runtime();
+    let probed = isolated
+        .hop(&config, 1, bottom.clone(), bottom.clone(), &[])
+        .unwrap();
+    assert!(Arc::ptr_eq(&live, &probed));
+    isolated.shutdown().await;
+    assert!(Arc::ptr_eq(
+        runtime.sessions.lock().unwrap().values().next().unwrap(),
+        &live
+    ));
+
+    // An edited profile is a different session and is built afresh.
+    config.profiles.get_mut(&1).unwrap().revision += 1;
+    let edited = isolated
+        .hop(&config, 1, bottom.clone(), bottom, &[])
+        .unwrap();
+    assert!(!Arc::ptr_eq(&live, &edited));
+    runtime.shutdown().await;
+}

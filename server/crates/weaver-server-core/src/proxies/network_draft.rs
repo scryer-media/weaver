@@ -114,6 +114,7 @@ impl NetworkRuntime {
                     .clone(),
             ),
             sessions: Mutex::new(HashMap::new()),
+            borrowed_sessions: self.sessions.lock().expect("network sessions").clone(),
             pools: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             interfaces: self.interfaces.clone(),

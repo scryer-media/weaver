@@ -127,6 +127,10 @@ pub struct NetworkRuntime {
     handle: tokio::runtime::Handle,
     configuration: RwLock<Configuration>,
     sessions: Mutex<HashMap<String, Arc<dyn Dialer>>>,
+    /// Live sessions a probe runtime may use but does not own. A probe of a
+    /// saved profile shares the session already holding its WireGuard permit
+    /// instead of competing with it for the budget, and never shuts it down.
+    borrowed_sessions: HashMap<String, Arc<dyn Dialer>>,
     pools: Mutex<HashMap<(u32, u32), Arc<PoolStage>>>,
     routes: Mutex<HashMap<String, Arc<LiveNetworkRoute>>>,
     interfaces: Arc<InterfaceMonitor>,
@@ -160,6 +164,7 @@ impl NetworkRuntime {
             handle: handle.clone(),
             configuration: RwLock::new(configuration),
             sessions: Mutex::new(HashMap::new()),
+            borrowed_sessions: HashMap::new(),
             pools: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             interfaces,
@@ -297,7 +302,10 @@ impl NetworkRuntime {
             .collect();
         let key = format!("{}:{:?}:{revisions:?}", bottom.id, bottom.binding);
         let mut sessions = self.sessions.lock().expect("network sessions");
-        if let Some(stage) = sessions.get(&key) {
+        if let Some(stage) = sessions
+            .get(&key)
+            .or_else(|| self.borrowed_sessions.get(&key))
+        {
             return Ok(stage.clone());
         }
         let observer = Arc::new(super::runtime::Observer {
@@ -654,6 +662,7 @@ impl NetworkRuntime {
             handle: self.handle.clone(),
             configuration: RwLock::new(next.clone()),
             sessions: Mutex::new(self.sessions.lock().expect("network sessions").clone()),
+            borrowed_sessions: HashMap::new(),
             pools: Mutex::new(self.pools.lock().expect("network pools").clone()),
             routes: Mutex::new(HashMap::new()),
             interfaces: self.interfaces.clone(),
