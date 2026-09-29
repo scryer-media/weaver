@@ -94,6 +94,12 @@ interface DuplicateSnapshotQueryData {
 type DuplicateAction = "good" | "bad" | "promote" | "forget";
 
 export function JobDetail() {
+  const { id } = useParams();
+  // Queries, subscriptions and pending confirmations belong to one job.
+  return <JobDetailContent key={id} />;
+}
+
+function JobDetailContent() {
   const t = useTranslate();
   const { id } = useParams();
   const jobId = Number(id);

@@ -1,6 +1,6 @@
 import { ProxyRoutingEditor, ProxyRoutingStatus } from "@/components/ProxyRoutingEditor";
 import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { FilePenLine, Trash2 } from "lucide-react";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -316,7 +316,11 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     return [...groups.entries()].sort(([left], [right]) => left - right);
   }, [servers]);
 
+  const editorSession = useRef(0);
+
   const openAdd = () => {
+    editorSession.current += 1;
+    setTesting(false);
     setEditingServerId(null);
     setSaveError(null);
     setTestResult(null);
@@ -324,6 +328,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   };
 
   const openEdit = (server: Server) => {
+    editorSession.current += 1;
+    setTesting(false);
     setEditingServerId(server.id);
     setSaveError(null);
     setTestResult(null);
@@ -331,6 +337,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   };
 
   const closeForm = () => {
+    editorSession.current += 1;
+    setTesting(false);
     setEditingServerId(null);
     setSaveError(null);
     setTestResult(null);
@@ -338,6 +346,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   };
 
   async function showConnectionTestResult(values: ServerFormValues) {
+    const session = editorSession.current;
     setTesting(true);
     setSaveError(null);
     setTestResult(null);
@@ -357,11 +366,13 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         tlsNameMismatchCertificateDerBase64: values.tlsNameMismatchCertificateDerBase64,
       },
     });
+    if (session !== editorSession.current) return;
     setTestResult(result.data?.testConnection ?? null);
     setTesting(false);
   }
 
   const handleSave = async (values: ServerFormValues) => {
+    const session = editorSession.current;
     setSaveError(null);
     const input = {
       routing: values.routing,
@@ -381,6 +392,10 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
 
     if (editingServerId != null) {
       const result = await updateServer({ id: editingServerId, input });
+      if (session !== editorSession.current) {
+        void reexecuteServers({ requestPolicy: "network-only" });
+        return;
+      }
       if (result.data?.updateServer) {
         setServers((current) =>
           current.map((server) =>
@@ -402,6 +417,10 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       return;
     } else {
       const result = await addServer({ input });
+      if (session !== editorSession.current) {
+        void reexecuteServers({ requestPolicy: "network-only" });
+        return;
+      }
       if (result.data?.addServer) {
         setServers((current) =>
           [...current, result.data.addServer].sort((left, right) =>
@@ -462,7 +481,10 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     () => servers.find((server) => server.id === editingServerId) ?? null,
     [editingServerId, servers],
   );
-  const editingServerDetail = editingServerData?.server ?? null;
+  // A paused or changed query can still contain the last provider's details.
+  const editingServerDetail = editingServerId != null && editingServerData?.server?.id === editingServerId
+    ? editingServerData.server
+    : null;
 
   return (
     <div className={embedded ? "space-y-5" : "space-y-6"}>

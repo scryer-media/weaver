@@ -155,6 +155,12 @@ function sentenceCase(value: string): string {
 }
 
 export function JobDetailPage() {
+  const { id } = useParams();
+  // Reset retained results and destructive confirmations on job navigation.
+  return <JobDetailContent key={id} />;
+}
+
+function JobDetailContent() {
   const t = useTranslate();
   const { id } = useParams();
   const jobId = Number(id);

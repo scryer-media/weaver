@@ -38,19 +38,20 @@ function failureMessage(error: { graphQLErrors: { message: string }[]; message: 
  * being shown. Browsing with no starting path opens the completed folder, the
  * daemon's own default.
  */
-export function DirectoryBrowserDialog({
-  open,
-  initialPath,
-  title,
-  onClose,
-  onChoose,
-}: {
+type DirectoryBrowserProps = {
   open: boolean;
   initialPath: string | null;
   title?: string;
   onClose: () => void;
   onChoose: (path: string) => void;
-}) {
+};
+
+export function DirectoryBrowserDialog(props: DirectoryBrowserProps) {
+  // A reopened picker must not inherit a previous folder's pending creation.
+  return props.open ? <DirectoryBrowserSession key={props.initialPath} {...props} /> : null;
+}
+
+function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }: DirectoryBrowserProps) {
   const t = useTranslate();
   const client = useClient();
   const [listing, setListing] = useState<DirectoryListing | null>(null);
@@ -240,7 +241,7 @@ export function DirectoryBrowserDialog({
               value={typedPath}
               onChange={setTypedPath}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && typedPath.trim() !== "") {
+                if (event.key === "Enter" && !busy && typedPath.trim() !== "") {
                   event.preventDefault();
                   void browse(typedPath.trim());
                 }
