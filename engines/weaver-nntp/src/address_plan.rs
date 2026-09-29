@@ -32,15 +32,24 @@
 //! connection the server was reopening anyway is pointed at a challenger
 //! instead of the pin — at most one in [`SHADOW_EVERY_CONNECTS`], no sooner
 //! than [`SHADOW_INTERVAL`] apart, never an extra connection and never a
-//! handshake the server would not have paid for regardless. When the pin's age
-//! comes due and both the pin and a challenger have delivered at least
-//! [`DELIVERY_MIN_SAMPLES`] articles, that evidence decides instead of a race:
-//! a challenger that delivered [`DELIVERY_REPIN_RATIO`] times the pin's
-//! per-connection rate at two verdicts running takes the pin, and otherwise
-//! the pin stays, with no losing handshakes paid either way. A pin without
-//! that evidence — an idle server, or one whose connections never turned over
-//! — races on age as before, and every [`VERDICTS_BETWEEN_RACES`] verdicts
-//! the pin races regardless so the hostname is resolved again.
+//! handshake the server would not have paid for regardless. Once the pin and a
+//! challenger have each delivered at least [`DELIVERY_MIN_SAMPLES`] articles
+//! over at least [`DELIVERY_MIN_WIRE`] of wire time, the next connect judges
+//! that evidence, no sooner than [`DELIVERY_VERDICT_INTERVAL`] after the pin
+//! was chosen or last judged: a challenger that delivered
+//! [`DELIVERY_REPIN_RATIO`] times the pin's per-connection rate at two
+//! verdicts running takes the pin, and otherwise the pin stays, with no race
+//! and no losing handshakes either way. Every verdict judges the next one from
+//! fresh samples, so a busy server settles a faster address within a few
+//! verdicts rather than a few intervals.
+//!
+//! Verdicts run on their own clock and leave the pin's age alone: neither a
+//! verdict nor a pin moved on one restarts it. The pin still races on age,
+//! busy or idle, at least once per [`ADDRESS_REPLAN_INTERVAL`], because a race
+//! is also where the hostname is resolved again, and a server whose delivery
+//! keeps being judged would otherwise never learn of an address the provider
+//! added or withdrew. A server that never gathers the evidence — an idle one,
+//! or one whose connections never turned over — only ever races.
 
 use std::collections::HashMap;
 use std::io;
@@ -52,7 +61,10 @@ use tracing::{debug, info, warn};
 
 /// How old a pin may get before the next connect races the server's
 /// addresses again. Every race, won or failed, restarts the pin's age, so this
-/// is also the most often a server races on age alone, busy or idle.
+/// is also the most often a server races on age alone, busy or idle. A
+/// delivery verdict does not restart it, even one that moves the pin, so a
+/// server whose connects keep coming resolves its hostname again at least
+/// this often.
 pub const ADDRESS_REPLAN_INTERVAL: Duration = Duration::from_mins(10);
 
 /// How long after a race in which no address answered, with nothing pinned,
@@ -86,8 +98,21 @@ const EWMA_WEIGHT: f64 = 0.25;
 /// Warm article fetches an address must have served since the pin was last
 /// judged before its delivery rate counts as evidence, for the pin and for a
 /// challenger alike. A busy server fills this in seconds; an idle one never
-/// does, and races on age as before.
+/// does, and its pin only ever races on age.
 pub const DELIVERY_MIN_SAMPLES: u32 = 16;
+
+/// Wire time an address's booked fetches must add up to, besides
+/// [`DELIVERY_MIN_SAMPLES`], before its delivery rate counts as evidence. A
+/// handful of small articles finishes within the round trips it costs to ask
+/// for them and says more about latency than about throughput; this keeps
+/// them from out-voting an address that was moving large ones.
+pub const DELIVERY_MIN_WIRE: Duration = Duration::from_secs(10);
+
+/// Least time between two delivery verdicts, and least age of a pin before its
+/// first. A busy server measures the pin and a challenger well within it, so
+/// it is what paces the two verdicts that move a pin; it also keeps one
+/// verdict's samples from being judged again before fresh ones have come in.
+pub const DELIVERY_VERDICT_INTERVAL: Duration = Duration::from_mins(1);
 
 /// How much faster, per connection, a challenger must have delivered than the
 /// pin to take the pin on that evidence alone. Addresses of one provider are
@@ -110,16 +135,9 @@ pub const SHADOW_INTERVAL: Duration = Duration::from_secs(30);
 /// at any time.
 pub const SHADOW_EVERY_CONNECTS: u32 = 8;
 
-/// Consecutive verdicts settled on delivery before the pin's age races anyway.
-/// A race is also where the hostname is resolved again, and a busy server
-/// whose verdicts keep coming would otherwise never learn of an address the
-/// provider added or withdrew. At [`ADDRESS_REPLAN_INTERVAL`] this is about
-/// one race an hour.
-pub const VERDICTS_BETWEEN_RACES: u32 = 6;
-
 /// How long booked delivery stays evidence. A server idle for longer than
 /// this has samples from a different time, and possibly the pin's from one
-/// time and a challenger's from another, so it races as if it had none.
+/// time and a challenger's from another, so they are not judged.
 pub const DELIVERY_EVIDENCE_AGE: Duration = ADDRESS_REPLAN_INTERVAL;
 
 /// Why the pin moved, or a race ran.
@@ -134,7 +152,7 @@ pub enum RaceReason {
     OverLimitCleared,
     /// The pin failed [`SUSPECT_AFTER_FAILURES`] connects in a row.
     Suspect,
-    /// A challenger out-delivered the aged pin by [`DELIVERY_REPIN_RATIO`]. No
+    /// A challenger out-delivered the pin by [`DELIVERY_REPIN_RATIO`]. No
     /// race ran: the pin moved on measured delivery alone.
     Delivery,
 }
@@ -339,13 +357,14 @@ impl Delivery {
             .then(|| self.bytes as f64 / self.wire.as_secs_f64())
     }
 
-    /// The rate, once enough fetches stand behind it to be evidence and while
-    /// the latest of them is recent enough to still describe the address.
+    /// The rate, once enough fetches and enough wire time stand behind it to
+    /// be evidence and while the latest of them is recent enough to still
+    /// describe the address.
     fn measured_rate(self, now: Instant) -> Option<f64> {
         let fresh = self
             .last_at
             .is_some_and(|at| now.saturating_duration_since(at) < DELIVERY_EVIDENCE_AGE);
-        (fresh && self.samples >= DELIVERY_MIN_SAMPLES)
+        (fresh && self.samples >= DELIVERY_MIN_SAMPLES && self.wire >= DELIVERY_MIN_WIRE)
             .then(|| self.bytes_per_second())
             .flatten()
     }
@@ -365,7 +384,8 @@ enum DeliveryVerdict {
         best_rate: f64,
         pin_rate: f64,
     },
-    /// The pin or every challenger is short of [`DELIVERY_MIN_SAMPLES`].
+    /// The pin or every challenger is short of [`DELIVERY_MIN_SAMPLES`] or
+    /// [`DELIVERY_MIN_WIRE`], or its evidence has gone stale.
     Unmeasured,
 }
 
@@ -462,8 +482,10 @@ struct PlanState {
     /// the pin only if the next verdict finds the same, so one verdict's
     /// worth of samples from one connection never moves the pin by itself.
     delivery_leader: Option<SocketAddr>,
-    /// Verdicts settled on delivery since the last race.
-    verdicts_since_race: u32,
+    /// When delivery was last judged, since the last race. The next verdict
+    /// waits [`DELIVERY_VERDICT_INTERVAL`] from it, or from the pin's choice
+    /// when there has been none.
+    last_verdict_at: Option<Instant>,
     /// Bumped whenever a race finishes, so a caller waiting on one can tell
     /// that it did.
     generation: u64,
@@ -888,10 +910,10 @@ impl PlanState {
             }
             (None, _) => Some(RaceReason::Initial),
             (Some(_), Some(pending)) => Some(pending),
-            (Some(pin), None) if self.pin_is_due(now) => {
-                let (reason, verdict) = self.judge_on_delivery(now, pin);
-                announce = verdict;
-                reason
+            (Some(_), None) if self.pin_is_due(now) => Some(RaceReason::Interval),
+            (Some(pin), None) if self.verdict_is_allowed(now) => {
+                announce = self.judge_on_delivery(now, pin);
+                None
             }
             _ => None,
         };
@@ -911,17 +933,18 @@ impl PlanState {
         self.per_addr.get(&addr.ip()).copied().unwrap_or_default()
     }
 
-    /// The pin's age is due. Settle it on delivery when there is enough, and
-    /// say which race to run when there is not — or when enough verdicts
-    /// have gone by that the hostname is owed a fresh resolve.
-    fn judge_on_delivery(
-        &mut self,
-        now: Instant,
-        pin: SocketAddr,
-    ) -> (Option<RaceReason>, Option<Announce>) {
-        if self.verdicts_since_race >= VERDICTS_BETWEEN_RACES {
-            return (Some(RaceReason::Interval), None);
-        }
+    /// A verdict may run: the pin was chosen, or last judged, at least
+    /// [`DELIVERY_VERDICT_INTERVAL`] ago.
+    fn verdict_is_allowed(&self, now: Instant) -> bool {
+        self.last_verdict_at
+            .or(self.chosen_at)
+            .is_some_and(|at| now.saturating_duration_since(at) >= DELIVERY_VERDICT_INTERVAL)
+    }
+
+    /// Judge the pin on the delivery booked since it was last judged, when
+    /// there is enough of it. Leaves the pin's age alone, and leaves the
+    /// samples to keep gathering when there is not enough.
+    fn judge_on_delivery(&mut self, now: Instant, pin: SocketAddr) -> Option<Announce> {
         let announce = match self.delivery_verdict(now, pin) {
             DeliveryVerdict::Challenged {
                 challenger,
@@ -964,12 +987,11 @@ impl PlanState {
                     best_rate,
                 }
             }
-            DeliveryVerdict::Unmeasured => return (Some(RaceReason::Interval), None),
+            DeliveryVerdict::Unmeasured => return None,
         };
-        self.chosen_at = Some(now);
-        self.verdicts_since_race += 1;
+        self.last_verdict_at = Some(now);
         self.reset_delivery();
-        (None, Some(announce))
+        Some(announce)
     }
 
     /// Compare the pin with the best measured challenger that is not
@@ -1124,7 +1146,7 @@ impl RaceTicket<'_> {
         state.generation = state.generation.wrapping_add(1);
         state.reset_delivery();
         state.delivery_leader = None;
-        state.verdicts_since_race = 0;
+        state.last_verdict_at = None;
         let now = plan.now();
         let previous = state.pinned;
         match outcome {
