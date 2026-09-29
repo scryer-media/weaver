@@ -901,6 +901,11 @@ const (
 	directUnpackConsumedMessage = "installed direct-unpack members instead of re-extracting"
 	directUnpackDemotedMessage  = "direct unpack demoted"
 	directUnpackAbortedMessage  = "direct unpack aborted"
+	// directUnpackMemoryYielded is the demotion of a chase that gave its
+	// decoder up to an extraction waiting for memory. Whether that happens
+	// depends on what the other jobs in the run are decoding at the time, not
+	// on the set under test.
+	directUnpackMemoryYielded = "memory_yielded"
 )
 
 func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssertion) error {
@@ -911,13 +916,19 @@ func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssert
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
 	}
+	return directUnpackVerdict(string(raw), jobID, assertion, directUnpackEnabledForPhase())
+}
 
+// directUnpackVerdict judges one job's direct-unpack log lines against its
+// assertion, in a phase that ran with the feature enabled or not.
+func directUnpackVerdict(log string, jobID int, assertion *ScenarioDirectUnpackAssertion, enabled bool) error {
 	wantJobID := strconv.Itoa(jobID)
 	armed := 0
 	consumed := false
+	yielded := false
 	seenDemotion := false
 	anyActivity := false
-	for _, rawLine := range strings.Split(string(raw), "\n") {
+	for _, rawLine := range strings.Split(log, "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
 		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
 			continue
@@ -931,8 +942,11 @@ func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssert
 			anyActivity = true
 		case strings.Contains(line, directUnpackDemotedMessage):
 			anyActivity = true
-			if assertion.ExpectedDemotionReason != "" &&
-				directDemotionReason(line) == assertion.ExpectedDemotionReason {
+			reason := directDemotionReason(line)
+			if reason == directUnpackMemoryYielded {
+				yielded = true
+			}
+			if assertion.ExpectedDemotionReason != "" && reason == assertion.ExpectedDemotionReason {
 				seenDemotion = true
 			}
 		case strings.Contains(line, directUnpackAbortedMessage):
@@ -942,20 +956,22 @@ func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssert
 
 	// Darkness is only meaningful in a phase that ran without the gate; with it
 	// on, activity is the expected result rather than a failure.
-	if assertion.ForbidAnyActivity && !directUnpackEnabledForPhase() {
+	if assertion.ForbidAnyActivity && !enabled {
 		if anyActivity {
 			return errors.New("direct unpack left traces in the log with the gate off")
 		}
 		return nil
 	}
-	if !directUnpackEnabledForPhase() {
+	if !enabled {
 		return nil
 	}
 
 	if assertion.RequireArmed && armed == 0 {
 		return errors.New("direct unpack never armed this set")
 	}
-	if assertion.RequireConsumed && !consumed {
+	// A chase that yielded its decoder was extracted conventionally by
+	// design, so its members were never there to install.
+	if assertion.RequireConsumed && !consumed && !yielded {
 		return errors.New("direct unpack did not install its members; the set was extracted conventionally")
 	}
 	if assertion.RequireRearmAfterRestart && armed < 2 {
