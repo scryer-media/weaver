@@ -293,6 +293,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         window_ends_at_epoch_ms: None,
         timezone_name: "MDT".into(),
         scheduled_speed_limit: 0,
+        schedule_hold_reason: None,
     };
     let server_health = vec![sample_server_health()];
 

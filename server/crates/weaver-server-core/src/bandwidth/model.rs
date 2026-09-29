@@ -126,6 +126,16 @@ impl ScheduleAction {
         matches!(self, Self::RunScript { .. })
     }
 
+    /// Whether failing to apply this action must keep new downloads from
+    /// starting: a pause that did not take, or a server that should have gone
+    /// offline. Any other failure leaves admission as it was.
+    pub const fn holds_admission(&self) -> bool {
+        matches!(
+            self,
+            Self::Pause | Self::PauseAll | Self::SetServerActive { active: false, .. }
+        )
+    }
+
     pub const fn is_hardware_profile(&self) -> bool {
         matches!(self, Self::HardwareProfile { .. })
     }

@@ -100,6 +100,8 @@ pub struct SharedPipelineState {
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
     schedule_replay_paused: Arc<AtomicBool>,
+    /// Why the schedule evaluator is holding download admission, while it is.
+    schedule_hold_reason: Arc<RwLock<Option<String>>>,
     post_processing_paused: Arc<AtomicBool>,
     metrics: Arc<PipelineMetrics>,
     metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
@@ -150,6 +152,7 @@ impl SharedPipelineState {
             job_revision,
             paused: Arc::new(AtomicBool::new(false)),
             schedule_replay_paused: Arc::new(AtomicBool::new(false)),
+            schedule_hold_reason: Arc::new(RwLock::new(None)),
             post_processing_paused: Arc::new(AtomicBool::new(false)),
             metrics,
             metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
@@ -256,7 +259,12 @@ impl SharedPipelineState {
     }
 
     pub fn download_block(&self) -> DownloadBlockState {
-        self.download_block.read().unwrap().clone()
+        let mut state = self.download_block.read().unwrap().clone();
+        state.schedule_hold_reason = self.schedule_hold_reason.read().unwrap().clone();
+        if state.schedule_hold_reason.is_some() && state.kind == DownloadBlockKind::None {
+            state.kind = DownloadBlockKind::Scheduled;
+        }
+        state
     }
 
     // --- Writer methods (called by pipeline loop only) ---
@@ -535,6 +543,9 @@ pub struct DownloadBlockState {
     /// Speed limit imposed by the active schedule (0 = no scheduled limit).
     #[serde(default)]
     pub scheduled_speed_limit: u64,
+    /// Why a schedule rule is holding new downloads, while one is.
+    #[serde(default)]
+    pub schedule_hold_reason: Option<String>,
 }
 
 impl Default for DownloadBlockState {
@@ -551,6 +562,7 @@ impl Default for DownloadBlockState {
             window_ends_at_epoch_ms: None,
             timezone_name: chrono::Local::now().offset().to_string(),
             scheduled_speed_limit: 0,
+            schedule_hold_reason: None,
         }
     }
 }
@@ -1275,10 +1287,14 @@ impl SchedulerHandle {
         self.state.is_paused()
     }
 
-    pub(crate) fn set_schedule_replay_paused(&self, paused: bool) {
+    /// Hold or release download admission for the schedule evaluator. The
+    /// reason is published with the download block so the hold is visible.
+    pub(crate) fn set_schedule_admission_hold(&self, reason: Option<String>) {
+        let held = reason.is_some();
+        *self.state.schedule_hold_reason.write().unwrap() = reason;
         self.state
             .schedule_replay_paused
-            .store(paused, Ordering::Release);
+            .store(held, Ordering::Release);
     }
 
     pub fn is_post_processing_paused(&self) -> bool {

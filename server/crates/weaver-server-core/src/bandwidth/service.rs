@@ -324,6 +324,7 @@ impl BandwidthCapRuntime {
                 .map(|window| window.ends_at().timestamp_millis() as f64),
             timezone_name,
             scheduled_speed_limit: 0,
+            schedule_hold_reason: None,
         }
     }
 }

@@ -105,7 +105,7 @@ pub fn spawn_evaluator_with_services(
     tokio::sync::oneshot::Receiver<Result<(), String>>,
 ) {
     let (ready, replayed) = tokio::sync::oneshot::channel();
-    handle.set_schedule_replay_paused(true);
+    handle.set_schedule_admission_hold(Some("waiting for the first schedule replay".into()));
     let (stop, mut stopping) = tokio::sync::oneshot::channel();
     let cancellation = crate::bandwidth::schedule::ScheduleCancellation::new();
     let stopping_actions = cancellation.clone();
@@ -189,6 +189,10 @@ pub fn spawn_evaluator_with_services(
                             ?result,
                             "cannot load schedule intake state; retrying next tick"
                         );
+                        handle.set_schedule_admission_hold(
+                            holds_admission(&entries)
+                                .then(|| format!("cannot load schedule state: {result:?}")),
+                        );
                         if let Some(ready) = ready.take() {
                             let _ = ready.send(Err(format!(
                                 "cannot load schedule intake state: {result:?}"
@@ -227,7 +231,7 @@ pub fn spawn_evaluator_with_services(
             match result {
                 Ok((tick, failures)) => {
                     evaluator = tick;
-                    handle.set_schedule_replay_paused(evaluator.download_admission_blocked);
+                    handle.set_schedule_admission_hold(evaluator.admission_hold.clone());
                     if failures.is_empty()
                         && let Some((watch_paused, rss_paused)) = intake_before_failure.take()
                     {
@@ -254,7 +258,10 @@ pub fn spawn_evaluator_with_services(
                     }
                 }
                 Err(panic) => {
-                    handle.set_schedule_replay_paused(true);
+                    handle.set_schedule_admission_hold(
+                        holds_admission(&schedules.read().await)
+                            .then(|| format!("schedule evaluation failed: {panic}")),
+                    );
                     evaluator.applied.remove(&ScheduleTrack::WatchFolder);
                     evaluator.applied.remove(&ScheduleTrack::Rss);
                     if intake_before_failure.is_none() {
@@ -296,6 +303,13 @@ pub fn spawn_evaluator_with_services(
         },
         replayed,
     )
+}
+
+/// Whether any enabled rule, left unapplied, would have to hold admission.
+fn holds_admission(entries: &[ScheduleEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.enabled && entry.action.holds_admission())
 }
 
 async fn apply_one_shot(
@@ -369,7 +383,9 @@ struct HoldEvaluator {
     last_utc: Option<NaiveDateTime>,
     repeated_until: Option<NaiveDateTime>,
     pause_all_seen: bool,
-    download_admission_blocked: bool,
+    /// Set when a pause or server disable failed this tick. New downloads
+    /// stay held until it applies, so the rule's intent is not overrun.
+    admission_hold: Option<String>,
 }
 
 impl HoldEvaluator {
@@ -425,7 +441,7 @@ impl HoldEvaluator {
         self.last_tick = Some(now);
         self.last_utc = Some(utc);
         let mut failures = Vec::new();
-        self.download_admission_blocked = false;
+        self.admission_hold = None;
         // A legacy Resume only affects downloads. Once PauseAll has introduced
         // intake holds, Resume must clear them even if that rule is later deleted.
         self.pause_all_seen |= entries
@@ -481,8 +497,19 @@ impl HoldEvaluator {
                 }
                 Err(ScheduleApplyError::Pending) => {}
                 Err(ScheduleApplyError::Failed(error)) => {
-                    self.download_admission_blocked |=
-                        matches!(track, ScheduleTrack::Downloads | ScheduleTrack::Server(_));
+                    if matches!(track, ScheduleTrack::Downloads | ScheduleTrack::Server(_))
+                        && entry.action.holds_admission()
+                        && self.admission_hold.is_none()
+                    {
+                        let rule = if entry.label.is_empty() {
+                            &entry.id
+                        } else {
+                            &entry.label
+                        };
+                        self.admission_hold = Some(format!(
+                            "schedule rule \"{rule}\" could not be applied: {error}"
+                        ));
+                    }
                     warn!(%error, id = %entry.id, "failed to apply schedule action; retrying next tick");
                     failures.push(error);
                 }

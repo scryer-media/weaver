@@ -462,59 +462,81 @@ async fn soft_pressure_clamps_to_one_article_of_the_hot_job() {
     );
 }
 
-/// The whole-link gates, each reported as itself. These are the only reasons
-/// a slot may be left empty while a job has servable work.
 #[tokio::test(start_paused = true)]
-async fn failed_server_schedule_blocks_admission_without_overwriting_manual_pause() {
+async fn only_a_failed_pause_or_server_disable_holds_admission() {
     use crate::bandwidth::schedule::{ScheduleServices, spawn_evaluator_with_services};
+    use crate::bandwidth::{ScheduleAction, ScheduleEntry};
+    use crate::jobs::handle::DownloadBlockKind;
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     add_job(&mut pipeline, JobId(71080), "Schedule Gate", 200).await;
     let (commands, _) = tokio::sync::mpsc::channel(1);
     let (events, _) = tokio::sync::broadcast::channel(1);
     let handle = crate::SchedulerHandle::new(commands, events, pipeline.shared_state.clone());
-    let schedules = Arc::new(tokio::sync::RwLock::new(vec![
-        crate::bandwidth::ScheduleEntry {
-            id: "disable-server".into(),
-            enabled: true,
-            label: String::new(),
-            days: vec![],
-            time: "00:00".into(),
-            times: vec![],
-            every_hour_at_minute: None,
-            action: crate::bandwidth::ScheduleAction::SetServerActive {
-                server_id: 42,
-                active: false,
-            },
+    let rule = |active| ScheduleEntry {
+        id: "server-rule".into(),
+        enabled: true,
+        label: "Backup server".into(),
+        days: vec![],
+        time: "00:00".into(),
+        times: vec![],
+        every_hour_at_minute: None,
+        action: ScheduleAction::SetServerActive {
+            server_id: 42,
+            active,
         },
-    ]));
-    let (task, ready) =
-        spawn_evaluator_with_services(handle, schedules.clone(), ScheduleServices::default());
+    };
+    // No servers service is wired, so every server rule fails to apply.
+    let schedules = Arc::new(tokio::sync::RwLock::new(vec![rule(true)]));
+    let (task, ready) = spawn_evaluator_with_services(
+        handle.clone(),
+        schedules.clone(),
+        ScheduleServices::default(),
+    );
+
+    // A server that failed to come online leaves the others downloading.
     assert!(ready.await.unwrap().is_err());
+    assert!(!pipeline.shared_state.schedule_replay_paused());
+    assert_eq!(handle.get_download_block().kind, DownloadBlockKind::None);
+    assert!(!taken(ask(&mut pipeline, SERVER_A, 8, None)).is_empty());
+
+    // A server that failed to go offline holds new downloads, and says why.
+    *schedules.write().await = vec![rule(false)];
+    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    while !pipeline.shared_state.schedule_replay_paused() {
+        tokio::task::yield_now().await;
+    }
+    let block = handle.get_download_block();
+    assert_eq!(block.kind, DownloadBlockKind::Scheduled);
+    assert!(
+        block
+            .schedule_hold_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Backup server")),
+        "{block:?}"
+    );
     assert!(!pipeline.global_paused);
+    assert!(!pipeline.shared_state.is_paused());
     assert!(matches!(
         ask(&mut pipeline, SERVER_A, 8, None),
         Handout::Yield(YieldReason::Paused)
     ));
-    pipeline.global_paused = true;
-    pipeline.shared_state.set_paused(true);
+
+    // Removing the rule releases the hold.
     schedules.write().await.clear();
     tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
     while pipeline.shared_state.schedule_replay_paused() {
         tokio::task::yield_now().await;
     }
-    assert!(pipeline.global_paused);
-    assert!(pipeline.shared_state.is_paused());
-    assert!(matches!(
-        ask(&mut pipeline, SERVER_A, 8, None),
-        Handout::Yield(YieldReason::Paused)
-    ));
-    pipeline.global_paused = false;
-    pipeline.shared_state.set_paused(false);
+    let block = handle.get_download_block();
+    assert_eq!(block.kind, DownloadBlockKind::None);
+    assert_eq!(block.schedule_hold_reason, None);
     assert!(!taken(ask(&mut pipeline, SERVER_A, 8, None)).is_empty());
     task.shutdown().await;
 }
 
+/// The whole-link gates, each reported as itself. These are the only reasons
+/// a slot may be left empty while a job has servable work.
 #[tokio::test]
 async fn every_whole_link_gate_yields_under_its_own_name() {
     let temp_dir = tempfile::tempdir().unwrap();

@@ -1153,6 +1153,7 @@ fn manual_pause_block() -> DownloadBlockState {
         window_ends_at_epoch_ms: None,
         timezone_name: "MDT".into(),
         scheduled_speed_limit: 4_096,
+        schedule_hold_reason: None,
     }
 }
 

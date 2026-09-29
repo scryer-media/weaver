@@ -375,6 +375,10 @@ type DownloadBlock {
 	windowEndsAtEpochMs: Float
 	timezoneName: String!
 	scheduledSpeedLimit: Int!
+	"""
+	Why a schedule rule is holding new downloads, while one is.
+	"""
+	scheduleHoldReason: String
 }
 
 enum DownloadBlockKindGql {

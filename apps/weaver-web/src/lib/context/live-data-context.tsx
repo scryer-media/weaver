@@ -34,6 +34,8 @@ export interface DownloadBlockState {
   windowEndsAtEpochMs?: number | null;
   timezoneName: string;
   scheduledSpeedLimit: number;
+  /** Why a schedule rule is holding new downloads, while one is. */
+  scheduleHoldReason?: string | null;
 }
 
 export interface LiveData {
