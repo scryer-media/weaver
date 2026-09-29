@@ -18,6 +18,7 @@ use weaver_server_api::{
     submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
+use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
@@ -859,20 +860,18 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         .await
         .map_err(|error| append_refused(&requested_name, error))?;
     let (nzb_bytes, fetched_filename) = if is_http_url(&request.content_or_url) {
-        let fetched = fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await;
-        if let Err(error) = weaver_server_core::post_processing::hooks::url_completed(
-            &ctx.db,
-            &request.content_or_url,
-            request.category.as_deref(),
-            fetched.is_ok(),
-        )
-        .await
-        {
-            tracing::warn!(%error, "could not raise URL script event");
-        }
-        match fetched {
+        match fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await {
             Ok(fetched) => fetched,
-            Err(error) => return append_rejection_result(&requested_name, error),
+            Err(error) => {
+                raise_url_completed(
+                    ctx,
+                    &request.content_or_url,
+                    request.category.as_deref(),
+                    UrlStatus::Failure,
+                )
+                .await;
+                return append_rejection_result(&requested_name, error);
+            }
         }
     } else {
         // Strip ASCII whitespace before decoding: with trim_text off, typed
@@ -967,6 +966,8 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
             request.content_or_url.clone(),
         ));
     }
+    let url_event = is_http_url(&request.content_or_url)
+        .then(|| (request.content_or_url.clone(), request.category.clone()));
     let filename = request.filename.or(fetched_filename);
     let release = filename.clone().unwrap_or_default();
     let submitted = submit_nzb_bytes_with_options(
@@ -1001,10 +1002,33 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         },
     )
     .await;
+    // The URL outcome is known only once its NZB has been accepted or refused.
+    if let Some((url, category)) = &url_event {
+        let status = if submitted.is_ok() {
+            UrlStatus::Success
+        } else {
+            UrlStatus::ScanFailure
+        };
+        raise_url_completed(ctx, url, category.as_deref(), status).await;
+    }
 
     match submitted {
         Ok(submitted) => Ok(json!(submitted.job_id.0)),
         Err(error) => append_rejection_result(&release, error),
+    }
+}
+
+async fn raise_url_completed(
+    ctx: &NzbgetFacadeContext,
+    url: &str,
+    category: Option<&str>,
+    status: UrlStatus,
+) {
+    if let Err(error) =
+        weaver_server_core::post_processing::hooks::url_completed(&ctx.db, url, category, status)
+            .await
+    {
+        tracing::warn!(%error, "could not raise URL script event");
     }
 }
 
