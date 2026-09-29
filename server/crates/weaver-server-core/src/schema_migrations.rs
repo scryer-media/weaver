@@ -1261,6 +1261,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn previous_release_schema_upgrades_to_current_and_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("previous-release.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(50), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            max_recorded_migration_version(&pool).await.unwrap(),
+            Some(50)
+        );
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        pool.close().await;
+        let db = crate::Database::open(&db_path).unwrap();
+        db.validate_backup_catalog().unwrap();
+        assert_eq!(db.list_egress_interfaces().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn fresh_install_runs_remaining_migrations_to_current_schema() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
