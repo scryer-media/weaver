@@ -46,6 +46,10 @@ pub use application_updater::phases;
 /// The running version, as the manifest's `version` field spells it.
 const WEAVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// What a run is failed with when the boot after its promotion is not the
+/// build, or not the program file, its journal named.
+const UNEXPECTED_BOOT_ERROR: &str = "upgrade did not boot the expected version; backups preserved";
+
 /// Settings key holding the JSON-encoded latest [`ApplicationUpgradeRun`].
 const APPLICATION_UPGRADE_RUN_SETTING_KEY: &str = "application_upgrade_run";
 
@@ -990,7 +994,7 @@ impl ApplicationUpgradeService {
         self.finish_journal_run(
             &journal,
             ApplicationUpgradeRunStatus::Failed,
-            Some("upgrade did not boot the expected version; backups preserved".to_string()),
+            Some(UNEXPECTED_BOOT_ERROR.to_string()),
         );
         Ok(Vec::new())
     }
@@ -1042,7 +1046,14 @@ impl ApplicationUpgradeService {
             .clone()
             .filter(|run| run.run_id == journal.run_id)
             .unwrap_or_else(|| ApplicationUpgradeRun::from_journal(journal));
-        if run.status.is_terminal() {
+        // A boot of the wrong build is a verdict on that boot, and the journal
+        // and backup were kept for it. A later boot of the build the journal
+        // named is the upgrade having taken after all: the restart started
+        // the previous build, and the next start found the new one.
+        let booted_after_all = status == ApplicationUpgradeRunStatus::Completed
+            && run.status == ApplicationUpgradeRunStatus::Failed
+            && run.error.as_deref() == Some(UNEXPECTED_BOOT_ERROR);
+        if run.status.is_terminal() && !booted_after_all {
             tracing::info!(
                 run_id = %run.run_id,
                 status = run.status.as_str(),
@@ -2152,6 +2163,73 @@ mod tests {
             Some("upgrade did not boot the expected version; backups preserved")
         );
         assert!(backup_path.exists(), "the way back is preserved");
+    }
+
+    /// A restart that started the previous build fails the run, and the start
+    /// after it finds the build the journal named. That boot is the upgrade
+    /// having taken: the run completes and the backup and journal go away.
+    #[tokio::test]
+    async fn a_later_boot_of_the_expected_build_completes_a_run_failed_by_the_wrong_boot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service =
+            service_with_update(temp.path(), Some(TEST_VERSION), portable_assessment(), None).await;
+        let backup_path = temp.path().join("weaver.pre-upgrade-old");
+        fs::write(&backup_path, b"previous build").expect("write the backup");
+        let wrong_boot = journal_for(
+            "recovered-run",
+            "99.99.99",
+            std::env::current_exe().expect("current executable"),
+            backup_path.clone(),
+            phases::RESTARTING,
+        );
+        write_journal(&service.journal_path(), &wrong_boot).expect("write journal");
+        assert!(service.finalize_journal().expect("finalize").is_empty());
+        let run = service.snapshot().latest_run.expect("the run is published");
+        assert_eq!(run.status, ApplicationUpgradeRunStatus::Failed);
+        assert!(service.journal_path().exists(), "the journal is kept");
+
+        let expected_boot = ApplicationUpgradeJournal {
+            expected_version: WEAVER_VERSION.to_string(),
+            ..wrong_boot
+        };
+        write_journal(&service.journal_path(), &expected_boot).expect("write journal");
+        assert!(service.finalize_journal().expect("finalize").is_empty());
+        let run = service.snapshot().latest_run.expect("the run is published");
+        assert_eq!(run.run_id, "recovered-run");
+        assert_eq!(run.status, ApplicationUpgradeRunStatus::Completed);
+        assert_eq!(run.error, None);
+        assert!(
+            !backup_path.exists(),
+            "a completed upgrade drops its backup"
+        );
+        assert!(!service.journal_path().exists());
+    }
+
+    /// A run that failed for any other reason stays failed whatever boots.
+    #[tokio::test]
+    async fn a_boot_of_the_expected_build_leaves_a_helper_failure_failed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service =
+            service_with_update(temp.path(), Some(TEST_VERSION), portable_assessment(), None).await;
+        let journal = journal_for(
+            "helper-run",
+            WEAVER_VERSION,
+            std::env::current_exe().expect("current executable"),
+            temp.path().join("weaver.pre-upgrade-old"),
+            phases::RESTARTING,
+        );
+        let failed = ApplicationUpgradeJournal {
+            helper_error: Some("the installer refused to run".to_string()),
+            ..journal.clone()
+        };
+        write_journal(&service.journal_path(), &failed).expect("write journal");
+        assert!(service.finalize_journal().expect("finalize").is_empty());
+
+        write_journal(&service.journal_path(), &journal).expect("write journal");
+        assert!(service.finalize_journal().expect("finalize").is_empty());
+        let run = service.snapshot().latest_run.expect("the run is published");
+        assert_eq!(run.status, ApplicationUpgradeRunStatus::Failed);
+        assert_eq!(run.error.as_deref(), Some("the installer refused to run"));
     }
 
     /// A helper that recorded a failure fails the run on the next boot and clears
