@@ -214,3 +214,20 @@ fn disabled_legacy_download_rules_enable_their_reset_companions() {
         assert_eq!(db.list_schedules().unwrap(), saved);
     }
 }
+
+#[test]
+fn unreadable_reset_links_do_not_block_schedule_saves() {
+    let db = Database::open_in_memory().unwrap();
+    let entries = vec![limit("limit", "07:00", vec![])];
+    db.save_schedules(&entries).unwrap();
+    db.set_setting("schedule_legacy_speed_reset_links", "invalid")
+        .unwrap();
+    db.save_schedules(&entries).unwrap();
+    assert_eq!(db.list_schedules().unwrap(), entries);
+    assert_eq!(
+        db.get_setting("schedule_legacy_speed_reset_links")
+            .unwrap()
+            .as_deref(),
+        Some("{}")
+    );
+}

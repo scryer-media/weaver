@@ -175,9 +175,13 @@ async fn sync_legacy_reset_enablement(
     else {
         return Ok(());
     };
+    // The links only keep generated companions in step. An unreadable value
+    // must not block every schedule save, so it is dropped and rewritten.
     let links: std::collections::BTreeMap<String, String> =
-        serde_json::from_str(&row.text("value")?)
-            .map_err(|error| StateError::Database(error.to_string()))?;
+        serde_json::from_str(&row.text("value")?).unwrap_or_else(|error| {
+            tracing::warn!(%error, "discarding unreadable legacy speed reset links");
+            Default::default()
+        });
     let previous = tx
         .fetch_optional(
             "SELECT value FROM settings WHERE key = {}",
