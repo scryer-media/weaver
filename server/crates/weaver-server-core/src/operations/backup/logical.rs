@@ -819,7 +819,8 @@ async fn import_sqlite(
     .await?;
     let export =
         ordered_sqlite_tables(&mut conn, &actual, &[BackupTableClassification::Export]).await?;
-    let import = import_table_order(expected, &export, source_schema_version)?;
+    let import = import_table_order(expected, &export, allow_older_catalog)?;
+    let restored = restored_tables(expected, &import);
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *conn)
         .await
@@ -880,7 +881,7 @@ async fn import_sqlite(
                 "restored database has {violations} foreign-key violations"
             )));
         }
-        validate_sqlite_counts(&mut conn, expected).await
+        validate_sqlite_counts(&mut conn, &restored).await
     }
     .await;
     match result {
@@ -918,7 +919,8 @@ async fn import_postgres(
     .await?;
     let export =
         ordered_postgres_tables(&mut tx, &actual, &[BackupTableClassification::Export]).await?;
-    let import = import_table_order(expected, &export, source_schema_version)?;
+    let import = import_table_order(expected, &export, allow_older_catalog)?;
+    let restored = restored_tables(expected, &import);
     for table in clear.iter().rev() {
         let query = format!("DELETE FROM {}", quote_identifier(table));
         sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
@@ -960,7 +962,7 @@ async fn import_postgres(
             "restored networking configuration is missing the System egress".into(),
         ));
     }
-    validate_postgres_counts(&mut tx, expected).await?;
+    validate_postgres_counts(&mut tx, &restored).await?;
     repair_postgres_sequences(&mut tx).await?;
     tx.commit().await.map_err(db_err)
 }
@@ -968,22 +970,34 @@ async fn import_postgres(
 const EGRESS_CATALOG_SCHEMA_VERSION: i64 = 53;
 const SYSTEM_EGRESS_SEED: &str = "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, created_at, updated_at) VALUES (0, 'System', 'system', NULL, 1, 0, 0, 0)";
 
+/// Chooses the tables to restore, in dependency order. A bundle from the
+/// current schema must carry exactly the export catalog. A bundle from an older
+/// schema restores the tables both sides know: tables it predates stay empty,
+/// and tables retired since it was written are left out.
 fn import_table_order(
     expected: &BTreeMap<String, TablePartMetadata>,
     export: &[String],
-    source_schema_version: i64,
+    older_source: bool,
 ) -> Result<Vec<String>, StateError> {
-    let import: Vec<_> = export
+    if older_source {
+        return Ok(export
+            .iter()
+            .filter(|table| expected.contains_key(*table))
+            .cloned()
+            .collect());
+    }
+    validate_manifest_tables(expected, export)?;
+    Ok(export.to_vec())
+}
+
+fn restored_tables(
+    expected: &BTreeMap<String, TablePartMetadata>,
+    import: &[String],
+) -> BTreeMap<String, TablePartMetadata> {
+    import
         .iter()
-        .filter(|table| {
-            !(source_schema_version < EGRESS_CATALOG_SCHEMA_VERSION
-                && matches!(table.as_str(), "egress_interfaces" | "proxy_pools")
-                && !expected.contains_key(*table))
-        })
-        .cloned()
-        .collect();
-    validate_manifest_tables(expected, &import)?;
-    Ok(import)
+        .filter_map(|table| Some((table.clone(), expected.get(table)?.clone())))
+        .collect()
 }
 
 fn validate_manifest_tables(
@@ -1767,6 +1781,39 @@ mod logical_reader_tests {
         let error = validate_manifest_tables(&expected, &export).unwrap_err();
 
         assert!(error.to_string().contains("missing [servers]"));
+    }
+
+    #[test]
+    fn older_bundle_restores_despite_retired_and_newer_tables() {
+        let source = Database::open_in_memory().unwrap();
+        let mut archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        std::fs::write(
+            tables.join("retired_settings.ndjson"),
+            b"{\"id\":7,\"value\":\"retained\"}\n",
+        )
+        .unwrap();
+        archive.tables.insert(
+            "retired_settings".into(),
+            TablePartMetadata {
+                rows: 1,
+                columns: vec!["id".into(), "value".into()],
+                checksum: String::new(),
+            },
+        );
+        // The source predates this table, so its bundle has no part for it.
+        archive.tables.remove("rss_seen_items");
+
+        let target = Database::open_in_memory().unwrap();
+        let error = target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap_err();
+        assert!(error.to_string().contains("unexpected [retired_settings]"));
+
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version - 1)
+            .unwrap();
+        assert_eq!(target.list_egress_interfaces().unwrap().len(), 1);
     }
 
     #[test]
