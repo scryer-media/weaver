@@ -466,6 +466,12 @@ pub(crate) struct DirectUnpackRuntime {
     /// can find a chase's output after the chase has left every map.
     #[cfg(test)]
     last_staging: HashMap<(JobId, String), PathBuf>,
+    /// Deletions of retired chases' staging trees that may still be running.
+    staging_cleanups: Vec<tokio::task::JoinHandle<()>>,
+    /// Holds every staging deletion before it starts until a permit is
+    /// added, so a test can see the pipeline carry on while one is pending.
+    #[cfg(test)]
+    pub(crate) staging_cleanup_hold: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Drop for DirectUnpackRuntime {
@@ -528,6 +534,46 @@ impl DirectUnpackRuntime {
         self.armed.len() + draining
     }
 
+    /// Delete a retired chase's staging tree on a task of its own.
+    ///
+    /// The tree can hold a partially extracted multi-gigabyte member, and on a
+    /// network mount a recursive unlink of it is as slow as the mount is.
+    /// Nothing waits for it: the tree is one arm's generation, so no later
+    /// chase writes into it, and the set's next arm stages somewhere else.
+    /// Only shutdown joins what is still running, so the process does not exit
+    /// with a delete half done.
+    fn retire_staging(&mut self, key: &(JobId, String), staging_dir: PathBuf) {
+        self.staging_cleanups
+            .retain(|cleanup| !cleanup.is_finished());
+        let (job_id, set_name) = key.clone();
+        #[cfg(test)]
+        let hold = self.staging_cleanup_hold.clone();
+        self.staging_cleanups.push(tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let _ = hold.acquire().await;
+            }
+            if let Err(error) = tokio::fs::remove_dir_all(&staging_dir).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    path = %staging_dir.display(),
+                    error = %error,
+                    "failed to remove direct-unpack staging"
+                );
+            }
+        }));
+    }
+
+    /// Wait for every staging deletion still running.
+    async fn settle_staging_cleanups(&mut self) {
+        for cleanup in std::mem::take(&mut self.staging_cleanups) {
+            let _ = cleanup.await;
+        }
+    }
+
     /// Whether the commit hook has nothing at all to do: nothing being chased,
     /// and no bare `.7z` waiting to arm.
     fn idle(&self) -> bool {
@@ -556,6 +602,22 @@ impl DirectUnpackRuntime {
         self.armed
             .get(&(job_id, set_name.to_string()))
             .is_some_and(|armed| armed.handle.is_finished())
+    }
+
+    /// Whether an aborted chase is still waiting to be joined by the reap.
+    #[cfg(test)]
+    pub(crate) fn is_draining(&self, job_id: JobId, set_name: &str) -> bool {
+        self.draining
+            .iter()
+            .any(|((job, set), _)| *job == job_id && set == set_name)
+    }
+
+    /// Whether an aborted chase's worker has returned but not yet been reaped.
+    #[cfg(test)]
+    pub(crate) fn draining_worker_finished(&self, job_id: JobId, set_name: &str) -> bool {
+        self.draining.iter().any(|((job, set), armed)| {
+            *job == job_id && set == set_name && armed.handle.is_finished()
+        })
     }
 
     #[cfg(test)]
@@ -2143,9 +2205,16 @@ impl Pipeline {
             let draining = std::mem::take(&mut self.direct_unpack.draining);
             for (key, armed) in draining {
                 let _ = armed.handle.await;
-                self.remove_direct_unpack_staging(&key, &armed.staging_dir);
+                self.direct_unpack.retire_staging(&key, armed.staging_dir);
             }
         }
+        self.direct_unpack.settle_staging_cleanups().await;
+    }
+
+    /// Wait for every retired chase's staging deletion to finish.
+    #[cfg(test)]
+    pub(in crate::pipeline) async fn settle_direct_unpack_staging_cleanups(&mut self) {
+        self.direct_unpack.settle_staging_cleanups().await;
     }
 
     /// Abort any chase whose set contains `filename`.
@@ -2181,20 +2250,6 @@ impl Pipeline {
             AbortLatch::Permanent,
             DemotionReason::DownloadEnded,
         );
-    }
-
-    fn remove_direct_unpack_staging(&self, key: &(JobId, String), staging_dir: &std::path::Path) {
-        if let Err(error) = std::fs::remove_dir_all(staging_dir)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                job_id = key.0.0,
-                set_name = %key.1,
-                path = %staging_dir.display(),
-                error = %error,
-                "failed to remove direct-unpack staging"
-            );
-        }
     }
 
     /// Settle every chase for a job whose download has stopped producing bytes.
@@ -2439,7 +2494,8 @@ impl Pipeline {
             for (key, mut armed) in std::mem::take(&mut self.direct_unpack.draining) {
                 if armed.handle.is_finished() {
                     let _ = armed.handle.await;
-                    self.remove_direct_unpack_staging(&key, &armed.staging_dir);
+                    self.direct_unpack
+                        .retire_staging(&key, armed.staging_dir.clone());
                 } else {
                     // A worker that outlives its own abort is a zombie: it still
                     // holds a chase worker, its staging directory is never
@@ -2534,16 +2590,8 @@ impl Pipeline {
                     self.direct_unpack
                         .latched
                         .insert(key.clone(), reason.as_str());
-                    if let Err(error) = std::fs::remove_dir_all(&armed.staging_dir)
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        warn!(
-                            job_id = key.0.0,
-                            set_name = %key.1,
-                            error = %error,
-                            "failed to remove direct-unpack staging after demotion"
-                        );
-                    }
+                    self.direct_unpack
+                        .retire_staging(&key, armed.staging_dir.clone());
                     warn!(
                         job_id = key.0.0,
                         set_name = %key.1,
@@ -2618,7 +2666,11 @@ impl Pipeline {
             }
             self.direct_unpack.counters.discarded += 1;
             record_event("discarded");
-            self.remove_direct_unpack_staging(&key, &outcome.staging_dir);
+            // A failed chase's tree was already retired when it was reaped.
+            if outcome.result.is_ok() {
+                self.direct_unpack
+                    .retire_staging(&key, outcome.staging_dir.clone());
+            }
             debug!(
                 job_id = job_id.0,
                 set_name,
