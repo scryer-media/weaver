@@ -1335,7 +1335,7 @@ impl Pipeline {
     /// Under a slow destination — a network share answering fsyncs in seconds
     /// — every lane of every job stopped for the whole sync, once per 256 MiB
     /// batch, and the download ran in bursts between them.
-    fn start_direct_barrier(
+    pub(in crate::pipeline) fn start_direct_barrier(
         &mut self,
         job_id: JobId,
         set_index: usize,
@@ -1370,18 +1370,32 @@ impl Pipeline {
         };
         let paths: Vec<PathBuf> = touched.iter().map(|(_, path)| path.clone()).collect();
         let done_tx = self.direct_barrier_done_tx.clone();
-        let task = tokio::spawn(async move {
+        let flight_id = self.next_direct_barrier_flight_id;
+        self.next_direct_barrier_flight_id = self.next_direct_barrier_flight_id.wrapping_add(1);
+        let (outcome_tx, outcomes) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
             let outcomes = crate::pipeline::orchestrator::sync_direct_destinations(paths).await;
+            // The outcomes first, so a join never waits on the done channel:
+            // the pipeline task drains that channel, and a demanded barrier
+            // joins from the pipeline task. A dropped receiver is a flight
+            // already settled or a pipeline gone; either way nothing is owed.
+            let _ = outcome_tx.send(outcomes);
             // A closed channel is the pipeline gone; the flight is dropped
             // with it and the snapshot is never claimed.
-            let _ = done_tx.send(DirectBarrierDone { job_id, set_index }).await;
-            outcomes
+            let _ = done_tx
+                .send(DirectBarrierDone {
+                    job_id,
+                    set_index,
+                    flight_id,
+                })
+                .await;
         });
         self.direct_barrier_flights.insert(
             (job_id, set_index),
             DirectBarrierFlight {
+                id: flight_id,
                 prepared,
-                task,
+                outcomes,
                 dirty_bytes,
                 touched,
             },
@@ -1393,11 +1407,19 @@ impl Pipeline {
         &mut self,
         done: DirectBarrierDone,
     ) {
-        let Some(flight) = self
+        let key = (done.job_id, done.set_index);
+        // The message names its flight. One joined by a demanded barrier
+        // leaves its message queued, and the set may have a newer flight out
+        // by the time it arrives; settling that one here would wait on its
+        // syncs from the pipeline task — the wait the flight exists to avoid.
+        if self
             .direct_barrier_flights
-            .remove(&(done.job_id, done.set_index))
-        else {
-            // Joined by a demanded barrier before the message arrived.
+            .get(&key)
+            .is_none_or(|flight| flight.id != done.flight_id)
+        {
+            return;
+        }
+        let Some(flight) = self.direct_barrier_flights.remove(&key) else {
             return;
         };
         self.commit_direct_barrier_flight(done.job_id, done.set_index, flight)
@@ -1423,20 +1445,25 @@ impl Pipeline {
         flight: DirectBarrierFlight,
     ) {
         let DirectBarrierFlight {
+            id: _,
             prepared,
-            task,
+            outcomes,
             dirty_bytes,
             touched,
         } = flight;
-        let outcomes = match task.await {
+        let outcomes = match outcomes.await {
             Ok(outcomes) => outcomes,
-            Err(error) => {
-                // The sync task panicked or was cancelled: no destination is
-                // known synced, so every one fails and the barrier does.
-                let error = error.to_string();
+            Err(_) => {
+                // The sync task went away without answering (a panic): no
+                // destination is known synced, so every one fails and the
+                // barrier does.
                 touched
                     .iter()
-                    .map(|_| Err(std::io::Error::other(error.clone())))
+                    .map(|_| {
+                        Err(std::io::Error::other(
+                            "the destination sync task did not complete",
+                        ))
+                    })
                     .collect()
             }
         };

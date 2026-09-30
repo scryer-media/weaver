@@ -459,6 +459,7 @@ impl Pipeline {
             direct_tolerated_done_tx,
             direct_tolerated_done_rx,
             direct_barrier_flights: HashMap::new(),
+            next_direct_barrier_flight_id: 0,
             direct_barrier_done_tx,
             direct_barrier_done_rx,
             direct_rearm_in_flight: HashSet::new(),
