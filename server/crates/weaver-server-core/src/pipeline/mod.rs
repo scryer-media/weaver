@@ -19,7 +19,10 @@ mod repair;
 mod server_attribution;
 
 pub(crate) use orchestrator::check_disk_space;
-pub(crate) use orchestrator::{close_cached_write_handles_under, release_cached_write_handle};
+pub(crate) use orchestrator::{
+    close_cached_write_handles_under, release_cached_write_handle,
+    remove_file_after_cached_write_handle,
+};
 #[cfg(test)]
 use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
 use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_disk};

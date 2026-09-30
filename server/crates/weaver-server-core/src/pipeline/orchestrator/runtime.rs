@@ -1835,6 +1835,9 @@ enum DiskWriteCommand {
         scope: CloseHandleScope,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
     },
+    /// Close the cached handle for `path` and unlink the file, in that order
+    /// and on the closer thread, so the unlink never lands on an open file.
+    RemoveFile { path: std::path::PathBuf },
 }
 
 #[derive(Clone)]
@@ -1977,6 +1980,18 @@ impl DiskWriteOwnerPool {
         });
     }
 
+    fn remove_file(&self, path: &std::path::Path) {
+        let index = self.owner_index_for_path(path);
+        if let Err(std::sync::mpsc::SendError(DiskWriteCommand::RemoveFile { path })) =
+            self.senders[index].send(DiskWriteCommand::RemoveFile {
+                path: path.to_path_buf(),
+            })
+        {
+            // The owner is gone and its handles with it: nothing is open.
+            remove_closed_file(&path);
+        }
+    }
+
     async fn close_handles_matching(&self, scope: CloseHandleScope) {
         let mut acks = Vec::with_capacity(self.senders.len());
         for sender in &self.senders {
@@ -2025,6 +2040,23 @@ pub(crate) fn release_cached_write_handle(path: &std::path::Path) {
     pool.release_handle(path);
 }
 
+/// Close the cached write handle for `path`, if any, then unlink the file,
+/// both on the closer thread in the order given. Fire-and-forget like
+/// [`release_cached_write_handle`], and queued behind it: a caller that
+/// released the path earlier gets the unlink after that close too.
+///
+/// This is the only way to delete a file the owner pool may still hold open.
+/// Unlinking it from the caller instead races the close, and on a network
+/// share the race is lost visibly: the file is renamed to a `.nfs…` sibling
+/// that refuses to be unlinked until the handle closes, and the directory
+/// it sits in cannot be removed until then.
+pub(crate) fn remove_file_after_cached_write_handle(path: &std::path::Path) {
+    match DISK_WRITE_OWNER_POOL.get() {
+        Some(pool) => pool.remove_file(path),
+        None => remove_closed_file(path),
+    }
+}
+
 /// Close every cached write handle for paths under `dir` and wait until the
 /// owner threads acknowledge. Must be awaited before renaming, moving, or
 /// deleting a job's working files: working-dir paths are reused verbatim after
@@ -2056,6 +2088,14 @@ struct CachedDiskWriteHandle {
 struct HandleCloseRequest {
     files: Vec<std::fs::File>,
     ack: Option<tokio::sync::oneshot::Sender<()>>,
+    /// A path to unlink once `files` are closed. An unlink that races the
+    /// close is not a delete on a network share: NFS renames a still-open
+    /// file to a `.nfs…` sibling and only removes that on the last close,
+    /// and the sibling refuses `unlink` with `EBUSY` until then — which is
+    /// how a job's staging directory outlives its own cleanup, empty. The
+    /// close and the unlink stay in FIFO order here, behind every earlier
+    /// close of the same path.
+    remove: Option<std::path::PathBuf>,
 }
 
 fn run_disk_handle_closer(rx: std::sync::mpsc::Receiver<HandleCloseRequest>) {
@@ -2069,9 +2109,28 @@ fn run_disk_handle_closer(rx: std::sync::mpsc::Receiver<HandleCloseRequest>) {
                 started.elapsed(),
             );
         }
+        if let Some(path) = request.remove {
+            remove_closed_file(&path);
+        }
         if let Some(ack) = request.ack {
             let _ = ack.send(());
         }
+    }
+}
+
+/// Unlinks a scratch file whose cached handle is closed. One that is already
+/// gone is the outcome wanted; anything else is worth a line, since the file
+/// would otherwise sit in the job's staging directory until the job is
+/// removed.
+fn remove_closed_file(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to remove a direct-store scratch file after closing it"
+        );
     }
 }
 
@@ -2112,8 +2171,20 @@ impl DiskWriteHandleCache {
 
     fn discard(&mut self, path: &std::path::Path) {
         if let Some(entry) = self.entries.remove(path) {
-            self.close_files(vec![entry.file], None);
+            self.close_files(vec![entry.file], None, None);
         }
+    }
+
+    /// Drop the handle for `path`, if any, and unlink the file once it is
+    /// closed. The request travels even with nothing cached: the unlink must
+    /// still queue behind an earlier fire-and-forget release of the path.
+    fn close_and_remove(&mut self, path: &std::path::Path) {
+        let files = self
+            .entries
+            .remove(path)
+            .map(|entry| vec![entry.file])
+            .unwrap_or_default();
+        self.close_files(files, None, Some(path.to_path_buf()));
     }
 
     /// Drop every handle `scope` matches. `ack` fires once they are closed,
@@ -2128,7 +2199,7 @@ impl DiskWriteHandleCache {
             .extract_if(|path, _| scope.matches(path))
             .map(|(_, entry)| entry.file)
             .collect();
-        self.close_files(files, ack);
+        self.close_files(files, ack, None);
     }
 
     fn close_idle(&mut self, ttl: std::time::Duration) {
@@ -2141,22 +2212,23 @@ impl DiskWriteHandleCache {
             .extract_if(|_, entry| now.duration_since(entry.last_used) >= ttl)
             .map(|(_, entry)| entry.file)
             .collect();
-        self.close_files(files, None);
+        self.close_files(files, None, None);
     }
 
     /// Hand `files` to the closer thread, or close them here when there is
-    /// none. An empty request still travels when it carries an ack: the ack's
-    /// promise is that earlier closes of the path have landed, not that this
-    /// call found something to close.
+    /// none. An empty request still travels when it carries an ack or an
+    /// unlink: their promise is that earlier closes of the path have landed,
+    /// not that this call found something to close.
     fn close_files(
         &self,
         files: Vec<std::fs::File>,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
+        remove: Option<std::path::PathBuf>,
     ) {
-        if files.is_empty() && ack.is_none() {
+        if files.is_empty() && ack.is_none() && remove.is_none() {
             return;
         }
-        let request = HandleCloseRequest { files, ack };
+        let request = HandleCloseRequest { files, ack, remove };
         let request = match &self.closer {
             Some(closer) => match closer.send(request) {
                 Ok(()) => return,
@@ -2165,6 +2237,9 @@ impl DiskWriteHandleCache {
             None => request,
         };
         drop(request.files);
+        if let Some(path) = request.remove {
+            remove_closed_file(&path);
+        }
         if let Some(ack) = request.ack {
             let _ = ack.send(());
         }
@@ -2182,7 +2257,7 @@ impl DiskWriteHandleCache {
             };
             crate::runtime::perf_probe::record_value("download.disk_write.handle_cache.evicted", 1);
             if let Some(entry) = self.entries.remove(&least_recent) {
-                self.close_files(vec![entry.file], None);
+                self.close_files(vec![entry.file], None, None);
             }
         }
     }
@@ -2248,6 +2323,9 @@ fn run_disk_write_owner(
             }
             Ok(DiskWriteCommand::CloseHandles { scope, ack }) => {
                 handles.close_matching(&scope, ack);
+            }
+            Ok(DiskWriteCommand::RemoveFile { path }) => {
+                handles.close_and_remove(&path);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -3027,6 +3105,64 @@ mod disk_write_handle_cache_tests {
         });
         closer.join().unwrap();
         assert!(ack_rx.try_recv().is_ok());
+    }
+
+    /// A removal leaves the owner's cache at once and reaches the closer as
+    /// one request that closes first and unlinks second, queued behind an
+    /// earlier release of the same path; the file is on disk until the
+    /// closer runs that request, and gone once it has.
+    #[test]
+    fn close_and_remove_unlinks_on_the_closer_after_the_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let (closer, closer_rx) = std::sync::mpsc::channel();
+        let mut cache = DiskWriteHandleCache {
+            closer: Some(closer),
+            ..DiskWriteHandleCache::default()
+        };
+        let path = temp.path().join("part.bin");
+        cache.open_or_reuse(&path).unwrap();
+
+        cache.close_matching(&CloseHandleScope::Path(path.clone()), None);
+        cache.close_and_remove(&path);
+        assert!(cache.entries.is_empty());
+
+        let release = closer_rx.try_recv().unwrap();
+        assert_eq!(release.files.len(), 1);
+        assert!(release.remove.is_none());
+        let removal = closer_rx.try_recv().unwrap();
+        assert!(
+            removal.files.is_empty(),
+            "the release already took the handle"
+        );
+        assert_eq!(removal.remove.as_deref(), Some(path.as_path()));
+        assert!(path.exists(), "unlinked before the closer ran");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || run_disk_handle_closer(rx));
+        tx.send(release).unwrap();
+        tx.send(removal).unwrap();
+        drop(tx);
+        closer.join().unwrap();
+        assert!(!path.exists(), "the closer must unlink after closing");
+    }
+
+    /// Without a closer the removal is inline, and a path with no cached
+    /// handle is still unlinked.
+    #[test]
+    fn close_and_remove_without_a_closer_unlinks_inline() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = DiskWriteHandleCache::default();
+        let cached = temp.path().join("cached.bin");
+        let uncached = temp.path().join("uncached.bin");
+        cache.open_or_reuse(&cached).unwrap();
+        std::fs::write(&uncached, b"x").unwrap();
+
+        cache.close_and_remove(&cached);
+        cache.close_and_remove(&uncached);
+
+        assert!(cache.entries.is_empty());
+        assert!(!cached.exists());
+        assert!(!uncached.exists());
     }
 
     #[test]

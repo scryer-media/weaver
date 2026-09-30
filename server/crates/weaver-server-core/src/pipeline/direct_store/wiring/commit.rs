@@ -1864,8 +1864,7 @@ impl Pipeline {
         }
 
         for scratch in &repair_scratch {
-            crate::pipeline::release_cached_write_handle(scratch);
-            let _ = tokio::fs::remove_file(scratch).await;
+            crate::pipeline::remove_file_after_cached_write_handle(scratch);
         }
         // The set's members are at their destinations now, which is the earliest
         // moment the retained image can point at them and the last moment its
@@ -1879,8 +1878,7 @@ impl Pipeline {
             );
         } else {
             for envelope in &envelopes {
-                crate::pipeline::release_cached_write_handle(envelope);
-                let _ = tokio::fs::remove_file(envelope).await;
+                crate::pipeline::remove_file_after_cached_write_handle(envelope);
             }
         }
         // The scratch dies with the set, and its high-water is reported
@@ -2130,8 +2128,7 @@ impl Pipeline {
             let set_name = set.set_name().to_string();
             let envelopes = set.plan().envelope_paths();
             for envelope in &envelopes {
-                crate::pipeline::release_cached_write_handle(envelope);
-                let _ = tokio::fs::remove_file(envelope).await;
+                crate::pipeline::remove_file_after_cached_write_handle(envelope);
             }
             if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
                 set.release_retained_volumes();
