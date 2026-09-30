@@ -1235,6 +1235,73 @@ pub(super) struct DirectBarrierDone {
     pub(super) flight_id: u64,
 }
 
+/// One routed article waiting for its destination writes to return: the spans
+/// routing produced and the decoded article they came out of.
+///
+/// The article is held, not copied: the spans are refcounted views of its
+/// buffers, and the segment itself is what the commit reads its CRC facts
+/// from — or what the conventional path takes back if the placement fails.
+pub(super) struct DirectPlacement {
+    pub(super) spans: Vec<direct_store::router::RoutedSpan>,
+    pub(super) segment: BufferedDecodedSegment,
+    pub(super) volume_index: u32,
+    pub(super) file_offset: u64,
+    /// Counted into the resident write backlog while the placement waits, so
+    /// a slow destination slows dispatch the way a slow conventional write does.
+    pub(super) buffered_len: usize,
+}
+
+/// Where a placement flight's writes are.
+pub(super) enum DirectPlacementFlightState {
+    /// Writing on a task of its own.
+    Pending(tokio::sync::oneshot::Receiver<DirectPlacementOutcome>),
+    /// The writes returned and a join collected the outcome; the done message
+    /// applies it.
+    Resolved(DirectPlacementOutcome),
+    /// Being applied right now, further up the pipeline task's own stack.
+    Applying,
+}
+
+/// What a placement task reports: the destinations it created (for the
+/// once-per-job preparation cache) and whether every write returned.
+pub(super) struct DirectPlacementOutcome {
+    pub(super) prepared: Vec<PathBuf>,
+    pub(super) result: Result<(), direct_store::wiring::DirectPlacementError>,
+}
+
+/// A set's placements between routing and commit.
+///
+/// The destination writes of a routed article used to be awaited on the
+/// pipeline task, so a destination that took seconds to answer stopped every
+/// lane of every job for those seconds. Routing still happens on the task —
+/// it is what decides where the bytes go — but the writes run on a task of
+/// their own, and the commit is applied when the done message comes back.
+///
+/// At most one flight per set is out at a time. Articles routed while it is
+/// out queue behind it and leave together as the next flight, so the set's
+/// commits keep their routing order, and a destination is only ever prepared
+/// by one task at a time.
+pub(super) struct DirectPlacementFlight {
+    /// Names this flight to its done message, as a barrier flight's id does.
+    pub(super) id: u64,
+    /// The set this flight was routed into, checked again before it commits.
+    pub(super) set_name: String,
+    pub(super) state: DirectPlacementFlightState,
+    pub(super) placements: VecDeque<DirectPlacement>,
+}
+
+#[derive(Default)]
+pub(super) struct DirectPlacementLane {
+    pub(super) flight: Option<DirectPlacementFlight>,
+    pub(super) queued: VecDeque<DirectPlacement>,
+}
+
+pub(super) struct DirectPlacementDone {
+    pub(super) job_id: JobId,
+    pub(super) set_index: usize,
+    pub(super) flight_id: u64,
+}
+
 /// The re-read of a set's restart-seeded coverage, detached from the actor.
 ///
 /// Restart restores a set's floors from its checkpoint but not the bytes'
@@ -2665,6 +2732,17 @@ pub struct Pipeline {
     pub(super) next_direct_barrier_flight_id: u64,
     pub(super) direct_barrier_done_tx: mpsc::Sender<DirectBarrierDone>,
     pub(super) direct_barrier_done_rx: mpsc::Receiver<DirectBarrierDone>,
+    /// Routed articles whose destination writes are out or queued, per set;
+    /// see [`DirectPlacementFlight`].
+    pub(super) direct_placement_lanes: HashMap<(JobId, usize), DirectPlacementLane>,
+    /// Monotonic; stamps each placement flight and its done message.
+    pub(super) next_direct_placement_flight_id: u64,
+    pub(super) direct_placement_done_tx: mpsc::Sender<DirectPlacementDone>,
+    pub(super) direct_placement_done_rx: mpsc::Receiver<DirectPlacementDone>,
+    /// Holds every placement task at its first step until a permit is added,
+    /// so a test can keep a destination write open for as long as it likes.
+    #[cfg(test)]
+    pub(super) direct_placement_hold: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     /// Sets whose restart-seeded re-read is running; see [`DirectRearmDone`].
     pub(super) direct_rearm_in_flight: HashSet<(JobId, usize)>,
     pub(super) direct_rearm_done_tx: mpsc::Sender<DirectRearmDone>,

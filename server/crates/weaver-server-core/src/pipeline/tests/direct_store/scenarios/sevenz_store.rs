@@ -255,6 +255,7 @@ async fn submit_volume_article_declaring(
             },
         )
         .await;
+    settle_direct_placement_work(pipeline).await;
 }
 
 /// What one 7z gate run produced.

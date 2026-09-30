@@ -534,6 +534,7 @@ impl Pipeline {
         // refresh". The set already delivered everything it was for — its
         // members are the very bytes being rebuilt over.
         self.direct_store.clear_job(job_id);
+        self.drop_direct_placements_for_job(job_id);
         self.forget_direct_tolerated_work(job_id);
         // A damaged-path verdict names files by path against the assembly
         // being replaced here, so it cannot be allowed to reach the rebuilt one.

@@ -74,7 +74,7 @@ const REARM_CHUNK_BYTES: usize = 256 * 1024;
 /// A placement failure before any coverage is admitted. The caller decides
 /// whether to reconstruct conventional volumes or retain verified repair output.
 #[derive(Debug)]
-pub(in crate::pipeline) enum DirectPlacementError {
+pub(crate) enum DirectPlacementError {
     Sparse {
         path: PathBuf,
         error: std::io::Error,
@@ -2643,6 +2643,7 @@ pub(crate) fn offer_direct_header_candidates(
 mod commit;
 mod demotion;
 mod par2;
+mod placement;
 
 /// One contiguous copy of a decoded span. Routing splits the span at
 /// destination boundaries, which a batched chunk list cannot express.
