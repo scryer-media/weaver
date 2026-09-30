@@ -1205,12 +1205,20 @@ pub(super) struct DirectToleratedWork {
 ///
 /// The syncs are the barrier's only slow step — an fsync of up to a batch's
 /// worth of dirty bytes per destination — and awaiting them on the pipeline
-/// task stopped every lane for as long as the disk took. The task returns the
-/// sync outcomes; the done message only says they are ready, and a demanded
-/// barrier that cannot wait for the message joins the task directly.
+/// task stopped every lane for as long as the disk took.
+///
+/// The outcomes come back on their own channel, sent **before** the done
+/// message is offered: a demanded barrier that cannot wait for the message
+/// joins the flight through `outcomes`, and that join must not depend on the
+/// done channel having room — the pipeline task is the one that drains it,
+/// and it is the one doing the joining.
 pub(super) struct DirectBarrierFlight {
+    /// Names this flight to its done message. A flight joined by a demand
+    /// leaves its message queued, and the set may have a newer flight out by
+    /// the time it arrives; the message must not settle that one.
+    pub(super) id: u64,
     pub(super) prepared: direct_store::barrier::PreparedBarrier,
-    pub(super) task: tokio::task::JoinHandle<Vec<std::io::Result<()>>>,
+    pub(super) outcomes: tokio::sync::oneshot::Receiver<Vec<std::io::Result<()>>>,
     /// The set's dirty bytes at the prepare, for the barrier's perf probes.
     pub(super) dirty_bytes: u64,
     /// The destinations being synced, relative name and absolute path, in
@@ -1221,6 +1229,7 @@ pub(super) struct DirectBarrierFlight {
 pub(super) struct DirectBarrierDone {
     pub(super) job_id: JobId,
     pub(super) set_index: usize,
+    pub(super) flight_id: u64,
 }
 
 /// The re-read of a set's restart-seeded coverage, detached from the actor.
@@ -2649,6 +2658,8 @@ pub struct Pipeline {
     pub(super) direct_tolerated_done_rx: mpsc::Receiver<DirectToleratedWorkDone>,
     /// At most one barrier in flight per set; see [`DirectBarrierFlight`].
     pub(super) direct_barrier_flights: HashMap<(JobId, usize), DirectBarrierFlight>,
+    /// Monotonic; stamps each flight and its done message.
+    pub(super) next_direct_barrier_flight_id: u64,
     pub(super) direct_barrier_done_tx: mpsc::Sender<DirectBarrierDone>,
     pub(super) direct_barrier_done_rx: mpsc::Receiver<DirectBarrierDone>,
     /// Sets whose restart-seeded re-read is running; see [`DirectRearmDone`].
