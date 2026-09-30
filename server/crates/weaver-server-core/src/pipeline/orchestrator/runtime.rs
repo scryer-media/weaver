@@ -1695,6 +1695,107 @@ struct DiskWriteOwnerPool {
     senders: Vec<std::sync::mpsc::Sender<DiskWriteCommand>>,
 }
 
+enum DiskSyncRequest {
+    /// One flush, off the owner thread. `file` is a duplicate of the owner's
+    /// cached handle, so the flush covers every byte written through the
+    /// original, and the owner's cache is untouched whether it succeeds or not.
+    Sync {
+        path: std::path::PathBuf,
+        file: std::fs::File,
+        response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    },
+    /// Answered once every sync queued before it has finished and dropped its
+    /// duplicate handle. A duplicate outliving the owner's close would keep
+    /// the file open past the close's acknowledgement — on Windows, a
+    /// delete-pending file whose path cannot be reused — so a close waits on
+    /// this after the owners have answered.
+    Fence(tokio::sync::oneshot::Sender<()>),
+}
+
+/// The flush a coverage barrier relies on.
+///
+/// `sync_data` everywhere, and on Apple platforms that is `fcntl(F_FULLFSYNC)`
+/// — the device barrier, which local volumes implement and which stays the
+/// call made. A mount that does not implement it — SMB is the common one —
+/// *refuses* it with `ENOTSUP`, and only that refusal is answered with the
+/// plain `fsync` such a mount does implement: the strongest promise it can
+/// make, and the same one every other platform's `sync_data` makes. Any other
+/// failure is a failed flush and is reported as one.
+fn durable_sync(file: &std::fs::File) -> std::io::Result<()> {
+    match file.sync_data() {
+        #[cfg(target_vendor = "apple")]
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::ENOTTY)) => {
+            use std::os::fd::AsRawFd;
+            crate::runtime::perf_probe::record_value("download.disk_sync.fullfsync_refused", 1);
+            // SAFETY: `fsync` takes only the descriptor, which `file` keeps
+            // open for the whole call.
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        result => result,
+    }
+}
+
+/// The one path-to-thread mapping the owner and sync pools share.
+fn sync_index_for_path(path: &std::path::Path, threads: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    (hasher.finish() as usize) % threads
+}
+
+/// Sync threads, one per owner thread and routed by the same path hash, so
+/// two syncs of one file stay ordered while syncs of different files run in
+/// parallel — the same shape the writes have.
+fn disk_sync_senders() -> &'static [std::sync::mpsc::Sender<DiskSyncRequest>] {
+    static SENDERS: std::sync::OnceLock<Vec<std::sync::mpsc::Sender<DiskSyncRequest>>> =
+        std::sync::OnceLock::new();
+    SENDERS.get_or_init(|| {
+        (0..DISK_WRITE_OWNER_THREADS)
+            .map(|index| {
+                let (tx, rx) = std::sync::mpsc::channel::<DiskSyncRequest>();
+                std::thread::Builder::new()
+                    .name(format!("weaver-disk-sync-{index}"))
+                    .spawn(move || {
+                        for request in rx {
+                            match request {
+                                DiskSyncRequest::Sync {
+                                    path,
+                                    file,
+                                    response,
+                                } => {
+                                    let started = Instant::now();
+                                    let result = durable_sync(&file);
+                                    drop(file);
+                                    crate::runtime::perf_probe::record(
+                                        "download.disk_sync.flush",
+                                        started.elapsed(),
+                                    );
+                                    if result.is_err() {
+                                        // The owner keeps a handle a sync just
+                                        // failed through; drop it so the next
+                                        // write reopens, exactly as the inline
+                                        // sync used to.
+                                        release_cached_write_handle(&path);
+                                    }
+                                    let _ = response.send(result);
+                                }
+                                DiskSyncRequest::Fence(ack) => {
+                                    let _ = ack.send(());
+                                }
+                            }
+                        }
+                    })
+                    .expect("failed to spawn Weaver disk sync thread");
+                tx
+            })
+            .collect()
+    })
+}
+
 enum DiskWriteCommand {
     Batch {
         path: std::path::PathBuf,
@@ -1715,8 +1816,16 @@ enum DiskWriteCommand {
         queued_at: Instant,
         response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
     },
-    /// Durably syncs one destination, on the thread that owns its handle so the
-    /// sync is ordered behind every batch queued before it.
+    /// Durably syncs one destination. The owner thread only duplicates the
+    /// cached handle — no I/O — and hands the duplicate to a sync thread, so
+    /// the file's writes keep flowing while its dirty pages are flushed.
+    ///
+    /// Queued behind the batches submitted before it, which is all the
+    /// barrier needs: a coverage barrier only claims writes the owner has
+    /// already acknowledged, and a sync through any handle flushes the whole
+    /// inode. What it must **not** do is hold this thread for the flush's
+    /// duration: on a network share that is seconds per barrier, and every
+    /// write to the file — the download itself — would queue behind it.
     SyncPath {
         path: std::path::PathBuf,
         response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
@@ -1767,10 +1876,7 @@ impl DiskWriteOwnerPool {
     // per-thread FIFO then guarantees a queued CloseHandles runs after every
     // batch submitted before it.
     fn owner_index_for_path(&self, path: &std::path::Path) -> usize {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut hasher);
-        (hasher.finish() as usize) % self.senders.len()
+        sync_index_for_path(path, self.senders.len())
     }
 
     async fn write_batch(
@@ -1886,6 +1992,18 @@ impl DiskWriteOwnerPool {
         }
         for ack in acks {
             let _ = ack.await;
+        }
+        // The owners have closed, so no new duplicate can be made; fence the
+        // sync threads so the duplicates already out are dropped too.
+        let mut fences = Vec::with_capacity(DISK_WRITE_OWNER_THREADS);
+        for sender in disk_sync_senders() {
+            let (ack, ack_rx) = tokio::sync::oneshot::channel();
+            if sender.send(DiskSyncRequest::Fence(ack)).is_ok() {
+                fences.push(ack_rx);
+            }
+        }
+        for fence in fences {
+            let _ = fence.await;
         }
     }
 }
@@ -2101,13 +2219,31 @@ fn run_disk_write_owner(
                 let _ = response.send(result);
             }
             Ok(DiskWriteCommand::SyncPath { path, response }) => {
-                let result = handles
+                let file = match handles
                     .open_or_reuse(&path)
-                    .and_then(|file| file.sync_data());
-                if result.is_err() {
-                    handles.discard(&path);
+                    .and_then(|file| file.try_clone())
+                {
+                    Ok(file) => file,
+                    Err(error) => {
+                        handles.discard(&path);
+                        let _ = response.send(Err(error));
+                        continue;
+                    }
+                };
+                let senders = disk_sync_senders();
+                let index = sync_index_for_path(&path, senders.len());
+                if let Err(std::sync::mpsc::SendError(DiskSyncRequest::Sync { response, .. })) =
+                    senders[index].send(DiskSyncRequest::Sync {
+                        path,
+                        file,
+                        response,
+                    })
+                {
+                    let _ = response.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "disk sync thread stopped",
+                    )));
                 }
-                let _ = response.send(result);
             }
             Ok(DiskWriteCommand::CloseHandles { scope, ack }) => {
                 handles.close_matching(&scope, ack);
@@ -2437,6 +2573,10 @@ pub(crate) async fn write_direct_batches(batches: DirectWriteBatches) -> std::io
 /// so awaiting them one at a time serialized `n` independent fsyncs behind each
 /// other on the pipeline task. The ordering guarantee is unchanged — the barrier
 /// still sees every sync's outcome before it persists anything.
+///
+/// The flush itself runs on a sync thread through a duplicate of the owner's
+/// handle (see [`DiskWriteCommand::SyncPath`]), so the destination keeps taking
+/// writes for as long as the flush lasts.
 pub(crate) async fn sync_direct_destinations(
     paths: Vec<std::path::PathBuf>,
 ) -> Vec<std::io::Result<()>> {
