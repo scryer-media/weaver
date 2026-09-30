@@ -924,6 +924,7 @@ impl ApplicationUpgradeService {
         let journal_path = self.journal_path();
         let Some(journal) = load_journal(&journal_path)? else {
             self.fail_interrupted_run(None);
+            self.complete_run_failed_by_the_wrong_boot();
             return Ok(Vec::new());
         };
         self.fail_interrupted_run(Some(&journal.run_id));
@@ -997,6 +998,41 @@ impl ApplicationUpgradeService {
             Some(UNEXPECTED_BOOT_ERROR.to_string()),
         );
         Ok(Vec::new())
+    }
+
+    /// Complete the latest run when all that failed it was a boot of the wrong
+    /// build, its journal is gone, and this build is the one it was installing
+    /// or a later one.
+    ///
+    /// The build that was started after the wrong boot removed the journal
+    /// and the backup and left the run failed, so there is nothing left to
+    /// judge the run by but the version that is running.
+    fn complete_run_failed_by_the_wrong_boot(&self) {
+        let Some(mut run) = self.inner.state.borrow().clone().filter(|run| {
+            run.status == ApplicationUpgradeRunStatus::Failed
+                && run.error.as_deref() == Some(UNEXPECTED_BOOT_ERROR)
+        }) else {
+            return;
+        };
+        let installed = match (
+            Version::parse(WEAVER_VERSION),
+            Version::parse(&run.target_version),
+        ) {
+            (Ok(running), Ok(target)) => running >= target,
+            _ => WEAVER_VERSION == run.target_version,
+        };
+        if !installed {
+            return;
+        }
+        tracing::info!(
+            run_id = %run.run_id,
+            target_version = %run.target_version,
+            "application upgrade had installed its build; the restart after it started the previous one"
+        );
+        run.status = ApplicationUpgradeRunStatus::Completed;
+        run.error = None;
+        run.completed_at_epoch_ms = Some(epoch_ms_now());
+        self.publish(run);
     }
 
     fn complete_journal_run(
@@ -2203,6 +2239,52 @@ mod tests {
             "a completed upgrade drops its backup"
         );
         assert!(!service.journal_path().exists());
+    }
+
+    /// The build started after the wrong boot removed the journal and left the
+    /// run failed. With no journal, a build at or past the run's target
+    /// completes it; an older build and any other failure leave it alone.
+    #[tokio::test]
+    async fn a_run_failed_by_the_wrong_boot_completes_without_its_journal() {
+        let failed = |target: &str, error: &str| ApplicationUpgradeRun {
+            run_id: "journal-gone".to_string(),
+            status: ApplicationUpgradeRunStatus::Failed,
+            phase: phases::RESTARTING.to_string(),
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            target_version: target.to_string(),
+            target_tag: release_tag_for_version(target),
+            from_version: "0.0.1".to_string(),
+            error: Some(error.to_string()),
+            started_at_epoch_ms: 1,
+            completed_at_epoch_ms: Some(2),
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service =
+            service_with_update(temp.path(), Some(TEST_VERSION), portable_assessment(), None).await;
+
+        for target in [WEAVER_VERSION, "0.0.2"] {
+            service.publish(failed(target, UNEXPECTED_BOOT_ERROR));
+            assert!(service.finalize_journal().expect("finalize").is_empty());
+            let run = service.snapshot().latest_run.expect("the run is published");
+            assert_eq!(
+                run.status,
+                ApplicationUpgradeRunStatus::Completed,
+                "{target}"
+            );
+            assert_eq!(run.error, None);
+        }
+
+        service.publish(failed("9999.0.0", UNEXPECTED_BOOT_ERROR));
+        assert!(service.finalize_journal().expect("finalize").is_empty());
+        let run = service.snapshot().latest_run.expect("the run is published");
+        assert_eq!(run.status, ApplicationUpgradeRunStatus::Failed);
+
+        service.publish(failed(WEAVER_VERSION, "the download was refused"));
+        assert!(service.finalize_journal().expect("finalize").is_empty());
+        let run = service.snapshot().latest_run.expect("the run is published");
+        assert_eq!(run.status, ApplicationUpgradeRunStatus::Failed);
+        assert_eq!(run.error.as_deref(), Some("the download was refused"));
     }
 
     /// A run that failed for any other reason stays failed whatever boots.
