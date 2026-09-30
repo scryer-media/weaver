@@ -94,7 +94,7 @@ pub enum RefusalReason {
     EndHeaderTooLarge,
     /// The declared lengths do not describe a coherent archive.
     LengthOverflow,
-    /// The chase could not get a staging directory or an extraction budget.
+    /// The chase could not get an extraction budget.
     BudgetUnavailable,
     /// Every chase worker is already occupied. Admitting another would arm a
     /// chase that cannot start, and extraction awaits a started chase without a
@@ -120,6 +120,10 @@ impl RefusalReason {
         }
     }
 }
+
+/// Prefix on a worker error that means the chase never got a staging tree, so
+/// the reap can tell it apart from a decode failure.
+const STAGING_UNAVAILABLE: &str = "direct-unpack staging directory unavailable";
 
 /// How long a worker may keep running after its set was aborted before the drain
 /// reap says so. Generous: a decode that is mid-member finishes on its own.
@@ -170,6 +174,9 @@ pub enum DemotionReason {
     /// The set was gated on recovery-set evidence that never arrived, and the
     /// repair has concluded, so nothing will unpark it.
     GatedStall,
+    /// The worker could not create or open its staging directory. Nothing is
+    /// wrong with the archive; the chase had nowhere to write.
+    StagingUnavailable,
 }
 
 impl DemotionReason {
@@ -182,6 +189,7 @@ impl DemotionReason {
             Self::RepairRewrote => "repair_rewrote",
             Self::RepairFailed => "repair_failed",
             Self::GatedStall => "gated_stall",
+            Self::StagingUnavailable => "staging_unavailable",
         }
     }
 }
@@ -260,6 +268,7 @@ pub struct DirectUnpackCounters {
     pub demoted_repair_rewrote: u64,
     pub demoted_repair_failed: u64,
     pub demoted_gated_stall: u64,
+    pub demoted_staging_unavailable: u64,
     /// Chases whose members were installed instead of re-extracting.
     pub consumed: u64,
     /// Chases whose output was thrown away in favour of conventional extraction.
@@ -304,6 +313,7 @@ impl DirectUnpackCounters {
             DemotionReason::RepairRewrote => self.demoted_repair_rewrote += 1,
             DemotionReason::RepairFailed => self.demoted_repair_failed += 1,
             DemotionReason::GatedStall => self.demoted_gated_stall += 1,
+            DemotionReason::StagingUnavailable => self.demoted_staging_unavailable += 1,
         }
     }
 }
@@ -442,6 +452,26 @@ pub(crate) struct DirectUnpackRuntime {
     /// Finished chases, awaiting a consumer.
     outcomes: HashMap<(JobId, String), ChaseOutcome>,
     counters: DirectUnpackCounters,
+    /// The generation the next arm stages into.
+    ///
+    /// Every arm gets a directory of its own, so a retired chase's tree can be
+    /// deleted while the set's next chase writes a disjoint one: there is no
+    /// ordering between the two and nothing to rename. Pipeline-wide rather
+    /// than per set, and never reset, because a job keeps its id through a
+    /// reprocess or a nested rebuild that forgets its chases — a per-job
+    /// counter restarted there would hand a new arm a path whose delete may
+    /// still be running.
+    next_staging_generation: u64,
+    /// The staging directory each set's most recent arm was given, so a test
+    /// can find a chase's output after the chase has left every map.
+    #[cfg(test)]
+    last_staging: HashMap<(JobId, String), PathBuf>,
+    /// Deletions of retired chases' staging trees that may still be running.
+    staging_cleanups: Vec<tokio::task::JoinHandle<()>>,
+    /// Holds every staging deletion before it starts until a permit is
+    /// added, so a test can see the pipeline carry on while one is pending.
+    #[cfg(test)]
+    pub(crate) staging_cleanup_hold: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Drop for DirectUnpackRuntime {
@@ -504,6 +534,46 @@ impl DirectUnpackRuntime {
         self.armed.len() + draining
     }
 
+    /// Delete a retired chase's staging tree on a task of its own.
+    ///
+    /// The tree can hold a partially extracted multi-gigabyte member, and on a
+    /// network mount a recursive unlink of it is as slow as the mount is.
+    /// Nothing waits for it: the tree is one arm's generation, so no later
+    /// chase writes into it, and the set's next arm stages somewhere else.
+    /// Only shutdown joins what is still running, so the process does not exit
+    /// with a delete half done.
+    fn retire_staging(&mut self, key: &(JobId, String), staging_dir: PathBuf) {
+        self.staging_cleanups
+            .retain(|cleanup| !cleanup.is_finished());
+        let (job_id, set_name) = key.clone();
+        #[cfg(test)]
+        let hold = self.staging_cleanup_hold.clone();
+        self.staging_cleanups.push(tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let _ = hold.acquire().await;
+            }
+            if let Err(error) = tokio::fs::remove_dir_all(&staging_dir).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    path = %staging_dir.display(),
+                    error = %error,
+                    "failed to remove direct-unpack staging"
+                );
+            }
+        }));
+    }
+
+    /// Wait for every staging deletion still running.
+    async fn settle_staging_cleanups(&mut self) {
+        for cleanup in std::mem::take(&mut self.staging_cleanups) {
+            let _ = cleanup.await;
+        }
+    }
+
     /// Whether the commit hook has nothing at all to do: nothing being chased,
     /// and no bare `.7z` waiting to arm.
     fn idle(&self) -> bool {
@@ -532,6 +602,22 @@ impl DirectUnpackRuntime {
         self.armed
             .get(&(job_id, set_name.to_string()))
             .is_some_and(|armed| armed.handle.is_finished())
+    }
+
+    /// Whether an aborted chase is still waiting to be joined by the reap.
+    #[cfg(test)]
+    pub(crate) fn is_draining(&self, job_id: JobId, set_name: &str) -> bool {
+        self.draining
+            .iter()
+            .any(|((job, set), _)| *job == job_id && set == set_name)
+    }
+
+    /// Whether an aborted chase's worker has returned but not yet been reaped.
+    #[cfg(test)]
+    pub(crate) fn draining_worker_finished(&self, job_id: JobId, set_name: &str) -> bool {
+        self.draining.iter().any(|((job, set), armed)| {
+            *job == job_id && set == set_name && armed.handle.is_finished()
+        })
     }
 
     #[cfg(test)]
@@ -947,8 +1033,9 @@ impl Pipeline {
         }) {
             return;
         }
-        // A paused worker still owns this staging path until it is joined and
-        // cleaned up. Reusing it sooner would race both its writes and cleanup.
+        // A set whose previous chase is still draining waits for it to be
+        // joined. Each arm stages into its own generation, so this no longer
+        // protects a path; it keeps at most one worker per set alive at once.
         if self
             .direct_unpack
             .draining
@@ -1015,18 +1102,13 @@ impl Pipeline {
             return;
         }
 
-        let output_dir = self.direct_unpack_staging_dir(job_id, set_name);
-        if let Err(error) = std::fs::create_dir_all(&output_dir) {
-            warn!(
-                job_id = job_id.0,
-                set_name,
-                path = %output_dir.display(),
-                error = %error,
-                "direct unpack could not create its staging directory"
-            );
-            self.latch_direct_unpack_refusal(job_id, set_name, RefusalReason::BudgetUnavailable);
-            return;
-        }
+        let generation = self.direct_unpack.next_staging_generation;
+        self.direct_unpack.next_staging_generation += 1;
+        let output_dir = self.direct_unpack_generation_dir(job_id, set_name, generation);
+        #[cfg(test)]
+        self.direct_unpack
+            .last_staging
+            .insert((job_id, set_name.to_string()), output_dir.clone());
         let budget = match self.direct_unpack_budget(job_id, &paths, &output_dir) {
             Ok(budget) => budget,
             Err(error) => {
@@ -1132,24 +1214,6 @@ impl Pipeline {
             }
         }
 
-        let root = match ExtractionRoot::open(&output_dir) {
-            Ok(root) => Arc::new(root),
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    set_name,
-                    error = %error,
-                    "direct unpack could not open its staging root"
-                );
-                self.latch_direct_unpack_refusal(
-                    job_id,
-                    set_name,
-                    RefusalReason::BudgetUnavailable,
-                );
-                return;
-            }
-        };
-
         let password = self.primary_archive_password_for_job(job_id);
         let boost_paths = paths.clone();
         let counters = Arc::new(crate::jobs::PhaseCounters::default());
@@ -1159,7 +1223,6 @@ impl Pipeline {
             paths,
             Arc::clone(&coverage),
             output_dir.clone(),
-            root,
             Arc::clone(&budget),
             password,
             Arc::clone(&counters),
@@ -1505,21 +1568,46 @@ impl Pipeline {
         self.direct_unpack.counters.record_refusal(reason);
     }
 
-    /// Where a chased set's members land.
+    /// Where one arm of a chased set lands its members.
     ///
     /// Deliberately not the conventional staging dir and not inside it: the
     /// conventional extractor's own output and the delivery scan both live
     /// there, and a demotion has to be able to `remove_dir_all` this without
     /// touching anything the conventional path will look at.
+    ///
+    /// The generation is the last dot-separated component and never contains
+    /// a dot itself, so two `(set, generation)` pairs cannot name the same
+    /// directory. The job level stays a bare number: the maintenance sweep
+    /// keys on it.
+    pub(in crate::pipeline) fn direct_unpack_generation_dir(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        generation: u64,
+    ) -> PathBuf {
+        self.complete_dir
+            .join(".weaver-direct-unpack")
+            .join(job_id.0.to_string())
+            .join(format!("{}.{generation}", sanitize_set_dir_name(set_name)))
+    }
+
+    /// The staging directory of the set's most recent arm, or the job's
+    /// staging level when the set never armed.
+    #[cfg(test)]
     pub(in crate::pipeline) fn direct_unpack_staging_dir(
         &self,
         job_id: JobId,
         set_name: &str,
     ) -> PathBuf {
-        self.complete_dir
-            .join(".weaver-direct-unpack")
-            .join(job_id.0.to_string())
-            .join(sanitize_set_dir_name(set_name))
+        self.direct_unpack
+            .last_staging
+            .get(&(job_id, set_name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| {
+                self.complete_dir
+                    .join(".weaver-direct-unpack")
+                    .join(job_id.0.to_string())
+            })
     }
 
     /// An extraction budget for the chase, rooted at its own staging dir.
@@ -1558,8 +1646,6 @@ impl Pipeline {
             .map(|file| file.total_bytes())
             .sum::<u64>()
             .max(1);
-        let (initial_entries, initial_bytes) =
-            ExtractionRoot::snapshot_usage(staging).unwrap_or((0, 0));
 
         crate::pipeline::extraction::JobExtractionBudget::with_capacity(
             Arc::clone(&self.extraction_limits),
@@ -1570,8 +1656,11 @@ impl Pipeline {
                 .reader(crate::operations::StorageRoot::Complete),
             staging.to_path_buf(),
             declared_archive_bytes,
-            initial_entries,
-            initial_bytes,
+            // Nothing to count: the staging directory is this arm's own
+            // generation, and its worker creates it empty before writing the
+            // first member. There is no earlier output there to charge.
+            0,
+            0,
             Arc::clone(&self.metrics),
         )
     }
@@ -1634,7 +1723,6 @@ impl Pipeline {
         paths: Vec<PathBuf>,
         coverage: Arc<SetCoverage>,
         output_dir: PathBuf,
-        root: Arc<ExtractionRoot>,
         budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
         password: Option<String>,
         counters: Arc<crate::jobs::PhaseCounters>,
@@ -1669,6 +1757,13 @@ impl Pipeline {
             } else {
                 None
             };
+            // The staging tree is made here rather than at arming, which runs
+            // on the pipeline task: on a network mount every step of it is a
+            // round trip, and a set can arm many times over one download.
+            let root = Arc::new(
+                ExtractionRoot::create_empty(&output_dir)
+                    .map_err(|error| format!("{STAGING_UNAVAILABLE}: {error}"))?,
+            );
             // Between here and the line below sits `install`, which queues
             // behind occupied workers with no logging, no timeout, and no
             // sensitivity to this set's abort — the closure has not touched the
@@ -2110,9 +2205,16 @@ impl Pipeline {
             let draining = std::mem::take(&mut self.direct_unpack.draining);
             for (key, armed) in draining {
                 let _ = armed.handle.await;
-                self.remove_direct_unpack_staging(&key, &armed.staging_dir);
+                self.direct_unpack.retire_staging(&key, armed.staging_dir);
             }
         }
+        self.direct_unpack.settle_staging_cleanups().await;
+    }
+
+    /// Wait for every retired chase's staging deletion to finish.
+    #[cfg(test)]
+    pub(in crate::pipeline) async fn settle_direct_unpack_staging_cleanups(&mut self) {
+        self.direct_unpack.settle_staging_cleanups().await;
     }
 
     /// Abort any chase whose set contains `filename`.
@@ -2148,20 +2250,6 @@ impl Pipeline {
             AbortLatch::Permanent,
             DemotionReason::DownloadEnded,
         );
-    }
-
-    fn remove_direct_unpack_staging(&self, key: &(JobId, String), staging_dir: &std::path::Path) {
-        if let Err(error) = std::fs::remove_dir_all(staging_dir)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                job_id = key.0.0,
-                set_name = %key.1,
-                path = %staging_dir.display(),
-                error = %error,
-                "failed to remove direct-unpack staging"
-            );
-        }
     }
 
     /// Settle every chase for a job whose download has stopped producing bytes.
@@ -2406,7 +2494,8 @@ impl Pipeline {
             for (key, mut armed) in std::mem::take(&mut self.direct_unpack.draining) {
                 if armed.handle.is_finished() {
                     let _ = armed.handle.await;
-                    self.remove_direct_unpack_staging(&key, &armed.staging_dir);
+                    self.direct_unpack
+                        .retire_staging(&key, armed.staging_dir.clone());
                 } else {
                     // A worker that outlives its own abort is a zombie: it still
                     // holds a chase worker, its staging directory is never
@@ -2484,8 +2573,11 @@ impl Pipeline {
                 }
                 Err(error) => {
                     // A part that vanished under the reader is a rename racing
-                    // the chase, not a broken archive.
-                    let reason = if error.contains("failed to open 7z direct-unpack reader")
+                    // the chase, not a broken archive. The staging check comes
+                    // first: its error can carry the same "not found" text.
+                    let reason = if error.contains(STAGING_UNAVAILABLE) {
+                        DemotionReason::StagingUnavailable
+                    } else if error.contains("failed to open 7z direct-unpack reader")
                         || error.contains("No such file or directory")
                     {
                         DemotionReason::PartUnreadable
@@ -2498,16 +2590,8 @@ impl Pipeline {
                     self.direct_unpack
                         .latched
                         .insert(key.clone(), reason.as_str());
-                    if let Err(error) = std::fs::remove_dir_all(&armed.staging_dir)
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        warn!(
-                            job_id = key.0.0,
-                            set_name = %key.1,
-                            error = %error,
-                            "failed to remove direct-unpack staging after demotion"
-                        );
-                    }
+                    self.direct_unpack
+                        .retire_staging(&key, armed.staging_dir.clone());
                     warn!(
                         job_id = key.0.0,
                         set_name = %key.1,
@@ -2582,7 +2666,11 @@ impl Pipeline {
             }
             self.direct_unpack.counters.discarded += 1;
             record_event("discarded");
-            self.remove_direct_unpack_staging(&key, &outcome.staging_dir);
+            // A failed chase's tree was already retired when it was reaped.
+            if outcome.result.is_ok() {
+                self.direct_unpack
+                    .retire_staging(&key, outcome.staging_dir.clone());
+            }
             debug!(
                 job_id = job_id.0,
                 set_name,

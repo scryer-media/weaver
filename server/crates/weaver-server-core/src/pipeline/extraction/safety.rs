@@ -1714,27 +1714,7 @@ pub(crate) struct ExtractionRoot {
 
 impl ExtractionRoot {
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
-        let parent_path = path
-            .parent()
-            .ok_or_else(|| format!("extraction staging root has no parent: {}", path.display()))?;
-        let anchor_path = parent_path.parent().ok_or_else(|| {
-            format!(
-                "extraction staging parent has no anchor: {}",
-                parent_path.display()
-            )
-        })?;
-        let parent_name = parent_path.file_name().ok_or_else(|| {
-            format!(
-                "extraction staging parent has no directory name: {}",
-                parent_path.display()
-            )
-        })?;
-        let root_name = path.file_name().ok_or_else(|| {
-            format!(
-                "extraction staging root has no directory name: {}",
-                path.display()
-            )
-        })?;
+        let (anchor_path, parent_name, root_name) = staging_root_components(path)?;
 
         let anchor = Dir::open_ambient_dir(anchor_path, ambient_authority()).map_err(|error| {
             format!(
@@ -1752,6 +1732,65 @@ impl ExtractionRoot {
             Path::new(root_name),
             "extraction staging root",
         )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dir,
+        })
+    }
+
+    /// Create a staging root that starts empty, and open it.
+    ///
+    /// For a caller that names a fresh directory on every use, so whatever
+    /// already sits at `path` was left there by an earlier process and is
+    /// removed rather than adopted. The anchor chain is created as
+    /// [`Self::open`] expects it; the removal and the creation both go through
+    /// the parent opened without following links, so a link planted at `path`
+    /// is unlinked, never followed.
+    pub(crate) fn create_empty(path: &Path) -> Result<Self, String> {
+        let (anchor_path, parent_name, root_name) = staging_root_components(path)?;
+        let root_name = Path::new(root_name);
+
+        std::fs::create_dir_all(anchor_path).map_err(|error| {
+            format!(
+                "failed to create extraction staging anchor {}: {error}",
+                anchor_path.display()
+            )
+        })?;
+        let anchor = Dir::open_ambient_dir(anchor_path, ambient_authority()).map_err(|error| {
+            format!(
+                "failed to open extraction staging anchor {}: {error}",
+                anchor_path.display()
+            )
+        })?;
+        let parent = open_or_create_directory_nofollow(
+            &anchor,
+            Path::new(parent_name),
+            "extraction staging parent",
+        )?;
+        let stale = match parent.symlink_metadata(root_name) {
+            Ok(metadata) if metadata.is_dir() => parent.remove_dir_all(root_name),
+            Ok(_) => parent.remove_file(root_name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+        stale.map_err(|error| {
+            format!(
+                "failed to clear stale extraction staging root {}: {error}",
+                path.display()
+            )
+        })?;
+        parent.create_dir(root_name).map_err(|error| {
+            format!(
+                "failed to create extraction staging root {}: {error}",
+                path.display()
+            )
+        })?;
+        let dir = parent.open_dir_nofollow(root_name).map_err(|error| {
+            format!(
+                "failed to open extraction staging root {} without following links: {error}",
+                path.display()
+            )
+        })?;
         Ok(Self {
             path: path.to_path_buf(),
             dir,
@@ -1975,6 +2014,33 @@ impl ExtractionRoot {
         let root = Self::open(path)?;
         scan_capability_tree(&root.dir, path)
     }
+}
+
+/// Split a staging root into the anchor that is opened by path and the two
+/// directory names beneath it that are opened without following links.
+fn staging_root_components(path: &Path) -> Result<(&Path, &OsStr, &OsStr), String> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| format!("extraction staging root has no parent: {}", path.display()))?;
+    let anchor_path = parent_path.parent().ok_or_else(|| {
+        format!(
+            "extraction staging parent has no anchor: {}",
+            parent_path.display()
+        )
+    })?;
+    let parent_name = parent_path.file_name().ok_or_else(|| {
+        format!(
+            "extraction staging parent has no directory name: {}",
+            parent_path.display()
+        )
+    })?;
+    let root_name = path.file_name().ok_or_else(|| {
+        format!(
+            "extraction staging root has no directory name: {}",
+            path.display()
+        )
+    })?;
+    Ok((anchor_path, parent_name, root_name))
 }
 
 fn open_or_create_directory_nofollow(
