@@ -235,6 +235,9 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         )
         .await;
     }
+    // The restored coverage is re-read off the pipeline task; settle that read
+    // the way the select loop does before judging the gates.
+    settle_direct_post_repair_work(&mut pipeline).await;
     assert!(
         pipeline
             .direct_store
@@ -342,6 +345,9 @@ async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
         )
         .await;
     }
+    // The restored coverage is re-read off the pipeline task; settle that read
+    // the way the select loop does before judging the gates.
+    settle_direct_post_repair_work(&mut pipeline).await;
 
     // The **reason**, not merely "something demoted". A bare `Demoted` passes for
     // a set that never got as far as the re-read — a refused row, a rebuild
@@ -564,6 +570,9 @@ async fn a_restart_re_derives_its_destinations_in_the_same_staging_root() {
         )
         .await;
     }
+    // The restored coverage is re-read off the pipeline task; settle that read
+    // the way the select loop does before judging the gates.
+    settle_direct_post_repair_work(&mut pipeline).await;
     drain_rar_refreshes(&mut pipeline).await;
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
@@ -1441,6 +1450,9 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
          run and must not claim decode strength"
     );
     rar_pipeline.finalize_ready_direct_sets(rar_only_job).await;
+    // The re-read that pass starts runs off the pipeline task; the gates
+    // re-arm when its ticket is handled.
+    settle_direct_post_repair_work(&mut rar_pipeline).await;
     assert!(
         rar_pipeline.direct_rar_contributes_strong_decode(rar_only_job),
         "non-vacuity: the same restored set in an all-RAR job does earn the contribution \
@@ -2737,6 +2749,7 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
                 job_id,
                 work_id: work_id.wrapping_add(1),
                 recovery_set_id,
+                post_repair: true,
                 result: Err("stale verdict".to_string()),
             });
             assert!(

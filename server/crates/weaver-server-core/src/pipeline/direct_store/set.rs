@@ -1049,6 +1049,57 @@ impl DirectSet {
         Some(barrier.barrier(trigger, now, drain, sync, persist))
     }
 
+    /// The first half of [`Self::run_barrier`]: the same guards and the same
+    /// leveling, then a [`super::barrier::PreparedBarrier`] whose sync the
+    /// caller runs wherever it likes before [`Self::commit_barrier`].
+    pub(crate) fn prepare_barrier<D>(
+        &mut self,
+        trigger: BarrierTrigger,
+        now: Instant,
+        drain: &mut D,
+    ) -> Option<Result<super::barrier::PreparedBarrier, BarrierError>>
+    where
+        D: super::barrier::BarrierDrain + ?Sized,
+    {
+        if self.router.repair_batch_in_progress() || self.is_finalized() {
+            return None;
+        }
+        if self.barrier.is_some() {
+            self.ensure_registered();
+        }
+        let crypt = self.router.member_crypt_snapshots();
+        let barrier = self.barrier.as_mut()?;
+        barrier.set_member_crypt(crypt);
+        Some(barrier.prepare(trigger, now, drain))
+    }
+
+    /// The second half of [`Self::run_barrier`] for a prepared barrier.
+    ///
+    /// `None` means the barrier was abandoned rather than run: the set was
+    /// demoted, finalized, or entered a repair while the sync ran, so the
+    /// prepared snapshot no longer describes bytes the row may claim. The
+    /// interval it captured goes back to the controller for the next barrier.
+    pub(crate) fn commit_barrier<S, P>(
+        &mut self,
+        prepared: super::barrier::PreparedBarrier,
+        now: Instant,
+        sync: &mut S,
+        persist: &mut P,
+    ) -> Option<Result<BarrierReport, BarrierError>>
+    where
+        S: super::barrier::DestinationSync + ?Sized,
+        P: CoveragePersist + ?Sized,
+    {
+        let stale =
+            self.router.repair_batch_in_progress() || self.is_finalized() || self.is_demoted();
+        let barrier = self.barrier.as_mut()?;
+        if stale {
+            barrier.abandon(prepared);
+            return None;
+        }
+        Some(barrier.commit(prepared, now, sync, persist))
+    }
+
     /// Deletes the set's checkpoint row and keeps everything else (repair while
     /// still direct), so the coverage the hybrid provider reads survives a
     /// repair that only rewrote bytes in place.

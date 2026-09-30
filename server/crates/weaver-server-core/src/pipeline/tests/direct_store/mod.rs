@@ -895,6 +895,9 @@ async fn run_par2_direct_gate_with_password(
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
+    // The verification reads the set back on a detached ticket; settle that
+    // round so the verdict, and the finalization it clears, have landed.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
 
     // Snapshotted here, not at the end: the exhausted download pass runs the
     // verification, and a job that then completes has its direct-store runtime
@@ -2409,6 +2412,9 @@ async fn direct_job_after_verification(
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
+    // The verification's read-back is a detached ticket; settle it so the
+    // verdict, and the finalization it clears, have landed.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
     (pipeline, working_dir)
 }
 
@@ -3339,6 +3345,9 @@ async fn live_damaged_direct_job(
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
+    // The verdict that starts the repair comes back on a detached read
+    // ticket; the repair itself runs on the completion check it re-arms.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
     (pipeline, working_dir)
 }
 
