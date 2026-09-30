@@ -553,6 +553,9 @@ pub enum HealthDeferralKind {
     Par2Recovery,
     /// A probe round is still running and may yet revise the estimate.
     ProbeConfirmation,
+    /// The first-article sample still has articles outstanding and can still
+    /// rule the post dead, which is the diagnosis the failure should carry.
+    FirstArticleSample,
 }
 
 impl HealthDeferralKind {
@@ -560,6 +563,7 @@ impl HealthDeferralKind {
         match self {
             Self::Par2Recovery => "par2_recovery",
             Self::ProbeConfirmation => "probe_confirmation",
+            Self::FirstArticleSample => "first_article_sample",
         }
     }
 }

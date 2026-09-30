@@ -728,6 +728,9 @@ impl Pipeline {
                 self.schedule_job_completion_check(job_id);
                 return;
             }
+            if self.defer_health_abort_to_first_article_sample(job_id, health, critical) {
+                return;
+            }
             self.clear_health_deferral(job_id);
             warn!(
                 job_id = job_id.0,
@@ -780,18 +783,94 @@ impl Pipeline {
         if health > critical {
             // Health is back above the line: nothing is being held back now.
             self.clear_health_deferral(job_id);
-        } else {
-            warn!(
+            return;
+        }
+        if self.defer_health_abort_to_first_article_sample(job_id, health, critical) {
+            return;
+        }
+        self.clear_health_deferral(job_id);
+        warn!(
+            job_id = job_id.0,
+            health_pct = health as f64 / 10.0,
+            critical_pct = critical as f64 / 10.0,
+            failed_bytes,
+            total_bytes = total,
+            "aborting job: health below critical threshold"
+        );
+        let error = self.health_abort_error(job_id, health, critical);
+        self.fail_job(job_id, error);
+    }
+
+    /// Holds a health abort while the first-article sample can still rule the
+    /// post dead, so that the failure carries that diagnosis rather than a
+    /// byte count. Returns whether the abort was held.
+    ///
+    /// The hold is bounded: the sample is one article per payload file, those
+    /// articles lead the queue, and each one settles by delivery or by every
+    /// server answering for it, on which [`Self::note_first_article_settled`]
+    /// reads the sample again and re-runs the health arithmetic when it can
+    /// no longer reach its share. Health is not consulted a second time on a
+    /// path the sample cannot change: once the share is out of reach, or the
+    /// sample is complete, the health error stands as before.
+    fn defer_health_abort_to_first_article_sample(
+        &mut self,
+        job_id: JobId,
+        health: u32,
+        critical: u32,
+    ) -> bool {
+        if !self.first_article_sample_can_still_decide(job_id) {
+            return false;
+        }
+        let entered = self.note_health_deferral(job_id, HealthDeferralKind::FirstArticleSample);
+        if entered {
+            info!(
                 job_id = job_id.0,
                 health_pct = health as f64 / 10.0,
                 critical_pct = critical as f64 / 10.0,
-                failed_bytes,
-                total_bytes = total,
-                "aborting job: health below critical threshold"
+                "deferring health failure until the first-article sample settles"
             );
-            let error = self.health_abort_error(job_id, health, critical);
-            self.fail_job(job_id, error);
+        } else {
+            debug!(
+                job_id = job_id.0,
+                health_pct = health as f64 / 10.0,
+                critical_pct = critical as f64 / 10.0,
+                "deferring health failure until the first-article sample settles"
+            );
         }
+        true
+    }
+
+    /// Whether the first-article sample is short of its verdict only because
+    /// articles are still outstanding: large enough to be read, not yet at
+    /// the failure share, and able to reach it if every outstanding article
+    /// comes back missing. A sample that has already ruled is read by
+    /// [`Self::evaluate_first_article_gate`] and never reaches here.
+    fn first_article_sample_can_still_decide(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let total = state.download_queue.first_articles().count();
+        if total < Self::FIRST_ARTICLE_GATE_MIN_FILES {
+            return false;
+        }
+        let mut missing = 0usize;
+        let mut outstanding = 0usize;
+        for segment_id in state.download_queue.first_articles() {
+            if state
+                .assembly
+                .file(segment_id.file_id)
+                .is_some_and(|file| file.has_segment(segment_id.segment_number))
+            {
+                continue;
+            }
+            match self.segment_terminal_states.get(&segment_id) {
+                Some(SegmentTerminalState::Missing) => missing += 1,
+                Some(_) => {}
+                None => outstanding += 1,
+            }
+        }
+        let share = total * Self::FIRST_ARTICLE_GATE_MISSING_PCT;
+        outstanding > 0 && missing * 100 < share && (missing + outstanding) * 100 >= share
     }
 
     /// The terminal error for a job the health arithmetic is failing.
@@ -1088,6 +1167,17 @@ impl Pipeline {
             return;
         }
         self.evaluate_first_article_gate(job_id);
+        // A health abort held for this sample is owed an answer the moment
+        // the sample can no longer give one: the settled article may have
+        // been delivered, or ruled something other than missing, and put the
+        // share out of reach without any further damage to re-run the
+        // arithmetic.
+        let held_for_sample = self.jobs.get(&job_id).is_some_and(|state| {
+            state.health_deferral.kind == Some(HealthDeferralKind::FirstArticleSample)
+        });
+        if held_for_sample && !self.first_article_sample_can_still_decide(job_id) {
+            self.check_health(job_id);
+        }
     }
 
     /// Reads the first-article sample as soon as it can answer.
