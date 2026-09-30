@@ -136,6 +136,11 @@ impl Pipeline {
                 warn!(path = %dir.display(), error = %error, "download folder unavailable");
             }
         }
+        let storage_capacity = Arc::new(crate::operations::StorageCapacity::start(
+            data_dir.clone(),
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+        ));
         let uu_spool_root = intermediate_dir.join(".uu-park");
         let cleanup_root = uu_spool_root.clone();
         if let Err(error) =
@@ -167,6 +172,7 @@ impl Pipeline {
         let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
         let (direct_barrier_done_tx, direct_barrier_done_rx) = mpsc::channel(32);
+        let (direct_placement_done_tx, direct_placement_done_rx) = mpsc::channel(64);
         let (direct_rearm_done_tx, direct_rearm_done_rx) = mpsc::channel(32);
         let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
         let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
@@ -251,10 +257,9 @@ impl Pipeline {
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
-            uu_spool_capacity: crate::operations::CapacitySampler::new(
-                intermediate_dir.clone(),
-                Pipeline::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL,
-            ),
+            uu_spool_capacity: storage_capacity
+                .reader(crate::operations::StorageRoot::Intermediate),
+            uu_spool_debits: crate::operations::CapacityDebits::default(),
             uu_spool_blocked_spill_bytes: None,
             intermediate_dir,
             complete_dir,
@@ -406,6 +411,7 @@ impl Pipeline {
             uu_parked_segments: 0,
             write_buffers: HashMap::new(),
             file_prefix_16k: HashMap::new(),
+            file_proven_par2_fingerprint: HashMap::new(),
             file_declared_size: HashMap::new(),
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
@@ -418,9 +424,12 @@ impl Pipeline {
             #[cfg(test)]
             par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
-            direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
-                direct_store_settings,
-            ),
+            direct_store:
+                crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_working_capacity(
+                    direct_store_settings,
+                    storage_capacity.reader(crate::operations::StorageRoot::Intermediate),
+                ),
+            storage_capacity,
             direct_unpack:
                 crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime::with_settings(
                     direct_unpack_settings,
@@ -462,6 +471,14 @@ impl Pipeline {
             next_direct_barrier_flight_id: 0,
             direct_barrier_done_tx,
             direct_barrier_done_rx,
+            direct_placement_lanes: HashMap::new(),
+            next_direct_placement_flight_id: 0,
+            direct_placement_done_tx,
+            direct_placement_done_rx,
+            #[cfg(test)]
+            direct_placement_hold: None,
+            #[cfg(test)]
+            direct_placement_panics: false,
             direct_rearm_in_flight: HashSet::new(),
             direct_rearm_done_tx,
             direct_rearm_done_rx,
@@ -588,6 +605,13 @@ impl Pipeline {
 
     pub fn nntp_pool(&self) -> Arc<weaver_nntp::pool::NntpPool> {
         self.nntp.pool().clone()
+    }
+
+    /// The background free-space samplers for the data, intermediate and
+    /// complete roots, for readers outside the pipeline (metrics, the NZBGet
+    /// status). Reading them never touches the filesystem.
+    pub fn storage_capacity(&self) -> Arc<crate::operations::StorageCapacity> {
+        Arc::clone(&self.storage_capacity)
     }
 
     /// Point the per-server metric counters at the servers of `nntp`.
@@ -784,6 +808,7 @@ impl Pipeline {
         // barrier poll keeps demanding checkpoints for a working directory that
         // is being deleted.
         self.direct_store.clear_job(job_id);
+        self.drop_direct_placements_for_job(job_id);
         self.forget_direct_tolerated_work(job_id);
         self.forget_par2_analysis_work(job_id);
         self.forget_direct_demotion_work(job_id);
@@ -1059,6 +1084,9 @@ impl Pipeline {
                     }
                     Some(done) = self.direct_barrier_done_rx.recv() => {
                         self.handle_direct_barrier_done(done).await;
+                    }
+                    Some(done) = self.direct_placement_done_rx.recv() => {
+                        self.handle_direct_placement_done(done).await;
                     }
                     Some(done) = self.direct_rearm_done_rx.recv() => {
                         self.handle_direct_rearm_done(done).await;
@@ -1527,6 +1555,11 @@ impl Pipeline {
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.drain_inflight_download_and_decode_work().await;
+        // The articles the drain routed are still writing, off this task; the
+        // select loop that would have committed them is gone, so they are
+        // joined here — and any a failed write handed back rejoin the
+        // conventional backlog the flush below writes out.
+        self.settle_all_direct_placements().await;
         self.flush_quiescent_write_backlog().await;
 
         if self.active_downloads > 0
@@ -2063,6 +2096,10 @@ pub(crate) fn remove_file_after_cached_write_handle(path: &std::path::Path) {
 /// deletion, and a stale cached handle would silently swallow a later job's
 /// writes into the old unlinked inode.
 pub(crate) async fn close_cached_write_handles_under(dir: &std::path::Path) {
+    // A direct-store placement writing under `dir` right now would open its
+    // destination again after the close, through a handle nothing then
+    // closes — and into a file the caller is about to move or delete.
+    wait_for_direct_placements_under(dir).await;
     let Some(pool) = DISK_WRITE_OWNER_POOL.get() else {
         return;
     };
@@ -2608,6 +2645,70 @@ fn write_raw_batch_blocking(
 /// directly with a vectored write.
 pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<bytes::Bytes>)>)>;
 
+/// The destinations each direct-store placement task is writing right now,
+/// keyed by a process-wide ticket number. A handle close waits on the ones
+/// under its root; see [`close_cached_write_handles_under`].
+///
+/// Process-wide rather than the pipeline's, because the closes that need it
+/// run on tasks of their own after the pipeline has let the job go.
+static DIRECT_PLACEMENTS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<PlacementsInFlight>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Ticket number to the destinations a placement task claims and the watcher
+/// its ticket releases.
+type PlacementsInFlight =
+    HashMap<u64, (Vec<std::path::PathBuf>, tokio::sync::watch::Receiver<()>)>;
+
+static NEXT_DIRECT_PLACEMENT_TICKET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A placement task's claim on its destinations. Dropped when the task's
+/// writes have all returned, which is what releases a close waiting on it.
+pub(crate) struct DirectPlacementTicket {
+    id: u64,
+    _released: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for DirectPlacementTicket {
+    fn drop(&mut self) {
+        if let Ok(mut flights) = DIRECT_PLACEMENTS_IN_FLIGHT.lock() {
+            flights.remove(&self.id);
+        }
+    }
+}
+
+/// Claims `paths` for a placement task about to write them. Taken on the
+/// pipeline task, before the writer is spawned, so a close the pipeline asks
+/// for afterwards always sees it.
+pub(crate) fn register_direct_placement(paths: Vec<std::path::PathBuf>) -> DirectPlacementTicket {
+    let id = NEXT_DIRECT_PLACEMENT_TICKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (released, watcher) = tokio::sync::watch::channel(());
+    if let Ok(mut flights) = DIRECT_PLACEMENTS_IN_FLIGHT.lock() {
+        flights.insert(id, (paths, watcher));
+    }
+    DirectPlacementTicket {
+        id,
+        _released: released,
+    }
+}
+
+/// Waits until no placement task is writing a destination under `dir`.
+pub(crate) async fn wait_for_direct_placements_under(dir: &std::path::Path) {
+    let mut watchers: Vec<tokio::sync::watch::Receiver<()>> =
+        match DIRECT_PLACEMENTS_IN_FLIGHT.lock() {
+            Ok(flights) => flights
+                .values()
+                .filter(|(paths, _)| paths.iter().any(|path| path.starts_with(dir)))
+                .map(|(_, watcher)| watcher.clone())
+                .collect(),
+            Err(_) => return,
+        };
+    for watcher in &mut watchers {
+        // Nothing is ever sent; the channel closes when the ticket drops.
+        while watcher.changed().await.is_ok() {}
+    }
+}
+
 /// Writes one routed article's fragments to **every** destination it touches,
 /// fanning the per-path sub-batches out to their owner threads and joining them
 /// all.
@@ -2751,31 +2852,6 @@ fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
         + metrics.large_total * BufferTier::Large.size_bytes()
 }
 
-pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    match crate::operations::probe_nearest_disk_space(output_dir) {
-        Ok(space) => {
-            let available = space.available_bytes;
-            if available < needed_bytes {
-                let avail_mb = available / (1024 * 1024);
-                let need_mb = needed_bytes / (1024 * 1024);
-                warn!(
-                    available_mb = avail_mb,
-                    needed_mb = need_mb,
-                    "output directory may not have enough free disk space"
-                );
-            } else {
-                let avail_mb = available / (1024 * 1024);
-                debug!(available_mb = avail_mb, "disk space check passed");
-            }
-        }
-        Err(error) => debug!(
-            path = %output_dir.display(),
-            error = %error,
-            "could not check free disk space"
-        ),
-    }
-}
-
 pub(crate) fn timestamp_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2791,6 +2867,24 @@ pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
 mod disk_write_handle_cache_tests {
     use super::*;
     use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+
+    #[test]
+    fn a_handle_close_waits_for_a_direct_placement_writing_under_its_root() {
+        use std::future::Future;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("job");
+        let other = temp_dir.path().join("other-job");
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        let ticket = register_direct_placement(vec![root.join("feature.mkv.direct.partial")]);
+        let mut under = std::pin::pin!(wait_for_direct_placements_under(&root));
+        assert!(under.as_mut().poll(&mut cx).is_pending());
+        let mut elsewhere = std::pin::pin!(wait_for_direct_placements_under(&other));
+        assert!(elsewhere.as_mut().poll(&mut cx).is_ready());
+
+        drop(ticket);
+        assert!(under.as_mut().poll(&mut cx).is_ready());
+    }
 
     /// Accepts a fixed number of bytes per call, whatever it was offered, so a
     /// write lands in the middle of an `IoSlice` and the next call has to
@@ -3163,6 +3257,55 @@ mod disk_write_handle_cache_tests {
         assert!(cache.entries.is_empty());
         assert!(!cached.exists());
         assert!(!uncached.exists());
+    }
+
+    /// What the final move relies on: a removal queued before it closes a
+    /// root's handles is **done** by the time that close returns, on every
+    /// owner and on the closer, so the walk that follows never meets the file.
+    ///
+    /// Through the real pool: the files are written by it, so each handle is
+    /// cached on whichever owner its path hashes to, and enough of them that
+    /// the removals land on more than one owner.
+    #[tokio::test]
+    async fn a_removal_queued_before_a_root_close_is_done_when_the_close_returns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("job");
+        std::fs::create_dir_all(&root).unwrap();
+        let paths: Vec<std::path::PathBuf> = (0..DISK_WRITE_OWNER_THREADS * 4)
+            .map(|index| root.join(format!("set.f0.vol{index:05}.envelope")))
+            .collect();
+        write_direct_batches(
+            paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        vec![(0, vec![bytes::Bytes::from_static(b"volume bytes")])],
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "non-vacuity: every file must exist before its removal"
+        );
+
+        for path in &paths {
+            remove_file_after_cached_write_handle(path);
+        }
+        close_cached_write_handles_under(&root).await;
+
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "a removal queued before the close must be complete when it returns, found {left:?}"
+        );
     }
 
     #[test]

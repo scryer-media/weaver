@@ -11,7 +11,7 @@ use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::jobs::working_dir::{compute_working_dir, stamp_working_dir};
-use crate::pipeline::{Pipeline, check_disk_space};
+use crate::pipeline::Pipeline;
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
 #[derive(Debug, Default)]
@@ -794,8 +794,6 @@ impl Pipeline {
             stage = "active_job_persisted",
             "pipeline add_job stage"
         );
-
-        check_disk_space(&self.intermediate_dir, spec.total_bytes);
 
         let queue_depth = download_queue.len() + recovery_queue.len();
 
@@ -2082,6 +2080,7 @@ impl Pipeline {
         let direct_swept = direct_restore.swept;
         let direct_installed = direct_restore.installed;
         self.direct_store.install_restored(job_id, direct_sets);
+        self.reinstate_restored_identity_sets(job_id);
         self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
@@ -2117,6 +2116,9 @@ impl Pipeline {
             }
         }
         self.reload_metadata_from_disk(job_id).await;
+        // After the reload, which is where a restored described set's roster
+        // re-arms from its recovery set.
+        self.settle_restored_identity_rosters(job_id).await;
         let mut archive_refresh_file_indices = refreshed_rar_files;
         archive_refresh_file_indices.extend(repair_output_indices);
         archive_refresh_file_indices.extend(

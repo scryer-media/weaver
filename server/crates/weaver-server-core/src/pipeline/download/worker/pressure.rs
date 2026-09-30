@@ -86,11 +86,6 @@ impl DownloadPressure {
 }
 
 impl Pipeline {
-    /// The cache avoids turning every dispatch decision into a filesystem
-    /// query while still making low-space admission responsive.
-    pub(in crate::pipeline) const UU_SPOOL_DISK_SPACE_CHECK_INTERVAL: Duration =
-        Duration::from_secs(1);
-
     /// Whether ahead-of-cursor UU parking is at one of its aggregate limits.
     ///
     /// This is the predicate the memory park consults, so it
@@ -154,7 +149,7 @@ impl Pipeline {
         let admitted =
             available.is_some() && !self.uu_spool_limits_reached(spilled_bytes, available);
         if admitted {
-            self.uu_spool_capacity.debit(spilled_bytes as u64);
+            self.uu_spool_debits.debit(spilled_bytes as u64);
         } else {
             self.uu_spool_blocked_spill_bytes = Some(
                 self.uu_spool_blocked_spill_bytes
@@ -165,7 +160,9 @@ impl Pipeline {
         admitted
     }
 
-    fn uu_spool_capacity(&mut self) -> crate::operations::Capacity {
+    /// The spool filesystem's reading less the spills admitted against it.
+    /// Reads the sampler's cache; never touches the filesystem.
+    pub(in crate::pipeline) fn uu_spool_capacity(&mut self) -> crate::operations::Capacity {
         #[cfg(test)]
         if let Some(available) = self.uu_spool_available_bytes_for_test {
             use crate::operations::{Capacity, CapacityReading};
@@ -180,7 +177,7 @@ impl Pipeline {
             };
         }
 
-        self.uu_spool_capacity.sample()
+        self.uu_spool_debits.apply(self.uu_spool_capacity.current())
     }
 
     pub(in crate::pipeline::download::worker) fn uu_spool_cursor_ordinals(

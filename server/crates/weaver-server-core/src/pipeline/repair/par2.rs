@@ -1470,15 +1470,25 @@ impl Pipeline {
     /// would be a guess. The file is then unbound, which costs it in-stream
     /// verification and nothing else: it is read at completion like every file
     /// was before the grid existed.
+    ///
+    /// A file with no captured prefix but a fingerprint an identity roster
+    /// already proved (see
+    /// [`crate::pipeline::Pipeline::file_proven_par2_fingerprint`]) is matched
+    /// on that fingerprint and its proven length, under the same uniqueness
+    /// rule.
     fn content_bound_par2_file_id(
         &self,
         file_id: NzbFileId,
         set: &Par2FileSet,
     ) -> Option<par2_rs::FileId> {
-        let prefix = self.file_prefix_16k.get(&file_id)?;
-        if prefix.is_empty() {
-            return None;
-        }
+        let prefix = self
+            .file_prefix_16k
+            .get(&file_id)
+            .filter(|prefix| !prefix.is_empty());
+        let proven = match prefix {
+            Some(_) => None,
+            None => Some(*self.file_proven_par2_fingerprint.get(&file_id)?),
+        };
         let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
@@ -1489,10 +1499,14 @@ impl Pipeline {
             .files
             .iter()
             .filter(|(_, desc)| {
-                let length_contradicts = if file.is_complete() {
-                    file.received_bytes() != desc.length
-                } else {
-                    file.received_bytes() > desc.length
+                // A proven fingerprint carries the length it was proven at.
+                // The file's own count cannot stand in for it: articles a
+                // restart found already delivered are recounted at their
+                // declared, encoded sizes.
+                let length_contradicts = match proven {
+                    Some((_, proven_length)) => proven_length != desc.length,
+                    None if file.is_complete() => file.received_bytes() != desc.length,
+                    None => file.received_bytes() > desc.length,
                 };
                 if length_contradicts
                     || crate::pipeline::is_split_fragment_of(&current_filename, &desc.filename)
@@ -1506,9 +1520,15 @@ impl Pipeline {
                 // A zero-length description has no content to be identified by.
                 // A window the capture does not reach cannot be tested without
                 // inventing the bytes it is missing.
-                window > 0
-                    && prefix.len() >= window
-                    && par2_rs::checksum::md5(&prefix[..window]) == desc.hash_16k
+                match (prefix, proven) {
+                    (Some(prefix), _) => {
+                        window > 0
+                            && prefix.len() >= window
+                            && par2_rs::checksum::md5(&prefix[..window]) == desc.hash_16k
+                    }
+                    (None, Some((proven_hash, _))) => window > 0 && proven_hash == desc.hash_16k,
+                    (None, None) => false,
+                }
             })
             .map(|(par2_file_id, _)| *par2_file_id)
             .collect::<Vec<_>>();

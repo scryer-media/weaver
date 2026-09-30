@@ -144,6 +144,25 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
     let working_dir =
         direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
 
+    // Restarted twice. The set's source volumes never exist as files, so the
+    // cached facts are the only thing its layout rebuilds from: a restore that
+    // discarded them as stale would leave the second restart nothing to rebuild
+    // with, and the checkpoint would be refused as naming an unknown set.
+    let pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    let retained_facts = pipeline.db.load_all_rar_volume_facts(job_id).unwrap();
+    assert!(
+        retained_facts.values().any(|rows| !rows.is_empty()),
+        "conventional restore must retain facts owned by the accepted direct checkpoint"
+    );
+    drop(pipeline);
     let mut pipeline = direct_store_after_restart(
         &temp_dir,
         DirectStoreGate::Enabled,
@@ -153,14 +172,10 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         &working_dir,
     )
     .await;
-    assert!(
-        pipeline
-            .db
-            .load_all_rar_volume_facts(job_id)
-            .unwrap()
-            .values()
-            .all(|rows| rows.is_empty()),
-        "without a pending PAR3 verdict, base discovery must discard facts for absent source files"
+    assert_eq!(
+        pipeline.db.load_all_rar_volume_facts(job_id).unwrap(),
+        retained_facts,
+        "a second restart must preserve the direct layout's cached facts"
     );
 
     // The set came back from its checkpoint rather than from zero.
@@ -1103,6 +1118,609 @@ async fn restart_sweeps_stale_holds_scratch() {
             kept.display()
         );
     }
+}
+
+/// A set admitted by identity is never rediscovered from the spec, so its
+/// checkpoint is refused at restore and the set redownloads — and its scratch
+/// has to go before it does.
+///
+/// Nothing in this spec classifies as a RAR volume and no plan names the set,
+/// which is exactly how a refused identity set's partial and envelopes used to
+/// survive the restore and be published beside the finished member: the sweep
+/// either never ran or had no name for them.
+/// A set admitted by identity rebuilds its plan from the binding its checkpoint
+/// carries, and only while that binding still holds against the spec. Here a
+/// bound file's name now classifies it, which no identity rung would have bound:
+/// the row is refused exactly as an unknown set's, and the set's scratch is
+/// swept before it redownloads.
+#[tokio::test]
+async fn an_identity_binding_whose_file_now_classifies_is_refused_and_swept() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E41.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 173) as u8).collect();
+    let volumes = obfuscate_volumes(&single_member_store_set(member_name, &payload, 3));
+    assert!(
+        volumes.iter().all(|(filename, _)| !matches!(
+            FileRole::from_filename(filename),
+            FileRole::RarVolume { .. }
+        )),
+        "non-vacuity: no file may classify as a RAR volume"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41790);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    let envelopes: Vec<PathBuf> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".envelope"))
+        })
+        .collect();
+    let payload_dir = payload_root(&temp_dir, job_id);
+    assert!(
+        !envelopes.is_empty() && any_direct_partial(&payload_dir),
+        "non-vacuity: the identity set must have routed into envelopes and a partial"
+    );
+    {
+        let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        assert!(
+            !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+            "non-vacuity: the identity set must have checkpointed"
+        );
+    }
+    // An `.envelope` at the top level whose name rebuilds from no set the job's
+    // rows name is not direct-store's, and the sweep must leave it alone.
+    let unrelated = working_dir.join("chapter.f0.vol00000.envelope");
+    std::fs::write(&unrelated, b"not an envelope of this job").unwrap();
+
+    // File 1 is bound; its name now says it is a zip archive.
+    let mut renamed = volumes.clone();
+    renamed[1].0 = "silver.horizon.extras.zip".to_string();
+    assert!(matches!(
+        FileRole::from_filename(&renamed[1].0),
+        FileRole::ZipArchive
+    ));
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &renamed,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    assert!(
+        pipeline.direct_store.sets_for(job_id).is_empty(),
+        "a refused identity binding brings no set back"
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert_eq!(
+        queued.len(),
+        volumes.len() * ARTICLES,
+        "a refused identity set redownloads whole, got {queued:?}"
+    );
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "the refused row is deleted"
+    );
+    // Its cached facts go with it: they are how the sweep names the set, and a
+    // refused set's rows outliving it would have every later restore walk for
+    // a set nothing will ever route into again.
+    assert!(
+        pipeline
+            .db
+            .load_all_rar_volume_facts(job_id)
+            .unwrap()
+            .values()
+            .all(|rows| rows.is_empty()),
+        "a refused set's cached facts are deleted with its row"
+    );
+    for envelope in &envelopes {
+        assert!(
+            !envelope.exists(),
+            "{} belongs to a refused set and must be swept before it redownloads",
+            envelope.display()
+        );
+    }
+    assert!(
+        !any_direct_partial(&payload_dir),
+        "the refused set's partial must be swept from the staging root"
+    );
+    assert!(
+        unrelated.exists(),
+        "the sweep must only touch the job's own sets"
+    );
+}
+
+/// Feeds exactly what a restored identity job asks for and returns the member
+/// it produced, where it landed, and the job's status.
+#[allow(clippy::too_many_arguments)]
+async fn finish_restored_identity_job(
+    pipeline: &mut Pipeline,
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    articles: usize,
+    working_dir: &Path,
+    member_name: &str,
+    expected_volumes: usize,
+) -> (Option<Vec<u8>>, Option<&'static str>, Option<JobStatus>) {
+    let queued = peek_queued_segments(pipeline, job_id);
+    for (file_index, segment_number) in queued {
+        dispatch_and_submit(
+            pipeline,
+            job_id,
+            volumes,
+            file_index,
+            segment_number,
+            articles,
+        )
+        .await;
+    }
+    settle_direct_post_repair_work(pipeline).await;
+    // Every file that arrived after the restart joined the restored set; no
+    // rung admitted a second set out of them.
+    let sets = pipeline.direct_store.sets_for(job_id);
+    assert_eq!(sets.len(), 1, "no second set may be admitted");
+    assert_eq!(
+        sets[0].plan().volumes.len(),
+        expected_volumes,
+        "the files that arrived after the restart bound to the restored set"
+    );
+    drain_rar_refreshes(pipeline).await;
+    drive_extractions_to_terminal(pipeline, job_id, 64).await;
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists()),
+        "a restored identity set must never materialize a source volume"
+    );
+    let (member, location) =
+        member_after_gate(&temp_dir.path().join("complete"), working_dir, member_name);
+    (member, location, job_status_for_assert(pipeline, job_id))
+}
+
+/// The restored set is the one the checkpoint named, admitted by the same
+/// evidence, and alone: no rung admitted a second set out of its files.
+fn assert_one_restored_identity_set(
+    pipeline: &Pipeline,
+    job_id: JobId,
+    set_name: &str,
+    kind: crate::pipeline::direct_store::plan::IdentityKind,
+) {
+    let sets = pipeline.direct_store.sets_for(job_id);
+    assert_eq!(sets.len(), 1, "exactly the checkpointed set comes back");
+    let set = &sets[0];
+    assert_eq!(set.set_name(), set_name);
+    assert_eq!(
+        set.plan().identity.map(|identity| identity.kind),
+        Some(kind)
+    );
+    assert!(
+        set.has_restart_seeded_coverage(),
+        "the set came back from its checkpoint rather than from zero"
+    );
+}
+
+/// The headline restart differential, for a set admitted from its volumes' own
+/// RAR5 headers rather than from its file names.
+///
+/// Nothing in the spec names the set, so before the checkpoint carried its
+/// binding the restart refused the row as an unknown set and refetched every
+/// volume. Now the floors are honoured, the volume that had not arrived binds
+/// to the restored set through the header rung, and the member is
+/// byte-identical to an uninterrupted run's.
+#[tokio::test]
+async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_identically() {
+    const ARTICLES: usize = 4;
+    let member_name = "Silver.Horizon.S01E43.mkv";
+    let payload: Vec<u8> = (0..240_000u32).map(|index| (index % 239) as u8).collect();
+    let volumes = obfuscate_volumes(&single_member_store_set(member_name, &payload, 3));
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| matches!(FileRole::from_filename(filename), FileRole::Unknown)),
+        "non-vacuity: no file may classify"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41800);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+    {
+        let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        let snapshot = coverage_snapshot_of(&pipeline, job_id);
+        assert_eq!(
+            rows.keys().cloned().collect::<Vec<_>>(),
+            vec!["obfuscated-set.f0".to_string()]
+        );
+        assert_eq!(
+            snapshot
+                .identity
+                .map(|identity| (identity.kind, identity.volumes)),
+            Some((
+                crate::pipeline::direct_store::plan::IdentityKind::HeaderVolumeSet,
+                vec![(0, 0), (1, 1)]
+            )),
+            "the checkpoint must carry the plan the header rung admitted"
+        );
+    }
+
+    // Twice, as the headline differential does: the second restore rebuilds
+    // from what the first one left.
+    let pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    assert_one_restored_identity_set(
+        &pipeline,
+        job_id,
+        "obfuscated-set.f0",
+        crate::pipeline::direct_store::plan::IdentityKind::HeaderVolumeSet,
+    );
+    drop(pipeline);
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    assert_one_restored_identity_set(
+        &pipeline,
+        job_id,
+        "obfuscated-set.f0",
+        crate::pipeline::direct_store::plan::IdentityKind::HeaderVolumeSet,
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.iter().any(|(file_index, _)| *file_index == 0),
+        "volume 0 was complete at the barrier; none of its articles may be refetched, got {queued:?}"
+    );
+    assert!(
+        !queued.contains(&(1, 0)),
+        "volume 1's checkpointed articles must not be refetched, got {queued:?}"
+    );
+    assert!(
+        (0..ARTICLES as u32).all(|segment| queued.contains(&(2, segment))),
+        "volume 2 never arrived at all and must be fetched whole, got {queued:?}"
+    );
+
+    let (member, location, status) = finish_restored_identity_job(
+        &mut pipeline,
+        &temp_dir,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+        member_name,
+        volumes.len(),
+    )
+    .await;
+    drop(pipeline);
+
+    let uninterrupted = run_direct_store_gate(
+        DirectStoreGate::Enabled,
+        JobId(41801),
+        member_name,
+        &volumes,
+        &in_order_arrivals(volumes.len()),
+    )
+    .await;
+    assert_eq!(member.as_deref(), Some(payload.as_slice()));
+    assert_eq!(
+        (member.as_deref(), location, &status),
+        (
+            uninterrupted.member.as_deref(),
+            uninterrupted.member_location,
+            &uninterrupted.status
+        ),
+        "a restarted identity job must finish exactly as an uninterrupted one"
+    );
+}
+
+/// One RAR5 archive that is not a volume, under a name that says nothing.
+fn obfuscated_standalone_archive(member_name: &str, payload: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TEST_RAR5_SIG);
+    bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+    bytes.extend_from_slice(&build_test_rar_file_header(
+        member_name,
+        0,
+        payload.len() as u64,
+        payload.len() as u64,
+        Some(checksum::crc32(payload)),
+    ));
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&build_test_rar_end_header(false));
+    vec![(format!("{:032x}", 0xd1c7_5000_u128), bytes)]
+}
+
+/// The same differential for a standalone archive: a set of one, closed at
+/// admission, whose restart has no later file to bind.
+#[tokio::test]
+async fn a_standalone_identity_archive_restarts_from_its_floor_and_completes_byte_identically() {
+    const ARTICLES: usize = 4;
+    let member_name = "Silver.Horizon.S01E44.mkv";
+    let payload: Vec<u8> = (0..160_000u32).map(|index| (index % 233) as u8).collect();
+    let volumes = obfuscated_standalone_archive(member_name, &payload);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41810);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+    {
+        let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let snapshot = coverage_snapshot_of(&pipeline, job_id);
+        assert_eq!(
+            snapshot
+                .identity
+                .map(|identity| (identity.kind, identity.expected_volumes)),
+            Some((
+                crate::pipeline::direct_store::plan::IdentityKind::Standalone,
+                Some(1)
+            )),
+            "non-vacuity: the header rung admitted a standalone archive"
+        );
+    }
+
+    let pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    assert_one_restored_identity_set(
+        &pipeline,
+        job_id,
+        "obfuscated-archive.f0",
+        crate::pipeline::direct_store::plan::IdentityKind::Standalone,
+    );
+    drop(pipeline);
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    assert_one_restored_identity_set(
+        &pipeline,
+        job_id,
+        "obfuscated-archive.f0",
+        crate::pipeline::direct_store::plan::IdentityKind::Standalone,
+    );
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.contains(&(0, 0)),
+        "the checkpointed article must not be refetched, got {queued:?}"
+    );
+    assert!(
+        queued.contains(&(0, 2)) && queued.contains(&(0, 3)),
+        "the articles past the floor come back, got {queued:?}"
+    );
+
+    let (member, _, status) = finish_restored_identity_job(
+        &mut pipeline,
+        &temp_dir,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+        member_name,
+        1,
+    )
+    .await;
+    assert_eq!(member.as_deref(), Some(payload.as_slice()));
+    assert!(
+        matches!(status, Some(JobStatus::Complete)),
+        "the restored standalone archive completes, got {status:?}"
+    );
+}
+
+/// Restores a job whose spec carries a PAR2 index the previous run already
+/// downloaded whole, as a real restart finds it: the index is a completed file
+/// in the working directory, and its descriptions are parsed again on restore.
+async fn restore_with_downloaded_index(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    spec: JobSpec,
+    index_file_index: u32,
+    working_dir: &Path,
+    file_identities: HashMap<u32, crate::jobs::record::ActiveFileIdentity>,
+) -> Pipeline {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: HashSet::from([NzbFileId {
+                job_id,
+                file_index: index_file_index,
+            }]),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities,
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.to_path_buf(),
+        })
+        .await
+        .unwrap();
+    pipeline
+}
+
+/// The same differential for a set admitted from the recovery set's
+/// descriptions. Its roster is not in the checkpoint — the descriptions say it
+/// again when the index is re-parsed on restore — but its bindings are, and the
+/// re-armed roster must start from them: the volume still to come binds to the
+/// restored set, and the ones bound before the restart are not matched again.
+#[tokio::test]
+async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_identically() {
+    const ARTICLES: usize = 4;
+    let member_name = "Silver.Horizon.S01E45.mkv";
+    let payload: Vec<u8> = (0..240_000u32).map(|index| (index % 229) as u8).collect();
+    let named = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&named);
+    let volumes = obfuscate_volumes(&named);
+    let (spec, index_file_index) =
+        par2_bearing_job_spec_with_articles("Silver Horizon", &volumes, &par2_bytes, ARTICLES);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41820);
+    let (working_dir, file_identities) = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+        deliver_par2_index(&mut pipeline, job_id, index_file_index, &par2_bytes).await;
+        for (file_index, segment_number) in [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)] {
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                &volumes,
+                file_index,
+                segment_number,
+                ARTICLES,
+            )
+            .await;
+        }
+        pipeline
+            .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+            .await;
+        // The names the recovery set's content binding learned for the
+        // obfuscated files, which the job persists and a restart reads back.
+        let file_identities = pipeline.jobs[&job_id].file_identities.clone();
+        (working_dir, file_identities)
+    };
+    let set_name = {
+        let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        assert_eq!(rows.len(), 1, "non-vacuity: the described set checkpointed");
+        let snapshot = coverage_snapshot_of(&pipeline, job_id);
+        assert_eq!(
+            snapshot.identity.map(|identity| (
+                identity.kind,
+                identity.volumes,
+                identity.expected_volumes
+            )),
+            Some((
+                crate::pipeline::direct_store::plan::IdentityKind::Roster,
+                vec![(0, 0), (1, 1)],
+                Some(3)
+            )),
+            "the checkpoint must carry the plan the roster admitted"
+        );
+        rows.keys().next().unwrap().clone()
+    };
+
+    let pipeline = restore_with_downloaded_index(
+        &temp_dir,
+        job_id,
+        spec.clone(),
+        index_file_index,
+        &working_dir,
+        file_identities.clone(),
+    )
+    .await;
+    assert_one_restored_identity_set(
+        &pipeline,
+        job_id,
+        &set_name,
+        crate::pipeline::direct_store::plan::IdentityKind::Roster,
+    );
+    drop(pipeline);
+    let mut pipeline = restore_with_downloaded_index(
+        &temp_dir,
+        job_id,
+        spec,
+        index_file_index,
+        &working_dir,
+        file_identities,
+    )
+    .await;
+    assert_one_restored_identity_set(
+        &pipeline,
+        job_id,
+        &set_name,
+        crate::pipeline::direct_store::plan::IdentityKind::Roster,
+    );
+    let roster_bound = pipeline
+        .direct_store
+        .identity
+        .get(&job_id)
+        .and_then(|admission| admission.rosters.get(&set_name))
+        .map(|roster| (roster.bound.clone(), roster.set_index));
+    assert_eq!(
+        roster_bound,
+        Some((HashMap::from([(0u32, 0u32), (1, 1)]), Some(0))),
+        "the re-armed roster starts from the checkpoint's bindings and names the restored set"
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.iter().any(|(file_index, _)| *file_index == 0),
+        "volume 0 was complete at the barrier; none of its articles may be refetched, got {queued:?}"
+    );
+    assert!(
+        !queued.contains(&(1, 0)),
+        "volume 1's checkpointed articles must not be refetched, got {queued:?}"
+    );
+    assert!(
+        !queued
+            .iter()
+            .any(|(file_index, _)| *file_index == index_file_index),
+        "the downloaded index is not fetched again, got {queued:?}"
+    );
+
+    let (member, _, status) = finish_restored_identity_job(
+        &mut pipeline,
+        &temp_dir,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+        member_name,
+        volumes.len(),
+    )
+    .await;
+    assert_eq!(member.as_deref(), Some(payload.as_slice()));
+    assert!(
+        matches!(status, Some(JobStatus::Complete)),
+        "the restored described set completes, got {status:?}"
+    );
 }
 
 /// A restart inside the PAR2 finalization wait — the common case now, because a

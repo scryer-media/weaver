@@ -235,6 +235,7 @@ fn nzbget_test_router(
         rss,
         watch_folder,
         scheduled_resume,
+        weaver_server_core::operations::CapacityReader::unknown(),
     );
 
     routes::build_nzbget_rpc_routes(context)

@@ -123,6 +123,7 @@ fn snapshot_round_trips_exactly() {
                 complete: false,
             },
         ],
+        identity: None,
     };
 
     let blob = encode(&snapshot).unwrap();
@@ -195,6 +196,7 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
             crypt: None,
         }],
         floors,
+        identity: None,
     };
 
     let blob = encode(&snapshot).unwrap();
@@ -204,6 +206,96 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
         blob.len()
     );
     assert_eq!(decode(&blob).unwrap(), snapshot);
+}
+
+/// The body a v6 writer produced: the v7 fields but the identity binding, in
+/// the same positional order.
+fn encode_v6(snapshot: &CoverageSnapshot) -> Vec<u8> {
+    let body = rmp_serde::to_vec(&(
+        snapshot.generation,
+        snapshot.plan_digest,
+        &snapshot.destinations,
+        &snapshot.floors,
+    ))
+    .unwrap();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&SNAPSHOT_MAGIC);
+    blob.extend_from_slice(&6u16.to_le_bytes());
+    blob.extend_from_slice(&body);
+    blob
+}
+
+fn sample_identity_snapshot() -> CoverageSnapshot {
+    CoverageSnapshot {
+        identity: Some(IdentityBinding {
+            kind: IdentityKind::HeaderVolumeSet,
+            volumes: vec![(0, 0)],
+            expected_volumes: None,
+            discriminator: 0,
+        }),
+        ..sample_snapshot()
+    }
+}
+
+#[test]
+fn a_snapshot_with_an_identity_binding_round_trips_byte_identically() {
+    let snapshot = sample_identity_snapshot();
+    let blob = encode(&snapshot).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([blob[4], blob[5]]),
+        SNAPSHOT_SCHEMA_VERSION
+    );
+    let decoded = decode(&blob).unwrap();
+    assert_eq!(decoded, snapshot);
+    assert_eq!(encode(&decoded).unwrap(), blob);
+
+    // Canonical: the binding's volumes are ordered by the encoder, so the
+    // order they were gathered in never changes the row.
+    let mut wide = snapshot.clone();
+    wide.identity.as_mut().unwrap().volumes = vec![(2, 7), (0, 0), (1, 4)];
+    let mut sorted = wide.clone();
+    sorted.identity.as_mut().unwrap().volumes = vec![(0, 0), (1, 4), (2, 7)];
+    assert_eq!(encode(&wide).unwrap(), encode(&sorted).unwrap());
+
+    // And a body that bypassed the encoder with them out of order is refused.
+    let mut forged = Vec::new();
+    forged.extend_from_slice(&SNAPSHOT_MAGIC);
+    forged.extend_from_slice(&SNAPSHOT_SCHEMA_VERSION.to_le_bytes());
+    forged.extend_from_slice(&rmp_serde::to_vec(&wide).unwrap());
+    assert!(matches!(decode(&forged), Err(SnapshotError::Malformed(_))));
+}
+
+#[tokio::test]
+async fn a_version_6_row_decodes_and_restores_with_no_identity_binding() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
+    let blob = encode_v6(&sample_snapshot());
+
+    assert_eq!(
+        decode(&blob),
+        Ok(sample_snapshot()),
+        "a v6 row is a v7 row with no identity binding"
+    );
+    let snapshot = restore_set(&roots, &blob, &sample_expected())
+        .await
+        .expect("a checkpoint written before the upgrade must still restore");
+    assert_eq!(snapshot.identity, None);
+    assert_eq!(snapshot.generation, 3);
+    assert_eq!(refetch_floors(&snapshot), HashMap::from([(0u32, 60u64)]));
+
+    // Only ever read: what the next barrier writes is the current version.
+    assert_eq!(
+        u16::from_le_bytes({
+            let rewritten = encode(&snapshot).unwrap();
+            [rewritten[4], rewritten[5]]
+        }),
+        SNAPSHOT_SCHEMA_VERSION
+    );
 }
 
 #[test]

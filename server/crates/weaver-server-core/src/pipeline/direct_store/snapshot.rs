@@ -23,10 +23,12 @@ use crate::pipeline::extraction::validate_sanitized_rar_member_path;
 /// `W`eaver `D`irect `S`tore `C`overage.
 pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 
-/// Bump on any change to the body layout below. Decoding accepts **exactly**
-/// this version — a newer writer's blob is rejected rather than partially
-/// trusted, and so is an older one — so a bump is also the way to retire rows
-/// whose *meaning* changed under a field that kept its type.
+/// Bump on any change to the body layout below. Encoding writes **only** this
+/// version. Decoding accepts this version and, where a bump only *added*
+/// something, the version before it, lifted with the addition absent — see
+/// [`SNAPSHOT_LIFTED_VERSION`]. A newer writer's blob is always rejected rather
+/// than partially trusted, and so is any older one, so a bump is also the way
+/// to retire rows whose *meaning* changed under a field that kept its type.
 ///
 /// - 2: `VolumeFloor::complete` added.
 /// - 3: `VolumeFloor::complete` narrowed from "every article arrived" to "every
@@ -79,6 +81,15 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///
 ///   Operationally it costs nothing today: the direct-store gate defaults off,
 ///   so a shipped install has no rows to refuse.
+/// - 7: `CoverageSnapshot::identity` added. A set admitted by identity rather
+///   than by its file names is not rediscovered from the spec at restart, so
+///   the checkpoint has to carry the volume-to-file mapping its plan was built
+///   on or the row cannot be judged. This is purely additive: every v6 field
+///   kept its type and meaning, and a v6 row is exactly a v7 row with no
+///   identity binding, which is what every v6 writer checkpointed (it refused
+///   identity sets at restart). So v6 is **read** and lifted rather than
+///   refused, and a set mid-flight across the upgrade resumes the way it would
+///   have without it.
 ///
 /// # The v3 refusal is a release note
 ///
@@ -88,7 +99,11 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 /// redownload per set that was mid-download across the upgrade — but it is
 /// user-visible traffic and belongs in the notes rather than in a support
 /// thread.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 7;
+
+/// The one older version [`decode`] still reads, lifted into the current shape
+/// with `identity: None`. Nothing writes it.
+pub(crate) const SNAPSHOT_LIFTED_VERSION: u16 = 6;
 
 const FRAME_HEADER_LEN: usize = 6;
 
@@ -199,6 +214,25 @@ pub(crate) struct VolumeFloor {
     pub(crate) complete: bool,
 }
 
+/// The plan an identity-admitted set's coverage was produced against.
+///
+/// A name-admitted set is rediscovered from the spec's file names at restart,
+/// so its plan needs no record. An identity-admitted one was matched by what
+/// its files *contain* — the recovery set's descriptions, or the volumes' own
+/// archive headers — and the evidence for that is gone after a restart: the
+/// bound files' first bytes were never kept. What restart needs to rebuild the
+/// exact plan is the mapping and the facts it was admitted with, and those are
+/// recorded here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IdentityBinding {
+    pub(crate) kind: super::plan::IdentityKind,
+    /// Volume index to NZB file index, sorted by volume.
+    pub(crate) volumes: Vec<(u32, u32)>,
+    pub(crate) expected_volumes: Option<u32>,
+    /// The NZB file whose index names the set.
+    pub(crate) discriminator: u32,
+}
+
 /// The decoded checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CoverageSnapshot {
@@ -212,6 +246,30 @@ pub(crate) struct CoverageSnapshot {
     pub(crate) destinations: Vec<DestinationClaim>,
     /// Sorted by `volume_index`.
     pub(crate) floors: Vec<VolumeFloor>,
+    /// Present exactly for a set admitted by identity; `None` for a set its
+    /// file names admitted.
+    pub(crate) identity: Option<IdentityBinding>,
+}
+
+/// The v6 body, positionally: everything v7 has but the identity binding.
+#[derive(Deserialize)]
+struct CoverageSnapshotV6 {
+    generation: u64,
+    plan_digest: [u8; 32],
+    destinations: Vec<DestinationClaim>,
+    floors: Vec<VolumeFloor>,
+}
+
+impl From<CoverageSnapshotV6> for CoverageSnapshot {
+    fn from(old: CoverageSnapshotV6) -> Self {
+        Self {
+            generation: old.generation,
+            plan_digest: old.plan_digest,
+            destinations: old.destinations,
+            floors: old.floors,
+            identity: None,
+        }
+    }
 }
 
 impl CoverageSnapshot {
@@ -245,6 +303,9 @@ impl CoverageSnapshot {
                 .collect();
         }
         normalized.floors.sort_by_key(|entry| entry.volume_index);
+        if let Some(identity) = &mut normalized.identity {
+            identity.volumes.sort_unstable();
+        }
         normalized
     }
 }
@@ -309,7 +370,7 @@ pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
         return Err(SnapshotError::BadMagic);
     }
     let version = u16::from_le_bytes([blob[4], blob[5]]);
-    if version != SNAPSHOT_SCHEMA_VERSION {
+    if version != SNAPSHOT_SCHEMA_VERSION && version != SNAPSHOT_LIFTED_VERSION {
         return Err(SnapshotError::UnsupportedVersion {
             found: version,
             supported: SNAPSHOT_SCHEMA_VERSION,
@@ -323,8 +384,12 @@ pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
     // row, and neither is something to partially trust.
     let body = &blob[FRAME_HEADER_LEN..];
     let mut deserializer = rmp_serde::Deserializer::new(std::io::Cursor::new(body));
-    let snapshot = CoverageSnapshot::deserialize(&mut deserializer)
-        .map_err(|error| SnapshotError::Malformed(error.to_string()))?;
+    let snapshot = if version == SNAPSHOT_LIFTED_VERSION {
+        CoverageSnapshotV6::deserialize(&mut deserializer).map(CoverageSnapshot::from)
+    } else {
+        CoverageSnapshot::deserialize(&mut deserializer)
+    }
+    .map_err(|error| SnapshotError::Malformed(error.to_string()))?;
     let consumed = deserializer.position();
     if consumed != body.len() as u64 {
         return Err(SnapshotError::Malformed(format!(
@@ -380,6 +445,18 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
             ));
         }
         previous_volume = Some(entry.volume_index);
+    }
+
+    if let Some(identity) = &snapshot.identity {
+        let mut previous_volume: Option<u32> = None;
+        for &(volume_index, _) in &identity.volumes {
+            if previous_volume.is_some_and(|previous| previous >= volume_index) {
+                return Err(SnapshotError::Malformed(
+                    "identity binding volumes are not sorted by volume index".into(),
+                ));
+            }
+            previous_volume = Some(volume_index);
+        }
     }
 
     Ok(())

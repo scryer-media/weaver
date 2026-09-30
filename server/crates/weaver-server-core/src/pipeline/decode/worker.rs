@@ -875,7 +875,7 @@ impl Pipeline {
     /// [`Self::job_has_pending_download_work_beyond_health_probe`] — it asks
     /// only about the decode stage, and is the cheap gate that decides whether
     /// a settling decode is worth re-running the download-drain sequence for.
-    fn job_decode_stage_drained(&self, job_id: JobId) -> bool {
+    pub(in crate::pipeline) fn job_decode_stage_drained(&self, job_id: JobId) -> bool {
         self.active_decodes_by_job
             .get(&job_id)
             .copied()
@@ -885,6 +885,9 @@ impl Pipeline {
                 .pending_decode
                 .iter()
                 .any(|work| work.segment_id.file_id.job_id == job_id)
+            // A routed article whose destination write is still out has not
+            // been committed yet; its placement's landing re-runs this check.
+            && !self.has_direct_placements(job_id)
     }
 
     pub(in crate::pipeline) fn decode_retry_exclude_servers(
@@ -2198,6 +2201,36 @@ impl Pipeline {
                 None => {}
             }
 
+            (buffered_segment, file_offset, direct_handoff)
+        };
+
+        let (buffered_segment, file_offset, direct_handoff) = ready;
+        self.buffer_decoded_segment_conventionally(
+            segment_id,
+            file_offset,
+            buffered_segment,
+            direct_handoff,
+        )
+        .await;
+    }
+
+    /// The conventional half of a decoded article: into the file's reorder
+    /// buffer, then out to disk as far as the buffer is contiguous, with the
+    /// write backlog relieved behind it.
+    ///
+    /// `direct_handoff` marks an article direct routing handed back — a set
+    /// that demoted around it, or a placement whose destination write failed —
+    /// whose materialization handoff this seam now settles.
+    pub(in crate::pipeline) async fn buffer_decoded_segment_conventionally(
+        &mut self,
+        segment_id: SegmentId,
+        file_offset: u64,
+        buffered_segment: BufferedDecodedSegment,
+        direct_handoff: bool,
+    ) {
+        let file_id = segment_id.file_id;
+        let job_id = file_id.job_id;
+        let ready = {
             let buffered_len = buffered_segment.len_bytes();
 
             // While a demoted set's reconstruction sweep is outstanding, this

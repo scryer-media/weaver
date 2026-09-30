@@ -3240,7 +3240,17 @@ async fn the_disk_reserve_refuses_a_spill_before_it_is_written() {
             scratch_bytes: u64::MAX,
             disk_reserve_bytes: 1000,
         },
-        Box::new(|_| Some(1200)),
+        {
+            let taken = std::time::Instant::now();
+            crate::operations::CapacityReader::from_fn(move || {
+                crate::operations::Capacity::Known(crate::operations::CapacityReading {
+                    available_bytes: 1200,
+                    total_bytes: u64::MAX,
+                    sampled_at: taken,
+                    stale: false,
+                })
+            })
+        },
     );
     let job_id = JobId(41024);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);

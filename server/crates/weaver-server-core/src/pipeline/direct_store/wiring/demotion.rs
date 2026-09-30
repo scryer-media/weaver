@@ -72,6 +72,45 @@ impl Pipeline {
         reason: DemotionReason,
         handoff: Option<SegmentId>,
     ) {
+        let handoffs: Vec<SegmentId> = handoff.into_iter().collect();
+        self.demote_direct_set_with_handoffs(job_id, set_index, reason, &handoffs)
+            .await;
+    }
+
+    /// [`Self::demote_direct_set`] with the routed articles the caller is
+    /// handing to the conventional path itself.
+    ///
+    /// The set's own outstanding placements go first. A flight's writes are
+    /// joined before anything else — the sweep deletes the destinations they
+    /// target — and every article behind the set, written or not, joins the
+    /// handoffs: none of them was committed, so the sweep must leave their
+    /// ranges alone and the requeue must not fetch them, and they rejoin the
+    /// conventional path here once the demotion is under way.
+    pub(super) async fn demote_direct_set_with_handoffs(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        reason: DemotionReason,
+        handoffs: &[SegmentId],
+    ) {
+        let orphans = self.take_direct_placements(job_id, set_index).await;
+        let mut all_handoffs = handoffs.to_vec();
+        all_handoffs.extend(
+            orphans
+                .iter()
+                .filter_map(crate::pipeline::DirectPlacement::article),
+        );
+        Box::pin(self.demote_direct_set_owning(job_id, set_index, reason, &all_handoffs)).await;
+        self.hand_back_direct_placements(orphans).await;
+    }
+
+    async fn demote_direct_set_owning(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        reason: DemotionReason,
+        handoffs: &[SegmentId],
+    ) {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
@@ -81,9 +120,9 @@ impl Pipeline {
         // flipped to `Demoted` and have its committed members deleted out from
         // under a job that had already counted them.
         if !set.claim_demotion(reason) {
-            if let Some(segment_id) = handoff {
+            for segment_id in handoffs {
                 self.direct_store
-                    .note_materialization_handoff(set_index, segment_id);
+                    .note_materialization_handoff(set_index, *segment_id);
             }
             return;
         }
@@ -169,9 +208,9 @@ impl Pipeline {
             set_index,
             demoted_volume_files.iter().copied(),
         );
-        if let Some(segment_id) = handoff {
+        for segment_id in handoffs {
             self.direct_store
-                .note_materialization_handoff(set_index, segment_id);
+                .note_materialization_handoff(set_index, *segment_id);
         }
         for file_id in &demoted_volume_files {
             self.block_crcs.forget_file(*file_id);
