@@ -1168,6 +1168,9 @@ pub(super) struct Par2Md5SubstitutionBinding {
 pub(super) struct DirectPostRepairWork {
     pub(super) work_id: u64,
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    /// Which shape of the pass this is: the read of what a repair rewrote, or
+    /// the pre-repair read of what the grid could not claim.
+    pub(super) post_repair: bool,
     /// When this ticket was handed to the detached task, so the completion
     /// handler can log how long the read-back actually took. The gap between
     /// submission and completion is exactly the window that once produced an
@@ -1179,6 +1182,7 @@ pub(super) struct DirectPostRepairWorkDone {
     pub(super) job_id: JobId,
     pub(super) work_id: u64,
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
+    pub(super) post_repair: bool,
     pub(super) result: Result<par2_rs::VerificationResult, String>,
 }
 
@@ -1194,6 +1198,44 @@ pub(super) struct DirectToleratedWork {
     pub(super) work_id: u64,
     pub(super) set_index: usize,
     pub(super) submitted_at: std::time::Instant,
+}
+
+/// A coverage barrier between its prepare and its commit: the checkpoint the
+/// pipeline task captured and the destination syncs running off it.
+///
+/// The syncs are the barrier's only slow step — an fsync of up to a batch's
+/// worth of dirty bytes per destination — and awaiting them on the pipeline
+/// task stopped every lane for as long as the disk took. The task returns the
+/// sync outcomes; the done message only says they are ready, and a demanded
+/// barrier that cannot wait for the message joins the task directly.
+pub(super) struct DirectBarrierFlight {
+    pub(super) prepared: direct_store::barrier::PreparedBarrier,
+    pub(super) task: tokio::task::JoinHandle<Vec<std::io::Result<()>>>,
+    /// The set's dirty bytes at the prepare, for the barrier's perf probes.
+    pub(super) dirty_bytes: u64,
+    /// The destinations being synced, relative name and absolute path, in
+    /// the order the task reports them.
+    pub(super) touched: Vec<(String, PathBuf)>,
+}
+
+pub(super) struct DirectBarrierDone {
+    pub(super) job_id: JobId,
+    pub(super) set_index: usize,
+}
+
+/// The re-read of a set's restart-seeded coverage, detached from the actor.
+///
+/// Restart restores a set's floors from its checkpoint but not the bytes'
+/// checksums, so before the member gates can compose, every seeded run is
+/// read back and hashed — the whole pre-restart download, which on a slow
+/// disk is minutes. The plan the read was made from rides along: a plan that
+/// moved while the read ran (a repair, a migration) makes its checksums stale,
+/// and the pass is simply made again.
+pub(super) struct DirectRearmDone {
+    pub(super) job_id: JobId,
+    pub(super) set_index: usize,
+    pub(super) runs: Vec<direct_store::router::RestartReadRun>,
+    pub(super) checksums: Result<Vec<u32>, String>,
 }
 
 pub(super) struct DirectToleratedWorkDone {
@@ -2576,6 +2618,7 @@ pub struct Pipeline {
         JobId,
         (
             par2_rs::RecoverySetId,
+            bool,
             Result<par2_rs::VerificationResult, String>,
         ),
     >,
@@ -2604,6 +2647,14 @@ pub struct Pipeline {
     >,
     pub(super) direct_tolerated_done_tx: mpsc::Sender<DirectToleratedWorkDone>,
     pub(super) direct_tolerated_done_rx: mpsc::Receiver<DirectToleratedWorkDone>,
+    /// At most one barrier in flight per set; see [`DirectBarrierFlight`].
+    pub(super) direct_barrier_flights: HashMap<(JobId, usize), DirectBarrierFlight>,
+    pub(super) direct_barrier_done_tx: mpsc::Sender<DirectBarrierDone>,
+    pub(super) direct_barrier_done_rx: mpsc::Receiver<DirectBarrierDone>,
+    /// Sets whose restart-seeded re-read is running; see [`DirectRearmDone`].
+    pub(super) direct_rearm_in_flight: HashSet<(JobId, usize)>,
+    pub(super) direct_rearm_done_tx: mpsc::Sender<DirectRearmDone>,
+    pub(super) direct_rearm_done_rx: mpsc::Receiver<DirectRearmDone>,
     /// Monotonic fence for the detached PAR2 damaged-path analysis tickets.
     pub(super) next_par2_analysis_work_id: u64,
     /// At most one damaged-path analysis runs per job. While the entry is

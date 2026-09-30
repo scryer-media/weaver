@@ -166,6 +166,8 @@ impl Pipeline {
             mpsc::channel(32);
         let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
+        let (direct_barrier_done_tx, direct_barrier_done_rx) = mpsc::channel(32);
+        let (direct_rearm_done_tx, direct_rearm_done_rx) = mpsc::channel(32);
         let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
         let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
         let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
@@ -456,6 +458,12 @@ impl Pipeline {
             direct_tolerated_results: HashMap::new(),
             direct_tolerated_done_tx,
             direct_tolerated_done_rx,
+            direct_barrier_flights: HashMap::new(),
+            direct_barrier_done_tx,
+            direct_barrier_done_rx,
+            direct_rearm_in_flight: HashSet::new(),
+            direct_rearm_done_tx,
+            direct_rearm_done_rx,
             next_par2_analysis_work_id: 0,
             par2_analysis_in_flight: HashMap::new(),
             par2_analysis_results: HashMap::new(),
@@ -1047,6 +1055,12 @@ impl Pipeline {
                     }
                     Some(done) = self.direct_tolerated_done_rx.recv() => {
                         self.handle_direct_tolerated_done(done).await;
+                    }
+                    Some(done) = self.direct_barrier_done_rx.recv() => {
+                        self.handle_direct_barrier_done(done).await;
+                    }
+                    Some(done) = self.direct_rearm_done_rx.recv() => {
+                        self.handle_direct_rearm_done(done).await;
                     }
                     Some(done) = self.repair_work_done_rx.recv() => {
                         self.handle_repair_work_done(done).await;

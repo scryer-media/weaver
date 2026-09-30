@@ -626,6 +626,7 @@ async fn demoting_a_carrying_set_clears_the_carry_and_the_ticket_slots() {
         crate::pipeline::DirectPostRepairWork {
             work_id: 1,
             recovery_set_id,
+            post_repair: true,
             submitted_at: std::time::Instant::now(),
         },
     );
@@ -633,6 +634,7 @@ async fn demoting_a_carrying_set_clears_the_carry_and_the_ticket_slots() {
         job_id,
         (
             recovery_set_id,
+            true,
             Ok(par2_rs::VerificationResult {
                 files: Vec::new(),
                 recovery_blocks_available: 0,
@@ -703,6 +705,7 @@ async fn a_ticket_parked_against_a_stale_recovery_set_is_dropped_for_a_fresh_one
         crate::pipeline::DirectPostRepairWork {
             work_id: 999,
             recovery_set_id: stale_recovery_set_id,
+            post_repair: true,
             submitted_at: std::time::Instant::now(),
         },
     );

@@ -1189,6 +1189,10 @@ async fn grid_fed_direct_job(
             .await;
         }
     }
+    // A set whose volumes all completed reaches its verdict on a detached read
+    // ticket; settle that one round so the verdict has landed, as the doc on
+    // `withhold_last_article` promises.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
     (pipeline, working_dir, complete_dir)
 }
 

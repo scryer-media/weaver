@@ -337,6 +337,43 @@ pub(crate) struct CoverageBarrier {
     /// The crypt rows the next checkpoint carries, by member index. Empty for
     /// every set with no encrypted member, which is every unencrypted set.
     member_crypt: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
+    /// A [`PreparedBarrier`] is out, its sync running elsewhere. While it is,
+    /// no automatic trigger is due and no second one can be prepared: two
+    /// barriers in flight would both persist generation `n + 1`, and the one
+    /// finishing last would clobber the newer floors with the older.
+    in_flight: bool,
+    /// Bumped whenever the committed row is deleted (a repair). A prepared
+    /// barrier carries the epoch it was prepared under; one that outlived its
+    /// row is a claim over bytes a repair has since rewritten, and is refused.
+    row_epoch: u64,
+}
+
+/// A barrier between its prepare and its commit: the checkpoint the pipeline
+/// captured **before** the sync, so the sync can run off the pipeline task
+/// while writes keep landing.
+///
+/// Everything the row will claim is fixed here. Writes recorded after the
+/// prepare go into the controller's fresh transient state and are the next
+/// barrier's business; they are never claimed by this one, which is what
+/// keeps "claimed" a subset of "synced" — the bytes this snapshot names were
+/// all written before the sync it waits for was even requested.
+#[derive(Debug)]
+pub(crate) struct PreparedBarrier {
+    trigger: BarrierTrigger,
+    generation: u64,
+    row_epoch: u64,
+    floors: BTreeMap<u32, u64>,
+    plan_digest: [u8; 32],
+    blob: Vec<u8>,
+    /// The interval's touched members, taken out of the controller so the
+    /// members a later write touches start a fresh interval. Restored whole on
+    /// failure or abandonment, because a failed sync leaves them unsynced.
+    touched: BTreeSet<u32>,
+    /// The touched members and their destination paths, in member order: what
+    /// the caller syncs and what the commit replays.
+    sync_targets: Vec<(u32, String)>,
+    dirty_bytes: u64,
+    dirty_since: Option<Instant>,
 }
 
 impl CoverageBarrier {
@@ -356,6 +393,8 @@ impl CoverageBarrier {
             consecutive_failures: 0,
             cooldown_until: None,
             member_crypt: BTreeMap::new(),
+            in_flight: false,
+            row_epoch: 0,
         }
     }
 
@@ -672,6 +711,12 @@ impl CoverageBarrier {
     /// [`BarrierTrigger::Demand`] and are always honoured — a shutdown must
     /// still attempt a barrier, however many have just failed.
     pub(crate) fn due(&self, now: Instant) -> Option<BarrierTrigger> {
+        // The one out already carries everything up to its prepare; what is
+        // dirty now is the next interval's, and it becomes due once that one
+        // commits.
+        if self.in_flight {
+            return None;
+        }
         // Deliberately ahead of the cooldown: the byte threshold is not damped.
         // 256 MiB of dirty bytes is enough work that retrying a failing barrier
         // is worth the attempt, and a set that keeps filling up while its
@@ -767,9 +812,13 @@ impl CoverageBarrier {
         }
     }
 
-    /// Runs the four-step barrier. On error nothing is published, the touched
-    /// set is not cleared, and the previously committed checkpoint stays
-    /// authoritative.
+    /// Runs the four-step barrier inline. On error nothing is published, the
+    /// touched set is not cleared, and the previously committed checkpoint
+    /// stays authoritative.
+    ///
+    /// The same two halves the split form runs — [`Self::prepare`] then
+    /// [`Self::commit`] — with the sync replayed between them, so the inline
+    /// and the off-task barrier cannot drift apart.
     ///
     /// `now` is the caller's clock, and only failure handling uses it: a failed
     /// barrier starts a cooldown that suppresses the age trigger (see
@@ -787,50 +836,175 @@ impl CoverageBarrier {
         S: DestinationSync + ?Sized,
         P: CoveragePersist + ?Sized,
     {
-        match self.run_steps(trigger, drain, sync, persist) {
-            Ok(report) => {
-                self.consecutive_failures = 0;
-                self.cooldown_until = None;
-                Ok(report)
+        let prepared = self.prepare(trigger, now, drain)?;
+        self.commit(prepared, now, sync, persist)
+    }
+
+    /// Steps 1 and 3a: drain, then capture the checkpoint this barrier will
+    /// commit, with the interval's touched members taken out of the
+    /// controller. The caller syncs [`PreparedBarrier::sync_targets`] — on the
+    /// pipeline task or off it — and then calls [`Self::commit`] or
+    /// [`Self::abandon`].
+    ///
+    /// Refused while another prepared barrier is out; see
+    /// [`CoverageBarrier::in_flight`]. A drain failure counts as a failed
+    /// barrier and starts the cooldown.
+    pub(crate) fn prepare<D>(
+        &mut self,
+        trigger: BarrierTrigger,
+        now: Instant,
+        drain: &mut D,
+    ) -> Result<PreparedBarrier, BarrierError>
+    where
+        D: BarrierDrain + ?Sized,
+    {
+        if self.in_flight {
+            return Err(BarrierError::Drain(
+                "a coverage barrier is already in flight".to_string(),
+            ));
+        }
+        match self.prepare_steps(trigger, drain) {
+            Ok(prepared) => {
+                self.in_flight = true;
+                Ok(prepared)
             }
             Err(error) => {
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                self.cooldown_until = Some(now + failure_backoff(self.consecutive_failures));
+                self.note_failure(now);
                 Err(error)
             }
         }
     }
 
-    fn run_steps<D, S, P>(
+    fn prepare_steps<D>(
         &mut self,
         trigger: BarrierTrigger,
         drain: &mut D,
-        sync: &mut S,
-        persist: &mut P,
-    ) -> Result<BarrierReport, BarrierError>
+    ) -> Result<PreparedBarrier, BarrierError>
     where
         D: BarrierDrain + ?Sized,
-        S: DestinationSync + ?Sized,
-        P: CoveragePersist + ?Sized,
     {
-        let mut steps = Vec::with_capacity(4);
-
         e2e_failpoint::maybe_trip(e2e_failpoint::DIRECT_STORE_BARRIER_DRAIN);
         drain.drain().map_err(BarrierError::Drain)?;
-        steps.push(BarrierStep::Drain);
 
         // Computed after the drain so the drained batch counts toward the
         // floors this barrier publishes.
         let floors = self.candidate_floors();
+        let generation = self.committed_generation.saturating_add(1);
+        let snapshot = self.build_snapshot(generation, &floors);
+        let blob = super::snapshot::encode(&snapshot).map_err(BarrierError::Encode)?;
+        let sync_targets: Vec<(u32, String)> = self
+            .touched
+            .iter()
+            .filter_map(|member_index| {
+                self.destinations
+                    .get(member_index)
+                    .map(|destination| (*member_index, destination.relative_path.clone()))
+            })
+            .collect();
+        Ok(PreparedBarrier {
+            trigger,
+            generation,
+            row_epoch: self.row_epoch,
+            floors,
+            plan_digest: snapshot.plan_digest,
+            blob,
+            touched: std::mem::take(&mut self.touched),
+            sync_targets,
+            dirty_bytes: std::mem::take(&mut self.dirty_bytes),
+            dirty_since: self.dirty_since.take(),
+        })
+    }
+
+    /// Steps 2 (replayed), 3 and 4 for a prepared barrier. `sync` answers for
+    /// the syncs the caller ran; a destination that did not sync fails the
+    /// barrier and nothing is published.
+    ///
+    /// The checkpoint row the barrier increments must still be the one it was
+    /// prepared against: a repair that deleted the row while the sync ran, or
+    /// a demotion that retired the controller, makes the prepared snapshot a
+    /// claim over bytes that are no longer there. Both are refused here rather
+    /// than left to the caller's guards alone, and neither counts as a failed
+    /// barrier.
+    pub(crate) fn commit<S, P>(
+        &mut self,
+        prepared: PreparedBarrier,
+        now: Instant,
+        sync: &mut S,
+        persist: &mut P,
+    ) -> Result<BarrierReport, BarrierError>
+    where
+        S: DestinationSync + ?Sized,
+        P: CoveragePersist + ?Sized,
+    {
+        if !self.in_flight {
+            return Err(BarrierError::Persist(
+                "the coverage controller was retired while the barrier was in flight".to_string(),
+            ));
+        }
+        if self.committed_generation.saturating_add(1) != prepared.generation
+            || self.row_epoch != prepared.row_epoch
+        {
+            self.abandon(prepared);
+            return Err(BarrierError::Persist(
+                "the checkpoint row was retired while the barrier was in flight".to_string(),
+            ));
+        }
+        match self.commit_steps(&prepared, sync, persist) {
+            Ok(report) => {
+                self.in_flight = false;
+                self.consecutive_failures = 0;
+                self.cooldown_until = None;
+                Ok(report)
+            }
+            Err(error) => {
+                self.abandon(prepared);
+                self.note_failure(now);
+                Err(error)
+            }
+        }
+    }
+
+    /// Gives a prepared barrier up without committing it. The interval's
+    /// touched members and dirty bytes go back into the controller, so the
+    /// next barrier syncs and claims them; the cooldown is untouched.
+    pub(crate) fn abandon(&mut self, prepared: PreparedBarrier) {
+        if !self.in_flight {
+            // Retired underneath the flight: the controller is fresh and the
+            // prepared interval describes destinations that are gone.
+            return;
+        }
+        self.in_flight = false;
+        self.touched.extend(prepared.touched);
+        self.dirty_bytes = self.dirty_bytes.saturating_add(prepared.dirty_bytes);
+        self.dirty_since = match (self.dirty_since, prepared.dirty_since) {
+            (Some(current), Some(earlier)) => Some(current.min(earlier)),
+            (current, earlier) => current.or(earlier),
+        };
+    }
+
+    fn note_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.cooldown_until = Some(now + failure_backoff(self.consecutive_failures));
+    }
+
+    fn commit_steps<S, P>(
+        &mut self,
+        prepared: &PreparedBarrier,
+        sync: &mut S,
+        persist: &mut P,
+    ) -> Result<BarrierReport, BarrierError>
+    where
+        S: DestinationSync + ?Sized,
+        P: CoveragePersist + ?Sized,
+    {
+        let mut steps = Vec::with_capacity(4);
+        steps.push(BarrierStep::Drain);
 
         let mut synced = 0usize;
-        for member_index in &self.touched {
-            let Some(destination) = self.destinations.get(member_index) else {
-                continue;
-            };
-            sync.sync(&destination.relative_path)
+        for (_, relative_path) in &prepared.sync_targets {
+            sync.sync(relative_path)
                 .map_err(|error| BarrierError::Sync {
-                    destination: destination.relative_path.clone(),
+                    destination: relative_path.clone(),
                     error,
                 })?;
             synced += 1;
@@ -844,39 +1018,33 @@ impl CoverageBarrier {
         }
         steps.push(BarrierStep::Sync);
 
-        let generation = self.committed_generation.saturating_add(1);
-        let snapshot = self.build_snapshot(generation, &floors);
-        let blob = super::snapshot::encode(&snapshot).map_err(BarrierError::Encode)?;
         e2e_failpoint::maybe_trip(e2e_failpoint::DIRECT_STORE_BARRIER_PERSIST);
         persist
-            .write(self.job_id, &self.set_name, &blob)
+            .write(self.job_id, &self.set_name, &prepared.blob)
             .map_err(BarrierError::Persist)?;
         steps.push(BarrierStep::Persist);
 
         e2e_failpoint::maybe_trip(e2e_failpoint::DIRECT_STORE_BARRIER_PUBLISH);
-        self.committed_generation = generation;
+        self.committed_generation = prepared.generation;
         // Read off the snapshot that was persisted, not off `self`: what
         // satisfies the re-stamp trigger is the digest the *row* carries.
-        self.committed_digest = snapshot.plan_digest;
-        for (volume_index, floor) in &floors {
+        self.committed_digest = prepared.plan_digest;
+        for (volume_index, floor) in &prepared.floors {
             if let Some(volume) = self.volumes.get_mut(volume_index) {
                 volume.floor = *floor;
                 volume.ranges.trim_below(*floor);
             }
         }
-        self.published_floors = floors.clone();
-        self.touched.clear();
-        self.dirty_bytes = 0;
-        self.dirty_since = None;
+        self.published_floors = prepared.floors.clone();
         steps.push(BarrierStep::Publish);
 
         Ok(BarrierReport {
-            trigger,
-            generation,
+            trigger: prepared.trigger,
+            generation: prepared.generation,
             steps,
             synced_destinations: synced,
-            snapshot_bytes: blob.len(),
-            published_floors: floors,
+            snapshot_bytes: prepared.blob.len(),
+            published_floors: prepared.floors.clone(),
         })
     }
 
@@ -903,6 +1071,7 @@ impl CoverageBarrier {
             .delete(self.job_id, &self.set_name)
             .map_err(BarrierError::Persist)?;
         self.committed_generation = 0;
+        self.row_epoch = self.row_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -936,6 +1105,7 @@ impl CoverageBarrier {
         self.dirty_since = None;
         self.consecutive_failures = 0;
         self.cooldown_until = None;
+        self.in_flight = false;
         Ok(())
     }
 }

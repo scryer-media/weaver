@@ -2357,6 +2357,13 @@ async fn submit_decoded_segment_declaring(
     // server the select loop picks the ticket up; here nothing does, so the
     // volumes would never become files and every assertion after the demoting
     // article would be reading a half-finished handback.
+    //
+    // Likewise the verification a set's last article triggers: its read-back
+    // is a detached ticket, and the verdict every assertion after that article
+    // used to find already reached lands on the check the ticket re-arms —
+    // settled first, because that verdict can be the demotion the sweep below
+    // then hands back.
+    settle_direct_verification_read(pipeline, file_id.job_id).await;
     settle_direct_demotion_work(pipeline).await;
 }
 
@@ -2752,6 +2759,8 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         Tolerated(crate::pipeline::DirectToleratedWorkDone),
         Demotion(crate::pipeline::DirectDemotionWorkDone),
         Repair(crate::pipeline::RepairWorkDone),
+        Rearm(crate::pipeline::DirectRearmDone),
+        Barrier(crate::pipeline::DirectBarrierDone),
     }
     loop {
         pipeline.pump_decode_queue();
@@ -2776,6 +2785,14 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
             pipeline.handle_repair_work_done(done).await;
             handled_a_ticket = true;
         }
+        while let Ok(done) = pipeline.direct_rearm_done_rx.try_recv() {
+            pipeline.handle_direct_rearm_done(done).await;
+            handled_a_ticket = true;
+        }
+        while let Ok(done) = pipeline.direct_barrier_done_rx.try_recv() {
+            pipeline.handle_direct_barrier_done(done).await;
+            handled_a_ticket = true;
+        }
         // A ticket that had already finished by the time this loop looked is
         // handled here rather than at the wait below, and its handler arms the
         // completion check that carries the outcome forward. Going back to the
@@ -2795,7 +2812,14 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
                     .keys()
                     .any(|job_id| coordinator.has_work(*job_id))
             });
-        if !post_repair_pending && !tolerated_pending && !demotion_pending && !par2_analysis_pending
+        let rearm_pending = !pipeline.direct_rearm_in_flight.is_empty();
+        let barrier_pending = !pipeline.direct_barrier_flights.is_empty();
+        if !post_repair_pending
+            && !tolerated_pending
+            && !demotion_pending
+            && !par2_analysis_pending
+            && !rearm_pending
+            && !barrier_pending
         {
             return;
         }
@@ -2803,6 +2827,8 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         let tolerated_rx = &mut pipeline.direct_tolerated_done_rx;
         let demotion_rx = &mut pipeline.direct_demotion_done_rx;
         let repair_rx = &mut pipeline.repair_work_done_rx;
+        let rearm_rx = &mut pipeline.direct_rearm_done_rx;
+        let barrier_rx = &mut pipeline.direct_barrier_done_rx;
         let ticket = tokio::select! {
             done = post_repair_rx.recv(), if post_repair_pending => {
                 Ticket::PostRepair(done.expect("direct post-repair completion channel should stay open"))
@@ -2816,12 +2842,20 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
             done = repair_rx.recv(), if par2_analysis_pending => {
                 Ticket::Repair(done.expect("repair completion channel should stay open"))
             }
+            done = rearm_rx.recv(), if rearm_pending => {
+                Ticket::Rearm(done.expect("direct restart re-read channel should stay open"))
+            }
+            done = barrier_rx.recv(), if barrier_pending => {
+                Ticket::Barrier(done.expect("direct barrier channel should stay open"))
+            }
         };
         match ticket {
             Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
             Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
             Ticket::Demotion(done) => pipeline.handle_direct_demotion_done(done).await,
             Ticket::Repair(done) => pipeline.handle_repair_work_done(done).await,
+            Ticket::Rearm(done) => pipeline.handle_direct_rearm_done(done).await,
+            Ticket::Barrier(done) => pipeline.handle_direct_barrier_done(done).await,
         }
     }
 }
@@ -2846,6 +2880,64 @@ async fn settle_par2_analysis_work(pipeline: &mut Pipeline) {
             pipeline.check_job_completion(queued_job).await;
         }
     }
+}
+
+/// The direct-store twin of [`settle_par2_analysis_work`]: waits for the
+/// job's detached verification read-back, if one is out, and runs only the
+/// completion check its verdict re-arms, so a test sees the state that check
+/// leaves behind and not the end of a fully drained queue. One round only: a
+/// verdict that starts a repair leaves the repair's own read-back ticket out,
+/// for the test to settle or to interpose on as it needs.
+async fn settle_direct_verification_read(pipeline: &mut Pipeline, job_id: JobId) {
+    let Some(in_flight) = pipeline.direct_post_repair_in_flight.get(&job_id) else {
+        return;
+    };
+    let work_id = in_flight.work_id;
+    loop {
+        let done = pipeline
+            .direct_post_repair_done_rx
+            .recv()
+            .await
+            .expect("direct post-repair completion channel should stay open");
+        let ours = done.job_id == job_id && done.work_id == work_id;
+        pipeline.handle_direct_post_repair_done(done);
+        if ours {
+            break;
+        }
+    }
+    if let Some(position) = pipeline
+        .pending_completion_checks
+        .iter()
+        .position(|queued| *queued == job_id)
+    {
+        pipeline.pending_completion_checks.remove(position);
+        pipeline.check_job_completion(job_id).await;
+    }
+}
+
+/// Waits for the job's detached verification read-back and hands its verdict
+/// to the pipeline **without** running the completion check it re-arms, for
+/// tests that drive the verification seam themselves and call it again.
+async fn park_direct_verification_verdict(pipeline: &mut Pipeline, job_id: JobId) {
+    let Some(in_flight) = pipeline.direct_post_repair_in_flight.get(&job_id) else {
+        return;
+    };
+    let work_id = in_flight.work_id;
+    loop {
+        let done = pipeline
+            .direct_post_repair_done_rx
+            .recv()
+            .await
+            .expect("direct post-repair completion channel should stay open");
+        let ours = done.job_id == job_id && done.work_id == work_id;
+        pipeline.handle_direct_post_repair_done(done);
+        if ours {
+            break;
+        }
+    }
+    pipeline
+        .pending_completion_checks
+        .retain(|queued| *queued != job_id);
 }
 
 async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {

@@ -1128,22 +1128,37 @@ impl Pipeline {
         .await
     }
 
+    /// The detached read-back behind [`Self::verify_direct_sets_quietly`]:
+    /// returns a finished verdict for this job and recovery set if one is
+    /// parked, starts the read and returns `None` if none is, and returns
+    /// `None` while one is running. The done message schedules the completion
+    /// check that re-enters here and takes the verdict.
+    ///
+    /// Both of the pass's shapes go through it — the post-repair read of what a
+    /// repair rewrote, and the pre-repair read of the files the grid could not
+    /// claim — because both are the whole set read back from disk, which on a
+    /// slow destination is tens of seconds no lane may wait on. `post_repair`
+    /// is part of the ticket's identity: a verdict read under one shape is not
+    /// an answer for the other.
     pub(super) fn take_or_start_direct_post_repair_verification(
         &mut self,
         job_id: JobId,
         par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
         access: std::sync::Arc<super::super::par2_access::DirectVolumeFileAccess>,
         to_read: Vec<par2_rs::FileId>,
-        selective: bool,
+        post_repair: bool,
+        options: par2_rs::VerifyOptions,
     ) -> Option<Result<par2_rs::VerificationResult, String>> {
         let recovery_set_id = par2_set.recovery_set_id;
-        if let Some((result_set_id, result)) = self.direct_post_repair_results.remove(&job_id) {
-            if result_set_id == recovery_set_id {
+        if let Some((result_set_id, result_post_repair, result)) =
+            self.direct_post_repair_results.remove(&job_id)
+        {
+            if result_set_id == recovery_set_id && result_post_repair == post_repair {
                 self.direct_post_repair_in_flight.remove(&job_id);
                 return Some(result);
             }
             self.direct_post_repair_results
-                .insert(job_id, (result_set_id, result));
+                .insert(job_id, (result_set_id, result_post_repair, result));
         }
         if let Some(in_flight) = self.direct_post_repair_in_flight.get(&job_id) {
             // A ticket for a *different* recovery set is not this call's to
@@ -1160,12 +1175,14 @@ impl Pipeline {
             // ticket against the set this call actually cares about; the
             // work id we are about to hand out fences the old task's done
             // message if it lands late.
-            if in_flight.recovery_set_id != recovery_set_id {
+            if in_flight.recovery_set_id != recovery_set_id || in_flight.post_repair != post_repair
+            {
                 warn!(
                     job_id = job_id.0,
                     stale_recovery_set_id = ?in_flight.recovery_set_id,
-                    "dropping a direct post-repair ticket parked against a recovery set this \
-                     job no longer serves"
+                    stale_post_repair = in_flight.post_repair,
+                    "dropping a direct verification ticket parked against a recovery set or \
+                     pass this job no longer serves"
                 );
                 self.direct_post_repair_in_flight.remove(&job_id);
                 self.direct_post_repair_results.remove(&job_id);
@@ -1182,6 +1199,7 @@ impl Pipeline {
             DirectPostRepairWork {
                 work_id,
                 recovery_set_id,
+                post_repair,
                 submitted_at,
             },
         );
@@ -1189,8 +1207,8 @@ impl Pipeline {
             job_id = job_id.0,
             work_id,
             files = to_read.len(),
-            selective,
-            "submitting a direct post-repair verification ticket"
+            post_repair,
+            "submitting a direct verification ticket"
         );
 
         let pp_pool = self.pp_pool.clone();
@@ -1211,18 +1229,18 @@ impl Pipeline {
                         &par2_set,
                         access.as_ref(),
                         &to_read,
-                        &crate::pipeline::completion::finalize::check::selective_pass_verify_options(),
+                        &options,
                     )
                 })
             })
             .await;
-            let result = joined
-                .map_err(|error| format!("direct post-repair verification panicked: {error}"));
+            let result = joined.map_err(|error| format!("direct verification panicked: {error}"));
             let _ = done_tx
                 .send(DirectPostRepairWorkDone {
                     job_id,
                     work_id,
                     recovery_set_id,
+                    post_repair,
                     result,
                 })
                 .await;
@@ -1237,11 +1255,14 @@ impl Pipeline {
         let Some(in_flight) = self.direct_post_repair_in_flight.get(&done.job_id) else {
             return;
         };
-        if in_flight.work_id != done.work_id || in_flight.recovery_set_id != done.recovery_set_id {
+        if in_flight.work_id != done.work_id
+            || in_flight.recovery_set_id != done.recovery_set_id
+            || in_flight.post_repair != done.post_repair
+        {
             debug!(
                 job_id = done.job_id.0,
                 work_id = done.work_id,
-                "discarding stale direct post-repair verification"
+                "discarding stale direct verification"
             );
             return;
         }
@@ -1256,15 +1277,25 @@ impl Pipeline {
             work_id = done.work_id,
             elapsed_ms = elapsed.as_millis() as u64,
             outcome,
-            "direct post-repair verification ticket completed"
+            post_repair = done.post_repair,
+            "direct verification ticket completed"
         );
-        crate::runtime::perf_probe::record("direct_store.post_repair_verify", elapsed);
+        crate::runtime::perf_probe::record(
+            if done.post_repair {
+                "direct_store.post_repair_verify"
+            } else {
+                "direct_store.verify_read"
+            },
+            elapsed,
+        );
         if !self.jobs.contains_key(&done.job_id) {
             self.direct_post_repair_in_flight.remove(&done.job_id);
             return;
         }
-        self.direct_post_repair_results
-            .insert(done.job_id, (done.recovery_set_id, done.result));
+        self.direct_post_repair_results.insert(
+            done.job_id,
+            (done.recovery_set_id, done.post_repair, done.result),
+        );
         self.schedule_job_completion_check(done.job_id);
     }
 
@@ -1422,6 +1453,7 @@ impl Pipeline {
                     std::sync::Arc::clone(&access),
                     to_read,
                     true,
+                    crate::pipeline::completion::finalize::check::selective_pass_verify_options(),
                 ) {
                     Some(Ok(fresh)) => fresh,
                     Some(Err(error)) => {
@@ -1587,7 +1619,8 @@ impl Pipeline {
                             std::sync::Arc::clone(&par2_set),
                             std::sync::Arc::clone(&access),
                             to_read,
-                            false,
+                            true,
+                            crate::pipeline::completion::finalize::check::selective_pass_verify_options(),
                         ) {
                             Some(Ok(verification)) => verification,
                             Some(Err(error)) => {
@@ -1649,23 +1682,32 @@ impl Pipeline {
                                 slices_proven as u64,
                             );
                         }
-                        let pp_pool = self.pp_pool.clone();
-                        let read_set = std::sync::Arc::clone(&par2_set);
-                        let access = std::sync::Arc::clone(&access);
-                        tokio::task::spawn_blocking(move || {
-                            pp_pool.install(move || {
-                                let mut options = par2_rs::VerifyOptions::default();
-                                options.proven_slices = proven_slices;
-                                par2_rs::verify_selected_file_ids_with_options(
-                                    &read_set,
-                                    access.as_ref(),
-                                    &to_read,
-                                    &options,
-                                )
-                            })
-                        })
-                        .await
-                        .ok()?
+                        // Detached like the post-repair read, and for the
+                        // same reason: this is the set read back whole, and
+                        // awaiting it here stopped every lane of every job
+                        // for the read's duration — 30 s and more on a
+                        // network share — once per finished job.
+                        let mut options = par2_rs::VerifyOptions::default();
+                        options.proven_slices = proven_slices;
+                        match self.take_or_start_direct_post_repair_verification(
+                            job_id,
+                            std::sync::Arc::clone(&par2_set),
+                            std::sync::Arc::clone(&access),
+                            to_read,
+                            false,
+                            options,
+                        ) {
+                            Some(Ok(verification)) => verification,
+                            Some(Err(error)) => {
+                                warn!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "direct verification read failed"
+                                );
+                                return None;
+                            }
+                            None => return None,
+                        }
                     };
                     // Appended, then re-ordered to the recovery set's own file
                     // order so the result is shaped exactly as `verify_all`'s
