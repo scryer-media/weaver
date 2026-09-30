@@ -6,7 +6,7 @@ use super::commit::prepare_direct_destination_paths;
 use super::*;
 use crate::pipeline::{
     DirectPlacement, DirectPlacementDone, DirectPlacementFlight, DirectPlacementFlightState,
-    DirectPlacementOutcome,
+    DirectPlacementKind, DirectPlacementOutcome,
 };
 
 /// Collects a placement task's outcome. A task that went away without
@@ -24,7 +24,27 @@ async fn collect_placement_outcome(
 }
 
 impl Pipeline {
-    /// Whether any routed article of this job is still waiting for its
+    /// Whether a completed volume's trailing region is still waiting to land
+    /// in this set. Until it has, the set's coverage is short of its volumes.
+    pub(in crate::pipeline) fn direct_set_has_pending_volume_tail(
+        &self,
+        job_id: JobId,
+        set_index: usize,
+    ) -> bool {
+        self.direct_placement_lanes
+            .get(&(job_id, set_index))
+            .is_some_and(|lane| {
+                lane.flight
+                    .iter()
+                    .flat_map(|flight| flight.placements.iter())
+                    .chain(lane.queued.iter())
+                    .any(|placement| {
+                        matches!(placement.kind, DirectPlacementKind::VolumeTail { .. })
+                    })
+            })
+    }
+
+    /// Whether any placement of this job is still waiting for its
     /// destination writes.
     pub(crate) fn has_direct_placements(&self, job_id: JobId) -> bool {
         self.direct_placement_lanes
@@ -336,7 +356,7 @@ impl Pipeline {
             if self.direct_set_takes_placements(job_id, set_index, Some(&set_name)) {
                 let handoffs: Vec<SegmentId> = placements
                     .iter()
-                    .map(|placement| placement.segment.segment_id)
+                    .filter_map(DirectPlacement::article)
                     .collect();
                 self.handle_direct_placement_failure(job_id, set_index, &handoffs, failure)
                     .await;
@@ -365,26 +385,41 @@ impl Pipeline {
             }
             let DirectPlacement {
                 spans,
-                segment,
-                volume_index,
-                file_offset,
+                kind,
                 buffered_len: _,
             } = placement;
             self.record_direct_placement(job_id, set_index, &spans);
             drop(spans);
-            Box::pin(self.commit_direct_segment(
-                segment.segment_id,
-                segment.decoded_size,
-                set_index,
-                volume_index,
-                file_offset,
-                segment.part_crc,
-                segment.part_crc_verified,
-                &segment.checkpoint_plan,
-                &segment.segments,
-            ))
-            .await;
-            self.note_mixed_rar_commit(job_id, set_index);
+            match kind {
+                DirectPlacementKind::Article {
+                    segment,
+                    volume_index,
+                    file_offset,
+                } => {
+                    Box::pin(self.commit_direct_segment(
+                        segment.segment_id,
+                        segment.decoded_size,
+                        set_index,
+                        volume_index,
+                        file_offset,
+                        segment.part_crc,
+                        segment.part_crc_verified,
+                        &segment.checkpoint_plan,
+                        &segment.segments,
+                    ))
+                    .await;
+                    self.note_mixed_rar_commit(job_id, set_index);
+                }
+                DirectPlacementKind::VolumeTail { volume_index } => {
+                    debug!(
+                        job_id = job_id.0,
+                        set_index,
+                        volume = volume_index,
+                        "a completed volume's trailing region landed"
+                    );
+                    Box::pin(self.finish_direct_volume_completion(job_id, set_index)).await;
+                }
+            }
         }
     }
 
@@ -452,9 +487,21 @@ impl Pipeline {
 
     /// Hands routed articles to the conventional path, exactly as the decode
     /// seam hands back one whose set demoted under it.
+    ///
+    /// A volume's trailing region carries no article to hand back; the
+    /// demotion that let it go owns those bytes, as it owns any the set had
+    /// not recorded as coverage.
     pub(super) async fn hand_back_direct_placements(&mut self, placements: Vec<DirectPlacement>) {
         for placement in placements {
-            let segment_id = placement.segment.segment_id;
+            let DirectPlacementKind::Article {
+                segment,
+                file_offset,
+                ..
+            } = placement.kind
+            else {
+                continue;
+            };
+            let segment_id = segment.segment_id;
             let file_id = segment_id.file_id;
             let Some(file) = self
                 .jobs
@@ -465,19 +512,15 @@ impl Pipeline {
             };
             // Demotion rebuilds conventional assembly with `reset`, which
             // also clears the placement this article recorded.
-            file.record_placement(
-                segment_id.segment_number,
-                placement.file_offset,
-                placement.segment.decoded_size,
-            );
+            file.record_placement(segment_id.segment_number, file_offset, segment.decoded_size);
             crate::runtime::perf_probe::record(
                 "direct_store.article.demoted",
                 std::time::Duration::from_nanos(1),
             );
             Box::pin(self.buffer_decoded_segment_conventionally(
                 segment_id,
-                placement.file_offset,
-                placement.segment,
+                file_offset,
+                segment,
                 true,
             ))
             .await;

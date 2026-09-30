@@ -297,9 +297,11 @@ impl Pipeline {
             set_index,
             crate::pipeline::DirectPlacement {
                 spans,
-                segment,
-                volume_index,
-                file_offset,
+                kind: crate::pipeline::DirectPlacementKind::Article {
+                    segment,
+                    volume_index,
+                    file_offset,
+                },
                 buffered_len,
             },
         );
@@ -312,9 +314,10 @@ impl Pipeline {
     ///
     /// The record only happens once **all** the writes returned: partial failure
     /// leaves orphan bytes, and the coverage map is the truth, not the bytes.
-    /// Both span producers go through here — the routing seam and the confirming
-    /// parse's drain at volume completion — so neither can grow its own,
-    /// subtly different, ordering.
+    /// This awaits the writes on the pipeline task, so it is for the repair
+    /// paths, which run once per repair. Routed articles and a completed
+    /// volume's trailing region go through the set's placement lane instead
+    /// ([`Self::enqueue_direct_placement`]), which records them the same way.
     pub(super) async fn place_direct_spans(
         &mut self,
         job_id: JobId,
@@ -1079,20 +1082,40 @@ impl Pipeline {
             }
             // The confirming parse can make the volume's trailing region
             // routable — it was held until the parse proved no further header
-            // could appear there — so those spans are written here, before the
-            // set is allowed to finalize and delete its envelopes.
+            // could appear there. Those spans go through the set's placement
+            // lane like an article's, and the rest of the completion waits for
+            // them to land: the set may not finalize and delete its envelopes
+            // before they are its coverage.
             Some(Ok(spans)) => {
                 self.cache_direct_volume_facts(job_id, set_index).await;
-                if !self
-                    .place_direct_spans(job_id, set_index, None, &spans)
-                    .await
-                {
+                if !spans.is_empty() {
+                    self.enqueue_direct_placement(
+                        job_id,
+                        set_index,
+                        crate::pipeline::DirectPlacement {
+                            spans,
+                            kind: crate::pipeline::DirectPlacementKind::VolumeTail { volume_index },
+                            buffered_len: 0,
+                        },
+                    );
                     return;
                 }
             }
             None => return,
         }
 
+        self.finish_direct_volume_completion(job_id, set_index)
+            .await;
+    }
+
+    /// What a completed volume does once every byte it routed is the set's
+    /// coverage: checkpoint the phase change, judge an open identity plan,
+    /// and finalize whatever is ready.
+    pub(super) async fn finish_direct_volume_completion(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+    ) {
         // The phase-change demand. The set's download phase ends exactly here,
         // at its last volume, and for a par2-bearing job the next thing that
         // happens is a verification wait that can run for the whole PAR2
@@ -1208,7 +1231,9 @@ impl Pipeline {
             .sets_for(job_id)
             .iter()
             .enumerate()
-            .filter(|(_, set)| set.ready_to_finalize())
+            .filter(|(index, set)| {
+                set.ready_to_finalize() && !self.direct_set_has_pending_volume_tail(job_id, *index)
+            })
             .map(|(index, _)| index)
             .collect();
         for set_index in ready {

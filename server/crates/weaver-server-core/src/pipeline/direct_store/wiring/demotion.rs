@@ -95,7 +95,11 @@ impl Pipeline {
     ) {
         let orphans = self.take_direct_placements(job_id, set_index).await;
         let mut all_handoffs = handoffs.to_vec();
-        all_handoffs.extend(orphans.iter().map(|placement| placement.segment.segment_id));
+        all_handoffs.extend(
+            orphans
+                .iter()
+                .filter_map(crate::pipeline::DirectPlacement::article),
+        );
         Box::pin(self.demote_direct_set_owning(job_id, set_index, reason, &all_handoffs)).await;
         self.hand_back_direct_placements(orphans).await;
     }

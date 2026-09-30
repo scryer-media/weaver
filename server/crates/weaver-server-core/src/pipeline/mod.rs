@@ -1234,20 +1234,42 @@ pub(super) struct DirectBarrierDone {
     pub(super) flight_id: u64,
 }
 
-/// One routed article waiting for its destination writes to return: the spans
-/// routing produced and the decoded article they came out of.
-///
-/// The article is held, not copied: the spans are refcounted views of its
-/// buffers, and the segment itself is what the commit reads its CRC facts
-/// from — or what the conventional path takes back if the placement fails.
+/// Spans waiting for their destination writes to return, and what produced
+/// them.
 pub(super) struct DirectPlacement {
     pub(super) spans: Vec<direct_store::router::RoutedSpan>,
-    pub(super) segment: BufferedDecodedSegment,
-    pub(super) volume_index: u32,
-    pub(super) file_offset: u64,
+    pub(super) kind: DirectPlacementKind,
     /// Counted into the resident write backlog while the placement waits, so
     /// a slow destination slows dispatch the way a slow conventional write does.
     pub(super) buffered_len: usize,
+}
+
+/// What a placement's spans came out of, which decides what its landing does.
+pub(super) enum DirectPlacementKind {
+    /// A routed article. It is held, not copied: the spans are refcounted
+    /// views of its buffers, and the segment itself is what the commit reads
+    /// its CRC facts from — or what the conventional path takes back if the
+    /// placement fails.
+    Article {
+        segment: BufferedDecodedSegment,
+        volume_index: u32,
+        file_offset: u64,
+    },
+    /// A completed volume's trailing region, which the confirming parse
+    /// released from the holds. Its landing finishes the volume's completion:
+    /// the set may not finalize, and delete its envelopes, before these bytes
+    /// are its coverage.
+    VolumeTail { volume_index: u32 },
+}
+
+impl DirectPlacement {
+    /// The routed article this placement carries, if it carries one.
+    pub(super) fn article(&self) -> Option<SegmentId> {
+        match &self.kind {
+            DirectPlacementKind::Article { segment, .. } => Some(segment.segment_id),
+            DirectPlacementKind::VolumeTail { .. } => None,
+        }
+    }
 }
 
 /// Where a placement flight's writes are.
