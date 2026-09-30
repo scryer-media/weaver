@@ -2651,9 +2651,13 @@ pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<byte
 ///
 /// Process-wide rather than the pipeline's, because the closes that need it
 /// run on tasks of their own after the pipeline has let the job go.
-static DIRECT_PLACEMENTS_IN_FLIGHT: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<u64, (Vec<std::path::PathBuf>, tokio::sync::watch::Receiver<()>)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static DIRECT_PLACEMENTS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<PlacementsInFlight>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Ticket number to the destinations a placement task claims and the watcher
+/// its ticket releases.
+type PlacementsInFlight =
+    HashMap<u64, (Vec<std::path::PathBuf>, tokio::sync::watch::Receiver<()>)>;
 
 static NEXT_DIRECT_PLACEMENT_TICKET: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);

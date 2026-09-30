@@ -1241,6 +1241,7 @@ async fn an_identity_binding_whose_file_now_classifies_is_refused_and_swept() {
 
 /// Feeds exactly what a restored identity job asks for and returns the member
 /// it produced, where it landed, and the job's status.
+#[allow(clippy::too_many_arguments)]
 async fn finish_restored_identity_job(
     pipeline: &mut Pipeline,
     temp_dir: &TempDir,
