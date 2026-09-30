@@ -94,7 +94,7 @@ pub enum RefusalReason {
     EndHeaderTooLarge,
     /// The declared lengths do not describe a coherent archive.
     LengthOverflow,
-    /// The chase could not get a staging directory or an extraction budget.
+    /// The chase could not get an extraction budget.
     BudgetUnavailable,
     /// Every chase worker is already occupied. Admitting another would arm a
     /// chase that cannot start, and extraction awaits a started chase without a
@@ -120,6 +120,10 @@ impl RefusalReason {
         }
     }
 }
+
+/// Prefix on a worker error that means the chase never got a staging tree, so
+/// the reap can tell it apart from a decode failure.
+const STAGING_UNAVAILABLE: &str = "direct-unpack staging directory unavailable";
 
 /// How long a worker may keep running after its set was aborted before the drain
 /// reap says so. Generous: a decode that is mid-member finishes on its own.
@@ -170,6 +174,9 @@ pub enum DemotionReason {
     /// The set was gated on recovery-set evidence that never arrived, and the
     /// repair has concluded, so nothing will unpark it.
     GatedStall,
+    /// The worker could not create or open its staging directory. Nothing is
+    /// wrong with the archive; the chase had nowhere to write.
+    StagingUnavailable,
 }
 
 impl DemotionReason {
@@ -182,6 +189,7 @@ impl DemotionReason {
             Self::RepairRewrote => "repair_rewrote",
             Self::RepairFailed => "repair_failed",
             Self::GatedStall => "gated_stall",
+            Self::StagingUnavailable => "staging_unavailable",
         }
     }
 }
@@ -260,6 +268,7 @@ pub struct DirectUnpackCounters {
     pub demoted_repair_rewrote: u64,
     pub demoted_repair_failed: u64,
     pub demoted_gated_stall: u64,
+    pub demoted_staging_unavailable: u64,
     /// Chases whose members were installed instead of re-extracting.
     pub consumed: u64,
     /// Chases whose output was thrown away in favour of conventional extraction.
@@ -304,6 +313,7 @@ impl DirectUnpackCounters {
             DemotionReason::RepairRewrote => self.demoted_repair_rewrote += 1,
             DemotionReason::RepairFailed => self.demoted_repair_failed += 1,
             DemotionReason::GatedStall => self.demoted_gated_stall += 1,
+            DemotionReason::StagingUnavailable => self.demoted_staging_unavailable += 1,
         }
     }
 }
@@ -1037,17 +1047,6 @@ impl Pipeline {
         self.direct_unpack
             .last_staging
             .insert((job_id, set_name.to_string()), output_dir.clone());
-        if let Err(error) = std::fs::create_dir_all(&output_dir) {
-            warn!(
-                job_id = job_id.0,
-                set_name,
-                path = %output_dir.display(),
-                error = %error,
-                "direct unpack could not create its staging directory"
-            );
-            self.latch_direct_unpack_refusal(job_id, set_name, RefusalReason::BudgetUnavailable);
-            return;
-        }
         let budget = match self.direct_unpack_budget(job_id, &paths, &output_dir) {
             Ok(budget) => budget,
             Err(error) => {
@@ -1153,24 +1152,6 @@ impl Pipeline {
             }
         }
 
-        let root = match ExtractionRoot::open(&output_dir) {
-            Ok(root) => Arc::new(root),
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    set_name,
-                    error = %error,
-                    "direct unpack could not open its staging root"
-                );
-                self.latch_direct_unpack_refusal(
-                    job_id,
-                    set_name,
-                    RefusalReason::BudgetUnavailable,
-                );
-                return;
-            }
-        };
-
         let password = self.primary_archive_password_for_job(job_id);
         let boost_paths = paths.clone();
         let counters = Arc::new(crate::jobs::PhaseCounters::default());
@@ -1180,7 +1161,6 @@ impl Pipeline {
             paths,
             Arc::clone(&coverage),
             output_dir.clone(),
-            root,
             Arc::clone(&budget),
             password,
             Arc::clone(&counters),
@@ -1604,8 +1584,6 @@ impl Pipeline {
             .map(|file| file.total_bytes())
             .sum::<u64>()
             .max(1);
-        let (initial_entries, initial_bytes) =
-            ExtractionRoot::snapshot_usage(staging).unwrap_or((0, 0));
 
         crate::pipeline::extraction::JobExtractionBudget::with_capacity(
             Arc::clone(&self.extraction_limits),
@@ -1616,8 +1594,11 @@ impl Pipeline {
                 .reader(crate::operations::StorageRoot::Complete),
             staging.to_path_buf(),
             declared_archive_bytes,
-            initial_entries,
-            initial_bytes,
+            // Nothing to count: the staging directory is this arm's own
+            // generation, and its worker creates it empty before writing the
+            // first member. There is no earlier output there to charge.
+            0,
+            0,
             Arc::clone(&self.metrics),
         )
     }
@@ -1680,7 +1661,6 @@ impl Pipeline {
         paths: Vec<PathBuf>,
         coverage: Arc<SetCoverage>,
         output_dir: PathBuf,
-        root: Arc<ExtractionRoot>,
         budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
         password: Option<String>,
         counters: Arc<crate::jobs::PhaseCounters>,
@@ -1715,6 +1695,13 @@ impl Pipeline {
             } else {
                 None
             };
+            // The staging tree is made here rather than at arming, which runs
+            // on the pipeline task: on a network mount every step of it is a
+            // round trip, and a set can arm many times over one download.
+            let root = Arc::new(
+                ExtractionRoot::create_empty(&output_dir)
+                    .map_err(|error| format!("{STAGING_UNAVAILABLE}: {error}"))?,
+            );
             // Between here and the line below sits `install`, which queues
             // behind occupied workers with no logging, no timeout, and no
             // sensitivity to this set's abort — the closure has not touched the
@@ -2530,8 +2517,11 @@ impl Pipeline {
                 }
                 Err(error) => {
                     // A part that vanished under the reader is a rename racing
-                    // the chase, not a broken archive.
-                    let reason = if error.contains("failed to open 7z direct-unpack reader")
+                    // the chase, not a broken archive. The staging check comes
+                    // first: its error can carry the same "not found" text.
+                    let reason = if error.contains(STAGING_UNAVAILABLE) {
+                        DemotionReason::StagingUnavailable
+                    } else if error.contains("failed to open 7z direct-unpack reader")
                         || error.contains("No such file or directory")
                     {
                         DemotionReason::PartUnreadable
