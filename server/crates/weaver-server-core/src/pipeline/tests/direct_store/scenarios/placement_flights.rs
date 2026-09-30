@@ -234,3 +234,41 @@ async fn a_shutdown_checkpoint_waits_for_a_placement_that_is_still_writing() {
     assert!(committed(&pipeline, segment(job_id, 0, 0)));
     assert_eq!(pipeline.write_buffered_bytes, 0);
 }
+
+#[tokio::test]
+async fn a_placement_task_that_panics_fails_its_placement_and_hands_the_article_back() {
+    let temp_dir = TempDir::new().unwrap();
+    let job_id = JobId(41804);
+    let volumes = fixture();
+    let (mut pipeline, working_dir, hold) = held_pipeline(&temp_dir, job_id, &volumes).await;
+    pipeline.direct_placement_panics = true;
+
+    route_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    assert!(
+        pipeline.direct_placement_lanes.contains_key(&(job_id, 0)),
+        "premise: the article's placement task is out"
+    );
+
+    // The task panics past the hold; its flight still resolves, as a failed
+    // write, and the set demotes the way any failed write demotes it.
+    hold.add_permits(1);
+    settle_direct_demotion_work(&mut pipeline).await;
+    pipeline.flush_quiescent_write_backlog().await;
+
+    assert!(pipeline.direct_placement_lanes.is_empty());
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.is_demoted()),
+        "a failed placement demotes its set"
+    );
+    // Handed back conventionally: written into the volume and committed
+    // there, and not fetched a second time.
+    assert!(committed(&pipeline, segment(job_id, 0, 0)));
+    assert!(!queued_segments(&mut pipeline, job_id).contains(&(0, 0)));
+    let (start, end) = article_extent(volumes[0].1.len(), 0, ARTICLES);
+    let volume = std::fs::read(working_dir.join(&volumes[0].0)).unwrap();
+    assert_eq!(&volume[start..end], &volumes[0].1[start..end]);
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+}

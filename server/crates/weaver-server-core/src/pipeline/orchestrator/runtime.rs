@@ -476,6 +476,8 @@ impl Pipeline {
             direct_placement_done_rx,
             #[cfg(test)]
             direct_placement_hold: None,
+            #[cfg(test)]
+            direct_placement_panics: false,
             direct_rearm_in_flight: HashSet::new(),
             direct_rearm_done_tx,
             direct_rearm_done_rx,

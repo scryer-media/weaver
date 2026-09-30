@@ -104,11 +104,21 @@ impl Pipeline {
             let done_tx = self.direct_placement_done_tx.clone();
             #[cfg(test)]
             let hold = self.direct_placement_hold.clone();
+            #[cfg(test)]
+            let panics = self.direct_placement_panics;
             let (outcome_tx, outcome) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
+            // The I/O runs on a task of its own, and this one only reports
+            // it: a panic in the I/O is a failed placement the pipeline
+            // applies, not a flight left writing forever with nothing to
+            // resolve it.
+            let writes = tokio::spawn(async move {
                 #[cfg(test)]
                 if let Some(hold) = hold {
                     let _ = hold.acquire().await;
+                }
+                #[cfg(test)]
+                if panics {
+                    panic!("test hook: the direct-store placement task panicked");
                 }
                 let (prepared, result) =
                     prepare_direct_destination_paths(job_id, unprepared, marking).await;
@@ -119,11 +129,21 @@ impl Pipeline {
                     Err(failure) => Err(failure),
                 };
                 // Every write has returned; a handle close waiting on these
-                // destinations may go ahead.
+                // destinations may go ahead. On a panic the ticket drops
+                // while the task unwinds, still before the outcome is sent.
                 drop(ticket);
+                DirectPlacementOutcome { prepared, result }
+            });
+            tokio::spawn(async move {
+                let outcome = writes.await.unwrap_or_else(|error| DirectPlacementOutcome {
+                    prepared: Vec::new(),
+                    result: Err(DirectPlacementError::Write(std::io::Error::other(format!(
+                        "the direct-store placement task did not complete: {error}"
+                    )))),
+                });
                 // The outcome first, so a join never waits on the done
                 // channel, which only the pipeline task drains.
-                let _ = outcome_tx.send(DirectPlacementOutcome { prepared, result });
+                let _ = outcome_tx.send(outcome);
                 // A closed channel is the pipeline gone; the flight goes with it.
                 let _ = done_tx
                     .send(DirectPlacementDone {

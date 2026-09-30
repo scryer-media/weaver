@@ -2742,6 +2742,9 @@ pub struct Pipeline {
     /// so a test can keep a destination write open for as long as it likes.
     #[cfg(test)]
     pub(super) direct_placement_hold: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// Test hook: a placement task panics once it is past the hold.
+    #[cfg(test)]
+    pub(super) direct_placement_panics: bool,
     /// Sets whose restart-seeded re-read is running; see [`DirectRearmDone`].
     pub(super) direct_rearm_in_flight: HashSet<(JobId, usize)>,
     pub(super) direct_rearm_done_tx: mpsc::Sender<DirectRearmDone>,
