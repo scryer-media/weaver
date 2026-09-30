@@ -717,6 +717,87 @@ pub(crate) const HOLDS_SCRATCH_PREFIX: &str = ".weaver-holds.";
 /// unbounded startup cost.
 const SWEEP_MAX_DEPTH: usize = 8;
 
+/// The identity-admitted plans a job's coverage rows can rebuild.
+///
+/// A row that does not decode, or that carries no binding, is left for
+/// [`restore_job`] to refuse as it always has. A binding that does not hold
+/// against the spec ([`DirectSetPlan::from_identity_binding`]) is dropped
+/// here, and the same refusal then meets its row as an unknown set. Across
+/// rows, the live rungs' own exclusions hold: a file bound by two sets, or a
+/// second header volume set, is a state no live job could have reached, and
+/// every set involved is dropped rather than one of them chosen.
+fn rebuild_identity_plans(
+    job_id: JobId,
+    spec: &JobSpec,
+    working_dir: &Path,
+    destination_dir: &Path,
+    rows: &HashMap<String, Vec<u8>>,
+) -> Vec<DirectSetPlan> {
+    let mut ordered: Vec<(&String, &Vec<u8>)> = rows.iter().collect();
+    ordered.sort();
+    let mut plans = Vec::new();
+    for (set_name, blob) in ordered {
+        let Ok(snapshot) = decode(blob) else {
+            continue;
+        };
+        let Some(binding) = snapshot.identity.as_ref() else {
+            continue;
+        };
+        match DirectSetPlan::from_identity_binding(
+            set_name,
+            binding,
+            spec,
+            working_dir,
+            destination_dir,
+        ) {
+            Ok(plan) => plans.push(plan),
+            Err(reason) => {
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    reason,
+                    "direct-store identity binding refused at restore; the set redownloads"
+                );
+            }
+        }
+    }
+    let mut owners: HashMap<u32, usize> = HashMap::new();
+    for plan in &plans {
+        for file_index in plan.files.keys() {
+            *owners.entry(*file_index).or_default() += 1;
+        }
+    }
+    let volume_sets = plans
+        .iter()
+        .filter(|plan| {
+            plan.identity
+                .is_some_and(|identity| identity.kind == super::plan::IdentityKind::HeaderVolumeSet)
+        })
+        .count();
+    plans.retain(|plan| {
+        let shared = plan
+            .files
+            .keys()
+            .any(|file_index| owners.get(file_index).copied().unwrap_or_default() > 1);
+        let second_volume_set = volume_sets > 1
+            && plan.identity.is_some_and(|identity| {
+                identity.kind == super::plan::IdentityKind::HeaderVolumeSet
+            });
+        if shared || second_volume_set {
+            tracing::info!(
+                job_id = job_id.0,
+                set_name = %plan.set_name,
+                shared,
+                second_volume_set,
+                "direct-store identity binding contradicts another at restore; the set redownloads"
+            );
+            return false;
+        }
+        true
+    });
+    plans
+}
+
 impl Pipeline {
     /// Restores a job's direct-store sets and the segments their coverage lets
     /// the job skip.
@@ -748,7 +829,7 @@ impl Pipeline {
         // own in this working directory even when nothing will route into them,
         // and those are the files a previously enabled binary wrote over the same
         // spec.
-        let (planned, refused) = DirectSetPlan::discover(spec, working_dir, &destination_dir);
+        let (mut planned, refused) = DirectSetPlan::discover(spec, working_dir, &destination_dir);
         if gate.is_enabled() {
             // The same counters the live admission seam emits. Restoring a job is
             // an admission decision too, and a set refused here is one whose
@@ -769,7 +850,7 @@ impl Pipeline {
                 );
             }
         }
-        let admitted: Vec<DirectSetPlan> = if gate.is_enabled() {
+        let mut admitted: Vec<DirectSetPlan> = if gate.is_enabled() {
             planned.clone()
         } else {
             Vec::new()
@@ -805,6 +886,20 @@ impl Pipeline {
         let (marker_rows, rows): (HashMap<String, Vec<u8>>, HashMap<String, Vec<u8>>) = rows
             .into_iter()
             .partition(|(_, blob)| super::snapshot::is_installed_marker(blob));
+        // A set admitted by identity is not rediscovered from the spec: its
+        // files' names say nothing, which is why it needed identity at all. Its
+        // checkpoint carries the plan it was admitted with, and a binding that
+        // still holds against this spec rebuilds that plan here, so the row is
+        // judged below exactly as a rediscovered set's would be. Only for a job
+        // whose spec names no set: the live rungs never admit by identity
+        // beside a name-admitted set, so a binding next to one is not a state
+        // this job could have been in.
+        if gate.is_enabled() && planned.is_empty() {
+            let rebuilt =
+                rebuild_identity_plans(job_id, spec, working_dir, &destination_dir, &rows);
+            admitted.extend(rebuilt.iter().cloned());
+            planned.extend(rebuilt);
+        }
         let mut installed: HashMap<String, super::snapshot::InstalledSet> = HashMap::new();
         let mut rejected_markers = 0usize;
         let ignored_markers = if gate.is_enabled() {
@@ -1074,6 +1169,15 @@ impl Pipeline {
                 continue;
             }
             let accepted = applied.get(&plan.set_name).cloned();
+            // An identity-admitted set comes back only on an accepted row. The
+            // binding is the whole case for its mapping, and a row refused for
+            // anything is a binding nothing vouches for any more: the set's
+            // files take the path a set with no row takes, where the live
+            // rungs judge them afresh as they arrive. Left in `restored`, so
+            // its rebuilt partials are still named for the sweep.
+            if plan.identity.is_some() && accepted.is_none() {
+                continue;
+            }
             let mut set = match (accepted.as_ref(), restored.remove(&plan.set_name)) {
                 (Some(_), Some(set)) => set,
                 _ => {

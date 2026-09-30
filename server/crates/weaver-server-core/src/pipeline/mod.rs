@@ -2937,6 +2937,15 @@ pub struct Pipeline {
     /// has landed have an entry at all. Dropped with the rest of the job's
     /// per-file runtime.
     pub(super) file_prefix_16k: HashMap<NzbFileId, Vec<u8>>,
+    /// The PAR2 content fingerprint (`hash_16k`, length) an identity roster
+    /// already proved for a file whose [`Self::file_prefix_16k`] capture did
+    /// not survive a restart.
+    ///
+    /// A restored set's files routed their offset-zero articles before the
+    /// restart, so no prefix is ever captured again; the roster binding the
+    /// checkpoint kept is the evidence instead. Consulted only where no
+    /// prefix exists, and dropped with the rest of the job's per-file runtime.
+    pub(super) file_proven_par2_fingerprint: HashMap<NzbFileId, ([u8; 16], u64)>,
     /// First non-zero decoded size declared by a yEnc header for each file.
     ///
     /// This is independent evidence about the file the poster intended to

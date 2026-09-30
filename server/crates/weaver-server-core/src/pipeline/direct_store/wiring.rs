@@ -157,6 +157,26 @@ pub(crate) struct IdentityAdmission {
     /// Files whose offset-zero bytes were evaluated and matched no roster
     /// volume — the extras: samples, nfo files, unrelated payload.
     pub(crate) no_match: HashSet<u32>,
+    /// Described sets a restart brought back from their checkpoints, by set
+    /// name, waiting for the recovery set's descriptions to be parsed again.
+    ///
+    /// The roster itself — each volume's fingerprint — was never persisted: the
+    /// descriptions are still on disk and say it again. What the checkpoint
+    /// kept is the set and its bindings, and those are what a re-armed roster
+    /// must start from, or a file bound before the restart would be matched a
+    /// second time and a second set admitted beside the first. Arming moves an
+    /// entry into [`Self::rosters`]; the restore drains whatever arming did not
+    /// claim right after the job's metadata reload, so this is empty again
+    /// before the job decodes an article.
+    pub(crate) restored_rosters: HashMap<String, RestoredRoster>,
+}
+
+/// A described set restored from its checkpoint, before its roster is armed.
+#[derive(Debug)]
+pub(crate) struct RestoredRoster {
+    pub(crate) set_index: usize,
+    /// NZB file index to volume index, exactly as the checkpoint bound them.
+    pub(crate) bound: HashMap<u32, u32>,
 }
 
 /// One set admitted from RAR5 headers rather than PAR2 descriptions.
@@ -1230,7 +1250,49 @@ impl Pipeline {
                 },
             );
         }
-        if rosters.is_empty() {
+        // A restored set whose descriptions just re-armed: its roster starts
+        // from the bindings the checkpoint kept, never empty. Held apart from
+        // the fresh rosters through the leak scan below, which is about
+        // admitting a *new* set and whose blanket refusal is not evidence
+        // against one that already owns bytes.
+        let mut resumed: HashMap<String, IdentityRoster> = HashMap::new();
+        let mut resumed_condemned: Vec<usize> = Vec::new();
+        if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
+            for (set_name, restored) in std::mem::take(&mut admission.restored_rosters) {
+                let Some(mut roster) = rosters.remove(&set_name) else {
+                    admission.restored_rosters.insert(set_name, restored);
+                    continue;
+                };
+                let expected = self
+                    .direct_store
+                    .sets
+                    .get(&job_id)
+                    .and_then(|sets| sets.get(restored.set_index))
+                    .and_then(|set| set.plan().identity)
+                    .and_then(|identity| identity.expected_volumes);
+                let consistent = expected == Some(roster.volumes.len() as u32)
+                    && restored
+                        .bound
+                        .values()
+                        .all(|volume_index| roster.volumes.contains_key(volume_index));
+                if !consistent {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        "a restored identity set disagrees with its re-parsed descriptions"
+                    );
+                    resumed_condemned.push(restored.set_index);
+                    continue;
+                }
+                roster.bound = restored.bound;
+                roster.set_index = Some(restored.set_index);
+                resumed.insert(set_name, roster);
+            }
+        }
+        for set_index in resumed_condemned {
+            self.condemn_restored_identity_set(job_id, set_index).await;
+        }
+        if rosters.is_empty() && resumed.is_empty() {
             return;
         }
 
@@ -1248,8 +1310,16 @@ impl Pipeline {
         };
         let mut leaked: HashSet<u32> = HashSet::new();
         let mut no_match: HashSet<u32> = HashSet::new();
+        let resumed_files: HashSet<u32> = resumed
+            .values()
+            .flat_map(|roster| roster.bound.keys().copied())
+            .collect();
+        let mut resumed_leaks: Vec<usize> = Vec::new();
         for file_index in 0..state.spec.files.len() as u32 {
+            // A resumed set's own files have bytes because the set routed
+            // them; those bytes are the set's, not a leak.
             if carrier_files.contains(&file_index)
+                || resumed_files.contains(&file_index)
                 || matches!(
                     state.spec.files[file_index as usize].role,
                     weaver_model::files::FileRole::Par2 { .. }
@@ -1268,6 +1338,42 @@ impl Pipeline {
             }
             leaked.insert(file_index);
             let prefix = self.file_prefix_16k.get(&file_id);
+            // A started file that proves to be one of a resumed set's unbound
+            // volumes leaves that set unfillable, exactly as the seam's leaked
+            // match does. One whose prefix is not held cannot be judged here;
+            // it can never bind either, so the viability sweep counts it out.
+            if let Some(prefix) = prefix {
+                let proven: Vec<String> = resumed
+                    .iter()
+                    .filter(|(_, roster)| {
+                        let claimed: HashSet<u32> = roster.bound.values().copied().collect();
+                        roster.volumes.iter().any(|(volume_index, volume)| {
+                            let window = volume
+                                .length
+                                .min(crate::pipeline::PAR2_HASH_16K_BYTES as u64)
+                                as usize;
+                            !claimed.contains(volume_index)
+                                && window > 0
+                                && prefix.len() >= window
+                                && par2_rs::checksum::md5(&prefix[..window]) == volume.hash_16k
+                        })
+                    })
+                    .map(|(set_name, _)| set_name.clone())
+                    .collect();
+                for set_name in proven {
+                    if let Some(roster) = resumed.remove(&set_name)
+                        && let Some(set_index) = roster.set_index
+                    {
+                        warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            file_index,
+                            "a restored identity set's volume already has conventional bytes"
+                        );
+                        resumed_leaks.push(set_index);
+                    }
+                }
+            }
             let mut matched_sets: Vec<String> = Vec::new();
             let mut evaluated_all = true;
             for (set_name, roster) in &rosters {
@@ -1317,14 +1423,47 @@ impl Pipeline {
                 }
                 rosters.clear();
             }
-            if rosters.is_empty() {
-                return;
+            if rosters.is_empty() && resumed.is_empty() {
+                break;
             }
         }
+        for set_index in std::mem::take(&mut resumed_leaks) {
+            self.condemn_restored_identity_set(job_id, set_index).await;
+        }
+        if rosters.is_empty() && resumed.is_empty() {
+            return;
+        }
 
+        // A resumed set's bound files routed their offset-zero articles before
+        // the restart, so their captured prefixes are gone for good. The
+        // binding the checkpoint kept already proved each one's fingerprint;
+        // without it the files could never bind to their descriptions again
+        // and the set would demote as unbindable at completion.
+        for roster in resumed.values() {
+            for (&file_index, volume_index) in &roster.bound {
+                let file_id = NzbFileId { job_id, file_index };
+                if self.file_prefix_16k.contains_key(&file_id) {
+                    continue;
+                }
+                if let Some(volume) = roster.volumes.get(volume_index) {
+                    self.file_proven_par2_fingerprint
+                        .insert(file_id, (volume.hash_16k, volume.length));
+                }
+            }
+        }
         let admission = self.direct_store.identity.entry(job_id).or_default();
         admission.leaked.extend(leaked);
         admission.no_match.extend(no_match);
+        for (set_name, roster) in resumed {
+            info!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                volumes = roster.volumes.len(),
+                bound = roster.bound.len(),
+                "identity admission re-armed a restored archive set from PAR2 descriptions"
+            );
+            admission.rosters.insert(set_name, roster);
+        }
         for (set_name, roster) in rosters {
             crate::runtime::perf_probe::record(
                 "direct_store.identity.armed",
@@ -1374,11 +1513,22 @@ impl Pipeline {
         // metadata named the volumes — are the stronger evidence and go
         // first; a job without them falls to the header rung, where the
         // volumes' own RAR5 headers are the remaining identity source.
-        let has_rosters = self
+        let (has_rosters, awaiting_rosters) = self
             .direct_store
             .identity
             .get(&job_id)
-            .is_some_and(|admission| !admission.rosters.is_empty());
+            .map(|admission| {
+                (
+                    !admission.rosters.is_empty(),
+                    !admission.restored_rosters.is_empty(),
+                )
+            })
+            .unwrap_or_default();
+        // A restored described set whose roster is not armed yet owns volumes
+        // still to come; neither rung may bid for them until it is.
+        if !has_rosters && awaiting_rosters {
+            return None;
+        }
         if !has_rosters {
             return self.direct_header_route_target(file_id).await;
         }
@@ -1549,6 +1699,7 @@ impl Pipeline {
             volumes: BTreeMap::from([(volume_index, file_index)]),
             files: HashMap::from([(file_index, volume_index)]),
             identity: Some(IdentityPlanFacts {
+                kind: super::plan::IdentityKind::Roster,
                 expected_volumes: Some(expected_volumes),
                 // The first bound file's index: stable by construction, which
                 // the derived minimum is not while the mapping grows.
@@ -1914,6 +2065,7 @@ impl Pipeline {
                 volumes: BTreeMap::from([(volume_number, file_index)]),
                 files: HashMap::from([(file_index, volume_number)]),
                 identity: Some(IdentityPlanFacts {
+                    kind: super::plan::IdentityKind::HeaderVolumeSet,
                     expected_volumes: None,
                     discriminator: file_index,
                 }),
@@ -1968,6 +2120,7 @@ impl Pipeline {
             volumes: BTreeMap::from([(0, file_index)]),
             files: HashMap::from([(file_index, 0)]),
             identity: Some(IdentityPlanFacts {
+                kind: super::plan::IdentityKind::Standalone,
                 expected_volumes: Some(1),
                 discriminator: file_index,
             }),
@@ -2115,6 +2268,7 @@ impl Pipeline {
         // refused. The retained entry costs one map probe per offset-zero
         // article.
         if admission.rosters.is_empty()
+            && admission.restored_rosters.is_empty()
             && admission.header_sets.is_empty()
             && admission.leaked.is_empty()
             && admission.no_match.is_empty()
@@ -2122,6 +2276,150 @@ impl Pipeline {
         {
             self.direct_store.identity.remove(&job_id);
         }
+    }
+
+    /// Registers the identity-admitted sets a restore brought back, so the
+    /// live rungs extend them with the files still to come instead of
+    /// admitting a second set out of those files.
+    ///
+    /// Called once the job exists and its sets are installed, before its
+    /// metadata is reloaded. A header volume set joins the header registry
+    /// with its checkpointed bindings; a described set waits in
+    /// [`IdentityAdmission::restored_rosters`] for its descriptions to re-arm
+    /// it; a standalone archive, closed at admission, needs neither. A set
+    /// whose every volume is already bound needs no registration at all,
+    /// exactly as a live set retires its bookkeeping once it is whole.
+    ///
+    /// The files the job already downloaded conventionally are recorded as
+    /// leaked: the run that wrote them knew it, and a set's viability is
+    /// judged against the files that could still bind — which those never can.
+    pub(crate) fn reinstate_restored_identity_sets(&mut self, job_id: JobId) {
+        let mut header_sets: Vec<HeaderSet> = Vec::new();
+        let mut restored_rosters: HashMap<String, RestoredRoster> = HashMap::new();
+        let mut owned_files: HashSet<u32> = HashSet::new();
+        let mut reprioritize: Vec<(u32, u32)> = Vec::new();
+        for (set_index, set) in self.direct_store.sets_for(job_id).iter().enumerate() {
+            let plan = set.plan();
+            owned_files.extend(plan.files.keys().copied());
+            let Some(identity) = plan.identity else {
+                continue;
+            };
+            if set.is_demoted() || set.is_finalized() {
+                continue;
+            }
+            let whole = identity
+                .expected_volumes
+                .is_some_and(|expected| plan.volumes.len() as u32 == expected);
+            match identity.kind {
+                super::plan::IdentityKind::Standalone => continue,
+                _ if whole => {}
+                super::plan::IdentityKind::HeaderVolumeSet => header_sets.push(HeaderSet {
+                    set_index,
+                    bound: plan.files.clone(),
+                    volume_set: true,
+                }),
+                super::plan::IdentityKind::Roster => {
+                    restored_rosters.insert(
+                        plan.set_name.clone(),
+                        RestoredRoster {
+                            set_index,
+                            bound: plan.files.clone(),
+                        },
+                    );
+                }
+            }
+            reprioritize.extend(
+                plan.volumes
+                    .iter()
+                    .map(|(volume_index, file_index)| (*file_index, *volume_index)),
+            );
+        }
+        if header_sets.is_empty() && restored_rosters.is_empty() {
+            return;
+        }
+        let leaked: HashSet<u32> = match self.jobs.get(&job_id) {
+            Some(state) => (0..state.spec.files.len() as u32)
+                .filter(|file_index| {
+                    !owned_files.contains(file_index)
+                        && !matches!(
+                            state.spec.files[*file_index as usize].role,
+                            weaver_model::files::FileRole::Par2 { .. }
+                        )
+                        && state
+                            .assembly
+                            .file(NzbFileId {
+                                job_id,
+                                file_index: *file_index,
+                            })
+                            .is_some_and(|file| file.received_bytes() > 0)
+                })
+                .collect(),
+            None => return,
+        };
+        for header_set in &header_sets {
+            info!(
+                job_id = job_id.0,
+                set_index = header_set.set_index,
+                bound = header_set.bound.len(),
+                "restored an identity-admitted header volume set"
+            );
+        }
+        for (set_name, roster) in &restored_rosters {
+            info!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                bound = roster.bound.len(),
+                "restored an identity-admitted described set; its roster re-arms from the \
+                 recovery set"
+            );
+        }
+        let admission = self.direct_store.identity.entry(job_id).or_default();
+        admission.header_sets.extend(header_sets);
+        admission.restored_rosters.extend(restored_rosters);
+        admission.leaked.extend(leaked);
+        for (file_index, volume_index) in reprioritize {
+            self.reprioritize_bound_identity_file(job_id, file_index, volume_index);
+        }
+        self.boost_identity_probe_segments(job_id);
+    }
+
+    /// Ends the wait of every restored described set whose roster the
+    /// metadata reload did not re-arm.
+    ///
+    /// Such a set can bind nothing further — the roster is what a new file is
+    /// matched against — so it could never become whole and never finalize. It
+    /// demotes, which costs what refusing its row would have: its volumes are
+    /// materialized and the job goes on conventionally.
+    pub(crate) async fn settle_restored_identity_rosters(&mut self, job_id: JobId) {
+        let unarmed: Vec<(String, usize)> = self
+            .direct_store
+            .identity
+            .get_mut(&job_id)
+            .map(|admission| {
+                std::mem::take(&mut admission.restored_rosters)
+                    .into_iter()
+                    .map(|(set_name, roster)| (set_name, roster.set_index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (set_name, set_index) in unarmed {
+            warn!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                "a restored identity set's descriptions did not re-arm its roster"
+            );
+            self.condemn_restored_identity_set(job_id, set_index).await;
+        }
+    }
+
+    /// Demotes a restored described set its roster cannot carry, with the
+    /// same latch a failed live roster set sets.
+    async fn condemn_restored_identity_set(&mut self, job_id: JobId, set_index: usize) {
+        if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
+            admission.header_volume_sets_poisoned = true;
+        }
+        self.demote_direct_set(job_id, set_index, DemotionReason::IdentityRosterUnfillable)
+            .await;
     }
 
     /// Retires one header set: drops its bookkeeping and demotes it through
@@ -2181,6 +2479,7 @@ impl Pipeline {
         // refused. The retained entry costs one map probe per offset-zero
         // article.
         if admission.rosters.is_empty()
+            && admission.restored_rosters.is_empty()
             && admission.header_sets.is_empty()
             && admission.leaked.is_empty()
             && admission.no_match.is_empty()
