@@ -136,6 +136,11 @@ impl Pipeline {
                 warn!(path = %dir.display(), error = %error, "download folder unavailable");
             }
         }
+        let storage_capacity = Arc::new(crate::operations::StorageCapacity::start(
+            data_dir.clone(),
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+        ));
         let uu_spool_root = intermediate_dir.join(".uu-park");
         let cleanup_root = uu_spool_root.clone();
         if let Err(error) =
@@ -252,10 +257,9 @@ impl Pipeline {
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
-            uu_spool_capacity: crate::operations::CapacitySampler::new(
-                intermediate_dir.clone(),
-                Pipeline::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL,
-            ),
+            uu_spool_capacity: storage_capacity
+                .reader(crate::operations::StorageRoot::Intermediate),
+            uu_spool_debits: crate::operations::CapacityDebits::default(),
             uu_spool_blocked_spill_bytes: None,
             intermediate_dir,
             complete_dir,
@@ -419,9 +423,12 @@ impl Pipeline {
             #[cfg(test)]
             par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
-            direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
-                direct_store_settings,
-            ),
+            direct_store:
+                crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_working_capacity(
+                    direct_store_settings,
+                    storage_capacity.reader(crate::operations::StorageRoot::Intermediate),
+                ),
+            storage_capacity,
             direct_unpack:
                 crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime::with_settings(
                     direct_unpack_settings,
@@ -595,6 +602,13 @@ impl Pipeline {
 
     pub fn nntp_pool(&self) -> Arc<weaver_nntp::pool::NntpPool> {
         self.nntp.pool().clone()
+    }
+
+    /// The background free-space samplers for the data, intermediate and
+    /// complete roots, for readers outside the pipeline (metrics, the NZBGet
+    /// status). Reading them never touches the filesystem.
+    pub fn storage_capacity(&self) -> Arc<crate::operations::StorageCapacity> {
+        Arc::clone(&self.storage_capacity)
     }
 
     /// Point the per-server metric counters at the servers of `nntp`.
@@ -2829,31 +2843,6 @@ fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
     metrics.small_total * BufferTier::Small.size_bytes()
         + metrics.medium_total * BufferTier::Medium.size_bytes()
         + metrics.large_total * BufferTier::Large.size_bytes()
-}
-
-pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    match crate::operations::probe_nearest_disk_space(output_dir) {
-        Ok(space) => {
-            let available = space.available_bytes;
-            if available < needed_bytes {
-                let avail_mb = available / (1024 * 1024);
-                let need_mb = needed_bytes / (1024 * 1024);
-                warn!(
-                    available_mb = avail_mb,
-                    needed_mb = need_mb,
-                    "output directory may not have enough free disk space"
-                );
-            } else {
-                let avail_mb = available / (1024 * 1024);
-                debug!(available_mb = avail_mb, "disk space check passed");
-            }
-        }
-        Err(error) => debug!(
-            path = %output_dir.display(),
-            error = %error,
-            "could not check free disk space"
-        ),
-    }
 }
 
 pub(crate) fn timestamp_secs() -> u64 {

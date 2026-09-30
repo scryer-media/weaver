@@ -295,13 +295,24 @@ impl std::fmt::Debug for DirectStoreRuntime {
 }
 
 impl DirectStoreRuntime {
-    /// Builds a runtime from the settings resolved at pipeline construction
-    /// (config, with the env override winning).
+    /// A runtime whose holds disk reserve has no free-space reading.
+    #[cfg(test)]
     pub(crate) fn with_settings(settings: DirectStoreSettings) -> Self {
+        Self::with_working_capacity(settings, crate::operations::CapacityReader::unknown())
+    }
+
+    /// Builds a runtime from the settings resolved at pipeline construction
+    /// (config, with the env override winning). `working_capacity` reads the
+    /// working directory's free space for the holds disk reserve.
+    pub(crate) fn with_working_capacity(
+        settings: DirectStoreSettings,
+        working_capacity: crate::operations::CapacityReader,
+    ) -> Self {
         Self {
             settings: Some(settings),
-            accountant: std::sync::Arc::new(super::accountant::HoldsAccountant::new(
+            accountant: std::sync::Arc::new(super::accountant::HoldsAccountant::with_probe(
                 settings.holds_limits(),
+                working_capacity,
             )),
             ..Self::default()
         }

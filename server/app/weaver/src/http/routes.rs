@@ -143,6 +143,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         rss,
         watch_folder,
         scheduled_resume,
+        disk_space.reader(weaver_server_core::operations::StorageRoot::Complete),
     );
     let backup_upload_routes = Router::new()
         .route("/inspect", post(super::backup::backup_inspect_handler))

@@ -71,9 +71,11 @@ impl Pipeline {
         let (initial_entries, initial_bytes) = match ExtractionRoot::snapshot_usage(staging) {
             Ok(usage) => usage,
             Err(error) => {
-                let budget = JobExtractionBudget::new_with_process_memory(
+                let budget = JobExtractionBudget::with_capacity(
                     Arc::clone(&self.extraction_limits),
                     self.process_memory_budget.for_job(job_id.0),
+                    self.storage_capacity
+                        .reader(crate::operations::StorageRoot::Complete),
                     staging.to_path_buf(),
                     declared_archive_bytes,
                     0,
@@ -88,9 +90,11 @@ impl Pipeline {
                 return Err(rejection);
             }
         };
-        let budget = JobExtractionBudget::new_with_process_memory(
+        let budget = JobExtractionBudget::with_capacity(
             Arc::clone(&self.extraction_limits),
             self.process_memory_budget.for_job(job_id.0),
+            self.storage_capacity
+                .reader(crate::operations::StorageRoot::Complete),
             staging.to_path_buf(),
             declared_archive_bytes,
             initial_entries,

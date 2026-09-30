@@ -6,7 +6,6 @@ mod history;
 mod runtime;
 mod state;
 
-pub(crate) use runtime::check_disk_space;
 pub(super) use runtime::timestamp_secs;
 pub(crate) use runtime::{
     DirectWriteBatches, close_cached_write_handles_under, is_terminal_status,

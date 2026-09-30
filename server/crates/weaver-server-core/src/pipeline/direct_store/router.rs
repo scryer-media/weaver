@@ -3349,8 +3349,7 @@ impl DirectSetRouter {
         // images exist. A refusal is a demotion, as it is for a spill.
         if self.scratch.is_pinned() {
             self.publish_holds();
-            self.accountant
-                .admit_scratch(live_bytes, &self.plan.working_dir)?;
+            self.accountant.admit_scratch(live_bytes)?;
         }
         let ranges: Vec<(u64, u64)> = extents
             .iter()
@@ -3425,8 +3424,7 @@ impl DirectSetRouter {
     /// the disk reserve — then appended to this set's own scratch, under its
     /// own ceiling. Published either way.
     fn spill_to_scratch(&mut self, bytes: &[u8]) -> Result<u64, DemotionReason> {
-        self.accountant
-            .admit_scratch(bytes.len() as u64, &self.plan.working_dir)?;
+        self.accountant.admit_scratch(bytes.len() as u64)?;
         let appended = self.scratch.append(bytes);
         self.publish_holds();
         appended

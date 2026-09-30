@@ -443,23 +443,22 @@ async fn uu_park_refuses_to_spill_when_free_space_is_unknown() {
 async fn uu_spill_admission_debits_the_cached_free_space_reading() {
     // Two spills inside one probe interval must not both see the headroom
     // the single reading reported.
-    use crate::operations::{CapacitySampler, DiskSpace};
+    use crate::operations::{Capacity, CapacityReader, CapacityReading};
 
     let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90], vec![b'c'; 85]];
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.write_backlog_budget_bytes = 1;
     let headroom = pipeline.uu_spool_min_free_bytes + 100;
-    pipeline.uu_spool_capacity = CapacitySampler::with_probe(
-        pipeline.intermediate_dir.clone(),
-        Duration::from_secs(3600),
-        Box::new(move |_| {
-            Ok(DiskSpace {
-                total_bytes: u64::MAX,
-                available_bytes: headroom,
-            })
-        }),
-    );
+    let taken = std::time::Instant::now();
+    pipeline.uu_spool_capacity = CapacityReader::from_fn(move || {
+        Capacity::Known(CapacityReading {
+            available_bytes: headroom,
+            total_bytes: u64::MAX,
+            sampled_at: taken,
+            stale: false,
+        })
+    });
     let job_id = JobId(20185);
     insert_active_job(
         &mut pipeline,
@@ -478,7 +477,7 @@ async fn uu_spill_admission_debits_the_cached_free_space_reading() {
         "the first spill fits the headroom"
     );
     assert_eq!(
-        pipeline.uu_spool_capacity.current().best_available_bytes(),
+        pipeline.uu_spool_capacity().best_available_bytes(),
         Some(headroom - parts[1].len() as u64),
         "the admitted spill is debited from the cached reading"
     );

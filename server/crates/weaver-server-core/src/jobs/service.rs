@@ -11,7 +11,7 @@ use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::jobs::working_dir::{compute_working_dir, stamp_working_dir};
-use crate::pipeline::{Pipeline, check_disk_space};
+use crate::pipeline::Pipeline;
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
 #[derive(Debug, Default)]
@@ -794,8 +794,6 @@ impl Pipeline {
             stage = "active_job_persisted",
             "pipeline add_job stage"
         );
-
-        check_disk_space(&self.intermediate_dir, spec.total_bytes);
 
         let queue_depth = download_queue.len() + recovery_queue.len();
 

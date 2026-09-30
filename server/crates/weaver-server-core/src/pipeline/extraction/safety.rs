@@ -10,7 +10,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use tracing::{info, warn};
 
-use crate::operations::disk::{Capacity, CapacitySampler, probe_nearest_disk_space};
+use crate::operations::disk::{Capacity, CapacityDebits, CapacityReader, probe_nearest_disk_space};
 use crate::operations::metrics::PipelineMetrics;
 
 const MIB: u64 = 1024 * 1024;
@@ -182,16 +182,17 @@ impl std::fmt::Display for ExtractionFailure {
 
 /// Free-space accounting for the extraction root.
 ///
-/// The sampler re-reads the filesystem at most once per
-/// [`DISK_REFRESH_INTERVAL`] and holds the last good reading across probe
-/// failures, so a transient stat error (a NAS hiccup, a path that is briefly
-/// unreachable) never rejects a write on its own. Only a fresh reading that
-/// confirms the reserve would be breached rejects; while the filesystem cannot
-/// be read the reserve check stands down and the write itself is the last
-/// line of defence.
+/// The reading comes from a sampler that refreshes on its own thread and
+/// holds the last good reading across probe failures, so a transient stat
+/// error (a NAS hiccup, a path that is briefly unreachable) never rejects a
+/// write on its own. Only a fresh reading that confirms the reserve would be
+/// breached rejects; while the filesystem cannot be read the reserve check
+/// stands down and the write itself is the last line of defence. Writes
+/// admitted against a reading are debited from it until the next one.
 #[derive(Debug)]
 struct DiskBudgetState {
-    sampler: CapacitySampler,
+    capacity: CapacityReader,
+    debits: CapacityDebits,
 }
 
 #[derive(Debug, Default)]
@@ -836,9 +837,11 @@ impl JobExtractionBudget {
         metrics: Arc<PipelineMetrics>,
     ) -> Result<Arc<Self>, String> {
         let process_memory = Arc::new(ProcessMemoryBudget::new(limits.max_memory_bytes));
-        Self::new_with_process_memory(
+        let capacity = CapacityReader::probing(root_path.clone(), DISK_REFRESH_INTERVAL);
+        Self::with_capacity(
             limits,
             process_memory,
+            capacity,
             root_path,
             declared_archive_bytes,
             initial_entries,
@@ -847,9 +850,38 @@ impl JobExtractionBudget {
         )
     }
 
+    /// [`Self::with_capacity`] reading the root's free space itself, on the
+    /// calling thread.
+    #[cfg(test)]
     pub(crate) fn new_with_process_memory(
         limits: Arc<ExtractionLimits>,
         process_memory: Arc<ProcessMemoryBudget>,
+        root_path: PathBuf,
+        declared_archive_bytes: u64,
+        initial_entries: u64,
+        initial_bytes: u64,
+        metrics: Arc<PipelineMetrics>,
+    ) -> Result<Arc<Self>, String> {
+        let capacity = CapacityReader::probing(root_path.clone(), DISK_REFRESH_INTERVAL);
+        Self::with_capacity(
+            limits,
+            process_memory,
+            capacity,
+            root_path,
+            declared_archive_bytes,
+            initial_entries,
+            initial_bytes,
+            metrics,
+        )
+    }
+
+    /// `capacity` reads the extraction root's free space. On the pipeline it
+    /// is the complete root's sampler, so building a budget never probes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_capacity(
+        limits: Arc<ExtractionLimits>,
+        process_memory: Arc<ProcessMemoryBudget>,
+        capacity: CapacityReader,
         root_path: PathBuf,
         declared_archive_bytes: u64,
         initial_entries: u64,
@@ -860,11 +892,10 @@ impl JobExtractionBudget {
             .saturating_mul(limits.max_ratio)
             .max(GIB);
         let effective_job_limit_bytes = limits.max_job_bytes.min(ratio_limit_bytes);
-        let mut sampler = CapacitySampler::new(root_path.clone(), DISK_REFRESH_INTERVAL);
-        if sampler.refresh() == Capacity::Unknown {
-            // The sampler already logged the operating-system reason. The job
-            // proceeds without a reserve check until a reading arrives; the
-            // extraction root's own writes surface a full disk.
+        if capacity.current() == Capacity::Unknown {
+            // The sampler logs the operating-system reason. The job proceeds
+            // without a reserve check until a reading arrives; the extraction
+            // root's own writes surface a full disk.
             warn!(
                 root = %root_path.display(),
                 "extraction root capacity is unknown; the disk reserve is not enforced until a reading arrives"
@@ -892,7 +923,10 @@ impl JobExtractionBudget {
             memory_reserved: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             failure: Mutex::new(None),
-            disk: Mutex::new(DiskBudgetState { sampler }),
+            disk: Mutex::new(DiskBudgetState {
+                capacity,
+                debits: CapacityDebits::default(),
+            }),
             active: Mutex::new(ActiveState::default()),
             idle: Condvar::new(),
             metrics,
@@ -920,12 +954,8 @@ impl JobExtractionBudget {
     /// Whether the extraction root has produced at least one capacity reading.
     #[cfg(all(test, unix))]
     pub(crate) fn disk_capacity_known(&self) -> bool {
-        self.disk
-            .lock()
-            .expect("extraction disk state poisoned")
-            .sampler
-            .current()
-            != Capacity::Unknown
+        let disk = self.disk.lock().expect("extraction disk state poisoned");
+        disk.capacity.current() != Capacity::Unknown
     }
 
     pub(crate) fn is_rejection(error: &str) -> bool {
@@ -1345,7 +1375,8 @@ impl JobExtractionBudget {
 
     fn reserve_disk(&self, bytes: u64) -> Result<(), ExtractionFailure> {
         let mut disk = self.disk.lock().expect("extraction disk state poisoned");
-        let Some(reading) = disk.sampler.sample().reading() else {
+        let current = disk.capacity.current();
+        let Some(reading) = disk.debits.apply(current).reading() else {
             // No reading has ever succeeded for this root: nothing to account
             // against, and refusing on ignorance would fail the job for a
             // problem the filesystem never reported.
@@ -1364,7 +1395,7 @@ impl JobExtractionBudget {
         // A stale reading keeps being debited so the estimate stays honest,
         // but only a fresh reading may reject: the next successful probe
         // confirms or clears the breach within one refresh interval.
-        disk.sampler.debit(bytes);
+        disk.debits.debit(bytes);
         Ok(())
     }
 
@@ -1376,7 +1407,7 @@ impl JobExtractionBudget {
         self.disk
             .lock()
             .expect("extraction disk state poisoned")
-            .sampler
+            .debits
             .credit(bytes);
     }
 
@@ -3135,6 +3166,67 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("deadline")
+        );
+    }
+
+    #[test]
+    fn the_disk_reserve_judges_the_injected_reading_and_debits_it_until_the_next() {
+        use crate::operations::disk::CapacityReading;
+
+        let taken = Instant::now();
+        let reading = Arc::new(Mutex::new(Capacity::Unknown));
+        let reads = Arc::clone(&reading);
+        let budget = JobExtractionBudget::with_capacity(
+            Arc::new(ExtractionLimits {
+                max_job_bytes: 10_000,
+                max_member_bytes: 10_000,
+                max_ratio: 10_000,
+                min_free_bytes: 500,
+                ..(*limits()).clone()
+            }),
+            Arc::new(ProcessMemoryBudget::new(64 * MIB)),
+            CapacityReader::from_fn(move || *reads.lock().unwrap()),
+            PathBuf::from("/injected"),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let set = |available_bytes, sampled_at, stale| {
+            *reading.lock().unwrap() = Capacity::Known(CapacityReading {
+                available_bytes,
+                total_bytes: u64::MAX,
+                sampled_at,
+                stale,
+            });
+        };
+
+        // Before any reading there is nothing to judge against.
+        budget.reserve_write(0, 5000).unwrap();
+        budget.rollback_write_reservation(5000);
+
+        // 1000 free, 500 reserved: writes spend the one reading between
+        // refreshes, and a rolled-back write gives its bytes back.
+        set(1000, taken, false);
+        budget.reserve_write(0, 300).unwrap();
+        budget.reserve_write(0, 100).unwrap();
+        budget.rollback_write_reservation(100);
+        budget.reserve_write(0, 200).unwrap();
+
+        // A stale reading of the same probe keeps the debits but never
+        // rejects on its own.
+        set(1000, taken, true);
+        budget.reserve_write(0, 100).unwrap();
+
+        // A fresh reading that confirms the breach rejects.
+        set(550, taken + Duration::from_secs(5), false);
+        assert!(
+            budget
+                .reserve_write(0, 100)
+                .unwrap_err()
+                .to_string()
+                .contains("disk_reserve")
         );
     }
 

@@ -24,18 +24,11 @@
 //! rule the extractor keeps for its own output — and refuses a spill that would
 //! eat into it, before the write.
 
-use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use super::router::DemotionReason;
-
-/// How long a free-space reading stays authoritative before the accountant
-/// asks the filesystem again. Between readings the estimate is decremented by
-/// every spill it admits, so a burst of paging inside one interval cannot run
-/// ahead of the reserve on a stale number.
-const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+use crate::operations::disk::{CapacityDebits, CapacityReader};
 
 /// The process-wide ceilings, resolved once with the rest of the direct-store
 /// settings.
@@ -71,30 +64,21 @@ pub(crate) struct HoldsCharge {
     scratch: u64,
 }
 
-/// Reads the free bytes on the filesystem backing a path. `None` when the
-/// filesystem cannot say, which the accountant treats as no reserve to
-/// enforce rather than as an empty disk: a probe failure must not demote a
-/// set that was routing fine.
-pub(crate) type DiskProbe = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
-
-#[derive(Debug)]
-struct DiskEstimate {
-    refreshed: Option<Instant>,
-    /// Free bytes at the last successful reading, less every spill admitted
-    /// since. Held across probe failures so admissions keep being accounted.
-    available: Option<u64>,
-    /// The most recent probe failed; `available` is the last good reading.
-    /// A stale reading is debited but never refuses, since only a fresh
-    /// reading can confirm the reserve is really gone.
-    stale: bool,
-}
+/// The working directory's latest free-space reading. Reading it never
+/// touches the filesystem: the runtime's sampler refreshes it on its own
+/// thread. No reading at all is treated as no reserve to enforce rather than
+/// as an empty disk, since a probe failure must not demote a set that was
+/// routing fine.
+pub(crate) type DiskProbe = CapacityReader;
 
 /// See the module documentation.
 pub(crate) struct HoldsAccountant {
     limits: HoldsLimits,
     resident: AtomicU64,
     scratch: AtomicU64,
-    disk: Mutex<DiskEstimate>,
+    /// Spills admitted against the current reading, so a burst of paging
+    /// between refreshes cannot run ahead of the reserve on one number.
+    disk: Mutex<CapacityDebits>,
     probe: DiskProbe,
 }
 
@@ -116,26 +100,10 @@ impl Default for HoldsAccountant {
 }
 
 impl HoldsAccountant {
-    /// An accountant over the real filesystem.
+    /// An accountant with no free-space reading: the reserve is not
+    /// enforced until [`Self::with_probe`] gives it one.
     pub(crate) fn new(limits: HoldsLimits) -> Self {
-        Self::with_probe(
-            limits,
-            Box::new(|path| {
-                // A missing working directory must not borrow capacity from
-                // its parent. Keep the estimate stale until this path returns.
-                match crate::operations::disk::probe_disk_space(path) {
-                    Ok(space) => Some(space.available_bytes),
-                    Err(error) => {
-                        tracing::debug!(
-                            path = %path.display(),
-                            error = %error,
-                            "holds scratch free-space reading unavailable"
-                        );
-                        None
-                    }
-                }
-            }),
-        )
+        Self::with_probe(limits, CapacityReader::unknown())
     }
 
     /// An accountant that never refuses anything.
@@ -143,18 +111,14 @@ impl HoldsAccountant {
         Self::new(HoldsLimits::UNBOUNDED)
     }
 
-    /// An accountant whose free-space reading is whatever `probe` says. The
-    /// tests drive the reserve with it; production uses [`Self::new`].
+    /// An accountant whose free-space reading is whatever `probe` reads:
+    /// the working root's sampler in production, a fixed reading in tests.
     pub(crate) fn with_probe(limits: HoldsLimits, probe: DiskProbe) -> Self {
         Self {
             limits,
             resident: AtomicU64::new(0),
             scratch: AtomicU64::new(0),
-            disk: Mutex::new(DiskEstimate {
-                refreshed: None,
-                available: None,
-                stale: false,
-            }),
+            disk: Mutex::new(CapacityDebits::default()),
             probe,
         }
     }
@@ -189,13 +153,14 @@ impl HoldsAccountant {
         self.publish(charge, 0, 0);
     }
 
-    /// Whether `bytes` more scratch may be written under `dir`: inside the
-    /// shared scratch ceiling, and leaving the filesystem its reserve.
+    /// Whether `bytes` more scratch may be written to the working directory:
+    /// inside the shared scratch ceiling, and leaving the filesystem its
+    /// reserve.
     ///
     /// Judged on the published totals, so a router calls this with its own
     /// scratch charge current. Admission spends the free-space estimate; a
     /// spill the caller then fails to make is reconciled at the next reading.
-    pub(crate) fn admit_scratch(&self, bytes: u64, dir: &Path) -> Result<(), DemotionReason> {
+    pub(crate) fn admit_scratch(&self, bytes: u64) -> Result<(), DemotionReason> {
         if self.scratch_bytes().saturating_add(bytes) > self.limits.scratch_bytes {
             return Err(DemotionReason::HoldsScratchCeiling);
         }
@@ -206,26 +171,17 @@ impl HoldsAccountant {
             .disk
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let stale = disk
-            .refreshed
-            .is_none_or(|refreshed| refreshed.elapsed() >= DISK_REFRESH_INTERVAL);
-        if stale {
-            match (self.probe)(dir) {
-                Some(available) => {
-                    disk.available = Some(available);
-                    disk.stale = false;
-                }
-                None => disk.stale = true,
-            }
-            disk.refreshed = Some(Instant::now());
-        }
-        let Some(available) = disk.available else {
+        let Some(reading) = disk.apply(self.probe.current()).reading() else {
             return Ok(());
         };
-        if !disk.stale && available < bytes.saturating_add(self.limits.disk_reserve_bytes) {
+        // A stale reading is debited but never refuses: only a fresh reading
+        // can confirm the reserve is really gone.
+        if !reading.stale
+            && reading.available_bytes < bytes.saturating_add(self.limits.disk_reserve_bytes)
+        {
             return Err(DemotionReason::HoldsScratchDiskReserve);
         }
-        disk.available = Some(available.saturating_sub(bytes));
+        disk.debit(bytes);
         Ok(())
     }
 }
@@ -241,8 +197,10 @@ fn adjust(total: &AtomicU64, from: u64, to: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::disk::{Capacity, CapacityReading};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
 
     fn limits(resident: u64, scratch: u64, reserve: u64) -> HoldsLimits {
         HoldsLimits {
@@ -252,10 +210,20 @@ mod tests {
         }
     }
 
-    fn probe_returning(free: Arc<Mutex<Option<u64>>>, calls: Arc<AtomicUsize>) -> DiskProbe {
-        Box::new(move |_| {
+    /// A reader of whatever `reading` holds, counting reads.
+    fn probe_returning(reading: Arc<Mutex<Capacity>>, calls: Arc<AtomicUsize>) -> DiskProbe {
+        CapacityReader::from_fn(move || {
             calls.fetch_add(1, Ordering::AcqRel);
-            *free.lock().unwrap()
+            *reading.lock().unwrap()
+        })
+    }
+
+    fn known(available_bytes: u64, sampled_at: Instant, stale: bool) -> Capacity {
+        Capacity::Known(CapacityReading {
+            available_bytes,
+            total_bytes: u64::MAX,
+            sampled_at,
+            stale,
         })
     }
 
@@ -294,53 +262,46 @@ mod tests {
         let accountant = HoldsAccountant::new(limits(u64::MAX, 100, 0));
         let mut other = HoldsCharge::default();
         accountant.publish(&mut other, 0, 70);
-        let dir = Path::new("/nonexistent");
 
-        assert_eq!(accountant.admit_scratch(30, dir), Ok(()));
+        assert_eq!(accountant.admit_scratch(30), Ok(()));
         assert_eq!(
-            accountant.admit_scratch(31, dir),
+            accountant.admit_scratch(31),
             Err(DemotionReason::HoldsScratchCeiling),
             "another set's scratch counts against this one's spill"
         );
         accountant.release(&mut other);
-        assert_eq!(accountant.admit_scratch(100, dir), Ok(()));
+        assert_eq!(accountant.admit_scratch(100), Ok(()));
     }
 
     #[test]
     fn the_disk_reserve_refuses_a_spill_that_would_eat_into_it() {
-        let free = Arc::new(Mutex::new(Some(1000u64)));
+        let free = Arc::new(Mutex::new(known(1000, Instant::now(), false)));
         let calls = Arc::new(AtomicUsize::new(0));
         let accountant = HoldsAccountant::with_probe(
             limits(u64::MAX, u64::MAX, 600),
             probe_returning(Arc::clone(&free), Arc::clone(&calls)),
         );
-        let dir = Path::new("/nonexistent");
 
-        // 1000 free, 600 reserved: 400 may be spent, and admissions inside one
-        // refresh interval spend the same reading rather than re-asking.
-        assert_eq!(accountant.admit_scratch(250, dir), Ok(()));
-        assert_eq!(accountant.admit_scratch(150, dir), Ok(()));
+        // 1000 free, 600 reserved: 400 may be spent, and admissions against
+        // one reading spend it rather than each seeing the same headroom.
+        assert_eq!(accountant.admit_scratch(250), Ok(()));
+        assert_eq!(accountant.admit_scratch(150), Ok(()));
         assert_eq!(
-            accountant.admit_scratch(1, dir),
+            accountant.admit_scratch(1),
             Err(DemotionReason::HoldsScratchDiskReserve)
-        );
-        assert_eq!(
-            calls.load(Ordering::Acquire),
-            1,
-            "one reading serves every admission inside the interval"
         );
     }
 
     #[test]
     fn an_unreadable_filesystem_enforces_no_reserve() {
-        let free = Arc::new(Mutex::new(None));
+        let free = Arc::new(Mutex::new(Capacity::Unknown));
         let calls = Arc::new(AtomicUsize::new(0));
         let accountant = HoldsAccountant::with_probe(
             limits(u64::MAX, u64::MAX, 600),
             probe_returning(free, calls),
         );
         assert_eq!(
-            accountant.admit_scratch(u64::MAX / 2, Path::new("/nonexistent")),
+            accountant.admit_scratch(u64::MAX / 2),
             Ok(()),
             "a probe that cannot answer must not demote a set that was routing fine"
         );
@@ -348,34 +309,34 @@ mod tests {
 
     #[test]
     fn a_probe_outage_holds_the_last_reading_without_refusing() {
-        let free = Arc::new(Mutex::new(Some(1000u64)));
+        let taken = Instant::now();
+        let free = Arc::new(Mutex::new(known(1000, taken, false)));
         let calls = Arc::new(AtomicUsize::new(0));
         let accountant = HoldsAccountant::with_probe(
             limits(u64::MAX, u64::MAX, 600),
             probe_returning(Arc::clone(&free), Arc::clone(&calls)),
         );
-        let dir = Path::new("/nonexistent");
-        assert_eq!(accountant.admit_scratch(300, dir), Ok(()));
+        assert_eq!(accountant.admit_scratch(300), Ok(()));
 
-        // The filesystem stops answering: the 700 left on the last reading is
-        // still debited, but a breach on a stale number does not demote.
-        *free.lock().unwrap() = None;
-        {
-            let mut disk = accountant.disk.lock().unwrap();
-            disk.refreshed = Some(Instant::now() - DISK_REFRESH_INTERVAL);
-        }
-        assert_eq!(accountant.admit_scratch(500, dir), Ok(()));
-        assert_eq!(accountant.disk.lock().unwrap().available, Some(200));
-        assert!(accountant.disk.lock().unwrap().stale);
+        // The filesystem stops answering and the sampler holds its last good
+        // reading as stale: the 700 left on it is still debited, but a breach
+        // on a stale number does not demote.
+        *free.lock().unwrap() = known(1000, taken, true);
+        assert_eq!(accountant.admit_scratch(500), Ok(()));
+        assert_eq!(
+            accountant
+                .disk
+                .lock()
+                .unwrap()
+                .apply(*free.lock().unwrap())
+                .best_available_bytes(),
+            Some(200)
+        );
 
         // A fresh reading takes over and enforces again.
-        *free.lock().unwrap() = Some(650);
-        {
-            let mut disk = accountant.disk.lock().unwrap();
-            disk.refreshed = Some(Instant::now() - DISK_REFRESH_INTERVAL);
-        }
+        *free.lock().unwrap() = known(650, taken + Duration::from_secs(5), false);
         assert_eq!(
-            accountant.admit_scratch(100, dir),
+            accountant.admit_scratch(100),
             Err(DemotionReason::HoldsScratchDiskReserve)
         );
         assert_eq!(calls.load(Ordering::Acquire), 3);
@@ -383,16 +344,13 @@ mod tests {
 
     #[test]
     fn a_zero_reserve_never_probes() {
-        let free = Arc::new(Mutex::new(Some(0u64)));
+        let free = Arc::new(Mutex::new(known(0, Instant::now(), false)));
         let calls = Arc::new(AtomicUsize::new(0));
         let accountant = HoldsAccountant::with_probe(
             limits(u64::MAX, u64::MAX, 0),
             probe_returning(free, Arc::clone(&calls)),
         );
-        assert_eq!(
-            accountant.admit_scratch(1 << 40, Path::new("/nonexistent")),
-            Ok(())
-        );
+        assert_eq!(accountant.admit_scratch(1 << 40), Ok(()));
         assert_eq!(calls.load(Ordering::Acquire), 0);
     }
 
@@ -402,9 +360,6 @@ mod tests {
         let mut charge = HoldsCharge::default();
         accountant.publish(&mut charge, u64::MAX / 2, u64::MAX / 2);
         assert!(!accountant.resident_over_limit());
-        assert_eq!(
-            accountant.admit_scratch(u64::MAX / 4, Path::new("/nonexistent")),
-            Ok(())
-        );
+        assert_eq!(accountant.admit_scratch(u64::MAX / 4), Ok(()));
     }
 }

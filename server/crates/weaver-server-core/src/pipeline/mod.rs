@@ -18,7 +18,6 @@ mod progress;
 mod repair;
 mod server_attribution;
 
-pub(crate) use orchestrator::check_disk_space;
 pub(crate) use orchestrator::{
     close_cached_write_handles_under, release_cached_write_handle,
     remove_file_after_cached_write_handle,
@@ -2887,9 +2886,15 @@ pub struct Pipeline {
     pub(super) uu_park_max_segments: usize,
     /// Free space preserved on the intermediate filesystem while spilling UU.
     pub(super) uu_spool_min_free_bytes: u64,
-    /// Rate-limited free-space readings for the spool filesystem. Admitted
-    /// spills are debited against the cached reading between probes.
-    pub(super) uu_spool_capacity: crate::operations::CapacitySampler,
+    /// The spool filesystem's latest free-space reading, from the
+    /// intermediate root's sampler. Never probes on the pipeline task.
+    pub(super) uu_spool_capacity: crate::operations::CapacityReader,
+    /// Spills admitted against the current reading, so a burst between
+    /// refreshes cannot each see the same headroom.
+    pub(super) uu_spool_debits: crate::operations::CapacityDebits,
+    /// One background free-space sampler per configured root. Everything on
+    /// the pipeline that gates work on free space reads these readings.
+    pub(super) storage_capacity: Arc<crate::operations::StorageCapacity>,
     /// Largest refused UU spill. Dispatch preserves cursor progress until
     /// this many bytes can be parked in memory or admitted to the spool.
     pub(super) uu_spool_blocked_spill_bytes: Option<usize>,

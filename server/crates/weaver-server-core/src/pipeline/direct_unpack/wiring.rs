@@ -1561,11 +1561,13 @@ impl Pipeline {
         let (initial_entries, initial_bytes) =
             ExtractionRoot::snapshot_usage(staging).unwrap_or((0, 0));
 
-        crate::pipeline::extraction::JobExtractionBudget::new_with_process_memory(
+        crate::pipeline::extraction::JobExtractionBudget::with_capacity(
             Arc::clone(&self.extraction_limits),
             // Coverage waits yield the decoder under contention, so speculative
             // chases can safely share the normal extraction allowance.
             self.process_memory_budget.for_job(job_id.0),
+            self.storage_capacity
+                .reader(crate::operations::StorageRoot::Complete),
             staging.to_path_buf(),
             declared_archive_bytes,
             initial_entries,
