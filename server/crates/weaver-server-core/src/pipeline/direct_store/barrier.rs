@@ -119,6 +119,10 @@ pub(crate) enum BarrierError {
     /// failure because it happens inside step 3.
     Encode(SnapshotError),
     Persist(String),
+    /// The controller or its checkpoint row was retired while the barrier was
+    /// in flight, so the snapshot describes a row that no longer exists. Not
+    /// a failure: nothing broke, the interval is simply given back.
+    Retired(&'static str),
 }
 
 impl BarrierError {
@@ -127,8 +131,13 @@ impl BarrierError {
         match self {
             Self::Drain(_) => BarrierStep::Drain,
             Self::Sync { .. } => BarrierStep::Sync,
-            Self::Encode(_) | Self::Persist(_) => BarrierStep::Persist,
+            Self::Encode(_) | Self::Persist(_) | Self::Retired(_) => BarrierStep::Persist,
         }
+    }
+
+    /// True when the barrier was overtaken rather than broken.
+    pub(crate) fn is_retired(&self) -> bool {
+        matches!(self, Self::Retired(_))
     }
 }
 
@@ -142,6 +151,10 @@ impl std::fmt::Display for BarrierError {
             ),
             Self::Encode(error) => write!(formatter, "coverage barrier encode failed: {error}"),
             Self::Persist(error) => write!(formatter, "coverage barrier persist failed: {error}"),
+            Self::Retired(what) => write!(
+                formatter,
+                "coverage barrier abandoned: {what} was retired while the barrier was in flight"
+            ),
         }
     }
 }
@@ -937,17 +950,13 @@ impl CoverageBarrier {
         P: CoveragePersist + ?Sized,
     {
         if !self.in_flight {
-            return Err(BarrierError::Persist(
-                "the coverage controller was retired while the barrier was in flight".to_string(),
-            ));
+            return Err(BarrierError::Retired("the coverage controller"));
         }
         if self.committed_generation.saturating_add(1) != prepared.generation
             || self.row_epoch != prepared.row_epoch
         {
             self.abandon(prepared);
-            return Err(BarrierError::Persist(
-                "the checkpoint row was retired while the barrier was in flight".to_string(),
-            ));
+            return Err(BarrierError::Retired("the checkpoint row"));
         }
         match self.commit_steps(&prepared, sync, persist) {
             Ok(report) => {

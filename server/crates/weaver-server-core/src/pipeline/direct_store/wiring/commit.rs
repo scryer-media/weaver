@@ -1512,6 +1512,11 @@ impl Pipeline {
                     "direct-store coverage barrier committed"
                 );
             }
+            Some(Err(error)) if error.is_retired() => {
+                // Overtaken by a restart or a reset of the set, not broken:
+                // the interval went back to the controller for the next one.
+                debug!(job_id = job_id.0, reason = %error, "direct-store coverage barrier abandoned");
+            }
             Some(Err(error)) => {
                 warn!(job_id = job_id.0, error = %error, "direct-store coverage barrier failed");
             }
