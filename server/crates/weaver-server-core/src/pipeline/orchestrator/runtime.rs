@@ -3165,6 +3165,55 @@ mod disk_write_handle_cache_tests {
         assert!(!uncached.exists());
     }
 
+    /// What the final move relies on: a removal queued before it closes a
+    /// root's handles is **done** by the time that close returns, on every
+    /// owner and on the closer, so the walk that follows never meets the file.
+    ///
+    /// Through the real pool: the files are written by it, so each handle is
+    /// cached on whichever owner its path hashes to, and enough of them that
+    /// the removals land on more than one owner.
+    #[tokio::test]
+    async fn a_removal_queued_before_a_root_close_is_done_when_the_close_returns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("job");
+        std::fs::create_dir_all(&root).unwrap();
+        let paths: Vec<std::path::PathBuf> = (0..DISK_WRITE_OWNER_THREADS * 4)
+            .map(|index| root.join(format!("set.f0.vol{index:05}.envelope")))
+            .collect();
+        write_direct_batches(
+            paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        vec![(0, vec![bytes::Bytes::from_static(b"volume bytes")])],
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "non-vacuity: every file must exist before its removal"
+        );
+
+        for path in &paths {
+            remove_file_after_cached_write_handle(path);
+        }
+        close_cached_write_handles_under(&root).await;
+
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "a removal queued before the close must be complete when it returns, found {left:?}"
+        );
+    }
+
     #[test]
     fn close_matching_honors_path_and_prefix_scopes() {
         let temp = tempfile::tempdir().unwrap();
