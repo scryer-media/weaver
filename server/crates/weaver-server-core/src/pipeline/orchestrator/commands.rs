@@ -745,18 +745,17 @@ impl Pipeline {
                         return;
                     }
                 }
-                let cleanup = self
-                    .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
-                    .await;
-                self.cleanup_output_dir(output_dir.as_deref()).await;
                 if self.jobs.contains_key(&job_id) {
                     self.purge_terminal_job_runtime(job_id);
                 }
                 self.finished_jobs.retain(|job| job.job_id != job_id);
                 self.publish_snapshot();
-                let result =
-                    cleanup.map(|left_in_place| crate::HistoryDeleteOutcome { left_in_place });
-                let _ = reply.send(result);
+                self.spawn_history_file_cleanup(
+                    history_cleanup_dirs,
+                    output_dir.into_iter().collect(),
+                    reply,
+                    |left_in_place| crate::HistoryDeleteOutcome { left_in_place },
+                );
             }
             SchedulerCommand::DeleteAllHistory {
                 delete_files,
@@ -798,13 +797,6 @@ impl Pipeline {
                         return;
                     }
                 }
-                let cleanup_error = self
-                    .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
-                    .await
-                    .err();
-                for dir in &output_dirs {
-                    self.cleanup_output_dir(Some(dir)).await;
-                }
                 let terminal_job_ids: Vec<JobId> = self
                     .jobs
                     .iter()
@@ -817,7 +809,7 @@ impl Pipeline {
                 }
                 self.finished_jobs.clear();
                 self.publish_snapshot();
-                let _ = reply.send(cleanup_error.map_or(Ok(()), Err));
+                self.spawn_history_file_cleanup(history_cleanup_dirs, output_dirs, reply, |_| ());
             }
             SchedulerCommand::PipelineDiagnostics { reply } => {
                 let _ = reply.send(Box::new(self.diagnostics_snapshot()));

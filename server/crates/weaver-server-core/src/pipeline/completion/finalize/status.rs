@@ -449,18 +449,6 @@ impl Pipeline {
             return false;
         }
 
-        let initial_missing_members: Vec<String> = existing_members
-            .iter()
-            .filter(|member| {
-                self.resolve_job_input_path(job_id, member)
-                    .is_none_or(|path| !path.exists())
-            })
-            .cloned()
-            .collect();
-        if initial_missing_members.is_empty() {
-            return false;
-        }
-
         let missing_members: Vec<String> = existing_members
             .iter()
             .filter(|member| {

@@ -7,6 +7,14 @@ impl Pipeline {
             .join(job_id.0.to_string())
     }
 
+    /// The job's staging root, registered on the job state so completion,
+    /// cancel and failure treat it as the job's output.
+    ///
+    /// Only names the directory: nothing here touches the filesystem, since
+    /// this runs on the pipeline task and the root sits under the complete
+    /// directory. Whatever writes into it creates it — [`ExtractionRoot::open`]
+    /// for extraction, the placement task for direct-store destinations — and
+    /// every reader of an unwritten root treats it as empty.
     pub(crate) fn extraction_staging_dir(&mut self, job_id: JobId) -> PathBuf {
         if let Some(state) = self.jobs.get(&job_id)
             && let Some(ref staging) = state.staging_dir
@@ -14,14 +22,6 @@ impl Pipeline {
             return staging.clone();
         }
         let staging = self.deterministic_extraction_staging_dir(job_id);
-        if let Err(e) = std::fs::create_dir_all(&staging) {
-            tracing::warn!(
-                job_id = job_id.0,
-                path = %staging.display(),
-                error = %e,
-                "failed to create staging dir"
-            );
-        }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.staging_dir = Some(staging.clone());
         }
