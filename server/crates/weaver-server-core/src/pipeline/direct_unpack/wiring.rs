@@ -442,6 +442,20 @@ pub(crate) struct DirectUnpackRuntime {
     /// Finished chases, awaiting a consumer.
     outcomes: HashMap<(JobId, String), ChaseOutcome>,
     counters: DirectUnpackCounters,
+    /// The generation the next arm stages into.
+    ///
+    /// Every arm gets a directory of its own, so a retired chase's tree can be
+    /// deleted while the set's next chase writes a disjoint one: there is no
+    /// ordering between the two and nothing to rename. Pipeline-wide rather
+    /// than per set, and never reset, because a job keeps its id through a
+    /// reprocess or a nested rebuild that forgets its chases — a per-job
+    /// counter restarted there would hand a new arm a path whose delete may
+    /// still be running.
+    next_staging_generation: u64,
+    /// The staging directory each set's most recent arm was given, so a test
+    /// can find a chase's output after the chase has left every map.
+    #[cfg(test)]
+    last_staging: HashMap<(JobId, String), PathBuf>,
 }
 
 impl Drop for DirectUnpackRuntime {
@@ -947,8 +961,9 @@ impl Pipeline {
         }) {
             return;
         }
-        // A paused worker still owns this staging path until it is joined and
-        // cleaned up. Reusing it sooner would race both its writes and cleanup.
+        // A set whose previous chase is still draining waits for it to be
+        // joined. Each arm stages into its own generation, so this no longer
+        // protects a path; it keeps at most one worker per set alive at once.
         if self
             .direct_unpack
             .draining
@@ -1015,7 +1030,13 @@ impl Pipeline {
             return;
         }
 
-        let output_dir = self.direct_unpack_staging_dir(job_id, set_name);
+        let generation = self.direct_unpack.next_staging_generation;
+        self.direct_unpack.next_staging_generation += 1;
+        let output_dir = self.direct_unpack_generation_dir(job_id, set_name, generation);
+        #[cfg(test)]
+        self.direct_unpack
+            .last_staging
+            .insert((job_id, set_name.to_string()), output_dir.clone());
         if let Err(error) = std::fs::create_dir_all(&output_dir) {
             warn!(
                 job_id = job_id.0,
@@ -1505,21 +1526,46 @@ impl Pipeline {
         self.direct_unpack.counters.record_refusal(reason);
     }
 
-    /// Where a chased set's members land.
+    /// Where one arm of a chased set lands its members.
     ///
     /// Deliberately not the conventional staging dir and not inside it: the
     /// conventional extractor's own output and the delivery scan both live
     /// there, and a demotion has to be able to `remove_dir_all` this without
     /// touching anything the conventional path will look at.
+    ///
+    /// The generation is the last dot-separated component and never contains
+    /// a dot itself, so two `(set, generation)` pairs cannot name the same
+    /// directory. The job level stays a bare number: the maintenance sweep
+    /// keys on it.
+    pub(in crate::pipeline) fn direct_unpack_generation_dir(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        generation: u64,
+    ) -> PathBuf {
+        self.complete_dir
+            .join(".weaver-direct-unpack")
+            .join(job_id.0.to_string())
+            .join(format!("{}.{generation}", sanitize_set_dir_name(set_name)))
+    }
+
+    /// The staging directory of the set's most recent arm, or the job's
+    /// staging level when the set never armed.
+    #[cfg(test)]
     pub(in crate::pipeline) fn direct_unpack_staging_dir(
         &self,
         job_id: JobId,
         set_name: &str,
     ) -> PathBuf {
-        self.complete_dir
-            .join(".weaver-direct-unpack")
-            .join(job_id.0.to_string())
-            .join(sanitize_set_dir_name(set_name))
+        self.direct_unpack
+            .last_staging
+            .get(&(job_id, set_name.to_string()))
+            .cloned()
+            .unwrap_or_else(|| {
+                self.complete_dir
+                    .join(".weaver-direct-unpack")
+                    .join(job_id.0.to_string())
+            })
     }
 
     /// An extraction budget for the chase, rooted at its own staging dir.
