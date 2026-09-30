@@ -60,7 +60,7 @@
 //! from zero, which is what an unwired restart already did, and its stale
 //! partials and envelopes are swept first so no byte of them survives.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::DirectStoreGate;
@@ -789,6 +789,12 @@ impl Pipeline {
                 HashMap::new()
             }
         };
+        // Every set the job's durable rows still name, whether or not any plan
+        // of this spec produces it. Taken before the rows are judged, because
+        // judging a refused row deletes it — and a set admitted by identity
+        // rather than by name is never rediscovered from the spec, so its row
+        // and its cached facts are the only record that its scratch exists.
+        let mut durable_set_names: BTreeSet<String> = rows.keys().cloned().collect();
         // A finalized set leaves an installation marker where its coverage row
         // was. It is not coverage and `restore_job` would refuse it as a bad
         // magic, so it is judged on its own terms here: a marker whose set is
@@ -853,11 +859,23 @@ impl Pipeline {
         // run: a job that used to route and no longer does (the gate went off,
         // the spec changed) is exactly the job whose working directory holds
         // partials nothing will ever claim again.
-        let facts = if admitted.is_empty() {
+        //
+        // A job whose files can be admitted by identity loads the facts even
+        // with nothing admitted by name: they are the durable names of the sets
+        // those rungs admitted, which the sweep needs to find their envelopes.
+        let identity_eligible = spec.files.iter().any(|file| {
+            matches!(
+                file.role,
+                weaver_model::files::FileRole::Unknown
+                    | weaver_model::files::FileRole::SplitFile { .. }
+            )
+        });
+        let facts = if admitted.is_empty() && !identity_eligible {
             HashMap::new()
         } else {
             self.load_direct_volume_facts(job_id).await
         };
+        durable_set_names.extend(facts.keys().cloned());
 
         // Step 2: rebuild every admitted set's layout from its cached facts. A
         // set whose facts no longer form a routable archive is dropped from
@@ -1170,12 +1188,17 @@ impl Pipeline {
         // rather than paying a walk per restored job at startup. Gate-independent
         // on purpose: the files a *disabled* gate has to sweep were written by an
         // enabled one, over the same spec.
-        let could_have_routed = spec
-            .files
-            .iter()
-            .any(|file| matches!(file.role, weaver_model::files::FileRole::RarVolume { .. }));
+        // A durable row is the other proof: an identity-admitted set routes
+        // files whose names classify as nothing, so a spec with no RAR volume
+        // role can still have left partials and envelopes behind.
+        let could_have_routed = !durable_set_names.is_empty()
+            || spec
+                .files
+                .iter()
+                .any(|file| matches!(file.role, weaver_model::files::FileRole::RarVolume { .. }));
         if could_have_routed {
-            result.swept = sweep_orphan_direct_files(&roots, &claimed, &owned).await;
+            result.swept =
+                sweep_orphan_direct_files(&roots, &claimed, &owned, &durable_set_names).await;
         }
 
         // The restart ledger, in the four numbers that separate "resumed" from
@@ -1294,8 +1317,8 @@ impl Pipeline {
 /// perfectly well contain. Deleting it is silent data loss in a job that
 /// otherwise succeeded.
 ///
-/// Two pattern rules survive, each for a file that exists precisely because it is
-/// *not* in any current plan:
+/// Three narrower rules survive, each for a file that exists precisely because
+/// it is *not* in any current plan:
 ///
 /// - holds scratch at the **top level only**, by prefix. A killed run's scratch
 ///   for a set this spec no longer produces has no plan to name it, and it lives
@@ -1304,6 +1327,11 @@ impl Pipeline {
 ///   header, so a set whose cached facts no longer rebuild has no way to name
 ///   its own partials — and the suffix is a two-part one this codebase invented,
 ///   not an extension an archive plausibly carries.
+/// - envelopes and repair scratch at the working directory's **top level** whose
+///   name rebuilds exactly from a set the job's durable rows name. A set
+///   admitted by identity is never rediscovered from the spec, so no plan names
+///   its envelopes, and its discriminator — the first file it bound — was never
+///   recorded; see [`names_durable_set_scratch`].
 ///
 /// # Both roots
 ///
@@ -1323,16 +1351,28 @@ async fn sweep_orphan_direct_files(
     roots: &DestinationRoots,
     claimed: &HashSet<PathBuf>,
     owned: &HashSet<PathBuf>,
+    durable_set_names: &BTreeSet<String>,
 ) -> usize {
     let roots = roots.clone();
     let claimed = claimed.clone();
     let owned = owned.clone();
+    let durable_set_names = durable_set_names.clone();
     tokio::task::spawn_blocking(move || {
-        let mut swept =
-            sweep_orphan_direct_files_blocking(&roots.working_dir, true, &claimed, &owned);
+        let mut swept = sweep_orphan_direct_files_blocking(
+            &roots.working_dir,
+            true,
+            &claimed,
+            &owned,
+            &durable_set_names,
+        );
         if roots.destination_dir != roots.working_dir {
-            swept +=
-                sweep_orphan_direct_files_blocking(&roots.destination_dir, false, &claimed, &owned);
+            swept += sweep_orphan_direct_files_blocking(
+                &roots.destination_dir,
+                false,
+                &claimed,
+                &owned,
+                &BTreeSet::new(),
+            );
         }
         swept
     })
@@ -1340,11 +1380,51 @@ async fn sweep_orphan_direct_files(
     .unwrap_or(0)
 }
 
+/// Whether `name` is an envelope or repair scratch of one of `set_names`, under
+/// whatever discriminator and volume it carries.
+///
+/// The fallback for a set no current plan names — one admitted by identity,
+/// whose discriminator was the first file it bound and is recorded nowhere. The
+/// name is parsed for the two numbers and then rebuilt exactly as the set
+/// would have built it, so only a file this subsystem could have written under
+/// a set the job's own rows name ever matches; an extension alone never does.
+fn names_durable_set_scratch(name: &str, set_names: &BTreeSet<String>) -> bool {
+    if set_names.is_empty() {
+        return false;
+    }
+    let (stem, repair) = if let Some(stem) = name.strip_suffix(".envelope") {
+        (stem, false)
+    } else if let Some(stem) = name.strip_suffix(super::plan::REPAIR_SUFFIX) {
+        (stem, true)
+    } else {
+        return false;
+    };
+    let Some((stem, volume)) = stem.rsplit_once(".vol") else {
+        return false;
+    };
+    let Some((_, discriminator)) = stem.rsplit_once(".f") else {
+        return false;
+    };
+    let (Ok(volume), Ok(discriminator)) = (volume.parse::<u32>(), discriminator.parse::<u32>())
+    else {
+        return false;
+    };
+    set_names.iter().any(|set_name| {
+        let rebuilt = if repair {
+            super::plan::repair_file_name(set_name, discriminator, volume)
+        } else {
+            super::plan::envelope_file_name(set_name, discriminator, volume)
+        };
+        rebuilt == name
+    })
+}
+
 fn sweep_orphan_direct_files_blocking(
     root: &Path,
     sweep_holds_scratch: bool,
     claimed: &HashSet<PathBuf>,
     owned: &HashSet<PathBuf>,
+    durable_set_names: &BTreeSet<String>,
 ) -> usize {
     let mut swept = 0usize;
     let mut queue = vec![(root.to_path_buf(), 0usize)];
@@ -1372,9 +1452,13 @@ fn sweep_orphan_direct_files_blocking(
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
+            // Envelopes and repair scratch live at the working directory's top
+            // level by construction, so the durable-name rule never looks
+            // deeper.
             let is_direct = owned.contains(&path)
                 || name.ends_with(DIRECT_PARTIAL_SUFFIX)
-                || (sweep_holds_scratch && depth == 0 && name.starts_with(HOLDS_SCRATCH_PREFIX));
+                || (sweep_holds_scratch && depth == 0 && name.starts_with(HOLDS_SCRATCH_PREFIX))
+                || (depth == 0 && names_durable_set_scratch(name, durable_set_names));
             if !is_direct || claimed.contains(&path) {
                 continue;
             }
@@ -1395,6 +1479,52 @@ fn sweep_orphan_direct_files_blocking(
         }
     }
     swept
+}
+
+#[cfg(test)]
+mod durable_set_scratch_tests {
+    use std::collections::BTreeSet;
+
+    use super::names_durable_set_scratch;
+    use crate::pipeline::direct_store::plan::{envelope_file_name, repair_file_name};
+
+    fn names(set_names: &[&str]) -> BTreeSet<String> {
+        set_names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// The rule deletes a file only when its whole name rebuilds from a set the
+    /// job's own rows name. A user's file of exactly the same shape under any
+    /// other stem is left alone, however envelope-like it looks.
+    #[test]
+    fn only_a_name_rebuilt_from_a_collected_set_matches() {
+        let collected = names(&["Silver Horizon"]);
+        let envelope = envelope_file_name("Silver Horizon", 7, 1);
+        let repair = repair_file_name("Silver Horizon", 7, 12);
+        assert!(names_durable_set_scratch(&envelope, &collected));
+        assert!(names_durable_set_scratch(&repair, &collected));
+
+        for user_file in [
+            "x.f0.vol00001.envelope",
+            "x.f0.vol00001.repair",
+            "chapter.envelope",
+            "chapter.repair",
+            "Silver Horizon.f0.vol00001.envelope.bak",
+            "silver-horizon.fX.vol00001.envelope",
+            "silver-horizon.f0.volXYZ.envelope",
+            "silver-horizon.f+0.vol00001.envelope",
+        ] {
+            assert!(
+                !names_durable_set_scratch(user_file, &collected),
+                "{user_file} does not rebuild from a collected set and must not match"
+            );
+        }
+        // The same shape under a stem the job's rows *do* name matches only
+        // once that set is collected.
+        let user_shaped = envelope_file_name("x", 0, 1);
+        assert!(!names_durable_set_scratch(&user_shaped, &collected));
+        assert!(names_durable_set_scratch(&user_shaped, &names(&["x"])));
+        assert!(!names_durable_set_scratch(&envelope, &BTreeSet::new()));
+    }
 }
 
 #[cfg(test)]

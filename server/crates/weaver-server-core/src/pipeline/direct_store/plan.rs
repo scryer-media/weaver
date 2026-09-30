@@ -61,6 +61,26 @@ pub(crate) enum SetFormat {
 /// suffix by the restart sweep, exactly as `.envelope` is.
 pub(crate) const REPAIR_SUFFIX: &str = ".repair";
 
+/// A set's envelope filename from its name, discriminator and volume alone.
+///
+/// Free of a plan so the restart sweep can rebuild the name for a set no
+/// current plan produces — an identity-admitted set is never rediscovered from
+/// the spec, yet its envelopes are in the working directory all the same.
+pub(crate) fn envelope_file_name(set_name: &str, discriminator: u32, volume_index: u32) -> String {
+    weaver_model::files::path_component_with_suffix(
+        &crate::jobs::working_dir::sanitize_dirname(set_name),
+        &format!(".f{discriminator}.vol{volume_index:05}.envelope"),
+    )
+}
+
+/// The repair-scratch counterpart of [`envelope_file_name`].
+pub(crate) fn repair_file_name(set_name: &str, discriminator: u32, volume_index: u32) -> String {
+    weaver_model::files::path_component_with_suffix(
+        &crate::jobs::working_dir::sanitize_dirname(set_name),
+        &format!(".f{discriminator}.vol{volume_index:05}{REPAIR_SUFFIX}"),
+    )
+}
+
 /// Appends `suffix` to the final component of a root-relative
 /// path, shortening the component's stem so the result stays inside
 /// [`weaver_model::files::DOWNLOAD_FILENAME_MAX_BYTES`].
@@ -454,13 +474,7 @@ impl DirectSetPlan {
         // extension survive. The discriminator rides the suffix for the same
         // reason it does on the holds scratch: the clamp can never shorten it
         // away, and two sets whose names sanitize identically stay two files.
-        weaver_model::files::path_component_with_suffix(
-            &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
-            &format!(
-                ".f{}.vol{volume_index:05}.envelope",
-                self.set_discriminator()
-            ),
-        )
+        envelope_file_name(&self.set_name, self.set_discriminator(), volume_index)
     }
 
     pub(crate) fn envelope_path(&self, volume_index: u32) -> PathBuf {
@@ -516,13 +530,7 @@ impl DirectSetPlan {
     /// sitting there would be read as a downloaded volume by every conventional
     /// path. This suffix is swept at restart alongside envelopes and partials.
     pub(crate) fn repair_relative_path(&self, volume_index: u32) -> String {
-        weaver_model::files::path_component_with_suffix(
-            &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
-            &format!(
-                ".f{}.vol{volume_index:05}{REPAIR_SUFFIX}",
-                self.set_discriminator()
-            ),
-        )
+        repair_file_name(&self.set_name, self.set_discriminator(), volume_index)
     }
 
     pub(crate) fn repair_path(&self, volume_index: u32) -> PathBuf {

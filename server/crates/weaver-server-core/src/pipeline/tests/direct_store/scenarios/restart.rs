@@ -1120,6 +1120,109 @@ async fn restart_sweeps_stale_holds_scratch() {
     }
 }
 
+/// A set admitted by identity is never rediscovered from the spec, so its
+/// checkpoint is refused at restore and the set redownloads — and its scratch
+/// has to go before it does.
+///
+/// Nothing in this spec classifies as a RAR volume and no plan names the set,
+/// which is exactly how a refused identity set's partial and envelopes used to
+/// survive the restore and be published beside the finished member: the sweep
+/// either never ran or had no name for them.
+#[tokio::test]
+async fn a_restart_sweeps_the_scratch_of_a_refused_identity_set() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E41.mkv";
+    let payload: Vec<u8> = (0..120_000u32).map(|index| (index % 173) as u8).collect();
+    let volumes = obfuscate_volumes(&single_member_store_set(member_name, &payload, 3));
+    assert!(
+        volumes.iter().all(|(filename, _)| !matches!(
+            FileRole::from_filename(filename),
+            FileRole::RarVolume { .. }
+        )),
+        "non-vacuity: no file may classify as a RAR volume"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41790);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    let envelopes: Vec<PathBuf> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".envelope"))
+        })
+        .collect();
+    let payload_dir = payload_root(&temp_dir, job_id);
+    assert!(
+        !envelopes.is_empty() && any_direct_partial(&payload_dir),
+        "non-vacuity: the identity set must have routed into envelopes and a partial"
+    );
+    {
+        let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        assert!(
+            !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+            "non-vacuity: the identity set must have checkpointed"
+        );
+    }
+    // An `.envelope` at the top level whose name rebuilds from no set the job's
+    // rows name is not direct-store's, and the sweep must leave it alone.
+    let unrelated = working_dir.join("chapter.f0.vol00000.envelope");
+    std::fs::write(&unrelated, b"not an envelope of this job").unwrap();
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert_eq!(
+        queued.len(),
+        volumes.len() * ARTICLES,
+        "a refused identity set redownloads whole, got {queued:?}"
+    );
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "the refused row is deleted"
+    );
+    // Its cached facts go with it: they are how the sweep names the set, and a
+    // refused set's rows outliving it would have every later restore walk for
+    // a set nothing will ever route into again.
+    assert!(
+        pipeline
+            .db
+            .load_all_rar_volume_facts(job_id)
+            .unwrap()
+            .values()
+            .all(|rows| rows.is_empty()),
+        "a refused set's cached facts are deleted with its row"
+    );
+    for envelope in &envelopes {
+        assert!(
+            !envelope.exists(),
+            "{} belongs to a refused set and must be swept before it redownloads",
+            envelope.display()
+        );
+    }
+    assert!(
+        !any_direct_partial(&payload_dir),
+        "the refused set's partial must be swept from the staging root"
+    );
+    assert!(
+        unrelated.exists(),
+        "the sweep must only touch the job's own sets"
+    );
+}
+
 /// A restart inside the PAR2 finalization wait — the common case now, because a
 /// par2-bearing set stays byte-complete-but-uncommitted for the whole PAR2
 /// download and verify.
