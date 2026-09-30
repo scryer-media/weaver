@@ -123,6 +123,9 @@ async fn assert_hp_set_survives_restart(
         )
         .await;
     }
+    // The restored coverage is re-read off the pipeline task before its
+    // member gates can compose; settle that read the way the select loop does.
+    settle_direct_post_repair_work(&mut pipeline).await;
     drain_rar_refreshes(&mut pipeline).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
 

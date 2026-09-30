@@ -1537,6 +1537,9 @@ async fn a_mid_download_direct_set_is_neither_verified_against_nor_demoted_for_i
         pipeline.direct_sets_ready_for_authoritative_par2(job_id),
         "once every volume has completed the set is ready to be verified"
     );
+    // The pass reads the set back on a detached ticket; its verdict lands on
+    // the completion check the ticket re-arms.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
     let settled = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
         pipeline.par2_authoritative_verify_calls > verifies_before || settled.contains("Finalized"),

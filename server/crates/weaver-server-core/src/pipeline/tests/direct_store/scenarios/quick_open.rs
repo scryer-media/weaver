@@ -1211,6 +1211,9 @@ async fn an_unmatched_obfuscated_extra_stays_conventional_beside_an_identity_set
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
+    // The verification reads the set back on a detached ticket; settle that
+    // round so the verdict, and the finalization it clears, have landed.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     drain_rar_refreshes(&mut pipeline).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
@@ -1812,6 +1815,9 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
+    // The verification reads the set back on a detached ticket; settle that
+    // round so the verdict, and the finalization it clears, have landed.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
 
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(

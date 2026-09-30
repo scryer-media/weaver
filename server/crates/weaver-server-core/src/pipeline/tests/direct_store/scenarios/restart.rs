@@ -235,6 +235,9 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         )
         .await;
     }
+    // The restored coverage is re-read off the pipeline task; settle that read
+    // the way the select loop does before judging the gates.
+    settle_direct_post_repair_work(&mut pipeline).await;
     assert!(
         pipeline
             .direct_store
@@ -342,6 +345,9 @@ async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
         )
         .await;
     }
+    // The restored coverage is re-read off the pipeline task; settle that read
+    // the way the select loop does before judging the gates.
+    settle_direct_post_repair_work(&mut pipeline).await;
 
     // The **reason**, not merely "something demoted". A bare `Demoted` passes for
     // a set that never got as far as the re-read — a refused row, a rebuild
@@ -564,6 +570,9 @@ async fn a_restart_re_derives_its_destinations_in_the_same_staging_root() {
         )
         .await;
     }
+    // The restored coverage is re-read off the pipeline task; settle that read
+    // the way the select loop does before judging the gates.
+    settle_direct_post_repair_work(&mut pipeline).await;
     drain_rar_refreshes(&mut pipeline).await;
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
@@ -1441,6 +1450,9 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
          run and must not claim decode strength"
     );
     rar_pipeline.finalize_ready_direct_sets(rar_only_job).await;
+    // The re-read that pass starts runs off the pipeline task; the gates
+    // re-arm when its ticket is handled.
+    settle_direct_post_repair_work(&mut rar_pipeline).await;
     assert!(
         rar_pipeline.direct_rar_contributes_strong_decode(rar_only_job),
         "non-vacuity: the same restored set in an all-RAR job does earn the contribution \
@@ -1702,6 +1714,128 @@ async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
         Pipeline::pause_barrier_scope(&SchedulerCommand::ResumeJob { job_id, reply }).is_none(),
         "only pause commands demand a barrier"
     );
+}
+
+/// A demanded barrier joins the set's flight through the flight's own outcome
+/// channel, never through the done channel: the pipeline task drains that
+/// channel and is the task doing the joining, so a demand raised with the
+/// channel full — every set of a large job syncing at once at a shutdown —
+/// would otherwise wait on itself.
+#[tokio::test]
+async fn a_demanded_barrier_joins_a_flight_with_the_done_channel_full() {
+    use crate::pipeline::direct_store::barrier::{BarrierDemand, BarrierTrigger};
+
+    let member_name = "Silver.Horizon.S01E41.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 193) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41081);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in [(0u32, 0u32), (0, 1)] {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+
+    pipeline.start_direct_barrier(job_id, 0, BarrierTrigger::DirtyAge);
+    assert!(
+        pipeline.direct_barrier_flights.contains_key(&(job_id, 0)),
+        "the polled barrier is in flight"
+    );
+    // Fill the done channel so the flight's own message cannot be delivered
+    // until something drains it.
+    while pipeline
+        .direct_barrier_done_tx
+        .try_send(crate::pipeline::DirectBarrierDone {
+            job_id,
+            set_index: 0,
+            flight_id: u64::MAX,
+        })
+        .is_ok()
+    {}
+
+    pipeline
+        .run_direct_barrier(job_id, 0, BarrierTrigger::Demand(BarrierDemand::Shutdown))
+        .await;
+    assert!(
+        !pipeline.direct_barrier_flights.contains_key(&(job_id, 0)),
+        "the demand settled the flight"
+    );
+    let generation = pipeline
+        .db
+        .load_direct_coverage(job_id)
+        .unwrap()
+        .values()
+        .next()
+        .map(|blob| {
+            crate::pipeline::direct_store::snapshot::decode(blob)
+                .unwrap()
+                .generation
+        })
+        .unwrap_or(0);
+    assert!(generation >= 1, "the joined flight committed its row");
+
+    // The queued messages name no live flight; each is ignored, and none may
+    // touch a set that has nothing in flight.
+    while let Ok(done) = pipeline.direct_barrier_done_rx.try_recv() {
+        pipeline.handle_direct_barrier_done(done).await;
+    }
+    assert!(pipeline.direct_barrier_flights.is_empty());
+}
+
+/// A flight joined by a demand leaves its done message queued. When it
+/// arrives, the set may have a newer flight out; the message names its own
+/// flight and must leave the newer one — and its unfinished syncs — alone.
+#[tokio::test]
+async fn a_stale_done_message_does_not_settle_a_newer_flight() {
+    use crate::pipeline::direct_store::barrier::{BarrierDemand, BarrierTrigger};
+
+    let member_name = "Silver.Horizon.S01E42.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 197) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41082);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+
+    pipeline.start_direct_barrier(job_id, 0, BarrierTrigger::DirtyAge);
+    let first = pipeline.direct_barrier_flights[&(job_id, 0)].id;
+    // The demand joins the first flight; its done message stays queued.
+    pipeline
+        .run_direct_barrier(job_id, 0, BarrierTrigger::Demand(BarrierDemand::Pause))
+        .await;
+    assert!(!pipeline.direct_barrier_flights.contains_key(&(job_id, 0)));
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    pipeline.start_direct_barrier(job_id, 0, BarrierTrigger::DirtyAge);
+    let second = pipeline.direct_barrier_flights[&(job_id, 0)].id;
+    assert_ne!(first, second, "every flight has its own identity");
+
+    pipeline
+        .handle_direct_barrier_done(crate::pipeline::DirectBarrierDone {
+            job_id,
+            set_index: 0,
+            flight_id: first,
+        })
+        .await;
+    assert_eq!(
+        pipeline
+            .direct_barrier_flights
+            .get(&(job_id, 0))
+            .map(|flight| flight.id),
+        Some(second),
+        "the first flight's message must not settle the second flight"
+    );
+
+    // The second flight's own message settles it.
+    settle_direct_post_repair_work(&mut pipeline).await;
+    assert!(pipeline.direct_barrier_flights.is_empty());
 }
 
 /// The checkpoint's per-volume `complete` bit means *all bytes durable*, and
@@ -2737,6 +2871,7 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
                 job_id,
                 work_id: work_id.wrapping_add(1),
                 recovery_set_id,
+                post_repair: true,
                 result: Err("stale verdict".to_string()),
             });
             assert!(

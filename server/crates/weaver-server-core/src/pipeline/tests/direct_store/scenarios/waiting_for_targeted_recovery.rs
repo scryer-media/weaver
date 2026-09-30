@@ -589,10 +589,21 @@ async fn a_direct_set_still_receiving_articles_neither_repairs_nor_waits_nor_dem
         .par2_set(job_id)
         .cloned()
         .expect("the index parsed");
-    let verification = pipeline
-        .verify_direct_sets_quietly(job_id, par2_set, working_dir.clone())
+    // The pass reads the set back on a detached ticket: the first call starts
+    // it, the verdict is parked, and the second call takes it.
+    let verification = match pipeline
+        .verify_direct_sets_quietly(job_id, par2_set.clone(), working_dir.clone())
         .await
-        .expect("the quiet pass reached a verdict");
+    {
+        Some(verification) => verification,
+        None => {
+            park_direct_verification_verdict(&mut pipeline, job_id).await;
+            pipeline
+                .verify_direct_sets_quietly(job_id, par2_set, working_dir.clone())
+                .await
+                .expect("the quiet pass reached a verdict")
+        }
+    };
     assert!(
         verification.needs_repair(),
         "non-vacuity: the pass must see damage, or every guard below is trivially \
@@ -799,9 +810,20 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
         .par2_set(job_id)
         .cloned()
         .expect("the index parsed");
-    let resolution = pipeline
-        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir.clone())
+    // The pass reads the live set back on a detached ticket: the first call
+    // starts it, the verdict is parked, and the second call resolves on it.
+    let mut resolution = pipeline
+        .resolve_direct_sets_before_par2_repairer(job_id, par2_set.clone(), working_dir.clone())
         .await;
+    if matches!(
+        resolution,
+        crate::pipeline::direct_store::wiring::DirectPar2Resolution::Pending
+    ) {
+        park_direct_verification_verdict(&mut pipeline, job_id).await;
+        resolution = pipeline
+            .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir.clone())
+            .await;
+    }
 
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
@@ -2357,6 +2379,9 @@ async fn an_encrypted_set_restarted_mid_download_honours_its_floors_and_complete
         )
         .await;
     }
+    // The restored coverage is re-read off the pipeline task; settle that read
+    // the way the select loop does before judging the gates.
+    settle_direct_post_repair_work(&mut pipeline).await;
     assert!(
         pipeline
             .direct_store
@@ -3243,6 +3268,9 @@ async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_comple
         None,
     )
     .await;
+    // The restored coverage is re-read off the pipeline task; settle that read
+    // the way the select loop does before judging the gates.
+    settle_direct_post_repair_work(&mut pipeline).await;
     assert!(
         pipeline
             .direct_store

@@ -454,6 +454,18 @@ impl Pipeline {
         if self.direct_demotion_in_flight.contains_key(&job_id) {
             return;
         }
+        // A restart-seeded re-read detached from that pass. Until it returns
+        // the set's member gates cannot compose, so the set is neither ready
+        // to finalize nor demoted; judged now, the job would read as complete
+        // with an archive nothing on disk answers for. The ticket's completion
+        // re-arms the gates and schedules this check again.
+        if self
+            .direct_rearm_in_flight
+            .iter()
+            .any(|(rearm_job, _)| *rearm_job == job_id)
+        {
+            return;
+        }
 
         if self.check_par3_completion(job_id).await {
             return;

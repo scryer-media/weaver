@@ -1000,8 +1000,7 @@ impl Pipeline {
         // it.
         doomed.extend(set.plan().repair_paths());
         for path in doomed {
-            crate::pipeline::release_cached_write_handle(&path);
-            let _ = tokio::fs::remove_file(&path).await;
+            crate::pipeline::remove_file_after_cached_write_handle(&path);
         }
     }
 

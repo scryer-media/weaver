@@ -273,6 +273,12 @@ fn sample_in_file_order(pipeline: &Pipeline, job_id: JobId) -> Vec<SegmentId> {
 /// the job itself. Nothing of the first-article sample is touched.
 fn fail_ordinary_articles_until_the_job_stops(pipeline: &mut Pipeline, job_id: JobId) {
     book_ordinary_articles_missing(pipeline, job_id);
+    answer_pending_health_probe(pipeline, job_id);
+}
+
+/// Answers the health probe round a job has armed, if any, confirming the
+/// damage with one sample present so the probe does not rule on the job.
+fn answer_pending_health_probe(pipeline: &mut Pipeline, job_id: JobId) {
     let Some(state) = pipeline.jobs.get(&job_id) else {
         return;
     };
@@ -349,8 +355,20 @@ async fn a_certain_sample_decides_before_it_is_complete() {
     );
 }
 
-/// A health abort with the sample short of the failure share is a health
-/// failure, and says so.
+/// Marks a sampled first article delivered and lets the sample read it.
+fn deliver_first_article(pipeline: &mut Pipeline, segment_id: SegmentId) {
+    let state = pipeline.jobs.get_mut(&segment_id.file_id.job_id).unwrap();
+    state
+        .assembly
+        .file_mut(segment_id.file_id)
+        .unwrap()
+        .commit_segment(segment_id.segment_number, 512)
+        .unwrap();
+    pipeline.note_first_article_settled(segment_id);
+}
+
+/// A health abort with the sample short of the failure share, and unable to
+/// reach it, is a health failure and says so.
 #[tokio::test]
 async fn a_health_abort_below_the_share_keeps_the_health_error() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -364,9 +382,13 @@ async fn a_health_abort_below_the_share_keeps_the_health_error() {
     .await;
     let sample = sample_in_file_order(&pipeline, job_id);
 
-    // Nine of the sample are ruled missing, three are still outstanding.
+    // Nine of the sample are ruled missing and three delivered: complete,
+    // and short of the share for good.
     for segment_id in sample.iter().take(9) {
         pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
+    }
+    for segment_id in sample.iter().skip(9) {
+        deliver_first_article(&mut pipeline, *segment_id);
     }
     assert!(job_failed(&pipeline, job_id).is_none());
 
@@ -376,6 +398,95 @@ async fn a_health_abort_below_the_share_keeps_the_health_error() {
     assert!(
         error.starts_with("health ") && error.contains("below critical"),
         "a sample short of the share leaves the health error standing: {error}"
+    );
+}
+
+/// The health arithmetic can reach its abort before the sample has settled:
+/// under load the ordinary articles of a dead post are answered for as fast
+/// as its first ones. The abort then waits for the sample, so that the job
+/// fails with the sample's diagnosis when the sample reaches its share —
+/// whichever order the answers arrive in.
+#[tokio::test]
+async fn a_health_abort_waits_for_a_sample_that_can_still_decide() {
+    use crate::jobs::model::HealthDeferralKind;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41708);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        multi_file_job_spec("Sample Outstanding", 12, 8),
+    )
+    .await;
+    let sample = sample_in_file_order(&pipeline, job_id);
+
+    // Nine of the sample are ruled missing, three are still outstanding.
+    for segment_id in sample.iter().take(9) {
+        pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
+    }
+    assert!(job_failed(&pipeline, job_id).is_none());
+
+    // The ordinary articles take health below critical first.
+    fail_ordinary_articles_until_the_job_stops(&mut pipeline, job_id);
+    assert!(
+        job_failed(&pipeline, job_id).is_none(),
+        "the abort must wait while the sample can still reach its share"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().health_deferral.kind,
+        Some(HealthDeferralKind::FirstArticleSample)
+    );
+
+    // The tenth ruling makes the sample certain; it, not the byte count,
+    // names the failure.
+    pipeline.book_terminal_segment(sample[9], SegmentTerminalState::Missing);
+    let error = job_failed(&pipeline, job_id).expect("the certain sample must fail the job");
+    assert_eq!(
+        error,
+        "aborted: 10 of 12 first articles are missing, the post cannot complete"
+    );
+}
+
+/// A held abort is not held past the point the sample can decide: when an
+/// outstanding first article is delivered and the share goes out of reach,
+/// the health arithmetic runs again on that delivery and fails the job with
+/// the health error, with no further damage needed to prompt it.
+#[tokio::test]
+async fn a_held_health_abort_lands_when_the_sample_settles_short() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41709);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        multi_file_job_spec("Sample Settles Short", 12, 8),
+    )
+    .await;
+    let sample = sample_in_file_order(&pipeline, job_id);
+
+    for segment_id in sample.iter().take(9) {
+        pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
+    }
+    fail_ordinary_articles_until_the_job_stops(&mut pipeline, job_id);
+    assert!(job_failed(&pipeline, job_id).is_none());
+
+    // Two deliveries leave one outstanding, and nine plus one still reaches
+    // the share of ten; the abort stays held.
+    deliver_first_article(&mut pipeline, sample[9]);
+    deliver_first_article(&mut pipeline, sample[10]);
+    assert!(
+        job_failed(&pipeline, job_id).is_none(),
+        "one outstanding article can still make the sample certain"
+    );
+
+    // The third completes the sample at nine of twelve: out of reach.
+    deliver_first_article(&mut pipeline, sample[11]);
+    answer_pending_health_probe(&mut pipeline, job_id);
+
+    let error = job_failed(&pipeline, job_id).expect("the settled sample must release the abort");
+    assert!(
+        error.starts_with("health ") && error.contains("below critical"),
+        "{error}"
     );
 }
 
@@ -793,6 +904,16 @@ async fn two_set_verdict(
             })
             .collect(),
     };
+    // The rest of the sample is delivered first: a health verdict is only
+    // taken once the sample can no longer rule the post dead.
+    let delivered: Vec<_> = sample
+        .iter()
+        .filter(|segment_id| !missing.contains(segment_id))
+        .copied()
+        .collect();
+    for segment_id in delivered {
+        deliver_first_article(&mut pipeline, segment_id);
+    }
     for segment_id in missing {
         pipeline.book_terminal_segment(segment_id, SegmentTerminalState::Missing);
     }

@@ -2346,6 +2346,10 @@ impl Pipeline {
             let state = self.rar_sets.entry((job_id, set_name.clone())).or_default();
             state.facts.clear();
             state.volume_files.clear();
+            // Rows that no longer decode, usually every row of a set written
+            // by an earlier facts schema. One line per set, not per volume.
+            let mut dropped: usize = 0;
+            let mut first_dropped: Option<(u32, String)> = None;
             for (volume_index, blob) in facts_rows {
                 match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
                     Ok(facts) => {
@@ -2380,15 +2384,22 @@ impl Pipeline {
                             container_sets.insert(set_name.clone());
                             continue;
                         }
-                        warn!(
-                            job_id = job_id.0,
-                            set_name = %set_name,
-                            volume_index,
-                            error = %error,
-                            "dropping invalid persisted RAR volume facts"
-                        );
+                        dropped += 1;
+                        if first_dropped.is_none() {
+                            first_dropped = Some((volume_index, error.to_string()));
+                        }
                     }
                 }
+            }
+            if let Some((volume_index, error)) = first_dropped {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    dropped,
+                    first_volume_index = volume_index,
+                    error = %error,
+                    "dropping invalid persisted RAR volume facts"
+                );
             }
         }
 

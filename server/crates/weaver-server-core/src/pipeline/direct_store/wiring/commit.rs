@@ -1,7 +1,8 @@
 //! Direct-store writes and finalization, including mixed-member chase handoff.
 
 use super::*;
-use crate::pipeline::direct_store::barrier::CoveragePersist;
+use crate::pipeline::direct_store::barrier::{BarrierError, CoveragePersist};
+use crate::pipeline::{DirectBarrierDone, DirectBarrierFlight, DirectRearmDone};
 
 fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedExtraction, String> {
     let mut result = ToleratedExtraction::default();
@@ -500,7 +501,17 @@ impl Pipeline {
     /// second call finds nothing to do — and if anything is still seeded after
     /// a full pass, the set demotes rather than being re-read on every
     /// completion check for the life of the job.
-    pub(super) async fn rearm_restart_seeded_gates(&mut self, job_id: JobId, set_index: usize) {
+    ///
+    /// The read itself runs off the pipeline task: it is the whole pre-restart
+    /// download read back from disk, and awaiting it here stalled every lane
+    /// of every job for as long as the disk took. `start` reads and hashes on
+    /// a blocking thread and the result comes back through
+    /// [`Self::handle_direct_rearm_done`], which re-arms the gates and resumes
+    /// the completion check the read interrupted.
+    pub(super) fn start_direct_rearm(&mut self, job_id: JobId, set_index: usize) {
+        if self.direct_rearm_in_flight.contains(&(job_id, set_index)) {
+            return;
+        }
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
@@ -522,37 +533,82 @@ impl Pipeline {
             "re-reading restart-seeded direct-store coverage to re-arm the member gates"
         );
 
+        self.direct_rearm_in_flight.insert((job_id, set_index));
+        let done_tx = self.direct_rearm_done_tx.clone();
         let read_runs = runs.clone();
-        let read_dir = destination_dir;
-        let checksums =
-            tokio::task::spawn_blocking(move || read_restart_seeded_runs(&read_dir, &read_runs))
+        tokio::spawn(async move {
+            let checksums = tokio::task::spawn_blocking(move || {
+                read_restart_seeded_runs(&destination_dir, &read_runs)
+            })
+            .await;
+            let checksums = match checksums {
+                Ok(Ok(checksums)) => Ok(checksums),
+                Ok(Err(error)) => Err(format!(
+                    "failed to re-read restart-seeded direct-store coverage: {error}"
+                )),
+                Err(error) => Err(format!(
+                    "the restart-seeded re-read task did not complete: {error}"
+                )),
+            };
+            // A closed channel is the pipeline gone; there is nothing to re-arm.
+            let _ = done_tx
+                .send(DirectRearmDone {
+                    job_id,
+                    set_index,
+                    runs,
+                    checksums,
+                })
                 .await;
+        });
+    }
+
+    /// The second half of [`Self::start_direct_rearm`]: the checksums are in,
+    /// so the gates re-arm and the completion check that started the read is
+    /// resumed. Nothing happens if the set moved on while the read ran — it
+    /// demoted, finalized, or its plan changed so the runs read are no longer
+    /// the runs seeded — except that a changed plan is read again on the next
+    /// check.
+    pub(in crate::pipeline) async fn handle_direct_rearm_done(&mut self, done: DirectRearmDone) {
+        let DirectRearmDone {
+            job_id,
+            set_index,
+            runs,
+            checksums,
+        } = done;
+        self.direct_rearm_in_flight.remove(&(job_id, set_index));
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return;
+        };
+        if set.is_demoted() || set.is_finalized() {
+            return;
+        }
+        let set_name = set.set_name().to_string();
+        if set.router.restart_read_plan() != runs {
+            debug!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                "the restart-seeded plan changed while its re-read ran; the pass is made again"
+            );
+            self.finalize_ready_direct_sets(job_id).await;
+            return;
+        }
         let checksums = match checksums {
-            Ok(Ok(checksums)) => checksums,
-            Ok(Err(error)) => {
-                warn!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    error = %error,
-                    "failed to re-read restart-seeded direct-store coverage; demoting the set"
-                );
-                self.demote_direct_set(job_id, set_index, DemotionReason::RestartRereadFailed)
-                    .await;
-                return;
-            }
+            Ok(checksums) => checksums,
             Err(error) => {
                 warn!(
                     job_id = job_id.0,
                     set_name = %set_name,
                     error = %error,
-                    "the restart-seeded re-read task did not complete; demoting the set"
+                    "restart-seeded direct-store coverage could not be re-read; demoting the set"
                 );
                 self.demote_direct_set(job_id, set_index, DemotionReason::RestartRereadFailed)
                     .await;
+                self.check_job_completion(job_id).await;
                 return;
             }
         };
 
+        let total: u64 = runs.iter().map(|run| run.len).sum();
         crate::runtime::perf_probe::record_value("direct_store.restart.reread_bytes", total);
         let mut failure = None;
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
@@ -576,6 +632,7 @@ impl Pipeline {
                 "restart-seeded direct-store coverage failed its checksum on re-read"
             );
             self.demote_direct_set(job_id, set_index, reason).await;
+            self.check_job_completion(job_id).await;
             return;
         }
 
@@ -598,6 +655,9 @@ impl Pipeline {
             self.demote_direct_set(job_id, set_index, DemotionReason::RestartRearmUnplaceable)
                 .await;
         }
+        // The read interrupted a completion check at the point the gates
+        // needed re-arming; pick that check up again with the gates armed.
+        self.check_job_completion(job_id).await;
     }
 
     /// Groups routed spans into one sub-batch per destination path.
@@ -1103,7 +1163,7 @@ impl Pipeline {
             .map(|(index, _)| index)
             .collect();
         for set_index in seeded {
-            self.rearm_restart_seeded_gates(job_id, set_index).await;
+            self.start_direct_rearm(job_id, set_index);
         }
         if self.direct_finalization_waits_for_par2(job_id) || self.par3_verification_pending(job_id)
         {
@@ -1221,7 +1281,7 @@ impl Pipeline {
                 .filter_map(|(index, set)| set.due(now).map(|trigger| (index, trigger)))
                 .collect();
             for (set_index, trigger) in due {
-                self.run_direct_barrier(job_id, set_index, trigger).await;
+                self.start_direct_barrier(job_id, set_index, trigger);
             }
         }
     }
@@ -1265,12 +1325,214 @@ impl Pipeline {
         }
     }
 
+    /// Starts a polled barrier and returns at once: the checkpoint snapshot is
+    /// taken here, on the pipeline task, and the destination syncs run on a
+    /// task of their own. [`Self::handle_direct_barrier_done`] commits the
+    /// snapshot once they are in. The controller refuses a second prepare
+    /// while one is out, so a set has at most one barrier in flight.
+    ///
+    /// The barrier used to run whole on the pipeline task, syncs included.
+    /// Under a slow destination — a network share answering fsyncs in seconds
+    /// — every lane of every job stopped for the whole sync, once per 256 MiB
+    /// batch, and the download ran in bursts between them.
+    pub(in crate::pipeline) fn start_direct_barrier(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        trigger: super::super::barrier::BarrierTrigger,
+    ) {
+        if self
+            .direct_barrier_flights
+            .contains_key(&(job_id, set_index))
+        {
+            return;
+        }
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return;
+        };
+        if set.router.repair_batch_in_progress() {
+            return;
+        }
+        let dirty_bytes = set.dirty_bytes();
+        let touched = set.touched_paths();
+        let mut drain = InlineDrain;
+        let now = Instant::now();
+        let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
+            return;
+        };
+        let prepared = match set.prepare_barrier(trigger, now, &mut drain) {
+            Some(Ok(prepared)) => prepared,
+            Some(Err(error)) => {
+                warn!(job_id = job_id.0, error = %error, "direct-store coverage barrier failed");
+                return;
+            }
+            None => return,
+        };
+        let paths: Vec<PathBuf> = touched.iter().map(|(_, path)| path.clone()).collect();
+        let done_tx = self.direct_barrier_done_tx.clone();
+        let flight_id = self.next_direct_barrier_flight_id;
+        self.next_direct_barrier_flight_id = self.next_direct_barrier_flight_id.wrapping_add(1);
+        let (outcome_tx, outcomes) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let outcomes = crate::pipeline::orchestrator::sync_direct_destinations(paths).await;
+            // The outcomes first, so a join never waits on the done channel:
+            // the pipeline task drains that channel, and a demanded barrier
+            // joins from the pipeline task. A dropped receiver is a flight
+            // already settled or a pipeline gone; either way nothing is owed.
+            let _ = outcome_tx.send(outcomes);
+            // A closed channel is the pipeline gone; the flight is dropped
+            // with it and the snapshot is never claimed.
+            let _ = done_tx
+                .send(DirectBarrierDone {
+                    job_id,
+                    set_index,
+                    flight_id,
+                })
+                .await;
+        });
+        self.direct_barrier_flights.insert(
+            (job_id, set_index),
+            DirectBarrierFlight {
+                id: flight_id,
+                prepared,
+                outcomes,
+                dirty_bytes,
+                touched,
+            },
+        );
+    }
+
+    /// The syncs of a started barrier are in: commit its snapshot.
+    pub(in crate::pipeline) async fn handle_direct_barrier_done(
+        &mut self,
+        done: DirectBarrierDone,
+    ) {
+        let key = (done.job_id, done.set_index);
+        // The message names its flight. One joined by a demanded barrier
+        // leaves its message queued, and the set may have a newer flight out
+        // by the time it arrives; settling that one here would wait on its
+        // syncs from the pipeline task — the wait the flight exists to avoid.
+        if self
+            .direct_barrier_flights
+            .get(&key)
+            .is_none_or(|flight| flight.id != done.flight_id)
+        {
+            return;
+        }
+        let Some(flight) = self.direct_barrier_flights.remove(&key) else {
+            return;
+        };
+        self.commit_direct_barrier_flight(done.job_id, done.set_index, flight)
+            .await;
+    }
+
+    /// Waits for a set's in-flight barrier, if any, and commits it. A demanded
+    /// barrier cannot start until the flight is settled — the controller has
+    /// one snapshot out at a time — and it must not wait for the done message
+    /// either, because the demand may be the pipeline's own shutdown.
+    async fn join_direct_barrier_flight(&mut self, job_id: JobId, set_index: usize) {
+        let Some(flight) = self.direct_barrier_flights.remove(&(job_id, set_index)) else {
+            return;
+        };
+        self.commit_direct_barrier_flight(job_id, set_index, flight)
+            .await;
+    }
+
+    async fn commit_direct_barrier_flight(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        flight: DirectBarrierFlight,
+    ) {
+        let DirectBarrierFlight {
+            id: _,
+            prepared,
+            outcomes,
+            dirty_bytes,
+            touched,
+        } = flight;
+        let outcomes = match outcomes.await {
+            Ok(outcomes) => outcomes,
+            Err(_) => {
+                // The sync task went away without answering (a panic): no
+                // destination is known synced, so every one fails and the
+                // barrier does.
+                touched
+                    .iter()
+                    .map(|_| {
+                        Err(std::io::Error::other(
+                            "the destination sync task did not complete",
+                        ))
+                    })
+                    .collect()
+            }
+        };
+        let results: HashMap<String, Result<(), String>> = touched
+            .into_iter()
+            .zip(outcomes)
+            .map(|((relative, _), outcome)| (relative, outcome.map_err(|error| error.to_string())))
+            .collect();
+        let mut sync = PreSyncedDestinations { results };
+        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
+        let now = Instant::now();
+        let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
+            return;
+        };
+        let outcome = set.commit_barrier(prepared, now, &mut sync, &mut persist);
+        Self::report_direct_barrier(job_id, dirty_bytes, outcome);
+    }
+
+    fn report_direct_barrier(
+        job_id: JobId,
+        dirty_bytes: u64,
+        outcome: Option<Result<super::super::barrier::BarrierReport, BarrierError>>,
+    ) {
+        match outcome {
+            Some(Ok(report)) => {
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.barrier.snapshot_bytes",
+                    report.snapshot_bytes as u64,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.barrier.dirty_bytes",
+                    dirty_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.barrier.overshoot_bytes",
+                    dirty_bytes.saturating_sub(super::super::barrier::BARRIER_DIRTY_BYTES),
+                );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.barrier.synced_destinations",
+                    report.synced_destinations as u64,
+                );
+                debug!(
+                    job_id = job_id.0,
+                    generation = report.generation,
+                    synced = report.synced_destinations,
+                    "direct-store coverage barrier committed"
+                );
+            }
+            Some(Err(error)) if error.is_retired() => {
+                // Overtaken by a restart or a reset of the set, not broken:
+                // the interval went back to the controller for the next one.
+                debug!(job_id = job_id.0, reason = %error, "direct-store coverage barrier abandoned");
+            }
+            Some(Err(error)) => {
+                warn!(job_id = job_id.0, error = %error, "direct-store coverage barrier failed");
+            }
+            None => {}
+        }
+    }
+
+    /// Runs a demanded barrier whole, on the pipeline task, after settling
+    /// any barrier the set has in flight.
     pub(in crate::pipeline) async fn run_direct_barrier(
         &mut self,
         job_id: JobId,
         set_index: usize,
         trigger: super::super::barrier::BarrierTrigger,
     ) {
+        self.join_direct_barrier_flight(job_id, set_index).await;
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
@@ -1313,36 +1575,8 @@ impl Pipeline {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
-        match set.run_barrier(trigger, now, &mut drain, &mut sync, &mut persist) {
-            Some(Ok(report)) => {
-                crate::runtime::perf_probe::record_value(
-                    "direct_store.barrier.snapshot_bytes",
-                    report.snapshot_bytes as u64,
-                );
-                crate::runtime::perf_probe::record_value(
-                    "direct_store.barrier.dirty_bytes",
-                    dirty_bytes,
-                );
-                crate::runtime::perf_probe::record_value(
-                    "direct_store.barrier.overshoot_bytes",
-                    dirty_bytes.saturating_sub(super::super::barrier::BARRIER_DIRTY_BYTES),
-                );
-                crate::runtime::perf_probe::record_value(
-                    "direct_store.barrier.synced_destinations",
-                    report.synced_destinations as u64,
-                );
-                debug!(
-                    job_id = job_id.0,
-                    generation = report.generation,
-                    synced = report.synced_destinations,
-                    "direct-store coverage barrier committed"
-                );
-            }
-            Some(Err(error)) => {
-                warn!(job_id = job_id.0, error = %error, "direct-store coverage barrier failed");
-            }
-            None => {}
-        }
+        let outcome = set.run_barrier(trigger, now, &mut drain, &mut sync, &mut persist);
+        Self::report_direct_barrier(job_id, dirty_bytes, outcome);
     }
 
     /// Commits a finished set: every member's partial becomes its destination
@@ -1630,8 +1864,7 @@ impl Pipeline {
         }
 
         for scratch in &repair_scratch {
-            crate::pipeline::release_cached_write_handle(scratch);
-            let _ = tokio::fs::remove_file(scratch).await;
+            crate::pipeline::remove_file_after_cached_write_handle(scratch);
         }
         // The set's members are at their destinations now, which is the earliest
         // moment the retained image can point at them and the last moment its
@@ -1645,8 +1878,7 @@ impl Pipeline {
             );
         } else {
             for envelope in &envelopes {
-                crate::pipeline::release_cached_write_handle(envelope);
-                let _ = tokio::fs::remove_file(envelope).await;
+                crate::pipeline::remove_file_after_cached_write_handle(envelope);
             }
         }
         // The scratch dies with the set, and its high-water is reported
@@ -1896,8 +2128,7 @@ impl Pipeline {
             let set_name = set.set_name().to_string();
             let envelopes = set.plan().envelope_paths();
             for envelope in &envelopes {
-                crate::pipeline::release_cached_write_handle(envelope);
-                let _ = tokio::fs::remove_file(envelope).await;
+                crate::pipeline::remove_file_after_cached_write_handle(envelope);
             }
             if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
                 set.release_retained_volumes();

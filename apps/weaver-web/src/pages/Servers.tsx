@@ -1,6 +1,6 @@
 import { ProxyRoutingEditor, ProxyRoutingStatus } from "@/components/ProxyRoutingEditor";
 import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { FilePenLine, Trash2 } from "lucide-react";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -279,6 +279,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   const [testing, setTesting] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{
+    values: ServerFormValues;
     success: boolean;
     message: string;
     latencyMs?: number;
@@ -316,7 +317,11 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     return [...groups.entries()].sort(([left], [right]) => left - right);
   }, [servers]);
 
+  const editorSession = useRef(0);
+
   const openAdd = () => {
+    editorSession.current += 1;
+    setTesting(false);
     setEditingServerId(null);
     setSaveError(null);
     setTestResult(null);
@@ -324,6 +329,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   };
 
   const openEdit = (server: Server) => {
+    editorSession.current += 1;
+    setTesting(false);
     setEditingServerId(server.id);
     setSaveError(null);
     setTestResult(null);
@@ -331,6 +338,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   };
 
   const closeForm = () => {
+    editorSession.current += 1;
+    setTesting(false);
     setEditingServerId(null);
     setSaveError(null);
     setTestResult(null);
@@ -338,6 +347,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   };
 
   async function showConnectionTestResult(values: ServerFormValues) {
+    const session = editorSession.current;
     setTesting(true);
     setSaveError(null);
     setTestResult(null);
@@ -357,11 +367,13 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         tlsNameMismatchCertificateDerBase64: values.tlsNameMismatchCertificateDerBase64,
       },
     });
-    setTestResult(result.data?.testConnection ?? null);
+    if (session !== editorSession.current) return;
+    setTestResult(result.data?.testConnection ? { ...result.data.testConnection, values } : null);
     setTesting(false);
   }
 
   const handleSave = async (values: ServerFormValues) => {
+    const session = editorSession.current;
     setSaveError(null);
     const input = {
       routing: values.routing,
@@ -381,6 +393,10 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
 
     if (editingServerId != null) {
       const result = await updateServer({ id: editingServerId, input });
+      if (session !== editorSession.current) {
+        void reexecuteServers({ requestPolicy: "network-only" });
+        return;
+      }
       if (result.data?.updateServer) {
         setServers((current) =>
           current.map((server) =>
@@ -402,6 +418,10 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       return;
     } else {
       const result = await addServer({ input });
+      if (session !== editorSession.current) {
+        void reexecuteServers({ requestPolicy: "network-only" });
+        return;
+      }
       if (result.data?.addServer) {
         setServers((current) =>
           [...current, result.data.addServer].sort((left, right) =>
@@ -462,7 +482,10 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     () => servers.find((server) => server.id === editingServerId) ?? null,
     [editingServerId, servers],
   );
-  const editingServerDetail = editingServerData?.server ?? null;
+  // A paused or changed query can still contain the last provider's details.
+  const editingServerDetail = editingServerId != null && editingServerData?.server?.id === editingServerId
+    ? editingServerData.server
+    : null;
 
   return (
     <div className={embedded ? "space-y-5" : "space-y-6"}>
@@ -715,7 +738,7 @@ function ServerFormCard({
   testing,
   resettingQuota,
   saveError,
-  testResult,
+  testResult: submittedTestResult,
   onSave,
   onTest,
   onRequestQuotaReset,
@@ -729,6 +752,7 @@ function ServerFormCard({
   resettingQuota: boolean;
   saveError: string | null;
   testResult: {
+    values: ServerFormValues;
     success: boolean;
     message: string;
     latencyMs?: number;
@@ -747,6 +771,9 @@ function ServerFormCard({
 }) {
   const t = useTranslate();
   const [values, setValues] = useState(initialValues);
+  const testResult = submittedTestResult && JSON.stringify(submittedTestResult.values) === JSON.stringify(values)
+    ? submittedTestResult
+    : null;
   const [showTlsWarning, setShowTlsWarning] = useState(false);
   const [pendingCertificateAdoption, setPendingCertificateAdoption] = useState<{
     derBase64: string;
@@ -830,7 +857,8 @@ function ServerFormCard({
               id="server-host"
               value={values.host}
               placeholder="news.example.com"
-              onChange={(event) => setValues((current) => ({ ...current, host: event.target.value }))}
+              onChange={(event) => setValues((current) => ({ ...current, host: event.target.value,
+                tlsNameMismatchCertificateDerBase64: null, tlsNameMismatchCertificateFingerprint: null }))}
               onBlur={() =>
                 setValues((current) => ({ ...current, host: normalizeServerHost(current.host) }))
               }
@@ -841,7 +869,8 @@ function ServerFormCard({
               id="server-port"
               type="number"
               value={values.port}
-              onChange={(event) => setValues((current) => ({ ...current, port: Number(event.target.value) }))}
+              onChange={(event) => setValues((current) => ({ ...current, port: Number(event.target.value),
+                tlsNameMismatchCertificateDerBase64: null, tlsNameMismatchCertificateFingerprint: null }))}
             />
           </Field>
           <Field label={t("servers.username")} htmlFor="server-username">
@@ -1197,12 +1226,12 @@ function ServerFormCard({
         />
 
         <ConfirmDialog
-          open={pendingCertificateAdoption != null}
+          open={pendingCertificateAdoption != null && testResult != null}
           title="Adopt hostname-mismatched certificate?"
           message="This is dangerous. Normal TLS verification remains required first; this certificate is accepted only when hostname validation fails. A different hostname-mismatched certificate will be rejected."
           confirmLabel="Adopt certificate"
           onConfirm={() => {
-            if (!pendingCertificateAdoption) return;
+            if (!pendingCertificateAdoption || !testResult) return;
             setValues((current) => ({
               ...current,
               tlsNameMismatchCertificateDerBase64: pendingCertificateAdoption.derBase64,

@@ -94,10 +94,21 @@ interface DuplicateSnapshotQueryData {
 type DuplicateAction = "good" | "bad" | "promote" | "forget";
 
 export function JobDetail() {
+  const { id } = useParams();
+  // Queries, subscriptions and pending confirmations belong to one job.
+  return <JobDetailContent key={id} />;
+}
+
+function JobDetailContent() {
   const t = useTranslate();
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
+  const active = useRef(false);
+  useEffect(() => {
+    active.current = true;
+    return () => { active.current = false; };
+  }, []);
   const connection = useLiveConnection();
   const graphqlConnection = useGraphqlConnectionState();
   const queryVariables = useMemo(() => ({ id: jobId }), [jobId]);
@@ -611,7 +622,9 @@ export function JobDetail() {
         confirmLabel={t("confirm.cancelJobConfirm")}
         cancelLabel={t("confirm.cancelJobDismiss")}
         onConfirm={() => {
-          void cancelJob({ id: job.id }).then(() => navigate("/"));
+          void cancelJob({ id: job.id }).then(() => {
+            if (active.current) navigate("/");
+          });
           setShowCancelConfirm(false);
         }}
         onCancel={() => setShowCancelConfirm(false)}
@@ -675,7 +688,7 @@ export function JobDetail() {
 
             setShowDeleteConfirm(false);
             setDeleteFiles(false);
-            navigate("/history");
+            if (active.current) navigate("/history");
           })();
         }}
         onCancel={() => {
