@@ -4288,7 +4288,34 @@ impl Pipeline {
     }
 }
 
+#[cfg(test)]
+static DIAGNOSTIC_CHECKSUM_READS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, usize>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl Pipeline {
+    pub(in crate::pipeline) fn diagnostic_checksum_count(path: &std::path::Path) -> usize {
+        DIAGNOSTIC_CHECKSUM_READS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileChecksum> {
+    #[cfg(test)]
+    {
+        *DIAGNOSTIC_CHECKSUM_READS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
     let mut md5 = par2_rs::checksum::FileHashState::new();

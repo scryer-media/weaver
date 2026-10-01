@@ -546,6 +546,13 @@ impl Par3Job {
                     carrier.published,
                     snapshot,
                 )?;
+                // An embedded carrier is also protected input. Its metadata
+                // can arrive before the archive body, so extending coverage
+                // must revisit missing source blocks even if no new packet
+                // changes the retained assessment.
+                for set in self.sets.values_mut() {
+                    set.source_arrived(source, &self.options)?;
+                }
                 return self.scan(source);
             }
         }
@@ -971,6 +978,12 @@ impl Pipeline {
             .as_ref()
             .is_some_and(|runtime| runtime.is_installing(job_id))
         {
+            return Ok(());
+        }
+        if self.has_direct_placements(job_id) {
+            // A finished write can still await its assembly commit, and a
+            // sibling volume may share the same backing member. Preserve dirty
+            // sources until the entire placement lane has settled.
             return Ok(());
         }
         if self.direct_demotion_in_flight.contains_key(&job_id) {
@@ -1401,5 +1414,7 @@ mod readback;
 pub(in crate::pipeline) mod virtual_source;
 pub(in crate::pipeline) mod work;
 
+#[cfg(test)]
+mod schedule_tests;
 #[cfg(test)]
 mod tests;

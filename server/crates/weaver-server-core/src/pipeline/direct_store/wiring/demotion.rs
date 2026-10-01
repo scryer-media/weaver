@@ -1184,11 +1184,10 @@ impl Pipeline {
                     .map(|segment| segment.ordinal)
                     .collect();
 
-                // Rebuild the assembly to exactly the kept set. `commit_segment`
-                // is the only way in and `reset` the only way out, so the
-                // sequence is reset-then-re-commit rather than a surgical
-                // removal; the decoded sizes come from the recorded extents, so
-                // the byte counters land where they were.
+                // Only sweep-verified bytes are committed here. Parked
+                // handoffs retain their geometry and commit after their writes;
+                // precommitting them makes each write look like a completed
+                // file rewrite and repeatedly hashes the entire volume.
                 if let Some(file_asm) = state.assembly.file_mut(file_id) {
                     file_asm.reset();
                 }
@@ -1199,26 +1198,26 @@ impl Pipeline {
                     let Some((offset, len)) = file_extents.get(segment_number).copied() else {
                         continue;
                     };
+                    if !verified.contains(segment_number) {
+                        if let Some(file_asm) = state.assembly.file_mut(file_id) {
+                            file_asm.record_placement(*segment_number, offset, len as u32);
+                        }
+                        kept_bytes = kept_bytes.saturating_add(len);
+                        continue;
+                    }
                     if let Some(file_asm) = state.assembly.file_mut(file_id)
                         && file_asm.commit_segment(*segment_number, len as u32).is_ok()
                     {
                         kept_bytes = kept_bytes.saturating_add(len);
-                        file_asm.note_part_verification(
+                        file_asm.note_part_verification(*segment_number, true);
+                        // Reconstruction must not manufacture streamed PAR2
+                        // checksum evidence for its already durable coverage.
+                        file_asm.record_reconstructed_placement(
                             *segment_number,
-                            verified.contains(segment_number),
+                            offset,
+                            len as u32,
                         );
-                        if verified.contains(segment_number) {
-                            // Coverage is durable, but reconstruction must not
-                            // manufacture streamed PAR2 checksum evidence.
-                            file_asm.record_reconstructed_placement(
-                                *segment_number,
-                                offset,
-                                len as u32,
-                            );
-                            materialized_extents.push((offset, len));
-                        } else {
-                            file_asm.record_placement(*segment_number, offset, len as u32);
-                        }
+                        materialized_extents.push((offset, len));
                     }
                 }
                 // Native PAR3 availability is independent of PAR2's placement

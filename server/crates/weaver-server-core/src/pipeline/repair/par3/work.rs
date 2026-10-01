@@ -1011,6 +1011,57 @@ impl Coordinator {
             .is_some_and(|job| job.ticket.is_some())
     }
 
+    #[cfg(test)]
+    pub(in crate::pipeline) fn diagnostic_source_snapshot(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Option<SourceSnapshot>> {
+        Ok(self.jobs[&job_id].sources.snapshot(source)?)
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn diagnostic_source_ranges(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Vec<(u64, u64)>> {
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        while let Some(range) = self.jobs[&job_id].sources.next_available(source, offset)? {
+            offset = range.end;
+            ranges.push((range.start, range.end));
+        }
+        Ok(ranges)
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn published_source_bytes(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Vec<(u64, Vec<u8>)>> {
+        let ranges = self.diagnostic_source_ranges(job_id, source)?;
+        let mut result = Vec::new();
+        for (start, end) in ranges {
+            let mut bytes = vec![0; (end - start) as usize];
+            let mut filled = 0;
+            while filled < bytes.len() {
+                let count = self.jobs[&job_id].sources.read_at(
+                    source,
+                    start + filled as u64,
+                    &mut bytes[filled..],
+                )?;
+                if count == 0 {
+                    return Err(EngineError::InvalidState("short published test source"));
+                }
+                filled += count;
+            }
+            result.push((start, bytes));
+        }
+        Ok(result)
+    }
+
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| {
             job.installing

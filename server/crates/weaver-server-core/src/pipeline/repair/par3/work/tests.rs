@@ -1,5 +1,7 @@
 use super::*;
 
+mod schedules;
+
 fn carrier(root: &std::path::Path) -> PathBuf {
     let path = root.join("set.par3");
     std::fs::write(&path, include_bytes!("../../backend/fixtures/set.par3")).unwrap();

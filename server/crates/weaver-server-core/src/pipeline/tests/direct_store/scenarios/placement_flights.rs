@@ -10,6 +10,228 @@ use tokio::sync::Semaphore;
 
 const ARTICLES: usize = 2;
 
+mod schedules;
+
+#[tokio::test]
+async fn diagnostic_demotion_handback_hashes_volume_once() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41991);
+    let payload: Vec<u8> = (0..1_200_000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let volumes = single_member_store_set("feature.mkv", &payload, 1);
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Handback diagnostic", &volumes, 12);
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    route_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    settle_direct_placement_work(&mut pipeline).await;
+    let hold = Arc::new(Semaphore::new(0));
+    pipeline.direct_placement_hold = Some(Arc::clone(&hold));
+    for ordinal in 1..12 {
+        route_article(&mut pipeline, job_id, &volumes, 0, ordinal).await;
+    }
+    assert!(pipeline.has_direct_placements(job_id));
+    let path = working.join(&volumes[0].0);
+    let before = Pipeline::diagnostic_checksum_count(&path);
+    hold.add_permits(1);
+    pipeline
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
+        .await;
+    assert!(pipeline.direct_demotion_in_flight.contains_key(&job_id));
+    settle_direct_demotion_work(&mut pipeline).await;
+    let reads = Pipeline::diagnostic_checksum_count(&path) - before;
+    assert_eq!(std::fs::read(&path).unwrap(), volumes[0].1);
+    assert_eq!(
+        reads, 1,
+        "a handback must not rehash the entire volume for every parked article"
+    );
+}
+
+#[tokio::test]
+async fn diagnostic_par3_partial_source_gains_committed_ranges() {
+    diagnostic_partial_publication(None).await;
+}
+
+#[tokio::test]
+async fn diagnostic_par3_encrypted_source_gains_committed_ranges() {
+    diagnostic_partial_publication(Some(false)).await;
+}
+
+#[tokio::test]
+async fn diagnostic_par3_header_encrypted_source_gains_committed_ranges() {
+    diagnostic_partial_publication(Some(true)).await;
+}
+
+async fn diagnostic_partial_publication(encrypted: Option<bool>) {
+    use crate::pipeline::repair::par3::work::Coordinator;
+    use par3_rs::source::SourceId;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41993);
+    let volumes = match encrypted {
+        None => fixture(),
+        Some(headers) => {
+            let payload: Vec<u8> = (0..120_000u32).map(|i| (i * 7 + 3) as u8).collect();
+            encrypted_store_set(
+                "feature.mkv",
+                &payload,
+                3,
+                "moonlit-harbour",
+                Some("moonlit-harbour"),
+                headers,
+            )
+        }
+    };
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec = direct_store_job_spec_with_articles("Publication diagnostic", &volumes, 3);
+    if encrypted.is_some() {
+        spec.password = Some("moonlit-harbour".into());
+    }
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    route_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    settle_direct_placement_work(&mut pipeline).await;
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        Arc::clone(&pipeline.metrics),
+    );
+    coordinator.admit(job_id).unwrap();
+    pipeline.par3_runtime = Some(Box::new(coordinator));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let before = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .diagnostic_source_ranges(job_id, SourceId(0))
+        .unwrap();
+
+    let hold = Arc::new(Semaphore::new(0));
+    pipeline.direct_placement_hold = Some(Arc::clone(&hold));
+    route_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    hold.add_permits(1);
+    pipeline.await_direct_placement_io(job_id, 0).await;
+    assert!(pipeline.has_direct_placements(job_id));
+    assert!(!committed(&pipeline, segment(job_id, 0, 1)));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    settle_direct_placement_work(&mut pipeline).await;
+    assert!(committed(&pipeline, segment(job_id, 0, 1)));
+    assert!(!committed(&pipeline, segment(job_id, 0, 2)));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let after = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .diagnostic_source_ranges(job_id, SourceId(0))
+        .unwrap();
+    let set = pipeline.direct_store.set(job_id, 0).unwrap();
+    let len = set.virtual_volume_len(0, 0);
+    let expected =
+        set.virtual_volumes(&std::collections::BTreeMap::from([(0, len)]))[0].readable_ranges();
+    assert_ne!(
+        before, expected,
+        "the committed article must grow readable coverage"
+    );
+    assert_eq!(
+        after, expected,
+        "PAR3 retained incomplete coverage after placement committed; before={before:?}, after={after:?}"
+    );
+}
+
+#[tokio::test]
+async fn diagnostic_par3_sibling_snapshot_stays_fresh_after_placement() {
+    use crate::pipeline::repair::par3::work::Coordinator;
+    use par3_rs::source::SourceId;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41992);
+    let volumes = fixture();
+    let (mut pipeline, _, initial_hold) = held_pipeline(&root, job_id, &volumes).await;
+    initial_hold.add_permits(1);
+    for ordinal in 0..2 {
+        route_article(&mut pipeline, job_id, &volumes, 0, ordinal).await;
+        settle_direct_placement_work(&mut pipeline).await;
+    }
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        Arc::clone(&pipeline.metrics),
+    );
+    coordinator.admit(job_id).unwrap();
+    pipeline.par3_runtime = Some(Box::new(coordinator));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    assert!(
+        pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .diagnostic_source_snapshot(job_id, SourceId(0))
+            .unwrap()
+            .is_some()
+    );
+
+    let hold = Arc::new(Semaphore::new(0));
+    pipeline.direct_placement_hold = Some(Arc::clone(&hold));
+    route_article(&mut pipeline, job_id, &volumes, 1, 0).await;
+    assert!(pipeline.has_direct_placements(job_id));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    hold.add_permits(1);
+    settle_direct_placement_work(&mut pipeline).await;
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let snapshot = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .diagnostic_source_snapshot(job_id, SourceId(0));
+    assert!(
+        matches!(snapshot, Ok(Some(_))),
+        "a completed sibling retained a stale snapshot after another volume's write: {snapshot:?}"
+    );
+}
+
+#[tokio::test]
+async fn diagnostic_par3_publication_waits_for_direct_placement() {
+    use crate::pipeline::repair::par3::work::Coordinator;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41990);
+    let volumes = fixture();
+    let (mut pipeline, _, initial_hold) = held_pipeline(&root, job_id, &volumes).await;
+    route_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    initial_hold.add_permits(1);
+    settle_direct_placement_work(&mut pipeline).await;
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        Arc::clone(&pipeline.metrics),
+    );
+    coordinator.admit(job_id).unwrap();
+    pipeline.par3_runtime = Some(Box::new(coordinator));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+
+    let hold = Arc::new(Semaphore::new(0));
+    pipeline.direct_placement_hold = Some(Arc::clone(&hold));
+    route_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    assert!(pipeline.has_direct_placements(job_id));
+    assert!(!committed(&pipeline, segment(job_id, 0, 1)));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    let published_while_writing = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .has_worker_in_flight(job_id);
+    settle_par3_work(&mut pipeline, job_id).await;
+    hold.add_permits(1);
+    settle_direct_placement_work(&mut pipeline).await;
+    assert!(
+        !published_while_writing,
+        "PAR3 dispatched a source snapshot while its direct placement was held before writing"
+    );
+}
+
 fn fixture() -> Vec<(String, Vec<u8>)> {
     let payload: Vec<u8> = (0..120_000u32).map(|index| (index * 7 + 3) as u8).collect();
     single_member_store_set("feature.mkv", &payload, 3)
@@ -62,7 +284,10 @@ async fn route_article(
         segment(job_id, file_index, segment_number),
     );
     let (filename, bytes) = &volumes[file_index as usize];
-    let (start, end) = article_extent(bytes.len(), segment_number, ARTICLES);
+    let articles = pipeline.jobs[&job_id].spec.files[file_index as usize]
+        .segments
+        .len();
+    let (start, end) = article_extent(bytes.len(), segment_number, articles);
     let data = &bytes[start..end];
     let file_id = NzbFileId { job_id, file_index };
     let total_segments = pipeline
