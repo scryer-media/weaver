@@ -842,6 +842,16 @@ impl Pipeline {
         }
     }
 
+    /// Whether any set of this job is holding a parked repair verdict.
+    pub(in crate::pipeline) fn job_has_pending_par2_repair(&self, job_id: JobId) -> bool {
+        self.par2_runtime(job_id).is_some_and(|runtime| {
+            runtime
+                .sets
+                .values()
+                .any(|set_runtime| set_runtime.pending_repair.is_some())
+        })
+    }
+
     /// The parked verdict, if this entry may repair on it instead of analysing
     /// again.
     ///
