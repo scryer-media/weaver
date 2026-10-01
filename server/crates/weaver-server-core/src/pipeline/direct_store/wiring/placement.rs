@@ -6,7 +6,7 @@ use super::commit::prepare_direct_destination_paths;
 use super::*;
 use crate::pipeline::{
     DirectPlacement, DirectPlacementDone, DirectPlacementFlight, DirectPlacementFlightState,
-    DirectPlacementKind, DirectPlacementOutcome,
+    DirectPlacementKind, DirectPlacementLane, DirectPlacementOutcome,
 };
 
 /// Collects a placement task's outcome. A task that went away without
@@ -21,6 +21,22 @@ async fn collect_placement_outcome(
             "the direct-store placement task did not complete",
         ))),
     })
+}
+
+/// Whether a lane holds a placement still waiting for its writes or its
+/// commit.
+///
+/// A flight being applied has already taken the placement it is committing
+/// off its list, and that placement's coverage is recorded before its commit
+/// runs. Counting it would make the commit's own follow-on — a volume
+/// completing, a set finalizing, the completion check after it — wait on
+/// itself.
+fn lane_has_placements(lane: &DirectPlacementLane) -> bool {
+    !lane.queued.is_empty()
+        || lane.flight.as_ref().is_some_and(|flight| {
+            !matches!(flight.state, DirectPlacementFlightState::Applying)
+                || !flight.placements.is_empty()
+        })
 }
 
 impl Pipeline {
@@ -45,23 +61,29 @@ impl Pipeline {
     }
 
     /// Whether any placement of this job is still waiting for its
-    /// destination writes or its commit.
-    ///
-    /// A flight being applied has already taken the placement it is
-    /// committing off its list. Counting that one would make the commit's own
-    /// follow-on — a volume completing, a set finalizing, the completion check
-    /// after it — wait on itself.
+    /// destination writes or its commit; see [`lane_has_placements`].
     pub(crate) fn has_direct_placements(&self, job_id: JobId) -> bool {
         self.direct_placement_lanes
             .iter()
-            .any(|((owner, _), lane)| {
-                *owner == job_id
-                    && (!lane.queued.is_empty()
-                        || lane.flight.as_ref().is_some_and(|flight| {
-                            !matches!(flight.state, DirectPlacementFlightState::Applying)
-                                || !flight.placements.is_empty()
-                        }))
-            })
+            .any(|((owner, _), lane)| *owner == job_id && lane_has_placements(lane))
+    }
+
+    /// Whether this set has a placement whose bytes are, or may already be,
+    /// on disk without being in its coverage: queued, writing, or written
+    /// and waiting for its done message to apply it.
+    ///
+    /// Nothing that snapshots the set's coverage may stand while this holds.
+    /// The routing retired the set's PAR3 images before these writes left,
+    /// and their commit does not retire them again, so an image taken now
+    /// would report the bytes missing for as long as it is published.
+    pub(in crate::pipeline) fn direct_set_has_placements(
+        &self,
+        job_id: JobId,
+        set_index: usize,
+    ) -> bool {
+        self.direct_placement_lanes
+            .get(&(job_id, set_index))
+            .is_some_and(lane_has_placements)
     }
 
     /// Re-queues a completion check that ran while this job had a placement
@@ -237,6 +259,7 @@ impl Pipeline {
             if self.jobs.contains_key(&done.job_id) && self.job_decode_stage_drained(done.job_id) {
                 self.maybe_finish_download_pass(done.job_id);
             }
+            self.republish_par3_awaiting_placements(done.job_id);
             self.wake_completion_check_awaiting_placements(done.job_id);
             return;
         }
@@ -250,6 +273,7 @@ impl Pipeline {
         if self.jobs.contains_key(&done.job_id) && self.job_decode_stage_drained(done.job_id) {
             self.maybe_finish_download_pass(done.job_id);
         }
+        self.republish_par3_awaiting_placements(done.job_id);
         self.wake_completion_check_awaiting_placements(done.job_id);
         // Bytes that waited here were counted as write backlog; a hard latch
         // they helped raise has nothing else to lift it until the next tick.
@@ -601,6 +625,8 @@ impl Pipeline {
     /// ([`crate::pipeline::close_cached_write_handles_under`]).
     pub(crate) fn drop_direct_placements_for_job(&mut self, job_id: JobId) {
         self.completion_checks_awaiting_placements.remove(&job_id);
+        self.par3_publications_awaiting_placements
+            .retain(|(owner, _)| *owner != job_id);
         let keys: Vec<(JobId, usize)> = self
             .direct_placement_lanes
             .keys()
