@@ -553,17 +553,7 @@ impl DirectUnpackRuntime {
             if let Some(hold) = hold {
                 let _ = hold.acquire().await;
             }
-            if let Err(error) = tokio::fs::remove_dir_all(&staging_dir).await
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    path = %staging_dir.display(),
-                    error = %error,
-                    "failed to remove direct-unpack staging"
-                );
-            }
+            remove_chase_staging(job_id, &set_name, &staging_dir).await;
         }));
     }
 
@@ -3658,6 +3648,41 @@ pub(in crate::pipeline) fn install_chased_members(
     })?;
     let _ = std::fs::remove_dir_all(from);
     Ok(())
+}
+
+/// Delete a chase's staging tree, and say so if it cannot be deleted.
+///
+/// `tokio::fs` runs the recursive unlink on a blocking thread, so an awaiting
+/// task does not pin a runtime worker for as long as the tree takes to go.
+pub(in crate::pipeline) async fn remove_chase_staging(
+    job_id: JobId,
+    set_name: &str,
+    staging_dir: &std::path::Path,
+) {
+    if let Err(error) = tokio::fs::remove_dir_all(staging_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            job_id = job_id.0,
+            set_name,
+            path = %staging_dir.display(),
+            error = %error,
+            "failed to remove direct-unpack staging"
+        );
+    }
+}
+
+/// Delete a chase's staging tree on a task of its own, for a caller that
+/// has nothing more to do with it and should not wait for it to go.
+pub(in crate::pipeline) fn spawn_chase_staging_removal(
+    job_id: JobId,
+    set_name: &str,
+    staging_dir: PathBuf,
+) {
+    let set_name = set_name.to_string();
+    tokio::spawn(async move {
+        remove_chase_staging(job_id, &set_name, &staging_dir).await;
+    });
 }
 
 /// Read the 32-byte signature header, or `Ok(None)` if the file is still

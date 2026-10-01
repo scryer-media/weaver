@@ -1630,9 +1630,15 @@ pub(in crate::pipeline) async fn install_direct_unpack(
                     // Aborting a started blocking task does not stop it. Let
                     // its cancellation checkpoints run before deleting paths
                     // it can still be writing, without delaying fallback.
+                    let set_name = pending.set_name.clone();
                     tokio::spawn(async move {
                         let _ = handle.await;
-                        let _ = tokio::fs::remove_dir_all(pending.staging_dir).await;
+                        crate::pipeline::direct_unpack::wiring::remove_chase_staging(
+                            job_id,
+                            &set_name,
+                            &pending.staging_dir,
+                        )
+                        .await;
                     });
                     None
                 }
@@ -1649,7 +1655,11 @@ pub(in crate::pipeline) async fn install_direct_unpack(
                             error = %error,
                             "chase failed at consumption; extracting conventionally"
                         );
-                        let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                        crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
+                            job_id,
+                            set_name_for_channel,
+                            pending.staging_dir,
+                        );
                         None
                     }
                     Err(error) => {
@@ -1658,7 +1668,11 @@ pub(in crate::pipeline) async fn install_direct_unpack(
                             error = %error,
                             "chase worker panicked; extracting conventionally"
                         );
-                        let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                        crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
+                            job_id,
+                            set_name_for_channel,
+                            pending.staging_dir,
+                        );
                         None
                     }
                 },
@@ -1667,11 +1681,20 @@ pub(in crate::pipeline) async fn install_direct_unpack(
         crate::pipeline::direct_unpack::wiring::ChaseDisposition::None => None,
     };
 
+    // The chase's tree is deleted on a task of its own so the conventional
+    // fallback does not wait for it. Nothing joins these deletes at shutdown:
+    // this whole path already runs on an extraction task shutdown does not
+    // join, and the maintenance sweep collects a tree an exit interrupts once
+    // its job is gone.
     if let Some((outcome, chase_staging, total_bytes, completed_bytes)) = chase {
         if expected_names.is_some_and(|expected| {
             outcome.extracted.iter().cloned().collect::<HashSet<_>>() != *expected
         }) {
-            let _ = tokio::fs::remove_dir_all(chase_staging).await;
+            crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
+                job_id,
+                set_name_for_channel,
+                chase_staging,
+            );
             return None;
         }
         if policy.is_some_and(|policy| {
@@ -1680,7 +1703,11 @@ pub(in crate::pipeline) async fn install_direct_unpack(
                 .iter()
                 .any(|name| policy.unacceptable_extension_match(name).is_some())
         }) {
-            let _ = tokio::fs::remove_dir_all(chase_staging).await;
+            crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
+                job_id,
+                set_name_for_channel,
+                chase_staging,
+            );
             return None;
         }
         // RAR supplies either its policy (whole set) or its mixed-member
