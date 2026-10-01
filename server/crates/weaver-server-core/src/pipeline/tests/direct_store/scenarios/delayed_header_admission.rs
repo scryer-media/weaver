@@ -108,6 +108,12 @@ fn segment(file: u32, article: u32) -> SegmentId {
 }
 
 async fn prepared(temp: &TempDir, volumes: &[(String, Vec<u8>)]) -> Pipeline {
+    let mut pipeline = scaled_pipeline(temp).await;
+    admit_delayed_header_job(&mut pipeline, JOB, "Silver Horizon", volumes).await;
+    pipeline
+}
+
+async fn scaled_pipeline(temp: &TempDir) -> Pipeline {
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         temp,
         BufferPoolConfig {
@@ -121,18 +127,31 @@ async fn prepared(temp: &TempDir, volumes: &[(String, Vec<u8>)]) -> Pipeline {
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.direct_store.set_holds_budget(4096);
     pipeline.direct_store.set_holds_scratch_ceiling(65536);
-    insert_active_job(
-        &mut pipeline,
-        JOB,
-        direct_store_job_spec("Silver Horizon", volumes),
-    )
-    .await;
+    pipeline
+}
+
+fn job_segment(job_id: JobId, file: u32, article: u32) -> SegmentId {
+    SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: file,
+        },
+        segment_number: article,
+    }
+}
+
+async fn admit_delayed_header_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    name: &str,
+    volumes: &[(String, Vec<u8>)],
+) {
+    insert_active_job(pipeline, job_id, direct_store_job_spec(name, volumes)).await;
     // A late split-member header, after 65 normally completed volumes.
     for (file, article) in in_order_arrivals(65).into_iter().chain([(65, 1)]) {
-        take_queued_segment(&mut pipeline, JOB, segment(file, article));
-        submit_volume_article(&mut pipeline, JOB, volumes, file, article).await;
+        take_queued_segment(pipeline, job_id, job_segment(job_id, file, article));
+        submit_volume_article(pipeline, job_id, volumes, file, article).await;
     }
-    pipeline
 }
 
 #[tokio::test]
@@ -604,4 +623,221 @@ async fn a_probe_exempt_header_gets_past_the_per_file_early_out() {
     // exempt, so its file passes the per-file answer and the scan finds it.
     assert_eq!(handed_out(&mut pipeline, 3), vec![segment(65, 0)]);
     assert_eq!(scan_counters(&pipeline).2, budget_blocks);
+}
+
+/// The articles behind the delayed header, in arrival order. Every one of them
+/// is staged in the set's holds until the header arrives.
+fn held_arrivals() -> impl Iterator<Item = (u32, u32)> {
+    (66..84).flat_map(|file| [(file, 0), (file, 1)])
+}
+
+fn article_len(volumes: &[(String, Vec<u8>)], file: u32, article: u32) -> u64 {
+    let (start, end) = article_extent(volumes[file as usize].1.len(), article, 2);
+    (end - start) as u64
+}
+
+#[tokio::test]
+async fn holds_admission_is_capped_by_the_shared_scratch_total_across_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = scaled_pipeline(&temp).await;
+    // Two sets' own admission limits (three quarters of 4 KiB + 64 KiB each)
+    // sum well past a shared scratch total of one set's ceiling.
+    let shared_scratch = 65536;
+    pipeline.direct_store.set_holds_limits(
+        crate::pipeline::direct_store::accountant::HoldsLimits {
+            resident_bytes: 8192,
+            scratch_bytes: shared_scratch,
+            disk_reserve_bytes: 0,
+        },
+    );
+    let peer = JobId(48005);
+    admit_delayed_header_job(&mut pipeline, JOB, "Silver Horizon", &volumes).await;
+    admit_delayed_header_job(&mut pipeline, peer, "Amber Coast", &volumes).await;
+
+    // The first set takes held arrivals for as long as its admission allows.
+    let mut first_arrivals = held_arrivals();
+    for (file, article) in first_arrivals.by_ref() {
+        let room = pipeline
+            .direct_store
+            .set(JOB, 0)
+            .unwrap()
+            .router
+            .holds_admission_room(0);
+        if article_len(&volumes, file, article) > room {
+            break;
+        }
+        take_queued_segment(&mut pipeline, JOB, job_segment(JOB, file, article));
+        submit_volume_article(&mut pipeline, JOB, &volumes, file, article).await;
+        assert!(!pipeline.direct_store.set(JOB, 0).unwrap().is_demoted());
+    }
+    assert!(
+        pipeline.direct_store.holds_accountant().scratch_bytes() > shared_scratch / 2,
+        "the first set must have paged most of the shared scratch"
+    );
+
+    // The second set's own limit alone would still admit far more than the
+    // shared total has left.
+    let router = &pipeline.direct_store.set(peer, 0).unwrap().router;
+    let own_room = router
+        .holds_admission_limit()
+        .saturating_sub(router.staged_bytes());
+    let room = router.holds_admission_room(0);
+    assert!(
+        room < own_room / 2,
+        "the shared remainder must cap the second set: {room} vs its own {own_room}"
+    );
+
+    // Admitted as dispatch admits it, the second set routes without either
+    // set demoting, and the shared scratch is never overrun.
+    let mut peer_arrivals = held_arrivals().peekable();
+    let mut admitted = 0;
+    while let Some(&(file, article)) = peer_arrivals.peek() {
+        let room = pipeline
+            .direct_store
+            .set(peer, 0)
+            .unwrap()
+            .router
+            .holds_admission_room(0);
+        if article_len(&volumes, file, article) > room {
+            break;
+        }
+        peer_arrivals.next();
+        take_queued_segment(&mut pipeline, peer, job_segment(peer, file, article));
+        submit_volume_article(&mut pipeline, peer, &volumes, file, article).await;
+        admitted += 1;
+    }
+    assert!(admitted > 0, "the shared remainder still admits some work");
+    assert!(!pipeline.direct_store.set(JOB, 0).unwrap().is_demoted());
+    assert!(!pipeline.direct_store.set(peer, 0).unwrap().is_demoted());
+    assert!(pipeline.direct_store.holds_accountant().scratch_bytes() <= shared_scratch);
+
+    // What the per-set figure alone admitted: arrivals inside the second
+    // set's own limit page past the shared total and demote it.
+    for (file, article) in peer_arrivals {
+        let router = &pipeline.direct_store.set(peer, 0).unwrap().router;
+        if router.staged_bytes() + article_len(&volumes, file, article)
+            > router.holds_admission_limit()
+        {
+            break;
+        }
+        take_queued_segment(&mut pipeline, peer, job_segment(peer, file, article));
+        submit_volume_article(&mut pipeline, peer, &volumes, file, article).await;
+        if pipeline.direct_store.set(peer, 0).unwrap().is_demoted() {
+            break;
+        }
+    }
+    assert!(
+        format!("{:?}", pipeline.direct_store.sets_for(peer)).contains("HoldsScratchCeiling"),
+        "the per-set figure alone admits arrivals the shared scratch cannot page"
+    );
+}
+
+#[tokio::test]
+async fn holds_scratch_ceiling_demotion_reconstructs_held_volumes_without_refetching_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    // Four whole volumes held behind the delayed header, most of them paged.
+    let held: Vec<(u32, u32)> = held_arrivals().take(8).collect();
+    for &(file, article) in &held {
+        take_queued_segment(&mut pipeline, JOB, segment(file, article));
+        submit_volume_article(&mut pipeline, JOB, &volumes, file, article).await;
+    }
+    let set = pipeline.direct_store.set(JOB, 0).unwrap();
+    assert!(!set.is_demoted());
+    assert!(
+        set.router.scratch_bytes() > 0,
+        "the held volumes must sit partly on scratch"
+    );
+
+    pipeline
+        .demote_direct_set(
+            JOB,
+            0,
+            crate::pipeline::direct_store::router::DemotionReason::HoldsScratchCeiling,
+        )
+        .await;
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    let working = pipeline.jobs.get(&JOB).unwrap().working_dir.clone();
+    for (name, bytes) in &volumes[66..70] {
+        assert_eq!(
+            &std::fs::read(working.join(name)).unwrap(),
+            bytes,
+            "held volume {name} must be rebuilt byte-exactly from its holds"
+        );
+    }
+    let queued = queued_segments(&mut pipeline, JOB);
+    for arrival in &held {
+        assert!(
+            !queued.contains(arrival),
+            "held article {arrival:?} must not be fetched again"
+        );
+    }
+    assert!(
+        queued.contains(&(65, 0)),
+        "the header that never arrived is still owed"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        0,
+        "the preserved scratch is released once the sweep has read it"
+    );
+}
+
+#[tokio::test]
+async fn routing_time_scratch_ceiling_demotion_keeps_every_held_article_but_the_handoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    // Uncontrolled arrivals, as in the pre-admission sequence: the article
+    // whose paging hits the scratch ceiling demotes the set while routing and
+    // is handed to the decode seam.
+    let mut routed: Vec<(u32, u32)> = Vec::new();
+    let mut handoff = None;
+    for (file, article) in held_arrivals() {
+        take_queued_segment(&mut pipeline, JOB, segment(file, article));
+        submit_volume_article(&mut pipeline, JOB, &volumes, file, article).await;
+        if pipeline.direct_store.set(JOB, 0).unwrap().is_demoted() {
+            handoff = Some((file, article));
+            break;
+        }
+        routed.push((file, article));
+    }
+    let (handoff_file, handoff_article) = handoff.expect("the scratch ceiling must be reached");
+    assert!(format!("{:?}", pipeline.direct_store.sets_for(JOB)).contains("HoldsScratchCeiling"));
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    let working = pipeline.jobs.get(&JOB).unwrap().working_dir.clone();
+    for (name, bytes) in &volumes[66..handoff_file as usize] {
+        assert_eq!(
+            &std::fs::read(working.join(name)).unwrap(),
+            bytes,
+            "held volume {name} must be rebuilt byte-exactly from its holds"
+        );
+    }
+    // The handed-off article reaches its volume through its owner, beside
+    // whatever of that volume was held before it.
+    let (name, bytes) = &volumes[handoff_file as usize];
+    let landed = std::fs::read(working.join(name)).unwrap();
+    let (_, through) = article_extent(bytes.len(), handoff_article, 2);
+    assert_eq!(&landed[..through], &bytes[..through]);
+
+    let queued = queued_segments(&mut pipeline, JOB);
+    for arrival in routed.iter().chain([&(handoff_file, handoff_article)]) {
+        assert!(
+            !queued.contains(arrival),
+            "article {arrival:?} was received and must not be fetched again"
+        );
+    }
+    assert!(
+        queued.contains(&(65, 0)),
+        "the header that never arrived is still owed"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        0,
+        "the preserved scratch is released once the sweep has read it"
+    );
 }

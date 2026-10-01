@@ -111,6 +111,9 @@ impl Pipeline {
         reason: DemotionReason,
         handoffs: &[SegmentId],
     ) {
+        // Read before the claim, so the set being demoted is counted among the
+        // sets that were sharing the holds limits when it gave up.
+        let live_sets = self.direct_store.live_set_count();
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
@@ -220,6 +223,13 @@ impl Pipeline {
             format!("direct_store.demoted.{}", reason.metric()),
             std::time::Duration::from_nanos(1),
         );
+        // How crowded the process was when this reason struck: a scratch cap
+        // that only ever fires with many sets live is a sharing problem, not
+        // one set's.
+        crate::runtime::perf_probe::record_value_owned(
+            format!("direct_store.demoted.{}.live_sets", reason.metric()),
+            live_sets as u64,
+        );
         // Reported, not yet acted on: how many demotions could have been served
         // by the set's own virtual volumes, split from the ones that genuinely
         // need files on disk. Every set still materializes below; this is the
@@ -240,6 +250,7 @@ impl Pipeline {
             set_name = %set_name,
             reason = reason.metric(),
             volumes = %volume_demand,
+            live_sets,
             "direct-store set demoted"
         );
 
@@ -338,7 +349,23 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(ReconstructionFailure::NoLayout);
         };
-        let preserve_holds = matches!(reason, DemotionReason::Par3MemoryPressure);
+        // Reasons that say the set ran out of room — PAR3's memory, the holds
+        // RAM budget, the scratch ceiling, the disk reserve — and nothing about
+        // the held bytes themselves: those are posted bytes the provider can
+        // still serve, so the sweep keeps them rather than fetching them again.
+        // A scratch that failed to write or read is not here: the bytes behind
+        // it are not known to be readable. A holds cap is usually struck while
+        // an article is routing, and that article goes to the decode seam; its
+        // own range is cut out of what the sweep keeps (below), and every
+        // other held byte is still kept.
+        let out_of_holds_room = matches!(
+            reason,
+            DemotionReason::HoldsBudgetExceeded
+                | DemotionReason::HoldsScratchCeiling
+                | DemotionReason::HoldsScratchDiskReserve
+        );
+        let preserve_holds =
+            out_of_holds_room || matches!(reason, DemotionReason::Par3MemoryPressure);
         if !preserve_holds && set.router.member_partials().is_empty() {
             // Nothing was ever routed to a member, so there is nothing to
             // reconstruct *from* beyond headers. Refetching is both correct and
@@ -387,15 +414,32 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
-            // Placed bytes only, deliberately. The provider can serve holds
-            // too, but this sweep hands the set to the conventional path, whose
-            // decode handoff owns the article that was routing when demotion
-            // struck and whose targeted requeue owns every segment the atoms do
-            // not wholly back; a hold materialized here would be written twice
-            // and counted against a completion gate nothing then clears.
-            // A PAR3 spill starts outside an article handoff. Its immutable
-            // holds can be reconstructed too, subject to the same CRC atoms.
-            let physical_coverage = if preserve_holds && handoffs.is_empty() {
+            // Placed bytes only, unless the demotion is for room. The provider
+            // can serve holds too, but this sweep hands the set to the
+            // conventional path, whose decode handoff owns the article that
+            // was routing when demotion struck and whose targeted requeue owns
+            // every segment the atoms do not wholly back; a handed-off article
+            // materialized here would be written twice and counted against a
+            // completion gate nothing then clears.
+            //
+            // A demotion for room keeps its holds: they are posted bytes,
+            // checked by their own article CRCs, and fetching them again is
+            // the cost the demotion exists to avoid. What it must not keep is
+            // a handed-off article's range, held or placed, so that range is
+            // cut out and left to its owner. A PAR3 spill keeps its holds only
+            // when it starts outside a handoff, as it always has.
+            let extents = set.segment_extents(*volume_index);
+            let physical_coverage = if out_of_holds_room {
+                let mut coverage = set.volume_coverage_with_holds(*volume_index);
+                for (offset, len) in handoffs
+                    .iter()
+                    .filter(|segment_id| segment_id.file_id == file_id)
+                    .filter_map(|segment_id| extents.get(&segment_id.segment_number))
+                {
+                    coverage.remove(*offset, *len);
+                }
+                coverage
+            } else if preserve_holds && handoffs.is_empty() {
                 set.volume_coverage_with_holds(*volume_index)
             } else {
                 set.volume_coverage(*volume_index)
@@ -406,7 +450,6 @@ impl Pipeline {
             // current segment, and the targeted requeue below owns any other
             // segment that is not wholly backed by an article CRC atom.
             let coverage = crcs.materializable_coverage(&physical_coverage);
-            let extents = set.segment_extents(*volume_index);
             // The sweep sets the file's length before it writes, to cut off a
             // stale tail an interrupted earlier attempt could have left above
             // the volume. It runs detached, though, and the decode seam writes

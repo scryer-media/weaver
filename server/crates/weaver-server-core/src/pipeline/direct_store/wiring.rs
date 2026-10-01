@@ -623,6 +623,16 @@ impl DirectStoreRuntime {
             && !self.prepared_destinations.contains_key(&job_id)
     }
 
+    /// Sets across every job that are still routing: neither demoted nor
+    /// finalized. These are the sets sharing the accountant's limits.
+    pub(crate) fn live_set_count(&self) -> usize {
+        self.sets
+            .values()
+            .flatten()
+            .filter(|set| !set.is_demoted() && !set.is_finalized())
+            .count()
+    }
+
     pub(crate) fn sets_for(&self, job_id: JobId) -> &[DirectSet] {
         self.sets.get(&job_id).map(Vec::as_slice).unwrap_or(&[])
     }

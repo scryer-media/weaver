@@ -4,10 +4,11 @@ use crate::pipeline::direct_store::router::HeaderProbe as DirectHeaderProbe;
 pub(in crate::pipeline::download) struct DirectStoreAdmission {
     job_id: JobId,
     files: HashSet<u32>,
-    limit: u64,
-    /// Staged bytes, plus every byte already on its way to the set, plus
-    /// what the handout being built has leased of it.
-    committed: u64,
+    /// Room the set had when the handout began: its holds admission room
+    /// with every byte already on its way to it counted.
+    room: u64,
+    /// What the handout being built has leased of the set so far.
+    leased: u64,
     available: u64,
     probes: Vec<SegmentId>,
     probe_lease: ProbeLease,
@@ -60,8 +61,12 @@ impl DirectStoreAdmission {
         if file.job_id != self.job_id || !self.files.contains(&file.file_index) {
             return;
         }
-        self.committed = self.committed.saturating_add(work.byte_estimate as u64);
-        self.available = self.limit.saturating_sub(self.committed);
+        // The holds admission room falls byte for byte with what is
+        // committed to the set, down to zero, so charging the lease against
+        // the room taken at the start equals asking the router again with
+        // the lease counted as incoming.
+        self.leased = self.leased.saturating_add(work.byte_estimate as u64);
+        self.available = self.room.saturating_sub(self.leased);
         match self.probe_lease {
             ProbeLease::CloseAll => self.probes.clear(),
             ProbeLease::CloseFile => self
@@ -123,8 +128,7 @@ impl Pipeline {
                         .active_decodes_by_file
                         .iter()
                         .any(|(file, count)| owns(*file) && *count != 0);
-                let limit = set.router.holds_admission_limit();
-                let committed = set.router.staged_bytes().saturating_add(incoming);
+                let room = set.router.holds_admission_room(incoming);
 
                 // Permit queued articles past the limit to resolve the layout.
                 // Ordinals need not match yEnc offsets: serialized progress
@@ -237,9 +241,9 @@ impl Pipeline {
                 DirectStoreAdmission {
                     job_id,
                     files,
-                    limit,
-                    committed,
-                    available: limit.saturating_sub(committed),
+                    room,
+                    leased: 0,
+                    available: room,
                     probes,
                     probe_lease,
                 }

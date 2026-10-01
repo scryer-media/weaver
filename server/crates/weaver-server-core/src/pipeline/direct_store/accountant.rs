@@ -147,6 +147,33 @@ impl HoldsAccountant {
         charge.scratch = scratch;
     }
 
+    /// How many more bytes one router may commit to its holds, judged against
+    /// what the process can still honour once every other set's published
+    /// holds are counted: RAM up to the shared resident limit, capped by
+    /// `resident_budget` (the most this router keeps resident before it pages),
+    /// plus whatever is left of the shared scratch total.
+    ///
+    /// `charge` is the caller's own standing charge, taken back out of the
+    /// totals so only other sets count as spent; `committed` is what the
+    /// caller already holds or has on its way. The same quarter the per-set
+    /// admission keeps back is kept back here, so the sum of every set's
+    /// admissions stops short of the point where a spill is refused.
+    pub(crate) fn admission_room(
+        &self,
+        charge: &HoldsCharge,
+        resident_budget: u64,
+        committed: u64,
+    ) -> u64 {
+        let others_resident = self.resident_bytes().saturating_sub(charge.resident);
+        let others_scratch = self.scratch_bytes().saturating_sub(charge.scratch);
+        let capacity = resident_budget
+            .min(self.limits.resident_bytes.saturating_sub(others_resident))
+            .saturating_add(self.limits.scratch_bytes.saturating_sub(others_scratch));
+        capacity
+            .saturating_sub(capacity / 4)
+            .saturating_sub(committed)
+    }
+
     /// Withdraws one router's charge entirely. A router dropping is the one
     /// caller: its bytes are gone with it, whatever it last published.
     pub(crate) fn release(&self, charge: &mut HoldsCharge) {
@@ -271,6 +298,39 @@ mod tests {
         );
         accountant.release(&mut other);
         assert_eq!(accountant.admit_scratch(100), Ok(()));
+    }
+
+    #[test]
+    fn admission_room_counts_only_other_sets_against_the_shared_limits() {
+        let accountant = HoldsAccountant::new(limits(100, 400, 0));
+        let mut own = HoldsCharge::default();
+        let mut other = HoldsCharge::default();
+
+        // Alone: its own resident budget plus the whole scratch total, less
+        // the quarter admission keeps back.
+        assert_eq!(accountant.admission_room(&own, 64, 0), 348);
+        assert_eq!(accountant.admission_room(&own, 64, 48), 300);
+
+        // Its own published holds are not counted twice: they are in
+        // `committed`, not in what the other sets have spent.
+        accountant.publish(&mut own, 40, 60);
+        assert_eq!(accountant.admission_room(&own, 64, 100), 248);
+
+        // Another set's holds shrink both halves: RAM to what the shared
+        // resident limit has left, scratch to what the shared total has left.
+        accountant.publish(&mut other, 80, 300);
+        assert_eq!(accountant.admission_room(&own, 64, 0), 90);
+        assert_eq!(accountant.admission_room(&own, 64, 100), 0);
+
+        accountant.release(&mut other);
+        assert_eq!(accountant.admission_room(&own, 64, 100), 248);
+    }
+
+    #[test]
+    fn unbounded_admission_room_never_caps_a_set() {
+        let accountant = HoldsAccountant::unbounded();
+        let own = HoldsCharge::default();
+        assert!(accountant.admission_room(&own, 64 << 20, 1 << 40) > 1 << 60);
     }
 
     #[test]
