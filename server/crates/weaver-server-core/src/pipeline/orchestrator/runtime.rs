@@ -2656,8 +2656,7 @@ static DIRECT_PLACEMENTS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<Placeme
 
 /// Ticket number to the destinations a placement task claims and the watcher
 /// its ticket releases.
-type PlacementsInFlight =
-    HashMap<u64, (Vec<std::path::PathBuf>, tokio::sync::watch::Receiver<()>)>;
+type PlacementsInFlight = HashMap<u64, (Vec<std::path::PathBuf>, tokio::sync::watch::Receiver<()>)>;
 
 static NEXT_DIRECT_PLACEMENT_TICKET: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2798,7 +2797,7 @@ pub(crate) fn compute_write_backlog_budget_bytes(
     // wall variance), while decode-side scaling is what prevents pressure
     // latch cycles during download waves.
     let scratch_bytes = buffer_pool_total_bytes(buffers);
-    let available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024) as usize;
+    let available_bytes = backlog_memory_ceiling_bytes(profile);
     let base = scratch_bytes
         .max(64 * 1024 * 1024)
         .min((available_bytes / 8).max(64 * 1024 * 1024));
@@ -2822,11 +2821,7 @@ pub(crate) fn compute_decode_backlog_budget_bytes(
     const DECODE_BACKLOG_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
     let scratch_bytes = buffer_pool_total_bytes(buffers);
-    let mut available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024);
-    if let Some(cgroup_limit) = profile.memory.cgroup_limit {
-        available_bytes = available_bytes.min(cgroup_limit);
-    }
-    let available_bytes = available_bytes as usize;
+    let available_bytes = backlog_memory_ceiling_bytes(profile);
     // A full download wave (every lane's leased runway decoding at once) must
     // fit under the soft limit on machines with memory to spare, or the
     // pressure latch cycles on every wave; scale the budget with available
@@ -2841,6 +2836,16 @@ pub(crate) fn compute_decode_backlog_budget_bytes(
         .max(write_backlog_budget_bytes);
 
     target.min(memory_cap).max(1)
+}
+
+/// The memory both backlog budgets are carved from: available memory with a
+/// 256 MiB floor, capped by the container's limit when there is one.
+fn backlog_memory_ceiling_bytes(profile: &SystemProfile) -> usize {
+    let available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024);
+    match profile.memory.cgroup_limit {
+        Some(cgroup_limit) => available_bytes.min(cgroup_limit) as usize,
+        None => available_bytes as usize,
+    }
 }
 
 fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {

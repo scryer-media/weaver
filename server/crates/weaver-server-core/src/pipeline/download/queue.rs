@@ -317,9 +317,10 @@ impl DownloadQueue {
     }
 
     /// Removes the highest-priority item matching `matches`, even when another
-    /// work class currently owns the heap head. This intentionally takes the
-    /// slower path and is reserved for class-constrained completion dispatch;
-    /// ordinary dispatch continues to use the O(log n) heap-head path above.
+    /// work class currently owns the heap head. Every dispatch takes this
+    /// path: it pops until a match, then pushes the skipped items back, so a
+    /// match at the head costs O(log n) and one behind `k` skipped items costs
+    /// up to O(k log n). The head-only paths above are not used by dispatch.
     pub fn pop_first_matching(
         &mut self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
