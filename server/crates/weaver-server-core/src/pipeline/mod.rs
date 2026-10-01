@@ -2756,6 +2756,9 @@ pub struct Pipeline {
     /// Routed articles whose destination writes are out or queued, per set;
     /// see [`DirectPlacementFlight`].
     pub(super) direct_placement_lanes: HashMap<(JobId, usize), DirectPlacementLane>,
+    /// Jobs whose completion check ran while a placement was out. The check
+    /// cannot judge them until it lands, and the landing re-queues it.
+    pub(super) completion_checks_awaiting_placements: HashSet<JobId>,
     /// Monotonic; stamps each placement flight and its done message.
     pub(super) next_direct_placement_flight_id: u64,
     pub(super) direct_placement_done_tx: mpsc::Sender<DirectPlacementDone>,
