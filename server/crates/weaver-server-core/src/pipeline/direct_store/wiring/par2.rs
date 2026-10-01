@@ -164,6 +164,20 @@ impl Pipeline {
             })
     }
 
+    /// Whether the archive set `set_name` has a demotion sweep whose ticket
+    /// has not landed, however many of its volumes are already handed back.
+    ///
+    /// A chase reads every volume of its set, so one handed-back volume does
+    /// not make the set readable: the sweep may still be rebuilding or
+    /// removing its siblings, and the set's routed outputs are deleted only
+    /// when the ticket lands. The completion replay that follows re-enters
+    /// every complete volume, and that is where the set may arm.
+    pub(crate) fn demotion_sweep_outstanding_for_set(&self, job_id: JobId, set_name: &str) -> bool {
+        self.direct_demotion_in_flight
+            .get(&job_id)
+            .is_some_and(|sets| sets.values().any(|work| work.plan.set_name == set_name))
+    }
+
     /// File indices whose queued articles are held back while a demotion
     /// sweep owns them, or `None` when no sweep is in flight for the job.
     ///
