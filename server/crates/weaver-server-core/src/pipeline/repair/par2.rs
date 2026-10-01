@@ -297,8 +297,8 @@ fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Resu
 }
 
 /// Scan a completed PAR2 carrier into per-set packet groups. The packet scan
-/// authenticates metadata, but intentionally defers recovery-payload hashes;
-/// validate those here before any caller can merge or count a slice.
+/// authenticates metadata and recovery payloads before accepting their packet
+/// boundaries, so every caller receives only authenticated slices.
 fn scan_completed_par2_packet_groups(
     path: &Path,
     budget: &SharedPar2ScanBudget,
@@ -321,22 +321,7 @@ fn scan_completed_par2_packet_groups(
             });
             index
         };
-        let packet_is_valid = match &scanned_packet.packet {
-            par2_rs::Packet::RecoverySlice(recovery) => {
-                recovery
-                    .data
-                    .validate_packet_hash(
-                        scanned_packet.recovery_set_id.as_bytes(),
-                        recovery.exponent,
-                    )
-                    .ok()
-                    == Some(true)
-            }
-            _ => true,
-        };
-        if packet_is_valid {
-            groups[index].packets.push(scanned_packet.packet);
-        }
+        groups[index].packets.push(scanned_packet.packet);
     }
     Ok(groups)
 }

@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod archive_schedules;
+
 mod chasing;
 mod classification_frontier;
 #[cfg(unix)]

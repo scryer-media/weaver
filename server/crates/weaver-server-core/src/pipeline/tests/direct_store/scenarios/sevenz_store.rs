@@ -7,6 +7,8 @@
 
 use super::*;
 
+mod schedules;
+
 use sevenz_turbo::encoder_options::AesEncoderOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
 
