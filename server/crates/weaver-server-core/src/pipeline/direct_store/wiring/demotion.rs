@@ -111,6 +111,9 @@ impl Pipeline {
         reason: DemotionReason,
         handoffs: &[SegmentId],
     ) {
+        // Read before the claim, so the set being demoted is counted among the
+        // sets that were sharing the holds limits when it gave up.
+        let live_sets = self.direct_store.live_set_count();
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
@@ -220,6 +223,13 @@ impl Pipeline {
             format!("direct_store.demoted.{}", reason.metric()),
             std::time::Duration::from_nanos(1),
         );
+        // How crowded the process was when this reason struck: a scratch cap
+        // that only ever fires with many sets live is a sharing problem, not
+        // one set's.
+        crate::runtime::perf_probe::record_value_owned(
+            format!("direct_store.demoted.{}.live_sets", reason.metric()),
+            live_sets as u64,
+        );
         // Reported, not yet acted on: how many demotions could have been served
         // by the set's own virtual volumes, split from the ones that genuinely
         // need files on disk. Every set still materializes below; this is the
@@ -240,6 +250,7 @@ impl Pipeline {
             set_name = %set_name,
             reason = reason.metric(),
             volumes = %volume_demand,
+            live_sets,
             "direct-store set demoted"
         );
 

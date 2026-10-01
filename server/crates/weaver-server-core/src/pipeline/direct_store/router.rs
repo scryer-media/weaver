@@ -3451,6 +3451,22 @@ impl DirectSetRouter {
         capacity.saturating_sub(capacity / 4)
     }
 
+    /// Bytes this set may still admit with `incoming` already on its way:
+    /// what is left under its own [`Self::holds_admission_limit`], further
+    /// capped by what the process-wide accountant can still honour once every
+    /// other set's holds are counted. Without the second cap, sets that each
+    /// stay inside their own limit can together page past the shared scratch
+    /// total and demote. A set alone on a host whose shared limits exceed its
+    /// own admits exactly what its own limit allows.
+    pub(crate) fn holds_admission_room(&self, incoming: u64) -> u64 {
+        let committed = self.staged_bytes().saturating_add(incoming);
+        let own = self.holds_admission_limit().saturating_sub(committed);
+        let shared = self
+            .accountant
+            .admission_room(&self.charge, self.holds_budget, committed);
+        own.min(shared)
+    }
+
     /// An incomplete header walk can still release retained bytes, including
     /// bytes from later volumes whose split-member offsets depend on this one.
     pub(crate) fn volume_needs_header(&self, volume: u32) -> bool {
