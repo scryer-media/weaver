@@ -737,9 +737,19 @@ impl Pipeline {
                 | JobStatus::Moving
                 | JobStatus::Complete
                 | JobStatus::Failed { .. }
-                | JobStatus::QueuedExtract
-                | JobStatus::Extracting
         ) {
+            return false;
+        }
+        // An extraction phase only owns the job while it has work in flight.
+        // A job whose sets extract independently stays `Extracting` (or
+        // queued for it) after one set's members are out while another set
+        // still waits on its repair; that idle phase must yield to the repair,
+        // or nothing ever moves the job out of it. While a worker or batch is
+        // live the repair waits: the extraction's settlement re-runs the
+        // completion check, which repairs on the same verdict.
+        if matches!(status, JobStatus::QueuedExtract | JobStatus::Extracting)
+            && self.job_has_active_extraction_tasks(job_id)
+        {
             return false;
         }
         if matches!(status, JobStatus::Repairing) {

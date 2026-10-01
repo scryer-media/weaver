@@ -1559,6 +1559,16 @@ impl Pipeline {
                         }
                         RarExtractionSettle::Idle => {
                             self.try_rar_extraction(job_id).await;
+                            // A parked repair verdict whose recovery landed
+                            // while this batch held the job is waiting on
+                            // exactly this settlement: the completion check
+                            // that found the recovery deferred behind the live
+                            // extraction, and nothing else re-runs it.
+                            if self.job_has_pending_par2_repair(job_id)
+                                && !self.job_has_active_extraction_tasks(job_id)
+                            {
+                                self.schedule_job_completion_check(job_id);
+                            }
                         }
                     }
                 }
