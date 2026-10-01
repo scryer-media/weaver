@@ -11,6 +11,8 @@ use tokio::sync::Semaphore;
 
 const ARTICLES: usize = 2;
 
+mod schedules;
+
 /// A placement routed into a set retires the set's PAR3 sources before its
 /// writes leave. A refresh while those writes are held must not publish one
 /// over a destination about to change.

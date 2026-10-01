@@ -1040,6 +1040,33 @@ impl Coordinator {
         Ok(ranges)
     }
 
+    #[cfg(test)]
+    pub(in crate::pipeline) fn published_source_bytes(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Vec<(u64, Vec<u8>)>> {
+        let ranges = self.source_ranges(job_id, source)?;
+        let mut result = Vec::new();
+        for (start, end) in ranges {
+            let mut bytes = vec![0; (end - start) as usize];
+            let mut filled = 0;
+            while filled < bytes.len() {
+                let count = self.jobs[&job_id].sources.read_at(
+                    source,
+                    start + filled as u64,
+                    &mut bytes[filled..],
+                )?;
+                if count == 0 {
+                    return Err(EngineError::InvalidState("short published test source"));
+                }
+                filled += count;
+            }
+            result.push((start, bytes));
+        }
+        Ok(result)
+    }
+
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| {
             job.installing

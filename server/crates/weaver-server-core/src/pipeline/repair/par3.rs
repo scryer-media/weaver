@@ -546,6 +546,13 @@ impl Par3Job {
                     carrier.published,
                     snapshot,
                 )?;
+                // An embedded carrier is also protected input. Its metadata
+                // can arrive before the archive body, so extending coverage
+                // must revisit missing source blocks even if no new packet
+                // changes the retained assessment.
+                for set in self.sets.values_mut() {
+                    set.source_arrived(source, &self.options)?;
+                }
                 return self.scan(source);
             }
         }
@@ -1453,5 +1460,7 @@ mod readback;
 pub(in crate::pipeline) mod virtual_source;
 pub(in crate::pipeline) mod work;
 
+#[cfg(test)]
+mod schedule_tests;
 #[cfg(test)]
 mod tests;
