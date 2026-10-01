@@ -916,6 +916,57 @@ fn decode_backlog_budget_respects_effective_memory_cap() {
     assert_eq!(decode_budget, 64 * 1024 * 1024);
 }
 
+#[test]
+fn backlog_budgets_share_one_memory_ceiling() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let host = SystemProfile {
+        cpu: CpuProfile {
+            physical_cores: 8,
+            logical_cores: 8,
+            simd: SimdSupport::default(),
+            cgroup_limit: None,
+        },
+        memory: MemoryProfile {
+            total_bytes: 16 * GIB,
+            available_bytes: 16 * GIB,
+            cgroup_limit: None,
+        },
+        disk: DiskProfile {
+            storage_class: StorageClass::Ssd,
+            filesystem: FilesystemType::Ext4,
+            sequential_write_mbps: 1000.0,
+            random_read_iops: 50_000.0,
+            same_filesystem: true,
+        },
+    };
+    let mut boxed = host.clone();
+    boxed.memory.cgroup_limit = Some(GIB);
+    let mut small_host = host.clone();
+    small_host.memory.available_bytes = GIB;
+    // 384 MiB of scratch: above an eighth of the container's limit, well
+    // below an eighth of the host's memory.
+    let buffers = BufferPool::new(BufferPoolConfig {
+        small_count: 512,
+        medium_count: 64,
+        large_count: 16,
+    });
+    let budgets = |profile: &SystemProfile| {
+        let write = compute_write_backlog_budget_bytes(profile, &buffers);
+        let decode = compute_decode_backlog_budget_bytes(profile, &buffers, write);
+        (write, decode)
+    };
+
+    // Without a container limit the host figure decides, as before.
+    assert_eq!(
+        budgets(&host),
+        (384 * 1024 * 1024, (16 * GIB / 12) as usize)
+    );
+    // A container limit scales both budgets down from the same ceiling the
+    // host would have with that much memory.
+    assert_eq!(budgets(&boxed), ((GIB / 8) as usize, (GIB / 8) as usize));
+    assert_eq!(budgets(&boxed), budgets(&small_host));
+}
+
 #[tokio::test]
 async fn fail_job_clears_write_backlog_accounting() {
     let temp_dir = tempfile::tempdir().unwrap();

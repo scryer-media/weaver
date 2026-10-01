@@ -31,6 +31,28 @@ impl DirectStoreAdmission {
             || self.probes.contains(&work.segment_id)
     }
 
+    /// Whether this set could admit *any* queued article of `file_index`,
+    /// given the smallest `byte_estimate` among them.
+    ///
+    /// [`Self::allows`] admits an article of one of the set's files only when
+    /// its estimate fits the room left or it is one of the set's probes. When
+    /// even the smallest article does not fit, no article of the file fits,
+    /// so only a probe can get through; a probe in this file keeps the answer
+    /// `true`. Probes are matched by file index alone, which can only make
+    /// the answer more permissive than [`Self::allows`].
+    pub(in crate::pipeline::download) fn may_admit_from_file(
+        &self,
+        file_index: u32,
+        smallest: u32,
+    ) -> bool {
+        !self.files.contains(&file_index)
+            || smallest as u64 <= self.available
+            || self
+                .probes
+                .iter()
+                .any(|probe| probe.file_id.file_index == file_index)
+    }
+
     /// Charge an article the handout being built has just taken, so the
     /// next one is admitted against what the set will hold with it.
     pub(in crate::pipeline::download) fn note_leased(&mut self, work: &DownloadWork) {

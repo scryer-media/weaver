@@ -88,8 +88,9 @@
 //! work it was handed, and returning unused work to the queue.
 
 use super::worker::DownloadPressure;
-use super::worker::ServableWork;
+use super::worker::{BlockedBy, ServableWork, ServableWorkFilter};
 use super::*;
+use crate::operations::metrics::SchedulerBlockClause;
 
 /// What a server gets when it asks for work.
 pub(in crate::pipeline) enum Handout {
@@ -138,7 +139,8 @@ pub(in crate::pipeline) enum YieldReason {
 enum ShareTaken {
     Works(Vec<DownloadWork>),
     Saturated(SaturationWake),
-    Blocked,
+    /// Nothing for this server, refused by these clauses.
+    Blocked(BlockedBy),
 }
 
 /// Which class of handout a counter should record.
@@ -198,7 +200,7 @@ impl Pipeline {
         match self.take_lane_share(*hot_job, server_idx, want, lane, pressure) {
             ShareTaken::Works(works) => return self.record_handout(HandoutKind::Hot, works),
             ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
-            ShareTaken::Blocked => {}
+            ShareTaken::Blocked(blocked) => self.note_hot_blocked(blocked),
         }
 
         if soft_pressure {
@@ -215,7 +217,7 @@ impl Pipeline {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
                 ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
-                ShareTaken::Blocked => {}
+                ShareTaken::Blocked(_) => {}
             }
         }
 
@@ -225,7 +227,7 @@ impl Pipeline {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
                 ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
-                ShareTaken::Blocked => {}
+                ShareTaken::Blocked(_) => {}
             }
         }
 
@@ -331,11 +333,9 @@ impl Pipeline {
         pressure: DownloadPressure,
     ) -> ShareTaken {
         let Some(lane) = lane else {
-            let works = self.take_servable_works(job_id, server_idx, want, pressure);
-            return if works.is_empty() {
-                ShareTaken::Blocked
-            } else {
-                ShareTaken::Works(works)
+            return match self.take_servable_works(job_id, server_idx, want, pressure) {
+                Ok(works) => ShareTaken::Works(works),
+                Err(blocked) => ShareTaken::Blocked(blocked),
             };
         };
         let share = self.lane_share_of_job(job_id, lane.depth);
@@ -366,37 +366,35 @@ impl Pipeline {
             // Only a job that would actually have served this lane may hold it:
             // one that is blocked here must let the walk go on, or a lane at
             // its share of a job it cannot fetch from would shut out the rest.
-            return if self.job_has_servable_work_for_server(job_id, server_idx, pressure) {
-                ShareTaken::Saturated(wake)
-            } else {
-                ShareTaken::Blocked
+            return match self.job_servable_work_for_server(job_id, server_idx, pressure) {
+                Ok(()) => ShareTaken::Saturated(wake),
+                Err(blocked) => ShareTaken::Blocked(blocked),
             };
         }
         let room = share - holds;
-        let works = self.take_servable_works(job_id, server_idx, want.min(room), pressure);
-        if works.is_empty() {
-            ShareTaken::Blocked
-        } else {
-            ShareTaken::Works(works)
+        match self.take_servable_works(job_id, server_idx, want.min(room), pressure) {
+            Ok(works) => ShareTaken::Works(works),
+            Err(blocked) => ShareTaken::Blocked(blocked),
         }
     }
 
     /// Take up to `want` articles of one job that `server_idx` may fetch.
     ///
-    /// Empty means this job is blocked on this server for this call. The
-    /// job's completion-critical heap leads its ordinary one, which is what
-    /// the queue's own "first matching" scan already does.
+    /// `Ok` is never empty; `Err` means this job is blocked on this server
+    /// for this call, and names the clauses that refused it. The job's
+    /// completion-critical heap leads its ordinary one, which is what the
+    /// queue's own "first matching" scan already does.
     fn take_servable_works(
         &mut self,
         job_id: JobId,
         server_idx: usize,
         want: usize,
         pressure: DownloadPressure,
-    ) -> Vec<DownloadWork> {
+    ) -> Result<Vec<DownloadWork>, BlockedBy> {
         // Too young to fetch: asking now produces not-founds indistinguishable
         // from articles that were never posted.
         if self.propagation_hold_until(job_id).is_some() {
-            return Vec::new();
+            return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
         }
         // An archive whose unlock order changed re-ranks its queue before
         // anything is taken from it.
@@ -414,7 +412,7 @@ impl Pipeline {
             uu_cursor_ordinals.as_ref(),
         ) {
             ServableWork::Scan(filter) => filter,
-            ServableWork::NoQueuedFilePasses => return Vec::new(),
+            ServableWork::NoQueuedFilePasses(blocked) => return Err(blocked),
             ServableWork::RetentionExcluded => {
                 // Retention rules this server out for the job. When it rules
                 // every server out, no lane will ever take the queue: retire
@@ -426,17 +424,21 @@ impl Pipeline {
                 {
                     self.retire_unservable_queued_work(job_id);
                 }
-                return Vec::new();
+                return Err(BlockedBy::only(SchedulerBlockClause::Retention));
             }
         };
         let mut taken: Vec<DownloadWork> = Vec::new();
         while taken.len() < want {
-            let popped = self.jobs.get_mut(&job_id).and_then(|state| {
-                state
-                    .download_queue
-                    .pop_first_matching(|work| filter.allows(work))
-            });
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                break;
+            };
+            let popped = state
+                .download_queue
+                .pop_first_matching(|work| filter.allows(work));
             let Some(work) = popped else {
+                self.metrics
+                    .download_scheduler_scan_no_match_total
+                    .fetch_add(1, Ordering::Relaxed);
                 break;
             };
             filter.note_taken(&work);
@@ -446,10 +448,32 @@ impl Pipeline {
             taken.push(work);
         }
 
-        if taken.is_empty() && filter.checkpoint_blocked() {
-            self.note_checkpoint_dispatch_block(job_id);
+        self.note_scan_skips(&filter);
+        if taken.is_empty() {
+            if filter.checkpoint_blocked() {
+                self.note_checkpoint_dispatch_block(job_id);
+            }
+            return Err(filter.refused_by());
         }
-        taken
+        Ok(taken)
+    }
+
+    fn note_scan_skips(&self, filter: &ServableWorkFilter<'_>) {
+        let skipped = filter.skipped();
+        if skipped != 0 {
+            self.metrics
+                .download_scheduler_scan_items_skipped_total
+                .fetch_add(skipped, Ordering::Relaxed);
+        }
+    }
+
+    /// Count what kept the hot job from the asking server, once per clause
+    /// that refused it.
+    fn note_hot_blocked(&self, blocked: BlockedBy) {
+        for clause in blocked.clauses() {
+            self.metrics.download_scheduler_hot_blocked_total[clause.index()]
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn record_handout(&mut self, kind: HandoutKind, works: Vec<DownloadWork>) -> Handout {
@@ -519,24 +543,49 @@ impl Pipeline {
         server_idx: usize,
         pressure: DownloadPressure,
     ) -> bool {
+        self.job_servable_work_for_server(job_id, server_idx, pressure)
+            .is_ok()
+    }
+
+    /// [`Self::job_has_servable_work_for_server`], naming the clauses that
+    /// refused the job when it holds nothing for the server.
+    fn job_servable_work_for_server(
+        &mut self,
+        job_id: JobId,
+        server_idx: usize,
+        pressure: DownloadPressure,
+    ) -> Result<(), BlockedBy> {
         if self.propagation_hold_until(job_id).is_some() {
-            return false;
+            return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
         }
         let bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
-        let ServableWork::Scan(filter) = self.servable_work_filter(
+        let filter = match self.servable_work_filter(
             job_id,
             server_idx,
             bootstrap_files.as_deref(),
             uu_cursor_ordinals.as_ref(),
-        ) else {
-            return false;
+        ) {
+            ServableWork::Scan(filter) => filter,
+            ServableWork::NoQueuedFilePasses(blocked) => return Err(blocked),
+            ServableWork::RetentionExcluded => {
+                return Err(BlockedBy::only(SchedulerBlockClause::Retention));
+            }
         };
-        self.jobs.get(&job_id).is_some_and(|state| {
-            state
-                .download_queue
-                .peek_first_matching(|work| filter.allows(work))
-                .is_some()
-        })
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Err(BlockedBy::default());
+        };
+        let found = state
+            .download_queue
+            .peek_first_matching(|work| filter.allows(work))
+            .is_some();
+        self.note_scan_skips(&filter);
+        if found {
+            return Ok(());
+        }
+        self.metrics
+            .download_scheduler_scan_no_match_total
+            .fetch_add(1, Ordering::Relaxed);
+        Err(filter.refused_by())
     }
 }

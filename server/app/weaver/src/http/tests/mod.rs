@@ -973,6 +973,10 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         download_scheduler_handouts_total_hot: 202,
         download_scheduler_handouts_total_spill: 203,
         download_scheduler_handouts_total_probe: 204,
+        download_scheduler_scan_items_skipped_total: 205,
+        download_scheduler_scan_no_match_total: 206,
+        download_scheduler_hot_blocked_total: [207;
+            weaver_server_core::SchedulerBlockClause::COUNT],
         download_lane_inflight_bytes: 6291456,
         download_jobs_eligible: 4,
         download_jobs_hot: 1,

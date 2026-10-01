@@ -472,3 +472,57 @@ fn queued_count_per_file_tracks_push_pop_removal_and_drain() {
     assert_eq!(q.queued_count_for_file(file0), 0);
     assert_eq!(q.queued_count_for_file(file1), 0);
 }
+
+#[test]
+fn min_queued_byte_estimate_tracks_every_add_and_removal_path() {
+    let file = |file_index| NzbFileId {
+        job_id: JobId(7),
+        file_index,
+    };
+    let sized = |file_index, seg, bytes| DownloadWork {
+        byte_estimate: bytes,
+        ..make_work(7, file_index, seg, 10)
+    };
+    let mut q = DownloadQueue::new();
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(0)), None);
+    q.push(sized(0, 0, 500));
+    q.push(sized(0, 1, 200));
+    q.push(sized(0, 2, 200));
+    q.push(sized(1, 0, 900));
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(0)), Some(200));
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(1)), Some(900));
+
+    // A re-key moves items without changing their estimates.
+    q.reprioritize_matching(|work| (work.segment_id.file_id == file(0)).then_some(1));
+    q.promote_matching_to_completion_critical_with_rank(|work| {
+        (work.segment_id.segment_number == 1).then_some((1, None))
+    });
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(0)), Some(200));
+
+    // Two items share the minimum: removing one keeps it.
+    let popped = q
+        .pop_first_matching(|work| {
+            work.segment_id.segment_number == 1 && work.segment_id.file_id == file(0)
+        })
+        .unwrap();
+    assert_eq!(popped.byte_estimate, 200);
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(0)), Some(200));
+    q.pop_first_matching(|work| {
+        work.segment_id.segment_number == 2 && work.segment_id.file_id == file(0)
+    })
+    .unwrap();
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(0)), Some(500));
+
+    // Bulk removal recounts.
+    q.push(sized(0, 3, 100));
+    let extracted = q.extract_matching(|work| work.byte_estimate == 100);
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(0)), Some(500));
+
+    // Draining the last item of a file forgets it.
+    q.pop_first_matching(|work| work.segment_id.file_id == file(0))
+        .unwrap();
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(0)), None);
+    q.drain_all();
+    assert_eq!(q.min_queued_byte_estimate_for_file(file(1)), None);
+}

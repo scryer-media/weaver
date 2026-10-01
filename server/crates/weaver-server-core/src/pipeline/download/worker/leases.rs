@@ -1,6 +1,30 @@
 use super::direct_store::DirectStoreAdmission;
 use super::pressure::{CheckpointAdmission, CheckpointLease};
 use super::*;
+use crate::operations::metrics::SchedulerBlockClause;
+
+/// The clauses that refused a job's articles during one scan, so the
+/// scheduler can say what kept a blocked job from the asking server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::pipeline::download) struct BlockedBy(u16);
+
+impl BlockedBy {
+    pub(in crate::pipeline::download) fn only(clause: SchedulerBlockClause) -> Self {
+        Self::default().with(clause)
+    }
+
+    fn with(self, clause: SchedulerBlockClause) -> Self {
+        Self(self.0 | 1 << clause.index())
+    }
+
+    pub(in crate::pipeline::download) fn clauses(
+        self,
+    ) -> impl Iterator<Item = SchedulerBlockClause> {
+        SchedulerBlockClause::ALL
+            .into_iter()
+            .filter(move |clause| self.0 & 1 << clause.index() != 0)
+    }
+}
 
 /// One sampled answer to "may this server fetch this article of this job?",
 /// reusable across a whole queue scan and across every article of one
@@ -28,6 +52,10 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     /// checkpoint" from "nothing here for this server" and schedule the
     /// recheck the checkpoint needs.
     checkpoint_blocked: std::cell::Cell<bool>,
+    /// Articles refused so far, and the clauses that refused them; counters
+    /// only, never consulted by the answer.
+    skipped: std::cell::Cell<u64>,
+    refused_by: std::cell::Cell<BlockedBy>,
 }
 
 /// What [`Pipeline::servable_work_filter`] found for one job and one server.
@@ -35,48 +63,87 @@ pub(in crate::pipeline::download) enum ServableWork<'a> {
     /// Retention rules this server out for the whole job.
     RetentionExcluded,
     /// Every queued file is refused by a clause decided per file, so no
-    /// article can pass and there is nothing to scan.
-    NoQueuedFilePasses,
+    /// article can pass and there is nothing to scan. Carries the clauses
+    /// that refused them.
+    NoQueuedFilePasses(BlockedBy),
     /// Some article may pass; scan the queue with this filter.
     Scan(ServableWorkFilter<'a>),
 }
 
 impl ServableWorkFilter<'_> {
     pub(in crate::pipeline::download) fn allows(&self, work: &DownloadWork) -> bool {
-        self.direct_admission.iter().all(|set| set.allows(work))
-            && self
-                .sweep_held
-                .as_deref()
-                .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
-            && !work.exclude_servers.contains(&self.server_idx)
-            && work.avoid_server != Some(self.server_idx)
-            && self.fill_servers.as_deref().is_none_or(|fill| {
-                fill.iter().all(|server| {
-                    self.retention_excludes.contains(server)
-                        || work.exclude_servers.contains(server)
-                        || work.avoid_server == Some(*server)
-                })
+        let Some(clause) = self.refusal(work) else {
+            return true;
+        };
+        self.skipped.set(self.skipped.get() + 1);
+        self.refused_by.set(self.refused_by.get().with(clause));
+        false
+    }
+
+    /// The first clause that refuses `work`, in a fixed order; the restart
+    /// checkpoint is asked last and only of an article every other clause
+    /// admits.
+    fn refusal(&self, work: &DownloadWork) -> Option<SchedulerBlockClause> {
+        let file_index = work.segment_id.file_id.file_index;
+        if !self.direct_admission.iter().all(|set| set.allows(work)) {
+            return Some(SchedulerBlockClause::DirectStore);
+        }
+        if self
+            .sweep_held
+            .as_deref()
+            .is_some_and(|held| held.contains(&file_index))
+        {
+            return Some(SchedulerBlockClause::SweepHeld);
+        }
+        if work.exclude_servers.contains(&self.server_idx)
+            || work.avoid_server == Some(self.server_idx)
+        {
+            return Some(SchedulerBlockClause::ServerExclusion);
+        }
+        if !self.fill_servers.as_deref().is_none_or(|fill| {
+            fill.iter().all(|server| {
+                self.retention_excludes.contains(server)
+                    || work.exclude_servers.contains(server)
+                    || work.avoid_server == Some(*server)
             })
-            && self
-                .bootstrap_files
-                .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
-            && self
-                .uu_cursor_ordinals
-                .is_none_or(|cursors| Pipeline::uu_work_closes_cursor(cursors, work))
-            && {
-                let allowed = self
-                    .checkpoint
-                    .decision_with_lease(work, self.leased)
-                    .allows();
-                if !allowed {
-                    self.checkpoint_blocked.set(true);
-                }
-                allowed
-            }
+        }) {
+            return Some(SchedulerBlockClause::Backfill);
+        }
+        if self
+            .bootstrap_files
+            .is_some_and(|files| !files.contains(&file_index))
+        {
+            return Some(SchedulerBlockClause::Par2Bootstrap);
+        }
+        if self
+            .uu_cursor_ordinals
+            .is_some_and(|cursors| !Pipeline::uu_work_closes_cursor(cursors, work))
+        {
+            return Some(SchedulerBlockClause::UuCursor);
+        }
+        if !self
+            .checkpoint
+            .decision_with_lease(work, self.leased)
+            .allows()
+        {
+            self.checkpoint_blocked.set(true);
+            return Some(SchedulerBlockClause::Checkpoint);
+        }
+        None
     }
 
     pub(in crate::pipeline::download) fn checkpoint_blocked(&self) -> bool {
         self.checkpoint_blocked.get()
+    }
+
+    /// Articles this filter has refused, over every scan it drove.
+    pub(in crate::pipeline::download) fn skipped(&self) -> u64 {
+        self.skipped.get()
+    }
+
+    /// The clauses that refused them.
+    pub(in crate::pipeline::download) fn refused_by(&self) -> BlockedBy {
+        self.refused_by.get()
     }
 
     /// Charge an article the handout has just taken, so every later article
@@ -241,10 +308,12 @@ impl Pipeline {
     /// once here, so a whole handout costs one sample rather than one per
     /// article.
     ///
-    /// Before anything that looks at an article — the header-probe peeks
-    /// included — the clauses decided per file are put to every queued file
-    /// at once (see [`Self::queued_file_may_pass`]); when none passes, the
-    /// answer is [`ServableWork::NoQueuedFilePasses`] and no scan is owed.
+    /// Before the queue is scanned, the clauses that can refuse a whole file
+    /// are put to every queued file at once (see
+    /// [`Self::queued_file_may_pass`]); when none passes, the answer is
+    /// [`ServableWork::NoQueuedFilePasses`] and no scan is owed. Only the
+    /// per-set header-probe peeks run ahead of that answer, because a file
+    /// holding a probe is never refused by its set's budget.
     ///
     /// The filter starts from an empty lease. A caller cutting a batch passes
     /// each article it takes to [`ServableWorkFilter::note_taken`], so the
@@ -263,8 +332,14 @@ impl Pipeline {
             return ServableWork::RetentionExcluded;
         }
         let sweep_held = self.demotion_sweep_held_file_indices(job_id);
-        if !self.queued_file_may_pass(job_id, sweep_held.as_deref(), bootstrap_files) {
-            return ServableWork::NoQueuedFilePasses;
+        let direct_admission = self.direct_store_admission(job_id);
+        if let Err(blocked) = self.queued_file_may_pass(
+            job_id,
+            &direct_admission,
+            sweep_held.as_deref(),
+            bootstrap_files,
+        ) {
+            return ServableWork::NoQueuedFilePasses(blocked);
         }
         ServableWork::Scan(ServableWorkFilter {
             server_idx,
@@ -272,59 +347,78 @@ impl Pipeline {
             retention_excludes,
             bootstrap_files,
             uu_cursor_ordinals,
-            direct_admission: self.direct_store_admission(job_id),
+            direct_admission,
             sweep_held,
             checkpoint: self.checkpoint_admission(job_id),
             leased: CheckpointLease::default(),
             checkpoint_blocked: std::cell::Cell::new(false),
+            skipped: std::cell::Cell::new(0),
+            refused_by: std::cell::Cell::new(BlockedBy::default()),
         })
     }
 
     /// Whether any queued file of the job could get an article past the
-    /// clauses that refuse whole files — a demotion sweep's holds and the
-    /// PAR2 index bootstrap — answered from the queue's per-file counts in
-    /// O(files), without looking at an article.
+    /// clauses that refuse whole files — a direct-store set's disk budget, a
+    /// demotion sweep's holds and the PAR2 index bootstrap — answered from
+    /// the queue's per-file counts and smallest queued estimates in
+    /// O(files · sets), without looking at an article.
     ///
-    /// Only a `false` is acted on, so this may answer `true` freely and must
-    /// never answer `false` while some article would pass. The other clauses
-    /// cannot refuse a whole file this way: a set's disk budget admits any
-    /// article that fits, and the smallest queued article of a file is not
-    /// known without a scan (against a zero-byte article every budget fits);
-    /// the UU cursor admits the article at its ordinal; exclusions, rotation
-    /// hints and the backfill gate are per article; and the checkpoint's
-    /// refusals must be observed article by article for the recheck it owes.
-    /// Retention is decided for the whole job before this is asked.
+    /// Only an `Err` is acted on, so this may answer `Ok` freely and must
+    /// never answer `Err` while some article would pass. The `Err` names the
+    /// clauses that refused the queued files. A set's budget refuses a file
+    /// only when even the file's smallest queued article does not fit and no
+    /// probe of the set lies in that file
+    /// (see [`DirectStoreAdmission::may_admit_from_file`]). The other clauses
+    /// cannot refuse a whole file this way: the UU cursor admits the article
+    /// at its ordinal; exclusions, rotation hints and the backfill gate are
+    /// per article; and the checkpoint's refusals must be observed article by
+    /// article for the recheck it owes. Retention is decided for the whole
+    /// job before this is asked.
     fn queued_file_may_pass(
         &self,
         job_id: JobId,
+        direct_admission: &[DirectStoreAdmission],
         sweep_held: Option<&[u32]>,
         bootstrap_files: Option<&[u32]>,
-    ) -> bool {
-        if sweep_held.is_none() && bootstrap_files.is_none() {
-            return true;
+    ) -> Result<(), BlockedBy> {
+        if direct_admission.is_empty() && sweep_held.is_none() && bootstrap_files.is_none() {
+            return Ok(());
         }
         let Some(state) = self.jobs.get(&job_id) else {
-            return true;
+            return Ok(());
         };
         let queue = &state.download_queue;
         let mut counted = 0usize;
+        let mut blocked = BlockedBy::default();
         for file_index in (0..state.spec.files.len()).filter_map(|index| u32::try_from(index).ok())
         {
-            let queued = queue.queued_count_for_file(NzbFileId { job_id, file_index }) as usize;
+            let file_id = NzbFileId { job_id, file_index };
+            let queued = queue.queued_count_for_file(file_id) as usize;
             if queued == 0 {
                 continue;
             }
             counted += queued;
-            let held = sweep_held.is_some_and(|held| held.contains(&file_index));
-            let outside_bootstrap =
-                bootstrap_files.is_some_and(|files| !files.contains(&file_index));
-            if !held && !outside_bootstrap {
-                return true;
+            let smallest = queue.min_queued_byte_estimate_for_file(file_id);
+            if smallest.is_some_and(|smallest| {
+                !direct_admission
+                    .iter()
+                    .all(|set| set.may_admit_from_file(file_index, smallest))
+            }) {
+                blocked = blocked.with(SchedulerBlockClause::DirectStore);
+            } else if sweep_held.is_some_and(|held| held.contains(&file_index)) {
+                blocked = blocked.with(SchedulerBlockClause::SweepHeld);
+            } else if bootstrap_files.is_some_and(|files| !files.contains(&file_index)) {
+                blocked = blocked.with(SchedulerBlockClause::Par2Bootstrap);
+            } else {
+                return Ok(());
             }
         }
         // Articles of a file the spec does not list were not looked at; let
         // the scan judge them.
-        counted != queue.len()
+        if counted != queue.len() {
+            return Ok(());
+        }
+        Err(blocked)
     }
 
     /// The fill servers a backfill server must see exhausted before it takes

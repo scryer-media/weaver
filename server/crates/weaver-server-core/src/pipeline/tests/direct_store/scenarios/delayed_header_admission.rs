@@ -517,3 +517,91 @@ async fn a_header_probe_is_handed_out_alone_when_the_set_budget_is_spent() {
     // it for the rest of the handout.
     assert_eq!(handed_out(&mut pipeline, 3), vec![segment(65, 0)]);
 }
+
+/// The scheduler counters the per-file early-out is judged by.
+fn scan_counters(pipeline: &Pipeline) -> (u64, u64, u64) {
+    use crate::operations::metrics::SchedulerBlockClause;
+    let metrics = &pipeline.metrics;
+    (
+        metrics
+            .download_scheduler_scan_items_skipped_total
+            .load(Ordering::Relaxed),
+        metrics
+            .download_scheduler_scan_no_match_total
+            .load(Ordering::Relaxed),
+        metrics.download_scheduler_hot_blocked_total[SchedulerBlockClause::DirectStore.index()]
+            .load(Ordering::Relaxed),
+    )
+}
+
+/// Leave only the queued articles of volumes 66 to 68, plus the header
+/// article of volume 65 when `with_header` is set.
+fn keep_three_volumes(pipeline: &mut Pipeline, with_header: bool) -> Vec<DownloadWork> {
+    requeue_in_scan_order(pipeline, |order| {
+        order.retain(|work| {
+            let file = work.segment_id.file_id.file_index;
+            (66..=68).contains(&file) || (with_header && work.segment_id == segment(65, 0))
+        });
+    })
+}
+
+#[tokio::test]
+async fn a_set_with_no_room_for_any_queued_files_smallest_article_is_answered_without_a_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    // The header is in flight, so the set is busy and probes nothing.
+    take_queued_segment(&mut pipeline, JOB, segment(65, 0));
+    let queued = keep_three_volumes(&mut pipeline, false);
+    let smallest = queued
+        .iter()
+        .map(|work| u64::from(work.byte_estimate))
+        .min()
+        .unwrap();
+    assert!(
+        queued
+            .iter()
+            .map(|work| work.segment_id.file_id.file_index)
+            .collect::<HashSet<_>>()
+            .len()
+            == 3
+    );
+    let set = pipeline.direct_store.set(JOB, 0).unwrap();
+    let room = set
+        .router
+        .holds_admission_limit()
+        .checked_sub(set.router.staged_bytes())
+        .unwrap();
+    // One byte short of the smallest article of any of the three files.
+    pipeline
+        .rate_limit_reservations
+        .insert(segment(65, 0), room - (smallest - 1));
+    let (skipped, no_match, budget_blocks) = scan_counters(&pipeline);
+
+    assert!(handed_out(&mut pipeline, 3).is_empty());
+
+    assert_eq!(
+        scan_counters(&pipeline),
+        (skipped, no_match, budget_blocks + 1),
+        "no article was looked at, no scan came up empty, and the block is the set's budget"
+    );
+    assert_eq!(pipeline.jobs[&JOB].download_queue.len(), queued.len());
+}
+
+#[tokio::test]
+async fn a_probe_exempt_header_gets_past_the_per_file_early_out() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    let router = &mut pipeline.direct_store.set_mut(JOB, 0).unwrap().router;
+    router.set_holds_budget(0);
+    router.set_holds_scratch_ceiling(0);
+    assert!(pipeline.rate_limit_reservations.is_empty());
+    keep_three_volumes(&mut pipeline, true);
+    let (_, _, budget_blocks) = scan_counters(&pipeline);
+
+    // No article fits, but the set is idle and its earliest unread header is
+    // exempt, so its file passes the per-file answer and the scan finds it.
+    assert_eq!(handed_out(&mut pipeline, 3), vec![segment(65, 0)]);
+    assert_eq!(scan_counters(&pipeline).2, budget_blocks);
+}
