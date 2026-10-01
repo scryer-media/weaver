@@ -2152,6 +2152,17 @@ impl Pipeline {
                     .map(|name| working_dir.join(name)),
             );
         }
+        // Direct scratch has its own lifetime: demotion queues its unlink
+        // behind cached write handles and can return before that unlink lands.
+        // A directory scan must not borrow it as an extra repair source while
+        // the closer is free to remove it. Only stable volume files may cross
+        // the handoff from direct storage to conventional repair.
+        for set in self.direct_store.sets_for(job_id) {
+            let plan = set.plan();
+            excluded.extend(plan.envelope_paths());
+            excluded.extend(plan.repair_paths());
+            excluded.push(plan.holds_scratch_path());
+        }
         // A path this set itself resolves to is never an exclusion, whatever
         // else claimed it: the set's own sources are scanned as canonical
         // candidates and are not extras in the first place.

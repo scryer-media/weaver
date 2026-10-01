@@ -1,6 +1,7 @@
 //! Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    Interruption, arrival_orders, run_archive, run_schedule, schedules,
+    Interruption, arrival_orders, combined_campaign, combined_schedules, run_archive, run_schedule,
+    schedules,
 };
 use super::*;
 
@@ -16,7 +17,7 @@ enum Shape {
     EncryptedLzma2,
 }
 
-async fn campaign(shape: Shape) {
+async fn campaign(shape: Shape, shard: Option<usize>) {
     let first = payload(13, 6001);
     let second = payload(29, 307);
     let name = if matches!(shape, Shape::Nested) {
@@ -57,7 +58,7 @@ async fn campaign(shape: Shape) {
     let mut spec = sevenz_job_spec(&volumes, 2);
     spec.password = password.map(str::to_owned);
     let wanted = expected.keys().copied().collect::<Vec<_>>();
-    if password.is_some() {
+    if password.is_some() && shard.is_none() {
         for order in arrival_orders() {
             let mut wrong = spec.clone();
             wrong.password = Some("incorrect-key".to_string());
@@ -75,7 +76,14 @@ async fn campaign(shape: Shape) {
             );
         }
     }
-    for (case, (order, interruption)) in schedules().into_iter().enumerate() {
+    let cases = shard.map_or_else(
+        || schedules().into_iter().enumerate().collect(),
+        combined_schedules,
+    );
+    for (case, (order, interruption)) in cases {
+        eprintln!(
+            "{shape:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
+        );
         let outcome = run_schedule(
             DirectStoreGate::Enabled,
             spec.clone(),
@@ -115,34 +123,43 @@ async fn campaign(shape: Shape) {
 
 #[tokio::test]
 async fn copy_arrival_schedules() {
-    campaign(Shape::Copy).await;
+    campaign(Shape::Copy, None).await;
 }
 #[tokio::test]
 async fn multiple_member_arrival_schedules() {
-    campaign(Shape::Multiple).await;
+    campaign(Shape::Multiple, None).await;
 }
 #[tokio::test]
 async fn empty_entry_arrival_schedules() {
-    campaign(Shape::EmptyEntry).await;
+    campaign(Shape::EmptyEntry, None).await;
 }
 #[tokio::test]
 async fn nested_member_arrival_schedules() {
-    campaign(Shape::Nested).await;
+    campaign(Shape::Nested, None).await;
 }
 #[tokio::test]
 async fn compressed_fallback_arrival_schedules() {
-    campaign(Shape::Lzma2Fallback).await;
+    campaign(Shape::Lzma2Fallback, None).await;
 }
 
 #[tokio::test]
 async fn encrypted_copy_schedules() {
-    campaign(Shape::EncryptedCopy).await;
+    campaign(Shape::EncryptedCopy, None).await;
 }
 #[tokio::test]
 async fn encrypted_header_schedules() {
-    campaign(Shape::EncryptedHeaders).await;
+    campaign(Shape::EncryptedHeaders, None).await;
 }
 #[tokio::test]
 async fn encrypted_compressed_schedules() {
-    campaign(Shape::EncryptedLzma2).await;
+    campaign(Shape::EncryptedLzma2, None).await;
 }
+
+combined_campaign!(combined_copy, Shape::Copy, campaign);
+combined_campaign!(combined_multiple, Shape::Multiple, campaign);
+combined_campaign!(combined_empty_entry, Shape::EmptyEntry, campaign);
+combined_campaign!(combined_nested, Shape::Nested, campaign);
+combined_campaign!(combined_lzma2, Shape::Lzma2Fallback, campaign);
+combined_campaign!(combined_encrypted_copy, Shape::EncryptedCopy, campaign);
+combined_campaign!(combined_encrypted_header, Shape::EncryptedHeaders, campaign);
+combined_campaign!(combined_encrypted_lzma2, Shape::EncryptedLzma2, campaign);
