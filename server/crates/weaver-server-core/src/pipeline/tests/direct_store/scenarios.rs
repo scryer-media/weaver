@@ -10,6 +10,7 @@ mod classification_frontier;
 mod cross_device;
 mod cross_device_probe;
 mod delayed_header_admission;
+mod demotion_sweep_chase;
 mod header_encrypted_parse_cost;
 mod header_encrypted_restart;
 mod par3_spill;

@@ -208,6 +208,46 @@ async fn par3_partial_publication(encrypted: Option<bool>) {
     );
 }
 
+/// A demotion that overtakes a run of placements hands every one of those
+/// articles to the conventional path, where they wait in the volume's write
+/// buffer until the sweep's handback drains it. The volume completes when the
+/// last of them is written, and is read back for its checksum exactly once
+/// then — not once more for every handed-back article written after an
+/// earlier one already made the file look complete.
+#[tokio::test]
+async fn a_demotion_handback_hashes_its_volume_once() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41991);
+    let payload: Vec<u8> = (0..1_200_000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let volumes = single_member_store_set("feature.mkv", &payload, 1);
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Demotion handback", &volumes, 12);
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    route_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    settle_direct_placement_work(&mut pipeline).await;
+    let hold = Arc::new(Semaphore::new(0));
+    pipeline.direct_placement_hold = Some(Arc::clone(&hold));
+    for ordinal in 1..12 {
+        route_article(&mut pipeline, job_id, &volumes, 0, ordinal).await;
+    }
+    assert!(pipeline.has_direct_placements(job_id));
+    let path = working.join(&volumes[0].0);
+    let before = Pipeline::completed_file_checksum_reads(&path);
+    hold.add_permits(1);
+    pipeline
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
+        .await;
+    assert!(pipeline.direct_demotion_in_flight.contains_key(&job_id));
+    settle_direct_demotion_work(&mut pipeline).await;
+    let reads = Pipeline::completed_file_checksum_reads(&path) - before;
+    assert_eq!(std::fs::read(&path).unwrap(), volumes[0].1);
+    assert_eq!(
+        reads, 1,
+        "a handback must not rehash the entire volume for every parked article"
+    );
+}
+
 fn fixture() -> Vec<(String, Vec<u8>)> {
     let payload: Vec<u8> = (0..120_000u32).map(|index| (index * 7 + 3) as u8).collect();
     single_member_store_set("feature.mkv", &payload, 3)
