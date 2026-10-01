@@ -1522,6 +1522,16 @@ fn blake2_only_store_set(
     payload: &[u8],
     volume_count: usize,
 ) -> Vec<(String, Vec<u8>)> {
+    blake2_store_set(member_name, payload, volume_count, [0x42; 32], false)
+}
+
+fn blake2_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    digest: [u8; 32],
+    packed_blake2: bool,
+) -> Vec<(String, Vec<u8>)> {
     let chunk = payload.len().div_ceil(volume_count);
     (0..volume_count)
         .map(|volume| {
@@ -1546,7 +1556,9 @@ fn blake2_only_store_set(
                 (!is_first).then_some(volume as u64),
             ));
             let extra = if is_last {
-                build_test_rar_blake2_extra([0x42; 32])
+                build_test_rar_blake2_extra(digest)
+            } else if packed_blake2 {
+                build_test_rar_blake2_extra(unrar_rs::crypto::blake2sp_hash(part))
             } else {
                 Vec::new()
             };
@@ -1555,7 +1567,7 @@ fn blake2_only_store_set(
                 split_flags,
                 part.len() as u64,
                 payload.len() as u64,
-                (!is_last).then(|| checksum::crc32(part)),
+                (!is_last && !packed_blake2).then(|| checksum::crc32(part)),
                 &extra,
             ));
             bytes.extend_from_slice(part);

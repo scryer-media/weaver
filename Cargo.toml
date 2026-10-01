@@ -114,7 +114,8 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.10.6", default-features = false, features = ["crypto-aws-lc"] }
+# Authenticated recovery scanning: scryer-media/rarpar#89, pending publication.
+par2-rs = { git = "https://github.com/scryer-media/rarpar.git", rev = "056b345e72ddb386f9887902ccd769a8e6c8da1f", version = "0.10.7", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -169,7 +170,8 @@ debug = 0
 split-debuginfo = "off"
 incremental = false
 
-# Rarpar crates use crates.io.
+# Rarpar crates normally use crates.io; the PAR2 revision above is a temporary
+# pin to the authenticated-scanner fix.
 # Do not add a `[patch.crates-io]` block that points outside this
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a

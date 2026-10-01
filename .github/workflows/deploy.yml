@@ -306,7 +306,16 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run Rust tests
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        run: cargo nextest run --workspace --locked --no-fail-fast -E 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_))'
+      - name: Archive compiled direct-store matrix tests
+        run: cargo nextest archive --locked -p weaver-server-core --lib --archive-file target/direct-store-matrix.tar.zst
+      - name: Upload compiled direct-store matrix tests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: direct-store-matrix-linux-x86_64
+          path: target/direct-store-matrix.tar.zst
+          compression-level: 0
+          retention-days: 1
       - name: Build the archive e2e binary
         run: cargo build --locked -p weaver
       - name: Prove direct unpack and PAR2 recovery for every sequential format
@@ -345,6 +354,37 @@ jobs:
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.rust-test-sccache-restore.outputs.cache-primary-key }}
+
+  direct-store-matrix:
+    name: direct-store-matrix-linux-x86_64-${{ matrix.partition }}
+    needs: [rust-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 32
+      matrix:
+        partition: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+        with:
+          tool: nextest
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: direct-store-matrix-linux-x86_64
+          path: target
+      - name: Run assigned direct-store matrix partition
+        run: >-
+          cargo nextest run
+          --archive-file target/direct-store-matrix.tar.zst
+          --workspace-remap .
+          --partition count:${{ matrix.partition }}/32
+          --no-fail-fast
+          -E 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_)'
 
   rust-clippy-windows:
     name: rust-clippy-windows-x86_64
@@ -471,7 +511,11 @@ jobs:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
       - name: Run Rust tests
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        run: >-
+          cargo nextest run --workspace --locked --no-fail-fast
+          -E 'not (test(archive_schedules::) | test(sevenz_store::schedules::) |
+          test(par2::tests::schedules::) | test(direct_store::tests::par2_schedules::) |
+          test(par2_completion::schedules::))'
 
   rust-test-arm:
     name: rust-test-arm-yenc
@@ -2176,6 +2220,7 @@ jobs:
         needs.rust-clippy.result == 'success' &&
         needs.rust-audit.result == 'success' &&
         needs.rust-test.result == 'success' &&
+        needs.direct-store-matrix.result == 'success' &&
         needs.rust-test-arm.result == 'success' &&
         needs.rust-test-sde.result == 'success' &&
         needs.rust-yenc-simd-targets.result == 'success' &&
@@ -2189,6 +2234,7 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test
+      - direct-store-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
@@ -2257,6 +2303,7 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test
+      - direct-store-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
@@ -2421,6 +2468,7 @@ jobs:
       - rust-clippy-windows
       - rust-audit
       - rust-test
+      - direct-store-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-test-windows

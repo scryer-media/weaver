@@ -1324,6 +1324,7 @@ fn a_long_run_behind_one_gap_is_not_recopied_per_arrival() {
 }
 
 mod par2_fileaccess_adapter_over;
+mod par2_schedules;
 mod par3_source_access;
 mod recording_test_doubles;
 mod repair_transactions;

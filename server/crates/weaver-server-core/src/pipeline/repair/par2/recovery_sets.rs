@@ -722,6 +722,31 @@ impl Pipeline {
         if !self.admit_par2_set_ids(job_id, &observed_set_ids) {
             return;
         }
+        if groups.is_empty() {
+            // Authentication can reject every packet in a completed carrier.
+            // Its arrival still settles capacity and the prior source view for
+            // sets already associated with it; corrupt headers grant no new
+            // recovery-set identity.
+            let prior_set_ids = self
+                .par2_runtime(job_id)
+                .map(|runtime| runtime.ordered_set_ids())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|set_id| self.recovery_file_serves_set(job_id, file_id.file_index, *set_id))
+                .collect::<Vec<_>>();
+            for set_id in prior_set_ids {
+                if !self.has_pending_par2_repair(job_id, set_id) {
+                    self.evict_par2_repair_session(job_id, set_id);
+                }
+                self.ensure_par2_runtime(job_id)
+                    .files
+                    .entry(file_id.file_index)
+                    .or_default()
+                    .recovery_blocks_by_set
+                    .entry(set_id)
+                    .or_insert(0);
+            }
+        }
         self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed_set_ids);
         {
             let entry = self
