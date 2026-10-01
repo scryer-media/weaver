@@ -476,8 +476,17 @@ impl Pipeline {
             .and_then(|state| state.staging_dir.as_ref())
             .is_some_and(|staging| staging == &scan_root)
         {
+            // Opening the root and walking the whole tree is filesystem work
+            // proportional to the job's output; it must not run on the
+            // pipeline task. The errors, rejections included, are the walk's
+            // own, unchanged.
             let budget = self.extraction_budget(job_id, &scan_root)?;
-            ExtractionRoot::open(&scan_root)?.scan_no_links(&budget)?;
+            let root_for_scan = scan_root.clone();
+            tokio::task::spawn_blocking(move || {
+                ExtractionRoot::open(&root_for_scan)?.scan_no_links(&budget)
+            })
+            .await
+            .map_err(|error| format!("extraction root link scan task failed: {error}"))??;
         }
         let password_candidates = self.archive_password_candidates_for_job(job_id);
         let scanned_files = Self::scan_extraction_root(&scan_root, password_candidates).await?;
