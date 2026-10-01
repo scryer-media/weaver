@@ -345,6 +345,7 @@ async fn encrypted_routing_outcome(
     let volume_file_seen = volumes
         .iter()
         .any(|(filename, _)| working_dir.join(filename).exists());
+    settle_direct_output_removals(temp_dir.path()).await;
     let partial_seen = any_direct_partial(&payload_root(&temp_dir, job_id));
     EncryptedRoutingOutcome {
         shape,
@@ -861,6 +862,7 @@ async fn hp_routing_outcome_named(
     let volume_file_seen = volumes
         .iter()
         .any(|(filename, _)| working_dir.join(filename).exists());
+    settle_direct_output_removals(temp_dir.path()).await;
     let partial_seen = any_direct_partial(&payload_root(&temp_dir, job_id));
     EncryptedRoutingOutcome {
         shape,
@@ -974,6 +976,7 @@ async fn hp_fallback_outcome(
         corrected == corrected_password.is_some(),
         "a caller that supplied a corrected password expects a refusal to apply it to"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
 
     let routing = EncryptedRoutingOutcome {
         shape: format!("{:?}", pipeline.direct_store.sets_for(job_id)),

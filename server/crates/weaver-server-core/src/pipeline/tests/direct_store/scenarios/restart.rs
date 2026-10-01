@@ -386,6 +386,7 @@ async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
         member, None,
         "corrupt coverage must not be committed to the member's destination"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(
         !partial.exists(),
         "a demoted set deletes its partials rather than leaving corrupt bytes behind"

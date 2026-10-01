@@ -101,6 +101,16 @@ fn direct_partial(temp_dir: &TempDir, job_id: JobId, member_name: &str) -> PathB
     payload_root(temp_dir, job_id).join(format!("{member_name}.f0.direct.partial"))
 }
 
+/// Waits until every unlink queued for a file under `root` has landed.
+///
+/// A demotion deletes its routed outputs behind their cached write handles, on
+/// the closer thread, and returns without waiting. A close of the root's
+/// handles is acknowledged only after every removal queued ahead of it is
+/// done, so this is the event an "it was deleted" assertion depends on.
+async fn settle_direct_output_removals(root: &std::path::Path) {
+    crate::pipeline::close_cached_write_handles_under(root).await;
+}
+
 /// A member sitting **unpublished** in the job's staging root.
 ///
 /// The third place a finished member can legitimately be, and the one this
@@ -659,6 +669,7 @@ async fn run_direct_store_routing_only(
     // A set with tolerated members finalizes through a detached extraction
     // ticket; the shape is only final once that ticket has been taken.
     settle_direct_post_repair_work(&mut pipeline).await;
+    settle_direct_output_removals(temp_dir.path()).await;
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     (shape, working_dir)
 }
