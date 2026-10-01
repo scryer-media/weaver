@@ -76,10 +76,7 @@ impl Pipeline {
                         .iter()
                         .any(|(file, count)| owns(*file) && *count != 0)
                     || leased.iter().any(|work| owns(work.segment_id.file_id));
-                let available = set
-                    .router
-                    .holds_admission_limit()
-                    .saturating_sub(set.router.staged_bytes().saturating_add(incoming));
+                let available = set.router.holds_admission_room(incoming);
 
                 // Permit queued articles past the limit to resolve the layout.
                 // Ordinals need not match yEnc offsets: serialized progress
