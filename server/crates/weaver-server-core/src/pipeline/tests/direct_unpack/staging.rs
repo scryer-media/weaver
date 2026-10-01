@@ -324,3 +324,53 @@ async fn a_failed_install_retires_the_chases_staging() {
     // The deletion is detached from consumption; wait for this tree to go.
     yield_until(|| !staging.exists()).await;
 }
+
+/// A later part's completion does not open part one for its signature
+/// header while part one has fewer than 32 committed bytes: the pipeline
+/// task already knows the answer would be "not yet". Bytes already sitting in
+/// the file do not count until they are committed.
+#[tokio::test]
+async fn arming_does_not_open_part_one_before_its_header_is_committed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(44760);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    assert!(files.len() > 2, "the fixture needs two later parts");
+    let spec = rar_job_spec("Amber Lantern Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    let part_one = working_dir.join(&files[0].0);
+    std::fs::write(&part_one, &files[0].1[..64]).unwrap();
+
+    write_and_complete_file(&mut pipeline, job_id, 1, &files[1].0, &files[1].1).await;
+    assert_eq!(
+        crate::pipeline::direct_unpack::wiring::signature_header_reads_of(&part_one),
+        0,
+        "nothing is committed on part one, so its file is not opened"
+    );
+    assert!(!pipeline.direct_unpack.is_armed(job_id, set_name));
+    assert_eq!(
+        pipeline.direct_unpack.latched_reason(job_id, set_name),
+        None
+    );
+
+    // Once the header is committed the next completion reads it and arms.
+    pipeline.pending_file_progress.insert(
+        NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        64,
+    );
+    write_and_complete_file(&mut pipeline, job_id, 2, &files[2].0, &files[2].1).await;
+    assert_eq!(
+        crate::pipeline::direct_unpack::wiring::signature_header_reads_of(&part_one),
+        1
+    );
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}

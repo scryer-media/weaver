@@ -681,6 +681,23 @@ impl Pipeline {
                 ),
             );
         } else {
+            // Whether part one's opening bytes are committed is known in memory,
+            // and this runs on the pipeline task for every part completion until
+            // the set arms. Ask the file only once the answer can be yes. The
+            // floor also keeps sparse out-of-order writes from passing for a
+            // header: a file can be longer than its verified prefix. A single
+            // archive arming off its commits is gated on its floor by its own
+            // caller.
+            let committed = self
+                .direct_unpack_progress_floor(job_id, &paths[0])
+                .unwrap_or(0)
+                .max(
+                    self.direct_unpack_known_part_len(job_id, &paths[0])
+                        .unwrap_or(0),
+                );
+            if committed < SIGNATURE_HEADER_LEN {
+                return;
+            }
             self.arm_direct_unpack_with_paths(job_id, set_name, paths);
         }
     }
@@ -3698,10 +3715,32 @@ pub(in crate::pipeline) fn spawn_chase_staging_removal(
     });
 }
 
+/// Every path [`read_signature_header`] was asked to open, so a test can
+/// tell whether arming touched a part's file.
+#[cfg(test)]
+static SIGNATURE_HEADER_READS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// How many times arming has opened `path` for its signature header.
+#[cfg(test)]
+pub(in crate::pipeline) fn signature_header_reads_of(path: &std::path::Path) -> usize {
+    SIGNATURE_HEADER_READS
+        .lock()
+        .expect("signature header read log poisoned")
+        .iter()
+        .filter(|read| read.as_path() == path)
+        .count()
+}
+
 /// Read the 32-byte signature header, or `Ok(None)` if the file is still
 /// shorter than that.
 fn read_signature_header(path: &std::path::Path) -> std::io::Result<Option<[u8; 32]>> {
     use std::io::Read;
+
+    #[cfg(test)]
+    SIGNATURE_HEADER_READS
+        .lock()
+        .expect("signature header read log poisoned")
+        .push(path.to_path_buf());
 
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
