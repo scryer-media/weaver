@@ -369,3 +369,262 @@ async fn a_completed_volumes_trailing_region_lands_through_the_lane_while_the_pi
     );
     assert_eq!(pipeline.write_buffered_bytes, 0);
 }
+
+/// A pipeline with one direct set admitted, also returning the directory a
+/// finished member is published into. Placement tasks run free until a test
+/// swaps a closed hold in with [`hold_next_flights`].
+async fn publishing_pipeline(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+) -> (Pipeline, PathBuf, PathBuf) {
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, ARTICLES);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    (pipeline, working_dir, complete_dir)
+}
+
+/// What the download stage does once a job's last article is in, and the
+/// completion checks that queues, run as the select loop's tick runs them.
+/// The placement lanes are left alone.
+async fn finish_download_pass_and_check(pipeline: &mut Pipeline, job_id: JobId) {
+    pipeline.maybe_finish_download_pass(job_id);
+    while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
+        pipeline.check_job_completion(queued).await;
+    }
+}
+
+/// Nothing judged the job: it is still downloading, with no extraction
+/// started over a set that has no volume on disk.
+fn assert_still_active(pipeline: &Pipeline, job_id: JobId) {
+    assert_eq!(
+        job_status_for_assert(pipeline, job_id),
+        Some(JobStatus::Downloading),
+        "nothing may judge the job while a placement is still writing"
+    );
+    assert!(
+        !pipeline.inflight_extractions.contains_key(&job_id),
+        "nothing may extract a set whose placements are still writing"
+    );
+    assert!(
+        pipeline.job_has_pending_download_pipeline_work(job_id),
+        "a placement still writing is download work the job is owed"
+    );
+}
+
+/// The completion check that deferred to the placements has run again: the
+/// landing either ran it inline, after the set finalized, and the job is
+/// moving its output, or queued it for the next tick. Neither leaves a check
+/// parked on placements that are gone.
+fn assert_carried_forward(pipeline: &Pipeline, job_id: JobId) {
+    let status = job_status_for_assert(pipeline, job_id);
+    assert!(
+        status == Some(JobStatus::Moving) || pipeline.pending_completion_checks.contains(&job_id),
+        "the last placement's landing carries the job on: {status:?}"
+    );
+    assert!(
+        !pipeline
+            .completion_checks_awaiting_placements
+            .contains(&job_id)
+    );
+}
+
+/// Lands every placement, checks that the landing itself carried the job on,
+/// and drives it to its end.
+async fn land_and_finish(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    complete_dir: &Path,
+    working_dir: &Path,
+    volumes: &[(String, Vec<u8>)],
+    payload: &[u8],
+) {
+    settle_direct_placement_work(pipeline).await;
+    assert!(pipeline.direct_placement_lanes.is_empty());
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| { !set.is_demoted() && set.is_finalized() }),
+        "the last placement's landing completes the volume and finalizes the set"
+    );
+    assert_carried_forward(pipeline, job_id);
+
+    drain_rar_refreshes(pipeline).await;
+    drive_extractions_to_terminal(pipeline, job_id, 64).await;
+    assert_eq!(
+        job_status_for_assert(pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        member_after_gate(complete_dir, working_dir, "feature.mkv"),
+        (Some(payload.to_vec()), Some("complete")),
+        "the member is published from its direct partial"
+    );
+    assert!(
+        no_volume_file(working_dir, volumes),
+        "the job completed direct: no volume was ever assembled"
+    );
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+}
+
+fn payload() -> Vec<u8> {
+    (0..120_000u32).map(|index| (index * 7 + 3) as u8).collect()
+}
+
+#[tokio::test]
+async fn a_completion_check_waits_for_the_placements_of_a_one_volume_set() {
+    let temp_dir = TempDir::new().unwrap();
+    let job_id = JobId(41806);
+    let payload = payload();
+    let volumes = single_member_store_set("feature.mkv", &payload, 1);
+    let (mut pipeline, working_dir, complete_dir) =
+        publishing_pipeline(&temp_dir, job_id, &volumes).await;
+    let hold = hold_next_flights(&mut pipeline);
+
+    // Every article of the only volume is downloaded and routed; none of
+    // their writes has returned, so the volume has nothing recorded yet.
+    for segment_number in 0..ARTICLES as u32 {
+        route_article(&mut pipeline, job_id, &volumes, 0, segment_number).await;
+    }
+    assert!(
+        pipeline.direct_placement_lanes.contains_key(&(job_id, 0)),
+        "premise: the articles' writes are held open"
+    );
+    assert!(!committed(&pipeline, segment(job_id, 0, 0)));
+    assert!(!committed(&pipeline, segment(job_id, 0, 1)));
+
+    // The download pass is over. Read as drained, this check would find the
+    // volume short of every article, no PAR2 to repair it, and fail the job.
+    finish_download_pass_and_check(&mut pipeline, job_id).await;
+    assert_still_active(&pipeline, job_id);
+    assert!(!committed(&pipeline, segment(job_id, 0, 0)));
+
+    hold.add_permits(1);
+    land_and_finish(
+        &mut pipeline,
+        job_id,
+        &complete_dir,
+        &working_dir,
+        &volumes,
+        &payload,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_completion_check_waits_for_the_trailing_region_of_a_sets_last_volume() {
+    let temp_dir = TempDir::new().unwrap();
+    let job_id = JobId(41807);
+    let payload = payload();
+    let volumes = single_member_store_set("feature.mkv", &payload, 3);
+    let last = (volumes.len() - 1) as u32;
+    let (mut pipeline, working_dir, complete_dir) =
+        publishing_pipeline(&temp_dir, job_id, &volumes).await;
+
+    // Every article but the very last lands.
+    for file_index in 0..=last {
+        for segment_number in 0..ARTICLES as u32 {
+            if (file_index, segment_number) == (last, ARTICLES as u32 - 1) {
+                continue;
+            }
+            route_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+        }
+    }
+    settle_direct_placement_work(&mut pipeline).await;
+
+    // The last article's own write returns, and its commit completes the
+    // volume: the region that completion releases goes out as a flight of its
+    // own, held open.
+    route_article(&mut pipeline, job_id, &volumes, last, ARTICLES as u32 - 1).await;
+    let tail_hold = hold_next_flights(&mut pipeline);
+    land_next_flight(&mut pipeline).await;
+    assert!(committed(
+        &pipeline,
+        segment(job_id, last, ARTICLES as u32 - 1)
+    ));
+    assert!(
+        pipeline.direct_set_has_pending_volume_tail(job_id, 0),
+        "premise: the completed volume's trailing region is writing"
+    );
+
+    // Every article is recorded, so the files read as whole; the set is not,
+    // and only the trailing region's landing finalizes it.
+    finish_download_pass_and_check(&mut pipeline, job_id).await;
+    assert_still_active(&pipeline, job_id);
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_demoted() && !set.is_finalized()),
+        "the set neither demotes nor finalizes ahead of its trailing region"
+    );
+
+    tail_hold.add_permits(1);
+    land_and_finish(
+        &mut pipeline,
+        job_id,
+        &complete_dir,
+        &working_dir,
+        &volumes,
+        &payload,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn placements_a_barrier_settles_still_carry_a_deferred_completion_on() {
+    let temp_dir = TempDir::new().unwrap();
+    let job_id = JobId(41808);
+    let payload = payload();
+    let volumes = single_member_store_set("feature.mkv", &payload, 1);
+    let (mut pipeline, working_dir, complete_dir) =
+        publishing_pipeline(&temp_dir, job_id, &volumes).await;
+    let hold = hold_next_flights(&mut pipeline);
+
+    let first_flight = pipeline.next_direct_placement_flight_id;
+    for segment_number in 0..ARTICLES as u32 {
+        route_article(&mut pipeline, job_id, &volumes, 0, segment_number).await;
+    }
+    finish_download_pass_and_check(&mut pipeline, job_id).await;
+    assert_still_active(&pipeline, job_id);
+
+    // A demanded barrier applies the set's placements itself, the trailing
+    // region's included, ahead of their done messages.
+    hold.add_permits(1);
+    pipeline
+        .demand_direct_store_barriers(job_id, BarrierDemand::PhaseChange)
+        .await;
+    assert!(pipeline.direct_placement_lanes.is_empty());
+    assert!(committed(
+        &pipeline,
+        segment(job_id, 0, ARTICLES as u32 - 1)
+    ));
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_demoted() && set.is_finalized()),
+        "the settle completes the volume and finalizes the set"
+    );
+
+    // Every flight it settled still answers, and finds nothing left to do.
+    let flights = pipeline.next_direct_placement_flight_id - first_flight;
+    for _ in 0..flights {
+        land_next_flight(&mut pipeline).await;
+    }
+    assert_carried_forward(&pipeline, job_id);
+
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        member_after_gate(&complete_dir, &working_dir, "feature.mkv"),
+        (Some(payload.clone()), Some("complete"))
+    );
+    assert!(no_volume_file(&working_dir, &volumes));
+}

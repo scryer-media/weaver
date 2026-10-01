@@ -45,11 +45,37 @@ impl Pipeline {
     }
 
     /// Whether any placement of this job is still waiting for its
-    /// destination writes.
+    /// destination writes or its commit.
+    ///
+    /// A flight being applied has already taken the placement it is
+    /// committing off its list. Counting that one would make the commit's own
+    /// follow-on — a volume completing, a set finalizing, the completion check
+    /// after it — wait on itself.
     pub(crate) fn has_direct_placements(&self, job_id: JobId) -> bool {
         self.direct_placement_lanes
-            .keys()
-            .any(|(owner, _)| *owner == job_id)
+            .iter()
+            .any(|((owner, _), lane)| {
+                *owner == job_id
+                    && (!lane.queued.is_empty()
+                        || lane.flight.as_ref().is_some_and(|flight| {
+                            !matches!(flight.state, DirectPlacementFlightState::Applying)
+                                || !flight.placements.is_empty()
+                        }))
+            })
+    }
+
+    /// Re-queues a completion check that ran while this job had a placement
+    /// out, once it has none. The drain sequence re-runs only once the
+    /// download stage is idle; a check a placement's own commit ran inline —
+    /// the one after a set finalizes — can defer while other downloads are
+    /// still queued, and nothing else would run it again.
+    fn wake_completion_check_awaiting_placements(&mut self, job_id: JobId) {
+        if self.has_direct_placements(job_id)
+            || !self.completion_checks_awaiting_placements.remove(&job_id)
+        {
+            return;
+        }
+        self.schedule_job_completion_check(job_id);
     }
 
     /// Queues a routed article's placement behind its set, sending it at once
@@ -205,6 +231,13 @@ impl Pipeline {
                 flight = done.flight_id,
                 "a direct-store placement landed after its set let it go"
             );
+            // A barrier's settle applies the flight on its own and does not
+            // re-run the drain sequence; whatever deferred to this placement
+            // meanwhile has nothing else to wake it.
+            if self.jobs.contains_key(&done.job_id) && self.job_decode_stage_drained(done.job_id) {
+                self.maybe_finish_download_pass(done.job_id);
+            }
+            self.wake_completion_check_awaiting_placements(done.job_id);
             return;
         }
         // The outcome was sent before this message; this does not wait.
@@ -217,6 +250,7 @@ impl Pipeline {
         if self.jobs.contains_key(&done.job_id) && self.job_decode_stage_drained(done.job_id) {
             self.maybe_finish_download_pass(done.job_id);
         }
+        self.wake_completion_check_awaiting_placements(done.job_id);
         // Bytes that waited here were counted as write backlog; a hard latch
         // they helped raise has nothing else to lift it until the next tick.
         self.relieve_latched_write_backlog().await;
@@ -566,6 +600,7 @@ impl Pipeline {
     /// their own, and a close of the job's roots waits for them
     /// ([`crate::pipeline::close_cached_write_handles_under`]).
     pub(crate) fn drop_direct_placements_for_job(&mut self, job_id: JobId) {
+        self.completion_checks_awaiting_placements.remove(&job_id);
         let keys: Vec<(JobId, usize)> = self
             .direct_placement_lanes
             .keys()

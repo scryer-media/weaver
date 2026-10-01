@@ -1397,6 +1397,9 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
+    // The last article's placement must land before the check that gates the
+    // pass may judge the set.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
 
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
