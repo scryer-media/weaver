@@ -570,11 +570,11 @@ async fn holds_scratch_ceiling_demotion_reconstructs_held_volumes_without_refetc
     settle_direct_post_repair_work(&mut pipeline).await;
 
     let working = pipeline.jobs.get(&JOB).unwrap().working_dir.clone();
-    for file in 66..70usize {
+    for (name, bytes) in &volumes[66..70] {
         assert_eq!(
-            std::fs::read(working.join(&volumes[file].0)).unwrap(),
-            volumes[file].1,
-            "held volume {file} must be rebuilt byte-exactly from its holds"
+            &std::fs::read(working.join(name)).unwrap(),
+            bytes,
+            "held volume {name} must be rebuilt byte-exactly from its holds"
         );
     }
     let queued = queued_segments(&mut pipeline, JOB);
@@ -582,6 +582,62 @@ async fn holds_scratch_ceiling_demotion_reconstructs_held_volumes_without_refetc
         assert!(
             !queued.contains(arrival),
             "held article {arrival:?} must not be fetched again"
+        );
+    }
+    assert!(
+        queued.contains(&(65, 0)),
+        "the header that never arrived is still owed"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        0,
+        "the preserved scratch is released once the sweep has read it"
+    );
+}
+
+#[tokio::test]
+async fn routing_time_scratch_ceiling_demotion_keeps_every_held_article_but_the_handoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    // Uncontrolled arrivals, as in the pre-admission sequence: the article
+    // whose paging hits the scratch ceiling demotes the set while routing and
+    // is handed to the decode seam.
+    let mut routed: Vec<(u32, u32)> = Vec::new();
+    let mut handoff = None;
+    for (file, article) in held_arrivals() {
+        take_queued_segment(&mut pipeline, JOB, segment(file, article));
+        submit_volume_article(&mut pipeline, JOB, &volumes, file, article).await;
+        if pipeline.direct_store.set(JOB, 0).unwrap().is_demoted() {
+            handoff = Some((file, article));
+            break;
+        }
+        routed.push((file, article));
+    }
+    let (handoff_file, handoff_article) = handoff.expect("the scratch ceiling must be reached");
+    assert!(format!("{:?}", pipeline.direct_store.sets_for(JOB)).contains("HoldsScratchCeiling"));
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    let working = pipeline.jobs.get(&JOB).unwrap().working_dir.clone();
+    for (name, bytes) in &volumes[66..handoff_file as usize] {
+        assert_eq!(
+            &std::fs::read(working.join(name)).unwrap(),
+            bytes,
+            "held volume {name} must be rebuilt byte-exactly from its holds"
+        );
+    }
+    // The handed-off article reaches its volume through its owner, beside
+    // whatever of that volume was held before it.
+    let (name, bytes) = &volumes[handoff_file as usize];
+    let landed = std::fs::read(working.join(name)).unwrap();
+    let (_, through) = article_extent(bytes.len(), handoff_article, 2);
+    assert_eq!(&landed[..through], &bytes[..through]);
+
+    let queued = queued_segments(&mut pipeline, JOB);
+    for arrival in routed.iter().chain([&(handoff_file, handoff_article)]) {
+        assert!(
+            !queued.contains(arrival),
+            "article {arrival:?} was received and must not be fetched again"
         );
     }
     assert!(

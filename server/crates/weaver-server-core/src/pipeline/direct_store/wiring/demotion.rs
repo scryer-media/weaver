@@ -354,17 +354,18 @@ impl Pipeline {
         // the held bytes themselves: those are posted bytes the provider can
         // still serve, so the sweep keeps them rather than fetching them again.
         // A scratch that failed to write or read is not here: the bytes behind
-        // it are not known to be readable. A holds cap struck while an article
-        // was routing hands that article to the decode seam, which owns it and
-        // the requeue around it; only a cap with no handoff keeps its holds.
+        // it are not known to be readable. A holds cap is usually struck while
+        // an article is routing, and that article goes to the decode seam; its
+        // own range is cut out of what the sweep keeps (below), and every
+        // other held byte is still kept.
         let out_of_holds_room = matches!(
             reason,
             DemotionReason::HoldsBudgetExceeded
                 | DemotionReason::HoldsScratchCeiling
                 | DemotionReason::HoldsScratchDiskReserve
         );
-        let preserve_holds = matches!(reason, DemotionReason::Par3MemoryPressure)
-            || (out_of_holds_room && handoffs.is_empty());
+        let preserve_holds =
+            out_of_holds_room || matches!(reason, DemotionReason::Par3MemoryPressure);
         if !preserve_holds && set.router.member_partials().is_empty() {
             // Nothing was ever routed to a member, so there is nothing to
             // reconstruct *from* beyond headers. Refetching is both correct and
@@ -413,17 +414,32 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
-            // Placed bytes only, deliberately. The provider can serve holds
-            // too, but this sweep hands the set to the conventional path, whose
-            // decode handoff owns the article that was routing when demotion
-            // struck and whose targeted requeue owns every segment the atoms do
-            // not wholly back; a hold materialized here would be written twice
-            // and counted against a completion gate nothing then clears.
-            // A demotion for room that starts outside an article handoff — a
-            // PAR3 spill, or a cap struck off the routing seam — has no such
-            // owner. Its holds are reconstructed too, subject to the same CRC
-            // atoms.
-            let physical_coverage = if preserve_holds && handoffs.is_empty() {
+            // Placed bytes only, unless the demotion is for room. The provider
+            // can serve holds too, but this sweep hands the set to the
+            // conventional path, whose decode handoff owns the article that
+            // was routing when demotion struck and whose targeted requeue owns
+            // every segment the atoms do not wholly back; a handed-off article
+            // materialized here would be written twice and counted against a
+            // completion gate nothing then clears.
+            //
+            // A demotion for room keeps its holds: they are posted bytes,
+            // checked by their own article CRCs, and fetching them again is
+            // the cost the demotion exists to avoid. What it must not keep is
+            // a handed-off article's range, held or placed, so that range is
+            // cut out and left to its owner. A PAR3 spill keeps its holds only
+            // when it starts outside a handoff, as it always has.
+            let extents = set.segment_extents(*volume_index);
+            let physical_coverage = if out_of_holds_room {
+                let mut coverage = set.volume_coverage_with_holds(*volume_index);
+                for (offset, len) in handoffs
+                    .iter()
+                    .filter(|segment_id| segment_id.file_id == file_id)
+                    .filter_map(|segment_id| extents.get(&segment_id.segment_number))
+                {
+                    coverage.remove(*offset, *len);
+                }
+                coverage
+            } else if preserve_holds && handoffs.is_empty() {
                 set.volume_coverage_with_holds(*volume_index)
             } else {
                 set.volume_coverage(*volume_index)
@@ -434,7 +450,6 @@ impl Pipeline {
             // current segment, and the targeted requeue below owns any other
             // segment that is not wholly backed by an article CRC atom.
             let coverage = crcs.materializable_coverage(&physical_coverage);
-            let extents = set.segment_extents(*volume_index);
             // The sweep sets the file's length before it writes, to cut off a
             // stale tail an interrupted earlier attempt could have left above
             // the volume. It runs detached, though, and the decode seam writes

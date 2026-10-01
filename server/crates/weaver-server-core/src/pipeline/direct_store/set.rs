@@ -1189,10 +1189,9 @@ impl DirectSet {
     /// staging ([`super::router::DirectSetRouter::held_runs`]), so a repair
     /// sweep that only claimed the placed bytes would leave a hole exactly
     /// where an encrypted member's edge block waits for a lost article, and
-    /// refuse a volume whose every posted byte is in hand. For the in-place
-    /// repair only: the demotion sweep hands the set to the conventional path,
-    /// which owns those holds as articles to re-place, and must not
-    /// materialize them.
+    /// refuse a volume whose every posted byte is in hand. The demotion sweep
+    /// reads it only for a set demoted for room, with any handed-off article's
+    /// range cut out first: that article belongs to the conventional path.
     pub(crate) fn volume_coverage_with_holds(&self, volume_index: u32) -> ByteRanges {
         let mut coverage = self.volume_coverage(volume_index);
         for (start, end) in self.router.held_ranges(volume_index) {
