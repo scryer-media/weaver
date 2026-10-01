@@ -1,11 +1,12 @@
 use super::direct_store::DirectStoreAdmission;
-use super::pressure::CheckpointAdmission;
+use super::pressure::{CheckpointAdmission, CheckpointLease};
 use super::*;
 
 /// One sampled answer to "may this server fetch this article of this job?",
-/// reusable across a whole queue scan. Built by
-/// [`Pipeline::servable_work_filter`], which is the only place the clauses
-/// are written down.
+/// reusable across a whole queue scan and across every article of one
+/// handout. Built by [`Pipeline::servable_work_filter`], which is the only
+/// place the clauses are written down; [`ServableWorkFilter::note_taken`]
+/// charges each article the handout takes to the byte-budget clauses.
 pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     server_idx: usize,
     /// Set when `server_idx` is a backfill server: the fill servers that are
@@ -17,10 +18,11 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     retention_excludes: Arc<Vec<usize>>,
     bootstrap_files: Option<&'a [u32]>,
     uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
-    leased: &'a [DownloadWork],
     direct_admission: Vec<DirectStoreAdmission>,
     sweep_held: Option<Vec<u32>>,
     checkpoint: CheckpointAdmission,
+    /// What the handout being built has taken, as the checkpoint weighs it.
+    leased: CheckpointLease,
     /// Set when at least one article was refused *only* by the restart
     /// checkpoint, so a caller that came away empty can tell "held for the
     /// checkpoint" from "nothing here for this server" and schedule the
@@ -51,7 +53,10 @@ impl ServableWorkFilter<'_> {
                 .uu_cursor_ordinals
                 .is_none_or(|cursors| Pipeline::uu_work_closes_cursor(cursors, work))
             && {
-                let allowed = self.checkpoint.decision(work, self.leased).allows();
+                let allowed = self
+                    .checkpoint
+                    .decision_with_lease(work, self.leased)
+                    .allows();
                 if !allowed {
                     self.checkpoint_blocked.set(true);
                 }
@@ -61,6 +66,17 @@ impl ServableWorkFilter<'_> {
 
     pub(in crate::pipeline::download) fn checkpoint_blocked(&self) -> bool {
         self.checkpoint_blocked.get()
+    }
+
+    /// Charge an article the handout has just taken, so every later article
+    /// of the same handout is admitted against the lease as it now stands:
+    /// the per-set disk budgets and header probes, and the restart
+    /// checkpoint's projected lead.
+    pub(in crate::pipeline::download) fn note_taken(&mut self, work: &DownloadWork) {
+        for set in &mut self.direct_admission {
+            set.note_leased(work);
+        }
+        self.leased.add(work);
     }
 }
 
@@ -211,13 +227,14 @@ impl Pipeline {
     /// depends on — retention, per-set disk admission, a demotion sweep's
     /// held files, the restart checkpoint, the PAR2 index bootstrap, the UU
     /// spool cursor, the work's own exclusions and rotation hint — is sampled
-    /// once here, so a whole scan of a queue costs one sample rather than one
-    /// per article.
+    /// once here, so a whole handout costs one sample rather than one per
+    /// article.
     ///
     /// `None` means retention already rules this server out for the whole
     /// job; there is nothing to scan.
     ///
-    /// `leased` is the work already taken in the batch being built, so the
+    /// The filter starts from an empty lease. A caller cutting a batch passes
+    /// each article it takes to [`ServableWorkFilter::note_taken`], so the
     /// byte-budget clauses (per-set disk admission and the restart
     /// checkpoint's undurable lead) see the batch's own projection rather
     /// than only what the actor has already committed.
@@ -227,7 +244,6 @@ impl Pipeline {
         server_idx: usize,
         bootstrap_files: Option<&'a [u32]>,
         uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
-        leased: &'a [DownloadWork],
     ) -> Option<ServableWorkFilter<'a>> {
         let retention_excludes = self.job_retention_excludes(job_id);
         if retention_excludes.contains(&server_idx) {
@@ -239,10 +255,10 @@ impl Pipeline {
             retention_excludes,
             bootstrap_files,
             uu_cursor_ordinals,
-            leased,
-            direct_admission: self.direct_store_admission(job_id, leased),
+            direct_admission: self.direct_store_admission(job_id),
             sweep_held: self.demotion_sweep_held_file_indices(job_id),
             checkpoint: self.checkpoint_admission(job_id),
+            leased: CheckpointLease::default(),
             checkpoint_blocked: std::cell::Cell::new(false),
         })
     }

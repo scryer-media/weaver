@@ -403,46 +403,45 @@ impl Pipeline {
         let bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
 
+        // Sampled once for the whole handout. Each article taken is charged
+        // to the filter, so the byte-budget clauses see what this handout has
+        // already taken, exactly as a batch lease does.
+        let Some(mut filter) = self.servable_work_filter(
+            job_id,
+            server_idx,
+            bootstrap_files.as_deref(),
+            uu_cursor_ordinals.as_ref(),
+        ) else {
+            // Retention rules this server out for the job. When it rules
+            // every server out, no lane will ever take the queue: retire it
+            // as missing now rather than leave the job waiting.
+            let server_count = self.nntp.pool().server_count();
+            let retention = self.job_retention_excludes(job_id);
+            if Self::unavailable_server_count_from_excludes(server_count, &[], &retention)
+                >= server_count
+            {
+                self.retire_unservable_queued_work(job_id);
+            }
+            return Vec::new();
+        };
         let mut taken: Vec<DownloadWork> = Vec::new();
-        let mut checkpoint_blocked = false;
         while taken.len() < want {
-            // Rebuilt per article so the byte-budget clauses see what this
-            // handout has already taken, exactly as a batch lease does.
-            let Some(filter) = self.servable_work_filter(
-                job_id,
-                server_idx,
-                bootstrap_files.as_deref(),
-                uu_cursor_ordinals.as_ref(),
-                &taken,
-            ) else {
-                // Retention rules this server out for the job. When it rules
-                // every server out, no lane will ever take the queue: retire
-                // it as missing now rather than leave the job waiting.
-                let server_count = self.nntp.pool().server_count();
-                let retention = self.job_retention_excludes(job_id);
-                if Self::unavailable_server_count_from_excludes(server_count, &[], &retention)
-                    >= server_count
-                {
-                    self.retire_unservable_queued_work(job_id);
-                }
-                break;
-            };
             let popped = self.jobs.get_mut(&job_id).and_then(|state| {
                 state
                     .download_queue
                     .pop_first_matching(|work| filter.allows(work))
             });
-            checkpoint_blocked |= filter.checkpoint_blocked();
             let Some(work) = popped else {
                 break;
             };
+            filter.note_taken(&work);
             if bootstrap_files.is_some() {
                 self.par2_metadata_bootstrap_claims_work(job_id, &work);
             }
             taken.push(work);
         }
 
-        if taken.is_empty() && checkpoint_blocked {
+        if taken.is_empty() && filter.checkpoint_blocked() {
             self.note_checkpoint_dispatch_block(job_id);
         }
         taken
@@ -525,7 +524,6 @@ impl Pipeline {
             server_idx,
             bootstrap_files.as_deref(),
             uu_cursor_ordinals.as_ref(),
-            &[],
         ) else {
             return false;
         };

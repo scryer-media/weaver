@@ -414,3 +414,106 @@ async fn delayed_header_admission_spills_to_a_peer_job_but_obeys_global_hard_pre
         "the dispatcher must walk past a capped hot queue rather than idle the link"
     );
 }
+
+/// Every article of the job's queue, in the order a handout scans them, put
+/// back exactly as it was. `edit` rewrites the list before it is requeued.
+fn requeue_in_scan_order(
+    pipeline: &mut Pipeline,
+    edit: impl FnOnce(&mut Vec<DownloadWork>),
+) -> Vec<DownloadWork> {
+    // A pending unlock re-rank would reorder the queue under the handout.
+    pipeline.apply_rar_unlock_priorities_if_dirty(JOB);
+    let queue = &mut pipeline.jobs.get_mut(&JOB).unwrap().download_queue;
+    let mut order = Vec::new();
+    while let Some(work) = queue.pop() {
+        order.push(work);
+    }
+    edit(&mut order);
+    for work in &order {
+        queue.push(work.clone());
+    }
+    order
+}
+
+fn handed_out(pipeline: &mut Pipeline, want: usize) -> Vec<SegmentId> {
+    let pressure = pipeline.refresh_download_pressure();
+    assert_eq!(pressure.state, DownloadPressureState::Clear);
+    match pipeline.next_works(0, want, None, pressure) {
+        crate::pipeline::download::scheduler::Handout::Works(works) => {
+            works.iter().map(|work| work.segment_id).collect()
+        }
+        crate::pipeline::download::scheduler::Handout::Idle => Vec::new(),
+        _ => panic!("no whole-link gate or lane share applies here"),
+    }
+}
+
+#[tokio::test]
+async fn a_handout_charges_each_article_it_takes_against_the_set_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    // The header is in flight, so the set is busy and probes nothing.
+    take_queued_segment(&mut pipeline, JOB, segment(65, 0));
+    let queued = requeue_in_scan_order(&mut pipeline, |order| {
+        order.truncate(3);
+        for (work, bytes) in order.iter_mut().zip([1000, 3000, 1000]) {
+            work.byte_estimate = bytes;
+        }
+    });
+    assert_eq!(queued.len(), 3);
+    assert!(pipeline.pending_decode.is_empty());
+    assert!(pipeline.active_decode_bytes.is_empty());
+    assert!(
+        !pipeline
+            .pending_released_download_result_bytes_by_job
+            .contains_key(&JOB)
+    );
+    let set = pipeline.direct_store.set(JOB, 0).unwrap();
+    let room = set
+        .router
+        .holds_admission_limit()
+        .checked_sub(set.router.staged_bytes())
+        .unwrap();
+    assert!(room > 2500);
+    // 2500 bytes of room are left: the first article fits, the second does
+    // not fit beside it, and the third fits in what the first left over.
+    pipeline
+        .rate_limit_reservations
+        .insert(segment(65, 0), room - 2500);
+
+    assert_eq!(
+        handed_out(&mut pipeline, 3),
+        vec![queued[0].segment_id, queued[2].segment_id],
+    );
+    assert_eq!(pipeline.jobs[&JOB].download_queue.len(), 1);
+}
+
+#[tokio::test]
+async fn a_header_probe_is_handed_out_alone_when_the_set_budget_is_spent() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    let router = &mut pipeline.direct_store.set_mut(JOB, 0).unwrap().router;
+    router.set_holds_budget(0);
+    router.set_holds_scratch_ceiling(0);
+    assert_eq!(router.holds_admission_limit(), 0);
+    assert!(pipeline.rate_limit_reservations.is_empty());
+    assert!(
+        pipeline
+            .active_downloads_by_file
+            .values()
+            .all(|count| *count == 0)
+    );
+    assert!(
+        pipeline
+            .active_decodes_by_file
+            .values()
+            .all(|count| *count == 0)
+    );
+    requeue_in_scan_order(&mut pipeline, |_| {});
+
+    // Nothing fits, but the earliest unread header is exempt; once this
+    // handout has taken it the set is busy, and the exemption closes behind
+    // it for the rest of the handout.
+    assert_eq!(handed_out(&mut pipeline, 3), vec![segment(65, 0)]);
+}
