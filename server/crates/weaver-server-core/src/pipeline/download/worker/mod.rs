@@ -15,6 +15,7 @@ mod refill;
 mod spawn;
 
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
+pub(in crate::pipeline::download) use leases::ServableWork;
 #[cfg(test)]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
 

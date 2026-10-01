@@ -30,6 +30,17 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     checkpoint_blocked: std::cell::Cell<bool>,
 }
 
+/// What [`Pipeline::servable_work_filter`] found for one job and one server.
+pub(in crate::pipeline::download) enum ServableWork<'a> {
+    /// Retention rules this server out for the whole job.
+    RetentionExcluded,
+    /// Every queued file is refused by a clause decided per file, so no
+    /// article can pass and there is nothing to scan.
+    NoQueuedFilePasses,
+    /// Some article may pass; scan the queue with this filter.
+    Scan(ServableWorkFilter<'a>),
+}
+
 impl ServableWorkFilter<'_> {
     pub(in crate::pipeline::download) fn allows(&self, work: &DownloadWork) -> bool {
         self.direct_admission.iter().all(|set| set.allows(work))
@@ -230,8 +241,10 @@ impl Pipeline {
     /// once here, so a whole handout costs one sample rather than one per
     /// article.
     ///
-    /// `None` means retention already rules this server out for the whole
-    /// job; there is nothing to scan.
+    /// Before anything that looks at an article — the header-probe peeks
+    /// included — the clauses decided per file are put to every queued file
+    /// at once (see [`Self::queued_file_may_pass`]); when none passes, the
+    /// answer is [`ServableWork::NoQueuedFilePasses`] and no scan is owed.
     ///
     /// The filter starts from an empty lease. A caller cutting a batch passes
     /// each article it takes to [`ServableWorkFilter::note_taken`], so the
@@ -244,23 +257,74 @@ impl Pipeline {
         server_idx: usize,
         bootstrap_files: Option<&'a [u32]>,
         uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
-    ) -> Option<ServableWorkFilter<'a>> {
+    ) -> ServableWork<'a> {
         let retention_excludes = self.job_retention_excludes(job_id);
         if retention_excludes.contains(&server_idx) {
-            return None;
+            return ServableWork::RetentionExcluded;
         }
-        Some(ServableWorkFilter {
+        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
+        if !self.queued_file_may_pass(job_id, sweep_held.as_deref(), bootstrap_files) {
+            return ServableWork::NoQueuedFilePasses;
+        }
+        ServableWork::Scan(ServableWorkFilter {
             server_idx,
             fill_servers: self.backfill_fill_gate(server_idx),
             retention_excludes,
             bootstrap_files,
             uu_cursor_ordinals,
             direct_admission: self.direct_store_admission(job_id),
-            sweep_held: self.demotion_sweep_held_file_indices(job_id),
+            sweep_held,
             checkpoint: self.checkpoint_admission(job_id),
             leased: CheckpointLease::default(),
             checkpoint_blocked: std::cell::Cell::new(false),
         })
+    }
+
+    /// Whether any queued file of the job could get an article past the
+    /// clauses that refuse whole files — a demotion sweep's holds and the
+    /// PAR2 index bootstrap — answered from the queue's per-file counts in
+    /// O(files), without looking at an article.
+    ///
+    /// Only a `false` is acted on, so this may answer `true` freely and must
+    /// never answer `false` while some article would pass. The other clauses
+    /// cannot refuse a whole file this way: a set's disk budget admits any
+    /// article that fits, and the smallest queued article of a file is not
+    /// known without a scan (against a zero-byte article every budget fits);
+    /// the UU cursor admits the article at its ordinal; exclusions, rotation
+    /// hints and the backfill gate are per article; and the checkpoint's
+    /// refusals must be observed article by article for the recheck it owes.
+    /// Retention is decided for the whole job before this is asked.
+    fn queued_file_may_pass(
+        &self,
+        job_id: JobId,
+        sweep_held: Option<&[u32]>,
+        bootstrap_files: Option<&[u32]>,
+    ) -> bool {
+        if sweep_held.is_none() && bootstrap_files.is_none() {
+            return true;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return true;
+        };
+        let queue = &state.download_queue;
+        let mut counted = 0usize;
+        for file_index in (0..state.spec.files.len()).filter_map(|index| u32::try_from(index).ok())
+        {
+            let queued = queue.queued_count_for_file(NzbFileId { job_id, file_index }) as usize;
+            if queued == 0 {
+                continue;
+            }
+            counted += queued;
+            let held = sweep_held.is_some_and(|held| held.contains(&file_index));
+            let outside_bootstrap =
+                bootstrap_files.is_some_and(|files| !files.contains(&file_index));
+            if !held && !outside_bootstrap {
+                return true;
+            }
+        }
+        // Articles of a file the spec does not list were not looked at; let
+        // the scan judge them.
+        counted != queue.len()
     }
 
     /// The fill servers a backfill server must see exhausted before it takes

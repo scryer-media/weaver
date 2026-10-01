@@ -88,6 +88,7 @@
 //! work it was handed, and returning unused work to the queue.
 
 use super::worker::DownloadPressure;
+use super::worker::ServableWork;
 use super::*;
 
 /// What a server gets when it asks for work.
@@ -406,23 +407,27 @@ impl Pipeline {
         // Sampled once for the whole handout. Each article taken is charged
         // to the filter, so the byte-budget clauses see what this handout has
         // already taken, exactly as a batch lease does.
-        let Some(mut filter) = self.servable_work_filter(
+        let mut filter = match self.servable_work_filter(
             job_id,
             server_idx,
             bootstrap_files.as_deref(),
             uu_cursor_ordinals.as_ref(),
-        ) else {
-            // Retention rules this server out for the job. When it rules
-            // every server out, no lane will ever take the queue: retire it
-            // as missing now rather than leave the job waiting.
-            let server_count = self.nntp.pool().server_count();
-            let retention = self.job_retention_excludes(job_id);
-            if Self::unavailable_server_count_from_excludes(server_count, &[], &retention)
-                >= server_count
-            {
-                self.retire_unservable_queued_work(job_id);
+        ) {
+            ServableWork::Scan(filter) => filter,
+            ServableWork::NoQueuedFilePasses => return Vec::new(),
+            ServableWork::RetentionExcluded => {
+                // Retention rules this server out for the job. When it rules
+                // every server out, no lane will ever take the queue: retire
+                // it as missing now rather than leave the job waiting.
+                let server_count = self.nntp.pool().server_count();
+                let retention = self.job_retention_excludes(job_id);
+                if Self::unavailable_server_count_from_excludes(server_count, &[], &retention)
+                    >= server_count
+                {
+                    self.retire_unservable_queued_work(job_id);
+                }
+                return Vec::new();
             }
-            return Vec::new();
         };
         let mut taken: Vec<DownloadWork> = Vec::new();
         while taken.len() < want {
@@ -519,7 +524,7 @@ impl Pipeline {
         }
         let bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
-        let Some(filter) = self.servable_work_filter(
+        let ServableWork::Scan(filter) = self.servable_work_filter(
             job_id,
             server_idx,
             bootstrap_files.as_deref(),
