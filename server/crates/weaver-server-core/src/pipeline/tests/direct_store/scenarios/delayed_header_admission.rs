@@ -541,3 +541,56 @@ async fn holds_admission_is_capped_by_the_shared_scratch_total_across_jobs() {
         "the per-set figure alone admits arrivals the shared scratch cannot page"
     );
 }
+
+#[tokio::test]
+async fn holds_scratch_ceiling_demotion_reconstructs_held_volumes_without_refetching_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    // Four whole volumes held behind the delayed header, most of them paged.
+    let held: Vec<(u32, u32)> = held_arrivals().take(8).collect();
+    for &(file, article) in &held {
+        take_queued_segment(&mut pipeline, JOB, segment(file, article));
+        submit_volume_article(&mut pipeline, JOB, &volumes, file, article).await;
+    }
+    let set = pipeline.direct_store.set(JOB, 0).unwrap();
+    assert!(!set.is_demoted());
+    assert!(
+        set.router.scratch_bytes() > 0,
+        "the held volumes must sit partly on scratch"
+    );
+
+    pipeline
+        .demote_direct_set(
+            JOB,
+            0,
+            crate::pipeline::direct_store::router::DemotionReason::HoldsScratchCeiling,
+        )
+        .await;
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    let working = pipeline.jobs.get(&JOB).unwrap().working_dir.clone();
+    for file in 66..70usize {
+        assert_eq!(
+            std::fs::read(working.join(&volumes[file].0)).unwrap(),
+            volumes[file].1,
+            "held volume {file} must be rebuilt byte-exactly from its holds"
+        );
+    }
+    let queued = queued_segments(&mut pipeline, JOB);
+    for arrival in &held {
+        assert!(
+            !queued.contains(arrival),
+            "held article {arrival:?} must not be fetched again"
+        );
+    }
+    assert!(
+        queued.contains(&(65, 0)),
+        "the header that never arrived is still owed"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        0,
+        "the preserved scratch is released once the sweep has read it"
+    );
+}

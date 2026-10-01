@@ -349,7 +349,22 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(ReconstructionFailure::NoLayout);
         };
-        let preserve_holds = matches!(reason, DemotionReason::Par3MemoryPressure);
+        // Reasons that say the set ran out of room — PAR3's memory, the holds
+        // RAM budget, the scratch ceiling, the disk reserve — and nothing about
+        // the held bytes themselves: those are posted bytes the provider can
+        // still serve, so the sweep keeps them rather than fetching them again.
+        // A scratch that failed to write or read is not here: the bytes behind
+        // it are not known to be readable. A holds cap struck while an article
+        // was routing hands that article to the decode seam, which owns it and
+        // the requeue around it; only a cap with no handoff keeps its holds.
+        let out_of_holds_room = matches!(
+            reason,
+            DemotionReason::HoldsBudgetExceeded
+                | DemotionReason::HoldsScratchCeiling
+                | DemotionReason::HoldsScratchDiskReserve
+        );
+        let preserve_holds = matches!(reason, DemotionReason::Par3MemoryPressure)
+            || (out_of_holds_room && handoffs.is_empty());
         if !preserve_holds && set.router.member_partials().is_empty() {
             // Nothing was ever routed to a member, so there is nothing to
             // reconstruct *from* beyond headers. Refetching is both correct and
@@ -404,8 +419,10 @@ impl Pipeline {
             // struck and whose targeted requeue owns every segment the atoms do
             // not wholly back; a hold materialized here would be written twice
             // and counted against a completion gate nothing then clears.
-            // A PAR3 spill starts outside an article handoff. Its immutable
-            // holds can be reconstructed too, subject to the same CRC atoms.
+            // A demotion for room that starts outside an article handoff — a
+            // PAR3 spill, or a cap struck off the routing seam — has no such
+            // owner. Its holds are reconstructed too, subject to the same CRC
+            // atoms.
             let physical_coverage = if preserve_holds && handoffs.is_empty() {
                 set.volume_coverage_with_holds(*volume_index)
             } else {
