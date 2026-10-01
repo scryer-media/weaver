@@ -1026,6 +1026,12 @@ impl Pipeline {
         if self.direct_unpack.repairing_jobs.contains(&job_id) {
             return;
         }
+        // A demoted set's volumes belong to its sweep until the ticket lands,
+        // even once one of them is handed back complete. Not latched: the
+        // handback's completion replay tries again once the sweep is done.
+        if self.demotion_sweep_outstanding_for_set(job_id, set_name) {
+            return;
+        }
         // A different volume can trigger arming after damaged bytes arrived.
         // Check the whole input set before exposing any of its files to a chase.
         if self.jobs.get(&job_id).is_some_and(|state| {

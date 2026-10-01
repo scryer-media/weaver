@@ -1157,9 +1157,9 @@ impl Pipeline {
                 // The articles the decode seam owns are kept alongside the ones
                 // the sweep verified, but they are *its* bytes: it holds them in
                 // the write buffer, parked there until this handback seeds the
-                // sweep's extents and drains it. So they belong in the
-                // assembly and out of the requeue, and nowhere near the sparse
-                // seeding below.
+                // sweep's extents and drains it. So they stay out of the
+                // requeue and nowhere near the sparse seeding below, and each
+                // is committed by its own write, not here.
                 let handed_off: HashSet<u32> = handoffs
                     .iter()
                     .filter(|segment_id| segment_id.file_id == file_id)
@@ -1184,10 +1184,12 @@ impl Pipeline {
                     .map(|segment| segment.ordinal)
                     .collect();
 
-                // Only sweep-verified bytes are committed here. Parked
-                // handoffs retain their geometry and commit after their writes;
-                // precommitting them makes each write look like a completed
-                // file rewrite and repeatedly hashes the entire volume.
+                // Rebuild the assembly to exactly what the sweep verified, with
+                // the handed-off articles placed but left for their own writes
+                // to commit. `commit_segment` is the only way in and `reset` the
+                // only way out, so the sequence is reset-then-re-commit rather
+                // than a surgical removal; the decoded sizes come from the
+                // recorded extents, so the byte counters land where they were.
                 if let Some(file_asm) = state.assembly.file_mut(file_id) {
                     file_asm.reset();
                 }
@@ -1198,20 +1200,34 @@ impl Pipeline {
                     let Some((offset, len)) = file_extents.get(segment_number).copied() else {
                         continue;
                     };
+                    // Only bytes this file had already received can be lost to
+                    // the reset; a kept article that was not among them costs
+                    // the download counter nothing.
+                    let was_received = committed.contains(segment_number);
                     if !verified.contains(segment_number) {
+                        // A handed-off article is still parked in the write
+                        // buffer: placed, as every buffered article is, but not
+                        // received until its write lands and commits it there.
+                        // Committing it here would make that commit a duplicate
+                        // on a file already complete — one more whole-file
+                        // checksum read for every article parked behind it.
                         if let Some(file_asm) = state.assembly.file_mut(file_id) {
                             file_asm.record_placement(*segment_number, offset, len as u32);
                         }
-                        kept_bytes = kept_bytes.saturating_add(len);
+                        if was_received {
+                            kept_bytes = kept_bytes.saturating_add(len);
+                        }
                         continue;
                     }
                     if let Some(file_asm) = state.assembly.file_mut(file_id)
                         && file_asm.commit_segment(*segment_number, len as u32).is_ok()
                     {
-                        kept_bytes = kept_bytes.saturating_add(len);
+                        if was_received {
+                            kept_bytes = kept_bytes.saturating_add(len);
+                        }
                         file_asm.note_part_verification(*segment_number, true);
-                        // Reconstruction must not manufacture streamed PAR2
-                        // checksum evidence for its already durable coverage.
+                        // Coverage is durable, but reconstruction must not
+                        // manufacture streamed PAR2 checksum evidence.
                         file_asm.record_reconstructed_placement(
                             *segment_number,
                             offset,
@@ -1240,12 +1256,12 @@ impl Pipeline {
                     .assembly
                     .file(file_id)
                     .is_some_and(|file| !file.is_complete());
-                // A file that needs nothing more can still have a *buffer* that
-                // needs this seeding: the handed-off article is inserted at its
-                // own offset while the sweep is outstanding, so it waits behind
-                // a cursor still at zero — and it is often the very article
-                // that completed the file. Skipping the seeding on completeness
-                // would leave its bytes in memory and a hole on disk.
+                // A *buffer* needs this seeding whatever the sweep verified: the
+                // handed-off article is inserted at its own offset while the
+                // sweep is outstanding, so it waits behind a cursor still at
+                // zero — and it is often the very article that completes the
+                // file, which it does only once it is written. Skipping the
+                // seeding would leave its bytes in memory and a hole on disk.
                 let has_buffered_writes = self.write_buffers.contains_key(&file_id);
                 if has_buffered_writes || (!materialized_extents.is_empty() && needs_more_bytes) {
                     // Reconstruction made these article extents durable without

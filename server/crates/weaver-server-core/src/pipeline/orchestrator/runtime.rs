@@ -473,6 +473,7 @@ impl Pipeline {
             direct_barrier_done_rx,
             direct_placement_lanes: HashMap::new(),
             completion_checks_awaiting_placements: HashSet::new(),
+            par3_publications_awaiting_placements: HashSet::new(),
             next_direct_placement_flight_id: 0,
             direct_placement_done_tx,
             direct_placement_done_rx,

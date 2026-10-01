@@ -4288,16 +4288,18 @@ impl Pipeline {
     }
 }
 
+/// Every whole-file checksum read, by path, so a test can count how many
+/// times a completed file was read back.
 #[cfg(test)]
-static DIAGNOSTIC_CHECKSUM_READS: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<std::path::PathBuf, usize>>,
-> = std::sync::OnceLock::new();
+static COMPLETED_FILE_CHECKSUM_READS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+> = std::sync::LazyLock::new(Default::default);
 
 #[cfg(test)]
 impl Pipeline {
-    pub(in crate::pipeline) fn diagnostic_checksum_count(path: &std::path::Path) -> usize {
-        DIAGNOSTIC_CHECKSUM_READS
-            .get_or_init(Default::default)
+    /// How many whole-file checksum reads `path` has had in this process.
+    pub(in crate::pipeline) fn completed_file_checksum_reads(path: &std::path::Path) -> usize {
+        COMPLETED_FILE_CHECKSUM_READS
             .lock()
             .unwrap()
             .get(path)
@@ -4309,8 +4311,7 @@ impl Pipeline {
 fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileChecksum> {
     #[cfg(test)]
     {
-        *DIAGNOSTIC_CHECKSUM_READS
-            .get_or_init(Default::default)
+        *COMPLETED_FILE_CHECKSUM_READS
             .lock()
             .unwrap()
             .entry(path.to_path_buf())

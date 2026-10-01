@@ -8,7 +8,7 @@ use par3_rs::source::SourceId;
 enum Encryption {
     Plain,
     Member,
-    Header,
+    KeyedChecksum,
 }
 
 struct Harness {
@@ -27,13 +27,13 @@ impl Harness {
         let password = "moonlit-harbour";
         let volumes = match encryption {
             Encryption::Plain => single_member_store_set("feature.mkv", &payload, 3),
-            Encryption::Member | Encryption::Header => encrypted_store_set(
+            Encryption::Member | Encryption::KeyedChecksum => encrypted_store_set(
                 "feature.mkv",
                 &payload,
                 3,
                 password,
                 Some(password),
-                matches!(encryption, Encryption::Header),
+                matches!(encryption, Encryption::KeyedChecksum),
             ),
         };
         let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
@@ -130,7 +130,7 @@ impl Harness {
         let set = self.pipeline.direct_store.set(self.job, 0).unwrap();
         for (index, (_, expected)) in self.volumes.iter().enumerate() {
             let source = SourceId(index as u64);
-            let ranges = runtime.diagnostic_source_ranges(self.job, source).unwrap();
+            let ranges = runtime.source_ranges(self.job, source).unwrap();
             let actual = runtime.published_source_bytes(self.job, source).unwrap();
             // Independent bytes catch an incorrectly routed or decrypted range
             // even if both coverage accounting layers agree on its bounds.
@@ -200,6 +200,6 @@ async fn encrypted_placement_schedules() {
     campaign(Encryption::Member).await;
 }
 #[tokio::test]
-async fn header_encrypted_placement_schedules() {
-    campaign(Encryption::Header).await;
+async fn keyed_checksum_encrypted_placement_schedules() {
+    campaign(Encryption::KeyedChecksum).await;
 }

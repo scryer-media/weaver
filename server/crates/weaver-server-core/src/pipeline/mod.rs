@@ -2759,6 +2759,10 @@ pub struct Pipeline {
     /// Jobs whose completion check ran while a placement was out. The check
     /// cannot judge them until it lands, and the landing re-queues it.
     pub(super) completion_checks_awaiting_placements: HashSet<JobId>,
+    /// Direct sets whose PAR3 images were held back because a placement was
+    /// out. Nothing else is bound to publish them once it lands, so the
+    /// landing does.
+    pub(super) par3_publications_awaiting_placements: HashSet<(JobId, usize)>,
     /// Monotonic; stamps each placement flight and its done message.
     pub(super) next_direct_placement_flight_id: u64,
     pub(super) direct_placement_done_tx: mpsc::Sender<DirectPlacementDone>,
