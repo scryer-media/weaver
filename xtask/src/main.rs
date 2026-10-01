@@ -46,18 +46,7 @@ const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
 const LOCAL_AGENT_API_KEY_NAME: &str = "xtask-local-agent";
 const LOCAL_AGENT_API_KEY_SCOPE: &str = "admin";
 const LOCAL_AGENT_API_KEY_FILENAME: &str = "local-agent-api-key";
-const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[ReleaseAuditAllow] = &[
-    ReleaseAuditAllow {
-        id: "RUSTSEC-2023-0071",
-        expires_on: "2026-09-30",
-        reason: "transitive dependency still under review; release must revisit before expiry",
-    },
-    ReleaseAuditAllow {
-        id: "RUSTSEC-2025-0134",
-        expires_on: "2026-09-30",
-        reason: "slab advisory suppression is temporary while upstream dependency path is updated",
-    },
-];
+const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[ReleaseAuditAllow] = &[];
 const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
     concat!("/", "Users/"),
     concat!("/", "home/"),
