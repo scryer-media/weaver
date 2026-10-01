@@ -2572,6 +2572,17 @@ impl std::fmt::Debug for DirectSetRouter {
     }
 }
 
+/// What a set may still admit, by the two limits its holds answer to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HoldsAdmissionRooms {
+    /// Left under the set's own admission limit.
+    pub(crate) own: u64,
+    /// Left under both its own limit and what the process-wide accountant can
+    /// still honour once every other set's holds are counted; never above
+    /// `own`.
+    pub(crate) shared: u64,
+}
+
 impl Drop for DirectSetRouter {
     /// A set's bytes go with it. The accountant is charged with live holds,
     /// and a router that is dropped — its job removed, its set cleared — has
@@ -3451,20 +3462,29 @@ impl DirectSetRouter {
         capacity.saturating_sub(capacity / 4)
     }
 
-    /// Bytes this set may still admit with `incoming` already on its way:
-    /// what is left under its own [`Self::holds_admission_limit`], further
-    /// capped by what the process-wide accountant can still honour once every
-    /// other set's holds are counted. Without the second cap, sets that each
-    /// stay inside their own limit can together page past the shared scratch
-    /// total and demote. A set alone on a host whose shared limits exceed its
-    /// own admits exactly what its own limit allows.
+    /// The shared half of [`Self::holds_admission_rooms`].
+    #[cfg(test)]
     pub(crate) fn holds_admission_room(&self, incoming: u64) -> u64 {
+        self.holds_admission_rooms(incoming).shared
+    }
+
+    /// Bytes this set may still admit with `incoming` already on its way:
+    /// what is left under its own [`Self::holds_admission_limit`], and that
+    /// further capped by what the process-wide accountant can still honour
+    /// once every other set's holds are counted. Without the second cap, sets
+    /// that each stay inside their own limit can together page past the
+    /// shared scratch total and demote. A set alone on a host whose shared
+    /// limits exceed its own admits exactly what its own limit allows.
+    pub(crate) fn holds_admission_rooms(&self, incoming: u64) -> HoldsAdmissionRooms {
         let committed = self.staged_bytes().saturating_add(incoming);
         let own = self.holds_admission_limit().saturating_sub(committed);
         let shared = self
             .accountant
             .admission_room(&self.charge, self.holds_budget, committed);
-        own.min(shared)
+        HoldsAdmissionRooms {
+            own,
+            shared: own.min(shared),
+        }
     }
 
     /// An incomplete header walk can still release retained bytes, including

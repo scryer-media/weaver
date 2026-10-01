@@ -2689,3 +2689,123 @@ async fn sevenz_store_demotes_a_volume_that_decodes_shorter_than_the_map_placed_
         "and the member it was writing must not be shipped\nsets: {sets}"
     );
 }
+
+/// What one handout over the whole link takes, by segment.
+fn handout(pipeline: &mut Pipeline, want: usize) -> Vec<SegmentId> {
+    let pressure = pipeline.refresh_download_pressure();
+    assert_eq!(pressure.state, DownloadPressureState::Clear);
+    match pipeline.next_works(0, want, None, pressure) {
+        crate::pipeline::download::scheduler::Handout::Works(works) => {
+            works.iter().map(|work| work.segment_id).collect()
+        }
+        crate::pipeline::download::scheduler::Handout::Idle => Vec::new(),
+        _ => panic!("no whole-link gate or lane share applies here"),
+    }
+}
+
+#[tokio::test]
+async fn a_settled_set_holding_nothing_still_moves_when_other_sets_fill_the_shared_holds() {
+    use crate::pipeline::direct_store::accountant::{HoldsCharge, HoldsLimits};
+
+    let job_id = JobId(9_640);
+    let segment = |file_index: u32, segment_number: u32| SegmentId {
+        file_id: NzbFileId { job_id, file_index },
+        segment_number,
+    };
+    let member = payload(23, 40_000);
+    let archive = build_7z(&[Entry::file(MEMBER, member)], EncoderMethod::COPY, None);
+    let volumes = split_volumes(&archive, 4);
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let limits = HoldsLimits {
+        resident_bytes: 8192,
+        scratch_bytes: 65536,
+        disk_reserve_bytes: 0,
+    };
+    pipeline.direct_store.set_holds_limits(limits);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME),
+    )
+    .await;
+
+    // The front and the whole tail volume: the layout is read and every byte
+    // that arrived has been routed, so the set holds nothing.
+    for (file_index, segment_number) in [(0, 0), (3, 1), (3, 0)] {
+        take_queued_segment(&mut pipeline, job_id, segment(file_index, segment_number));
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES_PER_VOLUME,
+        )
+        .await;
+    }
+    let router = &pipeline.direct_store.set(job_id, 0).unwrap().router;
+    assert!(matches!(
+        router.header_probe(),
+        crate::pipeline::direct_store::router::HeaderProbe::Settled
+    ));
+    assert_eq!(router.staged_bytes(), 0, "the set must hold nothing");
+
+    // Other sets' holds take every byte the shared limits allow.
+    let mut others = HoldsCharge::default();
+    pipeline.direct_store.holds_accountant().publish(
+        &mut others,
+        limits.resident_bytes,
+        limits.scratch_bytes,
+    );
+    let rooms = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .unwrap()
+        .router
+        .holds_admission_rooms(0);
+    assert_eq!(rooms.shared, 0, "no shared room is left for this set");
+    assert!(rooms.own > 0, "its own limit still has room");
+
+    // Idle, the set is given the article it routes next, and only that one:
+    // with it on its way the set is busy, and the shared room — not its own —
+    // decides whether it may grow, so nothing more is handed out.
+    assert_eq!(handout(&mut pipeline, 4), vec![segment(0, 1)]);
+    // What a lane's activation records for the article it was given.
+    pipeline
+        .active_downloads_by_file
+        .insert(segment(0, 1).file_id, 1);
+    assert!(
+        handout(&mut pipeline, 4).is_empty(),
+        "a set with an article on its way must not grow past the shared room"
+    );
+
+    // The article lands and routes; idle again, the set is given the next.
+    pipeline
+        .active_downloads_by_file
+        .remove(&segment(0, 1).file_id);
+    submit_volume_article_of(&mut pipeline, job_id, &volumes, 0, 1, ARTICLES_PER_VOLUME).await;
+    let set = pipeline.direct_store.set(job_id, 0).unwrap();
+    assert!(!set.is_demoted());
+    assert_eq!(
+        set.router.staged_bytes(),
+        0,
+        "the frontier routes, it does not hold"
+    );
+    assert_eq!(handout(&mut pipeline, 4), vec![segment(1, 0)]);
+
+    pipeline
+        .direct_store
+        .holds_accountant()
+        .release(&mut others);
+}

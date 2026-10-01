@@ -478,6 +478,22 @@ impl DownloadQueue {
             .max_by_key(|work| work.segment_id.segment_number)
     }
 
+    /// The **lowest-numbered** queued segment of the matching work, ignoring
+    /// dispatch priority: [`Self::peek_last_matching`] from the other end.
+    ///
+    /// For the direct-store set that must reach the article it routes next.
+    /// A requeued retry sits behind the articles queued before it in dispatch
+    /// order, so the first match in that order can be one the set would only
+    /// hold; the lowest one still queued is the earliest it has not received.
+    pub fn peek_lowest_matching(
+        &self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<&DownloadWork> {
+        self.iter()
+            .filter(|work| matches(work))
+            .min_by_key(|work| work.segment_id.segment_number)
+    }
+
     /// The head of one dispatch class without removing it, in O(log n).
     ///
     /// For decisions that are about the *shape* of the work rather than the
