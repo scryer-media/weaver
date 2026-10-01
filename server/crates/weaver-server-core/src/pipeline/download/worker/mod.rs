@@ -476,15 +476,17 @@ impl Pipeline {
         }
     }
 
-    /// Completion-critical dispatch: unconditional and first, every pass.
+    /// Fill idle connections from the global article scheduler.
     ///
-    /// Completion-critical work (PAR2 completion reads, the direct-store
-    /// identity probe wave) always leads ordinary queue bytes, on every job
-    /// including the hot job's own — there is no lane cap here, unlike the
-    /// regular hot/spillover split below. Demand spreads to the
-    /// least-loaded critical job first (ties break on `eligible`'s existing
-    /// priority/submission order), so no single job's critical backlog
-    /// starves another's.
+    /// After the whole-link gates (pause, rate limiter, NNTP handover, ISP
+    /// bandwidth cap, byte pressure), each connection asks the one global
+    /// "what should this server fetch next?" in turn: articles come from the
+    /// hot job, and from exactly one spill job only when the hot job has
+    /// nothing that server may fetch. Completion-critical work (PAR2
+    /// completion reads, the direct-store identity probe wave) is drained
+    /// ahead of ordinary bytes within the chosen job only, never across jobs.
+    /// There are no per-server leases and no lane caps; soft byte pressure
+    /// limits the pass to a single article from the hot job.
     pub(crate) fn dispatch_downloads(&mut self) {
         let now = Instant::now();
         self.download_dispatch_wake = false;
