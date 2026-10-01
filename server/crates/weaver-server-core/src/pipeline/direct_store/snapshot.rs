@@ -79,8 +79,10 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   the old row describes are on the wrong filesystem for the new layout
 ///   anyway and the restart sweep deletes them.
 ///
-///   Operationally it costs nothing today: the direct-store gate defaults off,
-///   so a shipped install has no rows to refuse.
+///   Operationally this is no longer free: the direct-store gate now defaults
+///   **on**, so a shipped install does carry rows, and the refusal costs one
+///   redownload per checkpointed set on the first start after the bump — the
+///   same cost the v3 note below records.
 /// - 7: `CoverageSnapshot::identity` added. A set admitted by identity rather
 ///   than by its file names is not rediscovered from the spec at restart, so
 ///   the checkpoint has to carry the volume-to-file mapping its plan was built
