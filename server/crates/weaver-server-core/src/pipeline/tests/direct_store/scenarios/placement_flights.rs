@@ -1,7 +1,8 @@
 //! A routed article's destination writes run off the pipeline task. These pin
 //! what that must not change: the pipeline keeps serving while a write is
-//! held open, a demotion that overtakes a write hands its article back, and a
-//! shutdown checkpoint does not run ahead of a write that is still out.
+//! held open, a demotion that overtakes a write hands its article back, and
+//! neither a shutdown checkpoint nor a PAR3 publication runs ahead of a write
+//! that is still out.
 
 use super::*;
 
@@ -9,6 +10,203 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 const ARTICLES: usize = 2;
+
+/// A placement routed into a set retires the set's PAR3 sources before its
+/// writes leave. A refresh while those writes are held must not publish one
+/// over a destination about to change.
+#[tokio::test]
+async fn par3_publication_waits_for_direct_placement() {
+    use crate::pipeline::repair::par3::work::Coordinator;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41990);
+    let volumes = fixture();
+    let (mut pipeline, _, initial_hold) = held_pipeline(&root, job_id, &volumes).await;
+    route_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    initial_hold.add_permits(1);
+    settle_direct_placement_work(&mut pipeline).await;
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        Arc::clone(&pipeline.metrics),
+    );
+    coordinator.admit(job_id).unwrap();
+    pipeline.par3_runtime = Some(Box::new(coordinator));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+
+    let hold = Arc::new(Semaphore::new(0));
+    pipeline.direct_placement_hold = Some(Arc::clone(&hold));
+    route_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    assert!(pipeline.has_direct_placements(job_id));
+    assert!(!committed(&pipeline, segment(job_id, 0, 1)));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    let published_while_writing = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .has_worker_in_flight(job_id);
+    settle_par3_work(&mut pipeline, job_id).await;
+    hold.add_permits(1);
+    settle_direct_placement_work(&mut pipeline).await;
+    assert!(
+        !published_while_writing,
+        "PAR3 dispatched a source snapshot while its direct placement was held before writing"
+    );
+}
+
+/// Every volume of a split member reads the same destination, so a placement
+/// into one volume writes under the PAR3 images of the others. A refresh
+/// while it is out must not take a sibling's snapshot over that destination.
+#[tokio::test]
+async fn par3_sibling_snapshot_stays_fresh_after_placement() {
+    use crate::pipeline::repair::par3::work::Coordinator;
+    use par3_rs::source::SourceId;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41992);
+    let volumes = fixture();
+    let (mut pipeline, _, initial_hold) = held_pipeline(&root, job_id, &volumes).await;
+    initial_hold.add_permits(1);
+    for ordinal in 0..2 {
+        route_article(&mut pipeline, job_id, &volumes, 0, ordinal).await;
+        settle_direct_placement_work(&mut pipeline).await;
+    }
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        Arc::clone(&pipeline.metrics),
+    );
+    coordinator.admit(job_id).unwrap();
+    pipeline.par3_runtime = Some(Box::new(coordinator));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    assert!(
+        pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .source_snapshot(job_id, SourceId(0))
+            .unwrap()
+            .is_some()
+    );
+
+    let hold = Arc::new(Semaphore::new(0));
+    pipeline.direct_placement_hold = Some(Arc::clone(&hold));
+    route_article(&mut pipeline, job_id, &volumes, 1, 0).await;
+    assert!(pipeline.has_direct_placements(job_id));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    hold.add_permits(1);
+    settle_direct_placement_work(&mut pipeline).await;
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let snapshot = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .source_snapshot(job_id, SourceId(0));
+    assert!(
+        matches!(snapshot, Ok(Some(_))),
+        "a completed sibling retained a stale snapshot after another volume's write: {snapshot:?}"
+    );
+}
+
+#[tokio::test]
+async fn par3_partial_source_gains_committed_ranges() {
+    par3_partial_publication(None).await;
+}
+
+#[tokio::test]
+async fn par3_encrypted_source_gains_committed_ranges() {
+    par3_partial_publication(Some(false)).await;
+}
+
+#[tokio::test]
+async fn par3_keyed_checksum_encrypted_source_gains_committed_ranges() {
+    par3_partial_publication(Some(true)).await;
+}
+
+/// A volume's second article lands — its writes returned, its commit not yet
+/// applied — across a PAR3 refresh. The image published after the commit
+/// must read what the set has committed, not the coverage of before it.
+/// `encrypted` is `None` for a plain set, or whether an encrypted set keys
+/// its final part's checksum.
+async fn par3_partial_publication(encrypted: Option<bool>) {
+    use crate::pipeline::repair::par3::work::Coordinator;
+    use par3_rs::source::SourceId;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41993);
+    let volumes = match encrypted {
+        None => fixture(),
+        Some(keyed_checksum) => {
+            let payload: Vec<u8> = (0..120_000u32).map(|i| (i * 7 + 3) as u8).collect();
+            encrypted_store_set(
+                "feature.mkv",
+                &payload,
+                3,
+                "moonlit-harbour",
+                Some("moonlit-harbour"),
+                keyed_checksum,
+            )
+        }
+    };
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec = direct_store_job_spec_with_articles("Publication diagnostic", &volumes, 3);
+    if encrypted.is_some() {
+        spec.password = Some("moonlit-harbour".into());
+    }
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    route_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    settle_direct_placement_work(&mut pipeline).await;
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        Arc::clone(&pipeline.metrics),
+    );
+    coordinator.admit(job_id).unwrap();
+    pipeline.par3_runtime = Some(Box::new(coordinator));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let before = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .source_ranges(job_id, SourceId(0))
+        .unwrap();
+
+    let hold = Arc::new(Semaphore::new(0));
+    pipeline.direct_placement_hold = Some(Arc::clone(&hold));
+    route_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    hold.add_permits(1);
+    pipeline.await_direct_placement_io(job_id, 0).await;
+    assert!(pipeline.has_direct_placements(job_id));
+    assert!(!committed(&pipeline, segment(job_id, 0, 1)));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    settle_direct_placement_work(&mut pipeline).await;
+    assert!(committed(&pipeline, segment(job_id, 0, 1)));
+    assert!(!committed(&pipeline, segment(job_id, 0, 2)));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let after = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .source_ranges(job_id, SourceId(0))
+        .unwrap();
+    let set = pipeline.direct_store.set(job_id, 0).unwrap();
+    let len = set.virtual_volume_len(0, 0);
+    let expected =
+        set.virtual_volumes(&std::collections::BTreeMap::from([(0, len)]))[0].readable_ranges();
+    assert_ne!(
+        before, expected,
+        "the committed article must grow readable coverage"
+    );
+    assert_eq!(
+        after, expected,
+        "PAR3 retained incomplete coverage after placement committed; before={before:?}, after={after:?}"
+    );
+}
 
 fn fixture() -> Vec<(String, Vec<u8>)> {
     let payload: Vec<u8> = (0..120_000u32).map(|index| (index * 7 + 3) as u8).collect();
@@ -62,7 +260,10 @@ async fn route_article(
         segment(job_id, file_index, segment_number),
     );
     let (filename, bytes) = &volumes[file_index as usize];
-    let (start, end) = article_extent(bytes.len(), segment_number, ARTICLES);
+    let articles = pipeline.jobs[&job_id].spec.files[file_index as usize]
+        .segments
+        .len();
+    let (start, end) = article_extent(bytes.len(), segment_number, articles);
     let data = &bytes[start..end];
     let file_id = NzbFileId { job_id, file_index };
     let total_segments = pipeline
@@ -627,4 +828,202 @@ async fn placements_a_barrier_settles_still_carry_a_deferred_completion_on() {
         (Some(payload.clone()), Some("complete"))
     );
     assert!(no_volume_file(&working_dir, &volumes));
+}
+
+/// A refresh held back while a placement was out is owed once it lands, and
+/// no completion check is bound to follow the landing while the job still
+/// downloads: the landing itself publishes what the refresh did not.
+#[tokio::test]
+async fn a_placement_landing_publishes_the_par3_sources_it_held_back() {
+    use crate::pipeline::repair::par3::work::Coordinator;
+    use par3_rs::source::SourceId;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(41994);
+    let volumes = fixture();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, 3);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    route_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    settle_direct_placement_work(&mut pipeline).await;
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        Arc::clone(&pipeline.metrics),
+    );
+    coordinator.admit(job_id).unwrap();
+    pipeline.par3_runtime = Some(Box::new(coordinator));
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+
+    let hold = hold_next_flights(&mut pipeline);
+    route_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    let runtime = pipeline.par3_runtime.as_ref().unwrap();
+    assert!(
+        !runtime.has_worker_in_flight(job_id),
+        "premise: the refresh held the set's publication back"
+    );
+    assert!(
+        runtime
+            .source_ranges(job_id, SourceId(0))
+            .unwrap()
+            .is_empty(),
+        "premise: the routing withdrew the first volume's image"
+    );
+
+    hold.add_permits(1);
+    settle_direct_placement_work(&mut pipeline).await;
+    assert!(committed(&pipeline, segment(job_id, 0, 1)));
+    assert!(
+        !committed(&pipeline, segment(job_id, 0, 2)),
+        "premise: the volume is still short, so no completion of it publishes anything"
+    );
+    assert!(
+        pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .has_worker_in_flight(job_id),
+        "the landing must publish what the refresh before it held back"
+    );
+    settle_par3_work(&mut pipeline, job_id).await;
+    let published = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .source_ranges(job_id, SourceId(0))
+        .unwrap();
+    let set = pipeline.direct_store.set(job_id, 0).unwrap();
+    let len = set.virtual_volume_len(0, 0);
+    let expected =
+        set.virtual_volumes(&std::collections::BTreeMap::from([(0, len)]))[0].readable_ranges();
+    assert_eq!(
+        published, expected,
+        "the first volume's image must read both landed articles"
+    );
+}
+
+/// A direct set protected by PAR3, with one article of its middle volume
+/// held at its placement while everything else of the set has landed, and
+/// the middle volume's last article lost for good.
+///
+/// A completion check's PAR3 refresh runs while the held article is out —
+/// before its write lands when `landed_first` is false, after the write
+/// returned but before its done message is applied when it is true — and
+/// the next one after the landing. The verdict the runtime then holds must
+/// be the one a fresh publication of everything committed gives: the lost
+/// article and nothing more.
+async fn par3_refresh_across_a_held_placement(job_id: JobId, landed_first: bool) {
+    const ARTICLES_EACH: usize = 8;
+    let payload: Vec<u8> = (0..48_000u32).map(|index| (index * 13 + 5) as u8).collect();
+    let volumes = single_member_store_set("feature.mkv", &payload, 3);
+    let carriers = par3_carriers_over(&volumes, PAR2_SLICE_BYTES, 64);
+    let index = carriers
+        .iter()
+        .position(|(filename, _)| !filename.contains(".vol"))
+        .expect("the PAR3 index");
+
+    let temp_dir = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES_EACH);
+    let carrier_indices = append_single_article_files(&mut spec, &carriers);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let (filename, bytes) = &carriers[index];
+    submit_decoded_segment_declaring(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: carrier_indices[index],
+        },
+        0,
+        0,
+        bytes,
+        filename,
+        None,
+        true,
+        None,
+        bytes.len() as u64,
+    )
+    .await;
+    settle_par3_work(&mut pipeline, job_id).await;
+
+    let lost = (1u32, ARTICLES_EACH as u32 - 1);
+    let held = (1u32, 3u32);
+    for ordinal in 0..volumes.len() as u32 {
+        for article in 0..ARTICLES_EACH as u32 {
+            if (ordinal, article) == lost || (ordinal, article) == held {
+                continue;
+            }
+            submit_volume_article_indexed_of(
+                &mut pipeline,
+                job_id,
+                &volumes,
+                ordinal,
+                ordinal,
+                article,
+                ARTICLES_EACH,
+            )
+            .await;
+            pipeline.refresh_par3_sources(job_id).unwrap();
+            settle_par3_work(&mut pipeline, job_id).await;
+        }
+    }
+    assert!(
+        par3_lost_blocks(&pipeline, job_id).is_some_and(|lost| lost > 0),
+        "premise: the runtime holds a view over the set before the held article"
+    );
+
+    let hold = hold_next_flights(&mut pipeline);
+    route_article(&mut pipeline, job_id, &volumes, held.0, held.1).await;
+    assert!(
+        pipeline.direct_set_has_placements(job_id, 0),
+        "premise: the held article's writes are out"
+    );
+    if landed_first {
+        // The writes return; nothing has applied them.
+        hold.add_permits(1);
+        pipeline.await_direct_placement_io(job_id, 0).await;
+        assert!(!committed(&pipeline, segment(job_id, held.0, held.1)));
+    }
+
+    // A completion check between the routing and the commit.
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+
+    if !landed_first {
+        hold.add_permits(1);
+    }
+    settle_direct_placement_work(&mut pipeline).await;
+    assert!(committed(&pipeline, segment(job_id, held.0, held.1)));
+
+    // The completion check after the landing.
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let reached = par3_lost_blocks(&pipeline, job_id).expect("a settled PAR3 view");
+
+    // Every image retired and published afresh over what is committed.
+    pipeline.invalidate_par3_direct_set(job_id, 0);
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    settle_par3_work(&mut pipeline, job_id).await;
+    let fresh = par3_lost_blocks(&pipeline, job_id).expect("a settled PAR3 view");
+
+    assert!(fresh > 0, "premise: the lost article is real damage");
+    assert_eq!(
+        reached, fresh,
+        "the held article's blocks verify once it lands: an image published while \
+         its write was out must not stand (lost {reached}, fresh publication {fresh})"
+    );
+}
+
+#[tokio::test]
+async fn a_par3_refresh_while_a_placement_is_writing_does_not_miss_its_bytes() {
+    par3_refresh_across_a_held_placement(JobId(41809), false).await;
+}
+
+#[tokio::test]
+async fn a_par3_refresh_before_a_landed_placement_is_applied_does_not_miss_its_bytes() {
+    par3_refresh_across_a_held_placement(JobId(41811), true).await;
 }

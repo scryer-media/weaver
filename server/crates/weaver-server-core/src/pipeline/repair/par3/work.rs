@@ -1011,6 +1011,35 @@ impl Coordinator {
             .is_some_and(|job| job.ticket.is_some())
     }
 
+    /// The job's published snapshot of `source`, `None` while none is
+    /// published. An image whose backing changed under it fails here the way
+    /// a worker's read of it would.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn source_snapshot(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Option<SourceSnapshot>> {
+        Ok(self.jobs[&job_id].sources.snapshot(source)?)
+    }
+
+    /// The `(start, end)` ranges the job's published image of `source` can
+    /// read, empty while none is published or once it is withdrawn.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn source_ranges(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Vec<(u64, u64)>> {
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        while let Some(range) = self.jobs[&job_id].sources.next_available(source, offset)? {
+            offset = range.end;
+            ranges.push((range.start, range.end));
+        }
+        Ok(ranges)
+    }
+
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| {
             job.installing
