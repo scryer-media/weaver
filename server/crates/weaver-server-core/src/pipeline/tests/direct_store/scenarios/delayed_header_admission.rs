@@ -784,6 +784,20 @@ async fn holds_scratch_ceiling_demotion_reconstructs_held_volumes_without_refetc
         0,
         "the preserved scratch is released once the sweep has read it"
     );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().resident_bytes(),
+        0,
+        "the preserved RAM holds are released once the sweep has read them"
+    );
+    assert_eq!(
+        pipeline
+            .direct_store
+            .set(JOB, 0)
+            .unwrap()
+            .router
+            .staged_bytes(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -839,5 +853,75 @@ async fn routing_time_scratch_ceiling_demotion_keeps_every_held_article_but_the_
         pipeline.direct_store.holds_accountant().scratch_bytes(),
         0,
         "the preserved scratch is released once the sweep has read it"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().resident_bytes(),
+        0,
+        "the preserved RAM holds are released once the sweep has read them"
+    );
+    assert_eq!(
+        pipeline
+            .direct_store
+            .set(JOB, 0)
+            .unwrap()
+            .router
+            .staged_bytes(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_refetched_demotion_releases_the_holds_it_never_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = scaled_pipeline(&temp).await;
+    insert_active_job(
+        &mut pipeline,
+        JOB,
+        direct_store_job_spec("Silver Horizon", &volumes),
+    )
+    .await;
+    // Only the second halves of volumes whose fronts never arrived: no
+    // header has been read, nothing has been routed to a member, and the set
+    // holds every byte it was given, some of it paged.
+    let held: Vec<(u32, u32)> = (66..74).map(|file| (file, 1)).collect();
+    for &(file, article) in &held {
+        take_queued_segment(&mut pipeline, JOB, segment(file, article));
+        submit_volume_article(&mut pipeline, JOB, &volumes, file, article).await;
+    }
+    let set = pipeline.direct_store.set(JOB, 0).unwrap();
+    assert!(!set.is_demoted());
+    assert!(set.router.member_partials().is_empty());
+    assert!(pipeline.direct_store.holds_accountant().resident_bytes() > 0);
+    assert!(pipeline.direct_store.holds_accountant().scratch_bytes() > 0);
+
+    // A scratch that failed is not a reason to trust what it held: the set
+    // is refetched whole, and its holds are never read.
+    pipeline
+        .demote_direct_set(
+            JOB,
+            0,
+            crate::pipeline::direct_store::router::DemotionReason::HoldsScratchFailed,
+        )
+        .await;
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    let queued = queued_segments(&mut pipeline, JOB);
+    for arrival in &held {
+        assert!(
+            queued.contains(arrival),
+            "held article {arrival:?} is refetched with its set"
+        );
+    }
+    assert_eq!(pipeline.direct_store.holds_accountant().resident_bytes(), 0);
+    assert_eq!(pipeline.direct_store.holds_accountant().scratch_bytes(), 0);
+    assert_eq!(
+        pipeline
+            .direct_store
+            .set(JOB, 0)
+            .unwrap()
+            .router
+            .staged_bytes(),
+        0
     );
 }

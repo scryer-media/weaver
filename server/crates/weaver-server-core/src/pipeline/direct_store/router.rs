@@ -3159,8 +3159,22 @@ impl DirectSetRouter {
         self.scratch.bytes()
     }
 
-    /// Closes and deletes the scratch file. Idempotent; called at finalization
-    /// and demotion.
+    /// Drops every staged byte, RAM and scratch alike, closes and deletes the
+    /// scratch file, and publishes the set's charge as zero. Idempotent.
+    ///
+    /// For a set whose routed output is being deleted: nothing will route
+    /// through its staging again, so whatever it still holds is RAM and
+    /// shared admission room taken from every other live set until the job
+    /// goes. A reader that still needs the held bytes holds its own
+    /// references to them and pins the scratch image, so dropping the
+    /// router's copies never takes bytes out from under it.
+    pub(crate) fn discard_holds(&mut self) {
+        self.staging.clear();
+        self.discard_scratch();
+    }
+
+    /// Closes and deletes the scratch file. Idempotent; called at
+    /// finalization, and through [`Self::discard_holds`] at demotion.
     pub(crate) fn discard_scratch(&mut self) {
         self.scratch.discard();
         self.publish_holds();
