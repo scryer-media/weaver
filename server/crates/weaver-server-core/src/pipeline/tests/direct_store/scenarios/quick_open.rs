@@ -545,6 +545,7 @@ async fn member_checksum_demotion_hands_the_live_tail_to_a_reconstructed_prefix(
         !payload_root(&temp_dir, job_id).join(member_name).exists(),
         "a member failing its whole-member gate must not be committed as if it passed"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(
         !direct_partial(&temp_dir, job_id, member_name).exists(),
         "demotion must delete the set's partial direct output"
@@ -2125,6 +2126,7 @@ async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
         Some(volumes[0].1.as_slice()),
         "and the volume the set had covered end to end is materialized then, byte for byte"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(
         !direct_partial(&temp_dir, job_id, member_name).exists(),
         "with the routed output deleted behind it"
@@ -2244,6 +2246,7 @@ async fn a_volume_the_sweep_has_finished_goes_back_into_dispatch_before_its_sibl
         pipeline.direct_demotion_in_flight.is_empty(),
         "the finish retires the ticket"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(
         !direct_partial(&temp_dir, job_id, member_name).exists(),
         "deletes the routed output"
@@ -2716,6 +2719,7 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
 
     // The direct outputs are gone: a sparse half-written member would
     // masquerade as finished work, and the envelopes are scratch.
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(!direct_partial(&temp_dir, JobId(41015), member_name).exists());
     for volume_index in 0..volumes.len() as u32 {
         assert!(
@@ -4051,6 +4055,7 @@ async fn direct_store_demotes_a_volume_whose_yenc_whole_file_crc_disagrees() {
         "a volume whose composed yEnc CRC32 disagrees with its trailer must demote \
          at volume completion, long before any member gate could run, got {shape}"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(!direct_partial(&temp_dir, JobId(41022), member_name).exists());
 }
 
