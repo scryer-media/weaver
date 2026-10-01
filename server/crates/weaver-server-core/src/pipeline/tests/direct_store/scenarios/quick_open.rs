@@ -2256,6 +2256,73 @@ async fn a_volume_the_sweep_has_finished_goes_back_into_dispatch_before_its_sibl
 }
 
 #[tokio::test]
+async fn a_queue_held_whole_by_its_demotion_sweep_is_answered_without_a_scan() {
+    use crate::operations::metrics::SchedulerBlockClause;
+    use crate::pipeline::download::scheduler::Handout;
+
+    let member_name = "Silver.Horizon.S01E28.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41063);
+    let (mut pipeline, _, _) = demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+        &temp_dir,
+        job_id,
+        &volumes,
+        DemotionReason::HoldsBudgetExceeded,
+        true,
+        |_, _| {},
+    )
+    .await;
+    assert_eq!(
+        pipeline.demotion_sweep_held_file_indices(job_id),
+        Some(vec![0, 1, 2]),
+        "every volume of the set is held while the sweep runs"
+    );
+    let queued = pipeline.jobs[&job_id].download_queue.len();
+    assert!(queued > 0, "the held volumes still have queued articles");
+    let metrics = std::sync::Arc::clone(&pipeline.metrics);
+    let skipped = || {
+        metrics
+            .download_scheduler_scan_items_skipped_total
+            .load(Ordering::Relaxed)
+    };
+    let no_match = || {
+        metrics
+            .download_scheduler_scan_no_match_total
+            .load(Ordering::Relaxed)
+    };
+    let sweep_blocks = || {
+        metrics.download_scheduler_hot_blocked_total[SchedulerBlockClause::SweepHeld.index()]
+            .load(Ordering::Relaxed)
+    };
+    let (skipped_before, no_match_before, sweep_blocks_before) =
+        (skipped(), no_match(), sweep_blocks());
+
+    let pressure = pipeline.refresh_download_pressure();
+    assert!(matches!(
+        pipeline.next_works(0, 4, None, pressure),
+        Handout::Idle
+    ));
+
+    assert_eq!(
+        skipped(),
+        skipped_before,
+        "no queued article was looked at: the per-file answer refused the whole queue"
+    );
+    assert_eq!(
+        no_match(),
+        no_match_before,
+        "and no scan ran to come up empty"
+    );
+    assert_eq!(
+        sweep_blocks(),
+        sweep_blocks_before + 1,
+        "the hot job's block is put down to the sweep"
+    );
+    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), queued);
+}
+
+#[tokio::test]
 async fn the_archive_hook_leaves_a_volume_alone_while_its_demotion_sweep_is_outstanding() {
     // A demoted set's volumes stop being direct source files at the demotion,
     // so the conventional file-complete hook would otherwise classify and

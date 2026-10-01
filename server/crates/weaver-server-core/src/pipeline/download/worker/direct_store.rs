@@ -2,9 +2,27 @@ use super::*;
 use crate::pipeline::direct_store::router::HeaderProbe as DirectHeaderProbe;
 
 pub(in crate::pipeline::download) struct DirectStoreAdmission {
+    job_id: JobId,
     files: HashSet<u32>,
+    /// Room the set had when the handout began: its holds admission room
+    /// with every byte already on its way to it counted.
+    room: u64,
+    /// What the handout being built has leased of the set so far.
+    leased: u64,
     available: u64,
     probes: Vec<SegmentId>,
+    probe_lease: ProbeLease,
+}
+
+/// What leasing one of the set's articles does to its header probes.
+#[derive(Clone, Copy)]
+enum ProbeLease {
+    /// The earliest-volume probe is only asked of an idle set; anything of
+    /// the set out on a lane closes it.
+    CloseAll,
+    /// A container probes each end until that end's volume has an article
+    /// in flight; leasing one closes only the probe of that volume.
+    CloseFile,
 }
 
 impl DirectStoreAdmission {
@@ -13,17 +31,57 @@ impl DirectStoreAdmission {
             || work.byte_estimate as u64 <= self.available
             || self.probes.contains(&work.segment_id)
     }
+
+    /// Whether this set could admit *any* queued article of `file_index`,
+    /// given the smallest `byte_estimate` among them.
+    ///
+    /// [`Self::allows`] admits an article of one of the set's files only when
+    /// its estimate fits the room left or it is one of the set's probes. When
+    /// even the smallest article does not fit, no article of the file fits,
+    /// so only a probe can get through; a probe in this file keeps the answer
+    /// `true`. Probes are matched by file index alone, which can only make
+    /// the answer more permissive than [`Self::allows`].
+    pub(in crate::pipeline::download) fn may_admit_from_file(
+        &self,
+        file_index: u32,
+        smallest: u32,
+    ) -> bool {
+        !self.files.contains(&file_index)
+            || smallest as u64 <= self.available
+            || self
+                .probes
+                .iter()
+                .any(|probe| probe.file_id.file_index == file_index)
+    }
+
+    /// Charge an article the handout being built has just taken, so the
+    /// next one is admitted against what the set will hold with it.
+    pub(in crate::pipeline::download) fn note_leased(&mut self, work: &DownloadWork) {
+        let file = work.segment_id.file_id;
+        if file.job_id != self.job_id || !self.files.contains(&file.file_index) {
+            return;
+        }
+        // The holds admission room falls byte for byte with what is
+        // committed to the set, down to zero, so charging the lease against
+        // the room taken at the start equals asking the router again with
+        // the lease counted as incoming.
+        self.leased = self.leased.saturating_add(work.byte_estimate as u64);
+        self.available = self.room.saturating_sub(self.leased);
+        match self.probe_lease {
+            ProbeLease::CloseAll => self.probes.clear(),
+            ProbeLease::CloseFile => self
+                .probes
+                .retain(|probe| probe.file_id.file_index != file.file_index),
+        }
+    }
 }
 
 impl Pipeline {
     /// Per-set disk retention is separate from shared RAM pressure. Include
-    /// arrivals already committed to the wire/decode pipeline, and work in the
-    /// lease being built, before allowing another article to start.
-    pub(super) fn direct_store_admission(
-        &self,
-        job_id: JobId,
-        leased: &[DownloadWork],
-    ) -> Vec<DirectStoreAdmission> {
+    /// arrivals already committed to the wire/decode pipeline before allowing
+    /// another article to start; work leased by the handout being built is
+    /// charged as it is taken, through [`DirectStoreAdmission::note_leased`].
+    pub(super) fn direct_store_admission(&self, job_id: JobId) -> Vec<DirectStoreAdmission> {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();
         };
@@ -50,10 +108,6 @@ impl Pipeline {
                     .iter()
                     .filter(|work| owns(work.segment_id.file_id))
                     .map(|work| work.raw.len() as u64);
-                let leasing = leased
-                    .iter()
-                    .filter(|work| owns(work.segment_id.file_id))
-                    .map(|work| work.byte_estimate as u64);
                 // Released lane results are tracked per job, so charge them
                 // conservatively to each set until their actor event arrives.
                 let released = self
@@ -64,7 +118,6 @@ impl Pipeline {
                 let incoming = wire
                     .chain(decoding)
                     .chain(pending)
-                    .chain(leasing)
                     .fold(released, u64::saturating_add);
                 let busy = incoming != 0
                     || self
@@ -74,9 +127,8 @@ impl Pipeline {
                     || self
                         .active_decodes_by_file
                         .iter()
-                        .any(|(file, count)| owns(*file) && *count != 0)
-                    || leased.iter().any(|work| owns(work.segment_id.file_id));
-                let available = set.router.holds_admission_room(incoming);
+                        .any(|(file, count)| owns(*file) && *count != 0);
+                let room = set.router.holds_admission_room(incoming);
 
                 // Permit queued articles past the limit to resolve the layout.
                 // Ordinals need not match yEnc offsets: serialized progress
@@ -101,6 +153,10 @@ impl Pipeline {
                 // are unread; a container is read at both ends, because its
                 // volumes state their lengths one article each and its map sits
                 // at the very end of the last one.
+                let probe_lease = match set.header_probe() {
+                    DirectHeaderProbe::Earliest => ProbeLease::CloseAll,
+                    _ => ProbeLease::CloseFile,
+                };
                 let probes = match set.header_probe() {
                     DirectHeaderProbe::Settled => Vec::new(),
                     DirectHeaderProbe::Earliest if busy => Vec::new(),
@@ -146,9 +202,6 @@ impl Pipeline {
                         for work in &self.pending_decode {
                             note(work.segment_id.file_id);
                         }
-                        for work in leased {
-                            note(work.segment_id.file_id);
-                        }
                         for (file, count) in &self.active_downloads_by_file {
                             if *count != 0 {
                                 note(*file);
@@ -186,9 +239,13 @@ impl Pipeline {
                     }
                 };
                 DirectStoreAdmission {
+                    job_id,
                     files,
-                    available,
+                    room,
+                    leased: 0,
+                    available: room,
                     probes,
+                    probe_lease,
                 }
             })
             .collect()

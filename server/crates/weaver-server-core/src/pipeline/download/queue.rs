@@ -134,6 +134,10 @@ pub struct DownloadQueue {
     /// volume; answering that by scanning the queue made every replan cost
     /// files times queued segments.
     queued_by_file: HashMap<NzbFileId, u32>,
+    /// Queued byte estimates per file, as estimate -> how many queued items
+    /// carry it, maintained beside `queued_by_file`. Lets a caller ask for a
+    /// file's smallest queued article without reading the file's articles.
+    queued_estimates_by_file: HashMap<NzbFileId, BTreeMap<u32, u32>>,
     /// The file priority plan currently in force: `(priority, rank)` per
     /// file, applied to every push of an unprotected item and re-applied to
     /// the queue only when the plan itself changes.
@@ -165,6 +169,7 @@ impl DownloadQueue {
             excluded_work: 0,
             recovery_work: 0,
             queued_by_file: HashMap::new(),
+            queued_estimates_by_file: HashMap::new(),
             file_priority_plan: HashMap::new(),
             file_priority_plan_protected: 0,
             file_priority_plan_stale: false,
@@ -212,6 +217,12 @@ impl DownloadQueue {
         *self
             .queued_by_file
             .entry(work.segment_id.file_id)
+            .or_default() += 1;
+        *self
+            .queued_estimates_by_file
+            .entry(work.segment_id.file_id)
+            .or_default()
+            .entry(work.byte_estimate)
             .or_default() += 1;
         let completion_critical = work.completion_critical;
         let first_article = self.first_articles.contains(&work.segment_id);
@@ -274,15 +285,31 @@ impl DownloadQueue {
             .count();
         self.recovery_work = self.iter().filter(|work| work.is_recovery).count();
         let mut queued_by_file = HashMap::new();
+        let mut queued_estimates_by_file: HashMap<NzbFileId, BTreeMap<u32, u32>> = HashMap::new();
         for work in self.iter() {
             *queued_by_file.entry(work.segment_id.file_id).or_default() += 1;
+            *queued_estimates_by_file
+                .entry(work.segment_id.file_id)
+                .or_default()
+                .entry(work.byte_estimate)
+                .or_default() += 1;
         }
         self.queued_by_file = queued_by_file;
+        self.queued_estimates_by_file = queued_estimates_by_file;
     }
 
     /// Queued items for one file, in O(1).
     pub fn queued_count_for_file(&self, file_id: NzbFileId) -> u32 {
         self.queued_by_file.get(&file_id).copied().unwrap_or(0)
+    }
+
+    /// The smallest `byte_estimate` among one file's queued items, in
+    /// O(log n); `None` when the file has nothing queued.
+    pub fn min_queued_byte_estimate_for_file(&self, file_id: NzbFileId) -> Option<u32> {
+        self.queued_estimates_by_file
+            .get(&file_id)
+            .and_then(|estimates| estimates.first_key_value())
+            .map(|(estimate, _)| *estimate)
     }
 
     /// Every queued item, completion-critical class first, each class in
@@ -372,6 +399,21 @@ impl DownloadQueue {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.queued_by_file.remove(&work.segment_id.file_id);
+            }
+        }
+        if let Some(estimates) = self
+            .queued_estimates_by_file
+            .get_mut(&work.segment_id.file_id)
+        {
+            if let Some(count) = estimates.get_mut(&work.byte_estimate) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    estimates.remove(&work.byte_estimate);
+                }
+            }
+            if estimates.is_empty() {
+                self.queued_estimates_by_file
+                    .remove(&work.segment_id.file_id);
             }
         }
     }
@@ -514,6 +556,7 @@ impl DownloadQueue {
         self.excluded_work = 0;
         self.recovery_work = 0;
         self.queued_by_file.clear();
+        self.queued_estimates_by_file.clear();
         std::mem::take(&mut self.completion_critical_work)
             .into_values()
             .chain(std::mem::take(&mut self.ordinary_work).into_values())

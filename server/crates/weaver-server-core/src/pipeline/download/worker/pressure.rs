@@ -45,11 +45,50 @@ impl CheckpointDecision {
     }
 }
 
+/// What a lease being built weighs against the restart checkpoint: the
+/// payload bytes it carries (recovery is exempt), and whether it holds
+/// anything at all.
+#[derive(Clone, Copy, Default)]
+pub(in crate::pipeline) struct CheckpointLease {
+    payload_bytes: u64,
+    articles: usize,
+}
+
+impl CheckpointLease {
+    pub(in crate::pipeline) fn of(leased: &[DownloadWork]) -> Self {
+        let mut lease = Self::default();
+        for work in leased {
+            lease.add(work);
+        }
+        lease
+    }
+
+    pub(in crate::pipeline) fn add(&mut self, work: &DownloadWork) {
+        if !work.is_recovery {
+            self.payload_bytes = self.payload_bytes.saturating_add(work.byte_estimate as u64);
+        }
+        self.articles += 1;
+    }
+
+    fn is_empty(self) -> bool {
+        self.articles == 0
+    }
+}
+
 impl CheckpointAdmission {
     pub(in crate::pipeline) fn decision(
         self,
         work: &DownloadWork,
         leased: &[DownloadWork],
+    ) -> CheckpointDecision {
+        self.decision_with_lease(work, CheckpointLease::of(leased))
+    }
+
+    /// [`Self::decision`] against a lease already summed.
+    pub(in crate::pipeline) fn decision_with_lease(
+        self,
+        work: &DownloadWork,
+        leased: CheckpointLease,
     ) -> CheckpointDecision {
         if !self.enforced || self.limit == 0 {
             return CheckpointDecision::NotEnforced;
@@ -60,11 +99,9 @@ impl CheckpointAdmission {
         if self.progress_article_in_flight {
             return CheckpointDecision::WaitingForPipeline;
         }
-        let projected = leased
-            .iter()
-            .filter(|work| !work.is_recovery)
-            .map(|work| work.byte_estimate as u64)
-            .fold(self.undurable_bytes, u64::saturating_add)
+        let projected = self
+            .undurable_bytes
+            .saturating_add(leased.payload_bytes)
             .saturating_add(work.byte_estimate as u64);
         if projected <= self.limit {
             CheckpointDecision::WithinLimit
