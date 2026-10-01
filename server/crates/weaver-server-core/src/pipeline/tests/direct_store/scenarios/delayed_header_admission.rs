@@ -735,6 +735,35 @@ async fn holds_admission_is_capped_by_the_shared_scratch_total_across_jobs() {
 
 #[tokio::test]
 async fn holds_scratch_ceiling_demotion_reconstructs_held_volumes_without_refetching_them() {
+    room_demotion_reconstructs_held_volumes_without_refetching_them(
+        crate::pipeline::direct_store::router::DemotionReason::HoldsScratchCeiling,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn holds_budget_demotion_reconstructs_held_volumes_without_refetching_them() {
+    room_demotion_reconstructs_held_volumes_without_refetching_them(
+        crate::pipeline::direct_store::router::DemotionReason::HoldsBudgetExceeded,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn holds_disk_reserve_demotion_reconstructs_held_volumes_without_refetching_them() {
+    room_demotion_reconstructs_held_volumes_without_refetching_them(
+        crate::pipeline::direct_store::router::DemotionReason::HoldsScratchDiskReserve,
+    )
+    .await;
+}
+
+/// A set demoted for room — whichever of its holds limits it ran out of —
+/// keeps every held byte: the held volumes are rebuilt from the holds, none
+/// of their articles is fetched again, and the holds are released once the
+/// sweep has read them.
+async fn room_demotion_reconstructs_held_volumes_without_refetching_them(
+    reason: crate::pipeline::direct_store::router::DemotionReason,
+) {
     let temp = tempfile::tempdir().unwrap();
     let (_, volumes) = fixture();
     let mut pipeline = prepared(&temp, &volumes).await;
@@ -751,13 +780,7 @@ async fn holds_scratch_ceiling_demotion_reconstructs_held_volumes_without_refetc
         "the held volumes must sit partly on scratch"
     );
 
-    pipeline
-        .demote_direct_set(
-            JOB,
-            0,
-            crate::pipeline::direct_store::router::DemotionReason::HoldsScratchCeiling,
-        )
-        .await;
+    pipeline.demote_direct_set(JOB, 0, reason).await;
     settle_direct_post_repair_work(&mut pipeline).await;
 
     let working = pipeline.jobs.get(&JOB).unwrap().working_dir.clone();
@@ -784,29 +807,103 @@ async fn holds_scratch_ceiling_demotion_reconstructs_held_volumes_without_refetc
         0,
         "the preserved scratch is released once the sweep has read it"
     );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().resident_bytes(),
+        0,
+        "the preserved RAM holds are released once the sweep has read them"
+    );
+    assert_eq!(
+        pipeline
+            .direct_store
+            .set(JOB, 0)
+            .unwrap()
+            .router
+            .staged_bytes(),
+        0
+    );
 }
 
 #[tokio::test]
 async fn routing_time_scratch_ceiling_demotion_keeps_every_held_article_but_the_handoff() {
     let temp = tempfile::tempdir().unwrap();
     let (_, volumes) = fixture();
-    let mut pipeline = prepared(&temp, &volumes).await;
-    // Uncontrolled arrivals, as in the pre-admission sequence: the article
-    // whose paging hits the scratch ceiling demotes the set while routing and
-    // is handed to the decode seam.
+    let pipeline = prepared(&temp, &volumes).await;
+    routing_time_room_demotion_keeps_every_held_article_but_the_handoff(
+        pipeline,
+        &volumes,
+        "HoldsScratchCeiling",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn routing_time_disk_reserve_demotion_keeps_every_held_article_but_the_handoff() {
+    use crate::operations::disk::{Capacity, CapacityReader, CapacityReading};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = scaled_pipeline(&temp).await;
+    // A filesystem with room for a few pages of holds above its reserve, and
+    // shared limits that never refuse on their own: the reserve is what the
+    // set runs out of.
+    let reserve: u64 = 1 << 30;
+    let spare: u64 = 16 << 10;
+    let sampled_at = std::time::Instant::now();
+    pipeline.direct_store.set_holds_limits_with_disk_probe(
+        crate::pipeline::direct_store::accountant::HoldsLimits {
+            resident_bytes: u64::MAX,
+            scratch_bytes: u64::MAX,
+            disk_reserve_bytes: reserve,
+        },
+        CapacityReader::from_fn(move || {
+            Capacity::Known(CapacityReading {
+                available_bytes: reserve + spare,
+                total_bytes: u64::MAX,
+                sampled_at,
+                stale: false,
+            })
+        }),
+    );
+    admit_delayed_header_job(&mut pipeline, JOB, "Silver Horizon", &volumes).await;
+    assert!(!pipeline.direct_store.set(JOB, 0).unwrap().is_demoted());
+    routing_time_room_demotion_keeps_every_held_article_but_the_handoff(
+        pipeline,
+        &volumes,
+        "HoldsScratchDiskReserve",
+    )
+    .await;
+}
+
+/// Uncontrolled arrivals behind the delayed header, as in the pre-admission
+/// sequence: the article whose paging runs the set out of room demotes it
+/// while routing and is handed to the decode seam. `reason` is the demotion
+/// the set must show.
+async fn routing_time_room_demotion_keeps_every_held_article_but_the_handoff(
+    mut pipeline: Pipeline,
+    volumes: &[(String, Vec<u8>)],
+    reason: &str,
+) {
     let mut routed: Vec<(u32, u32)> = Vec::new();
     let mut handoff = None;
     for (file, article) in held_arrivals() {
         take_queued_segment(&mut pipeline, JOB, segment(file, article));
-        submit_volume_article(&mut pipeline, JOB, &volumes, file, article).await;
+        submit_volume_article(&mut pipeline, JOB, volumes, file, article).await;
         if pipeline.direct_store.set(JOB, 0).unwrap().is_demoted() {
             handoff = Some((file, article));
             break;
         }
         routed.push((file, article));
     }
-    let (handoff_file, handoff_article) = handoff.expect("the scratch ceiling must be reached");
-    assert!(format!("{:?}", pipeline.direct_store.sets_for(JOB)).contains("HoldsScratchCeiling"));
+    let (handoff_file, handoff_article) = handoff.expect("the set must run out of room");
+    assert!(
+        format!("{:?}", pipeline.direct_store.sets_for(JOB)).contains(reason),
+        "{:?}",
+        pipeline.direct_store.sets_for(JOB)
+    );
+    assert!(
+        handoff_file > 66,
+        "whole held volumes must sit ahead of the handoff"
+    );
     settle_direct_post_repair_work(&mut pipeline).await;
 
     let working = pipeline.jobs.get(&JOB).unwrap().working_dir.clone();
@@ -839,5 +936,75 @@ async fn routing_time_scratch_ceiling_demotion_keeps_every_held_article_but_the_
         pipeline.direct_store.holds_accountant().scratch_bytes(),
         0,
         "the preserved scratch is released once the sweep has read it"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().resident_bytes(),
+        0,
+        "the preserved RAM holds are released once the sweep has read them"
+    );
+    assert_eq!(
+        pipeline
+            .direct_store
+            .set(JOB, 0)
+            .unwrap()
+            .router
+            .staged_bytes(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_refetched_demotion_releases_the_holds_it_never_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = scaled_pipeline(&temp).await;
+    insert_active_job(
+        &mut pipeline,
+        JOB,
+        direct_store_job_spec("Silver Horizon", &volumes),
+    )
+    .await;
+    // Only the second halves of volumes whose fronts never arrived: no
+    // header has been read, nothing has been routed to a member, and the set
+    // holds every byte it was given, some of it paged.
+    let held: Vec<(u32, u32)> = (66..74).map(|file| (file, 1)).collect();
+    for &(file, article) in &held {
+        take_queued_segment(&mut pipeline, JOB, segment(file, article));
+        submit_volume_article(&mut pipeline, JOB, &volumes, file, article).await;
+    }
+    let set = pipeline.direct_store.set(JOB, 0).unwrap();
+    assert!(!set.is_demoted());
+    assert!(set.router.member_partials().is_empty());
+    assert!(pipeline.direct_store.holds_accountant().resident_bytes() > 0);
+    assert!(pipeline.direct_store.holds_accountant().scratch_bytes() > 0);
+
+    // A scratch that failed is not a reason to trust what it held: the set
+    // is refetched whole, and its holds are never read.
+    pipeline
+        .demote_direct_set(
+            JOB,
+            0,
+            crate::pipeline::direct_store::router::DemotionReason::HoldsScratchFailed,
+        )
+        .await;
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    let queued = queued_segments(&mut pipeline, JOB);
+    for arrival in &held {
+        assert!(
+            queued.contains(arrival),
+            "held article {arrival:?} is refetched with its set"
+        );
+    }
+    assert_eq!(pipeline.direct_store.holds_accountant().resident_bytes(), 0);
+    assert_eq!(pipeline.direct_store.holds_accountant().scratch_bytes(), 0);
+    assert_eq!(
+        pipeline
+            .direct_store
+            .set(JOB, 0)
+            .unwrap()
+            .router
+            .staged_bytes(),
+        0
     );
 }

@@ -7,11 +7,20 @@ pub(in crate::pipeline::download) struct DirectStoreAdmission {
     /// Room the set had when the handout began: its holds admission room
     /// with every byte already on its way to it counted.
     room: u64,
+    /// The same room judged by the set's own limit alone.
+    own_room: u64,
     /// What the handout being built has leased of the set so far.
     leased: u64,
     available: u64,
+    /// `own_room` less what the handout has leased.
+    own_available: u64,
     probes: Vec<SegmentId>,
     probe_lease: ProbeLease,
+    /// The article an idle set with a settled layout routes next: the
+    /// lowest queued article of its earliest unfinished volume. Judged by
+    /// the set's own room only, so what other sets hold can slow this set to
+    /// one article at a time but never stop it.
+    frontier: Option<SegmentId>,
 }
 
 /// What leasing one of the set's articles does to its header probes.
@@ -30,6 +39,8 @@ impl DirectStoreAdmission {
         !self.files.contains(&work.segment_id.file_id.file_index)
             || work.byte_estimate as u64 <= self.available
             || self.probes.contains(&work.segment_id)
+            || (self.frontier == Some(work.segment_id)
+                && work.byte_estimate as u64 <= self.own_available)
     }
 
     /// Whether this set could admit *any* queued article of `file_index`,
@@ -38,9 +49,9 @@ impl DirectStoreAdmission {
     /// [`Self::allows`] admits an article of one of the set's files only when
     /// its estimate fits the room left or it is one of the set's probes. When
     /// even the smallest article does not fit, no article of the file fits,
-    /// so only a probe can get through; a probe in this file keeps the answer
-    /// `true`. Probes are matched by file index alone, which can only make
-    /// the answer more permissive than [`Self::allows`].
+    /// so only a probe or the set's frontier can get through; either in this
+    /// file keeps the answer `true`. Both are matched by file index alone,
+    /// which can only make the answer more permissive than [`Self::allows`].
     pub(in crate::pipeline::download) fn may_admit_from_file(
         &self,
         file_index: u32,
@@ -52,6 +63,9 @@ impl DirectStoreAdmission {
                 .probes
                 .iter()
                 .any(|probe| probe.file_id.file_index == file_index)
+            || self
+                .frontier
+                .is_some_and(|frontier| frontier.file_id.file_index == file_index)
     }
 
     /// Charge an article the handout being built has just taken, so the
@@ -67,6 +81,11 @@ impl DirectStoreAdmission {
         // the lease counted as incoming.
         self.leased = self.leased.saturating_add(work.byte_estimate as u64);
         self.available = self.room.saturating_sub(self.leased);
+        self.own_available = self.own_room.saturating_sub(self.leased);
+        // Anything of the set out on a lane makes it busy, and a busy set
+        // waits for that article rather than reaching past the shared room
+        // for another.
+        self.frontier = None;
         match self.probe_lease {
             ProbeLease::CloseAll => self.probes.clear(),
             ProbeLease::CloseFile => self
@@ -128,7 +147,8 @@ impl Pipeline {
                         .active_decodes_by_file
                         .iter()
                         .any(|(file, count)| owns(*file) && *count != 0);
-                let room = set.router.holds_admission_room(incoming);
+                let rooms = set.router.holds_admission_rooms(incoming);
+                let room = rooms.shared;
 
                 // Permit queued articles past the limit to resolve the layout.
                 // Ordinals need not match yEnc offsets: serialized progress
@@ -238,14 +258,52 @@ impl Pipeline {
                         probes
                     }
                 };
+                // The shared room bounds how far holds may grow, not whether
+                // a set moves at all. Other sets' holds — a paused job's, one
+                // waiting on a retried gap — can leave less shared room than
+                // one article, and a settled set has no probe to fall back on,
+                // so an idle one is always given the article it routes next.
+                // Idle is what keeps this from growing holds past the shared
+                // total: one article at a time, each landing before the next
+                // is asked for. With nothing of the set in flight, the lowest
+                // article still queued in the earliest unfinished volume is
+                // the earliest byte the set lacks; while that volume has a
+                // retry pending, the retry is, and the set waits for it.
+                let frontier = (matches!(set.header_probe(), DirectHeaderProbe::Settled)
+                    && !busy
+                    && rooms.shared < rooms.own)
+                    .then(|| {
+                        set.plan()
+                            .volumes
+                            .values()
+                            .copied()
+                            .find(|file| unresolved(file))
+                    })
+                    .flatten()
+                    .filter(|file| {
+                        !self.pending_retries_by_segment.iter().any(|(id, count)| {
+                            id.file_id.job_id == job_id
+                                && id.file_id.file_index == *file
+                                && *count != 0
+                        })
+                    })
+                    .and_then(|file| {
+                        state
+                            .download_queue
+                            .peek_lowest_matching(|work| work.segment_id.file_id.file_index == file)
+                            .map(|work| work.segment_id)
+                    });
                 DirectStoreAdmission {
                     job_id,
                     files,
                     room,
+                    own_room: rooms.own,
                     leased: 0,
                     available: room,
+                    own_available: rooms.own,
                     probes,
                     probe_lease,
+                    frontier,
                 }
             })
             .collect()

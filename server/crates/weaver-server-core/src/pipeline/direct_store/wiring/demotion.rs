@@ -1057,13 +1057,19 @@ impl Pipeline {
         self.refetch_direct_volumes(job_id, &volumes).await;
     }
 
-    /// Deletes a set's partial members, envelope files and holds scratch.
+    /// Deletes a set's partial members, envelope files and holds, RAM and
+    /// scratch.
     ///
     /// A sparse half-written output would masquerade as finished work, and the
-    /// envelopes and the scratch are scratch by construction.
+    /// envelopes and the scratch are scratch by construction. The holds go
+    /// with them rather than with the job: a demoted set routes nothing
+    /// again, and both callers are past the last read of them — the refetch
+    /// never reads them, and a reconstruction calls this only once its sweep
+    /// has finished — so keeping them would only charge every other live set
+    /// for bytes no one will read.
     pub(super) async fn delete_direct_outputs(&mut self, job_id: JobId, set_index: usize) {
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
-            set.router.discard_scratch();
+            set.router.discard_holds();
         }
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
