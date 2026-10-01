@@ -4288,7 +4288,35 @@ impl Pipeline {
     }
 }
 
+/// Every whole-file checksum read, by path, so a test can count how many
+/// times a completed file was read back.
+#[cfg(test)]
+static COMPLETED_FILE_CHECKSUM_READS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+impl Pipeline {
+    /// How many whole-file checksum reads `path` has had in this process.
+    pub(in crate::pipeline) fn completed_file_checksum_reads(path: &std::path::Path) -> usize {
+        COMPLETED_FILE_CHECKSUM_READS
+            .lock()
+            .unwrap()
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileChecksum> {
+    #[cfg(test)]
+    {
+        *COMPLETED_FILE_CHECKSUM_READS
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
     let mut md5 = par2_rs::checksum::FileHashState::new();
