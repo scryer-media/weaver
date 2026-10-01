@@ -3587,9 +3587,22 @@ impl Pipeline {
         self.direct_unpack
             .latched
             .retain(|(latched_job, _), _| *latched_job != job_id);
-        self.direct_unpack
+        // Nothing will consume these now, so their trees go with them. A
+        // failed chase's tree was already retired when it was reaped.
+        let dropped: Vec<(JobId, String)> = self
+            .direct_unpack
             .outcomes
-            .retain(|(outcome_job, _), _| *outcome_job != job_id);
+            .keys()
+            .filter(|(outcome_job, _)| *outcome_job == job_id)
+            .cloned()
+            .collect();
+        for key in dropped {
+            if let Some(outcome) = self.direct_unpack.outcomes.remove(&key)
+                && outcome.result.is_ok()
+            {
+                self.direct_unpack.retire_staging(&key, outcome.staging_dir);
+            }
+        }
         self.direct_unpack.watermark_targets.remove(&job_id);
         self.direct_unpack
             .pending_single_arm

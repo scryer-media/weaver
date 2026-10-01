@@ -1714,6 +1714,9 @@ pub(in crate::pipeline) async fn install_direct_unpack(
         // manifest. Other formats retain their existing installation path.
         let rar_names =
             (policy.is_some() || expected_names.is_some()).then(|| outcome.extracted.clone());
+        // Both installs remove the chase's tree only once every member is in
+        // place, so a failed one leaves it behind for this path to retire.
+        let retired_staging = chase_staging.clone();
         let install = tokio::task::spawn_blocking(move || {
             if let Some(names) = rar_names {
                 crate::pipeline::direct_unpack::rar::install(
@@ -1756,6 +1759,11 @@ pub(in crate::pipeline) async fn install_direct_unpack(
                 "install task panicked; extracting conventionally"
             ),
         }
+        crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
+            job_id,
+            set_name_for_channel,
+            retired_staging,
+        );
     }
 
     None
