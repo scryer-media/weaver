@@ -553,17 +553,7 @@ impl DirectUnpackRuntime {
             if let Some(hold) = hold {
                 let _ = hold.acquire().await;
             }
-            if let Err(error) = tokio::fs::remove_dir_all(&staging_dir).await
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    path = %staging_dir.display(),
-                    error = %error,
-                    "failed to remove direct-unpack staging"
-                );
-            }
+            remove_chase_staging(job_id, &set_name, &staging_dir).await;
         }));
     }
 
@@ -691,6 +681,23 @@ impl Pipeline {
                 ),
             );
         } else {
+            // Whether part one's opening bytes are committed is known in memory,
+            // and this runs on the pipeline task for every part completion until
+            // the set arms. Ask the file only once the answer can be yes. The
+            // floor also keeps sparse out-of-order writes from passing for a
+            // header: a file can be longer than its verified prefix. A single
+            // archive arming off its commits is gated on its floor by its own
+            // caller.
+            let committed = self
+                .direct_unpack_progress_floor(job_id, &paths[0])
+                .unwrap_or(0)
+                .max(
+                    self.direct_unpack_known_part_len(job_id, &paths[0])
+                        .unwrap_or(0),
+                );
+            if committed < SIGNATURE_HEADER_LEN {
+                return;
+            }
             self.arm_direct_unpack_with_paths(job_id, set_name, paths);
         }
     }
@@ -3597,9 +3604,22 @@ impl Pipeline {
         self.direct_unpack
             .latched
             .retain(|(latched_job, _), _| *latched_job != job_id);
-        self.direct_unpack
+        // Nothing will consume these now, so their trees go with them. A
+        // failed chase's tree was already retired when it was reaped.
+        let dropped: Vec<(JobId, String)> = self
+            .direct_unpack
             .outcomes
-            .retain(|(outcome_job, _), _| *outcome_job != job_id);
+            .keys()
+            .filter(|(outcome_job, _)| *outcome_job == job_id)
+            .cloned()
+            .collect();
+        for key in dropped {
+            if let Some(outcome) = self.direct_unpack.outcomes.remove(&key)
+                && outcome.result.is_ok()
+            {
+                self.direct_unpack.retire_staging(&key, outcome.staging_dir);
+            }
+        }
         self.direct_unpack.watermark_targets.remove(&job_id);
         self.direct_unpack
             .pending_single_arm
@@ -3660,10 +3680,67 @@ pub(in crate::pipeline) fn install_chased_members(
     Ok(())
 }
 
+/// Delete a chase's staging tree, and say so if it cannot be deleted.
+///
+/// `tokio::fs` runs the recursive unlink on a blocking thread, so an awaiting
+/// task does not pin a runtime worker for as long as the tree takes to go.
+pub(in crate::pipeline) async fn remove_chase_staging(
+    job_id: JobId,
+    set_name: &str,
+    staging_dir: &std::path::Path,
+) {
+    if let Err(error) = tokio::fs::remove_dir_all(staging_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            job_id = job_id.0,
+            set_name,
+            path = %staging_dir.display(),
+            error = %error,
+            "failed to remove direct-unpack staging"
+        );
+    }
+}
+
+/// Delete a chase's staging tree on a task of its own, for a caller that
+/// has nothing more to do with it and should not wait for it to go.
+pub(in crate::pipeline) fn spawn_chase_staging_removal(
+    job_id: JobId,
+    set_name: &str,
+    staging_dir: PathBuf,
+) {
+    let set_name = set_name.to_string();
+    tokio::spawn(async move {
+        remove_chase_staging(job_id, &set_name, &staging_dir).await;
+    });
+}
+
+/// Every path [`read_signature_header`] was asked to open, so a test can
+/// tell whether arming touched a part's file.
+#[cfg(test)]
+static SIGNATURE_HEADER_READS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// How many times arming has opened `path` for its signature header.
+#[cfg(test)]
+pub(in crate::pipeline) fn signature_header_reads_of(path: &std::path::Path) -> usize {
+    SIGNATURE_HEADER_READS
+        .lock()
+        .expect("signature header read log poisoned")
+        .iter()
+        .filter(|read| read.as_path() == path)
+        .count()
+}
+
 /// Read the 32-byte signature header, or `Ok(None)` if the file is still
 /// shorter than that.
 fn read_signature_header(path: &std::path::Path) -> std::io::Result<Option<[u8; 32]>> {
     use std::io::Read;
+
+    #[cfg(test)]
+    SIGNATURE_HEADER_READS
+        .lock()
+        .expect("signature header read log poisoned")
+        .push(path.to_path_buf());
 
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,

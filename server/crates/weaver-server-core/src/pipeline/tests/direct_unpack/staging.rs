@@ -252,3 +252,125 @@ async fn reaping_an_aborted_chase_does_not_wait_for_its_staging_to_go() {
 
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
+
+/// Forgetting a job — a reprocess, a nested rebuild — drops its finished
+/// chases, and their trees go with them rather than waiting for the sweep.
+#[tokio::test]
+async fn forgetting_a_job_retires_its_finished_chases_staging() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let hold = hold_staging_cleanups(&mut pipeline);
+    let job_id = JobId(44740);
+    let set_name = "generated_split_store_plain.7z";
+
+    chase_a_complete_split_set(&mut pipeline, job_id, set_name).await;
+    let staging = pipeline.direct_unpack_staging_dir(job_id, set_name);
+    assert!(
+        pipeline
+            .direct_unpack
+            .outcome(job_id, set_name)
+            .is_some_and(|outcome| outcome.result.is_ok())
+    );
+    assert!(staging.is_dir());
+
+    pipeline.direct_unpack_forget_job(job_id);
+    assert!(pipeline.direct_unpack.outcome(job_id, set_name).is_none());
+    assert!(
+        staging.is_dir(),
+        "the deletion is not done on the pipeline task"
+    );
+
+    hold.add_permits(1);
+    pipeline.settle_direct_unpack_staging_cleanups().await;
+    assert!(!staging.exists());
+}
+
+/// An install that fails leaves the chase's tree behind — both installs only
+/// remove it once every member is in place — so consumption retires it before
+/// falling back to conventional extraction.
+#[tokio::test]
+async fn a_failed_install_retires_the_chases_staging() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(44750);
+    let set_name = "generated_split_store_plain.7z";
+
+    chase_a_complete_split_set(&mut pipeline, job_id, set_name).await;
+    let staging = pipeline.direct_unpack_staging_dir(job_id, set_name);
+    let member = pipeline
+        .direct_unpack
+        .outcome(job_id, set_name)
+        .and_then(|outcome| outcome.result.as_ref().ok())
+        .map(|members| members.extracted[0].clone())
+        .expect("a finished chase");
+    assert!(staging.join(&member).is_file());
+
+    // A non-empty directory where the member has to land: neither a rename
+    // nor a copy can put a file there.
+    let blocker = pipeline.extraction_staging_dir(job_id).join(&member);
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::write(blocker.join("occupied.bin"), b"in the way").unwrap();
+
+    pipeline.extract_7z_set(job_id, set_name).await.unwrap();
+    let _ = next_extraction_done(&mut pipeline).await;
+    assert_eq!(pipeline.direct_unpack.counters().consumed, 1);
+    assert!(
+        blocker.join("occupied.bin").is_file(),
+        "the install could not have placed the member"
+    );
+
+    // The deletion is detached from consumption; wait for this tree to go.
+    yield_until(|| !staging.exists()).await;
+}
+
+/// A later part's completion does not open part one for its signature
+/// header while part one has fewer than 32 committed bytes: the pipeline
+/// task already knows the answer would be "not yet". Bytes already sitting in
+/// the file do not count until they are committed.
+#[tokio::test]
+async fn arming_does_not_open_part_one_before_its_header_is_committed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(44760);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    assert!(files.len() > 2, "the fixture needs two later parts");
+    let spec = rar_job_spec("Amber Lantern Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    let part_one = working_dir.join(&files[0].0);
+    std::fs::write(&part_one, &files[0].1[..64]).unwrap();
+
+    write_and_complete_file(&mut pipeline, job_id, 1, &files[1].0, &files[1].1).await;
+    assert_eq!(
+        crate::pipeline::direct_unpack::wiring::signature_header_reads_of(&part_one),
+        0,
+        "nothing is committed on part one, so its file is not opened"
+    );
+    assert!(!pipeline.direct_unpack.is_armed(job_id, set_name));
+    assert_eq!(
+        pipeline.direct_unpack.latched_reason(job_id, set_name),
+        None
+    );
+
+    // Once the header is committed the next completion reads it and arms.
+    pipeline.pending_file_progress.insert(
+        NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        64,
+    );
+    write_and_complete_file(&mut pipeline, job_id, 2, &files[2].0, &files[2].1).await;
+    assert_eq!(
+        crate::pipeline::direct_unpack::wiring::signature_header_reads_of(&part_one),
+        1
+    );
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
