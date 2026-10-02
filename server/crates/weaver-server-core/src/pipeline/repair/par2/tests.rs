@@ -6,6 +6,8 @@ use super::{
 use crate::{JobId, JobStatus};
 use std::time::{Duration, Instant};
 
+mod schedules;
+
 #[test]
 fn par2_scan_budget_is_shared_across_metadata_carriers() {
     let temp = tempfile::tempdir().unwrap();

@@ -2572,6 +2572,17 @@ impl std::fmt::Debug for DirectSetRouter {
     }
 }
 
+/// What a set may still admit, by the two limits its holds answer to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HoldsAdmissionRooms {
+    /// Left under the set's own admission limit.
+    pub(crate) own: u64,
+    /// Left under both its own limit and what the process-wide accountant can
+    /// still honour once every other set's holds are counted; never above
+    /// `own`.
+    pub(crate) shared: u64,
+}
+
 impl Drop for DirectSetRouter {
     /// A set's bytes go with it. The accountant is charged with live holds,
     /// and a router that is dropped — its job removed, its set cleared — has
@@ -3148,8 +3159,22 @@ impl DirectSetRouter {
         self.scratch.bytes()
     }
 
-    /// Closes and deletes the scratch file. Idempotent; called at finalization
-    /// and demotion.
+    /// Drops every staged byte, RAM and scratch alike, closes and deletes the
+    /// scratch file, and publishes the set's charge as zero. Idempotent.
+    ///
+    /// For a set whose routed output is being deleted: nothing will route
+    /// through its staging again, so whatever it still holds is RAM and
+    /// shared admission room taken from every other live set until the job
+    /// goes. A reader that still needs the held bytes holds its own
+    /// references to them and pins the scratch image, so dropping the
+    /// router's copies never takes bytes out from under it.
+    pub(crate) fn discard_holds(&mut self) {
+        self.staging.clear();
+        self.discard_scratch();
+    }
+
+    /// Closes and deletes the scratch file. Idempotent; called at
+    /// finalization, and through [`Self::discard_holds`] at demotion.
     pub(crate) fn discard_scratch(&mut self) {
         self.scratch.discard();
         self.publish_holds();
@@ -3349,8 +3374,7 @@ impl DirectSetRouter {
         // images exist. A refusal is a demotion, as it is for a spill.
         if self.scratch.is_pinned() {
             self.publish_holds();
-            self.accountant
-                .admit_scratch(live_bytes, &self.plan.working_dir)?;
+            self.accountant.admit_scratch(live_bytes)?;
         }
         let ranges: Vec<(u64, u64)> = extents
             .iter()
@@ -3425,8 +3449,7 @@ impl DirectSetRouter {
     /// the disk reserve — then appended to this set's own scratch, under its
     /// own ceiling. Published either way.
     fn spill_to_scratch(&mut self, bytes: &[u8]) -> Result<u64, DemotionReason> {
-        self.accountant
-            .admit_scratch(bytes.len() as u64, &self.plan.working_dir)?;
+        self.accountant.admit_scratch(bytes.len() as u64)?;
         let appended = self.scratch.append(bytes);
         self.publish_holds();
         appended
@@ -3451,6 +3474,31 @@ impl DirectSetRouter {
     pub(crate) fn holds_admission_limit(&self) -> u64 {
         let capacity = self.holds_budget.saturating_add(self.scratch.ceiling);
         capacity.saturating_sub(capacity / 4)
+    }
+
+    /// The shared half of [`Self::holds_admission_rooms`].
+    #[cfg(test)]
+    pub(crate) fn holds_admission_room(&self, incoming: u64) -> u64 {
+        self.holds_admission_rooms(incoming).shared
+    }
+
+    /// Bytes this set may still admit with `incoming` already on its way:
+    /// what is left under its own [`Self::holds_admission_limit`], and that
+    /// further capped by what the process-wide accountant can still honour
+    /// once every other set's holds are counted. Without the second cap, sets
+    /// that each stay inside their own limit can together page past the
+    /// shared scratch total and demote. A set alone on a host whose shared
+    /// limits exceed its own admits exactly what its own limit allows.
+    pub(crate) fn holds_admission_rooms(&self, incoming: u64) -> HoldsAdmissionRooms {
+        let committed = self.staged_bytes().saturating_add(incoming);
+        let own = self.holds_admission_limit().saturating_sub(committed);
+        let shared = self
+            .accountant
+            .admission_room(&self.charge, self.holds_budget, committed);
+        HoldsAdmissionRooms {
+            own,
+            shared: own.min(shared),
+        }
     }
 
     /// An incomplete header walk can still release retained bytes, including

@@ -466,6 +466,17 @@ impl Pipeline {
         {
             return;
         }
+        // Every article recorded and a placement still out: a set's trailing
+        // region is writing. Its set is byte-complete but neither finalized
+        // nor a conventional archive — no volume is on disk to extract — so it
+        // is the same shape as the tickets above. The landing finalizes the
+        // set, and its lane draining queues this check again. While files
+        // are still short the verdicts below ask the download pipeline,
+        // which counts the placement, so mid-download checks are left to run.
+        if !has_incomplete_data_files && self.has_direct_placements(job_id) {
+            self.completion_checks_awaiting_placements.insert(job_id);
+            return;
+        }
 
         if self.check_par3_completion(job_id).await {
             return;

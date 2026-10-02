@@ -306,7 +306,7 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run Rust tests
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        run: cargo nextest run --workspace --locked --no-fail-fast -E 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_))'
       - name: Build the archive e2e binary
         run: cargo build --locked -p weaver
       - name: Prove direct unpack and PAR2 recovery for every sequential format
@@ -345,6 +345,117 @@ jobs:
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.rust-test-sccache-restore.outputs.cache-primary-key }}
+
+  archive-extraction-matrix-build:
+    name: archive-extraction-matrix-build-linux-x86_64
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || needs.changes.outputs.rust == 'true') && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
+    needs: [changes, verify-release-tag]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Hydrate Rust test fixtures
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+      - name: Restore sccache directory
+        id: matrix-build-sccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-v1-weaver-rust-test-build-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-weaver-rust-test-build-
+            gha-sccache-v1-weaver-rust-test-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+        with:
+          tool: nextest
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Archive compiled archive extraction matrix tests
+        run: cargo nextest archive --locked -p weaver-server-core --lib --archive-file target/archive-extraction-matrix.tar.zst
+      - name: Upload compiled archive extraction matrix tests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: archive-extraction-matrix-linux-x86_64
+          path: target/archive-extraction-matrix.tar.zst
+          compression-level: 0
+          retention-days: 1
+      - name: Show sccache stats
+        if: always()
+        run: |
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats
+          fi
+      - name: Save sccache directory
+        if: always() && steps.matrix-build-sccache-restore.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.matrix-build-sccache-restore.outputs.cache-primary-key }}
+
+  archive-extraction-matrix:
+    name: archive-extraction-matrix-linux-x86_64-${{ matrix.partition }}
+    if: ${{ !cancelled() && needs.archive-extraction-matrix-build.result == 'success' }}
+    needs: [archive-extraction-matrix-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 32
+      matrix:
+        partition: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+        with:
+          tool: nextest
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: archive-extraction-matrix-linux-x86_64
+          path: target
+      - name: Run assigned archive extraction matrix partition
+        run: >-
+          cargo nextest run
+          --profile archive-matrix
+          --run-ignored all
+          --archive-file target/archive-extraction-matrix.tar.zst
+          --workspace-remap .
+          --partition count:${{ matrix.partition }}/32
+          --no-fail-fast
 
   rust-clippy-windows:
     name: rust-clippy-windows-x86_64
@@ -471,7 +582,11 @@ jobs:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
       - name: Run Rust tests
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        run: >-
+          cargo nextest run --workspace --locked --no-fail-fast
+          -E 'not (test(archive_schedules::) | test(sevenz_store::schedules::) |
+          test(par2::tests::schedules::) | test(direct_store::tests::par2_schedules::) |
+          test(par2_completion::schedules::))'
 
   rust-test-arm:
     name: rust-test-arm-yenc
@@ -2176,6 +2291,7 @@ jobs:
         needs.rust-clippy.result == 'success' &&
         needs.rust-audit.result == 'success' &&
         needs.rust-test.result == 'success' &&
+        needs.archive-extraction-matrix.result == 'success' &&
         needs.rust-test-arm.result == 'success' &&
         needs.rust-test-sde.result == 'success' &&
         needs.rust-yenc-simd-targets.result == 'success' &&
@@ -2189,6 +2305,7 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test
+      - archive-extraction-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
@@ -2257,6 +2374,7 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test
+      - archive-extraction-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
@@ -2421,6 +2539,7 @@ jobs:
       - rust-clippy-windows
       - rust-audit
       - rust-test
+      - archive-extraction-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-test-windows

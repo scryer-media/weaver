@@ -101,6 +101,16 @@ fn direct_partial(temp_dir: &TempDir, job_id: JobId, member_name: &str) -> PathB
     payload_root(temp_dir, job_id).join(format!("{member_name}.f0.direct.partial"))
 }
 
+/// Waits until every unlink queued for a file under `root` has landed.
+///
+/// A demotion deletes its routed outputs behind their cached write handles, on
+/// the closer thread, and returns without waiting. A close of the root's
+/// handles is acknowledged only after every removal queued ahead of it is
+/// done, so this is the event an "it was deleted" assertion depends on.
+async fn settle_direct_output_removals(root: &std::path::Path) {
+    crate::pipeline::close_cached_write_handles_under(root).await;
+}
+
 /// A member sitting **unpublished** in the job's staging root.
 ///
 /// The third place a finished member can legitimately be, and the one this
@@ -659,6 +669,7 @@ async fn run_direct_store_routing_only(
     // A set with tolerated members finalizes through a detached extraction
     // ticket; the shape is only final once that ticket has been taken.
     settle_direct_post_repair_work(&mut pipeline).await;
+    settle_direct_output_removals(temp_dir.path()).await;
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     (shape, working_dir)
 }
@@ -1511,6 +1522,16 @@ fn blake2_only_store_set(
     payload: &[u8],
     volume_count: usize,
 ) -> Vec<(String, Vec<u8>)> {
+    blake2_store_set(member_name, payload, volume_count, [0x42; 32], false)
+}
+
+fn blake2_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    digest: [u8; 32],
+    packed_blake2: bool,
+) -> Vec<(String, Vec<u8>)> {
     let chunk = payload.len().div_ceil(volume_count);
     (0..volume_count)
         .map(|volume| {
@@ -1535,7 +1556,9 @@ fn blake2_only_store_set(
                 (!is_first).then_some(volume as u64),
             ));
             let extra = if is_last {
-                build_test_rar_blake2_extra([0x42; 32])
+                build_test_rar_blake2_extra(digest)
+            } else if packed_blake2 {
+                build_test_rar_blake2_extra(unrar_rs::crypto::blake2sp_hash(part))
             } else {
                 Vec::new()
             };
@@ -1544,7 +1567,7 @@ fn blake2_only_store_set(
                 split_flags,
                 part.len() as u64,
                 payload.len() as u64,
-                (!is_last).then(|| checksum::crc32(part)),
+                (!is_last && !packed_blake2).then(|| checksum::crc32(part)),
                 &extra,
             ));
             bytes.extend_from_slice(part);
@@ -2798,6 +2821,20 @@ async fn settle_par3_work(pipeline: &mut Pipeline, job_id: JobId) {
         let done = pipeline.repair_work_done_rx.recv().await.unwrap();
         pipeline.handle_repair_work_done(done).await;
     }
+}
+
+/// The lost cohort's size in the job's retained PAR3 view, `None` while the
+/// runtime has no settled view to offer.
+fn par3_lost_blocks(pipeline: &Pipeline, job_id: JobId) -> Option<u64> {
+    let runtime = pipeline.par3_runtime.as_ref()?;
+    let mut views = runtime.assessments(job_id).peekable();
+    views.peek()?;
+    Some(
+        views
+            .flat_map(|(_, view)| view.requirements.iter())
+            .map(|requirement| requirement.lost)
+            .sum(),
+    )
 }
 
 /// What a direct set protected by PAR3 reached.

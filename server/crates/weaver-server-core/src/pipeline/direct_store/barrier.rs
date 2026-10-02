@@ -350,6 +350,10 @@ pub(crate) struct CoverageBarrier {
     /// The crypt rows the next checkpoint carries, by member index. Empty for
     /// every set with no encrypted member, which is every unencrypted set.
     member_crypt: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
+    /// The identity binding the next checkpoint carries: the plan an
+    /// identity-admitted set was admitted with, so restart can rebuild it.
+    /// `None` for a set its file names admitted.
+    identity: Option<super::snapshot::IdentityBinding>,
     /// A [`PreparedBarrier`] is out, its sync running elsewhere. While it is,
     /// no automatic trigger is due and no second one can be prepared: two
     /// barriers in flight would both persist generation `n + 1`, and the one
@@ -406,6 +410,7 @@ impl CoverageBarrier {
             consecutive_failures: 0,
             cooldown_until: None,
             member_crypt: BTreeMap::new(),
+            identity: None,
             in_flight: false,
             row_epoch: 0,
         }
@@ -422,6 +427,16 @@ impl CoverageBarrier {
         rows: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
     ) {
         self.member_crypt = rows;
+    }
+
+    /// Hands the barrier the identity binding its next checkpoint must carry,
+    /// pushed immediately before every run beside the crypt rows so a
+    /// checkpoint always names the plan its coverage was produced against.
+    pub(crate) fn set_identity_binding(
+        &mut self,
+        identity: Option<super::snapshot::IdentityBinding>,
+    ) {
+        self.identity = identity;
     }
 
     /// Points the next snapshot at the plan the set is **currently** routing
@@ -505,6 +520,7 @@ impl CoverageBarrier {
     ) -> Self {
         let mut barrier = Self::new(job_id, set_name, snapshot.plan_digest);
         barrier.committed_generation = snapshot.generation;
+        barrier.identity = snapshot.identity.clone();
         for entry in &snapshot.floors {
             let volume = barrier.volumes.entry(entry.volume_index).or_default();
             volume.file_index = entry.file_index;
@@ -822,6 +838,7 @@ impl CoverageBarrier {
                         .is_some_and(|decoded_len| *floor >= decoded_len),
                 })
                 .collect(),
+            identity: self.identity.clone(),
         }
     }
 

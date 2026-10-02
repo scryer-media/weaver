@@ -23,7 +23,11 @@ import {
 import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { useTranslate } from "@/lib/context/translate-context";
-import type { DownloadBlockState } from "@/lib/context/live-data-context";
+import {
+  LiveJobDownloadRatesProvider,
+  type DownloadBlockState,
+} from "@/lib/context/live-data-context";
+import type { JobDownloadRate } from "@/lib/live-job-download-rates";
 import { formatRate } from "./format";
 import { withLiveConnections, type ProviderConnections } from "./provider-connections";
 import { useHistoryLiveRefresh } from "./use-history-live-refresh";
@@ -86,6 +90,8 @@ interface LiveMetricsSnapshot {
   globalState: { isPaused: boolean; speedLimitBytesPerSec: number; downloadBlock: DownloadBlockState };
   providerHoldoffs?: ProviderHoldoff[];
   providerConnections?: ProviderConnections[];
+  /** Per-job download rates on the same tick as the speed; only the push carries them. */
+  jobDownloadRates?: JobDownloadRate[];
 }
 
 /** A category as it is configured, not as the queue happens to use it. */
@@ -320,7 +326,13 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     ],
   );
 
-  return <NextDataContext.Provider value={value}>{children}</NextDataContext.Provider>;
+  return (
+    <NextDataContext.Provider value={value}>
+      <LiveJobDownloadRatesProvider rates={snapshot?.jobDownloadRates}>
+        {children}
+      </LiveJobDownloadRatesProvider>
+    </NextDataContext.Provider>
+  );
 }
 
 /** How long the tab title holds one speed before it takes the next. */

@@ -828,8 +828,18 @@ impl DirectSet {
         // minutes later, and every row written after that was refused at restart
         // for a set in perfect health. Re-pushed here, where every registration
         // already passes, and only when the router says the facts moved.
+        //
+        // Or when the volume map grew. The digest binds the mapping too, and an
+        // identity-admitted set's mapping grows file by file as later volumes
+        // bind — without a single member fact moving. A digest stamped at the
+        // first binding would label every later row with a one-volume plan the
+        // set stopped being, and the restart that rebuilds the plan from the
+        // row's own binding would refuse it. A name-admitted set's map is whole
+        // from admission, so for it this only recomputes the same value.
         let revision = self.router.member_facts_revision();
-        if self.digest_revision != Some(revision) {
+        if self.digest_revision != Some(revision)
+            || self.registered_volumes != self.router.plan().volumes.len()
+        {
             let digest = self.plan_digest();
             if let Some(barrier) = self.barrier.as_mut() {
                 barrier.set_plan_digest(digest);
@@ -1044,8 +1054,10 @@ impl DirectSet {
         // the retained tail padding and the cipher checkpoints are both produced
         // by the same routing call that produced the bytes being claimed.
         let crypt = self.router.member_crypt_snapshots();
+        let identity = self.router.plan().identity_binding();
         let barrier = self.barrier.as_mut()?;
         barrier.set_member_crypt(crypt);
+        barrier.set_identity_binding(identity);
         Some(barrier.barrier(trigger, now, drain, sync, persist))
     }
 
@@ -1068,8 +1080,10 @@ impl DirectSet {
             self.ensure_registered();
         }
         let crypt = self.router.member_crypt_snapshots();
+        let identity = self.router.plan().identity_binding();
         let barrier = self.barrier.as_mut()?;
         barrier.set_member_crypt(crypt);
+        barrier.set_identity_binding(identity);
         Some(barrier.prepare(trigger, now, drain))
     }
 
@@ -1175,10 +1189,9 @@ impl DirectSet {
     /// staging ([`super::router::DirectSetRouter::held_runs`]), so a repair
     /// sweep that only claimed the placed bytes would leave a hole exactly
     /// where an encrypted member's edge block waits for a lost article, and
-    /// refuse a volume whose every posted byte is in hand. For the in-place
-    /// repair only: the demotion sweep hands the set to the conventional path,
-    /// which owns those holds as articles to re-place, and must not
-    /// materialize them.
+    /// refuse a volume whose every posted byte is in hand. The demotion sweep
+    /// reads it only for a set demoted for room, with any handed-off article's
+    /// range cut out first: that article belongs to the conventional path.
     pub(crate) fn volume_coverage_with_holds(&self, volume_index: u32) -> ByteRanges {
         let mut coverage = self.volume_coverage(volume_index);
         for (start, end) in self.router.held_ranges(volume_index) {

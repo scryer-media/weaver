@@ -1,5 +1,4 @@
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::jobs::ids::{MessageId, NzbFileId, SegmentId};
 
@@ -48,9 +47,9 @@ pub struct DownloadWork {
 ///    after a whole file's worth of articles;
 /// 3. ordinary payload.
 ///
-/// Classes 0 and 1 live in the completion-critical heap and 2 and 3 in the
+/// Classes 0 and 1 live in the completion-critical map and 2 and 3 in the
 /// ordinary one, so the split is what `pop` reads; the rank orders the classes
-/// inside each heap ahead of the per-file priority.
+/// inside each map ahead of the per-file priority.
 const COMPLETION_RANK_CRITICAL: u8 = 0;
 const COMPLETION_RANK_PROMOTED_RECOVERY: u8 = 1;
 const COMPLETION_RANK_FIRST_ARTICLE: u8 = 2;
@@ -70,9 +69,11 @@ fn completion_rank_for(work: &DownloadWork, first_article: bool) -> u8 {
     }
 }
 
-/// Wrapper that implements ordering for the priority queue.
-/// Lower priority number = higher scheduling priority (downloaded first).
-struct PrioritizedWork {
+/// The dispatch key of one queued item: the queue serves keys in ascending
+/// order. Lower priority number = higher scheduling priority (downloaded
+/// first). The sequence is unique within a queue, so no two items share a key.
+#[derive(Clone, Copy)]
+struct QueueKey {
     /// Dispatch class: see [`completion_rank_for`].
     completion_rank: u8,
     priority: u32,
@@ -80,27 +81,23 @@ struct PrioritizedWork {
     rank: Option<u32>,
     /// Tie-breaker: insertion order (lower = earlier).
     sequence: u64,
-    work: DownloadWork,
 }
 
-impl PartialEq for PrioritizedWork {
+impl PartialEq for QueueKey {
     fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority
-            && self.completion_rank == other.completion_rank
-            && self.rank == other.rank
-            && self.sequence == other.sequence
+        self.cmp(other).is_eq()
     }
 }
 
-impl Eq for PrioritizedWork {}
+impl Eq for QueueKey {}
 
-impl PartialOrd for PrioritizedWork {
+impl PartialOrd for QueueKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for PrioritizedWork {
+impl Ord for QueueKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let self_rank = self.rank.unwrap_or(u32::MAX);
         let other_rank = other.rank.unwrap_or(u32::MAX);
@@ -112,10 +109,18 @@ impl Ord for PrioritizedWork {
     }
 }
 
+/// One dispatch class, served in ascending key order.
+///
+/// An ordered map rather than a heap so that a matching read can walk the
+/// class in dispatch order and stop at the first hit, and a removal takes out
+/// only the matched entry: skipping an ineligible head costs a read, not a
+/// pop and re-push of everything ahead of the match.
+type ClassMap = BTreeMap<QueueKey, DownloadWork>;
+
 /// Priority queue for download work items.
 pub struct DownloadQueue {
-    completion_critical_heap: BinaryHeap<Reverse<PrioritizedWork>>,
-    ordinary_heap: BinaryHeap<Reverse<PrioritizedWork>>,
+    completion_critical_work: ClassMap,
+    ordinary_work: ClassMap,
     next_sequence: u64,
     /// Queued items carrying failure exclusions — escalated work that may
     /// need a backfill lane. Maintained on push/pop; recounted on the rare
@@ -126,15 +131,19 @@ pub struct DownloadQueue {
     recovery_work: usize,
     /// Queued items per file, maintained on every push and removal. The RAR
     /// unlock planner asks "does this file still have queued work" once per
-    /// volume; answering that by scanning the heaps made every replan cost
+    /// volume; answering that by scanning the queue made every replan cost
     /// files times queued segments.
     queued_by_file: HashMap<NzbFileId, u32>,
+    /// Queued byte estimates per file, as estimate -> how many queued items
+    /// carry it, maintained beside `queued_by_file`. Lets a caller ask for a
+    /// file's smallest queued article without reading the file's articles.
+    queued_estimates_by_file: HashMap<NzbFileId, BTreeMap<u32, u32>>,
     /// The file priority plan currently in force: `(priority, rank)` per
     /// file, applied to every push of an unprotected item and re-applied to
-    /// the heaps only when the plan itself changes.
+    /// the queue only when the plan itself changes.
     ///
     /// A requeued retry used to lose its rank (a fresh push carries none) and
-    /// force a full heap rebuild to get it back. With the plan held here a
+    /// force a full rebuild to get it back. With the plan held here a
     /// push lands at the right key immediately, so a retry never triggers a
     /// rebuild and an unchanged plan is a no-op.
     file_priority_plan: HashMap<NzbFileId, (u32, Option<u32>)>,
@@ -154,12 +163,13 @@ pub struct DownloadQueue {
 impl DownloadQueue {
     pub fn new() -> Self {
         Self {
-            completion_critical_heap: BinaryHeap::new(),
-            ordinary_heap: BinaryHeap::new(),
+            completion_critical_work: ClassMap::new(),
+            ordinary_work: ClassMap::new(),
             next_sequence: 0,
             excluded_work: 0,
             recovery_work: 0,
             queued_by_file: HashMap::new(),
+            queued_estimates_by_file: HashMap::new(),
             file_priority_plan: HashMap::new(),
             file_priority_plan_protected: 0,
             file_priority_plan_stale: false,
@@ -208,24 +218,25 @@ impl DownloadQueue {
             .queued_by_file
             .entry(work.segment_id.file_id)
             .or_default() += 1;
+        *self
+            .queued_estimates_by_file
+            .entry(work.segment_id.file_id)
+            .or_default()
+            .entry(work.byte_estimate)
+            .or_default() += 1;
         let completion_critical = work.completion_critical;
         let first_article = self.first_articles.contains(&work.segment_id);
-        let item = Reverse(PrioritizedWork {
+        let key = QueueKey {
             completion_rank: completion_rank_for(&work, first_article),
             priority,
             rank,
             sequence,
-            work,
-        });
-        if completion_critical {
-            self.completion_critical_heap.push(item);
-        } else {
-            self.ordinary_heap.push(item);
-        }
+        };
+        self.class_mut(completion_critical).insert(key, work);
     }
 
     pub fn pop(&mut self) -> Option<DownloadWork> {
-        if self.completion_critical_heap.is_empty() {
+        if self.completion_critical_work.is_empty() {
             self.pop_from_class(false)
         } else {
             self.pop_from_class(true)
@@ -233,12 +244,10 @@ impl DownloadQueue {
     }
 
     fn pop_from_class(&mut self, completion_critical: bool) -> Option<DownloadWork> {
-        let work = if completion_critical {
-            self.completion_critical_heap.pop()
-        } else {
-            self.ordinary_heap.pop()
-        }
-        .map(|Reverse(pw)| pw.work);
+        let work = self
+            .class_mut(completion_critical)
+            .pop_first()
+            .map(|(_, work)| work);
         if let Some(work) = &work {
             self.note_removed(work);
         }
@@ -257,13 +266,14 @@ impl DownloadQueue {
         if self.excluded_work == 0 {
             return;
         }
-        for heap in [&mut self.completion_critical_heap, &mut self.ordinary_heap] {
-            let items: Vec<_> = heap.drain().collect();
-            for Reverse(mut pw) in items {
-                pw.work.exclude_servers.clear();
-                pw.work.avoid_server = None;
-                heap.push(Reverse(pw));
-            }
+        // Neither field is part of the key, so the entries are edited in place.
+        for work in self
+            .completion_critical_work
+            .values_mut()
+            .chain(self.ordinary_work.values_mut())
+        {
+            work.exclude_servers.clear();
+            work.avoid_server = None;
         }
         self.excluded_work = 0;
     }
@@ -271,16 +281,21 @@ impl DownloadQueue {
     fn recount_derived_counts(&mut self) {
         self.excluded_work = self
             .iter()
-            .filter(|item| !item.0.work.exclude_servers.is_empty())
+            .filter(|work| !work.exclude_servers.is_empty())
             .count();
-        self.recovery_work = self.iter().filter(|item| item.0.work.is_recovery).count();
+        self.recovery_work = self.iter().filter(|work| work.is_recovery).count();
         let mut queued_by_file = HashMap::new();
-        for item in self.iter() {
-            *queued_by_file
-                .entry(item.0.work.segment_id.file_id)
+        let mut queued_estimates_by_file: HashMap<NzbFileId, BTreeMap<u32, u32>> = HashMap::new();
+        for work in self.iter() {
+            *queued_by_file.entry(work.segment_id.file_id).or_default() += 1;
+            *queued_estimates_by_file
+                .entry(work.segment_id.file_id)
+                .or_default()
+                .entry(work.byte_estimate)
                 .or_default() += 1;
         }
         self.queued_by_file = queued_by_file;
+        self.queued_estimates_by_file = queued_estimates_by_file;
     }
 
     /// Queued items for one file, in O(1).
@@ -288,20 +303,31 @@ impl DownloadQueue {
         self.queued_by_file.get(&file_id).copied().unwrap_or(0)
     }
 
-    fn iter(&self) -> impl Iterator<Item = &Reverse<PrioritizedWork>> {
-        self.completion_critical_heap
-            .iter()
-            .chain(self.ordinary_heap.iter())
+    /// The smallest `byte_estimate` among one file's queued items, in
+    /// O(log n); `None` when the file has nothing queued.
+    pub fn min_queued_byte_estimate_for_file(&self, file_id: NzbFileId) -> Option<u32> {
+        self.queued_estimates_by_file
+            .get(&file_id)
+            .and_then(|estimates| estimates.first_key_value())
+            .map(|(estimate, _)| *estimate)
+    }
+
+    /// Every queued item, completion-critical class first, each class in
+    /// dispatch order.
+    fn iter(&self) -> impl Iterator<Item = &DownloadWork> {
+        self.completion_critical_work
+            .values()
+            .chain(self.ordinary_work.values())
     }
 
     pub fn pop_next_matching(
         &mut self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<DownloadWork> {
-        let completion_critical = !self.completion_critical_heap.is_empty();
-        self.heap_for_class(completion_critical)
-            .peek()
-            .is_some_and(|Reverse(pw)| matches(&pw.work))
+        let completion_critical = !self.completion_critical_work.is_empty();
+        self.class(completion_critical)
+            .first_key_value()
+            .is_some_and(|(_, work)| matches(work))
             .then(|| self.pop_from_class(completion_critical))?
     }
 
@@ -310,27 +336,31 @@ impl DownloadQueue {
         completion_critical: bool,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<DownloadWork> {
-        self.heap_for_class(completion_critical)
-            .peek()
-            .is_some_and(|Reverse(pw)| matches(&pw.work))
+        self.class(completion_critical)
+            .first_key_value()
+            .is_some_and(|(_, work)| matches(work))
             .then(|| self.pop_from_class(completion_critical))?
     }
 
     /// Removes the highest-priority item matching `matches`, even when another
-    /// work class currently owns the heap head. This intentionally takes the
-    /// slower path and is reserved for class-constrained completion dispatch;
-    /// ordinary dispatch continues to use the O(log n) heap-head path above.
+    /// work class currently owns the head. The classes are walked in dispatch
+    /// order until the first match, so the cost is O(log n) plus one predicate
+    /// call per item skipped ahead of the match; the skipped items are only
+    /// read, never moved. With an eligible head it is the same O(log n) as
+    /// [`Self::pop`].
+    /// Every dispatch takes this path; the head-only paths above are not
+    /// used by dispatch.
     pub fn pop_first_matching(
         &mut self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<DownloadWork> {
         if let Some(work) =
-            Self::remove_first_matching_from_heap(&mut self.completion_critical_heap, &mut matches)
+            Self::remove_first_matching_from_class(&mut self.completion_critical_work, &mut matches)
         {
             self.note_removed(&work);
             return Some(work);
         }
-        let work = Self::remove_first_matching_from_heap(&mut self.ordinary_heap, &mut matches)?;
+        let work = Self::remove_first_matching_from_class(&mut self.ordinary_work, &mut matches)?;
         self.note_removed(&work);
         Some(work)
     }
@@ -340,30 +370,22 @@ impl DownloadQueue {
         completion_critical: bool,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<DownloadWork> {
-        let work = Self::remove_first_matching_from_heap(
-            self.heap_for_class_mut(completion_critical),
+        let work = Self::remove_first_matching_from_class(
+            self.class_mut(completion_critical),
             &mut matches,
         )?;
         self.note_removed(&work);
         Some(work)
     }
 
-    fn remove_first_matching_from_heap(
-        heap: &mut BinaryHeap<Reverse<PrioritizedWork>>,
+    fn remove_first_matching_from_class(
+        class: &mut ClassMap,
         matches: &mut impl FnMut(&DownloadWork) -> bool,
     ) -> Option<DownloadWork> {
-        let mut skipped = Vec::new();
-        let matched = loop {
-            let Some(Reverse(item)) = heap.pop() else {
-                break None;
-            };
-            if matches(&item.work) {
-                break Some(item.work);
-            }
-            skipped.push(Reverse(item));
-        };
-        heap.extend(skipped);
-        matched
+        let key = class
+            .iter()
+            .find_map(|(key, work)| matches(work).then_some(*key))?;
+        class.remove(&key)
     }
 
     fn note_removed(&mut self, work: &DownloadWork) {
@@ -379,24 +401,36 @@ impl DownloadQueue {
                 self.queued_by_file.remove(&work.segment_id.file_id);
             }
         }
-    }
-
-    fn heap_for_class(&self, completion_critical: bool) -> &BinaryHeap<Reverse<PrioritizedWork>> {
-        if completion_critical {
-            &self.completion_critical_heap
-        } else {
-            &self.ordinary_heap
+        if let Some(estimates) = self
+            .queued_estimates_by_file
+            .get_mut(&work.segment_id.file_id)
+        {
+            if let Some(count) = estimates.get_mut(&work.byte_estimate) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    estimates.remove(&work.byte_estimate);
+                }
+            }
+            if estimates.is_empty() {
+                self.queued_estimates_by_file
+                    .remove(&work.segment_id.file_id);
+            }
         }
     }
 
-    fn heap_for_class_mut(
-        &mut self,
-        completion_critical: bool,
-    ) -> &mut BinaryHeap<Reverse<PrioritizedWork>> {
+    fn class(&self, completion_critical: bool) -> &ClassMap {
         if completion_critical {
-            &mut self.completion_critical_heap
+            &self.completion_critical_work
         } else {
-            &mut self.ordinary_heap
+            &self.ordinary_work
+        }
+    }
+
+    fn class_mut(&mut self, completion_critical: bool) -> &mut ClassMap {
+        if completion_critical {
+            &mut self.completion_critical_work
+        } else {
+            &mut self.ordinary_work
         }
     }
 
@@ -404,34 +438,20 @@ impl DownloadQueue {
         &self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<&DownloadWork> {
-        let completion_critical = !self.completion_critical_heap.is_empty();
-        self.heap_for_class(completion_critical)
-            .peek()
-            .and_then(|Reverse(pw)| matches(&pw.work).then_some(&pw.work))
+        let completion_critical = !self.completion_critical_work.is_empty();
+        self.class(completion_critical)
+            .first_key_value()
+            .and_then(|(_, work)| matches(work).then_some(work))
     }
 
     /// Read the same candidate as `pop_first_matching`, including work hidden
-    /// behind an ineligible head. Keep the ordinary eligible-head path O(1).
+    /// behind an ineligible head: the classes are walked in dispatch order and
+    /// the walk stops at the first match, so an eligible head is O(log n).
     pub fn peek_first_matching(
         &self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<&DownloadWork> {
-        for heap in [&self.completion_critical_heap, &self.ordinary_heap] {
-            if let Some(Reverse(item)) = heap.peek()
-                && matches(&item.work)
-            {
-                return Some(&item.work);
-            }
-            if let Some(item) = heap
-                .iter()
-                .map(|Reverse(item)| item)
-                .filter(|item| matches(&item.work))
-                .min()
-            {
-                return Some(&item.work);
-            }
-        }
-        None
+        self.iter().find(|work| matches(work))
     }
 
     /// The **highest-numbered** queued segment of the matching work, ignoring
@@ -444,42 +464,62 @@ impl DownloadQueue {
     /// size. Segment order is the only ordering that exists before a byte
     /// lands, and because a landed article leaves the queue, asking for the
     /// highest one still queued walks backwards from the tail on its own.
+    ///
+    /// Segment order is not dispatch order — a requeued retry or a file's
+    /// first article sits elsewhere in the key order than its segment number
+    /// says — so this is a scan of every queued item, not a walk from the end
+    /// of the dispatch order.
     pub fn peek_last_matching(
         &self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<&DownloadWork> {
         self.iter()
-            .map(|Reverse(item)| &item.work)
             .filter(|work| matches(work))
             .max_by_key(|work| work.segment_id.segment_number)
     }
 
-    /// The head of one dispatch class without removing it, in O(1).
+    /// The **lowest-numbered** queued segment of the matching work, ignoring
+    /// dispatch priority: [`Self::peek_last_matching`] from the other end.
+    ///
+    /// For the direct-store set that must reach the article it routes next.
+    /// A requeued retry sits behind the articles queued before it in dispatch
+    /// order, so the first match in that order can be one the set would only
+    /// hold; the lowest one still queued is the earliest it has not received.
+    pub fn peek_lowest_matching(
+        &self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<&DownloadWork> {
+        self.iter()
+            .filter(|work| matches(work))
+            .min_by_key(|work| work.segment_id.segment_number)
+    }
+
+    /// The head of one dispatch class without removing it, in O(log n).
     ///
     /// For decisions that are about the *shape* of the work rather than the
     /// work itself — which newsgroups a connection for this job would have to
     /// be opened for, ahead of any lease being cut.
     pub fn peek_in_class(&self, completion_critical: bool) -> Option<&DownloadWork> {
-        self.heap_for_class(completion_critical)
-            .peek()
-            .map(|Reverse(pw)| &pw.work)
+        self.class(completion_critical)
+            .first_key_value()
+            .map(|(_, work)| work)
     }
 
     pub fn len(&self) -> usize {
-        self.completion_critical_heap.len() + self.ordinary_heap.len()
+        self.completion_critical_work.len() + self.ordinary_work.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.completion_critical_heap.is_empty() && self.ordinary_heap.is_empty()
+        self.completion_critical_work.is_empty() && self.ordinary_work.is_empty()
     }
 
     /// Queued items in one dispatch class, in O(1).
     ///
     /// Lease sizing divides the remaining work of the class it is about to
-    /// lease from, so it must never pay for a queue scan: this is a heap
+    /// lease from, so it must never pay for a queue scan: this is a map
     /// length, read once per lease.
     pub fn len_in_class(&self, completion_critical: bool) -> usize {
-        self.heap_for_class(completion_critical).len()
+        self.class(completion_critical).len()
     }
 
     pub fn has_recovery_work(&self) -> bool {
@@ -487,7 +527,7 @@ impl DownloadQueue {
     }
 
     pub fn count_matching(&self, mut predicate: impl FnMut(&DownloadWork) -> bool) -> usize {
-        self.iter().filter(|item| predicate(&item.0.work)).count()
+        self.iter().filter(|work| predicate(work)).count()
     }
 
     /// Removes and returns every queued item matching the predicate, leaving
@@ -497,15 +537,12 @@ impl DownloadQueue {
         mut predicate: impl FnMut(&DownloadWork) -> bool,
     ) -> Vec<DownloadWork> {
         let mut extracted = Vec::new();
-        for heap in [&mut self.completion_critical_heap, &mut self.ordinary_heap] {
-            let items: Vec<_> = heap.drain().collect();
-            for item in items {
-                if predicate(&item.0.work) {
-                    extracted.push(item.0.work);
-                } else {
-                    heap.push(item);
-                }
-            }
+        for class in [&mut self.completion_critical_work, &mut self.ordinary_work] {
+            extracted.extend(
+                class
+                    .extract_if(.., |_, work| predicate(work))
+                    .map(|(_, work)| work),
+            );
         }
         if !extracted.is_empty() {
             self.recount_derived_counts();
@@ -519,15 +556,15 @@ impl DownloadQueue {
     /// queue and so must not re-queue an article the queue already owns —
     /// pushing a second copy would download it twice.
     pub fn extend_segment_ids(&self, out: &mut std::collections::HashSet<SegmentId>) {
-        out.extend(self.iter().map(|item| item.0.work.segment_id));
+        out.extend(self.iter().map(|work| work.segment_id));
     }
 
     pub fn has_completion_critical_work(&self) -> bool {
-        !self.completion_critical_heap.is_empty()
+        !self.completion_critical_work.is_empty()
     }
 
     pub fn has_noncritical_work(&self) -> bool {
-        !self.ordinary_heap.is_empty()
+        !self.ordinary_work.is_empty()
     }
 
     /// Remove and return all queued segments.
@@ -535,10 +572,10 @@ impl DownloadQueue {
         self.excluded_work = 0;
         self.recovery_work = 0;
         self.queued_by_file.clear();
-        self.completion_critical_heap
-            .drain()
-            .chain(self.ordinary_heap.drain())
-            .map(|Reverse(pw)| pw.work)
+        self.queued_estimates_by_file.clear();
+        std::mem::take(&mut self.completion_critical_work)
+            .into_values()
+            .chain(std::mem::take(&mut self.ordinary_work).into_values())
             .collect()
     }
 
@@ -548,9 +585,9 @@ impl DownloadQueue {
     ///
     /// The plan persists: every later push of an unprotected item for a planned
     /// file lands at the planned key, so a requeued retry keeps its rank without
-    /// a rebuild. Re-installing an identical plan is a no-op — the heaps are
-    /// only drained and rebuilt when the plan differs from the one in force,
-    /// which is what keeps a burst of retry requeues from costing a rebuild
+    /// a rebuild. Re-installing an identical plan is a no-op — queued keys are
+    /// only re-keyed when the plan differs from the one in force,
+    /// which is what keeps a burst of retry requeues from costing a re-key pass
     /// each.
     pub fn install_file_priority_plan(
         &mut self,
@@ -602,18 +639,29 @@ impl DownloadQueue {
     ) -> usize {
         self.file_priority_plan_stale = true;
         let mut changed = 0;
-        for heap in [&mut self.completion_critical_heap, &mut self.ordinary_heap] {
-            let items: Vec<_> = heap.drain().collect();
-            for Reverse(mut pw) in items {
-                if let Some((priority, rank)) = priority_for(&pw.work)
-                    && (pw.priority != priority || pw.rank != rank)
-                {
-                    pw.priority = priority;
-                    pw.rank = rank;
-                    pw.work.priority = priority;
-                    changed += 1;
+        for class in [&mut self.completion_critical_work, &mut self.ordinary_work] {
+            // Only the items whose key changes move; each keeps its sequence,
+            // so equal keys still serve in insertion order.
+            let rekeyed: Vec<_> = class
+                .iter()
+                .filter_map(|(key, work)| {
+                    let (priority, rank) = priority_for(work)?;
+                    (key.priority != priority || key.rank != rank).then_some((
+                        *key,
+                        QueueKey {
+                            priority,
+                            rank,
+                            ..*key
+                        },
+                    ))
+                })
+                .collect();
+            changed += rekeyed.len();
+            for (old, new) in rekeyed {
+                if let Some(mut work) = class.remove(&old) {
+                    work.priority = new.priority;
+                    class.insert(new, work);
                 }
-                heap.push(Reverse(pw));
             }
         }
         changed
@@ -625,28 +673,31 @@ impl DownloadQueue {
         &mut self,
         mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
     ) -> usize {
-        let items: Vec<_> = self
-            .completion_critical_heap
-            .drain()
-            .chain(self.ordinary_heap.drain())
-            .collect();
+        // Every selected item is taken out of whichever class holds it and put
+        // back into the completion-critical one under its new key, keeping
+        // its sequence; everything else stays where it is.
         let mut promoted = 0;
-        for Reverse(mut pw) in items {
-            if let Some((priority, rank)) = priority_for(&pw.work) {
-                pw.priority = priority;
-                pw.rank = rank;
-                pw.work.priority = priority;
-                pw.work.completion_critical = true;
-                pw.completion_rank = completion_rank_for(
-                    &pw.work,
-                    self.first_articles.contains(&pw.work.segment_id),
-                );
-                promoted += 1;
-            }
-            if pw.work.completion_critical {
-                self.completion_critical_heap.push(Reverse(pw));
-            } else {
-                self.ordinary_heap.push(Reverse(pw));
+        for completion_critical in [true, false] {
+            let selected: Vec<_> = self
+                .class(completion_critical)
+                .iter()
+                .filter_map(|(key, work)| priority_for(work).map(|pick| (*key, pick)))
+                .collect();
+            promoted += selected.len();
+            for (key, (priority, rank)) in selected {
+                let Some(mut work) = self.class_mut(completion_critical).remove(&key) else {
+                    continue;
+                };
+                work.priority = priority;
+                work.completion_critical = true;
+                let first_article = self.first_articles.contains(&work.segment_id);
+                let key = QueueKey {
+                    completion_rank: completion_rank_for(&work, first_article),
+                    priority,
+                    rank,
+                    sequence: key.sequence,
+                };
+                self.completion_critical_work.insert(key, work);
             }
         }
         promoted

@@ -511,11 +511,12 @@ impl DirectSetRouter {
     /// The runs of member partials that must be re-read from disk before the
     /// whole-member gates can compose (the "PAR2 absent" arm).
     ///
-    /// Split at part boundaries, because the composition is per part, and
-    /// returned in `(member, ascending offset)` order so the caller's read is one
-    /// forward pass per file rather than a seek per run.
+    /// Plaintext parts have separate compositions; encrypted members instead
+    /// compose plaintext across the whole member. Preserve those CRC atom
+    /// boundaries and return `(member, ascending offset)` order so the reader
+    /// makes one forward pass per file.
     pub(crate) fn restart_read_plan(&self) -> Vec<RestartReadRun> {
-        self.reread_plan(|member| &member.restart_seeded)
+        self.reread_plan(|member| &member.restart_seeded, true)
     }
 
     /// Whether any member is carrying a repair's stale composition gaps.
@@ -530,7 +531,7 @@ impl DirectSetRouter {
     /// (covered bytes with no value in this process) reached from two
     /// directions, so they share a reader and a re-arm.
     pub(crate) fn stale_gap_read_plan(&self) -> Vec<RestartReadRun> {
-        self.reread_plan(|member| &member.stale_gaps)
+        self.reread_plan(|member| &member.stale_gaps, false)
     }
 
     /// Select one stale run without allocating a plan or a part-boundary list.
@@ -587,6 +588,7 @@ impl DirectSetRouter {
     pub(super) fn reread_plan(
         &self,
         pick: impl Fn(&MemberRouting) -> &ByteRanges,
+        preserve_crc_atoms: bool,
     ) -> Vec<RestartReadRun> {
         let mut plan = Vec::new();
         for member_id in &self.member_order {
@@ -597,7 +599,52 @@ impl DirectSetRouter {
             if ranges.is_empty() {
                 continue;
             }
-            let boundaries = self.part_boundaries(*member_id);
+            // Repair or resumed routing can create a CRC atom straddling an
+            // old checkpoint range. Reading only that range would discard the
+            // atom's unread edges when the result is installed. Expand the
+            // restart read instead: every discarded byte is then reverified
+            // from disk, without changing ordinary article routing.
+            let mut expanded;
+            let ranges = if preserve_crc_atoms {
+                expanded = ranges.clone();
+                let mut include_overlapping_atoms = |base: u64, runs: &CrcRuns| {
+                    for &(offset, len, _) in &runs.runs {
+                        let start = base.saturating_add(offset);
+                        let end = start.saturating_add(len);
+                        let next = ranges.ranges().partition_point(|&(_, stop)| stop <= start);
+                        if ranges
+                            .ranges()
+                            .get(next)
+                            .is_some_and(|&(begin, _)| begin < end)
+                        {
+                            expanded.insert(start, len);
+                        }
+                    }
+                };
+                if let Some(crypt) = &member.crypt {
+                    include_overlapping_atoms(0, crypt.plain_runs());
+                } else if let Some(layout) = self
+                    .layout_index_for_member(*member_id)
+                    .and_then(|index| self.layout_members().get(index))
+                {
+                    for (&position, runs) in &member.parts {
+                        let Some(part) = layout.parts.get(position as usize) else {
+                            continue;
+                        };
+                        include_overlapping_atoms(part.logical_offset.unwrap_or(0), runs);
+                    }
+                }
+                &expanded
+            } else {
+                ranges
+            };
+            let boundaries = if preserve_crc_atoms && member.crypt.is_some() {
+                // A plaintext CRC atom may span cipher-part boundaries. The
+                // encrypted re-arm feeds the member-wide plaintext fold.
+                Vec::new()
+            } else {
+                self.part_boundaries(*member_id)
+            };
             for &(start, end) in ranges.ranges() {
                 let mut cursor = start;
                 while cursor < end {

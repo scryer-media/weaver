@@ -34,7 +34,7 @@ use serde::Serialize;
 
 use weaver_server_api::WeaverSchema;
 use weaver_server_core::SchedulerHandle;
-use weaver_server_core::operations::disk::DiskSpaceCollector;
+use weaver_server_core::operations::disk::StorageCapacity;
 use weaver_server_core::settings::model::SharedConfig;
 
 use self::archive::Component;
@@ -96,7 +96,7 @@ pub(super) async fn diagnostics_package_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(handle): Extension<SchedulerHandle>,
     Extension(exporter): Extension<super::PrometheusMetricsExporter>,
-    Extension(disk_space): Extension<Arc<DiskSpaceCollector>>,
+    Extension(disk_space): Extension<Arc<StorageCapacity>>,
     Extension(http_metrics): Extension<super::HttpMetricsHandle>,
     Extension(config): Extension<SharedConfig>,
     Extension(request_auth): Extension<super::RequestAuthContext>,
@@ -169,7 +169,7 @@ async fn collect_components(
     schema: &WeaverSchema,
     handle: &SchedulerHandle,
     exporter: &super::PrometheusMetricsExporter,
-    disk_space: &Arc<DiskSpaceCollector>,
+    disk_space: &Arc<StorageCapacity>,
     http_metrics: &super::HttpMetricsHandle,
     config: &SharedConfig,
     caller: super::auth::ResolvedCaller,

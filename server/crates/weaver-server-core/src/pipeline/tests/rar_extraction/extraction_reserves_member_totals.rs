@@ -2428,6 +2428,34 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
     assert!(!dest.join("release.nfo.xz").exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_scan_rejects_a_link_in_the_staging_tree() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(100_712);
+    let staging_dir = temp_dir.path().join("nested-linked-staging");
+    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+    tokio::fs::write(staging_dir.join("sample.mkv"), b"outer member")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(temp_dir.path(), staging_dir.join("escape")).unwrap();
+
+    let mut state = minimal_job_state(job_id, "Nested Linked Staging", temp_dir.path().join("wd"));
+    state.staging_dir = Some(staging_dir.clone());
+    pipeline.jobs.insert(job_id, state);
+    pipeline.job_order.push(job_id);
+
+    let error = match pipeline.maybe_start_nested_extraction(job_id).await {
+        Err(error) => error,
+        Ok(_) => panic!("a link in the staging tree must stop the nested scan"),
+    };
+    assert!(
+        JobExtractionBudget::is_rejection(&error),
+        "the link is refused as unsafe output, not reported as an I/O failure: {error}"
+    );
+}
+
 #[tokio::test]
 async fn nested_scan_detects_obfuscated_rar_archives_from_staging() {
     let temp_dir = tempfile::tempdir().unwrap();

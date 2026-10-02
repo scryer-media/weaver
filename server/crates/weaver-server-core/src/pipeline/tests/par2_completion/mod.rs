@@ -1,5 +1,7 @@
 use super::*;
 
+mod schedules;
+
 use crate::pipeline::completion::finalize::check::{
     CleanPar2VerificationMode, Par2SetSettlementReason, QuickPar2Evidence,
     bounded_repair_evidence_covers_assessment, error_chain_has_file_descriptor_exhaustion,

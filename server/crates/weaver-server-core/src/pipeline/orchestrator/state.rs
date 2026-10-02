@@ -7,6 +7,14 @@ impl Pipeline {
             .join(job_id.0.to_string())
     }
 
+    /// The job's staging root, registered on the job state so completion,
+    /// cancel and failure treat it as the job's output.
+    ///
+    /// Only names the directory: nothing here touches the filesystem, since
+    /// this runs on the pipeline task and the root sits under the complete
+    /// directory. Whatever writes into it creates it — [`ExtractionRoot::open`]
+    /// for extraction, the placement task for direct-store destinations — and
+    /// every reader of an unwritten root treats it as empty.
     pub(crate) fn extraction_staging_dir(&mut self, job_id: JobId) -> PathBuf {
         if let Some(state) = self.jobs.get(&job_id)
             && let Some(ref staging) = state.staging_dir
@@ -14,14 +22,6 @@ impl Pipeline {
             return staging.clone();
         }
         let staging = self.deterministic_extraction_staging_dir(job_id);
-        if let Err(e) = std::fs::create_dir_all(&staging) {
-            tracing::warn!(
-                job_id = job_id.0,
-                path = %staging.display(),
-                error = %e,
-                "failed to create staging dir"
-            );
-        }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.staging_dir = Some(staging.clone());
         }
@@ -71,9 +71,11 @@ impl Pipeline {
         let (initial_entries, initial_bytes) = match ExtractionRoot::snapshot_usage(staging) {
             Ok(usage) => usage,
             Err(error) => {
-                let budget = JobExtractionBudget::new_with_process_memory(
+                let budget = JobExtractionBudget::with_capacity(
                     Arc::clone(&self.extraction_limits),
                     self.process_memory_budget.for_job(job_id.0),
+                    self.storage_capacity
+                        .reader(crate::operations::StorageRoot::Complete),
                     staging.to_path_buf(),
                     declared_archive_bytes,
                     0,
@@ -88,9 +90,11 @@ impl Pipeline {
                 return Err(rejection);
             }
         };
-        let budget = JobExtractionBudget::new_with_process_memory(
+        let budget = JobExtractionBudget::with_capacity(
             Arc::clone(&self.extraction_limits),
             self.process_memory_budget.for_job(job_id.0),
+            self.storage_capacity
+                .reader(crate::operations::StorageRoot::Complete),
             staging.to_path_buf(),
             declared_archive_bytes,
             initial_entries,
@@ -238,6 +242,7 @@ impl Pipeline {
                 released_segments += parked.len();
             }
             self.file_prefix_16k.remove(&file_id);
+            self.file_proven_par2_fingerprint.remove(&file_id);
             self.par3_inside_probes.remove(file_id);
             self.file_declared_size.remove(&file_id);
         }

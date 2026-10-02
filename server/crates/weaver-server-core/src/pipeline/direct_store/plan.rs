@@ -61,6 +61,26 @@ pub(crate) enum SetFormat {
 /// suffix by the restart sweep, exactly as `.envelope` is.
 pub(crate) const REPAIR_SUFFIX: &str = ".repair";
 
+/// A set's envelope filename from its name, discriminator and volume alone.
+///
+/// Free of a plan so the restart sweep can rebuild the name for a set no
+/// current plan produces — an identity-admitted set is never rediscovered from
+/// the spec, yet its envelopes are in the working directory all the same.
+pub(crate) fn envelope_file_name(set_name: &str, discriminator: u32, volume_index: u32) -> String {
+    weaver_model::files::path_component_with_suffix(
+        &crate::jobs::working_dir::sanitize_dirname(set_name),
+        &format!(".f{discriminator}.vol{volume_index:05}.envelope"),
+    )
+}
+
+/// The repair-scratch counterpart of [`envelope_file_name`].
+pub(crate) fn repair_file_name(set_name: &str, discriminator: u32, volume_index: u32) -> String {
+    weaver_model::files::path_component_with_suffix(
+        &crate::jobs::working_dir::sanitize_dirname(set_name),
+        &format!(".f{discriminator}.vol{volume_index:05}{REPAIR_SUFFIX}"),
+    )
+}
+
 /// Appends `suffix` to the final component of a root-relative
 /// path, shortening the component's stem so the result stays inside
 /// [`weaver_model::files::DOWNLOAD_FILENAME_MAX_BYTES`].
@@ -100,6 +120,10 @@ impl AdmissionRefusal {
 /// answerable separately while the mapping grows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IdentityPlanFacts {
+    /// Which evidence admitted the set. A restart rebuilds the plan from its
+    /// checkpoint, and the flavour decides what the live rungs need to find
+    /// the set again when the files still to come arrive.
+    pub(crate) kind: IdentityKind,
     /// Total volumes the set has, once that is knowable. `volumes` is
     /// complete — and the set may finalize — only once it reaches this
     /// length.
@@ -120,6 +144,18 @@ pub(crate) struct IdentityPlanFacts {
     /// file's index is stable by construction, so it is captured once and
     /// carried.
     pub(crate) discriminator: u32,
+}
+
+/// The evidence an identity-admitted set was admitted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum IdentityKind {
+    /// The recovery set's file descriptions: a roster of volumes, each
+    /// matched to a file by its first bytes' fingerprint.
+    Roster,
+    /// The volumes' own RAR5 headers, which state each volume's position.
+    HeaderVolumeSet,
+    /// A single file whose RAR5 head says it is a whole archive.
+    Standalone,
 }
 
 /// One admitted archive set: its identity, its volume-to-file mapping, and the
@@ -327,6 +363,106 @@ impl DirectSetPlan {
             .collect()
     }
 
+    /// What a checkpoint records about an identity-admitted plan so a restart
+    /// can rebuild it exactly. `None` for a name-admitted plan, which the spec
+    /// rediscovers on its own.
+    pub(crate) fn identity_binding(&self) -> Option<super::snapshot::IdentityBinding> {
+        let identity = self.identity?;
+        Some(super::snapshot::IdentityBinding {
+            kind: identity.kind,
+            volumes: self
+                .volumes
+                .iter()
+                .map(|(volume, file)| (*volume, *file))
+                .collect(),
+            expected_volumes: identity.expected_volumes,
+            discriminator: identity.discriminator,
+        })
+    }
+
+    /// Rebuilds an identity-admitted plan from a checkpoint's binding, or says
+    /// why the binding cannot be trusted against this spec.
+    ///
+    /// The binding is the only record of which files the set owns, so it is
+    /// held to what the admission rungs themselves would have accepted: every
+    /// bound file exists and is still a file whose name says nothing, no file
+    /// or position is claimed twice, the discriminator is one of the bound
+    /// files, no position lies at or past a known end, and each flavour's own
+    /// shape holds. A binding that fails any of it describes a set this spec
+    /// could not have produced, and the row is refused.
+    pub(crate) fn from_identity_binding(
+        set_name: &str,
+        binding: &super::snapshot::IdentityBinding,
+        spec: &JobSpec,
+        working_dir: &Path,
+        destination_dir: &Path,
+    ) -> Result<Self, &'static str> {
+        if binding.volumes.is_empty() {
+            return Err("the identity binding binds no volume");
+        }
+        let mut volumes = BTreeMap::new();
+        let mut files = HashMap::new();
+        for &(volume_index, file_index) in &binding.volumes {
+            let Some(file) = spec.files.get(file_index as usize) else {
+                return Err("the identity binding names a file the spec does not have");
+            };
+            if !matches!(file.role, FileRole::Unknown | FileRole::SplitFile { .. }) {
+                return Err("a bound file's name now classifies it");
+            }
+            if volumes.insert(volume_index, file_index).is_some() {
+                return Err("the identity binding claims a volume position twice");
+            }
+            if files.insert(file_index, volume_index).is_some() {
+                return Err("the identity binding binds a file twice");
+            }
+        }
+        if !files.contains_key(&binding.discriminator) {
+            return Err("the identity binding's discriminator is not a bound file");
+        }
+        if let Some(expected) = binding.expected_volumes
+            && volumes
+                .keys()
+                .next_back()
+                .is_some_and(|highest| *highest >= expected)
+        {
+            return Err("the identity binding binds a volume past the set's end");
+        }
+        match binding.kind {
+            IdentityKind::Roster => {
+                if binding.expected_volumes.is_none() {
+                    return Err("a described set without its volume count");
+                }
+            }
+            IdentityKind::HeaderVolumeSet => {
+                if set_name != format!("obfuscated-set.f{}", binding.discriminator) {
+                    return Err("a header volume set under a name its rung does not give");
+                }
+            }
+            IdentityKind::Standalone => {
+                if binding.expected_volumes != Some(1)
+                    || volumes.len() != 1
+                    || !volumes.contains_key(&0)
+                    || set_name != format!("obfuscated-archive.f{}", binding.discriminator)
+                {
+                    return Err("a standalone archive that is not one volume under its own name");
+                }
+            }
+        }
+        Ok(Self {
+            set_name: set_name.to_string(),
+            format: SetFormat::Rar,
+            volumes,
+            files,
+            identity: Some(IdentityPlanFacts {
+                kind: binding.kind,
+                expected_volumes: binding.expected_volumes,
+                discriminator: binding.discriminator,
+            }),
+            working_dir: working_dir.to_path_buf(),
+            destination_dir: destination_dir.to_path_buf(),
+        })
+    }
+
     /// Working-directory-relative envelope file for **one source volume**
     /// (envelope v2 — "sparse envelope files", plural).
     ///
@@ -454,13 +590,7 @@ impl DirectSetPlan {
         // extension survive. The discriminator rides the suffix for the same
         // reason it does on the holds scratch: the clamp can never shorten it
         // away, and two sets whose names sanitize identically stay two files.
-        weaver_model::files::path_component_with_suffix(
-            &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
-            &format!(
-                ".f{}.vol{volume_index:05}.envelope",
-                self.set_discriminator()
-            ),
-        )
+        envelope_file_name(&self.set_name, self.set_discriminator(), volume_index)
     }
 
     pub(crate) fn envelope_path(&self, volume_index: u32) -> PathBuf {
@@ -516,13 +646,7 @@ impl DirectSetPlan {
     /// sitting there would be read as a downloaded volume by every conventional
     /// path. This suffix is swept at restart alongside envelopes and partials.
     pub(crate) fn repair_relative_path(&self, volume_index: u32) -> String {
-        weaver_model::files::path_component_with_suffix(
-            &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
-            &format!(
-                ".f{}.vol{volume_index:05}{REPAIR_SUFFIX}",
-                self.set_discriminator()
-            ),
-        )
+        repair_file_name(&self.set_name, self.set_discriminator(), volume_index)
     }
 
     pub(crate) fn repair_path(&self, volume_index: u32) -> PathBuf {

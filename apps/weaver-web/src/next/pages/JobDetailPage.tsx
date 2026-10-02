@@ -52,7 +52,7 @@ import { statusColor, WV } from "../data/palette";
 import { ratePhase } from "../data/phase-bars";
 import { releaseFields, releaseFlags } from "../data/release";
 import { eventTone, useStatusLabel } from "../data/status";
-import { buildTimelineView, type JobTimelineData } from "../data/timeline";
+import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/timeline";
 import { useNextData } from "../data/next-data";
 import { countLabel } from "../i18n/labels";
 import { NextShell, RailBlock } from "../shell/NextShell";
@@ -297,6 +297,7 @@ function JobDetailContent() {
     job.createdAt && job.completedAt && job.completedAt >= job.createdAt
       ? job.completedAt - job.createdAt
       : null;
+  const downloadMs = downloadingMs(snapshot?.jobTimeline);
   const savedBytes = Math.max(
     0,
     job.optionalRecoveryBytes - job.optionalRecoveryDownloadedBytes,
@@ -594,22 +595,24 @@ function JobDetailContent() {
           />
           <MetricCell
             variant="stat"
-            eyebrow={inQueue ? t("next.job.currentRate") : t("next.job.averageRate")}
+            eyebrow={terminal ? t("next.job.averageDownloadSpeed") : t("next.job.currentRate")}
             value={
-              inQueue
-                ? phase?.rateBps
-                  ? formatRate(phase.rateBps)
+              terminal
+                ? downloadMs !== null
+                  ? formatRate(job.downloadedBytes / (downloadMs / 1000))
                   : EM_DASH
-                : elapsedMs && elapsedMs > 0
-                  ? formatRate(job.downloadedBytes / (elapsedMs / 1000))
+                : phase?.rateBps
+                  ? formatRate(phase.rateBps)
                   : EM_DASH
             }
             note={
-              inQueue
-                ? phase
+              terminal
+                ? downloadMs !== null
+                  ? t("next.job.overDownloading", { span: formatSpan(downloadMs) })
+                  : undefined
+                : phase
                   ? t(`next.job.while.${phase.phase}`)
                   : t("next.job.thisPhase")
-                : t("next.job.endToEndWithScripts")
             }
           />
           <MetricCell

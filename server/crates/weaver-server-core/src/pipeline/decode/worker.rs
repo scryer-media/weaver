@@ -875,7 +875,7 @@ impl Pipeline {
     /// [`Self::job_has_pending_download_work_beyond_health_probe`] — it asks
     /// only about the decode stage, and is the cheap gate that decides whether
     /// a settling decode is worth re-running the download-drain sequence for.
-    fn job_decode_stage_drained(&self, job_id: JobId) -> bool {
+    pub(in crate::pipeline) fn job_decode_stage_drained(&self, job_id: JobId) -> bool {
         self.active_decodes_by_job
             .get(&job_id)
             .copied()
@@ -885,6 +885,9 @@ impl Pipeline {
                 .pending_decode
                 .iter()
                 .any(|work| work.segment_id.file_id.job_id == job_id)
+            // A routed article whose destination write is still out has not
+            // been committed yet; its placement's landing re-runs this check.
+            && !self.has_direct_placements(job_id)
     }
 
     pub(in crate::pipeline) fn decode_retry_exclude_servers(
@@ -2198,6 +2201,36 @@ impl Pipeline {
                 None => {}
             }
 
+            (buffered_segment, file_offset, direct_handoff)
+        };
+
+        let (buffered_segment, file_offset, direct_handoff) = ready;
+        self.buffer_decoded_segment_conventionally(
+            segment_id,
+            file_offset,
+            buffered_segment,
+            direct_handoff,
+        )
+        .await;
+    }
+
+    /// The conventional half of a decoded article: into the file's reorder
+    /// buffer, then out to disk as far as the buffer is contiguous, with the
+    /// write backlog relieved behind it.
+    ///
+    /// `direct_handoff` marks an article direct routing handed back — a set
+    /// that demoted around it, or a placement whose destination write failed —
+    /// whose materialization handoff this seam now settles.
+    pub(in crate::pipeline) async fn buffer_decoded_segment_conventionally(
+        &mut self,
+        segment_id: SegmentId,
+        file_offset: u64,
+        buffered_segment: BufferedDecodedSegment,
+        direct_handoff: bool,
+    ) {
+        let file_id = segment_id.file_id;
+        let job_id = file_id.job_id;
+        let ready = {
             let buffered_len = buffered_segment.len_bytes();
 
             // While a demoted set's reconstruction sweep is outstanding, this
@@ -3751,6 +3784,7 @@ impl Pipeline {
                             "article arrived for a segment the file already holds"
                         );
                     }
+                    self.invalidate_par2_session_for_file_write(file_id);
                     self.mark_file_hash_reread_required_for(file_id, "duplicate_rewrite");
                     drop(data);
                 } else {
@@ -4255,7 +4289,35 @@ impl Pipeline {
     }
 }
 
+/// Every whole-file checksum read, by path, so a test can count how many
+/// times a completed file was read back.
+#[cfg(test)]
+static COMPLETED_FILE_CHECKSUM_READS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+impl Pipeline {
+    /// How many whole-file checksum reads `path` has had in this process.
+    pub(in crate::pipeline) fn completed_file_checksum_reads(path: &std::path::Path) -> usize {
+        COMPLETED_FILE_CHECKSUM_READS
+            .lock()
+            .unwrap()
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileChecksum> {
+    #[cfg(test)]
+    {
+        *COMPLETED_FILE_CHECKSUM_READS
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
     let mut md5 = par2_rs::checksum::FileHashState::new();

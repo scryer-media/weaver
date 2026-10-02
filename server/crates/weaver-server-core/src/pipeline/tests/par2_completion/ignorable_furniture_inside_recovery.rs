@@ -2729,21 +2729,24 @@ async fn completed_payload_corrupt_recovery_volume_contributes_zero_capacity() {
         .expect("the direct source opens an access-backed session");
     assert!(fresh);
     pipeline.restore_par2_repair_session(job_id, set_id, session);
-    let corrupt_packets = par2_rs::scan_packets_from_path_with_set_ids(
-        &fixture.working_dir.join(&fixture.short_volume_filename),
-    )
-    .unwrap()
-    .into_iter()
-    .filter(|scanned| match &scanned.packet {
-        par2_rs::Packet::RecoverySlice(recovery) => !matches!(
-            recovery
-                .data
-                .validate_packet_hash(scanned.recovery_set_id.as_bytes(), recovery.exponent),
-            Ok(true)
-        ),
-        _ => false,
-    })
-    .count();
+    // The authenticated scanner now discards corrupt packets. Inspect the raw
+    // fixture headers to prove corruption independently of that admission rule.
+    let carrier = std::fs::read(fixture.working_dir.join(&fixture.short_volume_filename)).unwrap();
+    let mut corrupt_packets = 0;
+    for (offset, marker) in carrier.windows(par2_rs::packet::MAGIC.len()).enumerate() {
+        if marker != par2_rs::packet::MAGIC {
+            continue;
+        }
+        let header =
+            par2_rs::packet::PacketHeader::parse(&carrier[offset..], offset as u64).unwrap();
+        if header.packet_type == par2_rs::packet::PacketType::RecoverySlice {
+            assert!(matches!(
+                par2_rs::packet::parse_packet(&carrier[offset..], offset as u64),
+                Err(par2_rs::Par2Error::PacketHashMismatch { .. })
+            ));
+            corrupt_packets += 1;
+        }
+    }
     assert_eq!(
         corrupt_packets, 2,
         "test precondition: both header-valid recovery payloads are corrupt"

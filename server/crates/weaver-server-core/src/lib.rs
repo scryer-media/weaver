@@ -68,7 +68,7 @@ pub use operations::metrics::{
     DownloadPressureReason, DownloadPressureState, MetricsSnapshot, PAR3_MEMORY_CATEGORIES,
     PAR3_SLOTS, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3EngineNarrowing,
     Par3EngineRefusal, Par3MetricsSnapshot, Par3OutcomeClass, Par3Phase, Par3SlotSnapshot,
-    Par3Stage, PipelineMetrics, par3_memory_category_names,
+    Par3Stage, PipelineMetrics, SchedulerBlockClause, par3_memory_category_names,
 };
 pub use operations::{
     AsyncOperationState, AsyncOperationTargetState, COUNTER_METRIC_KEYS, CounterRollupValue,

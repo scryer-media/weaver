@@ -54,6 +54,64 @@ impl DownloadPressureState {
     }
 }
 
+/// A clause of the article scheduler's "may this server fetch this article"
+/// answer, as the per-clause hot-job block counters name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerBlockClause {
+    /// The job is too young to fetch from at all.
+    Propagation,
+    /// The job's posts are older than the server's retention.
+    Retention,
+    /// A direct-store set's disk budget is full.
+    DirectStore,
+    /// A demotion sweep holds the article's file.
+    SweepHeld,
+    /// The article excludes the server, or its rotation hint points away.
+    ServerExclusion,
+    /// A backfill server waits for the fill servers to give the article up.
+    Backfill,
+    /// The PAR2 index bootstrap claims the queue for its index files.
+    Par2Bootstrap,
+    /// The UU spool cursor has not reached the article.
+    UuCursor,
+    /// The restart checkpoint holds the job's undurable lead.
+    Checkpoint,
+}
+
+impl SchedulerBlockClause {
+    pub const COUNT: usize = 9;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Propagation,
+        Self::Retention,
+        Self::DirectStore,
+        Self::SweepHeld,
+        Self::ServerExclusion,
+        Self::Backfill,
+        Self::Par2Bootstrap,
+        Self::UuCursor,
+        Self::Checkpoint,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Propagation => "propagation",
+            Self::Retention => "retention",
+            Self::DirectStore => "direct_store",
+            Self::SweepHeld => "sweep_held",
+            Self::ServerExclusion => "server_exclusion",
+            Self::Backfill => "backfill",
+            Self::Par2Bootstrap => "par2_bootstrap",
+            Self::UuCursor => "uu_cursor",
+            Self::Checkpoint => "checkpoint",
+        }
+    }
+
+    /// The clause's slot in the per-clause counters.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadPressureReason {
@@ -322,6 +380,14 @@ pub struct PipelineMetrics {
     pub download_scheduler_handouts_total_spill: AtomicU64,
     /// Handouts made for a probe rather than for payload throughput.
     pub download_scheduler_handouts_total_probe: AtomicU64,
+    /// Queued articles a scheduler queue scan looked at and passed over.
+    pub download_scheduler_scan_items_skipped_total: AtomicU64,
+    /// Scheduler queue scans that found no article the server may fetch.
+    pub download_scheduler_scan_no_match_total: AtomicU64,
+    /// Times the hot job had nothing for the asking server, counted once
+    /// for each clause that refused it, indexed by
+    /// [`SchedulerBlockClause::index`].
+    pub download_scheduler_hot_blocked_total: [AtomicU64; SchedulerBlockClause::COUNT],
     /// Raw article bytes dispatched to lanes and not yet answered, summed
     /// across every lane. Sampled on the metrics tick from the dispatch
     /// reservations, never maintained on an article path.
@@ -458,6 +524,9 @@ impl PipelineMetrics {
             download_scheduler_handouts_total_hot: AtomicU64::new(0),
             download_scheduler_handouts_total_spill: AtomicU64::new(0),
             download_scheduler_handouts_total_probe: AtomicU64::new(0),
+            download_scheduler_scan_items_skipped_total: AtomicU64::new(0),
+            download_scheduler_scan_no_match_total: AtomicU64::new(0),
+            download_scheduler_hot_blocked_total: std::array::from_fn(|_| AtomicU64::new(0)),
             download_lane_inflight_bytes: AtomicU64::new(0),
             download_jobs_eligible: AtomicUsize::new(0),
             download_jobs_hot: AtomicUsize::new(0),
@@ -658,6 +727,15 @@ impl PipelineMetrics {
             download_scheduler_handouts_total_probe: self
                 .download_scheduler_handouts_total_probe
                 .load(Ordering::Relaxed),
+            download_scheduler_scan_items_skipped_total: self
+                .download_scheduler_scan_items_skipped_total
+                .load(Ordering::Relaxed),
+            download_scheduler_scan_no_match_total: self
+                .download_scheduler_scan_no_match_total
+                .load(Ordering::Relaxed),
+            download_scheduler_hot_blocked_total: std::array::from_fn(|index| {
+                self.download_scheduler_hot_blocked_total[index].load(Ordering::Relaxed)
+            }),
             download_lane_inflight_bytes: self.download_lane_inflight_bytes.load(Ordering::Relaxed),
             download_jobs_eligible: self.download_jobs_eligible.load(Ordering::Relaxed),
             download_jobs_hot: self.download_jobs_hot.load(Ordering::Relaxed),
@@ -840,6 +918,13 @@ pub struct MetricsSnapshot {
     pub download_scheduler_handouts_total_hot: u64,
     pub download_scheduler_handouts_total_spill: u64,
     pub download_scheduler_handouts_total_probe: u64,
+    #[serde(default)]
+    pub download_scheduler_scan_items_skipped_total: u64,
+    #[serde(default)]
+    pub download_scheduler_scan_no_match_total: u64,
+    /// Indexed by [`SchedulerBlockClause::index`].
+    #[serde(default)]
+    pub download_scheduler_hot_blocked_total: [u64; SchedulerBlockClause::COUNT],
     pub download_lane_inflight_bytes: u64,
     pub download_jobs_eligible: usize,
     pub download_jobs_hot: usize,
