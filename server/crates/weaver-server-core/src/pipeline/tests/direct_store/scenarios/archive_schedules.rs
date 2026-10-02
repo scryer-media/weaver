@@ -1,5 +1,7 @@
 //! Bounded exhaustive schedules over four articles: one or two volumes,
 //! every arrival permutation, loss subset and single duplicate/interruption.
+//! This enumerates delivery boundaries, not background worker or filesystem
+//! interleavings; those require separate tests that force the competing events.
 use super::*;
 
 fn enable_schedule_trace() {

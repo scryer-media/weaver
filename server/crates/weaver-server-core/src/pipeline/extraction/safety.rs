@@ -2100,6 +2100,17 @@ fn scan_capability_directory(
             display_root.join(relative).display()
         )
     })?;
+    scan_capability_children(directory, relative, display_root, entries, bytes, children)
+}
+
+fn scan_capability_children(
+    directory: &Dir,
+    relative: &Path,
+    display_root: &Path,
+    entries: &mut u64,
+    bytes: &mut u64,
+    children: impl IntoIterator<Item = io::Result<cap_std::fs::DirEntry>>,
+) -> Result<(), String> {
     for child in children {
         let child = child.map_err(|error| {
             format!(
@@ -2110,9 +2121,18 @@ fn scan_capability_directory(
         let name = child.file_name();
         let child_relative = relative.join(&name);
         let display_path = display_root.join(&child_relative);
-        let metadata = directory
-            .symlink_metadata(&name)
-            .map_err(|error| format!("failed to inspect '{}': {error}", display_path.display()))?;
+        let metadata = match directory.symlink_metadata(&name) {
+            Ok(metadata) => metadata,
+            // Demotion unlinks partials asynchronously. An entry can disappear
+            // after enumeration; it contributes nothing to this snapshot.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect '{}': {error}",
+                    display_path.display()
+                ));
+            }
+        };
         *entries = entries.saturating_add(1);
         if metadata.file_type().is_symlink() {
             return Err(format!(
@@ -2128,13 +2148,14 @@ fn scan_capability_directory(
             ));
         }
         if metadata.is_dir() {
-            let child_dir = directory.open_dir_nofollow(&name).map_err(|error| {
-                format!(
-                    "failed to open staging directory '{}' without following links: {error}",
-                    display_path.display()
-                )
-            })?;
-            scan_capability_directory(&child_dir, &child_relative, display_root, entries, bytes)?;
+            scan_capability_subdirectory(
+                directory,
+                &name,
+                &child_relative,
+                display_root,
+                entries,
+                bytes,
+            )?;
         } else if metadata.is_file() {
             *bytes = bytes.saturating_add(metadata.len());
         } else {
@@ -2145,6 +2166,28 @@ fn scan_capability_directory(
         }
     }
     Ok(())
+}
+
+fn scan_capability_subdirectory(
+    directory: &Dir,
+    name: &OsStr,
+    relative: &Path,
+    display_root: &Path,
+    entries: &mut u64,
+    bytes: &mut u64,
+) -> Result<(), String> {
+    let child_dir = match directory.open_dir_nofollow(name) {
+        Ok(child_dir) => child_dir,
+        // The directory may disappear after its metadata was inspected too.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to open staging directory '{}' without following links: {error}",
+                display_root.join(relative).display()
+            ));
+        }
+    };
+    scan_capability_directory(&child_dir, relative, display_root, entries, bytes)
 }
 
 #[cfg(target_os = "windows")]
@@ -3318,6 +3361,158 @@ mod tests {
         budget
             .reserve_write(0, 1)
             .expect("without any reading the reserve cannot be judged breached");
+    }
+
+    #[test]
+    fn staging_scan_ignores_entries_removed_after_enumeration() {
+        for nested in [false, true] {
+            for remove_directory in [false, true] {
+                let (temp, root, _) = root_and_budget();
+                let relative = if nested {
+                    Path::new("nested")
+                } else {
+                    Path::new("")
+                };
+                let path = temp.path().join(relative);
+                std::fs::create_dir_all(&path).unwrap();
+                let directory = if nested {
+                    root.dir.open_dir(relative).unwrap()
+                } else {
+                    root.dir.try_clone().unwrap()
+                };
+                std::fs::write(path.join("kept.bin"), b"keep").unwrap();
+                let removed = path.join("partial");
+                if remove_directory {
+                    std::fs::create_dir(&removed).unwrap();
+                } else {
+                    std::fs::write(&removed, b"discard").unwrap();
+                }
+                // Retain the exact enumeration result, then perform the
+                // demotion cleanup before the scanner inspects that entry.
+                let children: Vec<_> = directory.entries().unwrap().collect();
+                assert_eq!(children.len(), 2);
+                if remove_directory {
+                    std::fs::remove_dir(&removed).unwrap();
+                } else {
+                    std::fs::remove_file(&removed).unwrap();
+                }
+                let (mut entries, mut bytes) = (0, 0);
+                scan_capability_children(
+                    &directory,
+                    relative,
+                    temp.path(),
+                    &mut entries,
+                    &mut bytes,
+                    children,
+                )
+                .unwrap();
+                assert_eq!((entries, bytes), (1, 4));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_scan_rejects_dangling_links_after_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, root, _) = root_and_budget();
+        std::fs::write(temp.path().join("a.partial"), b"discard").unwrap();
+        symlink("a.partial", temp.path().join("z.link")).unwrap();
+        let mut children: Vec<_> = root.dir.entries().unwrap().map(Result::unwrap).collect();
+        children.sort_by_key(|child| child.file_name());
+        std::fs::remove_file(temp.path().join("a.partial")).unwrap();
+        let (mut entries, mut bytes) = (0, 0);
+        let error = scan_capability_children(
+            &root.dir,
+            Path::new(""),
+            temp.path(),
+            &mut entries,
+            &mut bytes,
+            children.into_iter().map(Ok),
+        )
+        .unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn staging_scan_tolerates_directory_removal_after_metadata() {
+        let (temp, root, _) = root_and_budget();
+        std::fs::create_dir(temp.path().join("partial")).unwrap();
+        assert!(root.dir.symlink_metadata("partial").unwrap().is_dir());
+        std::fs::remove_dir(temp.path().join("partial")).unwrap();
+        let (mut entries, mut bytes) = (1, 0);
+        scan_capability_subdirectory(
+            &root.dir,
+            OsStr::new("partial"),
+            Path::new("partial"),
+            temp.path(),
+            &mut entries,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!((entries, bytes), (1, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_scan_rejects_directory_link_replacement_after_metadata() {
+        use std::os::unix::fs::symlink;
+
+        for dangling in [false, true] {
+            let (temp, root, _) = root_and_budget();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("untouched"), b"outside").unwrap();
+            std::fs::create_dir(temp.path().join("partial")).unwrap();
+            assert!(root.dir.symlink_metadata("partial").unwrap().is_dir());
+            std::fs::remove_dir(temp.path().join("partial")).unwrap();
+            let target = if dangling {
+                outside.path().join("missing")
+            } else {
+                outside.path().to_path_buf()
+            };
+            symlink(target, temp.path().join("partial")).unwrap();
+            let (mut entries, mut bytes) = (1, 0);
+            let error = scan_capability_subdirectory(
+                &root.dir,
+                OsStr::new("partial"),
+                Path::new("partial"),
+                temp.path(),
+                &mut entries,
+                &mut bytes,
+            )
+            .unwrap_err();
+            assert!(error.contains("without following links"), "{error}");
+            assert_eq!((entries, bytes), (1, 0));
+            assert_eq!(
+                std::fs::read(outside.path().join("untouched")).unwrap(),
+                b"outside"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_scan_preserves_entry_read_errors() {
+        let (temp, root, _) = root_and_budget();
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            let (mut entries, mut bytes) = (0, 0);
+            let error = scan_capability_children(
+                &root.dir,
+                Path::new(""),
+                temp.path(),
+                &mut entries,
+                &mut bytes,
+                [Err(io::Error::new(kind, "entry enumeration failed"))],
+            )
+            .unwrap_err();
+            assert!(error.contains("entry enumeration failed"), "{error}");
+            assert_eq!((entries, bytes), (0, 0));
+        }
     }
 
     #[cfg(unix)]
