@@ -346,8 +346,8 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.rust-test-sccache-restore.outputs.cache-primary-key }}
 
-  direct-store-matrix-build:
-    name: direct-store-matrix-build-linux-x86_64
+  archive-extraction-matrix-build:
+    name: archive-extraction-matrix-build-linux-x86_64
     if: ${{ !cancelled() && (github.event_name == 'pull_request' || needs.changes.outputs.rust == 'true') && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     needs: [changes, verify-release-tag]
     runs-on: ubuntu-24.04
@@ -402,13 +402,13 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
-      - name: Archive compiled direct-store matrix tests
-        run: cargo nextest archive --locked -p weaver-server-core --lib --archive-file target/direct-store-matrix.tar.zst
-      - name: Upload compiled direct-store matrix tests
+      - name: Archive compiled archive extraction matrix tests
+        run: cargo nextest archive --locked -p weaver-server-core --lib --archive-file target/archive-extraction-matrix.tar.zst
+      - name: Upload compiled archive extraction matrix tests
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: direct-store-matrix-linux-x86_64
-          path: target/direct-store-matrix.tar.zst
+          name: archive-extraction-matrix-linux-x86_64
+          path: target/archive-extraction-matrix.tar.zst
           compression-level: 0
           retention-days: 1
       - name: Show sccache stats
@@ -424,10 +424,10 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.matrix-build-sccache-restore.outputs.cache-primary-key }}
 
-  direct-store-matrix:
-    name: direct-store-matrix-linux-x86_64-${{ matrix.partition }}
-    if: ${{ !cancelled() && needs.direct-store-matrix-build.result == 'success' }}
-    needs: [direct-store-matrix-build]
+  archive-extraction-matrix:
+    name: archive-extraction-matrix-linux-x86_64-${{ matrix.partition }}
+    if: ${{ !cancelled() && needs.archive-extraction-matrix-build.result == 'success' }}
+    needs: [archive-extraction-matrix-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -445,14 +445,14 @@ jobs:
           tool: nextest
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: direct-store-matrix-linux-x86_64
+          name: archive-extraction-matrix-linux-x86_64
           path: target
-      - name: Run assigned direct-store matrix partition
+      - name: Run assigned archive extraction matrix partition
         run: >-
           cargo nextest run
           --profile archive-matrix
           --run-ignored all
-          --archive-file target/direct-store-matrix.tar.zst
+          --archive-file target/archive-extraction-matrix.tar.zst
           --workspace-remap .
           --partition count:${{ matrix.partition }}/32
           --no-fail-fast
@@ -2291,7 +2291,7 @@ jobs:
         needs.rust-clippy.result == 'success' &&
         needs.rust-audit.result == 'success' &&
         needs.rust-test.result == 'success' &&
-        needs.direct-store-matrix.result == 'success' &&
+        needs.archive-extraction-matrix.result == 'success' &&
         needs.rust-test-arm.result == 'success' &&
         needs.rust-test-sde.result == 'success' &&
         needs.rust-yenc-simd-targets.result == 'success' &&
@@ -2305,7 +2305,7 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test
-      - direct-store-matrix
+      - archive-extraction-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
@@ -2374,7 +2374,7 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test
-      - direct-store-matrix
+      - archive-extraction-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
@@ -2539,7 +2539,7 @@ jobs:
       - rust-clippy-windows
       - rust-audit
       - rust-test
-      - direct-store-matrix
+      - archive-extraction-matrix
       - rust-test-arm
       - rust-test-sde
       - rust-test-windows
