@@ -82,3 +82,37 @@ async fn corrupt_duplicate_cannot_displace_valid_recovery_in_a_retained_session(
         assert_eq!(std::fs::read(output).unwrap(), fixture.original_payload);
     }
 }
+
+#[tokio::test]
+async fn a_duplicate_write_rejects_the_analysis_of_its_previous_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job = JobId(30972);
+    insert_damaged_job_ready_for_analysis(&mut pipeline, job, "analysis-duplicate").await;
+    pipeline.check_job_completion(job).await;
+    let done = next_par2_analysis_done(&mut pipeline).await;
+    let old_work_id = done.work_id;
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id: job,
+            file_index: 0,
+        },
+        0,
+        0,
+        &[0x42; 64],
+        "payload.mkv",
+        None,
+    )
+    .await;
+    assert!(
+        pipeline
+            .par2_analysis_in_flight
+            .get(&job)
+            .is_none_or(|work| work.work_id != old_work_id),
+        "the duplicate rewrote the source, so the old analysis must be fenced out"
+    );
+    pipeline.handle_par2_analysis_done(done).await;
+    assert!(!pipeline.par2_analysis_results.contains_key(&job));
+    settle_par2_analysis_work(&mut pipeline).await;
+}

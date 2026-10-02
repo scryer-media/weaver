@@ -3388,7 +3388,7 @@ dependencies = [
 [[package]]
 name = "par2-rs"
 version = "0.10.7"
-source = "git+https://github.com/scryer-media/rarpar.git?rev=056b345e72ddb386f9887902ccd769a8e6c8da1f#056b345e72ddb386f9887902ccd769a8e6c8da1f"
+source = "git+https://github.com/scryer-media/rarpar.git?rev=aa3e910b26e2e164679cb0bf71a2f94dff85ea0a#aa3e910b26e2e164679cb0bf71a2f94dff85ea0a"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -3398,7 +3398,7 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs 0.4.7 (git+https://github.com/scryer-media/rarpar.git?rev=056b345e72ddb386f9887902ccd769a8e6c8da1f)",
+ "reedsolomon-rs 0.4.7 (git+https://github.com/scryer-media/rarpar.git?rev=aa3e910b26e2e164679cb0bf71a2f94dff85ea0a)",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -3953,7 +3953,7 @@ dependencies = [
 [[package]]
 name = "reedsolomon-rs"
 version = "0.4.7"
-source = "git+https://github.com/scryer-media/rarpar.git?rev=056b345e72ddb386f9887902ccd769a8e6c8da1f#056b345e72ddb386f9887902ccd769a8e6c8da1f"
+source = "git+https://github.com/scryer-media/rarpar.git?rev=aa3e910b26e2e164679cb0bf71a2f94dff85ea0a#aa3e910b26e2e164679cb0bf71a2f94dff85ea0a"
 dependencies = [
  "memmap2",
  "rayon",

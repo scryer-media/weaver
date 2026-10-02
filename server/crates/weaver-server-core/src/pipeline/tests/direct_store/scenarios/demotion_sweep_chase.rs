@@ -167,3 +167,65 @@ async fn a_demoted_set_is_not_chased_while_its_sweep_is_outstanding() {
     );
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
+
+#[tokio::test]
+async fn demotion_rejects_par2_analysis_receipts_on_both_sides_of_the_handback() {
+    for receipt_first in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        let job = JobId(41121);
+        let volumes = single_member_store_set("fixture.mkv", &[0x31; 3000], 1);
+        let spec = direct_store_job_spec("Demotion analysis fence", &volumes);
+        insert_active_job(&mut pipeline, job, spec).await;
+        submit_volume_article(&mut pipeline, job, &volumes, 0, 0).await;
+        assert!(pipeline.direct_store.set(job, 0).is_some());
+
+        let set_id = par2_rs::RecoverySetId::from_bytes([0x21; 16]);
+        pipeline.par2_analysis_in_flight.insert(
+            job,
+            crate::pipeline::Par2AnalysisWork {
+                work_id: 7,
+                recovery_set_id: set_id,
+                submitted_at: std::time::Instant::now(),
+            },
+        );
+        pipeline
+            .metrics
+            .verify_active
+            .fetch_add(1, Ordering::Relaxed);
+        let done = crate::pipeline::Par2AnalysisWorkDone {
+            job_id: job,
+            work_id: 7,
+            recovery_set_id: set_id,
+            outcome:
+                crate::pipeline::completion::finalize::check::Par2AnalysisTicketOutcome::TaskFailed(
+                    "old source image".to_string(),
+                ),
+        };
+        let mut done = Some(done);
+        if receipt_first {
+            pipeline
+                .handle_par2_analysis_done(done.take().unwrap())
+                .await;
+            assert!(pipeline.par2_analysis_results.contains_key(&job));
+        }
+        pipeline
+            .demote_direct_set(job, 0, DemotionReason::HoldsBudgetExceeded)
+            .await;
+        assert!(pipeline.direct_demotion_in_flight.contains_key(&job));
+        assert!(
+            !pipeline.par2_analysis_in_flight.contains_key(&job),
+            "receipt_first={receipt_first}"
+        );
+        assert!(
+            !pipeline.par2_analysis_results.contains_key(&job),
+            "receipt_first={receipt_first}"
+        );
+        if let Some(done) = done {
+            pipeline.handle_par2_analysis_done(done).await;
+        }
+        assert!(!pipeline.par2_analysis_results.contains_key(&job));
+        settle_direct_demotion_work(&mut pipeline).await;
+    }
+}

@@ -3784,6 +3784,7 @@ impl Pipeline {
                             "article arrived for a segment the file already holds"
                         );
                     }
+                    self.invalidate_par2_session_for_file_write(file_id);
                     self.mark_file_hash_reread_required_for(file_id, "duplicate_rewrite");
                     drop(data);
                 } else {

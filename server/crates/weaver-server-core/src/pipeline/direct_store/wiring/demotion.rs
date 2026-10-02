@@ -217,6 +217,9 @@ impl Pipeline {
         }
         for file_id in &demoted_volume_files {
             self.block_crcs.forget_file(*file_id);
+            // Reconstruction replaces the source image an outstanding PAR2
+            // analysis or retained session may still describe.
+            self.invalidate_par2_session_for_file_write(*file_id);
         }
 
         crate::runtime::perf_probe::record_owned(
