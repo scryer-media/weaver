@@ -1,0 +1,460 @@
+{
+  "repository": "https://github.com/scryer-media/rarpar",
+  "revision": "006cdecb24d7f80f22f8be1ab649251fc1c50306",
+  "fixtures": [
+    {
+      "file": "rar4_enc_lz.rar",
+      "sha256": "7dfa49a76ddade5d3648b690bf7f4ac9d275416672726bef0a1290963a367ea8",
+      "size": 41848,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar4/rar4_enc_lz.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "encrypted",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "`rar4 a -ma4 -m3 -ep1 -ptestpass123`. Written by the rar:4 (RARLAB 6.24 per the fixtures README) image at generation time; the release was not recorded per file. Regeneration is shape-identical only (header times; salts for -p sets)."
+      }
+    },
+    {
+      "file": "rar4_hp_lz.rar",
+      "sha256": "c6ee7b3b4b85357f1b44947c3bebe22ee12b2ea435fdb2e9d4a47c94f6087b0f",
+      "size": 180,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar4/rar4_hp_lz.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "core_sets",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "notes": "Header-encrypted (`-hp`) under the corpus HP password `secretpass`, over the 48-byte member tests/integration.rs pins byte for byte. Every run draws a fresh KDF salt and IV."
+      }
+    },
+    {
+      "file": "rar4_lz.rar",
+      "sha256": "2ef862dfc8d3b63dfc765cbe19ca6865693a4dec4f72eadc55592d704dd4bfef",
+      "size": 41832,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar4/rar4_lz.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "core_sets",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "`rar a -ma4 -m3` over the 226 943-byte word-salad text."
+      }
+    },
+    {
+      "file": "rar4_multifile_lz.rar",
+      "sha256": "55991e30fff5219c969d70a4a016ae212e26c4fb1fb89295648be4f9bd167047",
+      "size": 264,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar4/rar4_multifile_lz.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "edge_cases",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "notes": "`rar4 a -ma4 ...`. Written by the rar:4 (RARLAB 6.24 per the fixtures README) image at generation time; the release was not recorded per file. Regeneration is shape-identical only (header times; salts for -p sets)."
+      }
+    },
+    {
+      "file": "rar5_enc_lz.rar",
+      "sha256": "f5b6b2135efd76fe45ae6264ca976af2daeb35b0e73e6ab164484e611cf0c615",
+      "size": 41946,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_lz.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "encrypted",
+        "toolchains": [
+          "rarlab-7.20"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "`rar5 a -m3 -ep1 -ptestpass123`. Written by the rar:latest (RARLAB 7.20 per the fixtures README) image at generation time; the release was not recorded per file. Regeneration is shape-identical only (header times; salts for -p sets)."
+      }
+    },
+    {
+      "file": "rar5_hp_lz.rar",
+      "sha256": "917a081801c40a3eb5815fed769ee5d0ed6700d3621a4a734661f1469b632dfd",
+      "size": 286,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar5/rar5_hp_lz.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "core_sets",
+        "toolchains": [
+          "rarlab-7.20"
+        ],
+        "notes": "Header-encrypted (`-hp`) under the corpus HP password `secretpass`, over the 48-byte member tests/integration.rs pins byte for byte. Every run draws a fresh KDF salt and IV."
+      }
+    },
+    {
+      "file": "rar5_lz.rar",
+      "sha256": "7941dc0293e689c8c23a40c3e298577252407d8f2d465f153552de5fef2a3b37",
+      "size": 41837,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar5/rar5_lz.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "core_sets",
+        "toolchains": [
+          "rarlab-7.20"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "`rar a -m3` over the 226 943-byte word-salad text."
+      }
+    },
+    {
+      "file": "rar5_multifile_lz.rar",
+      "sha256": "71dd0c6c06873ea2957a7db76a5909d8660a489f26a84cabba8bad8f3415f7e8",
+      "size": 235,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar5/rar5_multifile_lz.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "edge_cases",
+        "toolchains": [
+          "rarlab-7.20"
+        ],
+        "notes": "Written by the rar:latest (RARLAB 7.20 per the fixtures README) image at generation time; the release was not recorded per file. Regeneration is shape-identical only (header times; salts for -p sets)."
+      }
+    },
+    {
+      "file": "rar4_lz_solid_mv.rar",
+      "sha256": "86b9f32732e071023737e476f1d8f5ce8bd8e002666c0de1533e34e5716d9b40",
+      "size": 199355,
+      "source_path": "crates/unrar-rs/tests/fixtures/rar4/rar4_lz_solid_mv.rar",
+      "provenance": {
+        "kind": "generated",
+        "generator": "core_sets",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "notes": "Three 307 200-byte solid `-m3` members. Despite the name it is a single-volume, multi-member archive. tests/integration.rs pins each member's length and its first eight bytes, so the generator writes those eight bytes literally."
+      }
+    },
+    {
+      "file": "rar5_solid_small.rar",
+      "sha256": "dd51304b021b054b75b48448c9c957aef5f33d07fc07c95c8c1535d983f09631",
+      "size": 462,
+      "provenance": {
+        "kind": "generated",
+        "writer": "RAR 7.23 macOS ARM",
+        "writer_url": "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz",
+        "writer_archive_sha256": "68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-s",
+          "-m3",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "rar5_solid_small.rar",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "rar5_solid_encrypted_small.rar",
+      "sha256": "37c946b906dcdbfdb8219b8379683fba4bb5cd0524810134a94d0adf2db3ebf5",
+      "size": 636,
+      "provenance": {
+        "kind": "generated",
+        "writer": "RAR 7.23 macOS ARM",
+        "writer_url": "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz",
+        "writer_archive_sha256": "68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-s",
+          "-m3",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "-pmoonlit-harbour",
+          "rar5_solid_encrypted_small.rar",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "rar5_solid_headers_small.rar",
+      "sha256": "ae39807230e037260699afe152d44744c42ee42645ead5a0897d6a43829ed232",
+      "size": 798,
+      "provenance": {
+        "kind": "generated",
+        "writer": "RAR 7.23 macOS ARM",
+        "writer_url": "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz",
+        "writer_archive_sha256": "68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-s",
+          "-m3",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "-hpmoonlit-harbour",
+          "rar5_solid_headers_small.rar",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "sevenz_solid.7z",
+      "sha256": "8f7acfd533bb70f11a1bb1d2f3e1e9bc51dfe7875a7e8bfc0dbe181215372948",
+      "size": 577,
+      "provenance": {
+        "kind": "generated",
+        "writer": "7-Zip 26.01",
+        "arguments": [
+          "a",
+          "-t7z",
+          "-m0=lzma2",
+          "-ms=on",
+          "-mx=1",
+          "-md1m",
+          "-mtc=off",
+          "-mta=off",
+          "-mtm=off",
+          "sevenz_solid.7z",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "sevenz_solid_encrypted.7z",
+      "sha256": "7fda016dad18adcaa71383ea9db6b9350d8f2f3fc31ce89e1ad86f0384eaaa5c",
+      "size": 601,
+      "provenance": {
+        "kind": "generated",
+        "writer": "7-Zip 26.01",
+        "arguments": [
+          "a",
+          "-t7z",
+          "-m0=lzma2",
+          "-ms=on",
+          "-mx=1",
+          "-md1m",
+          "-mtc=off",
+          "-mta=off",
+          "-mtm=off",
+          "-pmoonlit-harbour",
+          "sevenz_solid_encrypted.7z",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "sevenz_solid_headers.7z",
+      "sha256": "44461be3b0a2d9e511e1ee718b6267cdead3eed0f7c72483a0c5e33aeead2f4b",
+      "size": 638,
+      "provenance": {
+        "kind": "generated",
+        "writer": "7-Zip 26.01",
+        "arguments": [
+          "a",
+          "-t7z",
+          "-m0=lzma2",
+          "-ms=on",
+          "-mx=1",
+          "-md1m",
+          "-mtc=off",
+          "-mta=off",
+          "-mtm=off",
+          "-pmoonlit-harbour",
+          "-mhe=on",
+          "sevenz_solid_headers.7z",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "rar4_solid_lz_encrypted.rar",
+      "sha256": "568f4c68489a7643c7710d4cb0616caf7559cf5359e1697c442e9c61d4ba9add",
+      "size": 526,
+      "provenance": {
+        "kind": "generated",
+        "writer": "RAR 6.24 linux/amd64",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
+        "writer_archive_blake3": "1c8637956b820293888027977818f408c07e3d42e885813496fc41fddef55bb2",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-ma4",
+          "-s",
+          "-m3",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "-pmoonlit-harbour",
+          "rar4_solid_lz_encrypted.rar",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "rar4_solid_lz_headers.rar",
+      "sha256": "cab7411fbd7815268daa8c5d6f6a21993bcab7111124ff640309d9c090096b2e",
+      "size": 612,
+      "provenance": {
+        "kind": "generated",
+        "writer": "RAR 6.24 linux/amd64",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
+        "writer_archive_blake3": "1c8637956b820293888027977818f408c07e3d42e885813496fc41fddef55bb2",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-ma4",
+          "-s",
+          "-m3",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "-hpmoonlit-harbour",
+          "rar4_solid_lz_headers.rar",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "rar4_solid_ppmd_plain.rar",
+      "sha256": "6a8cf0ea7467b03230dcb29fbf2fc964c8ac6e951d8ca6bb66e4d2f5a0618cde",
+      "size": 507,
+      "provenance": {
+        "kind": "generated",
+        "writer": "RAR 6.24 linux/amd64",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
+        "writer_archive_blake3": "1c8637956b820293888027977818f408c07e3d42e885813496fc41fddef55bb2",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-ma4",
+          "-s",
+          "-m5",
+          "-mc16:1t+",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "rar4_solid_ppmd_plain.rar",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "rar4_solid_ppmd_encrypted.rar",
+      "sha256": "8b1f75890d1698ac326c9445789283cdc5174c14de0a88d7f742c63713120790",
+      "size": 558,
+      "provenance": {
+        "kind": "generated",
+        "writer": "RAR 6.24 linux/amd64",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
+        "writer_archive_blake3": "1c8637956b820293888027977818f408c07e3d42e885813496fc41fddef55bb2",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-ma4",
+          "-s",
+          "-m5",
+          "-mc16:1t+",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "-pmoonlit-harbour",
+          "rar4_solid_ppmd_encrypted.rar",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    },
+    {
+      "file": "rar4_solid_ppmd_headers.rar",
+      "sha256": "6d75ebbfc8af3d46944960e935ce685af5253f452993bcb9a756db529dd26a10",
+      "size": 644,
+      "provenance": {
+        "kind": "generated",
+        "writer": "RAR 6.24 linux/amd64",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
+        "writer_archive_blake3": "1c8637956b820293888027977818f408c07e3d42e885813496fc41fddef55bb2",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-ma4",
+          "-s",
+          "-m5",
+          "-mc16:1t+",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "-hpmoonlit-harbour",
+          "rar4_solid_ppmd_headers.rar",
+          "part0.bin",
+          "part1.bin",
+          "part2.bin"
+        ],
+        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+      }
+    }
+  ]
+}

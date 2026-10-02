@@ -1,7 +1,7 @@
 //! Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    Interruption, arrival_orders, combined_campaign, combined_schedules, run_archive, run_schedule,
-    schedules,
+    ExtractionProfile, Interruption, arrival_orders, combined_campaign, combined_schedules,
+    run_profile_schedule, schedules,
 };
 use super::*;
 
@@ -15,9 +15,24 @@ enum Shape {
     EncryptedCopy,
     EncryptedHeaders,
     EncryptedLzma2,
+    Solid,
+    SolidEncrypted,
+    SolidHeaders,
 }
 
 async fn campaign(shape: Shape, shard: Option<usize>) {
+    profile_campaign(shape, shard, ExtractionProfile::DirectStore).await;
+}
+
+async fn chase_campaign(shape: Shape, shard: Option<usize>) {
+    profile_campaign(shape, shard, ExtractionProfile::Chase).await;
+}
+
+async fn conventional_campaign(shape: Shape, shard: Option<usize>) {
+    profile_campaign(shape, shard, ExtractionProfile::Conventional).await;
+}
+
+async fn profile_campaign(shape: Shape, shard: Option<usize>, profile: ExtractionProfile) {
     let first = payload(13, 6001);
     let second = payload(29, 307);
     let name = if matches!(shape, Shape::Nested) {
@@ -45,25 +60,71 @@ async fn campaign(shape: Shape, shard: Option<usize>) {
     };
     let password = matches!(
         shape,
-        Shape::EncryptedCopy | Shape::EncryptedHeaders | Shape::EncryptedLzma2
+        Shape::EncryptedCopy
+            | Shape::EncryptedHeaders
+            | Shape::EncryptedLzma2
+            | Shape::SolidEncrypted
+            | Shape::SolidHeaders
     )
     .then_some("moonlit-harbour");
-    let archive = build_7z_shaped(
-        &entries,
-        method,
-        password,
-        matches!(shape, Shape::EncryptedHeaders),
-    );
+    let archive = if matches!(
+        shape,
+        Shape::Solid | Shape::SolidEncrypted | Shape::SolidHeaders
+    ) {
+        expected.clear();
+        for (index, name) in ["part0.bin", "part1.bin", "part2.bin"]
+            .into_iter()
+            .enumerate()
+        {
+            expected.insert(
+                name,
+                (0..8193)
+                    .map(|n| ((n * 7 + n / 251 + index * 13) % 253) as u8)
+                    .collect(),
+            );
+        }
+        macro_rules! fixture {
+            ($name:literal) => {
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/extraction_profiles/",
+                    $name
+                ))
+                .to_vec()
+            };
+        }
+        match shape {
+            Shape::Solid => fixture!("sevenz_solid.7z"),
+            Shape::SolidEncrypted => fixture!("sevenz_solid_encrypted.7z"),
+            Shape::SolidHeaders => fixture!("sevenz_solid_headers.7z"),
+            _ => unreachable!(),
+        }
+    } else {
+        build_7z_shaped(
+            &entries,
+            method,
+            password,
+            matches!(shape, Shape::EncryptedHeaders),
+        )
+    };
     let volumes = split_volumes(&archive, 2);
     let mut spec = sevenz_job_spec(&volumes, 2);
     spec.password = password.map(str::to_owned);
     let wanted = expected.keys().copied().collect::<Vec<_>>();
-    if password.is_some() && shard.is_none() {
+    if password.is_some() && (shard.is_none() || shard == Some(0)) {
         for order in arrival_orders() {
             let mut wrong = spec.clone();
             wrong.password = Some("incorrect-key".to_string());
-            let rejected =
-                run_archive(DirectStoreGate::Enabled, wrong, &volumes, &order, &wanted).await;
+            let rejected = run_profile_schedule(
+                profile,
+                wrong,
+                &volumes,
+                &order,
+                &wanted,
+                Interruption::None,
+            )
+            .await;
+            profile.assert_route(&rejected);
             assert!(
                 matches!(rejected.status, Some(JobStatus::Failed { .. })),
                 "wrong password {shape:?} {order:?}: {:?}",
@@ -81,11 +142,14 @@ async fn campaign(shape: Shape, shard: Option<usize>) {
         combined_schedules,
     );
     for (case, (order, interruption)) in cases {
+        if !profile.includes(interruption) {
+            continue;
+        }
         eprintln!(
-            "{shape:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
+            "{shape:?} profile={profile:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        let outcome = run_schedule(
-            DirectStoreGate::Enabled,
+        let outcome = run_profile_schedule(
+            profile,
             spec.clone(),
             &volumes,
             &order,
@@ -99,11 +163,19 @@ async fn campaign(shape: Shape, shard: Option<usize>) {
             "{shape:?} case={case} order={order:?} interruption={interruption:?}: {:?}",
             outcome.trace
         );
-        if matches!(interruption, Interruption::None) {
-            let expected = usize::from(matches!(
-                shape,
-                Shape::Copy | Shape::Multiple | Shape::EmptyEntry | Shape::Nested
-            ));
+        profile.assert_route(&outcome);
+        let direct_compatible = matches!(
+            shape,
+            Shape::Copy | Shape::Multiple | Shape::EmptyEntry | Shape::Nested
+        );
+        if matches!(interruption, Interruption::None)
+            && (profile == ExtractionProfile::Chase
+                || (profile == ExtractionProfile::DirectStore && !direct_compatible))
+        {
+            assert_eq!(outcome.chase_consumed, 1, "{shape:?}: {:?}", outcome.trace);
+        }
+        if profile == ExtractionProfile::DirectStore && matches!(interruption, Interruption::None) {
+            let expected = usize::from(direct_compatible);
             assert_eq!(
                 outcome.finalized, expected,
                 "{shape:?} case={case} order={order:?}: {:?}",
@@ -163,3 +235,98 @@ combined_campaign!(combined_lzma2, Shape::Lzma2Fallback, campaign);
 combined_campaign!(combined_encrypted_copy, Shape::EncryptedCopy, campaign);
 combined_campaign!(combined_encrypted_header, Shape::EncryptedHeaders, campaign);
 combined_campaign!(combined_encrypted_lzma2, Shape::EncryptedLzma2, campaign);
+
+combined_campaign!(combined_chase_copy, Shape::Copy, chase_campaign);
+combined_campaign!(combined_chase_multiple, Shape::Multiple, chase_campaign);
+combined_campaign!(
+    combined_chase_empty_entry,
+    Shape::EmptyEntry,
+    chase_campaign
+);
+combined_campaign!(combined_chase_nested, Shape::Nested, chase_campaign);
+combined_campaign!(combined_chase_lzma2, Shape::Lzma2Fallback, chase_campaign);
+combined_campaign!(
+    combined_chase_encrypted_copy,
+    Shape::EncryptedCopy,
+    chase_campaign
+);
+combined_campaign!(
+    combined_chase_encrypted_header,
+    Shape::EncryptedHeaders,
+    chase_campaign
+);
+combined_campaign!(
+    combined_chase_encrypted_lzma2,
+    Shape::EncryptedLzma2,
+    chase_campaign
+);
+
+combined_campaign!(
+    combined_conventional_copy,
+    Shape::Copy,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_multiple,
+    Shape::Multiple,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_empty_entry,
+    Shape::EmptyEntry,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_nested,
+    Shape::Nested,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_lzma2,
+    Shape::Lzma2Fallback,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_encrypted_copy,
+    Shape::EncryptedCopy,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_encrypted_header,
+    Shape::EncryptedHeaders,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_encrypted_lzma2,
+    Shape::EncryptedLzma2,
+    conventional_campaign
+);
+combined_campaign!(combined_solid, Shape::Solid, campaign);
+combined_campaign!(combined_chase_solid, Shape::Solid, chase_campaign);
+combined_campaign!(
+    combined_conventional_solid,
+    Shape::Solid,
+    conventional_campaign
+);
+combined_campaign!(combined_solid_encrypted, Shape::SolidEncrypted, campaign);
+combined_campaign!(
+    combined_chase_solid_encrypted,
+    Shape::SolidEncrypted,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_solid_encrypted,
+    Shape::SolidEncrypted,
+    conventional_campaign
+);
+combined_campaign!(combined_solid_headers, Shape::SolidHeaders, campaign);
+combined_campaign!(
+    combined_chase_solid_headers,
+    Shape::SolidHeaders,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_solid_headers,
+    Shape::SolidHeaders,
+    conventional_campaign
+);

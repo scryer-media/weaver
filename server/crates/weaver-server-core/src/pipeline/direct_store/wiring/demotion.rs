@@ -983,6 +983,11 @@ impl Pipeline {
                         file_index, error = %error,
                         "failed to record a reconstructed volume as complete"
                     );
+                } else {
+                    // The completed-file row makes this prefix durable. Chase
+                    // reads the in-memory floor when deciding whether the
+                    // reconstructed archive signature is available.
+                    self.persisted_file_progress.insert(file_id, plan.len);
                 }
             } else if floor > 0 {
                 // A partial volume persists only a contiguous, segment-aligned

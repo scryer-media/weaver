@@ -1,5 +1,5 @@
-//! Every arrival permutation of two volumes with two articles each, with a
-//! duplicate, restart, or demotion at every nonterminal position.
+//! Bounded exhaustive schedules over four articles: one or two volumes,
+//! every arrival permutation, loss subset and single duplicate/interruption.
 use super::*;
 
 fn enable_schedule_trace() {
@@ -76,6 +76,60 @@ pub(super) struct Outcome {
     pub files: BTreeMap<String, Option<Vec<u8>>>,
     pub trace: Vec<String>,
     pub finalized: usize,
+    pub chase_armed: u64,
+    pub chase_consumed: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExtractionProfile {
+    DirectStore,
+    Chase,
+    Conventional,
+}
+
+impl ExtractionProfile {
+    fn configure(self, pipeline: &mut Pipeline) {
+        use crate::pipeline::direct_unpack::settings::{DirectUnpackGate, DirectUnpackSettings};
+        use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
+        pipeline
+            .direct_store
+            .set_gate(if self == Self::DirectStore {
+                DirectStoreGate::Enabled
+            } else {
+                DirectStoreGate::Disabled
+            });
+        pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+            gate: if self == Self::Conventional {
+                DirectUnpackGate::Disabled
+            } else {
+                DirectUnpackGate::Enabled
+            },
+        });
+    }
+
+    pub(super) fn includes(self, interruption: Interruption) -> bool {
+        // Conventional extraction has no speculative output to demote. Keep
+        // its arrival, loss and restart cases without counting no-op demotions.
+        self != Self::Conventional
+            || !matches!(
+                interruption,
+                Interruption::Demote(_)
+                    | Interruption::Combined {
+                        action: BoundaryAction::Demote,
+                        ..
+                    }
+            )
+    }
+
+    pub(super) fn assert_route(self, outcome: &Outcome) {
+        if self != Self::DirectStore {
+            assert_eq!(outcome.finalized, 0, "{:?}", outcome.trace);
+        }
+        if self == Self::Conventional {
+            assert_eq!(outcome.chase_armed, 0, "{:?}", outcome.trace);
+            assert_eq!(outcome.chase_consumed, 0, "{:?}", outcome.trace);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -249,18 +303,52 @@ pub(super) fn schedules() -> Vec<(Vec<(u32, u32)>, Interruption)> {
     }
 }
 
-pub(super) async fn run_archive(
+pub(super) async fn run_schedule(
     gate: DirectStoreGate,
     spec: JobSpec,
     volumes: &[(String, Vec<u8>)],
     order: &[(u32, u32)],
     wanted: &[&str],
+    interruption: Interruption,
 ) -> Outcome {
-    run_schedule(gate, spec, volumes, order, wanted, Interruption::None).await
+    let profile = match gate {
+        DirectStoreGate::Enabled => ExtractionProfile::DirectStore,
+        DirectStoreGate::Disabled => ExtractionProfile::Chase,
+    };
+    run_profile_schedule(profile, spec, volumes, order, wanted, interruption).await
 }
 
-pub(super) async fn run_schedule(
-    gate: DirectStoreGate,
+async fn deliver_schedule_article(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    volumes: &[(String, Vec<u8>)],
+    file: u32,
+    article: u32,
+    articles: usize,
+) {
+    let id = SegmentId {
+        file_id: NzbFileId {
+            job_id: job,
+            file_index: file,
+        },
+        segment_number: article,
+    };
+    let state = pipeline.jobs.get_mut(&job).unwrap();
+    // The schedule owns delivery, including deliberate duplicates. Retire a
+    // queued copy when present so a later drain cannot fabricate a rewrite.
+    for queue in [&mut state.download_queue, &mut state.recovery_queue] {
+        let queued = queue.drain_all();
+        for work in queued {
+            if work.segment_id != id {
+                queue.push(work);
+            }
+        }
+    }
+    submit_volume_article_of(pipeline, job, volumes, file, article, articles).await;
+}
+
+pub(super) async fn run_profile_schedule(
+    profile: ExtractionProfile,
     mut spec: JobSpec,
     volumes: &[(String, Vec<u8>)],
     order: &[(u32, u32)],
@@ -268,18 +356,49 @@ pub(super) async fn run_schedule(
     interruption: Interruption,
 ) -> Outcome {
     enable_schedule_trace();
+    let articles = spec.files[0].segments.len();
+    assert_eq!(volumes.len() * articles, 4, "four scheduled article slots");
+    assert!(
+        spec.files[..volumes.len()]
+            .iter()
+            .all(|file| file.segments.len() == articles)
+    );
+    let order: Vec<_> = order
+        .iter()
+        .map(|&(file, article)| {
+            let slot = file * 2 + article;
+            (slot / articles as u32, slot % articles as u32)
+        })
+        .collect();
     let root = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
-    pipeline.direct_store.set_gate(gate);
+    profile.configure(&mut pipeline);
+    let mut chase_armed = 0;
+    let mut chase_consumed = 0;
     let job = JobId(42200);
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let loss = interruption.loss();
     let recovery = if loss.is_some() {
+        // Keep several repair blocks per article even for larger compressed
+        // fixtures, without turning extraction scheduling into a codec benchmark.
+        let slice = volumes
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .max()
+            .unwrap()
+            .div_ceil(32)
+            .div_ceil(4)
+            * 4;
+        let slice = slice.max(PAR2_SLICE_BYTES as usize);
         let blocks = volumes
             .iter()
-            .map(|(_, bytes)| bytes.len().div_ceil(PAR2_SLICE_BYTES as usize))
+            .map(|(_, bytes)| bytes.len().div_ceil(slice))
             .sum();
-        let bytes = repairable_par2_index(volumes, blocks);
+        let described: Vec<_> = volumes
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let bytes = build_test_par2_with_recovery(&described, slice as u64, blocks);
         let index = append_par2_index(&mut spec, &bytes);
         Some((index, bytes))
     } else {
@@ -306,9 +425,22 @@ pub(super) async fn run_schedule(
     for step in 0..=order.len() {
         match interruption.action_at(step) {
             BoundaryAction::Demote => {
-                pipeline
-                    .demote_direct_set(job, 0, DemotionReason::HoldsBudgetExceeded)
-                    .await;
+                if profile == ExtractionProfile::DirectStore {
+                    pipeline
+                        .demote_direct_set(job, 0, DemotionReason::HoldsBudgetExceeded)
+                        .await;
+                }
+                // An incompatible set may already have left direct store and
+                // started chase. Withdraw that owner at the same boundary too.
+                use crate::pipeline::direct_unpack::wiring::{
+                    AbortLatch, DemotionReason as ChaseDemotion,
+                };
+                pipeline.direct_unpack_abort_job(
+                    job,
+                    "schedule withdraws speculative extraction",
+                    AbortLatch::Permanent,
+                    ChaseDemotion::MemoryYielded,
+                );
                 settle_direct_post_repair_work(&mut pipeline).await;
                 trace.push(format!("demote at {step}"));
             }
@@ -316,9 +448,13 @@ pub(super) async fn run_schedule(
                 pipeline
                     .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
                     .await;
+                let counters = pipeline.direct_unpack.counters();
+                chase_armed += counters.armed;
+                chase_consumed += counters.consumed;
+                pipeline.direct_unpack_shutdown("schedule restart").await;
                 drop(pipeline);
                 (pipeline, _, _) = new_direct_pipeline(&root).await;
-                pipeline.direct_store.set_gate(gate);
+                profile.configure(&mut pipeline);
                 pipeline
                     .restore_job(RestoreJobRequest {
                         job_id: job,
@@ -349,11 +485,11 @@ pub(super) async fn run_schedule(
         let Some(&(file, article)) = order.get(step) else {
             break;
         };
-        if loss.is_some_and(|(mask, _)| mask & (1 << (file * 2 + article)) != 0) {
+        if loss.is_some_and(|(mask, _)| mask & (1 << (file * articles as u32 + article)) != 0) {
             trace.push(format!("lost {file}:{article}"));
             continue;
         }
-        submit_volume_article_of(&mut pipeline, job, volumes, file, article, 2).await;
+        deliver_schedule_article(&mut pipeline, job, volumes, file, article, articles).await;
         trace.push(format!(
             "arrive {file}:{article}: {:?}",
             pipeline.direct_store.sets_for(job)
@@ -385,8 +521,11 @@ pub(super) async fn run_schedule(
             for work in queued {
                 let file = work.segment_id.file_id.file_index;
                 let article = work.segment_id.segment_number;
-                if file < volumes.len() as u32 && mask & (1 << (file * 2 + article)) == 0 {
-                    submit_volume_article_of(&mut pipeline, job, volumes, file, article, 2).await;
+                if file < volumes.len() as u32
+                    && mask & (1 << (file * articles as u32 + article)) == 0
+                {
+                    submit_volume_article_of(&mut pipeline, job, volumes, file, article, articles)
+                        .await;
                 } else if let Some((index, bytes)) = &recovery
                     && file == *index
                 {
@@ -425,9 +564,18 @@ pub(super) async fn run_schedule(
                 state.download_queue = crate::DownloadQueue::new();
                 state.recovery_queue = crate::DownloadQueue::new();
                 for (file, article) in queued {
-                    if file < volumes.len() as u32 && mask & (1 << (file * 2 + article)) == 0 {
-                        submit_volume_article_of(&mut pipeline, job, volumes, file, article, 2)
-                            .await;
+                    if file < volumes.len() as u32
+                        && mask & (1 << (file * articles as u32 + article)) == 0
+                    {
+                        submit_volume_article_of(
+                            &mut pipeline,
+                            job,
+                            volumes,
+                            file,
+                            article,
+                            articles,
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -439,7 +587,7 @@ pub(super) async fn run_schedule(
                     ) {
                         break;
                     }
-                    dispatch_and_submit(&mut pipeline, job, volumes, file, article, 2).await;
+                    dispatch_and_submit(&mut pipeline, job, volumes, file, article, articles).await;
                 }
                 continue;
             }
@@ -498,11 +646,19 @@ pub(super) async fn run_schedule(
         .map(|name| ((*name).to_string(), std::fs::read(output.join(name)).ok()))
         .collect();
     settle_direct_output_removals(root.path()).await;
+    let counters = pipeline.direct_unpack.counters();
+    chase_armed += counters.armed;
+    chase_consumed += counters.consumed;
+    trace.push(format!(
+        "profile={profile:?}; chase_armed={chase_armed}; chase_consumed={chase_consumed}; current={counters:?}"
+    ));
     Outcome {
         status,
         files,
         trace,
         finalized: pipeline.direct_store.finalized_sets,
+        chase_armed,
+        chase_consumed,
     }
 }
 
@@ -602,6 +758,18 @@ enum Format {
 }
 
 async fn campaign(format: Format, shard: Option<usize>) {
+    profile_campaign(format, shard, ExtractionProfile::DirectStore).await;
+}
+
+async fn chase_campaign(format: Format, shard: Option<usize>) {
+    profile_campaign(format, shard, ExtractionProfile::Chase).await;
+}
+
+async fn conventional_campaign(format: Format, shard: Option<usize>) {
+    profile_campaign(format, shard, ExtractionProfile::Conventional).await;
+}
+
+async fn profile_campaign(format: Format, shard: Option<usize>, profile: ExtractionProfile) {
     let name = "nested/feature.mkv";
     let password = "moonlit-harbour";
     let length = if matches!(format, Format::QuickOpen) {
@@ -669,25 +837,35 @@ async fn campaign(format: Format, shard: Option<usize>) {
     );
     let mut spec = direct_store_job_spec("Archive schedules", &volumes);
     spec.password = encrypted.then(|| password.to_string());
-    let baseline = run_archive(
-        DirectStoreGate::Disabled,
+    let baseline = run_profile_schedule(
+        ExtractionProfile::Conventional,
         spec.clone(),
         &volumes,
         &in_order_arrivals(2),
         &[name],
+        Interruption::None,
     )
     .await;
     assert_eq!(baseline.status, Some(JobStatus::Complete));
+    ExtractionProfile::Conventional.assert_route(&baseline);
     assert!(
         baseline.files[name].as_deref() == Some(payload.as_slice()),
         "conventional oracle {format:?}"
     );
-    if encrypted && shard.is_none() {
+    if encrypted && (shard.is_none() || shard == Some(0)) {
         for order in arrival_orders() {
             let mut wrong = spec.clone();
             wrong.password = Some("incorrect-key".to_string());
-            let rejected =
-                run_archive(DirectStoreGate::Enabled, wrong, &volumes, &order, &[name]).await;
+            let rejected = run_profile_schedule(
+                profile,
+                wrong,
+                &volumes,
+                &order,
+                &[name],
+                Interruption::None,
+            )
+            .await;
+            profile.assert_route(&rejected);
             assert!(
                 matches!(rejected.status, Some(JobStatus::Failed { .. })),
                 "wrong password {format:?} {order:?}: {:?}",
@@ -705,11 +883,14 @@ async fn campaign(format: Format, shard: Option<usize>) {
         combined_schedules,
     );
     for (case, (order, interruption)) in cases {
+        if !profile.includes(interruption) {
+            continue;
+        }
         eprintln!(
-            "{format:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
+            "{format:?} profile={profile:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        let actual = run_schedule(
-            DirectStoreGate::Enabled,
+        let actual = run_profile_schedule(
+            profile,
             spec.clone(),
             &volumes,
             &order,
@@ -723,7 +904,18 @@ async fn campaign(format: Format, shard: Option<usize>) {
             "{format:?} case={case} order={order:?} interruption={interruption:?} trace={:?}",
             actual.trace
         );
-        if matches!(interruption, Interruption::None) {
+        profile.assert_route(&actual);
+        // A duplicate can invalidate an already-running RAR chase. Clean
+        // unique arrivals must consume chase; duplicate schedules still must
+        // admit it and produce the same verified output through safe fallback.
+        let unique_arrivals = order.len() == 4;
+        if profile == ExtractionProfile::Chase && matches!(interruption, Interruption::None) {
+            assert!(actual.chase_armed > 0, "{format:?}: {:?}", actual.trace);
+            if unique_arrivals {
+                assert_eq!(actual.chase_consumed, 1, "{format:?}: {:?}", actual.trace);
+            }
+        }
+        if profile == ExtractionProfile::DirectStore && matches!(interruption, Interruption::None) {
             let expected = usize::from(!matches!(
                 format,
                 Format::Rar5UncheckedHeaders | Format::Blake2
@@ -733,6 +925,12 @@ async fn campaign(format: Format, shard: Option<usize>) {
                 "{format:?} case={case} order={order:?}: {:?}",
                 actual.trace
             );
+            if expected == 0 {
+                assert!(actual.chase_armed > 0, "{format:?}: {:?}", actual.trace);
+                if unique_arrivals {
+                    assert_eq!(actual.chase_consumed, 1, "{format:?}: {:?}", actual.trace);
+                }
+            }
         }
         assert_eq!(
             actual.files[name].as_deref(),
@@ -781,6 +979,218 @@ async fn quick_open_arrival_schedules() {
 #[tokio::test]
 async fn blake2_arrival_schedules() {
     campaign(Format::Blake2, None).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompressedFormat {
+    Rar4Mixed,
+    Rar4Lz,
+    Rar4Solid,
+    Rar4SolidEncrypted,
+    Rar4SolidHeaders,
+    Rar4Ppmd,
+    Rar4PpmdEncrypted,
+    Rar4PpmdHeaders,
+    Rar4Encrypted,
+    Rar4Headers,
+    Rar5Mixed,
+    Rar5Lz,
+    Rar5Encrypted,
+    Rar5Headers,
+    Rar5Solid,
+    Rar5SolidEncrypted,
+    Rar5SolidHeaders,
+}
+
+impl CompressedFormat {
+    fn fixture(self) -> (&'static str, &'static [u8], Option<&'static str>) {
+        // Real RAR encoders produced these archives. Embed them so the compiled
+        // nextest archive remains self-contained on a matrix runner.
+        macro_rules! fixture {
+            ($name:literal, $password:expr $(,)?) => {
+                (
+                    $name,
+                    include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/extraction_profiles/",
+                        $name
+                    ))
+                    .as_slice(),
+                    $password,
+                )
+            };
+        }
+        match self {
+            Self::Rar4Mixed => fixture!("rar4_multifile_lz.rar", None),
+            Self::Rar4Lz => fixture!("rar4_lz.rar", None),
+            Self::Rar4Solid => fixture!("rar4_lz_solid_mv.rar", None),
+            Self::Rar4SolidEncrypted => {
+                fixture!("rar4_solid_lz_encrypted.rar", Some("moonlit-harbour"))
+            }
+            Self::Rar4SolidHeaders => {
+                fixture!("rar4_solid_lz_headers.rar", Some("moonlit-harbour"))
+            }
+            Self::Rar4Ppmd => fixture!("rar4_solid_ppmd_plain.rar", None),
+            Self::Rar4PpmdEncrypted => {
+                fixture!("rar4_solid_ppmd_encrypted.rar", Some("moonlit-harbour"))
+            }
+            Self::Rar4PpmdHeaders => {
+                fixture!("rar4_solid_ppmd_headers.rar", Some("moonlit-harbour"))
+            }
+            Self::Rar4Encrypted => fixture!("rar4_enc_lz.rar", Some("testpass123")),
+            Self::Rar4Headers => fixture!("rar4_hp_lz.rar", Some("secretpass")),
+            Self::Rar5Mixed => fixture!("rar5_multifile_lz.rar", None),
+            Self::Rar5Lz => fixture!("rar5_lz.rar", None),
+            Self::Rar5Encrypted => fixture!("rar5_enc_lz.rar", Some("testpass123")),
+            Self::Rar5Headers => fixture!("rar5_hp_lz.rar", Some("secretpass")),
+            Self::Rar5Solid => fixture!("rar5_solid_small.rar", None),
+            Self::Rar5SolidEncrypted => {
+                fixture!("rar5_solid_encrypted_small.rar", Some("moonlit-harbour"),)
+            }
+            Self::Rar5SolidHeaders => {
+                fixture!("rar5_solid_headers_small.rar", Some("moonlit-harbour"),)
+            }
+        }
+    }
+}
+
+async fn compressed_direct_campaign(format: CompressedFormat, shard: Option<usize>) {
+    compressed_campaign(format, shard, ExtractionProfile::DirectStore).await;
+}
+
+async fn compressed_chase_campaign(format: CompressedFormat, shard: Option<usize>) {
+    compressed_campaign(format, shard, ExtractionProfile::Chase).await;
+}
+
+async fn compressed_conventional_campaign(format: CompressedFormat, shard: Option<usize>) {
+    compressed_campaign(format, shard, ExtractionProfile::Conventional).await;
+}
+
+async fn compressed_campaign(
+    format: CompressedFormat,
+    shard: Option<usize>,
+    profile: ExtractionProfile,
+) {
+    let (fixture_name, bytes, password) = format.fixture();
+    let mut archive = match password {
+        Some(password) => {
+            unrar_rs::RarArchive::open_with_password(std::io::Cursor::new(bytes), password)
+        }
+        None => unrar_rs::RarArchive::open(std::io::Cursor::new(bytes)),
+    }
+    .unwrap();
+    let mut expected = BTreeMap::new();
+    for index in 0..archive.len() {
+        let info = archive.member_info(index).unwrap();
+        if info.is_directory {
+            continue;
+        }
+        let mut output = Vec::new();
+        archive
+            .by_index(index)
+            .unwrap()
+            .copy_to(&mut output)
+            .unwrap();
+        expected.insert(info.name, output);
+    }
+    assert!(!expected.is_empty());
+    // Pin the oracle to the official reader, independently of the Rust reader
+    // used both here and in the pipeline. A shared decoder error cannot bless
+    // the bytes subsequently compared by every schedule.
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/expected.json"
+    )))
+    .unwrap();
+    let oracle = oracle["archives"][fixture_name].as_object().unwrap();
+    assert_eq!(expected.len(), oracle.len());
+    for (name, bytes) in &expected {
+        use sha2::Digest;
+        assert_eq!(bytes.len() as u64, oracle[name]["size"].as_u64().unwrap());
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(bytes)),
+            oracle[name]["sha256"].as_str().unwrap()
+        );
+    }
+    let wanted = expected.keys().map(String::as_str).collect::<Vec<_>>();
+    let volumes = vec![("compressed.rar".to_owned(), bytes.to_vec())];
+    let mut spec = direct_store_job_spec_with_articles("Compressed archive schedules", &volumes, 4);
+    spec.password = password.map(str::to_owned);
+    if password.is_some() && shard == Some(0) {
+        for order in arrival_orders() {
+            let mut wrong = spec.clone();
+            wrong.password = Some("incorrect-key".to_owned());
+            let outcome = run_profile_schedule(
+                profile,
+                wrong,
+                &volumes,
+                &order,
+                &wanted,
+                Interruption::None,
+            )
+            .await;
+            assert!(
+                matches!(outcome.status, Some(JobStatus::Failed { .. })),
+                "{format:?}: {:?}",
+                outcome.trace
+            );
+            assert_eq!(outcome.finalized, 0, "{:?}", outcome.trace);
+            assert!(
+                outcome.files.values().all(Option::is_none),
+                "wrong password published output: {format:?}"
+            );
+            profile.assert_route(&outcome);
+        }
+    }
+    for (case, (order, interruption)) in combined_schedules(shard.unwrap()) {
+        if !profile.includes(interruption) {
+            continue;
+        }
+        eprintln!(
+            "{format:?} profile={profile:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
+        );
+        let outcome = run_profile_schedule(
+            profile,
+            spec.clone(),
+            &volumes,
+            &order,
+            &wanted,
+            interruption,
+        )
+        .await;
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Complete),
+            "{format:?}: {:?}",
+            outcome.trace
+        );
+        profile.assert_route(&outcome);
+        if profile != ExtractionProfile::Conventional && interruption == Interruption::None {
+            assert!(outcome.chase_armed > 0, "{format:?}: {:?}", outcome.trace);
+            if order.len() == 4 {
+                assert_eq!(outcome.chase_consumed, 1, "{format:?}: {:?}", outcome.trace);
+                if profile == ExtractionProfile::DirectStore {
+                    assert_eq!(
+                        outcome.finalized,
+                        usize::from(matches!(
+                            format,
+                            CompressedFormat::Rar4Mixed | CompressedFormat::Rar5Mixed
+                        )),
+                        "{format:?}: {:?}",
+                        outcome.trace
+                    );
+                }
+            }
+        }
+        for (name, bytes) in &expected {
+            assert_eq!(
+                outcome.files[name].as_deref(),
+                Some(bytes.as_slice()),
+                "{format:?} member={name} case={case}: {:?}",
+                outcome.trace
+            );
+        }
+    }
 }
 
 // These are test names, not runner jobs. Nextest partitions the named shards
@@ -943,3 +1353,345 @@ combined_campaign!(
 );
 combined_campaign!(combined_quick_open, Format::QuickOpen, campaign);
 combined_campaign!(combined_blake2, Format::Blake2, campaign);
+
+combined_campaign!(combined_chase_rar4, Format::Rar4, chase_campaign);
+combined_campaign!(combined_chase_rar5, Format::Rar5, chase_campaign);
+combined_campaign!(
+    combined_chase_rar4_encrypted,
+    Format::Rar4Encrypted,
+    chase_campaign
+);
+combined_campaign!(
+    combined_chase_rar4_unsalted,
+    Format::Rar4Unsalted,
+    chase_campaign
+);
+combined_campaign!(
+    combined_chase_rar5_encrypted,
+    Format::Rar5Encrypted,
+    chase_campaign
+);
+combined_campaign!(
+    combined_chase_rar5_keyed_checksum,
+    Format::Rar5KeyedChecksum,
+    chase_campaign
+);
+combined_campaign!(
+    combined_chase_rar5_header_encrypted,
+    Format::Rar5EncryptedHeaders,
+    chase_campaign
+);
+combined_campaign!(
+    combined_chase_rar5_unchecked_header,
+    Format::Rar5UncheckedHeaders,
+    chase_campaign
+);
+combined_campaign!(combined_chase_quick_open, Format::QuickOpen, chase_campaign);
+combined_campaign!(combined_chase_blake2, Format::Blake2, chase_campaign);
+
+combined_campaign!(
+    combined_conventional_rar4,
+    Format::Rar4,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5,
+    Format::Rar5,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_encrypted,
+    Format::Rar4Encrypted,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_unsalted,
+    Format::Rar4Unsalted,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_encrypted,
+    Format::Rar5Encrypted,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_keyed_checksum,
+    Format::Rar5KeyedChecksum,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_header_encrypted,
+    Format::Rar5EncryptedHeaders,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_unchecked_header,
+    Format::Rar5UncheckedHeaders,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_quick_open,
+    Format::QuickOpen,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_conventional_blake2,
+    Format::Blake2,
+    conventional_campaign
+);
+
+combined_campaign!(
+    combined_compressed_direct_rar4_mixed,
+    CompressedFormat::Rar4Mixed,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_lz,
+    CompressedFormat::Rar4Lz,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_encrypted,
+    CompressedFormat::Rar4Encrypted,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_headers,
+    CompressedFormat::Rar4Headers,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_mixed,
+    CompressedFormat::Rar5Mixed,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_lz,
+    CompressedFormat::Rar5Lz,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_encrypted,
+    CompressedFormat::Rar5Encrypted,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_headers,
+    CompressedFormat::Rar5Headers,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_mixed,
+    CompressedFormat::Rar4Mixed,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_lz,
+    CompressedFormat::Rar4Lz,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_encrypted,
+    CompressedFormat::Rar4Encrypted,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_headers,
+    CompressedFormat::Rar4Headers,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_mixed,
+    CompressedFormat::Rar5Mixed,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_lz,
+    CompressedFormat::Rar5Lz,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_encrypted,
+    CompressedFormat::Rar5Encrypted,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_headers,
+    CompressedFormat::Rar5Headers,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_mixed,
+    CompressedFormat::Rar4Mixed,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_lz,
+    CompressedFormat::Rar4Lz,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_encrypted,
+    CompressedFormat::Rar4Encrypted,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_headers,
+    CompressedFormat::Rar4Headers,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_mixed,
+    CompressedFormat::Rar5Mixed,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_lz,
+    CompressedFormat::Rar5Lz,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_encrypted,
+    CompressedFormat::Rar5Encrypted,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_headers,
+    CompressedFormat::Rar5Headers,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_solid,
+    CompressedFormat::Rar5Solid,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_solid,
+    CompressedFormat::Rar5Solid,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_solid,
+    CompressedFormat::Rar5Solid,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_solid_encrypted,
+    CompressedFormat::Rar5SolidEncrypted,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_solid_encrypted,
+    CompressedFormat::Rar5SolidEncrypted,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_solid_encrypted,
+    CompressedFormat::Rar5SolidEncrypted,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_solid_headers,
+    CompressedFormat::Rar5SolidHeaders,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_solid_headers,
+    CompressedFormat::Rar5SolidHeaders,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_solid_headers,
+    CompressedFormat::Rar5SolidHeaders,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_solid,
+    CompressedFormat::Rar4Solid,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_solid,
+    CompressedFormat::Rar4Solid,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_solid,
+    CompressedFormat::Rar4Solid,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_solid_encrypted,
+    CompressedFormat::Rar4SolidEncrypted,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_solid_encrypted,
+    CompressedFormat::Rar4SolidEncrypted,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_solid_encrypted,
+    CompressedFormat::Rar4SolidEncrypted,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_solid_headers,
+    CompressedFormat::Rar4SolidHeaders,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_solid_headers,
+    CompressedFormat::Rar4SolidHeaders,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_solid_headers,
+    CompressedFormat::Rar4SolidHeaders,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_ppmd,
+    CompressedFormat::Rar4Ppmd,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_ppmd,
+    CompressedFormat::Rar4Ppmd,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_ppmd,
+    CompressedFormat::Rar4Ppmd,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_ppmd_encrypted,
+    CompressedFormat::Rar4PpmdEncrypted,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_ppmd_encrypted,
+    CompressedFormat::Rar4PpmdEncrypted,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_ppmd_encrypted,
+    CompressedFormat::Rar4PpmdEncrypted,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_ppmd_headers,
+    CompressedFormat::Rar4PpmdHeaders,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_ppmd_headers,
+    CompressedFormat::Rar4PpmdHeaders,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_ppmd_headers,
+    CompressedFormat::Rar4PpmdHeaders,
+    compressed_conventional_campaign
+);
