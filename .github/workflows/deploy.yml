@@ -429,7 +429,7 @@ jobs:
     if: ${{ !cancelled() && needs.archive-extraction-matrix-build.result == 'success' }}
     needs: [archive-extraction-matrix-build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       max-parallel: 32
