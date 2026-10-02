@@ -501,6 +501,13 @@ fn seeds() -> Vec<u64> {
 }
 
 fn campaign(variant: Variant) {
+    campaign_seeds(variant, &seeds());
+}
+
+fn campaign_seeds(variant: Variant, seeds: &[u64]) {
+    if seeds.is_empty() {
+        return;
+    }
     let fixture = Fixture::new(variant);
     for damage in [
         Damage::Clean,
@@ -518,7 +525,7 @@ fn campaign(variant: Variant) {
         {
             continue;
         }
-        for seed in seeds() {
+        for &seed in seeds {
             let mut events = schedule(&fixture, seed);
             if seed % 2 == 0 && !fixture.data_only {
                 // Every recovery volume repeats vital metadata. Alternate
@@ -573,7 +580,40 @@ variant_test!(cauchy_gf16_schedules, Cauchy16);
 variant_test!(fft_gf8_schedules, Fft8);
 variant_test!(fft_gf16_schedules, Fft16);
 variant_test!(fft_uneven_cohort_schedules, Cohorts);
-variant_test!(fft_over_65536_blocks_schedules, ManyBlocks);
+// Large-block repair performs filesystem work for every reconstructed block.
+// Keep the same seed/damage cross-product while bounding each runner slot to
+// one default seed, rather than serializing all sixteen scenarios in one test.
+mod fft_over_65536_blocks_schedules {
+    use super::*;
+
+    fn shard(index: u64) {
+        let selected: Vec<_> = seeds()
+            .into_iter()
+            .filter(|seed| seed % 4 == index)
+            .collect();
+        campaign_seeds(Variant::ManyBlocks, &selected);
+    }
+
+    #[test]
+    fn shard_00() {
+        shard(0);
+    }
+
+    #[test]
+    fn shard_01() {
+        shard(1);
+    }
+
+    #[test]
+    fn shard_02() {
+        shard(2);
+    }
+
+    #[test]
+    fn shard_03() {
+        shard(3);
+    }
+}
 variant_test!(aligned_deduplication_schedules, Aligned);
 variant_test!(sliding_deduplication_schedules, Sliding);
 variant_test!(data_only_schedules, DataOnly);

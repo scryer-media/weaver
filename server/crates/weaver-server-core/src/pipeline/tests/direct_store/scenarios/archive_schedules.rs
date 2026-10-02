@@ -328,6 +328,11 @@ async fn deliver_schedule_article(
     article: u32,
     articles: usize,
 ) {
+    retire_schedule_article(pipeline, job, file, article);
+    submit_volume_article_of(pipeline, job, volumes, file, article, articles).await;
+}
+
+fn retire_schedule_article(pipeline: &mut Pipeline, job: JobId, file: u32, article: u32) {
     let id = SegmentId {
         file_id: NzbFileId {
             job_id: job,
@@ -346,7 +351,56 @@ async fn deliver_schedule_article(
             }
         }
     }
-    submit_volume_article_of(pipeline, job, volumes, file, article, articles).await;
+}
+
+async fn deliver_schedule_refetches(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    volumes: &[(String, Vec<u8>)],
+    articles: usize,
+    mask: u8,
+    recovery: Option<&(u32, Vec<u8>)>,
+) {
+    let state = pipeline.jobs.get_mut(&job).unwrap();
+    let mut available = Vec::new();
+    for queue in [&mut state.download_queue, &mut state.recovery_queue] {
+        for work in queue.drain_all() {
+            let file = work.segment_id.file_id.file_index;
+            let article = work.segment_id.segment_number;
+            if (file < volumes.len() as u32
+                && mask & (1 << (file * articles as u32 + article)) == 0)
+                || recovery.is_some_and(|(index, _)| file == *index)
+            {
+                if !available.contains(&(file, article)) {
+                    available.push((file, article));
+                }
+                // Keep every undelivered article visible to the completion
+                // gate. Draining the whole batch hid future writes from PAR2.
+                queue.push(work);
+            }
+        }
+    }
+    for (file, article) in available {
+        if file < volumes.len() as u32 {
+            deliver_schedule_article(pipeline, job, volumes, file, article, articles).await;
+        } else {
+            let (index, bytes) = recovery.expect("queued recovery has fixture bytes");
+            retire_schedule_article(pipeline, job, *index, article);
+            submit_decoded_segment(
+                pipeline,
+                NzbFileId {
+                    job_id: job,
+                    file_index: *index,
+                },
+                article,
+                0,
+                bytes,
+                "silver.horizon.par2",
+                None,
+            )
+            .await;
+        }
+    }
 }
 
 pub(super) async fn run_profile_schedule(
@@ -410,6 +464,7 @@ pub(super) async fn run_profile_schedule(
     let mut trace = vec![];
     if loss.is_some_and(|(_, index_first)| index_first) {
         let (index, bytes) = recovery.as_ref().unwrap();
+        retire_schedule_article(&mut pipeline, job, *index, 0);
         submit_decoded_segment(
             &mut pipeline,
             NzbFileId {
@@ -499,6 +554,7 @@ pub(super) async fn run_profile_schedule(
     }
     if loss.is_some_and(|(_, index_first)| !index_first) {
         let (index, bytes) = recovery.as_ref().unwrap();
+        retire_schedule_article(&mut pipeline, job, *index, 0);
         submit_decoded_segment(
             &mut pipeline,
             NzbFileId {
@@ -517,35 +573,15 @@ pub(super) async fn run_profile_schedule(
     // more articles; service those before waiting for an extraction result.
     for _ in 0..128 {
         if let Some((mask, _)) = loss {
-            let state = pipeline.jobs.get_mut(&job).unwrap();
-            let mut queued = state.download_queue.drain_all();
-            queued.extend(state.recovery_queue.drain_all());
-            for work in queued {
-                let file = work.segment_id.file_id.file_index;
-                let article = work.segment_id.segment_number;
-                if file < volumes.len() as u32
-                    && mask & (1 << (file * articles as u32 + article)) == 0
-                {
-                    submit_volume_article_of(&mut pipeline, job, volumes, file, article, articles)
-                        .await;
-                } else if let Some((index, bytes)) = &recovery
-                    && file == *index
-                {
-                    submit_decoded_segment(
-                        &mut pipeline,
-                        NzbFileId {
-                            job_id: job,
-                            file_index: *index,
-                        },
-                        0,
-                        0,
-                        bytes,
-                        "silver.horizon.par2",
-                        None,
-                    )
-                    .await;
-                }
-            }
+            deliver_schedule_refetches(
+                &mut pipeline,
+                job,
+                volumes,
+                articles,
+                mask,
+                recovery.as_ref(),
+            )
+            .await;
         }
         drain_rar_refreshes(&mut pipeline).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
@@ -562,24 +598,15 @@ pub(super) async fn run_profile_schedule(
                 // A container probe can re-request its missing first article
                 // while the queues settle. Answer that request as unavailable
                 // before completion checks exhaustion, just like a server does.
-                let state = pipeline.jobs.get_mut(&job).unwrap();
-                state.download_queue = crate::DownloadQueue::new();
-                state.recovery_queue = crate::DownloadQueue::new();
-                for (file, article) in queued {
-                    if file < volumes.len() as u32
-                        && mask & (1 << (file * articles as u32 + article)) == 0
-                    {
-                        submit_volume_article_of(
-                            &mut pipeline,
-                            job,
-                            volumes,
-                            file,
-                            article,
-                            articles,
-                        )
-                        .await;
-                    }
-                }
+                deliver_schedule_refetches(
+                    &mut pipeline,
+                    job,
+                    volumes,
+                    articles,
+                    mask,
+                    recovery.as_ref(),
+                )
+                .await;
             } else {
                 trace.push(format!("refetch {queued:?}"));
                 for (file, article) in queued {
