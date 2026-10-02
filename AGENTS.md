@@ -11,7 +11,7 @@
 - Do not run the large archive schedule matrix during normal local development, routine validation, hygiene passes, or pre-commit checks. Run it locally only when an operator explicitly requests the matrix; a general request to test, validate, fix, or finish work is not authorization.
 - Keep ordinary smoke and regression tests in the default suite. Do not bypass the matrix exclusions with `--ignore-default-filter` or enable its ignored tests without that explicit request.
 - The opt-in local command is `cargo nextest run --profile archive-matrix --run-ignored all --no-fail-fast`. This covers the combined direct-store, chase, and conventional extraction campaigns for RAR and 7z.
-- CI must automatically run the complete matrix on every pull request update, in parallel with the ordinary test jobs, using the configured 32 Linux partitions. The local opt-in rule must not disable or scope-gate that CI coverage.
+- CI must automatically run the complete matrix on every pull request update, in parallel with the ordinary test jobs, using the configured 48 Linux partitions. The local opt-in rule must not disable or scope-gate that CI coverage.
 
 ## Test determinism
 

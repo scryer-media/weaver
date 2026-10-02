@@ -104,7 +104,7 @@ awk '
     if ($0 ~ /^    runs-on:/) matrix_runner = $0
     if ($0 ~ /^      max-parallel:/) matrix_parallel = $NF
     if ($0 ~ /^          name: archive-extraction-matrix-linux-x86_64$/) downloads++
-    if (index($0, "--partition count:${{ matrix.partition }}/32")) partition_command = 1
+    if (index($0, "--partition count:${{ matrix.partition }}/48")) partition_command = 1
     if ($0 ~ /^          --profile archive-matrix$/) matrix_profile = 1
     if ($0 ~ /^          --run-ignored all$/) matrix_opt_in = 1
     if ($0 ~ /^        partition:/) {
@@ -112,9 +112,9 @@ awk '
       sub(/^[^[]*\[/, "", values)
       sub(/\].*$/, "", values)
       count = split(values, partitions, ",")
-      if (count != 32) reject("archive extraction matrix must define 32 partitions")
+      if (count != 48) reject("archive extraction matrix must define 48 partitions")
       for (i = 1; i <= count; i++) {
-        if (partitions[i] + 0 != i) reject("archive extraction matrix partitions must cover 1 through 32 exactly once")
+        if (partitions[i] + 0 != i) reject("archive extraction matrix partitions must cover 1 through 48 exactly once")
       }
     }
   }
@@ -132,8 +132,8 @@ awk '
       reject("matrix workers must depend only on their artifact build")
     if (!index(matrix_if, "!cancelled()") || !index(matrix_if, "needs.archive-extraction-matrix-build.result =="))
       reject("matrix workers need an explicit cancellation and build-result condition")
-    if (matrix_runner != "    runs-on: ubuntu-24.04" || matrix_parallel != 32 || count != 32)
-      reject("matrix must stay on 32 Linux x86 workers")
+    if (matrix_runner != "    runs-on: ubuntu-24.04" || matrix_parallel != 48 || count != 48)
+      reject("matrix must stay on 48 Linux x86 workers")
     if (!matrix_profile || !matrix_opt_in)
       reject("matrix workers must explicitly select and enable the opt-in archive suite")
     if (downloads != 1 || !partition_command)
