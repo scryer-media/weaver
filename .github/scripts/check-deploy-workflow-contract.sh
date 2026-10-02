@@ -105,6 +105,8 @@ awk '
     if ($0 ~ /^      max-parallel:/) matrix_parallel = $NF
     if ($0 ~ /^          name: direct-store-matrix-linux-x86_64$/) downloads++
     if (index($0, "--partition count:${{ matrix.partition }}/32")) partition_command = 1
+    if ($0 ~ /^          --profile archive-matrix$/) matrix_profile = 1
+    if ($0 ~ /^          --run-ignored all$/) matrix_opt_in = 1
     if ($0 ~ /^        partition:/) {
       values = $0
       sub(/^[^[]*\[/, "", values)
@@ -118,8 +120,10 @@ awk '
   }
 
   END {
-    if (build_needs != "    needs: [changes, verify-release-tag, web-build]")
+    if (build_needs != "    needs: [changes, verify-release-tag]")
       reject("matrix compilation must run independently of the test jobs")
+    if (!index(build_if, "(github.event_name == " sprintf("%c", 39) "pull_request" sprintf("%c", 39) " || needs.changes.outputs.rust == " sprintf("%c", 39) "true" sprintf("%c", 39) ")"))
+      reject("matrix compilation must run for every pull request update regardless of changed paths")
     if (!index(build_if, "!cancelled()"))
       reject("matrix compilation must handle skipped optional ancestors explicitly")
     if (archives != 1 || uploads != 1 || build_runs_tests || archive_after_tests)
@@ -130,6 +134,8 @@ awk '
       reject("matrix workers need an explicit cancellation and build-result condition")
     if (matrix_runner != "    runs-on: ubuntu-24.04" || matrix_parallel != 32 || count != 32)
       reject("matrix must stay on 32 Linux x86 workers")
+    if (!matrix_profile || !matrix_opt_in)
+      reject("matrix workers must explicitly select and enable the opt-in archive suite")
     if (downloads != 1 || !partition_command)
       reject("matrix workers must consume the compiled artifact and select their partition")
     exit invalid

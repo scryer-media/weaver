@@ -1202,130 +1202,162 @@ macro_rules! combined_campaign {
         mod $module {
             use super::*;
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_00() {
                 $run($variant, Some(0)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_01() {
                 $run($variant, Some(1)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_02() {
                 $run($variant, Some(2)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_03() {
                 $run($variant, Some(3)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_04() {
                 $run($variant, Some(4)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_05() {
                 $run($variant, Some(5)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_06() {
                 $run($variant, Some(6)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_07() {
                 $run($variant, Some(7)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_08() {
                 $run($variant, Some(8)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_09() {
                 $run($variant, Some(9)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_10() {
                 $run($variant, Some(10)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_11() {
                 $run($variant, Some(11)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_12() {
                 $run($variant, Some(12)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_13() {
                 $run($variant, Some(13)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_14() {
                 $run($variant, Some(14)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_15() {
                 $run($variant, Some(15)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_16() {
                 $run($variant, Some(16)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_17() {
                 $run($variant, Some(17)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_18() {
                 $run($variant, Some(18)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_19() {
                 $run($variant, Some(19)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_20() {
                 $run($variant, Some(20)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_21() {
                 $run($variant, Some(21)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_22() {
                 $run($variant, Some(22)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_23() {
                 $run($variant, Some(23)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_24() {
                 $run($variant, Some(24)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_25() {
                 $run($variant, Some(25)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_26() {
                 $run($variant, Some(26)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_27() {
                 $run($variant, Some(27)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_28() {
                 $run($variant, Some(28)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_29() {
                 $run($variant, Some(29)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_30() {
                 $run($variant, Some(30)).await;
             }
             #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
             async fn shard_31() {
                 $run($variant, Some(31)).await;
             }

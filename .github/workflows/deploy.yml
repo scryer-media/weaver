@@ -348,8 +348,8 @@ jobs:
 
   direct-store-matrix-build:
     name: direct-store-matrix-build-linux-x86_64
-    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
-    needs: [changes, verify-release-tag, web-build]
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || needs.changes.outputs.rust == 'true') && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
+    needs: [changes, verify-release-tag]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -398,11 +398,6 @@ jobs:
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
         with:
           tool: nextest
-      - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ${{ env.WEB_ARTIFACT_NAME }}
-          path: apps/weaver-web/dist
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -455,11 +450,12 @@ jobs:
       - name: Run assigned direct-store matrix partition
         run: >-
           cargo nextest run
+          --profile archive-matrix
+          --run-ignored all
           --archive-file target/direct-store-matrix.tar.zst
           --workspace-remap .
           --partition count:${{ matrix.partition }}/32
           --no-fail-fast
-          -E 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_)'
 
   rust-clippy-windows:
     name: rust-clippy-windows-x86_64
