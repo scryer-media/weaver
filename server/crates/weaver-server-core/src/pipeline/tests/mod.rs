@@ -57,6 +57,8 @@ mod par2_multiset_gate;
 mod par2_multiset_grid;
 mod par3_completion;
 mod par3_recovery;
+#[cfg(unix)]
+mod post_processing_completion;
 mod rar_extraction;
 mod restart_resume_floor;
 mod restore_history;
