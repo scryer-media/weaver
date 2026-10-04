@@ -1116,6 +1116,11 @@ impl Pipeline {
             // has is the merged set, and so is the fail-fast arithmetic that
             // decides whether to wait, repair, or give up.
             self.salvage_partial_promoted_recovery_volumes(job_id).await;
+            // The salvage reads recovery volumes back, and a read the job
+            // cannot survive ends it there.
+            if !self.jobs.contains_key(&job_id) {
+                return;
+            }
 
             // Latched, so an indexless recovery set is named once rather than
             // on every entry to this gate.
@@ -1221,7 +1226,10 @@ impl Pipeline {
             // that pass read only the unproven remainder instead of the set.
             let mut quick_partial: Option<QuickPar2PartialEvidence> = None;
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
-                let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                let Some(state) = self.jobs.get(&job_id) else {
+                    return;
+                };
+                let working_dir = state.working_dir.clone();
                 Self::trip_par2_verification_started_failpoint();
                 match self
                     .quick_verify_par2_with_placement(
@@ -1334,7 +1342,12 @@ impl Pipeline {
 
             if let Some(par2_set) = par2_set {
                 let set_id = par2_set.recovery_set_id;
-                let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                // Every await above can end the job — a starved set fails it
+                // outright — and an ended job has nothing left to verify.
+                let Some(state) = self.jobs.get(&job_id) else {
+                    return;
+                };
+                let working_dir = state.working_dir.clone();
                 // Two direct-store preconditions for *any*
                 // authoritative pass below, whichever branch it takes. Both are
                 // no-ops for a job with no live direct set, so a conventional
