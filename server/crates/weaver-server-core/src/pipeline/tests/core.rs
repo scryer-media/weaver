@@ -752,6 +752,39 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
 }
 
 #[tokio::test]
+async fn completion_check_during_post_processing_does_not_finalize_again() {
+    for status in [JobStatus::QueuedPostProcessing, JobStatus::PostProcessing] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(10070);
+        let job_name = "Copper Lantern Late Completion Check";
+        let working_dir = intermediate_dir.join("copper-lantern");
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+        tokio::fs::write(working_dir.join("payload.mkv"), b"payload")
+            .await
+            .unwrap();
+        let mut state = minimal_job_state(job_id, job_name, working_dir.clone());
+        state.status = status.clone();
+        pipeline.jobs.insert(job_id, state);
+
+        // A late completion check landing while scripts run must not run the
+        // final move a second time: that claims `<name>.#<id>` and repoints the
+        // job's output directory out from under the running script.
+        pipeline.check_job_completion(job_id).await;
+        settle_inflight_moves(&mut pipeline).await;
+
+        assert_eq!(job_status_for_assert(&pipeline, job_id).unwrap(), status);
+        assert!(working_dir.join("payload.mkv").exists());
+        let mut entries = tokio::fs::read_dir(&complete_dir).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "{status:?}: completion check published into {}",
+            complete_dir.display()
+        );
+    }
+}
+
+#[tokio::test]
 async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
