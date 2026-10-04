@@ -2401,7 +2401,17 @@ impl Pipeline {
             else {
                 return Err(super::super::repair::DirectRepairFailure::DamageOutsideDirectSets);
             };
-            let ranges = super::super::repair::damaged_ranges(&file.valid_slices, slice_size, len);
+            let covered = set.volume_coverage_with_holds(volume_index);
+            // A slice verdict is about content, not about arrival: a slice
+            // whose bytes never came still verifies when the posted bytes were
+            // zeros, because that is what a hole reads as. Such a slice is
+            // right in the scratch and absent from the set, so the rewrite
+            // takes every byte the set does not hold as well as every byte
+            // the verdict condemned.
+            let ranges = super::super::repair::with_unheld_ranges(
+                super::super::repair::damaged_ranges(&file.valid_slices, slice_size, len),
+                &covered.missing(0, len),
+            );
             let rewrite = super::super::repair::widen_to_articles(
                 &ranges,
                 &set.segment_extents(volume_index),
@@ -2442,7 +2452,7 @@ impl Pipeline {
                     // Placed bytes and holds alike: the provider serves both,
                     // and an encrypted member's held edge block is the byte
                     // the composition needs to reach the article boundary.
-                    covered: set.volume_coverage_with_holds(volume_index),
+                    covered,
                     crcs: set.volume_crc_runs(volume_index),
                     // The raw physical coverage, not the article-whole clip the
                     // demotion sweep takes: PAR2 needs every slice it judged
