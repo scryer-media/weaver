@@ -316,6 +316,8 @@ impl Pipeline {
                 JobStatus::Paused
                     | JobStatus::Checking
                     | JobStatus::Moving
+                    | JobStatus::QueuedPostProcessing
+                    | JobStatus::PostProcessing
                     | JobStatus::Complete
                     | JobStatus::Failed { .. }
             ) {
