@@ -3368,27 +3368,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f4e3071967f671f618584179c4cb020d3180b82cb96aebca2ec5b9a925be00a"
-dependencies = [
- "aws-lc-sys",
- "bytes",
- "cap-std",
- "crc-fast",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "reedsolomon-rs 0.4.7 (registry+https://github.com/rust-lang/crates.io-index)",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "par2-rs"
 version = "0.10.7"
-source = "git+https://github.com/scryer-media/rarpar.git?rev=aa3e910b26e2e164679cb0bf71a2f94dff85ea0a#aa3e910b26e2e164679cb0bf71a2f94dff85ea0a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d22d0f1b80dea984502eb7101c99f8aa5cad6f93cff2a62d75a42aeeb40afcba"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -3398,23 +3380,25 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs 0.4.7 (git+https://github.com/scryer-media/rarpar.git?rev=aa3e910b26e2e164679cb0bf71a2f94dff85ea0a)",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
 ]
 
 [[package]]
 name = "par3-rs"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b4c4c9fa61c1181081494ea208f56def0969a46b538a5e89e1cb360c7821708"
+checksum = "6215b83666e769d4f840a9dfdb220df9d67df7de99c31784968004fb7af2bbbd"
 dependencies = [
  "blake3",
+ "cap-std",
  "crc-fast",
  "rayon",
- "reedsolomon-rs 0.4.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -3945,15 +3929,6 @@ name = "reedsolomon-rs"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f5c9886f0fb33841060092d2552aa1893edd77fad64143d31660edc8b3ae19a"
-dependencies = [
- "memmap2",
- "rayon",
-]
-
-[[package]]
-name = "reedsolomon-rs"
-version = "0.4.7"
-source = "git+https://github.com/scryer-media/rarpar.git?rev=aa3e910b26e2e164679cb0bf71a2f94dff85ea0a#aa3e910b26e2e164679cb0bf71a2f94dff85ea0a"
 dependencies = [
  "memmap2",
  "rayon",
@@ -5742,7 +5717,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs 0.4.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reedsolomon-rs",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",
@@ -5968,7 +5943,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-web-kit",
- "par2-rs 0.10.7",
+ "par2-rs",
  "quick-xml",
  "rayon",
  "reqwest",
@@ -6115,12 +6090,12 @@ dependencies = [
  "lzma-rust2",
  "lzma-turbo",
  "notify",
- "par2-rs 0.10.7",
+ "par2-rs",
  "par3-rs",
  "pbkdf2",
  "quick-xml",
  "rayon",
- "reedsolomon-rs 0.4.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reedsolomon-rs",
  "regex",
  "reqwest",
  "rmp-serde",
@@ -6181,7 +6156,7 @@ dependencies = [
  "criterion",
  "libloading",
  "memchr",
- "par2-rs 0.10.6",
+ "par2-rs",
  "thiserror 2.0.20",
 ]
 
