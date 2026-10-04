@@ -2732,6 +2732,16 @@ impl Pipeline {
             .direct_store
             .set(job_id, set_index)
             .is_some_and(|set| set.router.routes_encrypted());
+        // The neighbour a cipher edge is read from may itself be a volume this
+        // repair just rewrote, and `lengths` still states what it had received
+        // before the repair — short by every lost article. Read at that length,
+        // a rewritten volume's tail is past its end and the edge comes back
+        // empty. A repaired volume is exactly as long as PAR2 describes it.
+        let mut lengths = lengths.clone();
+        for volume in damaged {
+            lengths.insert(volume.volume_index, volume.len);
+        }
+        let lengths = &lengths;
         // One transaction over every volume the repair rewrote, in volume
         // order. A volume settled on its own cannot place a repaired byte whose
         // destination depends on another damaged volume: an encrypted block
