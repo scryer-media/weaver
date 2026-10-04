@@ -1,13 +1,16 @@
 //! Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    ExtractionProfile, Interruption, arrival_orders, combined_campaign, combined_schedules,
-    run_profile_schedule, schedules,
+    ExtractionProfile, Interruption, Route, Selection, combined_campaign, run_profile_schedule,
+    selected_schedules, wrong_password_schedules,
 };
 use super::*;
+use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
 
 #[derive(Clone, Copy, Debug)]
 enum Shape {
     Copy,
+    /// Four single-article volumes, so two of the volumes are middle volumes.
+    CopyFourVolumes,
     Multiple,
     EmptyEntry,
     Nested,
@@ -20,19 +23,19 @@ enum Shape {
     SolidHeaders,
 }
 
-async fn campaign(shape: Shape, shard: Option<usize>) {
-    profile_campaign(shape, shard, ExtractionProfile::DirectStore).await;
+async fn campaign(shape: Shape, selection: Selection) {
+    profile_campaign(shape, selection, ExtractionProfile::DirectStore).await;
 }
 
-async fn chase_campaign(shape: Shape, shard: Option<usize>) {
-    profile_campaign(shape, shard, ExtractionProfile::Chase).await;
+async fn chase_campaign(shape: Shape, selection: Selection) {
+    profile_campaign(shape, selection, ExtractionProfile::Chase).await;
 }
 
-async fn conventional_campaign(shape: Shape, shard: Option<usize>) {
-    profile_campaign(shape, shard, ExtractionProfile::Conventional).await;
+async fn conventional_campaign(shape: Shape, selection: Selection) {
+    profile_campaign(shape, selection, ExtractionProfile::Conventional).await;
 }
 
-async fn profile_campaign(shape: Shape, shard: Option<usize>, profile: ExtractionProfile) {
+async fn profile_campaign(shape: Shape, selection: Selection, profile: ExtractionProfile) {
     let first = payload(13, 6001);
     let second = payload(29, 307);
     let name = if matches!(shape, Shape::Nested) {
@@ -107,46 +110,90 @@ async fn profile_campaign(shape: Shape, shard: Option<usize>, profile: Extractio
             matches!(shape, Shape::EncryptedHeaders),
         )
     };
-    let volumes = split_volumes(&archive, 2);
-    let mut spec = sevenz_job_spec(&volumes, 2);
+    let count = if matches!(shape, Shape::CopyFourVolumes) {
+        4
+    } else {
+        2
+    };
+    let volumes = split_volumes(&archive, count);
+    let mut spec = sevenz_job_spec(&volumes, 4 / count);
     spec.password = password.map(str::to_owned);
     let wanted = expected.keys().copied().collect::<Vec<_>>();
-    if password.is_some() && (shard.is_none() || shard == Some(0)) {
-        for order in arrival_orders() {
-            let mut wrong = spec.clone();
-            wrong.password = Some("incorrect-key".to_string());
-            let rejected = run_profile_schedule(
-                profile,
-                wrong,
-                &volumes,
-                &order,
-                &wanted,
-                Interruption::None,
-            )
-            .await;
-            profile.assert_route(&rejected);
-            assert!(
-                matches!(rejected.status, Some(JobStatus::Failed { .. })),
-                "wrong password {shape:?} {order:?}: {:?}",
-                rejected.status
-            );
-            assert_eq!(rejected.finalized, 0);
-            assert!(
-                rejected.files.values().all(Option::is_none),
-                "wrong password published output: {shape:?} {order:?}"
-            );
+    let direct_compatible = matches!(
+        shape,
+        Shape::Copy | Shape::CopyFourVolumes | Shape::Multiple | Shape::EmptyEntry | Shape::Nested
+    );
+    // A 7z set's layout lives in two articles of its own: the start header
+    // opens the first volume and the end header closing the last volume holds
+    // the map. Every schedule spans four article slots, so those are always
+    // slots 0 and 3. While either is lost no byte has a destination, and
+    // only a repair of the whole payload brings it back.
+    let unmapped_loss: fn(u8) -> bool = |mask| mask & 0b1001 != 0;
+    let route = match shape {
+        _ if direct_compatible => Route {
+            unmapped_loss,
+            ..Route::DIRECT
+        },
+        // Coder output is not the archive's bytes, so it has nowhere to go.
+        Shape::Lzma2Fallback | Shape::Solid => Route {
+            unmapped_loss,
+            ..Route::refused(|reason| {
+                matches!(reason, DemotionReason::SevenZip(SevenZipRefusal::Coder))
+            })
+        },
+        // Ciphertext is not the member's bytes either, and a header that is
+        // itself encrypted hides the layout.
+        Shape::EncryptedCopy
+        | Shape::EncryptedHeaders
+        | Shape::EncryptedLzma2
+        | Shape::SolidEncrypted
+        | Shape::SolidHeaders => Route {
+            unmapped_loss,
+            ..Route::refused(|reason| {
+                matches!(
+                    reason,
+                    DemotionReason::SevenZip(
+                        SevenZipRefusal::EncryptedContent
+                            | SevenZipRefusal::EncryptedHeader
+                            | SevenZipRefusal::Coder
+                    )
+                )
+            })
+        },
+        _ => unreachable!("{shape:?} is direct-compatible"),
+    };
+    // A password the archive does not open with. An archive that needs none
+    // must not notice it.
+    for (order, interruption) in wrong_password_schedules(selection) {
+        if !profile.includes(interruption) {
+            continue;
+        }
+        let mut wrong = spec.clone();
+        wrong.password = Some("incorrect-key".to_string());
+        eprintln!(
+            "wrong password {shape:?} profile={profile:?} order={order:?} interruption={interruption:?}"
+        );
+        let outcome =
+            run_profile_schedule(profile, wrong, &volumes, &order, &wanted, interruption).await;
+        if password.is_some() {
+            profile.assert_rejected(&outcome, &wanted);
+        } else {
+            assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
+            profile.assert_delivery(&outcome, route, &wanted, interruption);
+            for (name, bytes) in &expected {
+                assert_eq!(
+                    outcome.files.get(*name).and_then(Option::as_deref),
+                    Some(bytes.as_slice())
+                );
+            }
         }
     }
-    let cases = shard.map_or_else(
-        || schedules().into_iter().enumerate().collect(),
-        combined_schedules,
-    );
-    for (case, (order, interruption)) in cases {
+    for (case, (order, interruption)) in selected_schedules(selection) {
         if !profile.includes(interruption) {
             continue;
         }
         eprintln!(
-            "{shape:?} profile={profile:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
+            "{shape:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
         let outcome = run_profile_schedule(
             profile,
@@ -157,17 +204,17 @@ async fn profile_campaign(shape: Shape, shard: Option<usize>, profile: Extractio
             interruption,
         )
         .await;
+        if interruption.fails() {
+            profile.assert_rejected(&outcome, &wanted);
+            continue;
+        }
         assert_eq!(
             outcome.status,
             Some(JobStatus::Complete),
             "{shape:?} case={case} order={order:?} interruption={interruption:?}: {:?}",
             outcome.trace
         );
-        profile.assert_route(&outcome);
-        let direct_compatible = matches!(
-            shape,
-            Shape::Copy | Shape::Multiple | Shape::EmptyEntry | Shape::Nested
-        );
+        profile.assert_delivery(&outcome, route, &wanted, interruption);
         if matches!(interruption, Interruption::None)
             && (profile == ExtractionProfile::Chase
                 || (profile == ExtractionProfile::DirectStore && !direct_compatible))
@@ -195,39 +242,58 @@ async fn profile_campaign(shape: Shape, shard: Option<usize>, profile: Extractio
 
 #[tokio::test]
 async fn copy_arrival_schedules() {
-    campaign(Shape::Copy, None).await;
+    campaign(Shape::Copy, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn copy_four_volume_arrival_schedules() {
+    campaign(Shape::CopyFourVolumes, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn multiple_member_arrival_schedules() {
-    campaign(Shape::Multiple, None).await;
+    campaign(Shape::Multiple, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn empty_entry_arrival_schedules() {
-    campaign(Shape::EmptyEntry, None).await;
+    campaign(Shape::EmptyEntry, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn nested_member_arrival_schedules() {
-    campaign(Shape::Nested, None).await;
+    campaign(Shape::Nested, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn compressed_fallback_arrival_schedules() {
-    campaign(Shape::Lzma2Fallback, None).await;
+    campaign(Shape::Lzma2Fallback, Selection::Smoke).await;
 }
 
 #[tokio::test]
 async fn encrypted_copy_schedules() {
-    campaign(Shape::EncryptedCopy, None).await;
+    campaign(Shape::EncryptedCopy, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn encrypted_header_schedules() {
-    campaign(Shape::EncryptedHeaders, None).await;
+    campaign(Shape::EncryptedHeaders, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn encrypted_compressed_schedules() {
-    campaign(Shape::EncryptedLzma2, None).await;
+    campaign(Shape::EncryptedLzma2, Selection::Smoke).await;
 }
 
 combined_campaign!(combined_copy, Shape::Copy, campaign);
+combined_campaign!(
+    combined_copy_four_volume,
+    Shape::CopyFourVolumes,
+    campaign
+);
+combined_campaign!(
+    combined_chase_copy_four_volume,
+    Shape::CopyFourVolumes,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_copy_four_volume,
+    Shape::CopyFourVolumes,
+    conventional_campaign
+);
 combined_campaign!(combined_multiple, Shape::Multiple, campaign);
 combined_campaign!(combined_empty_entry, Shape::EmptyEntry, campaign);
 combined_campaign!(combined_nested, Shape::Nested, campaign);

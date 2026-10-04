@@ -1,8 +1,10 @@
-//! Bounded exhaustive schedules over four articles: one or two volumes,
+//! Bounded exhaustive schedules over four articles: one, two or four volumes,
 //! every arrival permutation, loss subset and single duplicate/interruption.
 //! This enumerates delivery boundaries, not background worker or filesystem
 //! interleavings; those require separate tests that force the competing events.
 use super::*;
+use crate::pipeline::direct_store::router::MemberIneligibility;
+use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
 
 fn enable_schedule_trace() {
     if std::env::var_os("WEAVER_ARCHIVE_SCHEDULE_TRACE").is_none() {
@@ -77,9 +79,90 @@ pub(super) struct Outcome {
     pub status: Option<JobStatus>,
     pub files: BTreeMap<String, Option<Vec<u8>>>,
     pub trace: Vec<String>,
+    /// Sets finalized from their own partials, over every incarnation.
     pub finalized: usize,
     pub chase_armed: u64,
     pub chase_consumed: u64,
+    /// Every direct-store demotion any incarnation of the pipeline recorded.
+    pub demotions: Vec<DemotionReason>,
+    /// Whether the schedule's own demote action claimed a live set.
+    pub schedule_demoted: bool,
+    /// Every file under the job's output directory, by relative path.
+    pub published: BTreeSet<String>,
+    /// Everything the job left outside its output directory.
+    pub leftovers: BTreeSet<String>,
+    /// Volume articles the pipeline asked for again after it was handed them.
+    pub rerequested: BTreeSet<(u32, u32)>,
+    /// Delivered articles a direct set has no reason to ask for again.
+    ///
+    /// Without a restart that is every one of them. A shutdown barrier keeps
+    /// what its checkpoint names: each complete volume, and each partial
+    /// volume's articles under the floor short of the last, because the floor
+    /// counts decoded bytes against encoded article sizes and so stops one
+    /// article early. A crash promises nothing.
+    pub durable: BTreeSet<(u32, u32)>,
+}
+
+/// What a schedule may do to a direct set besides finalize it.
+#[derive(Clone, Copy)]
+pub(super) struct Route {
+    /// The set this archive forms routes direct from first article to last.
+    pub direct: bool,
+    /// Independent sets in the job. The schedule's own demotion claims the
+    /// first one only; every other set finalizes on its own.
+    pub sets: usize,
+    /// The demotions the archive's own shape earns, whatever the schedule.
+    pub shape_demotion: fn(DemotionReason) -> bool,
+    /// Loss masks that leave the set without a layout to route by.
+    ///
+    /// A set whose layout lives in articles of its own has no destination
+    /// for any byte while those articles are missing; only a repair of the
+    /// whole payload brings them back, and by then nothing is left to route.
+    pub unmapped_loss: fn(u8) -> bool,
+}
+
+impl Route {
+    pub(super) const DIRECT: Self = Self {
+        direct: true,
+        sets: 1,
+        shape_demotion: |_| false,
+        unmapped_loss: |_| false,
+    };
+
+    /// A set the layout refuses to route: it demotes for its shape and
+    /// nothing it does afterwards is a direct-store decision.
+    pub(super) const fn refused(shape_demotion: fn(DemotionReason) -> bool) -> Self {
+        Self {
+            direct: false,
+            sets: 1,
+            shape_demotion,
+            unmapped_loss: |_| false,
+        }
+    }
+}
+
+fn files_under(root: &Path) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+    found
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +206,98 @@ impl ExtractionProfile {
             )
     }
 
+    /// Holds a schedule that cannot succeed to failing cleanly: a failed job,
+    /// no set finalized, and none of the archive's members published.
+    pub(super) fn assert_rejected(self, outcome: &Outcome, expected: &[&str]) {
+        self.assert_route(outcome);
+        let trace = &outcome.trace;
+        assert!(
+            matches!(outcome.status, Some(JobStatus::Failed { .. })),
+            "{:?}: {trace:?}",
+            outcome.status
+        );
+        assert_eq!(outcome.finalized, 0, "{trace:?}");
+        assert!(
+            outcome.files.values().all(Option::is_none)
+                && expected
+                    .iter()
+                    .all(|name| !outcome.published.contains(*name)),
+            "a failed job published output {:?}: {trace:?}",
+            outcome.published
+        );
+    }
+
+    /// Holds a finished schedule to the route its profile and archive shape
+    /// allow: which sets may leave direct store, what reaches the output
+    /// directory, and what the job may leave behind or ask for twice.
+    pub(super) fn assert_delivery(
+        self,
+        outcome: &Outcome,
+        route: Route,
+        expected: &[&str],
+        interruption: Interruption,
+    ) {
+        self.assert_route(outcome);
+        let trace = &outcome.trace;
+        let unmapped = interruption
+            .loss()
+            .is_some_and(|(mask, _)| (route.unmapped_loss)(mask));
+        let unexpected: Vec<_> = outcome
+            .demotions
+            .iter()
+            .filter(|reason| match **reason {
+                DemotionReason::HoldsBudgetExceeded if outcome.schedule_demoted => false,
+                DemotionReason::SevenZip(SevenZipRefusal::UnreadableMap) if unmapped => false,
+                reason => !(route.shape_demotion)(reason),
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "direct store demoted unexpectedly: {unexpected:?} trace={trace:?}"
+        );
+        let schedule_only = outcome.schedule_demoted
+            && outcome
+                .demotions
+                .iter()
+                .all(|reason| *reason == DemotionReason::HoldsBudgetExceeded);
+        if self != Self::DirectStore {
+            assert!(outcome.demotions.is_empty(), "{trace:?}");
+        } else if route.direct && schedule_only {
+            // The schedule claimed one set; the others stay direct.
+            assert_eq!(
+                outcome.finalized,
+                route.sets - 1,
+                "a set the schedule left alone left the direct route: {trace:?}"
+            );
+        } else if route.direct && outcome.demotions.is_empty() {
+            assert_eq!(
+                outcome.finalized, route.sets,
+                "set left the direct route: {trace:?}"
+            );
+            let refetched: Vec<_> = outcome
+                .rerequested
+                .intersection(&outcome.durable)
+                .collect();
+            assert!(
+                refetched.is_empty(),
+                "direct set refetched durable articles {refetched:?}: {trace:?}"
+            );
+        } else if route.sets == 1 {
+            assert_eq!(outcome.finalized, 0, "{trace:?}");
+        } else {
+            assert!(outcome.finalized < route.sets, "{trace:?}");
+        }
+        if outcome.status == Some(JobStatus::Complete) {
+            let expected: BTreeSet<String> = expected.iter().map(|name| (*name).into()).collect();
+            assert_eq!(outcome.published, expected, "published files: {trace:?}");
+        }
+        assert!(
+            outcome.leftovers.is_empty(),
+            "job left files behind {:?}: {trace:?}",
+            outcome.leftovers
+        );
+    }
+
     pub(super) fn assert_route(self, outcome: &Outcome) {
         if self != Self::DirectStore {
             assert_eq!(outcome.finalized, 0, "{:?}", outcome.trace);
@@ -139,6 +314,9 @@ pub(super) enum BoundaryAction {
     None,
     Restart,
     Demote,
+    /// The process dies: no shutdown barrier, so the restart finds whatever
+    /// coverage the last barrier of its own happened to publish.
+    Crash,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -146,6 +324,7 @@ pub(super) enum Interruption {
     None,
     Restart(usize),
     Demote(usize),
+    Crash(usize),
     Loss {
         mask: u8,
         index_first: bool,
@@ -156,7 +335,25 @@ pub(super) enum Interruption {
         action: BoundaryAction,
         at: usize,
     },
+    /// Loss with a recovery set that describes the damage and cannot mend it.
+    Starved {
+        mask: u8,
+    },
 }
+
+/// Which slice of a campaign one test runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Selection {
+    /// The default suite's bounded sample.
+    Smoke,
+    /// One shard of the combined matrix.
+    Shard(usize),
+    /// A wrong password across every arrival order and interruption boundary.
+    WrongPassword,
+}
+
+/// Shards the combined matrix is cut into, each its own test.
+pub(super) const SHARDS: usize = 64;
 
 impl Interruption {
     fn loss(self) -> Option<(u8, bool)> {
@@ -165,14 +362,21 @@ impl Interruption {
             | Self::Combined {
                 mask, index_first, ..
             } => Some((mask, index_first)),
+            Self::Starved { mask } => Some((mask, false)),
             _ => None,
         }
+    }
+
+    /// The job cannot finish: what was lost is beyond the recovery it has.
+    pub(super) fn fails(self) -> bool {
+        matches!(self, Self::Starved { .. })
     }
 
     fn action_at(self, boundary: usize) -> BoundaryAction {
         match self {
             Self::Restart(at) if at == boundary => BoundaryAction::Restart,
             Self::Demote(at) if at == boundary => BoundaryAction::Demote,
+            Self::Crash(at) if at == boundary => BoundaryAction::Crash,
             Self::Combined { action, at, .. } if at == boundary => action,
             _ => BoundaryAction::None,
         }
@@ -182,6 +386,43 @@ impl Interruption {
 type Schedule = (Vec<(u32, u32)>, Interruption);
 
 pub(super) fn combined_schedules(shard: usize) -> Vec<(usize, Schedule)> {
+    assert!(shard < SHARDS);
+    combined_schedule_cases()
+        .into_iter()
+        .filter(|(case, _)| case % SHARDS == shard)
+        .collect()
+}
+
+/// A campaign's cases for one selection, by replay index.
+pub(super) fn selected_schedules(selection: Selection) -> Vec<(usize, Schedule)> {
+    match selection {
+        Selection::Smoke => schedules().into_iter().enumerate().collect(),
+        Selection::Shard(shard) => combined_schedules(shard),
+        Selection::WrongPassword => Vec::new(),
+    }
+}
+
+/// A wrong password's schedules: every arrival order, uninterrupted and
+/// interrupted at every boundary. The default suite keeps the uninterrupted
+/// orders; the matrix runs them all as a test of its own.
+pub(super) fn wrong_password_schedules(selection: Selection) -> Vec<Schedule> {
+    let mut result = Vec::new();
+    if selection == Selection::Smoke || selection == Selection::WrongPassword {
+        for order in arrival_orders() {
+            result.push((order.clone(), Interruption::None));
+            if selection == Selection::WrongPassword {
+                for at in 0..order.len() {
+                    result.push((order.clone(), Interruption::Restart(at)));
+                    result.push((order.clone(), Interruption::Crash(at)));
+                    result.push((order.clone(), Interruption::Demote(at)));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn combined_schedule_cases() -> Vec<(usize, Schedule)> {
     let mut orders = std::collections::BTreeSet::new();
     for order in arrival_orders() {
         orders.insert(order.clone());
@@ -245,7 +486,49 @@ pub(super) fn combined_schedules(shard: usize) -> Vec<(usize, Schedule)> {
         }
     }
     assert_eq!(cases.len(), 6318);
-    assert!(shard < 32);
+    // A crash at every boundary a restart was tried at, appended for the same
+    // reason: the cases above keep their replay indices.
+    let mut crashes = std::collections::BTreeSet::new();
+    for (received, interruption) in &cases {
+        match *interruption {
+            Interruption::Combined {
+                mask,
+                index_first,
+                action: BoundaryAction::Restart,
+                at,
+            } => {
+                crashes.insert((
+                    received.clone(),
+                    Interruption::Combined {
+                        mask,
+                        index_first,
+                        action: BoundaryAction::Crash,
+                        at,
+                    },
+                ));
+            }
+            Interruption::Restart(at) => {
+                crashes.insert((received.clone(), Interruption::Crash(at)));
+            }
+            _ => {}
+        }
+    }
+    cases.extend(crashes);
+    assert_eq!(cases.len(), 9168);
+    // Every distinct received sequence again, with nothing to repair it from.
+    let starved: std::collections::BTreeSet<_> = cases
+        .iter()
+        .filter_map(|(received, interruption)| match *interruption {
+            Interruption::Combined {
+                mask,
+                action: BoundaryAction::None,
+                ..
+            } => Some((received.clone(), Interruption::Starved { mask })),
+            _ => None,
+        })
+        .collect();
+    cases.extend(starved);
+    assert_eq!(cases.len(), 9393);
     let selected = std::env::var("WEAVER_ARCHIVE_COMBINED_CASE")
         .ok()
         .map(|selection| {
@@ -265,9 +548,7 @@ pub(super) fn combined_schedules(shard: usize) -> Vec<(usize, Schedule)> {
     cases
         .into_iter()
         .enumerate()
-        .filter(|(case, _)| {
-            case % 32 == shard && selected.as_ref().is_none_or(|range| range.contains(case))
-        })
+        .filter(|(case, _)| selected.as_ref().is_none_or(|range| range.contains(case)))
         .collect()
 }
 
@@ -289,6 +570,15 @@ pub(super) fn schedules() -> Vec<(Vec<(u32, u32)>, Interruption)> {
                 Interruption::Loss { mask, index_first },
             ));
         }
+    }
+    // Appended, so the cases above keep their replay indices.
+    for order in arrival_orders() {
+        for at in 1..4 {
+            result.push((order.clone(), Interruption::Crash(at)));
+        }
+    }
+    for mask in 1..16 {
+        result.push((in_order_arrivals(2), Interruption::Starved { mask }));
     }
     if let Ok(case) = std::env::var("WEAVER_ARCHIVE_SCHEDULE_CASE") {
         let case = case
@@ -405,8 +695,24 @@ async fn deliver_schedule_refetches(
 
 pub(super) async fn run_profile_schedule(
     profile: ExtractionProfile,
+    spec: JobSpec,
+    volumes: &[(String, Vec<u8>)],
+    order: &[(u32, u32)],
+    wanted: &[&str],
+    interruption: Interruption,
+) -> Outcome {
+    run_described_schedule(profile, spec, volumes, None, order, wanted, interruption).await
+}
+
+/// A schedule whose recovery set describes the volumes under `described`
+/// names rather than the posted ones, the way an obfuscated post's PAR2
+/// carries the real names. Such a job always carries its index: without a
+/// loss it arrives first and holds no recovery blocks.
+pub(super) async fn run_described_schedule(
+    profile: ExtractionProfile,
     mut spec: JobSpec,
     volumes: &[(String, Vec<u8>)],
+    described: Option<&[String]>,
     order: &[(u32, u32)],
     wanted: &[&str],
     interruption: Interruption,
@@ -431,10 +737,18 @@ pub(super) async fn run_profile_schedule(
     profile.configure(&mut pipeline);
     let mut chase_armed = 0;
     let mut chase_consumed = 0;
+    let mut finalized = 0;
+    let mut demotions = Vec::new();
+    let mut schedule_demoted = false;
+    let mut retired = None;
+    let mut delivered = BTreeSet::new();
+    let mut rerequested = BTreeSet::new();
+    let mut durable = None;
     let job = JobId(42200);
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let loss = interruption.loss();
-    let recovery = if loss.is_some() {
+    let index_first = loss.map_or(described.is_some(), |(_, first)| first);
+    let recovery = if loss.is_some() || described.is_some() {
         // Keep several repair blocks per article even for larger compressed
         // fixtures, without turning extraction scheduling into a codec benchmark.
         let slice = volumes
@@ -446,23 +760,32 @@ pub(super) async fn run_profile_schedule(
             .div_ceil(4)
             * 4;
         let slice = slice.max(PAR2_SLICE_BYTES as usize);
-        let blocks = volumes
+        let blocks: usize = volumes
             .iter()
             .map(|(_, bytes)| bytes.len().div_ceil(slice))
             .sum();
         let described: Vec<_> = volumes
             .iter()
-            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .enumerate()
+            .map(|(index, (name, bytes))| {
+                let name = described.map_or(name.as_str(), |names| names[index].as_str());
+                (name, bytes.as_slice())
+            })
             .collect();
+        let blocks = if interruption.fails() || loss.is_none() {
+            0
+        } else {
+            blocks
+        };
         let bytes = build_test_par2_with_recovery(&described, slice as u64, blocks);
         let index = append_par2_index(&mut spec, &bytes);
         Some((index, bytes))
     } else {
         None
     };
-    let working_dir = insert_active_job(&mut pipeline, job, spec.clone()).await;
+    insert_active_job(&mut pipeline, job, spec.clone()).await;
     let mut trace = vec![];
-    if loss.is_some_and(|(_, index_first)| index_first) {
+    if recovery.is_some() && index_first {
         let (index, bytes) = recovery.as_ref().unwrap();
         retire_schedule_article(&mut pipeline, job, *index, 0);
         submit_decoded_segment(
@@ -483,9 +806,11 @@ pub(super) async fn run_profile_schedule(
         match interruption.action_at(step) {
             BoundaryAction::Demote => {
                 if profile == ExtractionProfile::DirectStore {
+                    let before = pipeline.direct_store.demotions.len();
                     pipeline
                         .demote_direct_set(job, 0, DemotionReason::HoldsBudgetExceeded)
                         .await;
+                    schedule_demoted |= pipeline.direct_store.demotions.len() != before;
                 }
                 // An incompatible set may already have left direct store and
                 // started chase. Withdraw that owner at the same boundary too.
@@ -501,41 +826,126 @@ pub(super) async fn run_profile_schedule(
                 settle_direct_post_repair_work(&mut pipeline).await;
                 trace.push(format!("demote at {step}"));
             }
-            BoundaryAction::Restart => {
-                pipeline
-                    .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
-                    .await;
+            action @ (BoundaryAction::Restart | BoundaryAction::Crash) => {
+                if action == BoundaryAction::Restart {
+                    pipeline
+                        .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+                        .await;
+                }
+                durable = Some(if action == BoundaryAction::Restart {
+                    // What the barrier just published is what the restart may
+                    // rely on. Bytes held without a destination are not in it.
+                    let mut kept = BTreeSet::new();
+                    for blob in pipeline.db.load_direct_coverage(job).unwrap().values() {
+                        use crate::pipeline::direct_store::snapshot;
+                        // A finalized set's marker vouches for every article
+                        // of every file it installed from.
+                        if snapshot::is_installed_marker(blob) {
+                            let installed = snapshot::decode_installed(blob).unwrap();
+                            for (_, file_index) in installed.volumes {
+                                kept.extend(
+                                    (0..articles as u32)
+                                        .map(|article| (file_index, article))
+                                        .filter(|article| delivered.contains(article)),
+                                );
+                            }
+                            continue;
+                        }
+                        let snapshot =
+                            crate::pipeline::direct_store::snapshot::decode(blob).unwrap();
+                        for floor in snapshot.floors {
+                            let Some((_, bytes)) = volumes.get(floor.file_index as usize) else {
+                                continue;
+                            };
+                            let covered = (0..articles as u32)
+                                .take_while(|article| {
+                                    article_extent(bytes.len(), *article, articles).1 as u64
+                                        <= floor.floor
+                                })
+                                .count() as u32;
+                            let kept_articles = if floor.complete {
+                                articles as u32
+                            } else {
+                                covered.saturating_sub(1)
+                            };
+                            kept.extend(
+                                (0..kept_articles)
+                                    .map(|article| (floor.file_index, article))
+                                    .filter(|article| delivered.contains(article)),
+                            );
+                        }
+                    }
+                    kept
+                } else {
+                    BTreeSet::new()
+                });
                 let counters = pipeline.direct_unpack.counters();
                 chase_armed += counters.armed;
                 chase_consumed += counters.consumed;
+                finalized += pipeline.direct_store.finalized_sets;
+                demotions.append(&mut pipeline.direct_store.demotions);
+                let status = job_status_for_assert(&pipeline, job);
                 pipeline.direct_unpack_shutdown("schedule restart").await;
                 drop(pipeline);
+                // The write handles are process-wide; a dead process takes its
+                // handles with it, so the next incarnation must open its own.
+                settle_direct_output_removals(root.path()).await;
                 (pipeline, _, _) = new_direct_pipeline(&root).await;
                 profile.configure(&mut pipeline);
+                // Restore from the rows the dead process left, exactly as
+                // startup recovery does. A job it had already finished is not
+                // restored at all.
+                let recovered = pipeline.db.load_active_jobs().unwrap().remove(&job);
+                let recovered = recovered.filter(|recovered| {
+                    !matches!(
+                        recovered.status.as_str(),
+                        "complete" | "failed" | "cancelled"
+                    )
+                });
+                trace.push(format!(
+                    "{action:?} at {step}: status={status:?} recovered={:?}",
+                    recovered.as_ref().map(|recovered| (
+                        &recovered.status,
+                        &recovered.file_progress,
+                        &recovered.complete_files,
+                        &recovered.extracted_members
+                    ))
+                ));
+                let Some(recovered) = recovered else {
+                    retired = Some(status);
+                    break;
+                };
+                use crate::jobs::model::{DownloadState, PostState, RunState};
                 pipeline
                     .restore_job(RestoreJobRequest {
                         job_id: job,
-                        job_hash: [0; 32],
+                        job_hash: recovered.nzb_hash,
                         spec: spec.clone(),
-                        complete_files: HashSet::new(),
-                        file_progress: HashMap::new(),
-                        detected_archives: HashMap::new(),
-                        file_identities: HashMap::new(),
-                        extracted_members: HashSet::new(),
-                        status: JobStatus::Downloading,
-                        download_state: None,
-                        post_state: None,
-                        run_state: None,
-                        queued_repair_at_epoch_ms: None,
-                        queued_extract_at_epoch_ms: None,
+                        complete_files: recovered.complete_files,
+                        file_progress: recovered.file_progress,
+                        detected_archives: recovered.detected_archives,
+                        file_identities: recovered.file_identities,
+                        extracted_members: recovered.extracted_members,
+                        status: crate::jobs::model::job_status_from_persisted_str(
+                            &recovered.status,
+                            recovered.error.as_deref(),
+                        ),
+                        download_state: recovered
+                            .download_state
+                            .as_deref()
+                            .and_then(DownloadState::parse),
+                        post_state: recovered.post_state.as_deref().and_then(PostState::parse),
+                        run_state: recovered.run_state.as_deref().and_then(RunState::parse),
+                        queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,
+                        queued_extract_at_epoch_ms: recovered.queued_extract_at_epoch_ms,
                         paused_resume_status: None,
                         paused_resume_download_state: None,
                         paused_resume_post_state: None,
-                        working_dir: working_dir.clone(),
+                        working_dir: recovered.output_dir,
                     })
                     .await
                     .unwrap();
-                trace.push(format!("restart at {step}"));
+                note_rerequests(&mut pipeline, job, &delivered, &mut rerequested);
             }
             BoundaryAction::None => {}
         }
@@ -547,12 +957,13 @@ pub(super) async fn run_profile_schedule(
             continue;
         }
         deliver_schedule_article(&mut pipeline, job, volumes, file, article, articles).await;
+        delivered.insert((file, article));
         trace.push(format!(
             "arrive {file}:{article}: {:?}",
             pipeline.direct_store.sets_for(job)
         ));
     }
-    if loss.is_some_and(|(_, index_first)| !index_first) {
+    if recovery.is_some() && !index_first && retired.is_none() {
         let (index, bytes) = recovery.as_ref().unwrap();
         retire_schedule_article(&mut pipeline, job, *index, 0);
         submit_decoded_segment(
@@ -572,6 +983,10 @@ pub(super) async fn run_profile_schedule(
     // Every wait below is for a registered operation. A demotion can request
     // more articles; service those before waiting for an extraction result.
     for _ in 0..128 {
+        if retired.is_some() {
+            break;
+        }
+        note_rerequests(&mut pipeline, job, &delivered, &mut rerequested);
         if let Some((mask, _)) = loss {
             deliver_schedule_refetches(
                 &mut pipeline,
@@ -654,7 +1069,7 @@ pub(super) async fn run_profile_schedule(
             );
         }
     }
-    let status = job_status_for_assert(&pipeline, job);
+    let status = retired.unwrap_or_else(|| job_status_for_assert(&pipeline, job));
     let queued = if pipeline.jobs.contains_key(&job) {
         peek_queued_segments(&mut pipeline, job)
     } else {
@@ -678,17 +1093,54 @@ pub(super) async fn run_profile_schedule(
     let counters = pipeline.direct_unpack.counters();
     chase_armed += counters.armed;
     chase_consumed += counters.consumed;
+    finalized += pipeline.direct_store.finalized_sets;
+    demotions.append(&mut pipeline.direct_store.demotions);
+    let mut published = files_under(&output);
+    published.remove(crate::jobs::working_dir::OUTPUT_DIR_MARKER);
+    let mut leftovers: BTreeSet<String> = files_under(&pipeline.intermediate_dir)
+        .into_iter()
+        .map(|path| format!("intermediate/{path}"))
+        .collect();
+    leftovers.extend(
+        files_under(&complete.join(".weaver-staging"))
+            .into_iter()
+            .map(|path| format!("staging/{path}")),
+    );
     trace.push(format!(
-        "profile={profile:?}; chase_armed={chase_armed}; chase_consumed={chase_consumed}; current={counters:?}"
+        "profile={profile:?}; chase_armed={chase_armed}; chase_consumed={chase_consumed}; current={counters:?}; demotions={demotions:?}; rerequested={rerequested:?}"
     ));
     Outcome {
         status,
         files,
         trace,
-        finalized: pipeline.direct_store.finalized_sets,
+        finalized,
         chase_armed,
         chase_consumed,
+        demotions,
+        schedule_demoted,
+        published,
+        leftovers,
+        rerequested,
+        durable: durable.unwrap_or(delivered),
     }
+}
+
+/// Records every volume article sitting in the download queue that the
+/// schedule has already handed over: the pipeline is asking for it twice.
+fn note_rerequests(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    delivered: &BTreeSet<(u32, u32)>,
+    rerequested: &mut BTreeSet<(u32, u32)>,
+) {
+    if !pipeline.jobs.contains_key(&job) {
+        return;
+    }
+    rerequested.extend(
+        peek_queued_segments(pipeline, job)
+            .into_iter()
+            .filter(|article| delivered.contains(article)),
+    );
 }
 
 #[tokio::test]
@@ -784,21 +1236,64 @@ enum Format {
     Rar5UncheckedHeaders,
     QuickOpen,
     Blake2,
+    /// Four single-article volumes, so two of the volumes are middle volumes
+    /// that both continue and are continued.
+    Rar4FourVolumes,
+    Rar5FourVolumes,
+    Rar4EncryptedFourVolumes,
+    /// Volume names that say nothing. The recovery set carries the real
+    /// names, as an obfuscated post's does, and the set is admitted by them.
+    Rar5Obfuscated,
 }
 
-async fn campaign(format: Format, shard: Option<usize>) {
-    profile_campaign(format, shard, ExtractionProfile::DirectStore).await;
+impl Format {
+    fn volume_count(self) -> usize {
+        match self {
+            Self::Rar4FourVolumes | Self::Rar5FourVolumes | Self::Rar4EncryptedFourVolumes => 4,
+            _ => 2,
+        }
+    }
+
+    fn route(self) -> Route {
+        match self {
+            Self::Rar4
+            | Self::Rar5
+            | Self::Rar4FourVolumes
+            | Self::Rar5FourVolumes
+            | Self::Rar5Obfuscated
+            | Self::Rar4EncryptedFourVolumes
+            | Self::Rar4Encrypted
+            | Self::Rar4Unsalted
+            | Self::Rar5Encrypted
+            | Self::Rar5KeyedChecksum
+            | Self::Rar5EncryptedHeaders
+            | Self::QuickOpen => Route::DIRECT,
+            Self::Rar5UncheckedHeaders => Route::refused(|reason| {
+                matches!(reason, DemotionReason::HeaderEncryptedRefused(_))
+            }),
+            Self::Blake2 => Route::refused(|reason| {
+                matches!(
+                    reason,
+                    DemotionReason::MemberIneligible(MemberIneligibility::Blake2OnlyNoCrc32)
+                )
+            }),
+        }
+    }
 }
 
-async fn chase_campaign(format: Format, shard: Option<usize>) {
-    profile_campaign(format, shard, ExtractionProfile::Chase).await;
+async fn campaign(format: Format, selection: Selection) {
+    profile_campaign(format, selection, ExtractionProfile::DirectStore).await;
 }
 
-async fn conventional_campaign(format: Format, shard: Option<usize>) {
-    profile_campaign(format, shard, ExtractionProfile::Conventional).await;
+async fn chase_campaign(format: Format, selection: Selection) {
+    profile_campaign(format, selection, ExtractionProfile::Chase).await;
 }
 
-async fn profile_campaign(format: Format, shard: Option<usize>, profile: ExtractionProfile) {
+async fn conventional_campaign(format: Format, selection: Selection) {
+    profile_campaign(format, selection, ExtractionProfile::Conventional).await;
+}
+
+async fn profile_campaign(format: Format, selection: Selection, profile: ExtractionProfile) {
     let name = "nested/feature.mkv";
     let password = "moonlit-harbour";
     let length = if matches!(format, Format::QuickOpen) {
@@ -809,11 +1304,15 @@ async fn profile_campaign(format: Format, shard: Option<usize>, profile: Extract
     let payload: Vec<u8> = (0..length)
         .map(|n| ((n * 7 + n / 251) % 253) as u8)
         .collect();
+    let count = format.volume_count();
     let volumes = match format {
-        Format::Rar4 => single_member_rar4_store_set(name, &payload, 2),
-        Format::Rar5 => single_member_store_set(name, &payload, 2),
-        Format::Rar4Encrypted => {
-            encrypted_rar4_store_set(name, &payload, 2, password, Some(TEST_RAR4_SALT))
+        Format::Rar4 | Format::Rar4FourVolumes => {
+            single_member_rar4_store_set(name, &payload, count)
+        }
+        Format::Rar5 | Format::Rar5FourVolumes => single_member_store_set(name, &payload, count),
+        Format::Rar5Obfuscated => obfuscate_volumes(&single_member_store_set(name, &payload, 2)),
+        Format::Rar4Encrypted | Format::Rar4EncryptedFourVolumes => {
+            encrypted_rar4_store_set(name, &payload, count, password, Some(TEST_RAR4_SALT))
         }
         Format::Rar4Unsalted => encrypted_rar4_store_set(name, &payload, 2, password, None),
         Format::Rar5Encrypted => {
@@ -855,21 +1354,30 @@ async fn profile_campaign(format: Format, shard: Option<usize>, profile: Extract
             .unwrap();
         assert_eq!(extracted, payload);
     }
+    let described = matches!(format, Format::Rar5Obfuscated).then(|| {
+        single_member_store_set(name, &payload, 2)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+    });
     let encrypted = matches!(
         format,
         Format::Rar4Encrypted
             | Format::Rar4Unsalted
+            | Format::Rar4EncryptedFourVolumes
             | Format::Rar5Encrypted
             | Format::Rar5KeyedChecksum
             | Format::Rar5EncryptedHeaders
             | Format::Rar5UncheckedHeaders
     );
-    let mut spec = direct_store_job_spec("Archive schedules", &volumes);
+    let mut spec =
+        direct_store_job_spec_with_articles("Archive schedules", &volumes, 4 / count);
     spec.password = encrypted.then(|| password.to_string());
-    let baseline = run_profile_schedule(
+    let baseline = run_described_schedule(
         ExtractionProfile::Conventional,
         spec.clone(),
         &volumes,
+        described.as_deref(),
         &in_order_arrivals(2),
         &[name],
         Interruption::None,
@@ -881,59 +1389,64 @@ async fn profile_campaign(format: Format, shard: Option<usize>, profile: Extract
         baseline.files[name].as_deref() == Some(payload.as_slice()),
         "conventional oracle {format:?}"
     );
-    if encrypted && (shard.is_none() || shard == Some(0)) {
-        for order in arrival_orders() {
-            let mut wrong = spec.clone();
-            wrong.password = Some("incorrect-key".to_string());
-            let rejected = run_profile_schedule(
+    // A password the archive does not open with. An archive that needs none
+    // must not notice it.
+    for (order, interruption) in wrong_password_schedules(selection) {
+        if !profile.includes(interruption) {
+            continue;
+        }
+        let mut wrong = spec.clone();
+        wrong.password = Some("incorrect-key".to_string());
+        eprintln!(
+            "wrong password {format:?} profile={profile:?} order={order:?} interruption={interruption:?}"
+        );
+        let outcome =
+            run_described_schedule(
                 profile,
                 wrong,
                 &volumes,
+                described.as_deref(),
                 &order,
                 &[name],
-                Interruption::None,
+                interruption,
             )
             .await;
-            profile.assert_route(&rejected);
-            assert!(
-                matches!(rejected.status, Some(JobStatus::Failed { .. })),
-                "wrong password {format:?} {order:?}: {:?}",
-                rejected.status
-            );
-            assert_eq!(rejected.finalized, 0);
-            assert!(
-                rejected.files[name].is_none(),
-                "wrong password published output: {format:?} {order:?}"
-            );
+        if encrypted {
+            profile.assert_rejected(&outcome, &[name]);
+        } else {
+            assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
+            profile.assert_delivery(&outcome, format.route(), &[name], interruption);
+            assert_eq!(outcome.files[name].as_deref(), Some(payload.as_slice()));
         }
     }
-    let cases = shard.map_or_else(
-        || schedules().into_iter().enumerate().collect(),
-        combined_schedules,
-    );
-    for (case, (order, interruption)) in cases {
+    for (case, (order, interruption)) in selected_schedules(selection) {
         if !profile.includes(interruption) {
             continue;
         }
         eprintln!(
-            "{format:?} profile={profile:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
+            "{format:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        let actual = run_profile_schedule(
+        let actual = run_described_schedule(
             profile,
             spec.clone(),
             &volumes,
+            described.as_deref(),
             &order,
             &[name],
             interruption,
         )
         .await;
+        if interruption.fails() {
+            profile.assert_rejected(&actual, &[name]);
+            continue;
+        }
         assert_eq!(
             actual.status,
             Some(JobStatus::Complete),
             "{format:?} case={case} order={order:?} interruption={interruption:?} trace={:?}",
             actual.trace
         );
-        profile.assert_route(&actual);
+        profile.assert_delivery(&actual, format.route(), &[name], interruption);
         // A duplicate can invalidate an already-running RAR chase. Clean
         // unique arrivals must consume chase; duplicate schedules still must
         // admit it and produce the same verified output through safe fallback.
@@ -964,50 +1477,170 @@ async fn profile_campaign(format: Format, shard: Option<usize>, profile: Extract
         assert_eq!(
             actual.files[name].as_deref(),
             Some(payload.as_slice()),
-            "{format:?} case={case} order={order:?}"
+            "{format:?} case={case} order={order:?} {:?}", actual.trace
         );
     }
 }
 
 #[tokio::test]
 async fn rar4_arrival_schedules() {
-    campaign(Format::Rar4, None).await;
+    campaign(Format::Rar4, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn rar5_arrival_schedules() {
-    campaign(Format::Rar5, None).await;
+    campaign(Format::Rar5, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn rar4_encrypted_arrival_schedules() {
-    campaign(Format::Rar4Encrypted, None).await;
+    campaign(Format::Rar4Encrypted, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn rar4_unsalted_arrival_schedules() {
-    campaign(Format::Rar4Unsalted, None).await;
+    campaign(Format::Rar4Unsalted, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn rar5_encrypted_arrival_schedules() {
-    campaign(Format::Rar5Encrypted, None).await;
+    campaign(Format::Rar5Encrypted, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn rar5_keyed_checksum_arrival_schedules() {
-    campaign(Format::Rar5KeyedChecksum, None).await;
+    campaign(Format::Rar5KeyedChecksum, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn rar5_header_encrypted_arrival_schedules() {
-    campaign(Format::Rar5EncryptedHeaders, None).await;
+    campaign(Format::Rar5EncryptedHeaders, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn rar5_unchecked_header_arrival_schedules() {
-    campaign(Format::Rar5UncheckedHeaders, None).await;
+    campaign(Format::Rar5UncheckedHeaders, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn quick_open_arrival_schedules() {
-    campaign(Format::QuickOpen, None).await;
+    campaign(Format::QuickOpen, Selection::Smoke).await;
 }
 #[tokio::test]
 async fn blake2_arrival_schedules() {
-    campaign(Format::Blake2, None).await;
+    campaign(Format::Blake2, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_four_volume_arrival_schedules() {
+    campaign(Format::Rar4FourVolumes, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_four_volume_arrival_schedules() {
+    campaign(Format::Rar5FourVolumes, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_encrypted_four_volume_arrival_schedules() {
+    campaign(Format::Rar4EncryptedFourVolumes, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_obfuscated_arrival_schedules() {
+    campaign(Format::Rar5Obfuscated, Selection::Smoke).await;
+}
+
+/// Two single-volume stored sets in one job, two articles each. A demotion,
+/// a restart or a loss in one set is not a reason for the other to leave
+/// direct store.
+async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
+    let members = ["alpha.mkv", "nested/beta.mkv"];
+    let payloads: Vec<Vec<u8>> = [(6001, 7), (4093, 11)]
+        .into_iter()
+        .map(|(len, step)| (0..len).map(|n| ((n * step + n / 251) % 253) as u8).collect())
+        .collect();
+    let volumes: Vec<_> = ["alpha", "beta"]
+        .into_iter()
+        .zip(members.iter().zip(&payloads))
+        .map(|(stem, (member, payload))| {
+            let (_, bytes) = single_member_store_set(member, payload, 1).remove(0);
+            (format!("{stem}.part01.rar"), bytes)
+        })
+        .collect();
+    let spec = direct_store_job_spec("Two set schedules", &volumes);
+    let route = Route {
+        sets: 2,
+        ..Route::DIRECT
+    };
+    let check = |outcome: &Outcome, interruption: Interruption| {
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Complete),
+            "{interruption:?}: {:?}",
+            outcome.trace
+        );
+        profile.assert_delivery(outcome, route, &members, interruption);
+        for (member, payload) in members.iter().zip(&payloads) {
+            assert_eq!(
+                outcome.files[*member].as_deref(),
+                Some(payload.as_slice()),
+                "{member} {interruption:?}: {:?}",
+                outcome.trace
+            );
+        }
+    };
+    for (order, interruption) in wrong_password_schedules(selection) {
+        if !profile.includes(interruption) {
+            continue;
+        }
+        let mut wrong = spec.clone();
+        wrong.password = Some("incorrect-key".to_string());
+        let outcome =
+            run_profile_schedule(profile, wrong, &volumes, &order, &members, interruption).await;
+        check(&outcome, interruption);
+    }
+    for (case, (order, interruption)) in selected_schedules(selection) {
+        if !profile.includes(interruption) {
+            continue;
+        }
+        eprintln!(
+            "two sets profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
+        );
+        let outcome = run_profile_schedule(
+            profile,
+            spec.clone(),
+            &volumes,
+            &order,
+            &members,
+            interruption,
+        )
+        .await;
+        if interruption.fails() {
+            // The job fails, but only the set the loss reached is beyond
+            // repair: the other one owes nothing to it.
+            let (mask, _) = interruption.loss().unwrap();
+            let damaged: Vec<_> = members
+                .iter()
+                .enumerate()
+                .filter(|(set, _)| mask & (0b11 << (set * 2)) != 0)
+                .map(|(_, member)| *member)
+                .collect();
+            assert!(
+                matches!(outcome.status, Some(JobStatus::Failed { .. })),
+                "{:?}: {:?}",
+                outcome.status,
+                outcome.trace
+            );
+            assert!(
+                outcome.finalized <= members.len() - damaged.len(),
+                "{:?}",
+                outcome.trace
+            );
+            for member in &damaged {
+                assert!(
+                    outcome.files[*member].is_none() && !outcome.published.contains(*member),
+                    "unrepairable {member} published: {:?}",
+                    outcome.trace
+                );
+            }
+            continue;
+        }
+        check(&outcome, interruption);
+    }
+}
+
+#[tokio::test]
+async fn two_set_arrival_schedules() {
+    two_set_campaign(ExtractionProfile::DirectStore, Selection::Smoke).await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1083,21 +1716,61 @@ impl CompressedFormat {
     }
 }
 
-async fn compressed_direct_campaign(format: CompressedFormat, shard: Option<usize>) {
-    compressed_campaign(format, shard, ExtractionProfile::DirectStore).await;
+impl CompressedFormat {
+    /// Each refusal names what the archive itself puts beyond a byte copy:
+    /// a compressed, solid or encrypted member has no bytes of its own to
+    /// place, and encrypted headers hide the layout altogether.
+    fn route(self) -> Route {
+        use DemotionReason::{HeaderEncryptedRefused, MemberIneligible};
+        use MemberIneligibility::{Compressed, Encrypted, Solid};
+        match self {
+            // The stored members route; the compressed one rides the member
+            // tolerance and is extracted at finalization.
+            Self::Rar4Mixed | Self::Rar5Mixed => Route::DIRECT,
+            Self::Rar4Lz | Self::Rar5Lz => {
+                Route::refused(|reason| matches!(reason, MemberIneligible(Compressed)))
+            }
+            Self::Rar4Solid | Self::Rar4Ppmd | Self::Rar5Solid => Route::refused(|reason| {
+                matches!(reason, MemberIneligible(Compressed | Solid))
+            }),
+            Self::Rar4Encrypted
+            | Self::Rar4SolidEncrypted
+            | Self::Rar4PpmdEncrypted
+            | Self::Rar5Encrypted
+            | Self::Rar5SolidEncrypted => Route::refused(|reason| {
+                matches!(reason, MemberIneligible(Compressed | Solid | Encrypted))
+            }),
+            Self::Rar4Headers
+            | Self::Rar4SolidHeaders
+            | Self::Rar4PpmdHeaders
+            | Self::Rar5Headers
+            // Headers that open with the password refuse the member they
+            // describe, which is itself encrypted.
+            | Self::Rar5SolidHeaders => Route::refused(|reason| {
+                matches!(
+                    reason,
+                    HeaderEncryptedRefused(_) | MemberIneligible(Compressed | Solid | Encrypted)
+                )
+            }),
+        }
+    }
 }
 
-async fn compressed_chase_campaign(format: CompressedFormat, shard: Option<usize>) {
-    compressed_campaign(format, shard, ExtractionProfile::Chase).await;
+async fn compressed_direct_campaign(format: CompressedFormat, selection: Selection) {
+    compressed_campaign(format, selection, ExtractionProfile::DirectStore).await;
 }
 
-async fn compressed_conventional_campaign(format: CompressedFormat, shard: Option<usize>) {
-    compressed_campaign(format, shard, ExtractionProfile::Conventional).await;
+async fn compressed_chase_campaign(format: CompressedFormat, selection: Selection) {
+    compressed_campaign(format, selection, ExtractionProfile::Chase).await;
+}
+
+async fn compressed_conventional_campaign(format: CompressedFormat, selection: Selection) {
+    compressed_campaign(format, selection, ExtractionProfile::Conventional).await;
 }
 
 async fn compressed_campaign(
     format: CompressedFormat,
-    shard: Option<usize>,
+    selection: Selection,
     profile: ExtractionProfile,
 ) {
     let (fixture_name, bytes, password) = format.fixture();
@@ -1145,38 +1818,33 @@ async fn compressed_campaign(
     let volumes = vec![("compressed.rar".to_owned(), bytes.to_vec())];
     let mut spec = direct_store_job_spec_with_articles("Compressed archive schedules", &volumes, 4);
     spec.password = password.map(str::to_owned);
-    if password.is_some() && shard == Some(0) {
-        for order in arrival_orders() {
-            let mut wrong = spec.clone();
-            wrong.password = Some("incorrect-key".to_owned());
-            let outcome = run_profile_schedule(
-                profile,
-                wrong,
-                &volumes,
-                &order,
-                &wanted,
-                Interruption::None,
-            )
-            .await;
-            assert!(
-                matches!(outcome.status, Some(JobStatus::Failed { .. })),
-                "{format:?}: {:?}",
-                outcome.trace
-            );
-            assert_eq!(outcome.finalized, 0, "{:?}", outcome.trace);
-            assert!(
-                outcome.files.values().all(Option::is_none),
-                "wrong password published output: {format:?}"
-            );
-            profile.assert_route(&outcome);
+    for (order, interruption) in wrong_password_schedules(selection) {
+        if !profile.includes(interruption) {
+            continue;
+        }
+        let mut wrong = spec.clone();
+        wrong.password = Some("incorrect-key".to_owned());
+        eprintln!(
+            "wrong password {format:?} profile={profile:?} order={order:?} interruption={interruption:?}"
+        );
+        let outcome =
+            run_profile_schedule(profile, wrong, &volumes, &order, &wanted, interruption).await;
+        if password.is_some() {
+            profile.assert_rejected(&outcome, &wanted);
+        } else {
+            assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
+            profile.assert_delivery(&outcome, format.route(), &wanted, interruption);
+            for (name, bytes) in &expected {
+                assert_eq!(outcome.files[name].as_deref(), Some(bytes.as_slice()));
+            }
         }
     }
-    for (case, (order, interruption)) in combined_schedules(shard.unwrap()) {
+    for (case, (order, interruption)) in selected_schedules(selection) {
         if !profile.includes(interruption) {
             continue;
         }
         eprintln!(
-            "{format:?} profile={profile:?} shard={shard:?} case={case} order={order:?} interruption={interruption:?}"
+            "{format:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
         let outcome = run_profile_schedule(
             profile,
@@ -1187,13 +1855,17 @@ async fn compressed_campaign(
             interruption,
         )
         .await;
+        if interruption.fails() {
+            profile.assert_rejected(&outcome, &wanted);
+            continue;
+        }
         assert_eq!(
             outcome.status,
             Some(JobStatus::Complete),
             "{format:?}: {:?}",
             outcome.trace
         );
-        profile.assert_route(&outcome);
+        profile.assert_delivery(&outcome, format.route(), &wanted, interruption);
         if profile != ExtractionProfile::Conventional && interruption == Interruption::None {
             assert!(outcome.chase_armed > 0, "{format:?}: {:?}", outcome.trace);
             if order.len() == 4 {
@@ -1222,173 +1894,167 @@ async fn compressed_campaign(
     }
 }
 
+#[tokio::test]
+async fn compressed_rar4_mixed_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4Mixed, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_lz_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4Lz, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_solid_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4Solid, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_solid_encrypted_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4SolidEncrypted, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_solid_headers_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4SolidHeaders, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_ppmd_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4Ppmd, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_ppmd_encrypted_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4PpmdEncrypted, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_ppmd_headers_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4PpmdHeaders, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_encrypted_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4Encrypted, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_headers_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4Headers, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_mixed_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5Mixed, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_lz_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5Lz, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_encrypted_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5Encrypted, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_headers_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5Headers, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_solid_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5Solid, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_solid_encrypted_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5SolidEncrypted, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_solid_headers_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5SolidHeaders, Selection::Smoke).await;
+}
+
 // These are test names, not runner jobs. Nextest partitions the named shards
 // across the bounded CI runner matrix. Every shard is independently replayable.
 macro_rules! combined_campaign {
     ($module:ident, $variant:expr, $run:ident) => {
         mod $module {
             use super::*;
+            combined_campaign!(@shards $variant, $run);
+            // A test of its own, so no shard carries the password schedules.
             #[tokio::test]
             #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_00() {
-                $run($variant, Some(0)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_01() {
-                $run($variant, Some(1)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_02() {
-                $run($variant, Some(2)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_03() {
-                $run($variant, Some(3)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_04() {
-                $run($variant, Some(4)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_05() {
-                $run($variant, Some(5)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_06() {
-                $run($variant, Some(6)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_07() {
-                $run($variant, Some(7)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_08() {
-                $run($variant, Some(8)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_09() {
-                $run($variant, Some(9)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_10() {
-                $run($variant, Some(10)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_11() {
-                $run($variant, Some(11)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_12() {
-                $run($variant, Some(12)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_13() {
-                $run($variant, Some(13)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_14() {
-                $run($variant, Some(14)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_15() {
-                $run($variant, Some(15)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_16() {
-                $run($variant, Some(16)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_17() {
-                $run($variant, Some(17)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_18() {
-                $run($variant, Some(18)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_19() {
-                $run($variant, Some(19)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_20() {
-                $run($variant, Some(20)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_21() {
-                $run($variant, Some(21)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_22() {
-                $run($variant, Some(22)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_23() {
-                $run($variant, Some(23)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_24() {
-                $run($variant, Some(24)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_25() {
-                $run($variant, Some(25)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_26() {
-                $run($variant, Some(26)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_27() {
-                $run($variant, Some(27)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_28() {
-                $run($variant, Some(28)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_29() {
-                $run($variant, Some(29)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_30() {
-                $run($variant, Some(30)).await;
-            }
-            #[tokio::test]
-            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-            async fn shard_31() {
-                $run($variant, Some(31)).await;
+            async fn wrong_password() {
+                $run($variant, Selection::WrongPassword).await;
             }
         }
+    };
+    (@shards $variant:expr, $run:ident) => {
+        combined_campaign!(
+            @each $variant, $run;
+                shard_00 0,
+                shard_01 1,
+                shard_02 2,
+                shard_03 3,
+                shard_04 4,
+                shard_05 5,
+                shard_06 6,
+                shard_07 7,
+                shard_08 8,
+                shard_09 9,
+                shard_10 10,
+                shard_11 11,
+                shard_12 12,
+                shard_13 13,
+                shard_14 14,
+                shard_15 15,
+                shard_16 16,
+                shard_17 17,
+                shard_18 18,
+                shard_19 19,
+                shard_20 20,
+                shard_21 21,
+                shard_22 22,
+                shard_23 23,
+                shard_24 24,
+                shard_25 25,
+                shard_26 26,
+                shard_27 27,
+                shard_28 28,
+                shard_29 29,
+                shard_30 30,
+                shard_31 31,
+                shard_32 32,
+                shard_33 33,
+                shard_34 34,
+                shard_35 35,
+                shard_36 36,
+                shard_37 37,
+                shard_38 38,
+                shard_39 39,
+                shard_40 40,
+                shard_41 41,
+                shard_42 42,
+                shard_43 43,
+                shard_44 44,
+                shard_45 45,
+                shard_46 46,
+                shard_47 47,
+                shard_48 48,
+                shard_49 49,
+                shard_50 50,
+                shard_51 51,
+                shard_52 52,
+                shard_53 53,
+                shard_54 54,
+                shard_55 55,
+                shard_56 56,
+                shard_57 57,
+                shard_58 58,
+                shard_59 59,
+                shard_60 60,
+                shard_61 61,
+                shard_62 62,
+                shard_63 63
+        );
+    };
+    (@each $variant:expr, $run:ident; $($name:ident $shard:literal),+) => {
+        $(
+            #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
+            async fn $name() {
+                $run($variant, Selection::Shard($shard)).await;
+            }
+        )+
     };
 }
 pub(super) use combined_campaign;
@@ -1498,6 +2164,81 @@ combined_campaign!(
 combined_campaign!(
     combined_conventional_blake2,
     Format::Blake2,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_two_sets,
+    ExtractionProfile::DirectStore,
+    two_set_campaign
+);
+combined_campaign!(
+    combined_chase_two_sets,
+    ExtractionProfile::Chase,
+    two_set_campaign
+);
+combined_campaign!(
+    combined_conventional_two_sets,
+    ExtractionProfile::Conventional,
+    two_set_campaign
+);
+combined_campaign!(
+    combined_rar4_four_volume,
+    Format::Rar4FourVolumes,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar4_four_volume,
+    Format::Rar4FourVolumes,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_four_volume,
+    Format::Rar4FourVolumes,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar5_four_volume,
+    Format::Rar5FourVolumes,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar5_four_volume,
+    Format::Rar5FourVolumes,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_four_volume,
+    Format::Rar5FourVolumes,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar4_encrypted_four_volume,
+    Format::Rar4EncryptedFourVolumes,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar4_encrypted_four_volume,
+    Format::Rar4EncryptedFourVolumes,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_encrypted_four_volume,
+    Format::Rar4EncryptedFourVolumes,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar5_obfuscated,
+    Format::Rar5Obfuscated,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar5_obfuscated,
+    Format::Rar5Obfuscated,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_obfuscated,
+    Format::Rar5Obfuscated,
     conventional_campaign
 );
 

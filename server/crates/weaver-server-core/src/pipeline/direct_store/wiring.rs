@@ -303,6 +303,15 @@ pub(crate) struct DirectStoreRuntime {
     /// indistinguishable from a pass that found nothing to do.
     #[cfg(test)]
     pub(crate) repair_defers: usize,
+    /// Every demotion this pipeline's sets went through, in order, with the
+    /// reason the set actually carries.
+    ///
+    /// A log because a demotion is otherwise invisible in a finished job: the
+    /// conventional path delivers the same bytes, and the set is dropped with
+    /// the job, so a route that quietly fell back looks identical on disk to
+    /// one that stayed direct.
+    #[cfg(test)]
+    pub(crate) demotions: Vec<DemotionReason>,
 }
 
 impl std::fmt::Debug for DirectStoreRuntime {

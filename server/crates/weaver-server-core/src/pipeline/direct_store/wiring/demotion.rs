@@ -129,6 +129,8 @@ impl Pipeline {
             }
             return;
         }
+        #[cfg(test)]
+        let carried = set.demotion_reason().unwrap_or(reason);
         let set_name = set.set_name().to_string();
         // A demoted set's volumes become real files and hand off to the
         // conventional repairer, which brings its own post-repair pass — so
@@ -182,6 +184,8 @@ impl Pipeline {
                 file_index: *file_index,
             })
             .collect();
+        #[cfg(test)]
+        self.direct_store.demotions.push(carried);
         // Damage established before any recovery set has been asked. Recorded
         // as the *fact* rather than the reason, because the completion gate
         // reads it to refuse a stored set's "a clean decode proves integrity"
