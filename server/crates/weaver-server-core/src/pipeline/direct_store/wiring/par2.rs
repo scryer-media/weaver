@@ -59,6 +59,18 @@ impl DemotedMaterializationBlock {
     }
 }
 
+/// One direct set's share of a repair, decided before anything is changed.
+pub(crate) struct PreparedDirectRepair {
+    set_index: usize,
+    set_name: String,
+    /// The set's damaged volumes, in its own volume space.
+    damaged: Vec<super::super::repair::DamagedDirectVolume>,
+    affected_files: Vec<NzbFileId>,
+    /// The set's volume lengths, in its own volume space.
+    set_lengths: std::collections::BTreeMap<u32, u64>,
+    rewrite_bytes: u64,
+}
+
 impl Pipeline {
     /// Take any set claiming this file off the direct path, because its
     /// articles arrived uuencoded.
@@ -2133,7 +2145,8 @@ impl Pipeline {
         // conclusion whichever way it goes.
         self.direct_store.repair_defer_waves.remove(&job_id);
 
-        let mut repaired_any = false;
+        let mut prepared = Vec::new();
+        let mut refused = None;
         for (set_index, files) in by_set {
             if !self
                 .direct_store
@@ -2165,45 +2178,61 @@ impl Pipeline {
                 );
                 continue;
             }
-            match self
-                .repair_one_direct_set(job_id, set_index, &par2_set, verification, &overlay, &files)
-                .await
-            {
-                Ok(()) => repaired_any = true,
+            match self.prepare_direct_set_repair(
+                job_id, set_index, &par2_set, verification, &overlay, &files,
+            ) {
+                Ok(repair) => prepared.push(repair),
                 Err(failure) => {
-                    Self::record_direct_repair_failure(job_id, &failure);
-                    warn!(
-                        job_id = job_id.0,
-                        failure = %failure,
-                        "repairing a direct set in place was not possible; demoting it"
-                    );
-                    // A refusal that got as far as routing has already demoted
-                    // the set itself — a destination write failed, a repaired
-                    // span found no destination — and a demoted set is a state
-                    // change the caller has to act on exactly as a repair is:
-                    // its volumes are materializing, so the job's next move is a
-                    // fresh pass over them, not another lap of the verdict that
-                    // sent it here. A write the destination refused fails the
-                    // job instead, which ends the job's moves altogether.
-                    let already_demoted = self
-                        .direct_store
-                        .set(job_id, set_index)
-                        .is_some_and(DirectSet::is_demoted);
-                    let job_failed = self.jobs.get(&job_id).is_none_or(|state| {
-                        matches!(state.status, crate::JobStatus::Failed { .. })
-                    });
-                    return if repaired_any || already_demoted || job_failed {
-                        DirectRepairAnswer::Acted
-                    } else {
-                        DirectRepairAnswer::Declined
-                    };
+                    refused = Some(failure);
+                    break;
                 }
             }
         }
-        if repaired_any {
-            DirectRepairAnswer::Acted
-        } else {
-            DirectRepairAnswer::Declined
+        // One repair for every set the verdict found damage in. PAR2 recovers
+        // a recovery set's damaged files together or not at all: its plan
+        // writes every one of them, so a repair that materialized one set's
+        // volumes and left another's virtual would be refused for the write
+        // target it was never given.
+        let attempted: Vec<usize> = prepared.iter().map(|repair| repair.set_index).collect();
+        let result = match refused {
+            Some(failure) => Err(failure),
+            None if prepared.is_empty() => return DirectRepairAnswer::Declined,
+            None => {
+                self.repair_prepared_direct_sets(job_id, prepared, &par2_set, verification, &overlay)
+                    .await
+            }
+        };
+        match result {
+            Ok(()) => DirectRepairAnswer::Acted,
+            Err(failure) => {
+            Self::record_direct_repair_failure(job_id, &failure);
+            warn!(
+                job_id = job_id.0,
+                failure = %failure,
+                "repairing a direct set in place was not possible; demoting it"
+            );
+            // A refusal that got as far as routing has already demoted
+            // the set itself — a destination write failed, a repaired
+            // span found no destination — and a demoted set is a state
+            // change the caller has to act on exactly as a repair is:
+            // its volumes are materializing, so the job's next move is a
+            // fresh pass over them, not another lap of the verdict that
+            // sent it here. A write the destination refused fails the
+            // job instead, which ends the job's moves altogether.
+            let already_demoted = attempted.iter().any(|set_index| {
+                self.direct_store
+                    .set(job_id, *set_index)
+                    .is_some_and(DirectSet::is_demoted)
+            });
+            let job_failed = self.jobs.get(&job_id).is_none_or(|state| {
+                matches!(state.status, crate::JobStatus::Failed { .. })
+            });
+            return if already_demoted || job_failed {
+                DirectRepairAnswer::Acted
+            } else {
+                DirectRepairAnswer::Declined
+            };
+            }
         }
     }
 
@@ -2311,16 +2340,18 @@ impl Pipeline {
         debug!(job_id = job_id.0, failure = %failure, "direct-store repair refused");
     }
 
-    /// One set's repair, from the checkpoint delete to the scratch cleanup.
-    pub(super) async fn repair_one_direct_set(
-        &mut self,
+    /// Everything one set's repair can refuse for free: which of its volumes
+    /// are damaged, what the repair would rewrite, and whether that fits.
+    /// Nothing is changed, so a refusal here costs the set nothing.
+    pub(super) fn prepare_direct_set_repair(
+        &self,
         job_id: JobId,
         set_index: usize,
         par2_set: &std::sync::Arc<par2_rs::Par2FileSet>,
         verification: &par2_rs::VerificationResult,
         overlay: &DirectPar2Overlay,
         files: &[par2_rs::FileId],
-    ) -> Result<(), super::super::repair::DirectRepairFailure> {
+    ) -> Result<PreparedDirectRepair, super::super::repair::DirectRepairFailure> {
         let slice_size = par2_set.slice_size;
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(super::super::repair::DirectRepairFailure::DamageOutsideDirectSets);
@@ -2448,44 +2479,73 @@ impl Pipeline {
             );
         }
 
-        // Step 1: the row goes **before** any byte the row claims changes. The
-        // materialization writes only scratch, but the re-route below rewrites
-        // member partials and envelopes at offsets the checkpoint's floors
-        // cover, and a row that outlived that would let a restart trust floors
-        // over bytes that moved underneath them.
-        //
-        // The repair once-latch is burned in the same statement, because this is
-        // the first step that cannot be undone: everything above refuses for
-        // free, and everything below leaves the set changed whether or not it
-        // ends up repaired.
-        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
-            set.note_repair_attempted();
+        Ok(PreparedDirectRepair {
+            set_index,
+            set_name,
+            damaged,
+            affected_files,
+            set_lengths,
+            rewrite_bytes,
+        })
+    }
+
+    /// The repair itself, for every prepared set at once: from the checkpoint
+    /// deletes to the scratch cleanup.
+    pub(super) async fn repair_prepared_direct_sets(
+        &mut self,
+        job_id: JobId,
+        prepared: Vec<PreparedDirectRepair>,
+        par2_set: &std::sync::Arc<par2_rs::Par2FileSet>,
+        verification: &par2_rs::VerificationResult,
+        overlay: &DirectPar2Overlay,
+    ) -> Result<(), super::super::repair::DirectRepairFailure> {
+        for repair in &prepared {
+            let set_index = repair.set_index;
+            let set_name = &repair.set_name;
+            // Step 1: the row goes **before** any byte the row claims changes. The
+            // materialization writes only scratch, but the re-route below rewrites
+            // member partials and envelopes at offsets the checkpoint's floors
+            // cover, and a row that outlived that would let a restart trust floors
+            // over bytes that moved underneath them.
+            //
+            // The repair once-latch is burned in the same statement, because this is
+            // the first step that cannot be undone: everything above refuses for
+            // free, and everything below leaves the set changed whether or not it
+            // ends up repaired.
+            let mut persist = DatabaseCoveragePersist::new(self.db.clone());
+            if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+                set.note_repair_attempted();
+            }
+            #[cfg(test)]
+            {
+                self.direct_store.repair_attempts += 1;
+            }
+            if let Some(set) = self.direct_store.set_mut(job_id, set_index)
+                && let Err(error) = set.delete_checkpoint_row(&mut persist)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to delete a direct-store checkpoint before repairing; the set \
+                     demotes rather than repairing over a row that still claims its bytes"
+                );
+                return Err(super::super::repair::DirectRepairFailure::PlanRefused(
+                    format!("checkpoint delete failed: {error}"),
+                ));
+            }
+            // A repair rewrites only these direct volumes. Retire their byte-owned
+            // grid evidence before the first rewrite without discarding another
+            // set's untouched claims.
+            for file_id in &repair.affected_files {
+                self.block_crcs.forget_file(*file_id);
+            }
         }
-        #[cfg(test)]
-        {
-            self.direct_store.repair_attempts += 1;
-        }
-        if let Some(set) = self.direct_store.set_mut(job_id, set_index)
-            && let Err(error) = set.delete_checkpoint_row(&mut persist)
-        {
-            warn!(
-                job_id = job_id.0,
-                set_name = %set_name,
-                error = %error,
-                "failed to delete a direct-store checkpoint before repairing; the set \
-                 demotes rather than repairing over a row that still claims its bytes"
-            );
-            return Err(super::super::repair::DirectRepairFailure::PlanRefused(
-                format!("checkpoint delete failed: {error}"),
-            ));
-        }
-        // A repair rewrites only these direct volumes. Retire their byte-owned
-        // grid evidence before the first rewrite without discarding another
-        // set's untouched claims.
-        for file_id in affected_files {
-            self.block_crcs.forget_file(file_id);
-        }
+        let damaged: Vec<super::super::repair::DamagedDirectVolume> = prepared
+            .iter()
+            .flat_map(|repair| repair.damaged.iter().cloned())
+            .collect();
+        let rewrite_bytes: u64 = prepared.iter().map(|repair| repair.rewrite_bytes).sum();
         // Announced from here rather than from a status transition: the set
         // never enters `JobStatus::Repairing` — that status carries the repair
         // concurrency queue, and this repair holds no slot in it — so the event
@@ -2564,11 +2624,11 @@ impl Pipeline {
 
         info!(
             job_id = job_id.0,
-            set_name = %set_name,
+            sets = prepared.len(),
             volumes = outcome.materialized_volumes,
             recovery_blocks = outcome.recovery_blocks_used,
             rewrite_bytes,
-            "repaired a direct set's damaged volumes in place; its clean volumes stayed virtual"
+            "repaired direct sets' damaged volumes in place; their clean volumes stayed virtual"
         );
         // "Only the damaged volumes materialize" is the claim repair-while-direct
         // rests on, and the scratch is deleted as soon as its spans are routed —
@@ -2594,12 +2654,55 @@ impl Pipeline {
             self.direct_store.repair_recovery_blocks_used += outcome.recovery_blocks_used;
         }
 
-        let routed = self
-            .route_repaired_volumes(job_id, set_index, &damaged, &set_lengths)
-            .await;
+        // Every set is settled, even after one of them fails: each has spent its
+        // one repair and lost its checkpoint row, so a set skipped here would
+        // keep its damage with no second attempt to answer it.
+        let mut failure = None;
+        for repair in &prepared {
+            if let Err(error) = self.settle_repaired_direct_set(job_id, repair).await {
+                failure.get_or_insert(error);
+            }
+        }
         for path in &outcome.scratch {
             let _ = tokio::fs::remove_file(path).await;
         }
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        crate::runtime::perf_probe::record(
+            "direct_store.repaired_while_direct",
+            std::time::Duration::from_nanos(1),
+        );
+        self.metrics
+            .direct_sets_repaired_while_direct
+            .fetch_add(prepared.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        // Low-frequency: one observation per job-level repair, never on a
+        // per-segment path. Records the metric next to the event that already
+        // announces the same fact.
+        self.metrics.job_lifecycle.note_repair(
+            crate::operations::instrumentation::StageOutcomeKind::Complete,
+            outcome.recovery_blocks_used as u64,
+        );
+        let _ = self.event_tx.send(PipelineEvent::RepairComplete {
+            job_id,
+            slices_repaired: u32::try_from(outcome.recovery_blocks_used).unwrap_or(u32::MAX),
+        });
+        Ok(())
+    }
+
+    /// Routes one set's repaired volumes back, confirms them and settles the
+    /// rewrite.
+    async fn settle_repaired_direct_set(
+        &mut self,
+        job_id: JobId,
+        repair: &PreparedDirectRepair,
+    ) -> Result<(), super::super::repair::DirectRepairFailure> {
+        let set_index = repair.set_index;
+        let set_name = &repair.set_name;
+        let damaged = &repair.damaged;
+        let routed = self
+            .route_repaired_volumes(job_id, set_index, damaged, &repair.set_lengths)
+            .await;
         if !routed {
             return Err(super::super::repair::DirectRepairFailure::ExecuteFailed(
                 "the repaired spans could not be routed back into the set".to_string(),
@@ -2612,7 +2715,7 @@ impl Pipeline {
         // lost bytes can only be confirmed here — and what lets the set finalize
         // instead of waiting forever for a download that already finished by
         // another route.
-        for volume in &damaged {
+        for volume in damaged {
             let spans = {
                 let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
                     return Err(super::super::repair::DirectRepairFailure::ExecuteFailed(
@@ -2680,24 +2783,6 @@ impl Pipeline {
             super::super::barrier::BarrierTrigger::Demand(BarrierDemand::RepairRecreate),
         )
         .await;
-        crate::runtime::perf_probe::record(
-            "direct_store.repaired_while_direct",
-            std::time::Duration::from_nanos(1),
-        );
-        self.metrics
-            .direct_sets_repaired_while_direct
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Low-frequency: one observation per job-level repair, never on a
-        // per-segment path. Records the metric next to the event that already
-        // announces the same fact.
-        self.metrics.job_lifecycle.note_repair(
-            crate::operations::instrumentation::StageOutcomeKind::Complete,
-            outcome.recovery_blocks_used as u64,
-        );
-        let _ = self.event_tx.send(PipelineEvent::RepairComplete {
-            job_id,
-            slices_repaired: u32::try_from(outcome.recovery_blocks_used).unwrap_or(u32::MAX),
-        });
         Ok(())
     }
 
