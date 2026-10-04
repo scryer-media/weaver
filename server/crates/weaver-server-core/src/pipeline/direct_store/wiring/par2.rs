@@ -2642,6 +2642,34 @@ impl Pipeline {
             }
         }
         self.reread_direct_stale_gaps(job_id, set_index).await;
+        // The rewrite is whole only now: every volume routed, every repaired
+        // volume confirmed, every composition gap re-read. This is where a
+        // repaired byte that still has no destination, or a gate the rewrite
+        // fails, becomes the demotion.
+        let finished = match self.direct_store.set_mut(job_id, set_index) {
+            Some(set) if set.router.repair_batch_in_progress() => {
+                set.finish_repair_transaction()
+            }
+            // No volume carried a rewrite, so no transaction was opened.
+            Some(_) => Ok(()),
+            None => {
+                return Err(super::super::repair::DirectRepairFailure::ExecuteFailed(
+                    "the set went away mid-repair".to_string(),
+                ));
+            }
+        };
+        if let Err(reason) = finished {
+            warn!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                reason = reason.metric(),
+                "a direct set's repaired rewrite did not settle"
+            );
+            self.demote_direct_set(job_id, set_index, reason).await;
+            return Err(super::super::repair::DirectRepairFailure::ExecuteFailed(
+                format!("the repaired rewrite did not settle: {}", reason.metric()),
+            ));
+        }
         // The other half: the row was deleted before anything moved, so the set
         // has no durable coverage at all until a barrier writes one. Demanding
         // it here rather than waiting for the 5 s timer is what keeps the
@@ -2704,7 +2732,37 @@ impl Pipeline {
             .direct_store
             .set(job_id, set_index)
             .is_some_and(|set| set.router.routes_encrypted());
-        for volume in damaged {
+        // One transaction over every volume the repair rewrote, in volume
+        // order. A volume settled on its own cannot place a repaired byte whose
+        // destination depends on another damaged volume: an encrypted block
+        // straddling a seam needs both sides' rewrites, and a last volume's
+        // trailing region waits for the confirming parse the caller runs
+        // afterwards. The transaction keeps such bytes staged, and
+        // [`Self::finish_direct_repair_transaction`] answers for them once.
+        let mut rewritten: Vec<&super::super::repair::DamagedDirectVolume> = damaged
+            .iter()
+            .filter(|volume| volume.rewrite.iter().any(|(start, end)| start < end))
+            .collect();
+        rewritten.sort_by_key(|volume| volume.volume_index);
+        if rewritten.is_empty() {
+            return true;
+        }
+        let begun = match self.direct_store.set_mut(job_id, set_index) {
+            Some(set) => set.begin_repair_transaction(
+                rewritten.iter().map(|volume| volume.volume_index).collect(),
+            ),
+            None => return false,
+        };
+        if let Err(reason) = begun {
+            warn!(
+                job_id = job_id.0,
+                reason = reason.metric(),
+                "a direct set's repair could not open its replacement transaction"
+            );
+            self.demote_direct_set(job_id, set_index, reason).await;
+            return false;
+        }
+        for volume in rewritten {
             let volume_index = volume.volume_index;
             let for_task = volume.clone();
             let spans = match tokio::task::spawn_blocking(move || {
@@ -2732,9 +2790,6 @@ impl Pipeline {
                     return false;
                 }
             };
-            if spans.is_empty() {
-                continue;
-            }
             // The neighbouring-volume halves of this volume's member edge
             // blocks, read through the overlay so what is staged is what was
             // posted rather than the plaintext on disk. A read that refuses —
@@ -2764,7 +2819,7 @@ impl Pipeline {
                     .map(|(offset, data)| (volume_index, offset, data))
                     .collect();
                 lead_in.extend(edges);
-                set.route_repaired(
+                set.route_repaired_volume(
                     volume_index,
                     &staged,
                     &lead_in,
