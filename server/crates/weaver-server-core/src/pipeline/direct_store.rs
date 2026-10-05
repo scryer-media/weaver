@@ -267,11 +267,17 @@ fn env_bytes(name: &str) -> Option<u64> {
 }
 
 /// What the host can tell the shared-limit defaults: the memory the process
-/// may use, and the size of the filesystem under the working directory.
+/// may use, the size of the filesystem under the working directory, and how
+/// much of that memory the hardware profile lets resident holds claim.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HostFacts {
     pub(crate) total_memory_bytes: Option<u64>,
     pub(crate) working_fs_total_bytes: Option<u64>,
+    /// The hardware profile's cap on the derived resident limit. A smaller
+    /// profile asked for a smaller footprint, and holds are memory the
+    /// download path keeps resident; a configured limit is the operator's own
+    /// number and is never capped.
+    pub(crate) resident_default_cap_bytes: Option<u64>,
 }
 
 impl HostFacts {
@@ -279,7 +285,14 @@ impl HostFacts {
     pub(crate) const UNKNOWN: Self = Self {
         total_memory_bytes: None,
         working_fs_total_bytes: None,
+        resident_default_cap_bytes: None,
     };
+
+    /// These facts under a hardware profile's cap on the resident default.
+    pub(crate) fn with_resident_default_cap(mut self, cap_bytes: Option<u64>) -> Self {
+        self.resident_default_cap_bytes = cap_bytes;
+        self
+    }
 
     /// Probes the real host. `working_dir` may not exist yet at startup, so
     /// the nearest existing ancestor answers for its filesystem.
@@ -299,6 +312,7 @@ impl HostFacts {
         Self {
             total_memory_bytes: crate::runtime::system_probe::detect_total_memory_bytes(),
             working_fs_total_bytes,
+            resident_default_cap_bytes: None,
         }
     }
 }
@@ -391,6 +405,12 @@ impl DirectStoreSettings {
             config.and_then(|cfg| cfg.holds_scratch_ceiling_bytes),
             router::HOLDS_SCRATCH_CEILING_BYTES,
         );
+        let derived_resident_limit = default_resident_limit_bytes(host.total_memory_bytes);
+        let default_resident_limit = host
+            .resident_default_cap_bytes
+            .map_or(derived_resident_limit, |cap| {
+                derived_resident_limit.min(cap)
+            });
         Self {
             gate: if enabled {
                 DirectStoreGate::Enabled
@@ -401,7 +421,7 @@ impl DirectStoreSettings {
             holds_resident_limit_bytes: pick(
                 env.resident_limit,
                 config.and_then(|cfg| cfg.holds_resident_limit_bytes),
-                default_resident_limit_bytes(host.total_memory_bytes),
+                default_resident_limit,
             ),
             holds_scratch_total_bytes: pick(
                 env.scratch_total,

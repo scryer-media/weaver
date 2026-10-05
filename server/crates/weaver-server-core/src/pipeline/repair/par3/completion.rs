@@ -162,12 +162,7 @@ impl Pipeline {
             }
             // A completely unavailable index never emits a decode event. Its
             // remaining carriers still deserve bounded metadata discovery.
-            let runtime = self.par3_runtime.get_or_insert_with(|| {
-                Box::new(work::Coordinator::new(
-                    self.repair_work_done_tx.clone(),
-                    Arc::clone(&self.metrics),
-                ))
-            });
+            let runtime = self.par3_coordinator();
             if let Err(error) = runtime
                 .admit(job_id)
                 .and_then(|()| self.refresh_par3_sources(job_id))
