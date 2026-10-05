@@ -1923,6 +1923,7 @@ fn settings_derive_the_shared_limits_from_the_host() {
     let host = |memory: u64, fs: u64| HostFacts {
         total_memory_bytes: Some(memory),
         working_fs_total_bytes: Some(fs),
+        resident_default_cap_bytes: None,
     };
     assert_eq!(
         resolve(None, none, host(8 * GIB, 100 * GIB)).holds_resident_limit_bytes,
@@ -1997,6 +1998,112 @@ fn settings_derive_the_shared_limits_from_the_host() {
             scratch_bytes: 20,
             disk_reserve_bytes: 30,
         }
+    );
+}
+
+/// A hardware profile caps only the resident limit Weaver derives: the widest
+/// profiles leave it where the host puts it, the efficient one holds it to
+/// 256 MiB, and a configured or environment limit is never capped.
+#[test]
+fn settings_cap_the_derived_resident_limit_by_hardware_profile() {
+    use super::super::{DirectStoreEnv, DirectStoreSettings, HostFacts};
+    use crate::runtime::HardwareProfile;
+    use crate::runtime::system_profile::*;
+    use crate::settings::DirectStoreOverrides;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let machine = |cores: usize, memory: u64| SystemProfile {
+        cpu: CpuProfile {
+            physical_cores: cores,
+            logical_cores: cores * 2,
+            simd: SimdSupport::default(),
+            cgroup_limit: None,
+        },
+        memory: MemoryProfile {
+            total_bytes: memory,
+            available_bytes: memory / 2,
+            cgroup_limit: None,
+        },
+        disk: DiskProfile {
+            storage_class: StorageClass::Ssd,
+            filesystem: FilesystemType::Ext4,
+            sequential_write_mbps: 2000.0,
+            random_read_iops: 50000.0,
+            same_filesystem: true,
+        },
+    };
+    let resident = |profile: HardwareProfile,
+                    cores: usize,
+                    memory: Option<u64>,
+                    config: Option<&DirectStoreOverrides>,
+                    env: DirectStoreEnv| {
+        let cap = profile
+            .tuning(&machine(cores, memory.unwrap_or(GIB)))
+            .direct_store_resident_default_cap_bytes;
+        let host = HostFacts {
+            total_memory_bytes: memory,
+            working_fs_total_bytes: Some(100 * GIB),
+            resident_default_cap_bytes: None,
+        }
+        .with_resident_default_cap(cap);
+        DirectStoreSettings::resolve_parts(config, env, host).holds_resident_limit_bytes
+    };
+    let none = DirectStoreEnv::default();
+
+    // (cores, memory, efficient, balanced, performance)
+    for (cores, memory, efficient, balanced, performance) in [
+        (4, Some(8 * GIB), 256 * MIB, 512 * MIB, 512 * MIB),
+        (16, Some(64 * GIB), 256 * MIB, GIB, GIB),
+        (2, Some(2 * GIB), 128 * MIB, 128 * MIB, 128 * MIB),
+        (4, None, 256 * MIB, 256 * MIB, 256 * MIB),
+    ] {
+        assert_eq!(
+            resident(HardwareProfile::Efficient, cores, memory, None, none),
+            efficient
+        );
+        assert_eq!(
+            resident(HardwareProfile::Balanced, cores, memory, None, none),
+            balanced
+        );
+        assert_eq!(
+            resident(HardwareProfile::Performance, cores, memory, None, none),
+            performance
+        );
+        // The widest profile is exactly the uncapped derivation.
+        assert_eq!(
+            performance,
+            super::super::default_resident_limit_bytes(memory)
+        );
+    }
+
+    // Config and the environment are the operator's numbers, above any cap.
+    let config = DirectStoreOverrides {
+        holds_resident_limit_bytes: Some(2 * GIB),
+        ..Default::default()
+    };
+    assert_eq!(
+        resident(
+            HardwareProfile::Efficient,
+            16,
+            Some(64 * GIB),
+            Some(&config),
+            none
+        ),
+        2 * GIB
+    );
+    assert_eq!(
+        resident(
+            HardwareProfile::Efficient,
+            16,
+            Some(64 * GIB),
+            None,
+            DirectStoreEnv {
+                resident_limit: Some(3 * GIB),
+                ..Default::default()
+            }
+        ),
+        3 * GIB
     );
 }
 

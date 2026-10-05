@@ -80,6 +80,12 @@ impl Pipeline {
         self.tuner.set_profile_tuning(tuning);
         self.shared_state
             .set_sevenz_decode_memory_bytes(tuning.sevenz_decode_memory_bytes);
+        // The PAR3 budgets are sized on first use, so the share only matters
+        // until then; the worker cap is read at every dispatch.
+        crate::pipeline::repair::par3::budget::set_memory_share(tuning.par3_memory);
+        if let Some(par3) = self.par3_runtime.as_mut() {
+            par3.set_cpu_cap(tuning.par3_cpu_cap);
+        }
 
         let limits = self
             .extraction_limits

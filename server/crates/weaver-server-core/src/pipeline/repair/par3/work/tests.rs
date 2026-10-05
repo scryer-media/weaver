@@ -19,6 +19,32 @@ async fn next(coordinator: &mut Coordinator) -> WorkDone {
     coordinator.recv().await.unwrap()
 }
 
+/// Repair keeps every core but one when no profile caps it, a profile's cap
+/// only ever lowers that, and neither ever reaches zero.
+#[test]
+fn a_profile_cap_only_lowers_the_par3_cpu_limit() {
+    // (parallelism, uncapped, capped at 2, capped at 8)
+    for (parallelism, uncapped, at_two, at_eight) in [
+        (1, 1, 1, 1),
+        (2, 1, 1, 1),
+        (4, 3, 2, 3),
+        (16, 15, 2, 8),
+        (32, 31, 2, 8),
+    ] {
+        assert_eq!(cpu_limit_on(parallelism, None), uncapped);
+        assert_eq!(cpu_limit_on(parallelism, Some(2)), at_two);
+        assert_eq!(cpu_limit_on(parallelism, Some(8)), at_eight);
+    }
+    assert_eq!(cpu_limit_on(16, Some(0)), 1);
+
+    let mut coordinator = Coordinator::default();
+    let uncapped = coordinator.cpu_limit;
+    coordinator.set_cpu_cap(Some(1));
+    assert_eq!(coordinator.cpu_limit, 1);
+    coordinator.set_cpu_cap(None);
+    assert_eq!(coordinator.cpu_limit, uncapped);
+}
+
 #[tokio::test]
 async fn peer_pressure_waits_for_retirement_then_retries_once_in_isolation() {
     let root = tempfile::tempdir().unwrap();
