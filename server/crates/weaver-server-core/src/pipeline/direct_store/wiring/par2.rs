@@ -1444,16 +1444,14 @@ impl Pipeline {
         let volumes = overlay.volumes.clone();
         let provider = overlay.provider;
         // No placement scan: the direct volumes are absent from the directory
-        // by construction and every other file is at its declared name, which
-        // is the same assumption the repair's own fallback access makes.
-        let plan = par2_rs::PlacementPlan {
-            exact: volumes.iter().map(|volume| volume.par2_file_id).collect(),
-            swaps: Vec::new(),
-            renames: Vec::new(),
-            unresolved: Vec::new(),
-            conflicts: Vec::new(),
-        };
-        let inner = par2_rs::PlacementFileAccess::from_plan(working_dir.clone(), &par2_set, &plan);
+        // by construction, and every other file is read where its proven
+        // identity puts it, which is the same access the repair's own fallback
+        // takes.
+        let inner = par2_rs::PlacementFileAccess::new(
+            working_dir.clone(),
+            &par2_set,
+            self.direct_par2_fallback_names(job_id, &par2_set),
+        );
         let access = std::sync::Arc::new(super::super::par2_access::DirectVolumeFileAccess::new(
             inner, provider, &volumes,
         ));
@@ -2430,9 +2428,10 @@ impl Pipeline {
     ///
     /// A file is admitted only when the repair will write the very file the
     /// verdict measured. The verdict this repair is planned from reads every
-    /// file outside a direct set at its declared PAR2 name, and so does the
-    /// repair's fallback access, so the job's file must bind uniquely to that
-    /// description and sit at exactly that name. A file still owned by a
+    /// file outside a direct set where [`Self::direct_par2_fallback_names`]
+    /// puts it, and so does the repair's fallback access, so the job's file
+    /// must bind uniquely to that description and sit at exactly that name. A
+    /// file still owned by a
     /// direct set that has not been demoted is never written: a finalized
     /// set's volumes are not the repair's to recreate. Anything else refuses,
     /// and the caller demotes exactly as before.
@@ -2478,6 +2477,7 @@ impl Pipeline {
             .flat_map(|set| set.plan().volumes.values().copied())
             .collect();
         let unowned: HashSet<par2_rs::FileId> = unowned.iter().copied().collect();
+        let renamed = self.direct_par2_fallback_names(job_id, par2_set);
         let mut bound: HashMap<par2_rs::FileId, NzbFileId> = HashMap::new();
         for file in state.assembly.files() {
             let file_id = file.file_id();
@@ -2489,11 +2489,14 @@ impl Pipeline {
             if !unowned.contains(&binding.par2_file_id) {
                 continue;
             }
-            let declared = par2_set
-                .file_description(&binding.par2_file_id)
-                .map(|desc| state.working_dir.join(&desc.filename));
+            let read_at = match renamed.get(&binding.par2_file_id) {
+                Some(name) => Some(state.working_dir.join(name)),
+                None => par2_set
+                    .file_description(&binding.par2_file_id)
+                    .map(|desc| state.working_dir.join(&desc.filename)),
+            };
             if direct_files.contains(&file_id.file_index)
-                || declared.as_ref() != Some(&binding.path)
+                || read_at.as_ref() != Some(&binding.path)
                 || bound.insert(binding.par2_file_id, file_id).is_some()
             {
                 return Err(DirectRepairFailure::DamageOutsideDirectSets);
@@ -2509,6 +2512,63 @@ impl Pipeline {
                         file_id: *file_id,
                     })
                     .ok_or(DirectRepairFailure::DamageOutsideDirectSets)
+            })
+            .collect()
+    }
+
+    /// The names the direct verify and repair read a file outside every
+    /// direct set under, for each such file that does not sit at its declared
+    /// PAR2 name.
+    ///
+    /// An obfuscated or renamed post keeps its posted name on disk until
+    /// completion renames it, so a demoted set's volume is still under that
+    /// name when one recovery set's verdict and repair cover it beside a set
+    /// that stayed direct. Read at its declared name it is simply absent: the
+    /// verdict calls every slice missing and the repair has nowhere to write,
+    /// so the set that stayed direct was demoted for damage it never had.
+    ///
+    /// The name comes from the identity the job already proved, the same
+    /// binding the dual-CRC grid measures the file against: by name, or by
+    /// the content fingerprint its offset-zero article captured. Nothing is
+    /// read or hashed beyond that. A file is redirected only when the binding
+    /// is the description's alone, so two files claiming one description, or a
+    /// name some other description declares, leave the description at its
+    /// declared name exactly as before.
+    pub(super) fn direct_par2_fallback_names(
+        &self,
+        job_id: JobId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> HashMap<par2_rs::FileId, String> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return HashMap::new();
+        };
+        let mut bound: HashMap<par2_rs::FileId, Option<String>> = HashMap::new();
+        for file in state.assembly.files() {
+            let file_id = file.file_id();
+            if self.is_direct_source_file(file_id) {
+                continue;
+            }
+            let Some(binding) =
+                self.resolve_par2_file_binding_in_set(file_id, par2_set.recovery_set_id)
+            else {
+                continue;
+            };
+            let name = self.current_filename_for_file(job_id, file);
+            bound
+                .entry(binding.par2_file_id)
+                .and_modify(|claim| *claim = None)
+                .or_insert(Some(name));
+        }
+        let declared: HashSet<&str> = par2_set
+            .files
+            .values()
+            .map(|desc| desc.filename.as_str())
+            .collect();
+        bound
+            .into_iter()
+            .filter_map(|(par2_file_id, name)| {
+                let name = name?;
+                (!declared.contains(name.as_str())).then_some((par2_file_id, name))
             })
             .collect()
     }
@@ -2773,22 +2833,15 @@ impl Pipeline {
                 .virtual_volumes_for(&self.direct_store, job_id)
                 .unwrap_or_default(),
         );
-        // No overrides: the fallback answers only files this set does not own,
-        // and each one is at its declared PAR2 name — the placement scan that
-        // produced the verification already ran and reported no conflicts, and
-        // a rename since then would have invalidated the verdict this repair is
-        // planned from.
-        let inner_plan = par2_rs::PlacementPlan {
-            exact: Vec::new(),
-            swaps: Vec::new(),
-            renames: Vec::new(),
-            unresolved: Vec::new(),
-            conflicts: Vec::new(),
-        };
-        let inner = par2_rs::PlacementFileAccess::from_plan(
+        // The fallback answers only files this set does not own, each where
+        // the verdict this repair is planned from read it: at its declared
+        // PAR2 name, or under the name its proven identity binds when it sits
+        // somewhere else. A rename since then would have invalidated that
+        // verdict.
+        let inner = par2_rs::PlacementFileAccess::new(
             working_dir.clone(),
             par2_set.as_ref(),
-            &inner_plan,
+            self.direct_par2_fallback_names(job_id, par2_set),
         );
         let memory_limit = Some(self.par2_repair_memory_limit_bytes());
         let volumes = overlay.volumes.clone();

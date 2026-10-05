@@ -6,6 +6,20 @@ use super::*;
 use crate::pipeline::repair::backend::AlternateRepairReason;
 
 impl Pipeline {
+    /// Whether the job has archive extraction to run once its PAR2 verdict
+    /// lands.
+    ///
+    /// Asked again after a clean verdict's deobfuscation rather than read from
+    /// the start of the pass: an obfuscated volume the repair completed was
+    /// never classified by its content, so until the verdict names it the job
+    /// looks like it has no archive at all. Answering from that stale view
+    /// sends a job whose only archive was just named to reconciliation instead
+    /// of extraction, and leaves it verifying with nothing left to verify.
+    fn archive_extraction_applicable(&self, job_id: JobId) -> bool {
+        self.extraction_readiness_for_job(job_id) != ExtractionReadiness::NotApplicable
+            || self.job_has_only_rar_archives(job_id)
+    }
+
     pub(super) async fn check_rar_job_completion(&mut self, job_id: JobId) {
         let set_names = self.rar_set_names_for_job(job_id);
         if set_names.is_empty() {
@@ -1329,7 +1343,7 @@ impl Pipeline {
                             return;
                         }
 
-                        if archive_extraction_applicable {
+                        if self.archive_extraction_applicable(job_id) {
                             self.retry_archive_extraction_after_verify_or_repair(job_id)
                                 .await;
                             return;
@@ -1821,7 +1835,7 @@ impl Pipeline {
                             return;
                         }
 
-                        if archive_extraction_applicable {
+                        if self.archive_extraction_applicable(job_id) {
                             self.retry_archive_extraction_after_verify_or_repair(job_id)
                                 .await;
                             return;
@@ -2424,7 +2438,7 @@ impl Pipeline {
                         return;
                     }
 
-                    if archive_extraction_applicable {
+                    if self.archive_extraction_applicable(job_id) {
                         self.retry_archive_extraction_after_verify_or_repair(job_id)
                             .await;
                         return;
