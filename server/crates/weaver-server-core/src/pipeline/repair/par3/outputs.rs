@@ -294,7 +294,7 @@ impl Pipeline {
                     .any(|(_, view)| view.files.iter().any(|file| file.path == name))
             })
         };
-        let candidates: Vec<(NzbFileId, PathBuf, Vec<(u64, usize)>)> = state
+        let candidates: Vec<_> = state
             .assembly
             .files()
             .filter(|file| {
