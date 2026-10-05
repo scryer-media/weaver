@@ -139,11 +139,25 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
     /// Drain ready segments and return the contiguous end represented by the
     /// drain, including already-persisted gaps that were bridged.
     pub fn drain_ready_with_contiguous_end(&mut self) -> (Vec<(u64, T)>, u64) {
-        // Duplicate arrivals are writable immediately: everything they cover is
-        // already sequenced, so they never wait on the cursor and never move it.
-        // They lead the batch so that the copy holding the offset is the one
-        // written last, leaving the cursor describing what is really on disk.
-        let mut ready = self.take_redundant();
+        // A duplicate arrival is writable as soon as the bytes it covers are
+        // sequenced: it never waits on the cursor past that and never moves it.
+        // One whose first copy is still parked ahead of the cursor is not there
+        // yet. Nothing of that range has left the reorder stage, and writing
+        // the duplicate would put bytes on disk for a file that has none. It
+        // stays behind its first copy and leaves with it.
+        //
+        // Duplicates lead the batch so that the copy holding the offset is the
+        // one written last, leaving the cursor describing what is really on
+        // disk.
+        let (mut parked, released): (Vec<_>, Vec<_>) = std::mem::take(&mut self.redundant)
+            .into_iter()
+            .partition(|(offset, _)| {
+                matches!(self.pending.get(offset), Some(PendingChunk::Buffered(_)))
+            });
+        for (_, chunk) in &released {
+            self.forget_buffered(chunk.len_bytes());
+        }
+        let mut ready = released;
 
         // Drain contiguous segments starting from write_cursor.
         while let Some((&offset, _)) = self.pending.first_key_value() {
@@ -154,6 +168,16 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
             let (off, entry) = self.pending.pop_first().unwrap();
             match entry {
                 PendingChunk::Buffered(buf) => {
+                    let mut index = 0;
+                    while index < parked.len() {
+                        if parked[index].0 == off {
+                            let duplicate = parked.remove(index);
+                            self.forget_buffered(duplicate.1.len_bytes());
+                            ready.push(duplicate);
+                        } else {
+                            index += 1;
+                        }
+                    }
                     let len = buf.len_bytes();
                     self.forget_buffered(len);
                     if buf.contributes_to_coverage() {
@@ -167,6 +191,7 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
             }
         }
 
+        self.redundant = parked;
         (ready, self.write_cursor)
     }
 

@@ -331,20 +331,6 @@ async fn a_straddling_block_behind_a_held_volume_repairs_in_place_rar4_encryptio
     .await;
 }
 
-/// The lost cohort's size in the job's retained PAR3 view, `None` while the
-/// runtime has no settled view to offer.
-fn par3_lost_blocks(pipeline: &Pipeline, job_id: JobId) -> Option<u64> {
-    let runtime = pipeline.par3_runtime.as_ref()?;
-    let mut views = runtime.assessments(job_id).peekable();
-    views.peek()?;
-    Some(
-        views
-            .flat_map(|(_, view)| view.requirements.iter())
-            .map(|requirement| requirement.lost)
-            .sum(),
-    )
-}
-
 /// Every article of the volume after the lost tail lands behind the cipher
 /// block that tail took with it, so each one is held and none is placed. A
 /// held article writes no destination, yet it is posted bytes the volume's

@@ -27,8 +27,10 @@ pub enum TerminalDiscardKind {
     /// servers hold under them belongs to a different, coherent file, so the
     /// file this NZB declared could not have arrived from any server.
     UnfetchableDuplicate,
-    /// A split part whose bytes the PAR2 join already folded into an output the
-    /// verdict vouched for. It is a spent input, not an outstanding file.
+    /// A posted file whose bytes the recovery set already folded into an output
+    /// the verdict vouched for: a split part a join consumed, or the damaged
+    /// copy of a file the repair rebuilt. A spent input, not an outstanding
+    /// file.
     RepairLeftover,
     /// Recovery capacity the job never needed. Recovery volumes have never
     /// counted toward health, so nothing has to move them out of an accounting

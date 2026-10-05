@@ -18,7 +18,6 @@ mod progress;
 mod repair;
 mod server_attribution;
 
-pub(crate) use orchestrator::check_disk_space;
 pub(crate) use orchestrator::{
     close_cached_write_handles_under, release_cached_write_handle,
     remove_file_after_cached_write_handle,
@@ -1058,6 +1057,19 @@ pub(super) struct Par2SetSummary {
 }
 
 #[derive(Default)]
+pub(super) struct RecoveryUnpostedOutputs {
+    /// Described names a verdict proved complete on disk while no posted file
+    /// bound to them. A posting whose files carry no usable name reaches the
+    /// job this way: the recovery set rebuilds the described file beside a
+    /// posted one it cannot identify.
+    pub(super) outputs: HashSet<String>,
+    /// Posted files holding bytes of a rebuilt output at the offset the set
+    /// describes them. Each is the damaged copy of a file a recovery set has
+    /// since delivered whole, so it is a spent input rather than payload.
+    pub(super) superseded: HashSet<NzbFileId>,
+}
+
+#[derive(Default)]
 pub(super) struct Par2SetRuntime {
     /// The parsed recovery set. `None` until an index of this set was parsed.
     pub(super) set: Option<Arc<Par2FileSet>>,
@@ -1230,6 +1242,95 @@ pub(super) struct DirectBarrierFlight {
 }
 
 pub(super) struct DirectBarrierDone {
+    pub(super) job_id: JobId,
+    pub(super) set_index: usize,
+    pub(super) flight_id: u64,
+}
+
+/// Spans waiting for their destination writes to return, and what produced
+/// them.
+pub(super) struct DirectPlacement {
+    pub(super) spans: Vec<direct_store::router::RoutedSpan>,
+    pub(super) kind: DirectPlacementKind,
+    /// Counted into the resident write backlog while the placement waits, so
+    /// a slow destination slows dispatch the way a slow conventional write does.
+    pub(super) buffered_len: usize,
+}
+
+/// What a placement's spans came out of, which decides what its landing does.
+pub(super) enum DirectPlacementKind {
+    /// A routed article. It is held, not copied: the spans are refcounted
+    /// views of its buffers, and the segment itself is what the commit reads
+    /// its CRC facts from — or what the conventional path takes back if the
+    /// placement fails.
+    Article {
+        segment: BufferedDecodedSegment,
+        volume_index: u32,
+        file_offset: u64,
+    },
+    /// A completed volume's trailing region, which the confirming parse
+    /// released from the holds. Its landing finishes the volume's completion:
+    /// the set may not finalize, and delete its envelopes, before these bytes
+    /// are its coverage.
+    VolumeTail { volume_index: u32 },
+}
+
+impl DirectPlacement {
+    /// The routed article this placement carries, if it carries one.
+    pub(super) fn article(&self) -> Option<SegmentId> {
+        match &self.kind {
+            DirectPlacementKind::Article { segment, .. } => Some(segment.segment_id),
+            DirectPlacementKind::VolumeTail { .. } => None,
+        }
+    }
+}
+
+/// Where a placement flight's writes are.
+pub(super) enum DirectPlacementFlightState {
+    /// Writing on a task of its own.
+    Pending(tokio::sync::oneshot::Receiver<DirectPlacementOutcome>),
+    /// The writes returned and a join collected the outcome; the done message
+    /// applies it.
+    Resolved(DirectPlacementOutcome),
+    /// Being applied right now, further up the pipeline task's own stack.
+    Applying,
+}
+
+/// What a placement task reports: the destinations it created (for the
+/// once-per-job preparation cache) and whether every write returned.
+pub(super) struct DirectPlacementOutcome {
+    pub(super) prepared: Vec<PathBuf>,
+    pub(super) result: Result<(), direct_store::wiring::DirectPlacementError>,
+}
+
+/// A set's placements between routing and commit.
+///
+/// The destination writes of a routed article used to be awaited on the
+/// pipeline task, so a destination that took seconds to answer stopped every
+/// lane of every job for those seconds. Routing still happens on the task —
+/// it is what decides where the bytes go — but the writes run on a task of
+/// their own, and the commit is applied when the done message comes back.
+///
+/// At most one flight per set is out at a time. Articles routed while it is
+/// out queue behind it and leave together as the next flight, so the set's
+/// commits keep their routing order, and a destination is only ever prepared
+/// by one task at a time.
+pub(super) struct DirectPlacementFlight {
+    /// Names this flight to its done message, as a barrier flight's id does.
+    pub(super) id: u64,
+    /// The set this flight was routed into, checked again before it commits.
+    pub(super) set_name: String,
+    pub(super) state: DirectPlacementFlightState,
+    pub(super) placements: VecDeque<DirectPlacement>,
+}
+
+#[derive(Default)]
+pub(super) struct DirectPlacementLane {
+    pub(super) flight: Option<DirectPlacementFlight>,
+    pub(super) queued: VecDeque<DirectPlacement>,
+}
+
+pub(super) struct DirectPlacementDone {
     pub(super) job_id: JobId,
     pub(super) set_index: usize,
     pub(super) flight_id: u64,
@@ -2665,6 +2766,27 @@ pub struct Pipeline {
     pub(super) next_direct_barrier_flight_id: u64,
     pub(super) direct_barrier_done_tx: mpsc::Sender<DirectBarrierDone>,
     pub(super) direct_barrier_done_rx: mpsc::Receiver<DirectBarrierDone>,
+    /// Routed articles whose destination writes are out or queued, per set;
+    /// see [`DirectPlacementFlight`].
+    pub(super) direct_placement_lanes: HashMap<(JobId, usize), DirectPlacementLane>,
+    /// Jobs whose completion check ran while a placement was out. The check
+    /// cannot judge them until it lands, and the landing re-queues it.
+    pub(super) completion_checks_awaiting_placements: HashSet<JobId>,
+    /// Direct sets whose PAR3 images were held back because a placement was
+    /// out. Nothing else is bound to publish them once it lands, so the
+    /// landing does.
+    pub(super) par3_publications_awaiting_placements: HashSet<(JobId, usize)>,
+    /// Monotonic; stamps each placement flight and its done message.
+    pub(super) next_direct_placement_flight_id: u64,
+    pub(super) direct_placement_done_tx: mpsc::Sender<DirectPlacementDone>,
+    pub(super) direct_placement_done_rx: mpsc::Receiver<DirectPlacementDone>,
+    /// Holds every placement task at its first step until a permit is added,
+    /// so a test can keep a destination write open for as long as it likes.
+    #[cfg(test)]
+    pub(super) direct_placement_hold: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// Test hook: a placement task panics once it is past the hold.
+    #[cfg(test)]
+    pub(super) direct_placement_panics: bool,
     /// Sets whose restart-seeded re-read is running; see [`DirectRearmDone`].
     pub(super) direct_rearm_in_flight: HashSet<(JobId, usize)>,
     pub(super) direct_rearm_done_tx: mpsc::Sender<DirectRearmDone>,
@@ -2809,9 +2931,15 @@ pub struct Pipeline {
     pub(super) uu_park_max_segments: usize,
     /// Free space preserved on the intermediate filesystem while spilling UU.
     pub(super) uu_spool_min_free_bytes: u64,
-    /// Rate-limited free-space readings for the spool filesystem. Admitted
-    /// spills are debited against the cached reading between probes.
-    pub(super) uu_spool_capacity: crate::operations::CapacitySampler,
+    /// The spool filesystem's latest free-space reading, from the
+    /// intermediate root's sampler. Never probes on the pipeline task.
+    pub(super) uu_spool_capacity: crate::operations::CapacityReader,
+    /// Spills admitted against the current reading, so a burst between
+    /// refreshes cannot each see the same headroom.
+    pub(super) uu_spool_debits: crate::operations::CapacityDebits,
+    /// One background free-space sampler per configured root. Everything on
+    /// the pipeline that gates work on free space reads these readings.
+    pub(super) storage_capacity: Arc<crate::operations::StorageCapacity>,
     /// Largest refused UU spill. Dispatch preserves cursor progress until
     /// this many bytes can be parked in memory or admitted to the spool.
     pub(super) uu_spool_blocked_spill_bytes: Option<usize>,
@@ -2829,6 +2957,15 @@ pub struct Pipeline {
     /// has landed have an entry at all. Dropped with the rest of the job's
     /// per-file runtime.
     pub(super) file_prefix_16k: HashMap<NzbFileId, Vec<u8>>,
+    /// The PAR2 content fingerprint (`hash_16k`, length) an identity roster
+    /// already proved for a file whose [`Self::file_prefix_16k`] capture did
+    /// not survive a restart.
+    ///
+    /// A restored set's files routed their offset-zero articles before the
+    /// restart, so no prefix is ever captured again; the roster binding the
+    /// checkpoint kept is the evidence instead. Consulted only where no
+    /// prefix exists, and dropped with the rest of the job's per-file runtime.
+    pub(super) file_proven_par2_fingerprint: HashMap<NzbFileId, ([u8; 16], u64)>,
     /// First non-zero decoded size declared by a yEnc header for each file.
     ///
     /// This is independent evidence about the file the poster intended to
@@ -2995,6 +3132,9 @@ pub struct Pipeline {
     /// is retired here, and the parts it names become consumed inputs rather
     /// than payload the job is still short of.
     pub(super) par2_joined_split_sets: HashMap<JobId, HashMap<String, HashSet<String>>>,
+    /// What a recovery verdict put on disk that no posted file answers to, and
+    /// the posted files proven to be the damaged copies it was built from.
+    pub(super) recovery_unposted_outputs: HashMap<JobId, RecoveryUnpostedOutputs>,
     /// Working-directory entry names as they stood immediately before a repair
     /// ran, per job.
     ///

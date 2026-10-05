@@ -356,6 +356,24 @@ pub(crate) fn damaged_ranges(valid_slices: &[bool], slice_size: u64, len: u64) -
     ranges
 }
 
+/// `damaged` together with `unheld`, the ranges of the volume the set holds no
+/// byte of, sorted and coalesced.
+pub(crate) fn with_unheld_ranges(
+    mut damaged: Vec<(u64, u64)>,
+    unheld: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    damaged.extend(unheld.iter().copied().filter(|(start, end)| start < end));
+    damaged.sort_unstable();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in damaged {
+        match ranges.last_mut() {
+            Some((_, last_end)) if *last_end >= start => *last_end = (*last_end).max(end),
+            _ => ranges.push((start, end)),
+        }
+    }
+    ranges
+}
+
 /// Widens `ranges` to the article boundaries `extents` describes, so a rewrite
 /// covers whole articles wherever the decoded geometry is known.
 ///

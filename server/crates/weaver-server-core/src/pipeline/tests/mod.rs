@@ -57,6 +57,8 @@ mod par2_multiset_gate;
 mod par2_multiset_grid;
 mod par3_completion;
 mod par3_recovery;
+#[cfg(unix)]
+mod post_processing_completion;
 mod rar_extraction;
 mod restart_resume_floor;
 mod restore_history;
@@ -2449,12 +2451,30 @@ fn park_job_on_its_final_decode(pipeline: &mut Pipeline, segment_id: SegmentId, 
     pipeline.note_decode_started(segment_id, raw_size);
 }
 
+/// Drives every routed article's placement to its commit, the way the
+/// orchestrator's select loop would: the destination writes run on a task of
+/// their own, and the commit waits for the done message.
+///
+/// It waits on the messages themselves, with no deadline.
+async fn settle_direct_placement_work(pipeline: &mut Pipeline) {
+    while !pipeline.direct_placement_lanes.is_empty() {
+        let done = pipeline
+            .direct_placement_done_rx
+            .recv()
+            .await
+            .expect("the direct placement channel should stay open");
+        pipeline.handle_direct_placement_done(done).await;
+    }
+}
+
 /// Drives every outstanding demotion reconstruction ticket to its handler, the
 /// way the orchestrator's select loop would.
 ///
 /// It waits on the completion itself, with no deadline: how long a sweep takes
 /// depends on the machine, so a hang is the test runner's to catch.
 async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
+    // A placement whose write failed is what demotes the set.
+    settle_direct_placement_work(pipeline).await;
     while !pipeline.direct_demotion_in_flight.is_empty() {
         let done = pipeline
             .direct_demotion_done_rx
@@ -2523,6 +2543,7 @@ async fn submit_decoded_segment_from_server(
             },
         )
         .await;
+    settle_direct_placement_work(pipeline).await;
 }
 
 async fn persist_completed_file_hash(
@@ -2762,6 +2783,9 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         Rearm(crate::pipeline::DirectRearmDone),
         Barrier(crate::pipeline::DirectBarrierDone),
     }
+    // PAR3 jobs whose idle coordinator has already been offered a completion
+    // check by this call.
+    let mut republished = HashSet::new();
     loop {
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
@@ -2793,6 +2817,10 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
             pipeline.handle_direct_barrier_done(done).await;
             handled_a_ticket = true;
         }
+        if !pipeline.direct_placement_lanes.is_empty() {
+            settle_direct_placement_work(pipeline).await;
+            handled_a_ticket = true;
+        }
         // A ticket that had already finished by the time this loop looked is
         // handled here rather than at the wait below, and its handler arms the
         // completion check that carries the outcome forward. Going back to the
@@ -2805,12 +2833,35 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         let post_repair_pending = !pipeline.direct_post_repair_in_flight.is_empty();
         let tolerated_pending = !pipeline.direct_tolerated_in_flight.is_empty();
         let demotion_pending = !pipeline.direct_demotion_in_flight.is_empty();
+        // A write that lands after the queue drained leaves a PAR3 source
+        // withdrawn with no worker out: nothing will hand back, and the
+        // completion check the download worker schedules at the drain is what
+        // republishes it. Run that check once here; a coordinator still idle
+        // after it is waiting on its caller, not on a ticket.
+        let idle: Vec<JobId> = pipeline
+            .par3_runtime
+            .as_ref()
+            .map(|coordinator| {
+                pipeline
+                    .jobs
+                    .keys()
+                    .copied()
+                    .filter(|job_id| {
+                        coordinator.has_work(*job_id) && !coordinator.has_worker_in_flight(*job_id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(job_id) = idle.iter().copied().find(|job_id| republished.insert(*job_id)) {
+            pipeline.check_job_completion(job_id).await;
+            continue;
+        }
         let par2_analysis_pending = !pipeline.par2_analysis_in_flight.is_empty()
             || pipeline.par3_runtime.as_ref().is_some_and(|coordinator| {
                 pipeline
                     .jobs
                     .keys()
-                    .any(|job_id| coordinator.has_work(*job_id))
+                    .any(|job_id| coordinator.has_work(*job_id) && !idle.contains(job_id))
             });
         let rearm_pending = !pipeline.direct_rearm_in_flight.is_empty();
         let barrier_pending = !pipeline.direct_barrier_flights.is_empty();
@@ -2889,6 +2940,9 @@ async fn settle_par2_analysis_work(pipeline: &mut Pipeline) {
 /// verdict that starts a repair leaves the repair's own read-back ticket out,
 /// for the test to settle or to interpose on as it needs.
 async fn settle_direct_verification_read(pipeline: &mut Pipeline, job_id: JobId) {
+    // The set's last article is committed when its placement lands, and that
+    // commit is what submits the read-back.
+    settle_direct_placement_work(pipeline).await;
     let Some(in_flight) = pipeline.direct_post_repair_in_flight.get(&job_id) else {
         return;
     };
@@ -3010,6 +3064,7 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
             )
         });
         pipeline.handle_decode_done(done).await;
+        settle_direct_placement_work(pipeline).await;
         settle_inflight_moves(pipeline).await;
     }
     settle_inflight_moves(pipeline).await;

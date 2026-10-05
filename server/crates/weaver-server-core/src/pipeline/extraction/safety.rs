@@ -10,7 +10,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use tracing::{info, warn};
 
-use crate::operations::disk::{Capacity, CapacitySampler, probe_nearest_disk_space};
+use crate::operations::disk::{Capacity, CapacityDebits, CapacityReader, probe_nearest_disk_space};
 use crate::operations::metrics::PipelineMetrics;
 
 const MIB: u64 = 1024 * 1024;
@@ -182,16 +182,17 @@ impl std::fmt::Display for ExtractionFailure {
 
 /// Free-space accounting for the extraction root.
 ///
-/// The sampler re-reads the filesystem at most once per
-/// [`DISK_REFRESH_INTERVAL`] and holds the last good reading across probe
-/// failures, so a transient stat error (a NAS hiccup, a path that is briefly
-/// unreachable) never rejects a write on its own. Only a fresh reading that
-/// confirms the reserve would be breached rejects; while the filesystem cannot
-/// be read the reserve check stands down and the write itself is the last
-/// line of defence.
+/// The reading comes from a sampler that refreshes on its own thread and
+/// holds the last good reading across probe failures, so a transient stat
+/// error (a NAS hiccup, a path that is briefly unreachable) never rejects a
+/// write on its own. Only a fresh reading that confirms the reserve would be
+/// breached rejects; while the filesystem cannot be read the reserve check
+/// stands down and the write itself is the last line of defence. Writes
+/// admitted against a reading are debited from it until the next one.
 #[derive(Debug)]
 struct DiskBudgetState {
-    sampler: CapacitySampler,
+    capacity: CapacityReader,
+    debits: CapacityDebits,
 }
 
 #[derive(Debug, Default)]
@@ -836,9 +837,11 @@ impl JobExtractionBudget {
         metrics: Arc<PipelineMetrics>,
     ) -> Result<Arc<Self>, String> {
         let process_memory = Arc::new(ProcessMemoryBudget::new(limits.max_memory_bytes));
-        Self::new_with_process_memory(
+        let capacity = CapacityReader::probing(root_path.clone(), DISK_REFRESH_INTERVAL);
+        Self::with_capacity(
             limits,
             process_memory,
+            capacity,
             root_path,
             declared_archive_bytes,
             initial_entries,
@@ -847,9 +850,38 @@ impl JobExtractionBudget {
         )
     }
 
+    /// [`Self::with_capacity`] reading the root's free space itself, on the
+    /// calling thread.
+    #[cfg(test)]
     pub(crate) fn new_with_process_memory(
         limits: Arc<ExtractionLimits>,
         process_memory: Arc<ProcessMemoryBudget>,
+        root_path: PathBuf,
+        declared_archive_bytes: u64,
+        initial_entries: u64,
+        initial_bytes: u64,
+        metrics: Arc<PipelineMetrics>,
+    ) -> Result<Arc<Self>, String> {
+        let capacity = CapacityReader::probing(root_path.clone(), DISK_REFRESH_INTERVAL);
+        Self::with_capacity(
+            limits,
+            process_memory,
+            capacity,
+            root_path,
+            declared_archive_bytes,
+            initial_entries,
+            initial_bytes,
+            metrics,
+        )
+    }
+
+    /// `capacity` reads the extraction root's free space. On the pipeline it
+    /// is the complete root's sampler, so building a budget never probes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_capacity(
+        limits: Arc<ExtractionLimits>,
+        process_memory: Arc<ProcessMemoryBudget>,
+        capacity: CapacityReader,
         root_path: PathBuf,
         declared_archive_bytes: u64,
         initial_entries: u64,
@@ -860,11 +892,10 @@ impl JobExtractionBudget {
             .saturating_mul(limits.max_ratio)
             .max(GIB);
         let effective_job_limit_bytes = limits.max_job_bytes.min(ratio_limit_bytes);
-        let mut sampler = CapacitySampler::new(root_path.clone(), DISK_REFRESH_INTERVAL);
-        if sampler.refresh() == Capacity::Unknown {
-            // The sampler already logged the operating-system reason. The job
-            // proceeds without a reserve check until a reading arrives; the
-            // extraction root's own writes surface a full disk.
+        if capacity.current() == Capacity::Unknown {
+            // The sampler logs the operating-system reason. The job proceeds
+            // without a reserve check until a reading arrives; the extraction
+            // root's own writes surface a full disk.
             warn!(
                 root = %root_path.display(),
                 "extraction root capacity is unknown; the disk reserve is not enforced until a reading arrives"
@@ -892,7 +923,10 @@ impl JobExtractionBudget {
             memory_reserved: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             failure: Mutex::new(None),
-            disk: Mutex::new(DiskBudgetState { sampler }),
+            disk: Mutex::new(DiskBudgetState {
+                capacity,
+                debits: CapacityDebits::default(),
+            }),
             active: Mutex::new(ActiveState::default()),
             idle: Condvar::new(),
             metrics,
@@ -920,12 +954,8 @@ impl JobExtractionBudget {
     /// Whether the extraction root has produced at least one capacity reading.
     #[cfg(all(test, unix))]
     pub(crate) fn disk_capacity_known(&self) -> bool {
-        self.disk
-            .lock()
-            .expect("extraction disk state poisoned")
-            .sampler
-            .current()
-            != Capacity::Unknown
+        let disk = self.disk.lock().expect("extraction disk state poisoned");
+        disk.capacity.current() != Capacity::Unknown
     }
 
     pub(crate) fn is_rejection(error: &str) -> bool {
@@ -1345,7 +1375,8 @@ impl JobExtractionBudget {
 
     fn reserve_disk(&self, bytes: u64) -> Result<(), ExtractionFailure> {
         let mut disk = self.disk.lock().expect("extraction disk state poisoned");
-        let Some(reading) = disk.sampler.sample().reading() else {
+        let current = disk.capacity.current();
+        let Some(reading) = disk.debits.apply(current).reading() else {
             // No reading has ever succeeded for this root: nothing to account
             // against, and refusing on ignorance would fail the job for a
             // problem the filesystem never reported.
@@ -1364,7 +1395,7 @@ impl JobExtractionBudget {
         // A stale reading keeps being debited so the estimate stays honest,
         // but only a fresh reading may reject: the next successful probe
         // confirms or clears the breach within one refresh interval.
-        disk.sampler.debit(bytes);
+        disk.debits.debit(bytes);
         Ok(())
     }
 
@@ -1376,7 +1407,7 @@ impl JobExtractionBudget {
         self.disk
             .lock()
             .expect("extraction disk state poisoned")
-            .sampler
+            .debits
             .credit(bytes);
     }
 
@@ -1683,27 +1714,7 @@ pub(crate) struct ExtractionRoot {
 
 impl ExtractionRoot {
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
-        let parent_path = path
-            .parent()
-            .ok_or_else(|| format!("extraction staging root has no parent: {}", path.display()))?;
-        let anchor_path = parent_path.parent().ok_or_else(|| {
-            format!(
-                "extraction staging parent has no anchor: {}",
-                parent_path.display()
-            )
-        })?;
-        let parent_name = parent_path.file_name().ok_or_else(|| {
-            format!(
-                "extraction staging parent has no directory name: {}",
-                parent_path.display()
-            )
-        })?;
-        let root_name = path.file_name().ok_or_else(|| {
-            format!(
-                "extraction staging root has no directory name: {}",
-                path.display()
-            )
-        })?;
+        let (anchor_path, parent_name, root_name) = staging_root_components(path)?;
 
         let anchor = Dir::open_ambient_dir(anchor_path, ambient_authority()).map_err(|error| {
             format!(
@@ -1721,6 +1732,65 @@ impl ExtractionRoot {
             Path::new(root_name),
             "extraction staging root",
         )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dir,
+        })
+    }
+
+    /// Create a staging root that starts empty, and open it.
+    ///
+    /// For a caller that names a fresh directory on every use, so whatever
+    /// already sits at `path` was left there by an earlier process and is
+    /// removed rather than adopted. The anchor chain is created as
+    /// [`Self::open`] expects it; the removal and the creation both go through
+    /// the parent opened without following links, so a link planted at `path`
+    /// is unlinked, never followed.
+    pub(crate) fn create_empty(path: &Path) -> Result<Self, String> {
+        let (anchor_path, parent_name, root_name) = staging_root_components(path)?;
+        let root_name = Path::new(root_name);
+
+        std::fs::create_dir_all(anchor_path).map_err(|error| {
+            format!(
+                "failed to create extraction staging anchor {}: {error}",
+                anchor_path.display()
+            )
+        })?;
+        let anchor = Dir::open_ambient_dir(anchor_path, ambient_authority()).map_err(|error| {
+            format!(
+                "failed to open extraction staging anchor {}: {error}",
+                anchor_path.display()
+            )
+        })?;
+        let parent = open_or_create_directory_nofollow(
+            &anchor,
+            Path::new(parent_name),
+            "extraction staging parent",
+        )?;
+        let stale = match parent.symlink_metadata(root_name) {
+            Ok(metadata) if metadata.is_dir() => parent.remove_dir_all(root_name),
+            Ok(_) => parent.remove_file(root_name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+        stale.map_err(|error| {
+            format!(
+                "failed to clear stale extraction staging root {}: {error}",
+                path.display()
+            )
+        })?;
+        parent.create_dir(root_name).map_err(|error| {
+            format!(
+                "failed to create extraction staging root {}: {error}",
+                path.display()
+            )
+        })?;
+        let dir = parent.open_dir_nofollow(root_name).map_err(|error| {
+            format!(
+                "failed to open extraction staging root {} without following links: {error}",
+                path.display()
+            )
+        })?;
         Ok(Self {
             path: path.to_path_buf(),
             dir,
@@ -1946,6 +2016,33 @@ impl ExtractionRoot {
     }
 }
 
+/// Split a staging root into the anchor that is opened by path and the two
+/// directory names beneath it that are opened without following links.
+fn staging_root_components(path: &Path) -> Result<(&Path, &OsStr, &OsStr), String> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| format!("extraction staging root has no parent: {}", path.display()))?;
+    let anchor_path = parent_path.parent().ok_or_else(|| {
+        format!(
+            "extraction staging parent has no anchor: {}",
+            parent_path.display()
+        )
+    })?;
+    let parent_name = parent_path.file_name().ok_or_else(|| {
+        format!(
+            "extraction staging parent has no directory name: {}",
+            parent_path.display()
+        )
+    })?;
+    let root_name = path.file_name().ok_or_else(|| {
+        format!(
+            "extraction staging root has no directory name: {}",
+            path.display()
+        )
+    })?;
+    Ok((anchor_path, parent_name, root_name))
+}
+
 fn open_or_create_directory_nofollow(
     parent: &Dir,
     relative: &Path,
@@ -2003,6 +2100,17 @@ fn scan_capability_directory(
             display_root.join(relative).display()
         )
     })?;
+    scan_capability_children(directory, relative, display_root, entries, bytes, children)
+}
+
+fn scan_capability_children(
+    directory: &Dir,
+    relative: &Path,
+    display_root: &Path,
+    entries: &mut u64,
+    bytes: &mut u64,
+    children: impl IntoIterator<Item = io::Result<cap_std::fs::DirEntry>>,
+) -> Result<(), String> {
     for child in children {
         let child = child.map_err(|error| {
             format!(
@@ -2013,9 +2121,18 @@ fn scan_capability_directory(
         let name = child.file_name();
         let child_relative = relative.join(&name);
         let display_path = display_root.join(&child_relative);
-        let metadata = directory
-            .symlink_metadata(&name)
-            .map_err(|error| format!("failed to inspect '{}': {error}", display_path.display()))?;
+        let metadata = match directory.symlink_metadata(&name) {
+            Ok(metadata) => metadata,
+            // Demotion unlinks partials asynchronously. An entry can disappear
+            // after enumeration; it contributes nothing to this snapshot.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect '{}': {error}",
+                    display_path.display()
+                ));
+            }
+        };
         *entries = entries.saturating_add(1);
         if metadata.file_type().is_symlink() {
             return Err(format!(
@@ -2031,13 +2148,14 @@ fn scan_capability_directory(
             ));
         }
         if metadata.is_dir() {
-            let child_dir = directory.open_dir_nofollow(&name).map_err(|error| {
-                format!(
-                    "failed to open staging directory '{}' without following links: {error}",
-                    display_path.display()
-                )
-            })?;
-            scan_capability_directory(&child_dir, &child_relative, display_root, entries, bytes)?;
+            scan_capability_subdirectory(
+                directory,
+                &name,
+                &child_relative,
+                display_root,
+                entries,
+                bytes,
+            )?;
         } else if metadata.is_file() {
             *bytes = bytes.saturating_add(metadata.len());
         } else {
@@ -2048,6 +2166,28 @@ fn scan_capability_directory(
         }
     }
     Ok(())
+}
+
+fn scan_capability_subdirectory(
+    directory: &Dir,
+    name: &OsStr,
+    relative: &Path,
+    display_root: &Path,
+    entries: &mut u64,
+    bytes: &mut u64,
+) -> Result<(), String> {
+    let child_dir = match directory.open_dir_nofollow(name) {
+        Ok(child_dir) => child_dir,
+        // The directory may disappear after its metadata was inspected too.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to open staging directory '{}' without following links: {error}",
+                display_root.join(relative).display()
+            ));
+        }
+    };
+    scan_capability_directory(&child_dir, relative, display_root, entries, bytes)
 }
 
 #[cfg(target_os = "windows")]
@@ -3138,6 +3278,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_disk_reserve_judges_the_injected_reading_and_debits_it_until_the_next() {
+        use crate::operations::disk::CapacityReading;
+
+        let taken = Instant::now();
+        let reading = Arc::new(Mutex::new(Capacity::Unknown));
+        let reads = Arc::clone(&reading);
+        let budget = JobExtractionBudget::with_capacity(
+            Arc::new(ExtractionLimits {
+                max_job_bytes: 10_000,
+                max_member_bytes: 10_000,
+                max_ratio: 10_000,
+                min_free_bytes: 500,
+                ..(*limits()).clone()
+            }),
+            Arc::new(ProcessMemoryBudget::new(64 * MIB)),
+            CapacityReader::from_fn(move || *reads.lock().unwrap()),
+            PathBuf::from("/injected"),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let set = |available_bytes, sampled_at, stale| {
+            *reading.lock().unwrap() = Capacity::Known(CapacityReading {
+                available_bytes,
+                total_bytes: u64::MAX,
+                sampled_at,
+                stale,
+            });
+        };
+
+        // Before any reading there is nothing to judge against.
+        budget.reserve_write(0, 5000).unwrap();
+        budget.rollback_write_reservation(5000);
+
+        // 1000 free, 500 reserved: writes spend the one reading between
+        // refreshes, and a rolled-back write gives its bytes back.
+        set(1000, taken, false);
+        budget.reserve_write(0, 300).unwrap();
+        budget.reserve_write(0, 100).unwrap();
+        budget.rollback_write_reservation(100);
+        budget.reserve_write(0, 200).unwrap();
+
+        // A stale reading of the same probe keeps the debits but never
+        // rejects on its own.
+        set(1000, taken, true);
+        budget.reserve_write(0, 100).unwrap();
+
+        // A fresh reading that confirms the breach rejects.
+        set(550, taken + Duration::from_secs(5), false);
+        assert!(
+            budget
+                .reserve_write(0, 100)
+                .unwrap_err()
+                .to_string()
+                .contains("disk_reserve")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unavailable_disk_probe_stands_the_reserve_down_instead_of_rejecting() {
@@ -3160,6 +3361,158 @@ mod tests {
         budget
             .reserve_write(0, 1)
             .expect("without any reading the reserve cannot be judged breached");
+    }
+
+    #[test]
+    fn staging_scan_ignores_entries_removed_after_enumeration() {
+        for nested in [false, true] {
+            for remove_directory in [false, true] {
+                let (temp, root, _) = root_and_budget();
+                let relative = if nested {
+                    Path::new("nested")
+                } else {
+                    Path::new("")
+                };
+                let path = temp.path().join(relative);
+                std::fs::create_dir_all(&path).unwrap();
+                let directory = if nested {
+                    root.dir.open_dir(relative).unwrap()
+                } else {
+                    root.dir.try_clone().unwrap()
+                };
+                std::fs::write(path.join("kept.bin"), b"keep").unwrap();
+                let removed = path.join("partial");
+                if remove_directory {
+                    std::fs::create_dir(&removed).unwrap();
+                } else {
+                    std::fs::write(&removed, b"discard").unwrap();
+                }
+                // Retain the exact enumeration result, then perform the
+                // demotion cleanup before the scanner inspects that entry.
+                let children: Vec<_> = directory.entries().unwrap().collect();
+                assert_eq!(children.len(), 2);
+                if remove_directory {
+                    std::fs::remove_dir(&removed).unwrap();
+                } else {
+                    std::fs::remove_file(&removed).unwrap();
+                }
+                let (mut entries, mut bytes) = (0, 0);
+                scan_capability_children(
+                    &directory,
+                    relative,
+                    temp.path(),
+                    &mut entries,
+                    &mut bytes,
+                    children,
+                )
+                .unwrap();
+                assert_eq!((entries, bytes), (1, 4));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_scan_rejects_dangling_links_after_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, root, _) = root_and_budget();
+        std::fs::write(temp.path().join("a.partial"), b"discard").unwrap();
+        symlink("a.partial", temp.path().join("z.link")).unwrap();
+        let mut children: Vec<_> = root.dir.entries().unwrap().map(Result::unwrap).collect();
+        children.sort_by_key(|child| child.file_name());
+        std::fs::remove_file(temp.path().join("a.partial")).unwrap();
+        let (mut entries, mut bytes) = (0, 0);
+        let error = scan_capability_children(
+            &root.dir,
+            Path::new(""),
+            temp.path(),
+            &mut entries,
+            &mut bytes,
+            children.into_iter().map(Ok),
+        )
+        .unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn staging_scan_tolerates_directory_removal_after_metadata() {
+        let (temp, root, _) = root_and_budget();
+        std::fs::create_dir(temp.path().join("partial")).unwrap();
+        assert!(root.dir.symlink_metadata("partial").unwrap().is_dir());
+        std::fs::remove_dir(temp.path().join("partial")).unwrap();
+        let (mut entries, mut bytes) = (1, 0);
+        scan_capability_subdirectory(
+            &root.dir,
+            OsStr::new("partial"),
+            Path::new("partial"),
+            temp.path(),
+            &mut entries,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!((entries, bytes), (1, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_scan_rejects_directory_link_replacement_after_metadata() {
+        use std::os::unix::fs::symlink;
+
+        for dangling in [false, true] {
+            let (temp, root, _) = root_and_budget();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("untouched"), b"outside").unwrap();
+            std::fs::create_dir(temp.path().join("partial")).unwrap();
+            assert!(root.dir.symlink_metadata("partial").unwrap().is_dir());
+            std::fs::remove_dir(temp.path().join("partial")).unwrap();
+            let target = if dangling {
+                outside.path().join("missing")
+            } else {
+                outside.path().to_path_buf()
+            };
+            symlink(target, temp.path().join("partial")).unwrap();
+            let (mut entries, mut bytes) = (1, 0);
+            let error = scan_capability_subdirectory(
+                &root.dir,
+                OsStr::new("partial"),
+                Path::new("partial"),
+                temp.path(),
+                &mut entries,
+                &mut bytes,
+            )
+            .unwrap_err();
+            assert!(error.contains("without following links"), "{error}");
+            assert_eq!((entries, bytes), (1, 0));
+            assert_eq!(
+                std::fs::read(outside.path().join("untouched")).unwrap(),
+                b"outside"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_scan_preserves_entry_read_errors() {
+        let (temp, root, _) = root_and_budget();
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            let (mut entries, mut bytes) = (0, 0);
+            let error = scan_capability_children(
+                &root.dir,
+                Path::new(""),
+                temp.path(),
+                &mut entries,
+                &mut bytes,
+                [Err(io::Error::new(kind, "entry enumeration failed"))],
+            )
+            .unwrap_err();
+            assert!(error.contains("entry enumeration failed"), "{error}");
+            assert_eq!((entries, bytes), (0, 0));
+        }
     }
 
     #[cfg(unix)]

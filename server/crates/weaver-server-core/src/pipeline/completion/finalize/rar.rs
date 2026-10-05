@@ -905,7 +905,20 @@ impl Pipeline {
             return Ok(placement::ApplyOutcome::Applied);
         }
 
-        let plan = plan.clone();
+        let mut plan = plan.clone();
+        // The plan was scanned before the deobfuscation pass that runs ahead
+        // of this, and that pass performs the same renames by its own route.
+        // One it has already made leaves the plan naming a source that is gone
+        // and a destination that is in place; moving it again would fail the
+        // set on a rename that succeeded, and tainting for it would abort a
+        // chase over files nothing is about to move.
+        plan.renames.retain(|entry| {
+            working_dir.join(&entry.current_name).exists()
+                || !working_dir.join(&entry.correct_name).exists()
+        });
+        if plan.swaps.is_empty() && plan.renames.is_empty() {
+            return Ok(placement::ApplyOutcome::Applied);
+        }
         let normalization_map = Self::placement_normalization_map(&plan);
         let normalized_files = Self::placement_touched_files(&plan);
         // Renames and swaps move the bytes a chase is reading out from under
@@ -1334,7 +1347,7 @@ impl Pipeline {
             for topology in state.assembly.archive_topologies().values() {
                 cleanup_files.extend(topology.volume_map.keys().cloned());
             }
-            cleanup_files.extend(self.par2_joined_split_part_names(job_id));
+            cleanup_files.extend(self.par2_spent_input_names(job_id));
             cleanup_files
         };
 

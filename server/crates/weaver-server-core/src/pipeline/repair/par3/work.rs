@@ -1011,6 +1011,62 @@ impl Coordinator {
             .is_some_and(|job| job.ticket.is_some())
     }
 
+    /// The job's published snapshot of `source`, `None` while none is
+    /// published. An image whose backing changed under it fails here the way
+    /// a worker's read of it would.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn source_snapshot(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Option<SourceSnapshot>> {
+        Ok(self.jobs[&job_id].sources.snapshot(source)?)
+    }
+
+    /// The `(start, end)` ranges the job's published image of `source` can
+    /// read, empty while none is published or once it is withdrawn.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn source_ranges(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Vec<(u64, u64)>> {
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        while let Some(range) = self.jobs[&job_id].sources.next_available(source, offset)? {
+            offset = range.end;
+            ranges.push((range.start, range.end));
+        }
+        Ok(ranges)
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn published_source_bytes(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Vec<(u64, Vec<u8>)>> {
+        let ranges = self.source_ranges(job_id, source)?;
+        let mut result = Vec::new();
+        for (start, end) in ranges {
+            let mut bytes = vec![0; (end - start) as usize];
+            let mut filled = 0;
+            while filled < bytes.len() {
+                let count = self.jobs[&job_id].sources.read_at(
+                    source,
+                    start + filled as u64,
+                    &mut bytes[filled..],
+                )?;
+                if count == 0 {
+                    return Err(EngineError::InvalidState("short published test source"));
+                }
+                filled += count;
+            }
+            result.push((start, bytes));
+        }
+        Ok(result)
+    }
+
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| {
             job.installing
@@ -2546,6 +2602,13 @@ impl Coordinator {
             }
             (WorkKey::Source(source), Ok(_)) => {
                 job.errors.remove(&source);
+                // Another source's work that tripped over this one changing
+                // mid-read saw a moment that no longer exists. This source has
+                // now been published and read whole, which is the fresh
+                // evidence that report was waiting on.
+                job.errors.retain(
+                    |_, error| !matches!(error, EngineError::SourceChanged(changed) if *changed == source),
+                );
             }
             (WorkKey::Source(source), Err(error)) => {
                 if pressure.is_some() {

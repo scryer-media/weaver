@@ -3,7 +3,7 @@
 
 use super::sources::PublishedSources;
 use crate::jobs::ids::{JobId, NzbFileId};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{JobStatus, Pipeline};
 use par3_rs::ingest::{PacketScanner, ScanEvent};
 use par3_rs::runtime::{EngineError, EngineResult, ExecutionOptions, HandleBudget};
 use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId, SourceSnapshot};
@@ -546,6 +546,13 @@ impl Par3Job {
                     carrier.published,
                     snapshot,
                 )?;
+                // An embedded carrier is also protected input. Its metadata
+                // can arrive before the archive body, so extending coverage
+                // must revisit missing source blocks even if no new packet
+                // changes the retained assessment.
+                for set in self.sets.values_mut() {
+                    set.source_arrived(source, &self.options)?;
+                }
                 return self.scan(source);
             }
         }
@@ -1006,6 +1013,26 @@ impl Pipeline {
                 .par3_runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.is_carrier(job_id, source));
+        // A direct volume's image is its set's coverage over the set's
+        // destinations, and a set with a placement out has bytes on disk, or
+        // about to be, that its coverage does not record yet. An image taken
+        // now would miss them for good: the routing retired the set's images
+        // before those writes left, and their commit does not retire them
+        // again. So would a destination snapshot taken before a write that
+        // lands under it, and every volume of the set reads those
+        // destinations. Not publishing leaves the source due — the routing
+        // marked it so, or it was never published — and the lane draining
+        // publishes it whole; see `republish_par3_awaiting_placements`.
+        if !carrier
+            && let Some(set_index) = self.direct_store.sets_for(job_id).iter().position(|set| {
+                !set.is_demoted() && set.plan().volume_for_file(file_id.file_index).is_some()
+            })
+            && self.direct_set_has_placements(job_id, set_index)
+        {
+            self.par3_publications_awaiting_placements
+                .insert((job_id, set_index));
+            return Ok(());
+        }
         let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
         for segment in 0..file.total_segments() {
             if !file.has_segment(segment) {
@@ -1250,6 +1277,38 @@ impl Pipeline {
         }
     }
 
+    /// Where a placement lands: publishes the PAR3 images held back while a
+    /// set of this job had placements out, once that set has none.
+    ///
+    /// Without this the images would wait for whatever completion check runs
+    /// next, and none is bound to while the job still downloads: the sources
+    /// the routing retired would offer no view to assess, and no repair to
+    /// start, until some unrelated file or pass moved.
+    pub(in crate::pipeline) fn republish_par3_awaiting_placements(&mut self, job_id: JobId) {
+        let drained: Vec<(JobId, usize)> = self
+            .par3_publications_awaiting_placements
+            .iter()
+            .copied()
+            .filter(|&(owner, set_index)| {
+                owner == job_id && !self.direct_set_has_placements(job_id, set_index)
+            })
+            .collect();
+        if drained.is_empty() {
+            return;
+        }
+        for key in drained {
+            self.par3_publications_awaiting_placements.remove(&key);
+        }
+        if !self.jobs.get(&job_id).is_some_and(|state| {
+            !matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete)
+        }) {
+            return;
+        }
+        if let Err(error) = self.refresh_par3_sources(job_id) {
+            self.fail_job(job_id, format!("PAR3 source refresh failed: {error}"));
+        }
+    }
+
     pub(in crate::pipeline) fn refresh_par3_sources(&mut self, job_id: JobId) -> EngineResult<()> {
         let Some(coordinator) = self.par3_runtime.as_ref() else {
             return Ok(());
@@ -1401,5 +1460,7 @@ mod readback;
 pub(in crate::pipeline) mod virtual_source;
 pub(in crate::pipeline) mod work;
 
+#[cfg(test)]
+mod schedule_tests;
 #[cfg(test)]
 mod tests;

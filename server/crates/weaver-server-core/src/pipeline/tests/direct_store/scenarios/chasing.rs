@@ -454,6 +454,7 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
         pipeline.direct_unpack.counters().discarded,
         u64::from(invalidate_for_repair)
     );
+    pipeline.settle_direct_unpack_staging_cleanups().await;
     assert!(
         !pipeline
             .direct_unpack_staging_dir(job_id, &set_name)

@@ -523,6 +523,28 @@ impl ByteRanges {
         len - overlapped
     }
 
+    /// Removes `[start, start + len)`, splitting a range that straddles it.
+    pub(crate) fn remove(&mut self, start: u64, len: u64) {
+        let end = start.saturating_add(len);
+        if len == 0 {
+            return;
+        }
+        let mut kept = Vec::with_capacity(self.ranges.len() + 1);
+        for &(range_start, range_end) in &self.ranges {
+            if range_end <= start || range_start >= end {
+                kept.push((range_start, range_end));
+                continue;
+            }
+            if range_start < start {
+                kept.push((range_start, start));
+            }
+            if range_end > end {
+                kept.push((end, range_end));
+            }
+        }
+        self.ranges = kept;
+    }
+
     /// Extends `floor` through every range that continues it — the volume's
     /// candidate contiguous floor.
     ///

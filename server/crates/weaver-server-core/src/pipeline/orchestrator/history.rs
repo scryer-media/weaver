@@ -115,48 +115,29 @@ impl Pipeline {
         Ok(dirs)
     }
 
-    /// Removes every owned directory in `dirs`, and returns every directory
-    /// left on disk — the ones `dirs` already set aside plus any whose marker
-    /// stopped matching between the two looks.
-    pub(crate) async fn cleanup_history_intermediate_dirs(
+    /// Removes a deleted history entry's files — its owned intermediate
+    /// directories, then any complete output directories asked for — and
+    /// sends `reply` the outcome once they are gone.
+    ///
+    /// Runs on its own task: a recursive removal costs a round trip per
+    /// entry, and on a slow mount a finished download has many. The history
+    /// rows and the job runtime are already gone when this starts, so nothing
+    /// the pipeline serves waits on the files.
+    pub(crate) fn spawn_history_file_cleanup<T: Send + 'static>(
         &self,
-        dirs: &HistoryCleanupDirs,
-    ) -> Result<Vec<PathBuf>, crate::SchedulerError> {
-        let mut left_in_place = dirs.left_in_place.clone();
-        for (job_id, dir) in &dirs.owned {
-            // Failed jobs never pass through the finalize close, so drop any
-            // cached write handles before their dirs (and paths) are freed
-            // for reuse.
-            crate::pipeline::close_cached_write_handles_under(dir).await;
-            let root = self.intermediate_dir.clone();
-            let target = dir.clone();
-            let expected_job = *job_id;
-            let removal = tokio::task::spawn_blocking(move || {
-                crate::jobs::working_dir::remove_job_working_dir(&root, &target, expected_job)
-            })
-            .await
-            .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?;
-            match removal {
-                Ok(crate::jobs::working_dir::HistoryWorkingDir::Owned) => {
-                    info!(dir = %dir.display(), "removed historical intermediate directory");
-                }
-                Ok(crate::jobs::working_dir::HistoryWorkingDir::LeftInPlace) => {
-                    left_in_place.push(dir.clone());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(crate::SchedulerError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "failed to remove historical intermediate directory '{}': {error}",
-                            dir.display()
-                        ),
-                    )));
-                }
+        dirs: HistoryCleanupDirs,
+        output_dirs: Vec<PathBuf>,
+        reply: oneshot::Sender<Result<T, crate::SchedulerError>>,
+        outcome: impl FnOnce(Vec<PathBuf>) -> T + Send + 'static,
+    ) {
+        let intermediate_dir = self.intermediate_dir.clone();
+        tokio::spawn(async move {
+            let cleanup = cleanup_history_intermediate_dirs(&intermediate_dir, &dirs).await;
+            for dir in &output_dirs {
+                cleanup_output_dir(dir).await;
             }
-        }
-
-        Ok(left_in_place)
+            let _ = reply.send(cleanup.map(outcome));
+        });
     }
 
     pub(crate) async fn output_dir_for_job(&self, job_id: JobId) -> Option<PathBuf> {
@@ -208,44 +189,6 @@ impl Pipeline {
             }
         }
         dirs
-    }
-
-    pub(crate) async fn cleanup_output_dir(&self, dir: Option<&std::path::Path>) {
-        let Some(dir) = dir else { return };
-        match tokio::fs::symlink_metadata(dir).await {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => {
-                warn!(dir = %dir.display(), error = %error, "could not inspect complete output directory before cleanup");
-                return;
-            }
-            Ok(_) => {}
-        }
-        let ownership_path = dir.to_path_buf();
-        let owned = tokio::task::spawn_blocking(move || {
-            crate::jobs::working_dir::is_weaver_owned_output_dir(&ownership_path)
-        })
-        .await
-        .unwrap_or(false);
-        if !owned {
-            warn!(
-                dir = %dir.display(),
-                "refusing recursive cleanup of an output directory without a valid Weaver ownership marker"
-            );
-            return;
-        }
-        match tokio::fs::remove_dir_all(dir).await {
-            Ok(()) => {
-                debug!(dir = %dir.display(), "removed complete output directory");
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                warn!(
-                    dir = %dir.display(),
-                    error = %error,
-                    "failed to remove complete output directory"
-                );
-            }
-        }
     }
 
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
@@ -494,5 +437,86 @@ impl Pipeline {
             let _ = archived.await;
             let _ = event_tx.send(event);
         });
+    }
+}
+
+/// Removes every owned directory in `dirs`, and returns every directory
+/// left on disk — the ones `dirs` already set aside plus any whose marker
+/// stopped matching between the two looks.
+async fn cleanup_history_intermediate_dirs(
+    intermediate_dir: &std::path::Path,
+    dirs: &HistoryCleanupDirs,
+) -> Result<Vec<PathBuf>, crate::SchedulerError> {
+    let mut left_in_place = dirs.left_in_place.clone();
+    for (job_id, dir) in &dirs.owned {
+        // Failed jobs never pass through the finalize close, so drop any
+        // cached write handles before their dirs (and paths) are freed
+        // for reuse.
+        crate::pipeline::close_cached_write_handles_under(dir).await;
+        let root = intermediate_dir.to_path_buf();
+        let target = dir.clone();
+        let expected_job = *job_id;
+        let removal = tokio::task::spawn_blocking(move || {
+            crate::jobs::working_dir::remove_job_working_dir(&root, &target, expected_job)
+        })
+        .await
+        .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?;
+        match removal {
+            Ok(crate::jobs::working_dir::HistoryWorkingDir::Owned) => {
+                info!(dir = %dir.display(), "removed historical intermediate directory");
+            }
+            Ok(crate::jobs::working_dir::HistoryWorkingDir::LeftInPlace) => {
+                left_in_place.push(dir.clone());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(crate::SchedulerError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to remove historical intermediate directory '{}': {error}",
+                        dir.display()
+                    ),
+                )));
+            }
+        }
+    }
+
+    Ok(left_in_place)
+}
+
+async fn cleanup_output_dir(dir: &std::path::Path) {
+    match tokio::fs::symlink_metadata(dir).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(dir = %dir.display(), error = %error, "could not inspect complete output directory before cleanup");
+            return;
+        }
+        Ok(_) => {}
+    }
+    let ownership_path = dir.to_path_buf();
+    let owned = tokio::task::spawn_blocking(move || {
+        crate::jobs::working_dir::is_weaver_owned_output_dir(&ownership_path)
+    })
+    .await
+    .unwrap_or(false);
+    if !owned {
+        warn!(
+            dir = %dir.display(),
+            "refusing recursive cleanup of an output directory without a valid Weaver ownership marker"
+        );
+        return;
+    }
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => {
+            debug!(dir = %dir.display(), "removed complete output directory");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(
+                dir = %dir.display(),
+                error = %error,
+                "failed to remove complete output directory"
+            );
+        }
     }
 }

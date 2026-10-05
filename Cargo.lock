@@ -3368,9 +3368,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.6"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f4e3071967f671f618584179c4cb020d3180b82cb96aebca2ec5b9a925be00a"
+checksum = "d22d0f1b80dea984502eb7101c99f8aa5cad6f93cff2a62d75a42aeeb40afcba"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -3387,16 +3387,18 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b4c4c9fa61c1181081494ea208f56def0969a46b538a5e89e1cb360c7821708"
+checksum = "6215b83666e769d4f840a9dfdb220df9d67df7de99c31784968004fb7af2bbbd"
 dependencies = [
  "blake3",
+ "cap-std",
  "crc-fast",
  "rayon",
  "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -4555,9 +4557,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.26.0"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7ae28f29a0ae97f1684ed883efce22f5bed33f2c241e164ef0a26f15c76e732"
+checksum = "ef0b63767205ca00089473573d7172b94878631874f5f22183b9a411b436aedf"
 dependencies = [
  "aes",
  "aws-lc-rs",

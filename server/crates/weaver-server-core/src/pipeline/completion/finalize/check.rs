@@ -2248,6 +2248,10 @@ impl Pipeline {
             .file_crc_recoveries
             .keys()
             .any(|file_id| file_id.job_id == job_id);
+        // A routed article whose destination write is still out is decoded
+        // but not yet recorded on its file: its volume reads as short until
+        // the placement lands, and the landing re-runs the drain sequence.
+        let has_direct_placements = self.has_direct_placements(job_id);
 
         has_queued_work
             || has_inflight_downloads
@@ -2257,6 +2261,7 @@ impl Pipeline {
             || has_pending_decode
             || has_buffered_segments
             || has_file_crc_recovery
+            || has_direct_placements
     }
 
     fn promoted_recovery_pipeline_state(&self, job_id: JobId) -> PromotedRecoveryPipelineState {

@@ -263,28 +263,48 @@ impl Pipeline {
             self.invalidate_par3_direct_set(job_id, set_index);
         }
 
-        if !self
-            .place_direct_spans(job_id, set_index, Some(segment_id), &spans)
-            .await
-        {
-            return DirectRouteOutcome::Conventional(segment);
-        }
-
         drop(pieces);
 
-        self.commit_direct_segment(
-            segment_id,
-            decoded_size,
+        // An article that placed nothing — every byte of it staged in the
+        // holds — has no write to wait for and commits now, unless an earlier
+        // article of its set is still writing: a set commits in routing order.
+        if spans.is_empty()
+            && !self
+                .direct_placement_lanes
+                .contains_key(&(job_id, set_index))
+        {
+            self.commit_direct_segment(
+                segment_id,
+                decoded_size,
+                set_index,
+                volume_index,
+                file_offset,
+                part_crc,
+                part_crc_verified,
+                &segment.checkpoint_plan,
+                &segment.segments,
+            )
+            .await;
+            self.note_mixed_rar_commit(job_id, set_index);
+            return DirectRouteOutcome::Routed;
+        }
+
+        // The writes leave the pipeline task here; the commit waits for them
+        // to return (`handle_direct_placement_done`).
+        let buffered_len = segment.len_bytes();
+        self.enqueue_direct_placement(
+            job_id,
             set_index,
-            volume_index,
-            file_offset,
-            part_crc,
-            part_crc_verified,
-            &segment.checkpoint_plan,
-            &segment.segments,
-        )
-        .await;
-        self.note_mixed_rar_commit(job_id, set_index);
+            crate::pipeline::DirectPlacement {
+                spans,
+                kind: crate::pipeline::DirectPlacementKind::Article {
+                    segment,
+                    volume_index,
+                    file_offset,
+                },
+                buffered_len,
+            },
+        );
         DirectRouteOutcome::Routed
     }
 
@@ -294,9 +314,10 @@ impl Pipeline {
     ///
     /// The record only happens once **all** the writes returned: partial failure
     /// leaves orphan bytes, and the coverage map is the truth, not the bytes.
-    /// Both span producers go through here — the routing seam and the confirming
-    /// parse's drain at volume completion — so neither can grow its own,
-    /// subtly different, ordering.
+    /// This awaits the writes on the pipeline task, so it is for the repair
+    /// paths, which run once per repair. Routed articles and a completed
+    /// volume's trailing region go through the set's placement lane instead
+    /// ([`Self::enqueue_direct_placement`]), which records them the same way.
     pub(super) async fn place_direct_spans(
         &mut self,
         job_id: JobId,
@@ -308,6 +329,26 @@ impl Pipeline {
             Ok(()) => return true,
             Err(failure) => failure,
         };
+        let handoffs: Vec<SegmentId> = handoff.into_iter().collect();
+        self.handle_direct_placement_failure(job_id, set_index, &handoffs, failure)
+            .await;
+        false
+    }
+
+    /// What a placement whose writes did not all return does to its set: a
+    /// destination that could not be made sparse, or a write the destination
+    /// did not refuse outright, demotes the set; a refusal fails the job.
+    ///
+    /// `handoffs` are the routed articles the failed writes carried. They go
+    /// back to the conventional path, which the demotion is told about before
+    /// it plans its sweep.
+    pub(super) async fn handle_direct_placement_failure(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        handoffs: &[SegmentId],
+        failure: DirectPlacementError,
+    ) {
         match failure {
             DirectPlacementError::Sparse { path, error } => {
                 // A destination that could not be marked sparse is refused *before*
@@ -319,14 +360,13 @@ impl Pipeline {
                     error = %error,
                     "could not mark a direct-store destination sparse; demoting the set"
                 );
-                self.demote_direct_set_with_handoff(
+                self.demote_direct_set_with_handoffs(
                     job_id,
                     set_index,
                     DemotionReason::SparseMarkFailed,
-                    handoff,
+                    handoffs,
                 )
                 .await;
-                false
             }
             DirectPlacementError::Write(error) if destination_refused(&error) => {
                 // A refusal the destination itself makes — no space, no
@@ -347,7 +387,6 @@ impl Pipeline {
                         job_id.0
                     ),
                 );
-                false
             }
             DirectPlacementError::Write(error) => {
                 // Any other write failure is a demotion, not a job failure: the
@@ -360,11 +399,11 @@ impl Pipeline {
                     error = %error,
                     "direct-store destination write failed; demoting the set"
                 );
-                self.demote_direct_set_with_handoff(
+                self.demote_direct_set_with_handoffs(
                     job_id,
                     set_index,
                     DemotionReason::DestinationWriteFailed,
-                    handoff,
+                    handoffs,
                 )
                 .await;
                 if !self
@@ -380,7 +419,6 @@ impl Pipeline {
                         ),
                     );
                 }
-                false
             }
         }
     }
@@ -398,12 +436,26 @@ impl Pipeline {
         if spans.is_empty() {
             return Ok(());
         }
+        // Behind the set's placement flight, if one is writing: the two would
+        // otherwise prepare the same destination from two tasks at once.
+        self.await_direct_placement_io(job_id, set_index).await;
         self.invalidate_par3_direct_set(job_id, set_index);
         let batches = self.direct_write_batches(job_id, set_index, spans);
         self.prepare_direct_destinations(job_id, &batches).await?;
         crate::pipeline::orchestrator::write_direct_batches(batches)
             .await
             .map_err(DirectPlacementError::Write)?;
+        self.record_direct_placement(job_id, set_index, spans);
+        Ok(())
+    }
+
+    /// Admits spans whose every write returned as the set's coverage.
+    pub(super) fn record_direct_placement(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        spans: &[RoutedSpan],
+    ) {
         // Where the bytes went, split by destination kind. Two counters answer
         // the question the disk acceptance target is stated in: how much of
         // a set landed at its final offset versus how much rode the envelope
@@ -426,7 +478,6 @@ impl Pipeline {
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
             set.record_writes(spans, Instant::now());
         }
-        Ok(())
     }
 
     /// Caches whatever volume facts the set's parse just accepted, so a restart
@@ -809,95 +860,45 @@ impl Pipeline {
         // paths only `remove_dir_all` one the state names. Idempotent and
         // cached after the first call — see `Pipeline::extraction_staging_dir`.
         let _ = self.extraction_staging_dir(job_id);
+        let unprepared = self.unprepared_direct_destinations(job_id, batches);
         let marking = self.direct_store.sparse_marking();
-        for (path, _) in batches {
-            if self
-                .direct_store
-                .prepared_destinations
-                .get(&job_id)
-                .is_some_and(|prepared| prepared.contains(path))
-            {
-                continue;
-            }
-            if let Some(parent) = path.parent()
-                && let Err(error) = tokio::fs::create_dir_all(parent).await
-            {
-                warn!(
-                    job_id = job_id.0,
-                    path = %parent.display(),
-                    error = %error,
-                    "failed to create a direct-store destination directory"
-                );
-                // A refusal is reported here, where its kind is the same on
-                // every platform: the open below would see a file standing in
-                // the path as `NotADirectory` on unix but `NotFound` on Windows.
-                if destination_refused(&error) {
-                    return Err(DirectPlacementError::Write(error));
-                }
-                // Anything else is left unprepared on purpose: the write below
-                // fails and demotes, and a later attempt retries the directory
-                // rather than trusting a failure it never saw succeed. Not a
-                // sparse refusal — the write error path already distinguishes it.
-                continue;
-            }
-            let created = {
-                let path = path.clone();
-                tokio::task::spawn_blocking(move || {
-                    super::super::sparse::create_sparse(&path, &marking).map(drop)
-                })
-                .await
-            };
-            match created {
-                Ok(Ok(())) => {}
-                Ok(Err(super::super::sparse::SparseCreateError::Open(error))) => {
-                    // An ordinary filesystem failure, and exactly the one the
-                    // first routed write would have hit. Left unprepared so the
-                    // write path reports it as `destination_write_failed`,
-                    // which is what it is.
-                    warn!(
-                        job_id = job_id.0,
-                        path = %path.display(),
-                        error = %error,
-                        "failed to create a direct-store destination"
-                    );
-                    continue;
-                }
-                Ok(Err(super::super::sparse::SparseCreateError::Mark(error))) => {
-                    warn!(
-                        job_id = job_id.0,
-                        path = %path.display(),
-                        error = %error,
-                        "a direct-store destination could not be marked sparse"
-                    );
-                    return Err(DirectPlacementError::Sparse {
-                        path: path.clone(),
-                        error,
-                    });
-                }
-                Err(error) => {
-                    warn!(
-                        job_id = job_id.0,
-                        path = %path.display(),
-                        error = %error,
-                        "the sparse-marking task did not complete"
-                    );
-                    return Err(DirectPlacementError::Sparse {
-                        path: path.clone(),
-                        error: std::io::Error::other(error),
-                    });
-                }
-            }
-            // Keyed on the destination itself rather than its directory: the
-            // marking is per file, and the directory is created on the way to
-            // it. One entry per destination, which is `members + volumes` for
-            // the life of the job.
-            self.direct_store
-                .prepared_destinations
-                .entry(job_id)
-                .or_default()
-                .insert(path.clone());
+        let (prepared, result) =
+            prepare_direct_destination_paths(job_id, unprepared, marking).await;
+        self.note_prepared_direct_destinations(job_id, prepared);
+        result
+    }
+
+    /// The destinations of `batches` this job has not created yet.
+    pub(super) fn unprepared_direct_destinations(
+        &self,
+        job_id: JobId,
+        batches: &crate::pipeline::orchestrator::DirectWriteBatches,
+    ) -> Vec<PathBuf> {
+        let prepared = self.direct_store.prepared_destinations.get(&job_id);
+        batches
+            .iter()
+            .map(|(path, _)| path)
+            .filter(|path| prepared.is_none_or(|prepared| !prepared.contains(*path)))
+            .cloned()
+            .collect()
+    }
+
+    // Keyed on the destination itself rather than its directory: the marking
+    // is per file, and the directory is created on the way to it. One entry
+    // per destination, which is `members + volumes` for the life of the job.
+    pub(super) fn note_prepared_direct_destinations(
+        &mut self,
+        job_id: JobId,
+        prepared: Vec<PathBuf>,
+    ) {
+        if prepared.is_empty() {
+            return;
         }
-        Ok(())
+        self.direct_store
+            .prepared_destinations
+            .entry(job_id)
+            .or_default()
+            .extend(prepared);
     }
 
     /// The suppressed twin of `commit_persisted_segment`.
@@ -1081,20 +1082,40 @@ impl Pipeline {
             }
             // The confirming parse can make the volume's trailing region
             // routable — it was held until the parse proved no further header
-            // could appear there — so those spans are written here, before the
-            // set is allowed to finalize and delete its envelopes.
+            // could appear there. Those spans go through the set's placement
+            // lane like an article's, and the rest of the completion waits for
+            // them to land: the set may not finalize and delete its envelopes
+            // before they are its coverage.
             Some(Ok(spans)) => {
                 self.cache_direct_volume_facts(job_id, set_index).await;
-                if !self
-                    .place_direct_spans(job_id, set_index, None, &spans)
-                    .await
-                {
+                if !spans.is_empty() {
+                    self.enqueue_direct_placement(
+                        job_id,
+                        set_index,
+                        crate::pipeline::DirectPlacement {
+                            spans,
+                            kind: crate::pipeline::DirectPlacementKind::VolumeTail { volume_index },
+                            buffered_len: 0,
+                        },
+                    );
                     return;
                 }
             }
             None => return,
         }
 
+        self.finish_direct_volume_completion(job_id, set_index)
+            .await;
+    }
+
+    /// What a completed volume does once every byte it routed is the set's
+    /// coverage: checkpoint the phase change, judge an open identity plan,
+    /// and finalize whatever is ready.
+    pub(super) async fn finish_direct_volume_completion(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+    ) {
         // The phase-change demand. The set's download phase ends exactly here,
         // at its last volume, and for a par2-bearing job the next thing that
         // happens is a verification wait that can run for the whole PAR2
@@ -1210,7 +1231,9 @@ impl Pipeline {
             .sets_for(job_id)
             .iter()
             .enumerate()
-            .filter(|(_, set)| set.ready_to_finalize())
+            .filter(|(index, set)| {
+                set.ready_to_finalize() && !self.direct_set_has_pending_volume_tail(job_id, *index)
+            })
             .map(|(index, _)| index)
             .collect();
         for set_index in ready {
@@ -1532,6 +1555,17 @@ impl Pipeline {
         set_index: usize,
         trigger: super::super::barrier::BarrierTrigger,
     ) {
+        // Every demand but a pause first applies the placements the set has
+        // writing, so the barrier describes them and nothing it syncs is still
+        // being written. A pause skips that: its checkpoint covers what has
+        // been recorded, the flight's bytes go in the next one, and pausing
+        // must not wait on a slow destination to answer.
+        if !matches!(
+            trigger,
+            super::super::barrier::BarrierTrigger::Demand(BarrierDemand::Pause)
+        ) {
+            Box::pin(self.settle_direct_placements(job_id, set_index)).await;
+        }
         self.join_direct_barrier_flight(job_id, set_index).await;
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -2581,6 +2615,96 @@ impl Pipeline {
 /// `AlreadyExists` is what creating a directory reports, on every platform,
 /// when a file stands where the directory belongs. Destination opens create
 /// or reuse, so they never report it themselves.
+/// Creates each destination in `paths` — its parent directory, then the file
+/// itself marked sparse — and returns the ones it created alongside the
+/// verdict. Free of the pipeline so a placement task can run it; the caller
+/// records what it created. See [`Pipeline::prepare_direct_destinations`].
+pub(super) async fn prepare_direct_destination_paths(
+    job_id: JobId,
+    paths: Vec<PathBuf>,
+    marking: super::super::sparse::SparseMarking,
+) -> (Vec<PathBuf>, Result<(), DirectPlacementError>) {
+    let mut prepared = Vec::with_capacity(paths.len());
+    for path in paths {
+        if let Some(parent) = path.parent()
+            && let Err(error) = tokio::fs::create_dir_all(parent).await
+        {
+            warn!(
+                job_id = job_id.0,
+                path = %parent.display(),
+                error = %error,
+                "failed to create a direct-store destination directory"
+            );
+            // A refusal is reported here, where its kind is the same on
+            // every platform: the open below would see a file standing in
+            // the path as `NotADirectory` on unix but `NotFound` on Windows.
+            if destination_refused(&error) {
+                return (prepared, Err(DirectPlacementError::Write(error)));
+            }
+            // Anything else is left unprepared on purpose: the write below
+            // fails and demotes, and a later attempt retries the directory
+            // rather than trusting a failure it never saw succeed. Not a
+            // sparse refusal — the write error path already distinguishes it.
+            continue;
+        }
+        let created = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                super::super::sparse::create_sparse(&path, &marking).map(drop)
+            })
+            .await
+        };
+        match created {
+            Ok(Ok(())) => {}
+            Ok(Err(super::super::sparse::SparseCreateError::Open(error))) => {
+                // An ordinary filesystem failure, and exactly the one the
+                // first routed write would have hit. Left unprepared so the
+                // write path reports it as `destination_write_failed`,
+                // which is what it is.
+                warn!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    error = %error,
+                    "failed to create a direct-store destination"
+                );
+                continue;
+            }
+            Ok(Err(super::super::sparse::SparseCreateError::Mark(error))) => {
+                warn!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    error = %error,
+                    "a direct-store destination could not be marked sparse"
+                );
+                return (
+                    prepared,
+                    Err(DirectPlacementError::Sparse {
+                        path: path.clone(),
+                        error,
+                    }),
+                );
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    error = %error,
+                    "the sparse-marking task did not complete"
+                );
+                return (
+                    prepared,
+                    Err(DirectPlacementError::Sparse {
+                        path: path.clone(),
+                        error: std::io::Error::other(error),
+                    }),
+                );
+            }
+        }
+        prepared.push(path);
+    }
+    (prepared, Ok(()))
+}
+
 fn destination_refused(error: &std::io::Error) -> bool {
     crate::operations::is_out_of_space(error)
         || matches!(

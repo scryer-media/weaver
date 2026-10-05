@@ -483,14 +483,44 @@ impl DirectSetRouter {
         true
     }
 
+    /// Whether an encrypted part in `volume` has no place in its member yet.
+    ///
+    /// That happens when an earlier volume's header never arrived: the
+    /// member's stream cannot be measured up to this part, so its edges have
+    /// no coordinates. A caller replacing that earlier volume as well plans
+    /// this volume's edges after the earlier image has been routed.
+    pub(crate) fn cipher_part_unplaced(&self, volume: u32) -> bool {
+        self.layout_members()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                self.member_id_for_layout(*index)
+                    .and_then(|id| self.members.get(&id))
+                    .is_some_and(|member| member.crypt.is_some())
+            })
+            .flat_map(|(_, member)| member.parts.iter())
+            .any(|part| part.volume == volume && part.logical_offset.is_none())
+    }
+
     /// CBC neighbours for complete replacement images, including part bytes
     /// that never arrived. The layout supplies coordinates; the caller must
     /// read them from verified outputs or generation-checked source coverage.
     /// Refuse incomplete geometry or requests beyond the reserved limit.
+    ///
+    /// One gap in the geometry is not a refusal: an edge that falls in the
+    /// adjacent volume when that volume's part is not mapped and `replaced`
+    /// says the volume is itself being replaced. Its header never arrived, so
+    /// the layout has no coordinates for it — and none are needed, because the
+    /// whole replacement image is about to be routed in order and brings those
+    /// bytes with it, exactly as the volume would have on first arrival.
+    ///
+    /// A part with no offset of its own is still a refusal here; see
+    /// [`Self::cipher_part_unplaced`] for the caller's way around it.
     pub(crate) fn cipher_replacement_edge_reads_bounded(
         &self,
         volume: u32,
         limit: usize,
+        replaced: &dyn Fn(u32) -> bool,
     ) -> Option<Vec<(u32, u64, u64)>> {
         let mut reads = Vec::new();
         for (index, member) in self.layout_members().iter().enumerate() {
@@ -505,20 +535,33 @@ impl DirectSetRouter {
                 let low = part.logical_offset?;
                 let high = low.checked_add(part.data_size)?;
                 let cipher_size = crypt.cipher_size()?;
-                for (from, to) in [
-                    (block_floor(low).saturating_sub(AES_BLOCK), low),
-                    (high, block_ceil(high).min(cipher_size)),
+                for (from, to, adjacent) in [
+                    (
+                        block_floor(low).saturating_sub(AES_BLOCK),
+                        low,
+                        volume.checked_sub(1),
+                    ),
+                    (
+                        high,
+                        block_ceil(high).min(cipher_size),
+                        volume.checked_add(1),
+                    ),
                 ] {
                     if from >= to {
                         continue;
                     }
                     let mut cursor = from;
                     while cursor < to {
-                        let candidate = member.parts.iter().find(|candidate| {
+                        let Some(candidate) = member.parts.iter().find(|candidate| {
                             candidate.logical_offset.is_some_and(|start| {
                                 cursor >= start && cursor - start < candidate.data_size
                             })
-                        })?;
+                        }) else {
+                            if adjacent.is_some_and(replaced) {
+                                break;
+                            }
+                            return None;
+                        };
                         let start = candidate.logical_offset?;
                         let end = to.min(start.checked_add(candidate.data_size)?);
                         if candidate.volume != volume {
@@ -819,6 +862,11 @@ impl DirectSetRouter {
                 self.gate_part(member_id, volume)?;
             }
             self.try_verify_member(member_id)?;
+        }
+        for member in self.members.values_mut() {
+            if let Some(crypt) = member.crypt.as_mut() {
+                crypt.note_repair_settled();
+            }
         }
         Ok(())
     }

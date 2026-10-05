@@ -1,0 +1,379 @@
+{
+  "oracle": "RAR 7.23 official reader",
+  "archives": {
+    "rar4_enc_lz.rar": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_hp_lz.rar": {
+      "small.txt": {
+        "size": 48,
+        "sha256": "269aff3cc52097c96f6de99bb3cceee3ebd71a6e729ac637918c0f33419b1bda"
+      }
+    },
+    "rar4_lz.rar": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_lz_solid_mv.rar": {
+      "lz_part0.bin": {
+        "size": 307200,
+        "sha256": "80676d9487c569d8be8468e9f681099511738da7c452c1b143795263d39951db"
+      },
+      "lz_part1.bin": {
+        "size": 307200,
+        "sha256": "eee3b0a5ab988494785b07f8f838438ab50833bfbe519edb10af9d21b19c9abb"
+      },
+      "lz_part2.bin": {
+        "size": 307200,
+        "sha256": "cefa91b919334cad4cba3c85c3fb5781ad43ef6f86be5da0d5c53e5584e24b34"
+      }
+    },
+    "rar4_multifile_lz.rar": {
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      },
+      "zeros_64k.bin": {
+        "size": 65536,
+        "sha256": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+      }
+    },
+    "rar5_enc_lz.rar": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_hp_lz.rar": {
+      "small.txt": {
+        "size": 48,
+        "sha256": "269aff3cc52097c96f6de99bb3cceee3ebd71a6e729ac637918c0f33419b1bda"
+      }
+    },
+    "rar5_lz.rar": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_multifile_lz.rar": {
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      },
+      "zeros_64k.bin": {
+        "size": 65536,
+        "sha256": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+      }
+    },
+    "rar5_solid_encrypted_small.rar": {
+      "part0.bin": {
+        "size": 8193,
+        "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
+      },
+      "part1.bin": {
+        "size": 8193,
+        "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
+      },
+      "part2.bin": {
+        "size": 8193,
+        "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
+      }
+    },
+    "rar5_solid_headers_small.rar": {
+      "part0.bin": {
+        "size": 8193,
+        "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
+      },
+      "part1.bin": {
+        "size": 8193,
+        "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
+      },
+      "part2.bin": {
+        "size": 8193,
+        "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
+      }
+    },
+    "rar5_solid_small.rar": {
+      "part0.bin": {
+        "size": 8193,
+        "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
+      },
+      "part1.bin": {
+        "size": 8193,
+        "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
+      },
+      "part2.bin": {
+        "size": 8193,
+        "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
+      }
+    },
+    "rar4_solid_lz_encrypted.rar": {
+      "part0.bin": {
+        "size": 8193,
+        "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
+      },
+      "part1.bin": {
+        "size": 8193,
+        "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
+      },
+      "part2.bin": {
+        "size": 8193,
+        "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
+      }
+    },
+    "rar4_solid_lz_headers.rar": {
+      "part0.bin": {
+        "size": 8193,
+        "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
+      },
+      "part1.bin": {
+        "size": 8193,
+        "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
+      },
+      "part2.bin": {
+        "size": 8193,
+        "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
+      }
+    },
+    "rar4_solid_ppmd_plain.rar": {
+      "part0.bin": {
+        "size": 8193,
+        "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
+      },
+      "part1.bin": {
+        "size": 8193,
+        "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
+      },
+      "part2.bin": {
+        "size": 8193,
+        "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
+      }
+    },
+    "rar4_solid_ppmd_encrypted.rar": {
+      "part0.bin": {
+        "size": 8193,
+        "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
+      },
+      "part1.bin": {
+        "size": 8193,
+        "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
+      },
+      "part2.bin": {
+        "size": 8193,
+        "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
+      }
+    },
+    "rar4_solid_ppmd_headers.rar": {
+      "part0.bin": {
+        "size": 8193,
+        "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
+      },
+      "part1.bin": {
+        "size": 8193,
+        "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
+      },
+      "part2.bin": {
+        "size": 8193,
+        "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
+      }
+    },
+    "rar4_lz_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_lz_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_lz_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_lz_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_solid_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      },
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      }
+    },
+    "rar4_solid_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      },
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      }
+    },
+    "rar4_enc_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_enc_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_hp_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_hp_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_solid_enc_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      },
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      }
+    },
+    "rar4_solid_enc_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      },
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      }
+    },
+    "rar5_solid_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      },
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      }
+    },
+    "rar5_solid_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      },
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      }
+    },
+    "rar5_enc_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_enc_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_hp_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_hp_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_solid_enc_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      },
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      }
+    },
+    "rar5_solid_enc_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      },
+      "hello.txt": {
+        "size": 14,
+        "sha256": "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+      },
+      "second.txt": {
+        "size": 25,
+        "sha256": "eaef64337c0a7c6820e36a35538d35af10f984e45634df25a0d75343a783a200"
+      }
+    }
+  }
+}

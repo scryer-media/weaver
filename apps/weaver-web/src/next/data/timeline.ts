@@ -113,6 +113,22 @@ export interface TimelineView {
   running: boolean;
 }
 
+/**
+ * How long the job spent downloading: the closed runs of its download lane,
+ * so pauses and the wait before the first article are left out. Null when no
+ * run has closed, which leaves nothing honest to average over.
+ */
+export function downloadingMs(timeline: JobTimelineData | null | undefined): number | null {
+  const lane = timeline?.lanes.find((candidate) => candidate.stage === "DOWNLOADING");
+  let total = 0;
+  for (const span of lane?.spans ?? []) {
+    if (span.endedAt !== null && span.endedAt > span.startedAt) {
+      total += span.endedAt - span.startedAt;
+    }
+  }
+  return total > 0 ? total : null;
+}
+
 /** The label under `key`, or the engine's own word made readable when there is no key for it. */
 function engineLabel(t: Translate, key: string, value: string): string {
   const label = t(key);

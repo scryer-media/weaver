@@ -124,19 +124,14 @@ export function LiveDataProvider({
   children: ReactNode;
 }) {
   const [jobsStore] = useState(() => createLiveJobsStore(jobs));
-  const [ratesStore] = useState(() => createLiveJobDownloadRatesStore());
 
   useLayoutEffect(() => {
     jobsStore.setJobs(jobs);
   }, [jobs, jobsStore]);
 
-  useLayoutEffect(() => {
-    ratesStore.setRates(jobDownloadRates);
-  }, [jobDownloadRates, ratesStore]);
-
   return (
     <LiveJobsStoreContext.Provider value={jobsStore}>
-      <LiveJobDownloadRatesStoreContext.Provider value={ratesStore}>
+      <LiveJobDownloadRatesProvider rates={jobDownloadRates}>
         <LiveJobsContext.Provider value={jobs}>
           <LiveSpeedContext.Provider value={speed}>
             <LivePauseStateContext.Provider value={isPaused}>
@@ -148,8 +143,32 @@ export function LiveDataProvider({
             </LivePauseStateContext.Provider>
           </LiveSpeedContext.Provider>
         </LiveJobsContext.Provider>
-      </LiveJobDownloadRatesStoreContext.Provider>
+      </LiveJobDownloadRatesProvider>
     </LiveJobsStoreContext.Provider>
+  );
+}
+
+/**
+ * Feeds `useLiveJobDownloadRate`. Pass undefined while the snapshot in hand
+ * did not carry per-job rates, so rows fall back to their queue item's rate.
+ */
+export function LiveJobDownloadRatesProvider({
+  rates,
+  children,
+}: {
+  rates: readonly JobDownloadRate[] | undefined;
+  children: ReactNode;
+}) {
+  const [ratesStore] = useState(() => createLiveJobDownloadRatesStore());
+
+  useLayoutEffect(() => {
+    ratesStore.setRates(rates);
+  }, [rates, ratesStore]);
+
+  return (
+    <LiveJobDownloadRatesStoreContext.Provider value={ratesStore}>
+      {children}
+    </LiveJobDownloadRatesStoreContext.Provider>
   );
 }
 

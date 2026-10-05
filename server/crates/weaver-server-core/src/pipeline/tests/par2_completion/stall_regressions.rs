@@ -287,3 +287,206 @@ async fn placement_occupied_unrelated_destination_does_not_rebind_or_partially_m
         "a failed plan must not invent a canonical identity"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A parked repair verdict against an extraction phase.
+//
+// A job whose sets extract independently enters `Extracting` for whichever set
+// is ready first and stays there after that set's members are out, while a
+// sibling set still waits on its repair. The fixtures below hold one damaged
+// set with a parked verdict and put the job in that idle extraction phase
+// before its recovery lands.
+// ---------------------------------------------------------------------------
+
+/// Parks the verdict, then leaves the job in `status` with no extraction work
+/// in flight: the state a sibling set's finished extraction leaves behind.
+async fn park_verdict_then_idle_extraction_phase(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    job_name: &str,
+    status: JobStatus,
+) -> ParkedRecoveryFixture {
+    let fixture = install_parked_recovery_par2_job(pipeline, job_id, job_name).await;
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(pipeline).await;
+    assert_eq!(
+        job_status_for_assert(pipeline, job_id),
+        Some(JobStatus::Downloading),
+        "the analysis promoted the volume and parked on it; {}",
+        debug_job_state(pipeline, job_id)
+    );
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0);
+
+    let persist = match status {
+        JobStatus::Extracting => "extracting",
+        JobStatus::QueuedExtract => "queued_extract",
+        ref other => panic!("not an extraction phase: {other:?}"),
+    };
+    pipeline.transition_postprocessing_status(job_id, status.clone(), Some(persist));
+    assert_eq!(job_status_for_assert(pipeline, job_id), Some(status));
+    assert!(!pipeline.job_has_active_extraction_tasks(job_id));
+    fixture
+}
+
+async fn assert_landed_recovery_repairs_out_of_idle_extraction_phase(
+    job_id: JobId,
+    job_name: &str,
+    status: JobStatus,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let fixture =
+        park_verdict_then_idle_extraction_phase(&mut pipeline, job_id, job_name, status).await;
+
+    land_parked_recovery_volume(&mut pipeline, job_id, &fixture).await;
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        pipeline.par2_repairs_from_parked_verdict,
+        1,
+        "the landed recovery repaired on the parked verdict; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+    let mut repair_started = false;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, PipelineEvent::RepairStarted { job_id: started } if started == job_id) {
+            repair_started = true;
+        }
+    }
+    assert!(repair_started, "the repair phase was entered");
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "the repaired job settled; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
+
+#[tokio::test]
+async fn a_landed_recovery_repairs_while_a_finished_sibling_extraction_holds_the_phase() {
+    assert_landed_recovery_repairs_out_of_idle_extraction_phase(
+        JobId(30960),
+        "Silver Horizon Idle Extracting Repair",
+        JobStatus::Extracting,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_landed_recovery_repairs_while_the_job_is_queued_for_extraction() {
+    assert_landed_recovery_repairs_out_of_idle_extraction_phase(
+        JobId(30961),
+        "Silver Horizon Queued Extract Repair",
+        JobStatus::QueuedExtract,
+    )
+    .await;
+}
+
+/// A live extraction still owns the job: the repair waits for its settlement,
+/// and the same verdict repairs once the extraction is idle.
+#[tokio::test]
+async fn a_landed_recovery_waits_for_a_live_extraction_then_repairs_on_the_same_verdict() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30962);
+    let fixture = park_verdict_then_idle_extraction_phase(
+        &mut pipeline,
+        job_id,
+        "Silver Horizon Live Extraction Repair",
+        JobStatus::Extracting,
+    )
+    .await;
+    pipeline
+        .inflight_extractions
+        .entry(job_id)
+        .or_default()
+        .insert("sibling".to_string());
+
+    land_parked_recovery_volume(&mut pipeline, job_id, &fixture).await;
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(pipeline.par2_repairs_from_parked_verdict, 0);
+    assert_eq!(pipeline.par2_repairer_execute_calls, 0);
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Extracting),
+        "the live extraction keeps the phase; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    pipeline.inflight_extractions.remove(&job_id);
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        pipeline.par2_repairs_from_parked_verdict,
+        1,
+        "the settled extraction released the parked verdict; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        pipeline.par2_authoritative_bytes_read.len(),
+        1,
+        "the wait did not cost a second analysis"
+    );
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
+
+#[tokio::test]
+async fn the_repair_phase_takes_an_idle_extraction_phase_and_refuses_a_live_one() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30963);
+    install_parked_recovery_par2_job(&mut pipeline, job_id, "Silver Horizon Repair Phase Gate")
+        .await;
+
+    // A RAR worker still running.
+    pipeline.transition_postprocessing_status(job_id, JobStatus::Extracting, Some("extracting"));
+    pipeline.rar_sets.insert(
+        (job_id, "sibling".to_string()),
+        crate::pipeline::archive::rar_state::RarSetState {
+            active_workers: 1,
+            ..Default::default()
+        },
+    );
+    assert!(!pipeline.maybe_start_repair(job_id).await);
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Extracting)
+    );
+
+    // A batch still in flight.
+    pipeline
+        .rar_sets
+        .get_mut(&(job_id, "sibling".to_string()))
+        .unwrap()
+        .active_workers = 0;
+    pipeline
+        .inflight_extractions
+        .entry(job_id)
+        .or_default()
+        .insert("sibling".to_string());
+    assert!(!pipeline.maybe_start_repair(job_id).await);
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Extracting)
+    );
+
+    // Idle.
+    pipeline.inflight_extractions.remove(&job_id);
+    assert!(pipeline.maybe_start_repair(job_id).await);
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Repairing)
+    );
+}

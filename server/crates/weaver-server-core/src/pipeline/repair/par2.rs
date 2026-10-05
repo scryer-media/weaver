@@ -297,8 +297,8 @@ fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Resu
 }
 
 /// Scan a completed PAR2 carrier into per-set packet groups. The packet scan
-/// authenticates metadata, but intentionally defers recovery-payload hashes;
-/// validate those here before any caller can merge or count a slice.
+/// authenticates metadata and recovery payloads before accepting their packet
+/// boundaries, so every caller receives only authenticated slices.
 fn scan_completed_par2_packet_groups(
     path: &Path,
     budget: &SharedPar2ScanBudget,
@@ -321,22 +321,7 @@ fn scan_completed_par2_packet_groups(
             });
             index
         };
-        let packet_is_valid = match &scanned_packet.packet {
-            par2_rs::Packet::RecoverySlice(recovery) => {
-                recovery
-                    .data
-                    .validate_packet_hash(
-                        scanned_packet.recovery_set_id.as_bytes(),
-                        recovery.exponent,
-                    )
-                    .ok()
-                    == Some(true)
-            }
-            _ => true,
-        };
-        if packet_is_valid {
-            groups[index].packets.push(scanned_packet.packet);
-        }
+        groups[index].packets.push(scanned_packet.packet);
     }
     Ok(groups)
 }
@@ -741,7 +726,25 @@ impl Pipeline {
             if let Some(canonical) = identity.canonical_filename.as_ref() {
                 by_canonical.insert(canonical.clone(), *file_id);
             }
-            if let weaver_model::files::FileRole::RarVolume { volume_number } = role {
+            // A probed volume whose headers state no number reads as volume 0
+            // in its role. That is right for a first volume and wrong for one
+            // that opens mid-member, and matching on it hands the first
+            // volume's described name to whichever volume happened to be
+            // probed. The headers do say which of the two this is.
+            let continues_a_member = identity
+                .classification
+                .as_ref()
+                .filter(|classification| classification.volume_index.is_none())
+                .and_then(|classification| {
+                    self.rar_sets
+                        .get(&(job_id, classification.set_name.clone()))
+                })
+                .and_then(|set| set.facts.get(&0))
+                .and_then(|facts| facts.members.first())
+                .is_some_and(|member| member.split_before);
+            if !continues_a_member
+                && let weaver_model::files::FileRole::RarVolume { volume_number } = role
+            {
                 by_rar_volume.insert(*volume_number, *file_id);
             }
         }
@@ -1470,15 +1473,25 @@ impl Pipeline {
     /// would be a guess. The file is then unbound, which costs it in-stream
     /// verification and nothing else: it is read at completion like every file
     /// was before the grid existed.
+    ///
+    /// A file with no captured prefix but a fingerprint an identity roster
+    /// already proved (see
+    /// [`crate::pipeline::Pipeline::file_proven_par2_fingerprint`]) is matched
+    /// on that fingerprint and its proven length, under the same uniqueness
+    /// rule.
     fn content_bound_par2_file_id(
         &self,
         file_id: NzbFileId,
         set: &Par2FileSet,
     ) -> Option<par2_rs::FileId> {
-        let prefix = self.file_prefix_16k.get(&file_id)?;
-        if prefix.is_empty() {
-            return None;
-        }
+        let prefix = self
+            .file_prefix_16k
+            .get(&file_id)
+            .filter(|prefix| !prefix.is_empty());
+        let proven = match prefix {
+            Some(_) => None,
+            None => Some(*self.file_proven_par2_fingerprint.get(&file_id)?),
+        };
         let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
@@ -1489,10 +1502,14 @@ impl Pipeline {
             .files
             .iter()
             .filter(|(_, desc)| {
-                let length_contradicts = if file.is_complete() {
-                    file.received_bytes() != desc.length
-                } else {
-                    file.received_bytes() > desc.length
+                // A proven fingerprint carries the length it was proven at.
+                // The file's own count cannot stand in for it: articles a
+                // restart found already delivered are recounted at their
+                // declared, encoded sizes.
+                let length_contradicts = match proven {
+                    Some((_, proven_length)) => proven_length != desc.length,
+                    None if file.is_complete() => file.received_bytes() != desc.length,
+                    None => file.received_bytes() > desc.length,
                 };
                 if length_contradicts
                     || crate::pipeline::is_split_fragment_of(&current_filename, &desc.filename)
@@ -1506,9 +1523,15 @@ impl Pipeline {
                 // A zero-length description has no content to be identified by.
                 // A window the capture does not reach cannot be tested without
                 // inventing the bytes it is missing.
-                window > 0
-                    && prefix.len() >= window
-                    && par2_rs::checksum::md5(&prefix[..window]) == desc.hash_16k
+                match (prefix, proven) {
+                    (Some(prefix), _) => {
+                        window > 0
+                            && prefix.len() >= window
+                            && par2_rs::checksum::md5(&prefix[..window]) == desc.hash_16k
+                    }
+                    (None, Some((proven_hash, _))) => window > 0 && proven_hash == desc.hash_16k,
+                    (None, None) => false,
+                }
             })
             .map(|(par2_file_id, _)| *par2_file_id)
             .collect::<Vec<_>>();
@@ -2146,6 +2169,17 @@ impl Pipeline {
                     .into_iter()
                     .map(|name| working_dir.join(name)),
             );
+        }
+        // Direct scratch has its own lifetime: demotion queues its unlink
+        // behind cached write handles and can return before that unlink lands.
+        // A directory scan must not borrow it as an extra repair source while
+        // the closer is free to remove it. Only stable volume files may cross
+        // the handoff from direct storage to conventional repair.
+        for set in self.direct_store.sets_for(job_id) {
+            let plan = set.plan();
+            excluded.extend(plan.envelope_paths());
+            excluded.extend(plan.repair_paths());
+            excluded.push(plan.holds_scratch_path());
         }
         // A path this set itself resolves to is never an exclusion, whatever
         // else claimed it: the set's own sources are scanned as canonical

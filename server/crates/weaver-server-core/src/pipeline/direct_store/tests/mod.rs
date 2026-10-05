@@ -15,6 +15,7 @@ use super::barrier::{
     CoveragePersist, DatabaseCoveragePersist, DestinationSync, RoutedWrite, WriteRefused,
 };
 use super::plan::DirectSetPlan;
+use super::plan::IdentityKind;
 use super::restart::{
     CoverageRejection, DestinationProbe, DestinationRoots, ExpectedSet, ProbedDestination,
     complete_files, coverage_skip_plan, refetch_floors, restore_job, restore_set,
@@ -25,8 +26,8 @@ use super::router::{
     restored_volume_is_confirmed,
 };
 use super::snapshot::{
-    CoverageSnapshot, DestinationClaim, DestinationExtent, SNAPSHOT_MAGIC, SNAPSHOT_SCHEMA_VERSION,
-    SnapshotError, VolumeFloor, decode, encode,
+    CoverageSnapshot, DestinationClaim, DestinationExtent, IdentityBinding, SNAPSHOT_MAGIC,
+    SNAPSHOT_SCHEMA_VERSION, SnapshotError, VolumeFloor, decode, encode,
 };
 use super::{ByteRanges, DirectStoreGate, parse_enabled};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
@@ -256,6 +257,7 @@ fn sample_snapshot() -> CoverageSnapshot {
             floor: 60,
             complete: false,
         }],
+        identity: None,
     }
 }
 
@@ -1322,6 +1324,7 @@ fn a_long_run_behind_one_gap_is_not_recopied_per_arrival() {
 }
 
 mod par2_fileaccess_adapter_over;
+mod par2_schedules;
 mod par3_source_access;
 mod recording_test_doubles;
 mod repair_transactions;

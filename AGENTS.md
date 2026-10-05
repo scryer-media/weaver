@@ -6,6 +6,21 @@
 - The one exception is creating release notes under `release-notes/` as part of the release process.
 - Keep plans, reports, and handoffs in the conversation or outside the repository. They never belong in a commit.
 
+## Local archive matrix execution
+
+- Do not run the large archive schedule matrix during normal local development, routine validation, hygiene passes, or pre-commit checks. Run it locally only when an operator explicitly requests the matrix; a general request to test, validate, fix, or finish work is not authorization.
+- Keep ordinary smoke and regression tests in the default suite. Do not bypass the matrix exclusions with `--ignore-default-filter` or enable its ignored tests without that explicit request.
+- The opt-in local command is `cargo nextest run --profile archive-matrix --run-ignored all --no-fail-fast`. This covers the combined direct-store, chase, and conventional extraction campaigns for RAR and 7z.
+- CI must automatically run the complete matrix on every pull request update, in parallel with the ordinary test jobs, using the configured 48 Linux partitions. The local opt-in rule must not disable or scope-gate that CI coverage.
+
+## Extended archive campaigns
+
+- The extended campaigns live under `archive_schedules::extended` and `sevenz_store::schedules::extended`. They widen the matrix with further formats, PAR3 recovery, every forceable demotion reason, and deeper schedules over the core direct-store RAR layouts.
+- They are separate from the archive matrix and far larger. Never run them locally unless an operator explicitly requests the extended campaigns; a request to run the archive matrix does not cover them.
+- The opt-in local command is `cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast`.
+- In CI they run only from the manually dispatched `archive-matrix-extended` workflow, across 128 Linux partitions. They must never run on pull requests, pushes, or release tags, and nothing added to them may match the archive matrix filter or change its 48 partitions.
+- Their smoke tests are not ignored and stay in the default suite. Keep every ignored campaign test well under the runner's ten-minute limit by adding shards, not by raising the limit.
+
 ## Test determinism
 
 A test must give the same result on a slow, loaded, or shared CI runner as on a fast idle workstation. Passing locally proves nothing if the result depends on machine speed, load, core count, or scheduling order. A test that can fail that way is broken and must be fixed before it merges.

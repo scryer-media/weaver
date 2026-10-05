@@ -72,6 +72,48 @@ impl Pipeline {
         reason: DemotionReason,
         handoff: Option<SegmentId>,
     ) {
+        let handoffs: Vec<SegmentId> = handoff.into_iter().collect();
+        self.demote_direct_set_with_handoffs(job_id, set_index, reason, &handoffs)
+            .await;
+    }
+
+    /// [`Self::demote_direct_set`] with the routed articles the caller is
+    /// handing to the conventional path itself.
+    ///
+    /// The set's own outstanding placements go first. A flight's writes are
+    /// joined before anything else — the sweep deletes the destinations they
+    /// target — and every article behind the set, written or not, joins the
+    /// handoffs: none of them was committed, so the sweep must leave their
+    /// ranges alone and the requeue must not fetch them, and they rejoin the
+    /// conventional path here once the demotion is under way.
+    pub(super) async fn demote_direct_set_with_handoffs(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        reason: DemotionReason,
+        handoffs: &[SegmentId],
+    ) {
+        let orphans = self.take_direct_placements(job_id, set_index).await;
+        let mut all_handoffs = handoffs.to_vec();
+        all_handoffs.extend(
+            orphans
+                .iter()
+                .filter_map(crate::pipeline::DirectPlacement::article),
+        );
+        Box::pin(self.demote_direct_set_owning(job_id, set_index, reason, &all_handoffs)).await;
+        self.hand_back_direct_placements(orphans).await;
+    }
+
+    async fn demote_direct_set_owning(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        reason: DemotionReason,
+        handoffs: &[SegmentId],
+    ) {
+        // Read before the claim, so the set being demoted is counted among the
+        // sets that were sharing the holds limits when it gave up.
+        let live_sets = self.direct_store.live_set_count();
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
@@ -81,12 +123,14 @@ impl Pipeline {
         // flipped to `Demoted` and have its committed members deleted out from
         // under a job that had already counted them.
         if !set.claim_demotion(reason) {
-            if let Some(segment_id) = handoff {
+            for segment_id in handoffs {
                 self.direct_store
-                    .note_materialization_handoff(set_index, segment_id);
+                    .note_materialization_handoff(set_index, *segment_id);
             }
             return;
         }
+        #[cfg(test)]
+        let carried = set.demotion_reason().unwrap_or(reason);
         let set_name = set.set_name().to_string();
         // A demoted set's volumes become real files and hand off to the
         // conventional repairer, which brings its own post-repair pass — so
@@ -140,6 +184,24 @@ impl Pipeline {
                 file_index: *file_index,
             })
             .collect();
+        // The set's identity evidence ends with it. A roster or header set
+        // left armed would bind this set's own volumes again as the
+        // conventional path brings them back, and so would a fresh header
+        // volume set formed from the files this demotion just handed over.
+        if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
+            let armed = admission.rosters.len() + admission.header_sets.len();
+            admission
+                .rosters
+                .retain(|_, roster| roster.set_index != Some(set_index));
+            admission
+                .header_sets
+                .retain(|header_set| header_set.set_index != set_index);
+            if admission.rosters.len() + admission.header_sets.len() != armed {
+                admission.header_volume_sets_poisoned = true;
+            }
+        }
+        #[cfg(test)]
+        self.direct_store.demotions.push(carried);
         // Damage established before any recovery set has been asked. Recorded
         // as the *fact* rather than the reason, because the completion gate
         // reads it to refuse a stored set's "a clean decode proves integrity"
@@ -169,17 +231,27 @@ impl Pipeline {
             set_index,
             demoted_volume_files.iter().copied(),
         );
-        if let Some(segment_id) = handoff {
+        for segment_id in handoffs {
             self.direct_store
-                .note_materialization_handoff(set_index, segment_id);
+                .note_materialization_handoff(set_index, *segment_id);
         }
         for file_id in &demoted_volume_files {
             self.block_crcs.forget_file(*file_id);
+            // Reconstruction replaces the source image an outstanding PAR2
+            // analysis or retained session may still describe.
+            self.invalidate_par2_session_for_file_write(*file_id);
         }
 
         crate::runtime::perf_probe::record_owned(
             format!("direct_store.demoted.{}", reason.metric()),
             std::time::Duration::from_nanos(1),
+        );
+        // How crowded the process was when this reason struck: a scratch cap
+        // that only ever fires with many sets live is a sharing problem, not
+        // one set's.
+        crate::runtime::perf_probe::record_value_owned(
+            format!("direct_store.demoted.{}.live_sets", reason.metric()),
+            live_sets as u64,
         );
         // Reported, not yet acted on: how many demotions could have been served
         // by the set's own virtual volumes, split from the ones that genuinely
@@ -201,6 +273,7 @@ impl Pipeline {
             set_name = %set_name,
             reason = reason.metric(),
             volumes = %volume_demand,
+            live_sets,
             "direct-store set demoted"
         );
 
@@ -299,7 +372,23 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(ReconstructionFailure::NoLayout);
         };
-        let preserve_holds = matches!(reason, DemotionReason::Par3MemoryPressure);
+        // Reasons that say the set ran out of room — PAR3's memory, the holds
+        // RAM budget, the scratch ceiling, the disk reserve — and nothing about
+        // the held bytes themselves: those are posted bytes the provider can
+        // still serve, so the sweep keeps them rather than fetching them again.
+        // A scratch that failed to write or read is not here: the bytes behind
+        // it are not known to be readable. A holds cap is usually struck while
+        // an article is routing, and that article goes to the decode seam; its
+        // own range is cut out of what the sweep keeps (below), and every
+        // other held byte is still kept.
+        let out_of_holds_room = matches!(
+            reason,
+            DemotionReason::HoldsBudgetExceeded
+                | DemotionReason::HoldsScratchCeiling
+                | DemotionReason::HoldsScratchDiskReserve
+        );
+        let preserve_holds =
+            out_of_holds_room || matches!(reason, DemotionReason::Par3MemoryPressure);
         if !preserve_holds && set.router.member_partials().is_empty() {
             // Nothing was ever routed to a member, so there is nothing to
             // reconstruct *from* beyond headers. Refetching is both correct and
@@ -348,15 +437,32 @@ impl Pipeline {
             // filling a file with a hole where the rebuilt prefix should be.
             let filename = self.current_filename_for_file(job_id, file_asm);
             let received = file_asm.received_bytes();
-            // Placed bytes only, deliberately. The provider can serve holds
-            // too, but this sweep hands the set to the conventional path, whose
-            // decode handoff owns the article that was routing when demotion
-            // struck and whose targeted requeue owns every segment the atoms do
-            // not wholly back; a hold materialized here would be written twice
-            // and counted against a completion gate nothing then clears.
-            // A PAR3 spill starts outside an article handoff. Its immutable
-            // holds can be reconstructed too, subject to the same CRC atoms.
-            let physical_coverage = if preserve_holds && handoffs.is_empty() {
+            // Placed bytes only, unless the demotion is for room. The provider
+            // can serve holds too, but this sweep hands the set to the
+            // conventional path, whose decode handoff owns the article that
+            // was routing when demotion struck and whose targeted requeue owns
+            // every segment the atoms do not wholly back; a handed-off article
+            // materialized here would be written twice and counted against a
+            // completion gate nothing then clears.
+            //
+            // A demotion for room keeps its holds: they are posted bytes,
+            // checked by their own article CRCs, and fetching them again is
+            // the cost the demotion exists to avoid. What it must not keep is
+            // a handed-off article's range, held or placed, so that range is
+            // cut out and left to its owner. A PAR3 spill keeps its holds only
+            // when it starts outside a handoff, as it always has.
+            let extents = set.segment_extents(*volume_index);
+            let physical_coverage = if out_of_holds_room {
+                let mut coverage = set.volume_coverage_with_holds(*volume_index);
+                for (offset, len) in handoffs
+                    .iter()
+                    .filter(|segment_id| segment_id.file_id == file_id)
+                    .filter_map(|segment_id| extents.get(&segment_id.segment_number))
+                {
+                    coverage.remove(*offset, *len);
+                }
+                coverage
+            } else if preserve_holds && handoffs.is_empty() {
                 set.volume_coverage_with_holds(*volume_index)
             } else {
                 set.volume_coverage(*volume_index)
@@ -367,7 +473,6 @@ impl Pipeline {
             // current segment, and the targeted requeue below owns any other
             // segment that is not wholly backed by an article CRC atom.
             let coverage = crcs.materializable_coverage(&physical_coverage);
-            let extents = set.segment_extents(*volume_index);
             // The sweep sets the file's length before it writes, to cut off a
             // stale tail an interrupted earlier attempt could have left above
             // the volume. It runs detached, though, and the decode seam writes
@@ -901,6 +1006,11 @@ impl Pipeline {
                         file_index, error = %error,
                         "failed to record a reconstructed volume as complete"
                     );
+                } else {
+                    // The completed-file row makes this prefix durable. Chase
+                    // reads the in-memory floor when deciding whether the
+                    // reconstructed archive signature is available.
+                    self.persisted_file_progress.insert(file_id, plan.len);
                 }
             } else if floor > 0 {
                 // A partial volume persists only a contiguous, segment-aligned
@@ -975,13 +1085,19 @@ impl Pipeline {
         self.refetch_direct_volumes(job_id, &volumes).await;
     }
 
-    /// Deletes a set's partial members, envelope files and holds scratch.
+    /// Deletes a set's partial members, envelope files and holds, RAM and
+    /// scratch.
     ///
     /// A sparse half-written output would masquerade as finished work, and the
-    /// envelopes and the scratch are scratch by construction.
+    /// envelopes and the scratch are scratch by construction. The holds go
+    /// with them rather than with the job: a demoted set routes nothing
+    /// again, and both callers are past the last read of them — the refetch
+    /// never reads them, and a reconstruction calls this only once its sweep
+    /// has finished — so keeping them would only charge every other live set
+    /// for bytes no one will read.
     pub(super) async fn delete_direct_outputs(&mut self, job_id: JobId, set_index: usize) {
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
-            set.router.discard_scratch();
+            set.router.discard_holds();
         }
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -1069,9 +1185,9 @@ impl Pipeline {
                 // The articles the decode seam owns are kept alongside the ones
                 // the sweep verified, but they are *its* bytes: it holds them in
                 // the write buffer, parked there until this handback seeds the
-                // sweep's extents and drains it. So they belong in the
-                // assembly and out of the requeue, and nowhere near the sparse
-                // seeding below.
+                // sweep's extents and drains it. So they stay out of the
+                // requeue and nowhere near the sparse seeding below, and each
+                // is committed by its own write, not here.
                 let handed_off: HashSet<u32> = handoffs
                     .iter()
                     .filter(|segment_id| segment_id.file_id == file_id)
@@ -1096,11 +1212,12 @@ impl Pipeline {
                     .map(|segment| segment.ordinal)
                     .collect();
 
-                // Rebuild the assembly to exactly the kept set. `commit_segment`
-                // is the only way in and `reset` the only way out, so the
-                // sequence is reset-then-re-commit rather than a surgical
-                // removal; the decoded sizes come from the recorded extents, so
-                // the byte counters land where they were.
+                // Rebuild the assembly to exactly what the sweep verified, with
+                // the handed-off articles placed but left for their own writes
+                // to commit. `commit_segment` is the only way in and `reset` the
+                // only way out, so the sequence is reset-then-re-commit rather
+                // than a surgical removal; the decoded sizes come from the
+                // recorded extents, so the byte counters land where they were.
                 if let Some(file_asm) = state.assembly.file_mut(file_id) {
                     file_asm.reset();
                 }
@@ -1111,26 +1228,40 @@ impl Pipeline {
                     let Some((offset, len)) = file_extents.get(segment_number).copied() else {
                         continue;
                     };
+                    // Only bytes this file had already received can be lost to
+                    // the reset; a kept article that was not among them costs
+                    // the download counter nothing.
+                    let was_received = committed.contains(segment_number);
+                    if !verified.contains(segment_number) {
+                        // A handed-off article is still parked in the write
+                        // buffer: placed, as every buffered article is, but not
+                        // received until its write lands and commits it there.
+                        // Committing it here would make that commit a duplicate
+                        // on a file already complete — one more whole-file
+                        // checksum read for every article parked behind it.
+                        if let Some(file_asm) = state.assembly.file_mut(file_id) {
+                            file_asm.record_placement(*segment_number, offset, len as u32);
+                        }
+                        if was_received {
+                            kept_bytes = kept_bytes.saturating_add(len);
+                        }
+                        continue;
+                    }
                     if let Some(file_asm) = state.assembly.file_mut(file_id)
                         && file_asm.commit_segment(*segment_number, len as u32).is_ok()
                     {
-                        kept_bytes = kept_bytes.saturating_add(len);
-                        file_asm.note_part_verification(
-                            *segment_number,
-                            verified.contains(segment_number),
-                        );
-                        if verified.contains(segment_number) {
-                            // Coverage is durable, but reconstruction must not
-                            // manufacture streamed PAR2 checksum evidence.
-                            file_asm.record_reconstructed_placement(
-                                *segment_number,
-                                offset,
-                                len as u32,
-                            );
-                            materialized_extents.push((offset, len));
-                        } else {
-                            file_asm.record_placement(*segment_number, offset, len as u32);
+                        if was_received {
+                            kept_bytes = kept_bytes.saturating_add(len);
                         }
+                        file_asm.note_part_verification(*segment_number, true);
+                        // Coverage is durable, but reconstruction must not
+                        // manufacture streamed PAR2 checksum evidence.
+                        file_asm.record_reconstructed_placement(
+                            *segment_number,
+                            offset,
+                            len as u32,
+                        );
+                        materialized_extents.push((offset, len));
                     }
                 }
                 // Native PAR3 availability is independent of PAR2's placement
@@ -1153,12 +1284,12 @@ impl Pipeline {
                     .assembly
                     .file(file_id)
                     .is_some_and(|file| !file.is_complete());
-                // A file that needs nothing more can still have a *buffer* that
-                // needs this seeding: the handed-off article is inserted at its
-                // own offset while the sweep is outstanding, so it waits behind
-                // a cursor still at zero — and it is often the very article
-                // that completed the file. Skipping the seeding on completeness
-                // would leave its bytes in memory and a hole on disk.
+                // A *buffer* needs this seeding whatever the sweep verified: the
+                // handed-off article is inserted at its own offset while the
+                // sweep is outstanding, so it waits behind a cursor still at
+                // zero — and it is often the very article that completes the
+                // file, which it does only once it is written. Skipping the
+                // seeding would leave its bytes in memory and a hole on disk.
                 let has_buffered_writes = self.write_buffers.contains_key(&file_id);
                 if has_buffered_writes || (!materialized_extents.is_empty() && needs_more_bytes) {
                     // Reconstruction made these article extents durable without
