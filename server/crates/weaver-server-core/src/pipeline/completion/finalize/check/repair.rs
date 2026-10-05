@@ -238,7 +238,7 @@ impl Pipeline {
                 if let Some((file_id, _)) = matched
                     && holder_is_output
                 {
-                    let unposted = self.par2_unposted_outputs.entry(job_id).or_default();
+                    let unposted = self.recovery_unposted_outputs.entry(job_id).or_default();
                     unposted.outputs.insert(requested_correct_name.clone());
                     unposted.superseded.insert(file_id);
                     // A roster or a chase still keyed by the posted copy's

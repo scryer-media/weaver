@@ -1740,7 +1740,7 @@ impl Pipeline {
     /// download to finish, so the file on disk is the whole of it.
     fn direct_unpack_rebuilt_part_len(&self, job_id: JobId, path: &std::path::Path) -> Option<u64> {
         let filename = path.file_name()?.to_str()?;
-        self.par2_unposted_outputs
+        self.recovery_unposted_outputs
             .get(&job_id)
             .is_some_and(|unposted| unposted.outputs.contains(filename))
             .then(|| std::fs::metadata(path).ok())

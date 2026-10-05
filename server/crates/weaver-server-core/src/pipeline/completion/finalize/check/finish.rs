@@ -1403,7 +1403,7 @@ impl Pipeline {
         topology.complete_volumes.insert(number);
         // On record before anything arms against the set: a chase reads a
         // part's length from its download, and this part never had one.
-        self.par2_unposted_outputs
+        self.recovery_unposted_outputs
             .entry(job_id)
             .or_default()
             .outputs
