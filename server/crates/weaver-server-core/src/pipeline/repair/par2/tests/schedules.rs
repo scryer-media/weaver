@@ -65,6 +65,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(shape: Shape, seed: u64) -> Self {
+        Self::with_recovery(shape, seed, 12)
+    }
+
+    fn with_recovery(shape: Shape, seed: u64, recovery: usize) -> Self {
         let mut random = Random(seed);
         let block = if matches!(shape, Shape::BeyondQuickHash) {
             4096
@@ -103,7 +107,7 @@ impl Fixture {
             .iter()
             .map(|(n, b)| (n.as_str(), b.as_slice()))
             .collect();
-        let set = build_repairable_par2_set_for_files(&borrowed, block as u64, 12);
+        let set = build_repairable_par2_set_for_files(&borrowed, block as u64, recovery);
         let index = build_test_par2_index_for_files(&borrowed, block as u64);
         let carriers = set
             .recovery_slices
@@ -539,6 +543,90 @@ fn duplicate_content_schedules() {
 #[test]
 fn beyond_quick_hash_schedules() {
     campaign(Shape::BeyondQuickHash);
+}
+
+/// Every order in which the chains' heads can be taken, each chain keeping
+/// its own order.
+fn interleavings(chains: &mut [Vec<Event>], prefix: &mut Vec<Event>, output: &mut Vec<Vec<Event>>) {
+    if chains.iter().all(Vec::is_empty) {
+        output.push(prefix.clone());
+        return;
+    }
+    for i in 0..chains.len() {
+        if chains[i].is_empty() {
+            continue;
+        }
+        let event = chains[i].remove(0);
+        prefix.push(event);
+        interleavings(chains, prefix, output);
+        prefix.pop();
+        chains[i].insert(0, event);
+    }
+}
+
+/// The seeded campaigns sample a large event space. This one is exhaustive
+/// over a small one: one source's partial and final publication, one
+/// carrier's malformed, valid and repeated publication, and an invalidation
+/// followed by a reopen, in every one of their 210 interleavings, under every
+/// damage and access mode. The rest of the recovery the final repair needs
+/// arrives after the interleaving, in a fixed order, so each damage finishes
+/// against the same recovery whichever order came first.
+fn exhaustive_campaign(access: Access) {
+    let fixture = Fixture::with_recovery(Shape::ShortTail, 0x45584841, 4);
+    let mut orders = Vec::new();
+    interleavings(
+        &mut [
+            vec![Event::Source(0, 1), Event::Source(0, 2)],
+            vec![
+                Event::Recovery(0, 0),
+                Event::Recovery(0, 1),
+                Event::Recovery(0, 2),
+            ],
+            vec![Event::Invalidate, Event::Reopen],
+        ],
+        &mut Vec::new(),
+        &mut orders,
+    );
+    assert_eq!(orders.len(), 210);
+    for damage in [
+        Damage::Clean,
+        Damage::Corrupt,
+        Damage::Truncated,
+        Damage::Missing,
+        Damage::Shifted,
+        Damage::Renamed,
+        Damage::Exhausted,
+    ] {
+        if matches!(access, Access::Snapshot) && matches!(damage, Damage::Shifted | Damage::Renamed)
+        {
+            continue;
+        }
+        // An exhausted set keeps the one carrier the interleaving delivers.
+        let rest = if matches!(damage, Damage::Exhausted) {
+            1
+        } else {
+            fixture.carriers.len()
+        };
+        for (case, order) in orders.iter().enumerate() {
+            let mut events = order.clone();
+            events.extend((1..rest).map(|i| Event::Recovery(i, 1)));
+            if let Err(error) = replay(&fixture, damage, access, &events, true) {
+                let reduced = minimize(&fixture, damage, access, &events, &error);
+                panic!(
+                    "{damage:?} {access:?} case={case}: {error}\ntrace={events:?}\nreduced trace={reduced:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_interleaving_from_disk() {
+    exhaustive_campaign(Access::Disk);
+}
+#[test]
+fn every_interleaving_from_snapshot() {
+    exhaustive_campaign(Access::Snapshot);
 }
 
 #[test]

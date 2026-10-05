@@ -820,6 +820,11 @@ impl DirectSetRouter {
             }
             self.try_verify_member(member_id)?;
         }
+        for member in self.members.values_mut() {
+            if let Some(crypt) = member.crypt.as_mut() {
+                crypt.note_repair_settled();
+            }
+        }
         Ok(())
     }
 

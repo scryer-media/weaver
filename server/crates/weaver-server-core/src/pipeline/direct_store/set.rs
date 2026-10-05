@@ -422,6 +422,16 @@ impl DirectSet {
         matches!(self.status, DirectSetStatus::Finalized)
     }
 
+    /// The reason the set left direct mode under, which is the router's own
+    /// when it demoted from inside `route` before the wiring seam was asked.
+    #[cfg(test)]
+    pub(crate) fn demotion_reason(&self) -> Option<DemotionReason> {
+        match self.status {
+            DirectSetStatus::Demoted(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
     /// Leaves direct mode. Refuses once the set is terminal in either
     /// direction: a demotion is idempotent, and a **finalized** set has already
     /// renamed its members to their destinations and been marked extracted, so
@@ -560,9 +570,13 @@ impl DirectSet {
         self.router.holds_budget()
     }
 
-    /// Routes one repaired span back through the router with replacement
-    /// semantics. A refusal demotes the set, exactly as [`Self::route`] does.
-    pub(crate) fn route_repaired(
+    /// Routes one volume's complete rewrite inside an open repair transaction.
+    ///
+    /// Unlike [`Self::route_repaired`] this does not settle: a repaired byte
+    /// that needs another volume's rewrite — an encrypted block straddling the
+    /// seam, a trailing region awaiting confirmation — stays staged until
+    /// [`Self::finish_repair_transaction`] answers for it.
+    pub(crate) fn route_repaired_volume(
         &mut self,
         volume_index: u32,
         spans: &[super::router::RepairedChunk],
@@ -571,12 +585,10 @@ impl DirectSet {
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         match self
             .router
-            .route_repaired(volume_index, spans, lead_in, whole_volume)
+            .route_repaired_batch(volume_index, spans, lead_in, whole_volume, true)
         {
             Ok(spans) => {
-                if !spans.is_empty() {
-                    self.latched_direct = true;
-                }
+                self.latched_direct |= !spans.is_empty();
                 Ok(spans)
             }
             Err(reason) => {

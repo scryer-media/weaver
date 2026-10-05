@@ -1929,6 +1929,35 @@ impl Pipeline {
         if has_assembly_binding {
             return false;
         }
+        // An obfuscated file binds by its opening bytes.  One that is missing
+        // them answers to no name and no fingerprint, so nothing here can say
+        // it is not one of this set's files; only a pass that reads it can.
+        let set_ids = self
+            .par2_runtime(job_id)
+            .map(|runtime| runtime.ordered_set_ids())
+            .unwrap_or_default();
+        let has_unidentifiable_payload = state.assembly.files().any(|file| {
+            let file_id = file.file_id();
+            let captured = self.file_prefix_16k.get(&file_id).map_or(0, Vec::len);
+            !file.is_complete()
+                && !matches!(
+                    file.role(),
+                    weaver_model::files::FileRole::Par2 { .. }
+                        | weaver_model::files::FileRole::Par3 { .. }
+                )
+                && !self.file_proven_par2_fingerprint.contains_key(&file_id)
+                && par2_set.files.values().any(|description| {
+                    captured
+                        < (description.length as usize).min(crate::pipeline::PAR2_HASH_16K_BYTES)
+                })
+                && set_ids.iter().all(|other| {
+                    self.resolve_par2_file_binding_in_set(file_id, *other)
+                        .is_none()
+                })
+        });
+        if has_unidentifiable_payload {
+            return false;
+        }
         // A split topology can assemble the described output even when none
         // of its individual fragments binds to that description.  Treat that
         // relationship as evidence rather than skipping a recovery pass.

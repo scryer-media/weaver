@@ -129,6 +129,8 @@ impl Pipeline {
             }
             return;
         }
+        #[cfg(test)]
+        let carried = set.demotion_reason().unwrap_or(reason);
         let set_name = set.set_name().to_string();
         // A demoted set's volumes become real files and hand off to the
         // conventional repairer, which brings its own post-repair pass — so
@@ -182,6 +184,24 @@ impl Pipeline {
                 file_index: *file_index,
             })
             .collect();
+        // The set's identity evidence ends with it. A roster or header set
+        // left armed would bind this set's own volumes again as the
+        // conventional path brings them back, and so would a fresh header
+        // volume set formed from the files this demotion just handed over.
+        if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
+            let armed = admission.rosters.len() + admission.header_sets.len();
+            admission
+                .rosters
+                .retain(|_, roster| roster.set_index != Some(set_index));
+            admission
+                .header_sets
+                .retain(|header_set| header_set.set_index != set_index);
+            if admission.rosters.len() + admission.header_sets.len() != armed {
+                admission.header_volume_sets_poisoned = true;
+            }
+        }
+        #[cfg(test)]
+        self.direct_store.demotions.push(carried);
         // Damage established before any recovery set has been asked. Recorded
         // as the *fact* rather than the reason, because the completion gate
         // reads it to refuse a stored set's "a clean decode proves integrity"

@@ -190,6 +190,30 @@
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }
+    },
+    "rar4_lz_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar4_lz_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_lz_two": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
+    },
+    "rar5_lz_four": {
+      "compressible.txt": {
+        "size": 226943,
+        "sha256": "4d0d8762437ab166dabf6a8279e566214b3df55c392a63f9a7b7dd480eb25519"
+      }
     }
   }
 }

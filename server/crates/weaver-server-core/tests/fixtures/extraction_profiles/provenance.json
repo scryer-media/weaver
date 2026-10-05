@@ -455,6 +455,186 @@
         ],
         "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
+    },
+    {
+      "file": "rar4_lz_two.part01.rar",
+      "sha256": "0f2f42fddfdf79fd041080f5f59fe6bd68c1d529ee6526adf8d485ba479de81f",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -ma4 -m3 -ep1 -v24k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_lz_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_lz_two.part02.rar",
+      "sha256": "c7999da27bb3869890430d5a8b66c6f5542f6ca6ff31a3097d92b519f1e697e4",
+      "size": 17366,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -ma4 -m3 -ep1 -v24k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_lz_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_lz_four.part01.rar",
+      "sha256": "b33467823dc6ec64b99f5cb76593144748c96586a5dfc584ad3570e6aa935da1",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -ma4 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_lz_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_lz_four.part02.rar",
+      "sha256": "34cf672ac16e88c36073c8dcb3fea8f81c557538d97ab8bb8d582da5694ffe62",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -ma4 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_lz_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_lz_four.part03.rar",
+      "sha256": "f472593d2f1fa232ba2de581854b45eca288fce2e51d91ac09bebc7d31ec9b7e",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -ma4 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_lz_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_lz_four.part04.rar",
+      "sha256": "437556aa43004b1aecb3710f5959bd94396ee88105f0b8fdb80b8e59312c23c9",
+      "size": 8336,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -ma4 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_lz_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_lz_two.part01.rar",
+      "sha256": "b15e7256b36612dcd69530b2a3b70f37072b148de43f3732fdda8a07a11ade89",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -ma5 -m3 -ep1 -v24k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_lz_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_lz_two.part02.rar",
+      "sha256": "8ffe040368cd619d3d2d698389415f3715edbee37a84adc71ecde78d3e0a05ec",
+      "size": 17440,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -ma5 -m3 -ep1 -v24k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_lz_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_lz_four.part01.rar",
+      "sha256": "b1e157960734b5d1cb8af43d1524c505b068f7c6f62719873abd2e7a8dbdada8",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -ma5 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_lz_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_lz_four.part02.rar",
+      "sha256": "e878a0ee3519fdbfbd072a5d9ab3311e8f49ea3a734e698ea93b701f63770e53",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -ma5 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_lz_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_lz_four.part03.rar",
+      "sha256": "f59034dd6f9fb26d1c478768e995386341928fafc5bcd7dc416c4cbd65af88a4",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -ma5 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_lz_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_lz_four.part04.rar",
+      "sha256": "d72ac4f5c5dc103d6782e3917dc36324027f02d35555eb394457db221ddeb636",
+      "size": 8577,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -ma5 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_lz_four` in expected.json."
+      }
     }
   ]
 }

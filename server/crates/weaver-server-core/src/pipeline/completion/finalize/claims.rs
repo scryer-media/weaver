@@ -47,8 +47,8 @@ pub(in crate::pipeline) enum TerminalFileClaim {
 impl TerminalFileClaim {
     /// Whether this claim says the job handed over content for the file.
     ///
-    /// A repair leftover counts: a join consumed it into an output the job
-    /// delivered. An unfetchable-duplicate discard does not — that claim only
+    /// A repair leftover counts: a join or a rebuild consumed it into an output
+    /// the job delivered. An unfetchable-duplicate discard does not — that claim only
     /// says the bytes could never arrive, which is a statement about the wire,
     /// not about anything reaching the destination.
     fn delivers_content(self) -> bool {
@@ -200,9 +200,17 @@ impl Pipeline {
         // breaker verdict proves the declared bytes can never arrive; when
         // nothing else delivered, that is not a surplus duplicate, it is the
         // payload, and the job has nothing to hand over.
+        //
+        // A verdict that rebuilt payload no posted file answers to is a
+        // delivery as well, and the only one a job can have when every posted
+        // file lost the bytes its identity is read from: the content is on
+        // disk, proven against the recovery set, under names the census has no
+        // row for. That is a fact about bytes the set verified, which is what
+        // keeps it apart from job 10220, where no set described anything.
         let delivered_any = census
             .iter()
-            .any(|row| !row.is_furniture && row.claim.delivers_content());
+            .any(|row| !row.is_furniture && row.claim.delivers_content())
+            || self.par2_verdict_delivered_unposted_payload(job_id);
         if delivered_any {
             for row in &mut census {
                 row.blocks_delivery = false;
@@ -351,7 +359,9 @@ impl Pipeline {
         is_complete: bool,
         has_delivery_evidence: bool,
     ) -> TerminalFileClaim {
-        if self.par2_join_consumed_split_part(job_id, file_id) {
+        if self.par2_join_consumed_split_part(job_id, file_id)
+            || self.par2_superseded_source(job_id, file_id)
+        {
             return TerminalFileClaim::Discarded(TerminalDiscardKind::RepairLeftover);
         }
         if self.direct_set_delivered_file(file_id) {

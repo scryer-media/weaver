@@ -1334,7 +1334,7 @@ impl Pipeline {
             for topology in state.assembly.archive_topologies().values() {
                 cleanup_files.extend(topology.volume_map.keys().cloned());
             }
-            cleanup_files.extend(self.par2_joined_split_part_names(job_id));
+            cleanup_files.extend(self.par2_spent_input_names(job_id));
             cleanup_files
         };
 

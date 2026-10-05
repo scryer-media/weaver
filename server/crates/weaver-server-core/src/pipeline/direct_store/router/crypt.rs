@@ -1187,6 +1187,14 @@ pub(crate) struct MemberCrypt {
     /// the padding, retained). An edge block leaves `edge_plain` when this
     /// covers all of it.
     emitted: ByteRanges,
+    /// Cipher ranges the repair in progress has already invalidated the caches
+    /// for. A repaired span that holds is offered again on every drain until
+    /// its other half arrives, and what the caches hold by then was derived
+    /// from repaired bytes — a straddling block the neighbouring volume's
+    /// rewrite decrypted and left in `edge_plain` for exactly this span.
+    /// Dropping it a second time would strand the span: the neighbour's half
+    /// of the cipher is routed and gone. Emptied when the repair settles.
+    repair_invalidated: ByteRanges,
     /// Layer 2's composition, over **plaintext**, in member-logical space.
     ///
     /// Member-wide rather than per part, unlike the plaintext path: layer 1
@@ -1264,6 +1272,7 @@ impl MemberCrypt {
             #[cfg(test)]
             decrypted_bytes: 0,
             emitted: ByteRanges::new(),
+            repair_invalidated: ByteRanges::new(),
             plain_runs: CrcRuns::default(),
             tail_plain: Vec::new(),
             tail_filled: 0,
@@ -1430,9 +1439,10 @@ impl MemberCrypt {
     /// asks `edge_plain` for the head and tail blocks it cannot decrypt alone,
     /// and would otherwise be handed the plaintext of the damage it is replacing.
     pub(crate) fn invalidate_repaired(&mut self, cipher_offset: u64, len: u64) {
-        if len == 0 {
+        if len == 0 || self.repair_invalidated.missing(cipher_offset, len).is_empty() {
             return;
         }
+        self.repair_invalidated.insert(cipher_offset, len);
         let from = block_floor(cipher_offset);
         let to = block_ceil(cipher_offset.saturating_add(len));
         self.edge_plain
@@ -1447,6 +1457,12 @@ impl MemberCrypt {
         // what it re-derived.
         self.decrypted = super::subtract(&self.decrypted, from, to.saturating_sub(from));
         self.prune_checkpoints();
+    }
+
+    /// The repair that was rewriting this member has settled, so the next
+    /// repaired span is a new rewrite and invalidates afresh.
+    pub(crate) fn note_repair_settled(&mut self) {
+        self.repair_invalidated = ByteRanges::new();
     }
 
     /// Files the plaintext of a block the caller could only emit part of.

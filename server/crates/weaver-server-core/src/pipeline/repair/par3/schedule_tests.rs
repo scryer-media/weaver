@@ -622,6 +622,105 @@ variant_test!(nested_inline_empty_schedules, Nested);
 variant_test!(alias_schedules, Aliases);
 variant_test!(independent_cauchy_and_fft_set_schedules, MultipleSets);
 
+/// Every order in which the chains' heads can be taken, each chain keeping
+/// its own order.
+fn interleavings(chains: &mut [Vec<Event>], prefix: &mut Vec<Event>, output: &mut Vec<Vec<Event>>) {
+    if chains.iter().all(Vec::is_empty) {
+        output.push(prefix.clone());
+        return;
+    }
+    for i in 0..chains.len() {
+        if chains[i].is_empty() {
+            continue;
+        }
+        let event = chains[i].remove(0);
+        prefix.push(event);
+        interleavings(chains, prefix, output);
+        prefix.pop();
+        chains[i].insert(0, event);
+    }
+}
+
+/// The seeded campaigns sample a large event space. This one is exhaustive
+/// over a small one: the protected source's three publications, and the
+/// index and the last recovery carrier each published with a hole and then
+/// whole, in every interleaving, with an assessment checked against a fresh
+/// one after each event, under every damage. The index is also left out
+/// altogether, since every recovery carrier repeats the metadata it holds.
+/// Carriers outside the interleaving arrive whole afterwards, so each damage
+/// finishes against the same recovery whichever order came first.
+#[test]
+fn every_interleaving_of_source_index_and_recovery() {
+    let fixture = Fixture::new(Variant::Cauchy8);
+    let last = fixture.carriers.len() - 1;
+    assert!(last > 0, "the fixture has an index and a recovery carrier");
+    let source = vec![
+        Event::Source(0, 0),
+        Event::Source(0, 1),
+        Event::Source(0, 2),
+    ];
+    let carrier = |i| vec![Event::Carrier(i, false), Event::Carrier(i, true)];
+    let mut orders = Vec::new();
+    interleavings(
+        &mut [source.clone(), carrier(0), carrier(last)],
+        &mut Vec::new(),
+        &mut orders,
+    );
+    assert_eq!(orders.len(), 210);
+    let mut without_index = Vec::new();
+    interleavings(
+        &mut [source, carrier(last)],
+        &mut Vec::new(),
+        &mut without_index,
+    );
+    assert_eq!(without_index.len(), 10);
+    let rest: Vec<_> = (1..last).map(|i| Event::Carrier(i, true)).collect();
+    for damage in [
+        Damage::Clean,
+        Damage::Corrupt,
+        Damage::Hole,
+        Damage::Exhausted,
+    ] {
+        for (case, order) in orders.iter().chain(&without_index).enumerate() {
+            let mut events = Vec::new();
+            for &event in order.iter().chain(&rest) {
+                events.push(event);
+                events.push(Event::Assess);
+            }
+            let run = |events: &[Event]| -> Check {
+                let mut replay = Replay::new(&fixture, damage);
+                for &event in events {
+                    replay.step(event)?;
+                }
+                Ok(())
+            };
+            let mut replay = Replay::new(&fixture, damage);
+            for (index, &event) in events.iter().enumerate() {
+                if let Err(failure) = replay.step(event) {
+                    drop(replay);
+                    let minimized = minimize(&events[..=index], |trace| {
+                        run(trace).is_err_and(|other| {
+                            other.contract == failure.contract
+                                && (failure.contract != "engine operation"
+                                    || other.detail == failure.detail)
+                        })
+                    });
+                    panic!(
+                        "damage={damage:?} case={case}; {}: {}; minimized={minimized:?}",
+                        failure.contract, failure.detail
+                    );
+                }
+            }
+            if let Err(failure) = replay.finish() {
+                panic!(
+                    "damage={damage:?} case={case}; {}: {}; trace={events:?}",
+                    failure.contract, failure.detail
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn fft_cohort_deficit_cannot_borrow_surplus_from_another_cohort() {
     let fixture = Fixture::new(Variant::Cohorts);
