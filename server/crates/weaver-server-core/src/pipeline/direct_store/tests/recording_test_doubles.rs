@@ -3554,6 +3554,160 @@ fn a_carried_remainder_still_verifies_the_articles_before_it() {
     assert!(path.exists());
 }
 
+/// Article records for `articles`, each `(start, len)` taken off `bytes`: the
+/// composition a process that placed only those articles would hold.
+fn article_crcs_for(bytes: &[u8], articles: &[(usize, usize)]) -> CrcRuns {
+    let mut runs = CrcRuns::default();
+    for &(start, len) in articles {
+        runs.insert(
+            start as u64,
+            len as u64,
+            par2_rs::checksum::crc32(&bytes[start..start + len]),
+        );
+    }
+    runs
+}
+
+/// After a restart the composition holds nothing for the bytes a checkpoint
+/// restored, so a volume that needs repair would refuse every byte placed
+/// before the restart and demote. The repair scratch carries a restored
+/// stretch with no record through, and still verifies every article this
+/// process recorded after it.
+#[test]
+fn a_repair_scratch_carries_restored_bytes_with_no_record() {
+    let fixture = provider_fixture(whole_volume_covered());
+    // Two articles placed before the restart, two after it.
+    let crcs = article_crcs_for(&fixture.conventional, &[(200, 100), (300, 100)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 400);
+    let mut restored = ByteRanges::new();
+    restored.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered, crcs);
+    target.restored = restored;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let rebuilt = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect("the restored stretch is carried and the recorded articles verify");
+
+    let mut verified = ByteRanges::new();
+    verified.insert(200, 200);
+    assert_eq!(
+        rebuilt[0].verified, verified,
+        "only the articles this process recorded are claimed as verified"
+    );
+    assert_eq!(rebuilt[0].contiguous, 0);
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..400], &fixture.conventional[..400]);
+}
+
+/// The carry stops where the restored bytes do. A covered stretch past them
+/// that no record accounts for is bytes this process placed and cannot vouch
+/// for, and is refused exactly as it would be without a restart.
+#[test]
+fn a_restored_carry_never_reaches_past_the_restored_bytes() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 300);
+    let mut restored = ByteRanges::new();
+    restored.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered, CrcRuns::default());
+    target.restored = restored;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("an unrecorded stretch past the restored bytes has no reference");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 200,
+        }
+    );
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..200], &fixture.conventional[..200]);
+    assert!(
+        written[200..].iter().all(|byte| *byte == 0),
+        "the refused stretch is left as a hole"
+    );
+}
+
+/// A record this process holds inside the restored bytes — an article fetched
+/// again after the restart — is checked like any other, so a restored byte
+/// that disagrees with it is still caught.
+#[test]
+fn a_record_inside_restored_bytes_is_still_verified() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let mut corrupted = fixture.conventional.clone();
+    corrupted[150] ^= 0xFF;
+    let crcs = article_crcs_for(&corrupted, &[(100, 100)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered.clone(), crcs);
+    target.restored = covered;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("the recorded article fails its reference");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::ChecksumMismatch {
+            volume_index: 0,
+            offset: 100,
+        }
+    );
+}
+
+/// The demotion sweep publishes a floor over what it writes, so restored bytes
+/// with no record are refused there whatever the repair scratch does.
+#[test]
+fn a_demotion_sweep_does_not_carry_restored_bytes() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 200);
+    let mut target =
+        reconstruction_target(&fixture, path.clone(), covered.clone(), CrcRuns::default());
+    target.restored = covered;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("a floor may not cover restored bytes nothing checked");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 0,
+        }
+    );
+}
+
 #[test]
 fn a_rebuilt_run_that_fails_its_reference_falls_back_to_refetching() {
     let fixture = provider_fixture(whole_volume_covered());

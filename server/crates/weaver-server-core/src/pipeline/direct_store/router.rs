@@ -916,6 +916,26 @@ impl CrcRuns {
         Some((cursor - start, composed))
     }
 
+    /// Where the stretch no run accounts for ends, when `offset` opens one:
+    /// the start of the next run, or `limit` when none begins before it.
+    ///
+    /// `None` means a run covers `offset`, so the byte there has a record.
+    pub(crate) fn unrecorded_until(&self, offset: u64, limit: u64) -> Option<u64> {
+        let index = self
+            .runs
+            .partition_point(|(run_start, _, _)| *run_start <= offset);
+        if let Some(&(run_start, run_len, _)) = index.checked_sub(1).and_then(|at| self.runs.get(at))
+            && run_start.saturating_add(run_len) > offset
+        {
+            return None;
+        }
+        Some(
+            self.runs
+                .get(index)
+                .map_or(limit, |(run_start, _, _)| (*run_start).min(limit)),
+        )
+    }
+
     /// The run that starts exactly at `offset`, as `(start, len)`.
     pub(crate) fn run_starting_at(&self, offset: u64) -> Option<(u64, u64)> {
         let index = self
