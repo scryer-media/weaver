@@ -2783,6 +2783,9 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         Rearm(crate::pipeline::DirectRearmDone),
         Barrier(crate::pipeline::DirectBarrierDone),
     }
+    // PAR3 jobs whose idle coordinator has already been offered a completion
+    // check by this call.
+    let mut republished = HashSet::new();
     loop {
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
@@ -2830,12 +2833,35 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         let post_repair_pending = !pipeline.direct_post_repair_in_flight.is_empty();
         let tolerated_pending = !pipeline.direct_tolerated_in_flight.is_empty();
         let demotion_pending = !pipeline.direct_demotion_in_flight.is_empty();
+        // A write that lands after the queue drained leaves a PAR3 source
+        // withdrawn with no worker out: nothing will hand back, and the
+        // completion check the download worker schedules at the drain is what
+        // republishes it. Run that check once here; a coordinator still idle
+        // after it is waiting on its caller, not on a ticket.
+        let idle: Vec<JobId> = pipeline
+            .par3_runtime
+            .as_ref()
+            .map(|coordinator| {
+                pipeline
+                    .jobs
+                    .keys()
+                    .copied()
+                    .filter(|job_id| {
+                        coordinator.has_work(*job_id) && !coordinator.has_worker_in_flight(*job_id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(job_id) = idle.iter().copied().find(|job_id| republished.insert(*job_id)) {
+            pipeline.check_job_completion(job_id).await;
+            continue;
+        }
         let par2_analysis_pending = !pipeline.par2_analysis_in_flight.is_empty()
             || pipeline.par3_runtime.as_ref().is_some_and(|coordinator| {
                 pipeline
                     .jobs
                     .keys()
-                    .any(|job_id| coordinator.has_work(*job_id))
+                    .any(|job_id| coordinator.has_work(*job_id) && !idle.contains(job_id))
             });
         let rearm_pending = !pipeline.direct_rearm_in_flight.is_empty();
         let barrier_pending = !pipeline.direct_barrier_flights.is_empty();
