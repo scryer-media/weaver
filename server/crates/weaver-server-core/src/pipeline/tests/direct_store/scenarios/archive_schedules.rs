@@ -1329,40 +1329,6 @@ impl Format {
     }
 }
 
-/// KNOWN DEFECT: a clean verification renames an obfuscated volume to its
-/// described name, then applies the placement plan scanned before that rename,
-/// which moves the same file again and fails the job on the missing source.
-/// An obfuscated RAR5 set escapes it only because every volume is rebound by
-/// its own headers before verification. Holds exactly that failure, and only
-/// for the obfuscated sets that reach it.
-pub(super) fn held_obfuscated_placement(outcome: &Outcome) -> bool {
-    let held = matches!(
-        &outcome.status,
-        Some(JobStatus::Failed { error })
-            if error.contains("placement normalization failed: ")
-                && error.ends_with("(os error 2)")
-    );
-    if held {
-        eprintln!("KNOWN DEFECT held: obfuscated placement replayed a done rename");
-    }
-    held
-}
-
-/// KNOWN DEFECT: an obfuscated RAR4 set that loses its first volume's
-/// offset-zero article binds its second volume as the first, repairs the real
-/// first beside it, and delivers the damaged original as an unprotected file.
-/// Holds exactly that stray posted volume, so every other check still runs.
-fn hold_stray_obfuscated_volume(outcome: &mut Outcome, volumes: &[(String, Vec<u8>)]) {
-    if outcome.status != Some(JobStatus::Complete) {
-        return;
-    }
-    for (posted, _) in volumes {
-        if outcome.published.remove(posted) {
-            eprintln!("KNOWN DEFECT held: delivered the damaged obfuscated volume {posted}");
-        }
-    }
-}
-
 async fn campaign(format: Format, selection: Selection) {
     profile_campaign(format, selection, ExtractionProfile::DirectStore).await;
 }
@@ -1476,10 +1442,7 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
         Interruption::None,
     )
     .await;
-    let held = |outcome: &Outcome| {
-        matches!(format, Format::Rar4Obfuscated) && held_obfuscated_placement(outcome)
-    };
-    if !held(&baseline) {
+    {
         assert_eq!(baseline.status, Some(JobStatus::Complete));
         ExtractionProfile::Conventional.assert_route(&baseline);
         assert!(
@@ -1511,7 +1474,7 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
             .await;
         if encrypted {
             profile.assert_rejected(&outcome, &[name]);
-        } else if !held(&outcome) {
+        } else {
             assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
             profile.assert_delivery(&outcome, format.route(), &[name], interruption);
             assert_eq!(outcome.files[name].as_deref(), Some(payload.as_slice()));
@@ -1524,7 +1487,7 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
         eprintln!(
             "{format:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        let mut actual = run_described_schedule(
+        let actual = run_described_schedule(
             profile,
             spec.clone(),
             &volumes,
@@ -1538,12 +1501,8 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
             profile.assert_rejected(&actual, &[name]);
             continue;
         }
-        if held(&actual) {
-            continue;
-        }
         let mut route = format.route();
         if matches!(format, Format::Rar4Obfuscated) {
-            hold_stray_obfuscated_volume(&mut actual, &volumes);
             // A RAR4 volume says nothing of its set in its own headers, so a
             // recovery set that arrives last finds every volume already landed.
             if interruption.loss().is_some_and(|(_, first)| !first) {

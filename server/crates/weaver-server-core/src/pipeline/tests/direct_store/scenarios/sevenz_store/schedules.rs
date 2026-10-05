@@ -1,48 +1,26 @@
 //! Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    ExtractionProfile, Interruption, Outcome, Route, Selection, combined_campaign,
-    held_obfuscated_placement, run_described_schedule, selected_schedules,
-    wrong_password_schedules,
+    ExtractionProfile, Interruption, Route, Selection, combined_campaign,
+    run_described_schedule, selected_schedules, wrong_password_schedules,
 };
 use super::*;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
 
 mod extended;
 
-/// KNOWN DEFECT: when a repair has already written an obfuscated 7z volume
-/// under its described name, renaming the damaged original to that name lands
-/// on a duplicate name instead, and the set, still keyed by the obfuscated
-/// name, then finds no 7z volume and fails the job. Which file the set opens
-/// is not settled by the schedule alone: it may instead read the damaged
-/// original and fail on its header checksum. Holds exactly those failures.
-fn held_duplicate_rename(outcome: &Outcome) -> bool {
-    let held = matches!(
-        &outcome.status,
-        Some(JobStatus::Failed { error })
-            if error == "failed to read 7z archive: NextHeaderCrcMismatch"
-                || error.strip_prefix("no 7z files found for set '").is_some_and(|set| {
-                    set.len() == 33
-                        && set.ends_with('\'')
-                        && set[..32].bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-    );
-    if held {
-        eprintln!("KNOWN DEFECT held: obfuscated 7z volume renamed to a duplicate name");
-    }
-    held
-}
-
-/// KNOWN DEFECT: an obfuscated 7z set that loses every volume's offset-zero
-/// article is repaired and renamed to its described names, and the job then
-/// completes with those volumes as its output instead of extracting them.
-/// Holds exactly that output.
-fn held_unextracted_volumes(outcome: &Outcome, described: &[String]) -> bool {
-    let held = outcome.status == Some(JobStatus::Complete)
-        && outcome.published.iter().eq(described.iter());
-    if held {
-        eprintln!("KNOWN DEFECT held: obfuscated 7z volumes delivered unextracted");
-    }
-    held
+/// Bytes in which no slice recurs. A recovery set mends a lost slice from any
+/// copy of it elsewhere in the set, so a payload that repeats survives a loss
+/// the set carries no recovery data for.
+fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 56) as u8
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,14 +58,11 @@ async fn conventional_campaign(shape: Shape, selection: Selection) {
 async fn profile_campaign(shape: Shape, selection: Selection, profile: ExtractionProfile) {
     // A described volume is bound by the fingerprint of its first 16 KiB,
     // which its offset-zero article has to cover whole.
-    let first = payload(
-        13,
-        if matches!(shape, Shape::CopyObfuscated) {
-            70_001
-        } else {
-            6001
-        },
-    );
+    let first = if matches!(shape, Shape::CopyObfuscated) {
+        unrepeated_payload(13, 70_001)
+    } else {
+        payload(13, 6001)
+    };
     let second = payload(29, 307);
     let name = if matches!(shape, Shape::Nested) {
         "nested/feature.mkv"
@@ -226,14 +201,6 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         },
         _ => unreachable!("{shape:?} is direct-compatible"),
     };
-    let held = |outcome: &_| {
-        matches!(shape, Shape::CopyObfuscated)
-            && (held_obfuscated_placement(outcome)
-                || held_duplicate_rename(outcome)
-                || described
-                    .as_deref()
-                    .is_some_and(|names| held_unextracted_volumes(outcome, names)))
-    };
     // A password the archive does not open with. An archive that needs none
     // must not notice it.
     for (order, interruption) in wrong_password_schedules(selection) {
@@ -257,7 +224,7 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         .await;
         if password.is_some() {
             profile.assert_rejected(&outcome, &wanted);
-        } else if !held(&outcome) {
+        } else {
             assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
             profile.assert_delivery(&outcome, route, &wanted, interruption);
             for (name, bytes) in &expected {
@@ -275,24 +242,6 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         eprintln!(
             "{shape:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        // KNOWN DEFECT: an obfuscated 7z set that loses the first volume's
-        // tail article and the second volume's offset-zero article, whatever
-        // else it loses, can settle
-        // only after minutes of wall clock, where every other schedule settles
-        // at once. Whether it stalls depends on real time, so the schedule is
-        // not run.
-        if matches!(shape, Shape::CopyObfuscated)
-            && matches!(
-                interruption,
-                Interruption::Loss { mask, .. }
-                    | Interruption::Combined { mask, .. }
-                    | Interruption::Starved { mask }
-                    if mask & 0b0110 == 0b0110
-            )
-        {
-            eprintln!("KNOWN DEFECT held: obfuscated 7z set stalls on wall clock");
-            continue;
-        }
         let outcome = run_described_schedule(
             profile,
             spec.clone(),
@@ -304,22 +253,7 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         )
         .await;
         if interruption.fails() {
-            // KNOWN DEFECT: an obfuscated 7z set whose recovery set cannot
-            // mend a withheld article still completes, with output that
-            // matches the oracle. Holds exactly that outcome.
-            if matches!(shape, Shape::CopyObfuscated)
-                && outcome.status == Some(JobStatus::Complete)
-                && expected.iter().all(|(name, bytes)| {
-                    outcome.files.get(*name).and_then(Option::as_deref) == Some(bytes.as_slice())
-                })
-            {
-                eprintln!("KNOWN DEFECT held: starved obfuscated 7z set completed");
-                continue;
-            }
             profile.assert_rejected(&outcome, &wanted);
-            continue;
-        }
-        if held(&outcome) {
             continue;
         }
         assert_eq!(
