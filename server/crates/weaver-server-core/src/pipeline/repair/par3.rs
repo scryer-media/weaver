@@ -1033,12 +1033,21 @@ impl Pipeline {
                 .insert((job_id, set_index));
             return Ok(());
         }
+        // A held ordinal is on disk whether its article was placed this run or
+        // a demotion handback rebuilt it. One with neither was held by a
+        // completed-file restore, which keeps no placements; a duplicate of
+        // its article placed later must not shrink the file to that one range.
         let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        let mut held_unplaced = false;
         for segment in 0..file.total_segments() {
             if !file.has_segment(segment) {
                 continue;
             }
-            let Some((offset, len)) = file.placement_of(segment) else {
+            let Some((offset, len)) = file
+                .placement_of(segment)
+                .or_else(|| file.reconstructed_placement_of(segment))
+            else {
+                held_unplaced = true;
                 continue;
             };
             if len == 0 {
@@ -1117,6 +1126,7 @@ impl Pipeline {
         let complete_disk_image = file.is_complete()
             && virtual_volume.is_none()
             && (ranges.is_empty()
+                || held_unplaced
                 || self
                     .par3_runtime
                     .as_ref()
