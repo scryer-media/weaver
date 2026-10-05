@@ -511,6 +511,7 @@ impl Pipeline {
             posted_name_disagreement_logged: HashSet::new(),
             par2_verified: HashSet::new(),
             par2_joined_split_sets: HashMap::new(),
+            par2_unposted_outputs: HashMap::new(),
             par2_pre_repair_dir_entries: HashMap::new(),
             sfv_checked: HashSet::new(),
             jobs_with_verification_outcome: HashSet::new(),

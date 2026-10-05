@@ -1057,6 +1057,19 @@ pub(super) struct Par2SetSummary {
 }
 
 #[derive(Default)]
+pub(super) struct Par2UnpostedOutputs {
+    /// Described names a verdict proved complete on disk while no posted file
+    /// bound to them. A posting whose files carry no usable name reaches the
+    /// job this way: the recovery set rebuilds the described file beside a
+    /// posted one it cannot identify.
+    pub(super) outputs: HashSet<String>,
+    /// Posted files holding a slice of one of those outputs at the offset the
+    /// set describes it. Each is the damaged copy of a file the verdict has
+    /// since delivered whole, so it is a spent input rather than payload.
+    pub(super) superseded: HashSet<NzbFileId>,
+}
+
+#[derive(Default)]
 pub(super) struct Par2SetRuntime {
     /// The parsed recovery set. `None` until an index of this set was parsed.
     pub(super) set: Option<Arc<Par2FileSet>>,
@@ -3119,6 +3132,9 @@ pub struct Pipeline {
     /// is retired here, and the parts it names become consumed inputs rather
     /// than payload the job is still short of.
     pub(super) par2_joined_split_sets: HashMap<JobId, HashMap<String, HashSet<String>>>,
+    /// What a recovery verdict put on disk that no posted file answers to, and
+    /// the posted files proven to be the damaged copies it was built from.
+    pub(super) par2_unposted_outputs: HashMap<JobId, Par2UnpostedOutputs>,
     /// Working-directory entry names as they stood immediately before a repair
     /// ran, per job.
     ///
