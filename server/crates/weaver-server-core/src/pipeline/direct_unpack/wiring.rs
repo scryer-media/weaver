@@ -1217,6 +1217,10 @@ impl Pipeline {
             }
             if let Some(len) = self.direct_unpack_known_part_len(job_id, path) {
                 coverage.note_part_len(index, len);
+                // A rebuilt part has no download floor to read: it is whole.
+                if self.direct_unpack_file_id_for_part(job_id, path).is_none() {
+                    coverage.advance_watermark(index, len);
+                }
                 coverage.mark_part_complete(index);
                 // A part that finished *before* the set armed never sees the
                 // completion seam, so without this its damage would go
@@ -1721,11 +1725,28 @@ impl Pipeline {
     fn direct_unpack_known_part_len(&self, job_id: JobId, path: &std::path::Path) -> Option<u64> {
         let filename = path.file_name()?.to_str()?;
         let state = self.jobs.get(&job_id)?;
-        let file = state
+        let Some(file) = state
             .assembly
             .files()
-            .find(|file| self.current_filename_for_file(job_id, file) == filename)?;
+            .find(|file| self.current_filename_for_file(job_id, file) == filename)
+        else {
+            return self.direct_unpack_rebuilt_part_len(job_id, path);
+        };
         file.is_complete().then(|| file.received_bytes())
+    }
+
+    /// The length of a part no posted file owns: one the recovery set wrote
+    /// under its described name and a verdict then proved complete. It has no
+    /// download to finish, so the file on disk is the whole of it.
+    fn direct_unpack_rebuilt_part_len(&self, job_id: JobId, path: &std::path::Path) -> Option<u64> {
+        let filename = path.file_name()?.to_str()?;
+        self.par2_unposted_outputs
+            .get(&job_id)
+            .is_some_and(|unposted| unposted.outputs.contains(filename))
+            .then(|| std::fs::metadata(path).ok())
+            .flatten()
+            .filter(std::fs::Metadata::is_file)
+            .map(|meta| meta.len())
     }
 
     #[allow(clippy::too_many_arguments)]

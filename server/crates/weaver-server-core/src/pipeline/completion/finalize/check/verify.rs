@@ -918,6 +918,35 @@ impl Pipeline {
             if identity.current_filename == *verified_filename {
                 continue;
             }
+            // The verdict's file is this entry's bytes from here on. A repair
+            // that rebuilt it beside a posted copy it could not use in place
+            // leaves that copy under the old name, owned by nothing once the
+            // entry moves — and the final move ships whatever the directory
+            // holds. It is the spent input of the file just proven whole.
+            let Some(working_dir) = self.jobs.get(&job_id).map(|state| &state.working_dir) else {
+                continue;
+            };
+            let spent = working_dir.join(&identity.current_filename);
+            let verified = working_dir.join(verified_filename);
+            if !crate::runtime::fs::paths_equivalent_for_placement(&spent, &verified)
+                && verified.is_file()
+                && spent.is_file()
+            {
+                match std::fs::remove_file(&spent) {
+                    Ok(()) => info!(
+                        job_id = job_id.0,
+                        spent = %identity.current_filename,
+                        verified = %verified_filename,
+                        "removed the posted copy a repaired output replaced"
+                    ),
+                    Err(error) => warn!(
+                        job_id = job_id.0,
+                        file = %spent.display(),
+                        error = %error,
+                        "failed to remove the posted copy a repaired output replaced"
+                    ),
+                }
+            }
             identity.current_filename = verified_filename.clone();
             identity.canonical_filename = Some(verified_filename.clone());
             if let Some(classification) =

@@ -1329,15 +1329,45 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(false);
         };
-        let Some(topology_name) = state
+        let known = state
             .assembly
             .archive_topologies()
             .iter()
             .find(|(name, topology)| {
                 topology.archive_type == archive_type && sanitize_download_filename(name) == set_key
             })
-            .map(|(name, _)| name.clone())
-        else {
+            .map(|(name, _)| name.clone());
+        let topology_name = match known {
+            Some(name) => name,
+            // A 7z set none of whose posted volumes could be named has no
+            // roster at all, and its rebuilt volumes would be delivered as
+            // they stand. The first one adopted opens the roster the rest
+            // join.
+            None if archive_type == crate::jobs::assembly::ArchiveType::SevenZip => {
+                let Some(state) = self.jobs.get_mut(&job_id) else {
+                    return Ok(false);
+                };
+                state.assembly.set_archive_topology(
+                    set_name.clone(),
+                    crate::jobs::assembly::ArchiveTopology {
+                        archive_type,
+                        volume_map: std::collections::HashMap::new(),
+                        complete_volumes: std::collections::HashSet::new(),
+                        expected_volume_count: None,
+                        members: vec![crate::jobs::assembly::ArchiveMember {
+                            name: set_name.clone(),
+                            first_volume: 0,
+                            last_volume: 0,
+                            unpacked_size: 0,
+                        }],
+                        unresolved_spans: vec![],
+                    },
+                );
+                set_name.clone()
+            }
+            None => return Ok(false),
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
             return Ok(false);
         };
         let already_listed = state
@@ -1371,6 +1401,20 @@ impl Pipeline {
         };
         topology.volume_map.insert(filename.to_string(), number);
         topology.complete_volumes.insert(number);
+        // On record before anything arms against the set: a chase reads a
+        // part's length from its download, and this part never had one.
+        self.par2_unposted_outputs
+            .entry(job_id)
+            .or_default()
+            .outputs
+            .insert(filename.to_string());
+        let Some(topology) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for_mut(&topology_name))
+        else {
+            return Ok(false);
+        };
         let expected = topology
             .expected_volume_count
             .map_or(number.saturating_add(1), |expected| {

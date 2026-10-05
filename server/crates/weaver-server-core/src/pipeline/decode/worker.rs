@@ -3903,6 +3903,17 @@ impl Pipeline {
                         let final_verified = file.is_some_and(|file| file.final_part_verified());
                         let disk_len = match tokio::fs::metadata(file_path).await {
                             Ok(metadata) => metadata.len(),
+                            // A copy committed behind the arrival that
+                            // completed the file finds it finalized already
+                            // and moved to its described name. That
+                            // finalization answered for the file, and the
+                            // copy has nothing to add to it.
+                            Err(error)
+                                if was_duplicate
+                                    && error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                return;
+                            }
                             Err(error) => {
                                 self.fail_job_for_disk_write(
                                     SegmentWriteError::new(file_id, error),

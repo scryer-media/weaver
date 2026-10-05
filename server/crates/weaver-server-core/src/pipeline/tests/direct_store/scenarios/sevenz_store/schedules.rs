@@ -1,10 +1,27 @@
 //! Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    ExtractionProfile, Interruption, Route, Selection, combined_campaign, run_profile_schedule,
-    selected_schedules, wrong_password_schedules,
+    ExtractionProfile, Interruption, Route, Selection, combined_campaign,
+    run_described_schedule, selected_schedules, wrong_password_schedules,
 };
 use super::*;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
+
+mod extended;
+
+/// Bytes in which no slice recurs. A recovery set mends a lost slice from any
+/// copy of it elsewhere in the set, so a payload that repeats survives a loss
+/// the set carries no recovery data for.
+fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 56) as u8
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Shape {
@@ -21,6 +38,9 @@ enum Shape {
     Solid,
     SolidEncrypted,
     SolidHeaders,
+    /// Volume names that say nothing. The recovery set carries the real
+    /// names, as an obfuscated post's does.
+    CopyObfuscated,
 }
 
 async fn campaign(shape: Shape, selection: Selection) {
@@ -36,7 +56,13 @@ async fn conventional_campaign(shape: Shape, selection: Selection) {
 }
 
 async fn profile_campaign(shape: Shape, selection: Selection, profile: ExtractionProfile) {
-    let first = payload(13, 6001);
+    // A described volume is bound by the fingerprint of its first 16 KiB,
+    // which its offset-zero article has to cover whole.
+    let first = if matches!(shape, Shape::CopyObfuscated) {
+        unrepeated_payload(13, 70_001)
+    } else {
+        payload(13, 6001)
+    };
     let second = payload(29, 307);
     let name = if matches!(shape, Shape::Nested) {
         "nested/feature.mkv"
@@ -116,6 +142,12 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         2
     };
     let volumes = split_volumes(&archive, count);
+    let (volumes, described) = if matches!(shape, Shape::CopyObfuscated) {
+        let described = volumes.iter().map(|(name, _)| name.clone()).collect();
+        (obfuscate_volumes(&volumes), Some(described))
+    } else {
+        (volumes, None::<Vec<String>>)
+    };
     let mut spec = sevenz_job_spec(&volumes, 4 / count);
     spec.password = password.map(str::to_owned);
     let wanted = expected.keys().copied().collect::<Vec<_>>();
@@ -140,6 +172,13 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
             ..Route::refused(|reason| {
                 matches!(reason, DemotionReason::SevenZip(SevenZipRefusal::Coder))
             })
+        },
+        // The recovery set's descriptions admit RAR volumes only, so an
+        // obfuscated 7z set is never admitted and nothing in it routes
+        // direct: it extracts from the volumes once they carry their names.
+        Shape::CopyObfuscated => Route {
+            unmapped_loss,
+            ..Route::refused(|_| false)
         },
         // Ciphertext is not the member's bytes either, and a header that is
         // itself encrypted hides the layout.
@@ -173,8 +212,16 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         eprintln!(
             "wrong password {shape:?} profile={profile:?} order={order:?} interruption={interruption:?}"
         );
-        let outcome =
-            run_profile_schedule(profile, wrong, &volumes, &order, &wanted, interruption).await;
+        let outcome = run_described_schedule(
+            profile,
+            wrong,
+            &volumes,
+            described.as_deref(),
+            &order,
+            &wanted,
+            interruption,
+        )
+        .await;
         if password.is_some() {
             profile.assert_rejected(&outcome, &wanted);
         } else {
@@ -195,10 +242,11 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         eprintln!(
             "{shape:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        let outcome = run_profile_schedule(
+        let outcome = run_described_schedule(
             profile,
             spec.clone(),
             &volumes,
+            described.as_deref(),
             &order,
             &wanted,
             interruption,

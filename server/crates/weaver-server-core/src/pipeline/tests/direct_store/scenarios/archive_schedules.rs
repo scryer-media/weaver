@@ -769,7 +769,10 @@ async fn deliver_schedule_refetches(
     mask: u8,
     recovery: &[ScheduleRecovery],
 ) {
-    let state = pipeline.jobs.get_mut(&job).unwrap();
+    // A job that failed while the queues settled has already been retired.
+    let Some(state) = pipeline.jobs.get_mut(&job) else {
+        return;
+    };
     let mut available = Vec::new();
     for queue in [&mut state.download_queue, &mut state.recovery_queue] {
         for work in queue.drain_all() {
@@ -1524,6 +1527,7 @@ enum Format {
     /// Volume names that say nothing. The recovery set carries the real
     /// names, as an obfuscated post's does, and the set is admitted by them.
     Rar5Obfuscated,
+    Rar4Obfuscated,
 }
 
 impl Format {
@@ -1548,7 +1552,7 @@ impl Format {
             | Self::Rar5EncryptedHeaders
             | Self::QuickOpen => Route::DIRECT,
             // Slots 0 and 2 are the two volumes' offset-zero articles.
-            Self::Rar5Obfuscated => Route {
+            Self::Rar5Obfuscated | Self::Rar4Obfuscated => Route {
                 unnamed_loss: |mask| mask & 0b0101 != 0,
                 ..Route::DIRECT
             },
@@ -1615,7 +1619,7 @@ async fn slot_campaign(
         // A described volume is bound by the fingerprint of its first 16 KiB,
         // which its offset-zero article has to cover whole, as every real
         // article does. Two articles a volume puts that at 32 KiB a volume.
-        Format::Rar5Obfuscated => 70_001,
+        Format::Rar5Obfuscated | Format::Rar4Obfuscated => 70_001,
         _ => 6001,
     };
     let payload: Vec<u8> = (0..length)
@@ -1628,6 +1632,9 @@ async fn slot_campaign(
         }
         Format::Rar5 | Format::Rar5FourVolumes => single_member_store_set(name, &payload, count),
         Format::Rar5Obfuscated => obfuscate_volumes(&single_member_store_set(name, &payload, 2)),
+        Format::Rar4Obfuscated => {
+            obfuscate_volumes(&single_member_rar4_store_set(name, &payload, 2))
+        }
         Format::Rar4Encrypted | Format::Rar4EncryptedFourVolumes => {
             encrypted_rar4_store_set(name, &payload, count, password, Some(TEST_RAR4_SALT))
         }
@@ -1671,8 +1678,13 @@ async fn slot_campaign(
             .unwrap();
         assert_eq!(extracted, payload);
     }
-    let described = matches!(format, Format::Rar5Obfuscated).then(|| {
-        single_member_store_set(name, &payload, 2)
+    let described = match format {
+        Format::Rar5Obfuscated => Some(single_member_store_set(name, &payload, 2)),
+        Format::Rar4Obfuscated => Some(single_member_rar4_store_set(name, &payload, 2)),
+        _ => None,
+    }
+    .map(|volumes| {
+        volumes
             .into_iter()
             .map(|(name, _)| name)
             .collect::<Vec<_>>()
@@ -1708,12 +1720,14 @@ async fn slot_campaign(
         Interruption::None,
     )
     .await;
-    assert_eq!(baseline.status, Some(JobStatus::Complete));
-    ExtractionProfile::Conventional.assert_route(&baseline);
-    assert!(
-        baseline.files[name].as_deref() == Some(payload.as_slice()),
-        "conventional oracle {format:?}"
-    );
+    {
+        assert_eq!(baseline.status, Some(JobStatus::Complete));
+        ExtractionProfile::Conventional.assert_route(&baseline);
+        assert!(
+            baseline.files[name].as_deref() == Some(payload.as_slice()),
+            "conventional oracle {format:?}"
+        );
+    }
     // A password the archive does not open with. An archive that needs none
     // must not notice it.
     for (order, interruption) in wrong_password {
@@ -1768,13 +1782,21 @@ async fn slot_campaign(
             profile.assert_rejected(&actual, &[name]);
             continue;
         }
+        let mut route = format.route();
+        if matches!(format, Format::Rar4Obfuscated) {
+            // A RAR4 volume says nothing of its set in its own headers, so a
+            // recovery set that arrives last finds every volume already landed.
+            if interruption.loss().is_some_and(|(_, first)| !first) {
+                route.unnamed_loss = |_| true;
+            }
+        }
         assert_eq!(
             actual.status,
             Some(JobStatus::Complete),
             "{format:?} case={case} order={order:?} interruption={interruption:?} trace={:?}",
             actual.trace
         );
-        profile.assert_delivery(&actual, format.route(), &[name], interruption);
+        profile.assert_delivery(&actual, route, &[name], interruption);
         // A duplicate can invalidate an already-running RAR chase. Clean
         // unique arrivals must consume chase; duplicate schedules still must
         // admit it and produce the same verified output through safe fallback.
@@ -1995,6 +2017,24 @@ enum CompressedFormat {
     Rar5LzTwoVolumes,
     Rar4LzFourVolumes,
     Rar5LzFourVolumes,
+    // A solid stream continued across every volume, with members after the
+    // spanning one; and data or headers encrypted across every volume.
+    Rar4SolidTwoVolumes,
+    Rar5SolidTwoVolumes,
+    Rar4SolidFourVolumes,
+    Rar5SolidFourVolumes,
+    Rar4EncryptedTwoVolumes,
+    Rar5EncryptedTwoVolumes,
+    Rar4EncryptedFourVolumes,
+    Rar5EncryptedFourVolumes,
+    Rar4HeadersTwoVolumes,
+    Rar5HeadersTwoVolumes,
+    Rar4HeadersFourVolumes,
+    Rar5HeadersFourVolumes,
+    Rar4SolidEncryptedTwoVolumes,
+    Rar5SolidEncryptedTwoVolumes,
+    Rar4SolidEncryptedFourVolumes,
+    Rar5SolidEncryptedFourVolumes,
 }
 
 impl CompressedFormat {
@@ -2022,6 +2062,26 @@ impl CompressedFormat {
             Self::Rar5LzTwoVolumes => volumes!("rar5_lz_two", "01", "02"),
             Self::Rar4LzFourVolumes => volumes!("rar4_lz_four", "01", "02", "03", "04"),
             Self::Rar5LzFourVolumes => volumes!("rar5_lz_four", "01", "02", "03", "04"),
+            Self::Rar4SolidTwoVolumes => volumes!("rar4_solid_two", "01", "02"),
+            Self::Rar5SolidTwoVolumes => volumes!("rar5_solid_two", "01", "02"),
+            Self::Rar4SolidFourVolumes => volumes!("rar4_solid_four", "01", "02", "03", "04"),
+            Self::Rar5SolidFourVolumes => volumes!("rar5_solid_four", "01", "02", "03", "04"),
+            Self::Rar4EncryptedTwoVolumes => volumes!("rar4_enc_two", "01", "02"),
+            Self::Rar5EncryptedTwoVolumes => volumes!("rar5_enc_two", "01", "02"),
+            Self::Rar4EncryptedFourVolumes => volumes!("rar4_enc_four", "01", "02", "03", "04"),
+            Self::Rar5EncryptedFourVolumes => volumes!("rar5_enc_four", "01", "02", "03", "04"),
+            Self::Rar4HeadersTwoVolumes => volumes!("rar4_hp_two", "01", "02"),
+            Self::Rar5HeadersTwoVolumes => volumes!("rar5_hp_two", "01", "02"),
+            Self::Rar4HeadersFourVolumes => volumes!("rar4_hp_four", "01", "02", "03", "04"),
+            Self::Rar5HeadersFourVolumes => volumes!("rar5_hp_four", "01", "02", "03", "04"),
+            Self::Rar4SolidEncryptedTwoVolumes => volumes!("rar4_solid_enc_two", "01", "02"),
+            Self::Rar5SolidEncryptedTwoVolumes => volumes!("rar5_solid_enc_two", "01", "02"),
+            Self::Rar4SolidEncryptedFourVolumes => {
+                volumes!("rar4_solid_enc_four", "01", "02", "03", "04")
+            }
+            Self::Rar5SolidEncryptedFourVolumes => {
+                volumes!("rar5_solid_enc_four", "01", "02", "03", "04")
+            }
             _ => None,
         }
     }
@@ -2065,13 +2125,34 @@ impl CompressedFormat {
             Self::Rar4PpmdHeaders => {
                 fixture!("rar4_solid_ppmd_headers.rar", Some("moonlit-harbour"))
             }
-            Self::Rar4Encrypted => fixture!("rar4_enc_lz.rar", Some("testpass123")),
+            // A header-encrypted set packs the member the data-encrypted one
+            // does, under the same password.
+            Self::Rar4Encrypted
+            | Self::Rar4EncryptedTwoVolumes
+            | Self::Rar4EncryptedFourVolumes
+            | Self::Rar4HeadersTwoVolumes
+            | Self::Rar4HeadersFourVolumes => fixture!("rar4_enc_lz.rar", Some("testpass123")),
             Self::Rar4Headers => fixture!("rar4_hp_lz.rar", Some("secretpass")),
             Self::Rar5Mixed => fixture!("rar5_multifile_lz.rar", None),
             Self::Rar5Lz | Self::Rar5LzTwoVolumes | Self::Rar5LzFourVolumes => {
                 fixture!("rar5_lz.rar", None)
             }
-            Self::Rar5Encrypted => fixture!("rar5_enc_lz.rar", Some("testpass123")),
+            Self::Rar5Encrypted
+            | Self::Rar5EncryptedTwoVolumes
+            | Self::Rar5EncryptedFourVolumes
+            | Self::Rar5HeadersTwoVolumes
+            | Self::Rar5HeadersFourVolumes => fixture!("rar5_enc_lz.rar", Some("testpass123")),
+            // The members decode the same from either format's archive.
+            Self::Rar4SolidTwoVolumes
+            | Self::Rar5SolidTwoVolumes
+            | Self::Rar4SolidFourVolumes
+            | Self::Rar5SolidFourVolumes => fixture!("rar5_solid_text.rar", None),
+            Self::Rar4SolidEncryptedTwoVolumes
+            | Self::Rar5SolidEncryptedTwoVolumes
+            | Self::Rar4SolidEncryptedFourVolumes
+            | Self::Rar5SolidEncryptedFourVolumes => {
+                fixture!("rar5_solid_text_encrypted.rar", Some("moonlit-harbour"))
+            }
             Self::Rar5Headers => fixture!("rar5_hp_lz.rar", Some("secretpass")),
             Self::Rar5Solid => fixture!("rar5_solid_small.rar", None),
             Self::Rar5SolidEncrypted => {
@@ -2103,20 +2184,38 @@ impl CompressedFormat {
             | Self::Rar5LzFourVolumes => {
                 Route::refused(|reason| matches!(reason, MemberIneligible(Compressed)))
             }
-            Self::Rar4Solid | Self::Rar4Ppmd | Self::Rar5Solid => Route::refused(|reason| {
+            Self::Rar4Solid
+            | Self::Rar4Ppmd
+            | Self::Rar5Solid
+            | Self::Rar4SolidTwoVolumes
+            | Self::Rar5SolidTwoVolumes
+            | Self::Rar4SolidFourVolumes
+            | Self::Rar5SolidFourVolumes => Route::refused(|reason| {
                 matches!(reason, MemberIneligible(Compressed | Solid))
             }),
             Self::Rar4Encrypted
             | Self::Rar4SolidEncrypted
             | Self::Rar4PpmdEncrypted
             | Self::Rar5Encrypted
-            | Self::Rar5SolidEncrypted => Route::refused(|reason| {
+            | Self::Rar5SolidEncrypted
+            | Self::Rar4EncryptedTwoVolumes
+            | Self::Rar5EncryptedTwoVolumes
+            | Self::Rar4EncryptedFourVolumes
+            | Self::Rar5EncryptedFourVolumes
+            | Self::Rar4SolidEncryptedTwoVolumes
+            | Self::Rar5SolidEncryptedTwoVolumes
+            | Self::Rar4SolidEncryptedFourVolumes
+            | Self::Rar5SolidEncryptedFourVolumes => Route::refused(|reason| {
                 matches!(reason, MemberIneligible(Compressed | Solid | Encrypted))
             }),
             Self::Rar4Headers
             | Self::Rar4SolidHeaders
             | Self::Rar4PpmdHeaders
             | Self::Rar5Headers
+            | Self::Rar4HeadersTwoVolumes
+            | Self::Rar5HeadersTwoVolumes
+            | Self::Rar4HeadersFourVolumes
+            | Self::Rar5HeadersFourVolumes
             // Headers that open with the password refuse the member they
             // describe, which is itself encrypted.
             | Self::Rar5SolidHeaders => Route::refused(|reason| {
