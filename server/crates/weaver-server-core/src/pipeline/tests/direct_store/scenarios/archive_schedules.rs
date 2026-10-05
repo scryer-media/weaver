@@ -5,6 +5,7 @@
 use super::*;
 use crate::pipeline::direct_store::router::MemberIneligibility;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
+use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason as ChaseDemotion};
 
 fn enable_schedule_trace() {
     if std::env::var_os("WEAVER_ARCHIVE_SCHEDULE_TRACE").is_none() {
@@ -670,7 +671,7 @@ async fn deliver_schedule_refetches(
     volumes: &[(String, Vec<u8>)],
     articles: usize,
     mask: u8,
-    recovery: Option<&(u32, Vec<u8>)>,
+    recovery: &[ScheduleRecovery],
 ) {
     let state = pipeline.jobs.get_mut(&job).unwrap();
     let mut available = Vec::new();
@@ -680,7 +681,7 @@ async fn deliver_schedule_refetches(
             let article = work.segment_id.segment_number;
             if (file < volumes.len() as u32
                 && mask & (1 << (file * articles as u32 + article)) == 0)
-                || recovery.is_some_and(|(index, _)| file == *index)
+                || recovery.iter().any(|carrier| carrier.index == file)
             {
                 if !available.contains(&(file, article)) {
                     available.push((file, article));
@@ -695,19 +696,60 @@ async fn deliver_schedule_refetches(
         if file < volumes.len() as u32 {
             deliver_schedule_article(pipeline, job, volumes, file, article, articles).await;
         } else {
-            let (index, bytes) = recovery.expect("queued recovery has fixture bytes");
-            retire_schedule_article(pipeline, job, *index, article);
+            let carrier = recovery
+                .iter()
+                .find(|carrier| carrier.index == file)
+                .expect("queued recovery has fixture bytes");
+            submit_schedule_recovery(pipeline, job, carrier, article).await;
+        }
+    }
+}
+
+/// A recovery file whose bytes the schedule holds, to hand over when due.
+struct ScheduleRecovery {
+    index: u32,
+    name: String,
+    bytes: Vec<u8>,
+    format: RecoveryFormat,
+}
+
+async fn submit_schedule_recovery(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    recovery: &ScheduleRecovery,
+    article: u32,
+) {
+    retire_schedule_article(pipeline, job, recovery.index, article);
+    let file = NzbFileId {
+        job_id: job,
+        file_index: recovery.index,
+    };
+    match recovery.format {
+        RecoveryFormat::Par2 => {
             submit_decoded_segment(
                 pipeline,
-                NzbFileId {
-                    job_id: job,
-                    file_index: *index,
-                },
+                file,
                 article,
                 0,
-                bytes,
-                "silver.horizon.par2",
+                &recovery.bytes,
+                &recovery.name,
                 None,
+            )
+            .await;
+        }
+        // A carrier states its true length, as a poster's does.
+        RecoveryFormat::Par3 => {
+            submit_decoded_segment_declaring(
+                pipeline,
+                file,
+                article,
+                0,
+                &recovery.bytes,
+                &recovery.name,
+                None,
+                true,
+                None,
+                recovery.bytes.len() as u64,
             )
             .await;
         }
@@ -728,6 +770,63 @@ fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize,
     ((seed / 2) % sets.max(1), reason)
 }
 
+/// What a schedule's recovery set is authored as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RecoveryFormat {
+    /// One PAR2 file carrying the descriptions and every recovery block.
+    Par2,
+    /// A PAR3 index and its recovery volumes. The index arrives where the
+    /// PAR2 file would; a recovery volume arrives when the pipeline asks.
+    Par3,
+}
+
+/// Who a schedule's demote action claims, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DemotionChoice {
+    /// [`scheduled_demotion`] picks the set and the reason; speculative
+    /// extraction is withdrawn for good, as yielded memory.
+    Scheduled,
+    /// Every demote action claims `set` under `reason` and withdraws
+    /// speculative extraction under `chase`, latched by `latch`.
+    Fixed {
+        set: usize,
+        reason: DemotionReason,
+        chase: ChaseDemotion,
+        latch: AbortLatch,
+    },
+}
+
+impl DemotionChoice {
+    fn direct(self, order: &[(u32, u32)], step: usize, sets: usize) -> (usize, DemotionReason) {
+        match self {
+            Self::Scheduled => scheduled_demotion(order, step, sets),
+            Self::Fixed { set, reason, .. } => (set, reason),
+        }
+    }
+
+    fn chase(self) -> (AbortLatch, ChaseDemotion) {
+        match self {
+            Self::Scheduled => (AbortLatch::Permanent, ChaseDemotion::MemoryYielded),
+            Self::Fixed { chase, latch, .. } => (latch, chase),
+        }
+    }
+}
+
+/// How a schedule is driven besides its arrivals and its interruption.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ScheduleOptions {
+    pub recovery: RecoveryFormat,
+    pub demotion: DemotionChoice,
+}
+
+impl ScheduleOptions {
+    /// What every campaign of the archive matrix proper runs under.
+    pub(super) const MATRIX: Self = Self {
+        recovery: RecoveryFormat::Par2,
+        demotion: DemotionChoice::Scheduled,
+    };
+}
+
 pub(super) async fn run_profile_schedule(
     profile: ExtractionProfile,
     spec: JobSpec,
@@ -744,6 +843,31 @@ pub(super) async fn run_profile_schedule(
 /// carries the real names. Such a job always carries its index: without a
 /// loss it arrives first and holds no recovery blocks.
 pub(super) async fn run_described_schedule(
+    profile: ExtractionProfile,
+    spec: JobSpec,
+    volumes: &[(String, Vec<u8>)],
+    described: Option<&[String]>,
+    order: &[(u32, u32)],
+    wanted: &[&str],
+    interruption: Interruption,
+) -> Outcome {
+    run_schedule_with(
+        ScheduleOptions::MATRIX,
+        profile,
+        spec,
+        volumes,
+        described,
+        order,
+        wanted,
+        interruption,
+    )
+    .await
+}
+
+/// [`run_described_schedule`] under `options`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_schedule_with(
+    options: ScheduleOptions,
     profile: ExtractionProfile,
     mut spec: JobSpec,
     volumes: &[(String, Vec<u8>)],
@@ -812,31 +936,47 @@ pub(super) async fn run_described_schedule(
         } else {
             blocks
         };
-        let bytes = build_test_par2_with_recovery(&described, slice as u64, blocks);
-        let index = append_par2_index(&mut spec, &bytes);
-        Some((index, bytes))
+        match options.recovery {
+            RecoveryFormat::Par2 => {
+                let bytes = build_test_par2_with_recovery(&described, slice as u64, blocks);
+                let index = append_par2_index(&mut spec, &bytes);
+                vec![ScheduleRecovery {
+                    index,
+                    name: "silver.horizon.par2".to_string(),
+                    bytes,
+                    format: RecoveryFormat::Par2,
+                }]
+            }
+            RecoveryFormat::Par3 => {
+                let described: Vec<_> = described
+                    .iter()
+                    .map(|(name, bytes)| (name.to_string(), bytes.to_vec()))
+                    .collect();
+                let mut carriers = par3_carriers_over(&described, slice as u64, blocks);
+                // The index leads: it is what arrives where a PAR2 file would.
+                carriers.sort_by_key(|(name, _)| name.contains(".vol"));
+                let indices = append_single_article_files(&mut spec, &carriers);
+                indices
+                    .into_iter()
+                    .zip(carriers)
+                    .map(|(index, (name, bytes))| ScheduleRecovery {
+                        index,
+                        name,
+                        bytes,
+                        format: RecoveryFormat::Par3,
+                    })
+                    .collect()
+            }
+        }
     } else {
-        None
+        Vec::new()
     };
     insert_active_job(&mut pipeline, job, spec.clone()).await;
     let mut trace = vec![];
-    if let Some((index, bytes)) = recovery.as_ref()
+    if let Some(index) = recovery.first()
         && index_first
     {
-        retire_schedule_article(&mut pipeline, job, *index, 0);
-        submit_decoded_segment(
-            &mut pipeline,
-            NzbFileId {
-                job_id: job,
-                file_index: *index,
-            },
-            0,
-            0,
-            bytes,
-            "silver.horizon.par2",
-            None,
-        )
-        .await;
+        submit_schedule_recovery(&mut pipeline, job, index, 0).await;
     }
     for step in 0..=order.len() {
         match interruption.action_at(step) {
@@ -844,7 +984,7 @@ pub(super) async fn run_described_schedule(
                 if profile == ExtractionProfile::DirectStore {
                     let before = pipeline.direct_store.demotions.len();
                     let sets = pipeline.direct_store.sets_for(job).len();
-                    let (set, reason) = scheduled_demotion(&order, step, sets);
+                    let (set, reason) = options.demotion.direct(&order, step, sets);
                     pipeline.demote_direct_set(job, set, reason).await;
                     if pipeline.direct_store.demotions.len() != before {
                         schedule_demoted = Some(reason);
@@ -852,14 +992,12 @@ pub(super) async fn run_described_schedule(
                 }
                 // An incompatible set may already have left direct store and
                 // started chase. Withdraw that owner at the same boundary too.
-                use crate::pipeline::direct_unpack::wiring::{
-                    AbortLatch, DemotionReason as ChaseDemotion,
-                };
+                let (latch, chase) = options.demotion.chase();
                 pipeline.direct_unpack_abort_job(
                     job,
                     "schedule withdraws speculative extraction",
-                    AbortLatch::Permanent,
-                    ChaseDemotion::MemoryYielded,
+                    latch,
+                    chase,
                 );
                 settle_direct_post_repair_work(&mut pipeline).await;
                 trace.push(format!("demote at {step}"));
@@ -1001,24 +1139,11 @@ pub(super) async fn run_described_schedule(
             pipeline.direct_store.sets_for(job)
         ));
     }
-    if let Some((index, bytes)) = recovery.as_ref()
+    if let Some(index) = recovery.first()
         && !index_first
         && retired.is_none()
     {
-        retire_schedule_article(&mut pipeline, job, *index, 0);
-        submit_decoded_segment(
-            &mut pipeline,
-            NzbFileId {
-                job_id: job,
-                file_index: *index,
-            },
-            0,
-            0,
-            bytes,
-            "silver.horizon.par2",
-            None,
-        )
-        .await;
+        submit_schedule_recovery(&mut pipeline, job, index, 0).await;
     }
     // Every wait below is for a registered operation. A demotion can request
     // more articles; service those before waiting for an extraction result.
@@ -1034,7 +1159,7 @@ pub(super) async fn run_described_schedule(
                 volumes,
                 articles,
                 mask,
-                recovery.as_ref(),
+                &recovery,
             )
             .await;
         }
@@ -1059,7 +1184,7 @@ pub(super) async fn run_described_schedule(
                     volumes,
                     articles,
                     mask,
-                    recovery.as_ref(),
+                    &recovery,
                 )
                 .await;
             } else {
@@ -1102,7 +1227,7 @@ pub(super) async fn run_described_schedule(
                 .await
                 .expect("registered extraction receipt");
             pipeline.handle_extraction_done(done).await;
-        } else if recovery.is_none() {
+        } else if recovery.is_empty() {
             panic!(
                 "archive stalled without an outstanding operation: {} trace={trace:?}",
                 debug_job_state(&pipeline, job)
