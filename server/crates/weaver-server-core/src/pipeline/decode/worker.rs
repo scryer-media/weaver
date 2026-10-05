@@ -3913,6 +3913,19 @@ impl Pipeline {
                         };
                         let safe_end = end
                             .filter(|end| disk_len == *end || (disk_len > *end && final_verified));
+                        // A copy of an article the file already held cannot
+                        // lengthen a file it lands inside, and the rewrite
+                        // withdrew the restored tiling that would have said
+                        // so. The verdict the file was completed under still
+                        // describes its length; what the copy wrote is the
+                        // whole-file re-read's question, already asked above.
+                        let safe_end = safe_end.or_else(|| {
+                            (was_duplicate
+                                && end.is_none()
+                                && file_offset.saturating_add(u64::from(decoded_size)) <= disk_len
+                                && file.is_some_and(|file| !file.requires_file_verification()))
+                            .then_some(disk_len)
+                        });
                         let Some(end) = safe_end else {
                             // A file geometry problem does not make the last
                             // verified article a failed download. Keep its

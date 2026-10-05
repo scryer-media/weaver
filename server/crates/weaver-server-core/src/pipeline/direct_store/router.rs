@@ -3018,16 +3018,43 @@ impl DirectSetRouter {
         volume_index: u32,
         limit: usize,
     ) -> Option<Vec<(u32, u64, u64)>> {
+        // The ranges whose edges matter: what this volume has routed, and the
+        // whole of every encrypted part the layout places in it. The second is
+        // what a rewrite needs when the part's own edge never routed — a hole
+        // below it kept the run behind its CBC predecessor, while the
+        // neighbour's drain decrypted the straddling block and dropped its
+        // share. The rewrite restages that edge with nothing beside it.
+        let mut ranges: Vec<(u32, u64, u64)> = self
+            .routed_extents
+            .get(&volume_index)
+            .into_iter()
+            .flatten()
+            .map(|extent| {
+                (
+                    extent.member_id,
+                    extent.logical_offset,
+                    extent.logical_offset.saturating_add(extent.len),
+                )
+            })
+            .collect();
+        for (index, member) in self.layout_members().iter().enumerate() {
+            let Some(member_id) = self.member_id_for_layout(index) else {
+                continue;
+            };
+            for part in member.parts.iter().filter(|part| part.volume == volume_index) {
+                if let Some(low) = part.logical_offset {
+                    ranges.push((member_id, low, low.saturating_add(part.data_size)));
+                }
+            }
+        }
         let mut reads = Vec::new();
-        for extent in self.routed_extents.get(&volume_index).into_iter().flatten() {
-            let Some(member) = self.members.get(&extent.member_id) else {
+        for (member_id, low, high) in ranges {
+            let Some(member) = self.members.get(&member_id) else {
                 continue;
             };
             let Some(cipher_size) = member.crypt.as_ref().and_then(MemberCrypt::cipher_size) else {
                 continue;
             };
-            let low = extent.logical_offset;
-            let high = extent.logical_offset.saturating_add(extent.len);
             for (from, to) in [
                 // One block below the straddling block: that block's own CBC
                 // predecessor, without which it cannot be decrypted. At offset
@@ -3045,19 +3072,23 @@ impl DirectSetRouter {
                     }
                     for candidate in extents
                         .iter()
-                        .filter(|candidate| candidate.member_id == extent.member_id)
+                        .filter(|candidate| candidate.member_id == member_id)
                     {
                         let begin = from.max(candidate.logical_offset);
                         let end = to.min(candidate.logical_offset.saturating_add(candidate.len));
                         if begin < end {
-                            if reads.len() == limit {
-                                return None;
-                            }
-                            reads.push((
+                            let read = (
                                 *volume,
                                 candidate.physical_offset + (begin - candidate.logical_offset),
                                 end - begin,
-                            ));
+                            );
+                            if reads.contains(&read) {
+                                continue;
+                            }
+                            if reads.len() == limit {
+                                return None;
+                            }
+                            reads.push(read);
                         }
                     }
                 }
