@@ -1,7 +1,7 @@
 //! Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    ExtractionProfile, Interruption, Route, Selection, combined_campaign,
-    run_described_schedule, selected_schedules, wrong_password_schedules,
+    ExtractionProfile, Interruption, Route, Schedule, ScheduleOptions, Selection,
+    combined_campaign, run_schedule_with, selected_schedules, wrong_password_schedules,
 };
 use super::*;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
@@ -28,6 +28,9 @@ enum Shape {
     Copy,
     /// Four single-article volumes, so two of the volumes are middle volumes.
     CopyFourVolumes,
+    /// One four-article volume: the start header opens it, the end header
+    /// closes it, and nothing else is posted besides the recovery set.
+    CopySingle,
     Multiple,
     EmptyEntry,
     Nested,
@@ -56,6 +59,25 @@ async fn conventional_campaign(shape: Shape, selection: Selection) {
 }
 
 async fn profile_campaign(shape: Shape, selection: Selection, profile: ExtractionProfile) {
+    run_shape(
+        shape,
+        profile,
+        ScheduleOptions::MATRIX,
+        wrong_password_schedules(selection),
+        selected_schedules(selection),
+    )
+    .await;
+}
+
+/// Runs `cases`, and `wrong_password` under a password the archive does not
+/// open with, over `shape` and holds each to what `profile` allows.
+async fn run_shape(
+    shape: Shape,
+    profile: ExtractionProfile,
+    options: ScheduleOptions,
+    wrong_password: Vec<Schedule>,
+    cases: Vec<(usize, Schedule)>,
+) {
     // A described volume is bound by the fingerprint of its first 16 KiB,
     // which its offset-zero article has to cover whole.
     let first = if matches!(shape, Shape::CopyObfuscated) {
@@ -136,10 +158,10 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
             matches!(shape, Shape::EncryptedHeaders),
         )
     };
-    let count = if matches!(shape, Shape::CopyFourVolumes) {
-        4
-    } else {
-        2
+    let count = match shape {
+        Shape::CopyFourVolumes => 4,
+        Shape::CopySingle => 1,
+        _ => 2,
     };
     let volumes = split_volumes(&archive, count);
     let (volumes, described) = if matches!(shape, Shape::CopyObfuscated) {
@@ -153,7 +175,12 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
     let wanted = expected.keys().copied().collect::<Vec<_>>();
     let direct_compatible = matches!(
         shape,
-        Shape::Copy | Shape::CopyFourVolumes | Shape::Multiple | Shape::EmptyEntry | Shape::Nested
+        Shape::Copy
+            | Shape::CopyFourVolumes
+            | Shape::CopySingle
+            | Shape::Multiple
+            | Shape::EmptyEntry
+            | Shape::Nested
     );
     // A 7z set's layout lives in two articles of its own: the start header
     // opens the first volume and the end header closing the last volume holds
@@ -203,7 +230,7 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
     };
     // A password the archive does not open with. An archive that needs none
     // must not notice it.
-    for (order, interruption) in wrong_password_schedules(selection) {
+    for (order, interruption) in wrong_password {
         if !profile.includes(interruption) {
             continue;
         }
@@ -212,7 +239,8 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         eprintln!(
             "wrong password {shape:?} profile={profile:?} order={order:?} interruption={interruption:?}"
         );
-        let outcome = run_described_schedule(
+        let outcome = run_schedule_with(
+            options,
             profile,
             wrong,
             &volumes,
@@ -235,14 +263,16 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
             }
         }
     }
-    for (case, (order, interruption)) in selected_schedules(selection) {
+    for (case, (order, interruption)) in cases {
         if !profile.includes(interruption) {
             continue;
         }
         eprintln!(
-            "{shape:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
+            "{shape:?} profile={profile:?} recovery={:?} case={case} order={order:?} interruption={interruption:?}",
+            options.recovery
         );
-        let outcome = run_described_schedule(
+        let outcome = run_schedule_with(
+            options,
             profile,
             spec.clone(),
             &volumes,

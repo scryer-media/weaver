@@ -7,6 +7,7 @@
 use super::*;
 
 mod embedded_par3;
+mod recovery;
 
 #[tokio::test]
 async fn copy_obfuscated_arrival_schedules() {

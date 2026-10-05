@@ -514,7 +514,7 @@ impl Interruption {
     }
 }
 
-type Schedule = (Vec<(u32, u32)>, Interruption);
+pub(super) type Schedule = (Vec<(u32, u32)>, Interruption);
 
 pub(super) fn combined_schedules(shard: usize, shards: usize) -> Vec<(usize, Schedule)> {
     assert!(shard < shards);
@@ -567,7 +567,7 @@ pub(super) fn wrong_password_schedules(selection: Selection) -> Vec<Schedule> {
     result
 }
 
-fn combined_schedule_cases() -> Vec<(usize, Schedule)> {
+pub(super) fn combined_schedule_cases() -> Vec<(usize, Schedule)> {
     let mut orders = std::collections::BTreeSet::new();
     for order in arrival_orders() {
         orders.insert(order.clone());
