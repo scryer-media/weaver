@@ -145,6 +145,57 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.max_concurrent_downloads_cap, None);
 }
 
+/// The extraction, PAR3 and holds limits shrink with the profile, and the
+/// widest profile leaves each exactly where the machine alone put it.
+#[test]
+fn each_profile_sizes_extraction_par3_and_holds_limits() {
+    for large in [machine(4, 8), machine(16, 64)] {
+        let efficient = HardwareProfile::Efficient.tuning(&large);
+        assert_eq!(efficient.max_concurrent_extractions, 2);
+        assert_eq!(
+            efficient.par3_memory,
+            MemoryShare {
+                divisor: 16,
+                cap_bytes: 256 * MIB
+            }
+        );
+        assert_eq!(efficient.par3_cpu_cap, Some(efficient.extract_threads));
+        assert_eq!(
+            efficient.direct_store_resident_default_cap_bytes,
+            Some(256 * MIB)
+        );
+
+        let balanced = HardwareProfile::Balanced.tuning(&large);
+        assert_eq!(balanced.max_concurrent_extractions, 4);
+        assert_eq!(
+            balanced.par3_memory,
+            MemoryShare {
+                divisor: 8,
+                cap_bytes: GIB
+            }
+        );
+        assert_eq!(balanced.par3_cpu_cap, Some(balanced.extract_threads));
+        assert_eq!(balanced.direct_store_resident_default_cap_bytes, None);
+
+        let performance = HardwareProfile::Performance.tuning(&large);
+        assert_eq!(performance.max_concurrent_extractions, 6);
+        assert_eq!(
+            performance.par3_memory,
+            MemoryShare {
+                divisor: 8,
+                cap_bytes: 2 * GIB
+            }
+        );
+        assert_eq!(performance.par3_cpu_cap, None);
+        assert_eq!(performance.direct_store_resident_default_cap_bytes, None);
+    }
+
+    let share = HardwareProfile::Balanced.tuning(&machine(4, 8)).par3_memory;
+    assert_eq!(share.of(8 * GIB), GIB);
+    assert_eq!(share.of(64 * GIB), GIB);
+    assert_eq!(share.of(GIB), 128 * MIB);
+}
+
 #[test]
 fn the_smallest_profile_still_extracts_with_every_core_it_can_spare() {
     // The allowance is what holds memory down, so the smallest profile buys

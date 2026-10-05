@@ -131,27 +131,34 @@ impl RuntimeTuner {
         self.profile.disk.random_read_iops = random_read_iops;
     }
 
-    /// Maximum concurrent streaming member extractions, adaptive to disk type.
+    /// Maximum concurrent streaming member extractions, adaptive to disk type
+    /// and bounded by the hardware profile in force.
     ///
-    /// SSD: no seek penalty, scale with CPU cores (2-6).
+    /// SSD: no seek penalty, scale with CPU cores from 2 up to the profile's
+    /// cap (2, 4 or 6).
     /// HDD: seeking between concurrent read positions kills throughput (1-2).
     /// Network/Unknown: moderate (2).
+    ///
+    /// The environment override is the operator's explicit number and wins
+    /// over every profile.
     pub fn max_concurrent_extractions(&self) -> usize {
         if let Some(override_value) = self.max_concurrent_extractions_override {
             return override_value;
         }
+        let cap = self.tuning.max_concurrent_extractions.max(1);
         if self.is_fast_storage() {
             // Fast storage: bottleneck is CPU decompression, not I/O.
             let cores = HardwareProfile::effective_cores(&self.profile);
-            cores.clamp(2, 6)
+            cores.max(2).min(cap)
         } else {
             // Slow storage: head seeks between concurrent streams hurt.
             // Allow 2 only if IOPS suggests a decent drive.
-            if self.profile.disk.random_read_iops > 500.0 {
+            let by_disk = if self.profile.disk.random_read_iops > 500.0 {
                 2
             } else {
                 1
-            }
+            };
+            by_disk.min(cap)
         }
     }
 }

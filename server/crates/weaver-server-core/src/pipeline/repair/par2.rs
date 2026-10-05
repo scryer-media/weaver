@@ -772,6 +772,23 @@ impl Pipeline {
                 by_rar_volume.insert(*volume_number, *file_id);
             }
         }
+        // A file some description names is that description's. The volume
+        // number speaks only for a file whose name says nothing, and numbers
+        // repeat across sets: two single-volume sets are both volume 0, so a
+        // set that never reached disk had its description handed to the other
+        // set's volume once that one was renamed to its own description.
+        let named: HashSet<NzbFileId> = par2_set
+            .files
+            .values()
+            .filter_map(|desc| {
+                let name = sanitize_download_filename(&desc.filename);
+                by_current
+                    .get(&name)
+                    .or_else(|| by_source.get(&name))
+                    .or_else(|| by_canonical.get(&name))
+                    .copied()
+            })
+            .collect();
         let mut occupied_filenames = HashSet::<String>::new();
         for (_, identity, _, _) in &files {
             reserve_identity_filenames(identity, &mut occupied_filenames);
@@ -794,7 +811,10 @@ impl Pipeline {
                 .or_else(|| {
                     match weaver_model::files::FileRole::from_filename(&canonical_filename) {
                         weaver_model::files::FileRole::RarVolume { volume_number } => {
-                            by_rar_volume.get(&volume_number).copied()
+                            by_rar_volume
+                                .get(&volume_number)
+                                .copied()
+                                .filter(|file_id| !named.contains(file_id))
                         }
                         _ => None,
                     }

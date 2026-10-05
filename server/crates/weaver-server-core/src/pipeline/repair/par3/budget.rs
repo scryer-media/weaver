@@ -1,6 +1,7 @@
 //! Process-wide PAR3 admission, resolved once outside the download loop.
 
 use super::*;
+use crate::runtime::MemoryShare;
 use par3_rs::runtime::{MemoryBudget, ResourceLimit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Weak};
@@ -119,9 +120,47 @@ struct Limits {
     payload: usize,
 }
 
+/// The whole PAR3 allowance when the host cannot say how much memory it has.
+const UNKNOWN_MEMORY_TOTAL: u64 = 256 << 20;
+
+/// The least a profile leaves PAR3 on a host that says how much memory it has:
+/// an eighth of it, up to this. A smaller profile trims a large machine's
+/// allowance, but on a small one it would push the allowance below what the
+/// sets it can download need, and a refusal there demotes the set.
+const SMALL_HOST_FLOOR: u64 = 128 << 20;
+
+/// The widest profile's share, in force until a pipeline puts its profile's
+/// share in place, so a process that never chose a profile sizes PAR3 as the
+/// widest profile does.
+const DEFAULT_SHARE: MemoryShare = MemoryShare {
+    divisor: 8,
+    cap_bytes: 2 << 30,
+};
+
+static MEMORY_SHARE: Mutex<MemoryShare> = Mutex::new(DEFAULT_SHARE);
+
+/// Put the hardware profile in force's PAR3 share behind the budgets.
+///
+/// The budgets are built once, on first PAR3 use, from whatever share is in
+/// place at that moment; the engine's budget cannot be resized under the work
+/// already charged to it, so a later change only matters until then.
+pub(in crate::pipeline) fn set_memory_share(share: MemoryShare) {
+    *MEMORY_SHARE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = share;
+}
+
+fn memory_share() -> MemoryShare {
+    *MEMORY_SHARE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Limits {
-    fn for_memory(memory: Option<u64>) -> Self {
-        let total = memory.map_or(256 << 20, |bytes| (bytes / 8).min(2 << 30)) as usize;
+    fn for_memory(memory: Option<u64>, share: MemoryShare) -> Self {
+        let total = memory.map_or(UNKNOWN_MEMORY_TOTAL, |bytes| {
+            share.of(bytes).max((bytes / 8).min(SMALL_HOST_FLOOR))
+        }) as usize;
         let native = total / 2;
         let metadata = (total / 16).min(64 << 20);
         Self {
@@ -267,7 +306,10 @@ impl Budgets {
 pub(super) fn budgets() -> &'static Budgets {
     static BUDGETS: OnceLock<Budgets> = OnceLock::new();
     BUDGETS.get_or_init(|| {
-        let limits = Limits::for_memory(crate::runtime::system_probe::detect_total_memory_bytes());
+        let limits = Limits::for_memory(
+            crate::runtime::system_probe::detect_total_memory_bytes(),
+            memory_share(),
+        );
         tracing::info!(
             native_bytes = limits.native,
             metadata_bytes = limits.metadata,
