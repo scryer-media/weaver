@@ -384,78 +384,6 @@ fn two_interruption_cases(orders: &BTreeSet<Order>) -> Vec<Schedule> {
     cases
 }
 
-/// KNOWN DEFECT: an encrypted two-volume set whose three-article first volume
-/// has a hole past its first article demotes for damage its recovery set
-/// repairs in full: as damaged, or as a repair it could not route. The hole is
-/// either a lost middle or last article, or, across a restart or crash, a
-/// middle article still missing when the article past it had arrived. Hold
-/// that one demotion to the demoted route it takes; every other rule of the
-/// case still applies.
-fn encrypted_first_volume_hole(
-    format: Format,
-    order: &[(u32, u32)],
-    interruption: Interruption,
-    outcome: &mut Outcome,
-) -> bool {
-    // Slots 1 and 2 are the first volume's middle and last articles.
-    let hole_at = |at: usize| !order[..at].contains(&(0, 1)) && order[..at].contains(&(1, 0));
-    let holed = match interruption {
-        Interruption::Combined {
-            mask, action, at, ..
-        } => {
-            mask & 0b110 != 0
-                || (matches!(action, BoundaryAction::Restart | BoundaryAction::Crash)
-                    && hole_at(at))
-        }
-        Interruption::Restart(at) | Interruption::Crash(at) => hole_at(at),
-        _ => false,
-    };
-    if matches!(format, Format::Rar4Encrypted | Format::Rar5Encrypted)
-        && holed
-        && let [reason @ (DemotionReason::Par2Damaged | DemotionReason::RepairRerouteFailed)] =
-            outcome.demotions[..]
-        && outcome.schedule_demoted.is_none()
-    {
-        eprintln!("KNOWN DEFECT held: encrypted first-volume hole");
-        outcome.schedule_demoted = Some(reason);
-    }
-    false
-}
-
-/// KNOWN DEFECT: a job whose speculative extraction the schedule withdrew,
-/// restarted or crashed afterwards, and then handed an article again that it
-/// had already received before the restart fails as retained damage awaiting
-/// verification, though the copy is identical and nothing was damaged. Hold
-/// that failure open whole.
-fn demoted_restart_duplicate(
-    _: Format,
-    order: &[(u32, u32)],
-    interruption: Interruption,
-    outcome: &mut Outcome,
-) -> bool {
-    let Interruption::Twice {
-        first: BoundaryAction::Demote,
-        second: BoundaryAction::Restart | BoundaryAction::Crash,
-        second_at,
-        ..
-    } = interruption
-    else {
-        return false;
-    };
-    let held = order[second_at..]
-        .iter()
-        .any(|article| order[..second_at].contains(article))
-        && matches!(
-            &outcome.status,
-            Some(JobStatus::Failed { error })
-                if error.starts_with("retained damaged article bytes require verification")
-        );
-    if held {
-        eprintln!("KNOWN DEFECT held: a withdrawn job's duplicate after a restart failed it");
-    }
-    held
-}
-
 async fn family_campaign(
     family: Family,
     format: Format,
@@ -465,9 +393,9 @@ async fn family_campaign(
     eprintln!("{family:?} {format:?} profile={profile:?} selection={selection:?}");
     let cases = family.selected(selection);
     let known_defect: KnownDefect = match family {
-        Family::FifthArticle => encrypted_first_volume_hole,
+        Family::FifthArticle => |_, _, _, _| false,
         Family::SecondDuplicate => |_, _, _, _| false,
-        Family::TwoInterruptions => demoted_restart_duplicate,
+        Family::TwoInterruptions => |_, _, _, _| false,
     };
     slot_campaign(
         format,
