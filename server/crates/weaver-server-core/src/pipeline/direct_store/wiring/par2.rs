@@ -152,6 +152,36 @@ impl Pipeline {
             })
     }
 
+    /// The current names of every source volume a finalized direct set owns,
+    /// for the job's post-extraction cleanup.
+    ///
+    /// A finalized set never wrote these files, so anything at their names is
+    /// left over from an earlier incarnation of the job: a restart that kept no
+    /// progress for a file the dead process had already started conventionally
+    /// leaves those bytes behind, and the set admitted afterwards routes the
+    /// refetched articles past them. The cleanup otherwise finds archive input
+    /// by its classified role, which an identity-bound volume under an
+    /// obfuscated name never gets, so the leftover would be published. Each name
+    /// is a file of this job in its own working directory, consumed by a set
+    /// that delivered every member, which is exactly what the cleanup deletes
+    /// for a conventional set.
+    pub(in crate::pipeline) fn finalized_direct_volume_filenames(
+        &self,
+        job_id: JobId,
+    ) -> Vec<String> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        self.direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| set.is_finalized() && !set.is_demoted())
+            .flat_map(|set| set.plan().volumes.values().copied())
+            .filter_map(|file_index| state.assembly.file(NzbFileId { job_id, file_index }))
+            .map(|file| self.current_filename_for_file(job_id, file))
+            .collect()
+    }
+
     /// Whether this file is a volume of a demoted set whose reconstruction
     /// sweep is still outstanding.
     ///

@@ -2896,6 +2896,7 @@ impl Pipeline {
                         cleanup_files.extend(topology.volume_map.keys().cloned());
                     }
                     cleanup_files.extend(self.par2_spent_input_names(job_id));
+                    cleanup_files.extend(self.finalized_direct_volume_filenames(job_id));
                     cleanup_files
                 };
                 let nested_decision = match self.maybe_start_nested_extraction(job_id).await {
