@@ -19,7 +19,7 @@
 - They are separate from the archive matrix and far larger. Never run them locally unless an operator explicitly requests the extended campaigns; a request to run the archive matrix does not cover them.
 - The opt-in local command is `cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast`.
 - In CI they run only from the manually dispatched `archive-matrix-extended` workflow, sharing its 128 Linux partitions with the archive matrix. They must never run on pull requests, pushes, or release tags, and nothing added to them may match the archive matrix filter.
-- Their smoke tests are not ignored and stay in the default suite. The campaign profiles flag a test every five minutes and end it after twenty. Keep every ignored campaign test well under that limit by adding shards, not by raising it.
+- Their smoke tests are not ignored and stay in the default suite. The campaign profiles flag a test every five minutes and end it after an hour. That limit only catches a hang; it is set far above any real run so a loaded runner cannot fail a test. Keep every ignored campaign test to a few minutes on an idle runner by adding shards.
 
 ## Test determinism
 
@@ -29,5 +29,5 @@ A test must give the same result on a slow, loaded, or shared CI runner as on a 
 - Do not assume one concurrent operation finishes before another unless the code under test guarantees that order. Background workers, pollers, schedulers, and timers race the test unless the test controls them.
 - Control time and scheduling explicitly. Use the paused or mocked clock, injected intervals, or explicit triggers instead of racing real timers.
 - Tie every wait to the specific item under test, using its ID, sequence number, or a watermark taken before the action. Earlier or unrelated activity must not be able to satisfy the wait.
-- Do not put deadlines or timeouts in tests, and never assert an upper bound on elapsed time. The test runner bounds every test instead: `.config/nextest.toml` flags a test after a minute and ends it after ten, so a missed condition fails the run instead of hanging it.
+- Do not put deadlines or timeouts in tests, and never assert an upper bound on elapsed time. The test runner bounds every test instead: `.config/nextest.toml` flags a test after a minute and ends it after an hour, so a missed condition fails the run instead of hanging it. That limit is set far above any real run so a loaded runner cannot fail a test; it only catches a hang.
 - Never fix a flaky test by raising a timeout, adding a sleep, or adding a retry. Find and remove the race. If the product exposes nothing observable to wait on, report that gap instead of working around it.
