@@ -880,6 +880,7 @@ async fn submit_schedule_recovery(
             )
             .await;
         }
+        RecoveryFormat::Embedded => unreachable!("an embedded set posts no recovery file"),
     }
 }
 
@@ -907,6 +908,8 @@ pub(super) enum RecoveryFormat {
     /// A PAR3 index and its recovery volumes. The index arrives where the
     /// PAR2 file would; a recovery volume arrives when the pipeline asks.
     Par3,
+    /// The volumes carry their own recovery set and nothing else is posted.
+    Embedded,
 }
 
 /// Who a schedule's demote action claims, and why.
@@ -1036,7 +1039,9 @@ pub(super) async fn run_schedule_with(
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let loss = interruption.loss();
     let index_first = loss.map_or(described.is_some(), |(_, first)| first);
-    let recovery = if loss.is_some() || described.is_some() {
+    let recovery = if options.recovery == RecoveryFormat::Embedded {
+        Vec::new()
+    } else if loss.is_some() || described.is_some() {
         // Keep several repair blocks per article even for larger compressed
         // fixtures, without turning extraction scheduling into a codec benchmark.
         let slice = volumes
@@ -1096,6 +1101,7 @@ pub(super) async fn run_schedule_with(
                     })
                     .collect()
             }
+            RecoveryFormat::Embedded => unreachable!("handled above"),
         }
     } else {
         Vec::new()
@@ -1372,7 +1378,9 @@ pub(super) async fn run_schedule_with(
                 .await
                 .expect("registered extraction receipt");
             pipeline.handle_extraction_done(done).await;
-        } else if recovery.is_empty() {
+        } else if recovery.is_empty() && options.recovery != RecoveryFormat::Embedded {
+            // An embedded set's verification and repair are settled by the
+            // pump above and may take another completion round to land.
             panic!(
                 "archive stalled without an outstanding operation: {} trace={trace:?}",
                 debug_job_state(&pipeline, job)
