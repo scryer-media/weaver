@@ -85,8 +85,8 @@ pub(super) struct Outcome {
     pub chase_consumed: u64,
     /// Every direct-store demotion any incarnation of the pipeline recorded.
     pub demotions: Vec<DemotionReason>,
-    /// Whether the schedule's own demote action claimed a live set.
-    pub schedule_demoted: bool,
+    /// The reason the schedule's own demote action claimed a live set under.
+    pub schedule_demoted: Option<DemotionReason>,
     /// Every file under the job's output directory, by relative path.
     pub published: BTreeSet<String>,
     /// Everything the job left outside its output directory.
@@ -119,6 +119,12 @@ pub(super) struct Route {
     /// for any byte while those articles are missing; only a repair of the
     /// whole payload brings them back, and by then nothing is left to route.
     pub unmapped_loss: fn(u8) -> bool,
+    /// Loss masks that leave a volume with nothing to say which volume it is.
+    ///
+    /// A set admitted by content knows a file by its offset-zero article
+    /// alone. A file that never receives one cannot be bound to its volume, and
+    /// its set cannot be made whole.
+    pub unnamed_loss: fn(u8) -> bool,
 }
 
 impl Route {
@@ -127,6 +133,7 @@ impl Route {
         sets: 1,
         shape_demotion: |_| false,
         unmapped_loss: |_| false,
+        unnamed_loss: |_| false,
     };
 
     /// A set the layout refuses to route: it demotes for its shape and
@@ -137,6 +144,7 @@ impl Route {
             sets: 1,
             shape_demotion,
             unmapped_loss: |_| false,
+            unnamed_loss: |_| false,
         }
     }
 }
@@ -242,12 +250,19 @@ impl ExtractionProfile {
         let unmapped = interruption
             .loss()
             .is_some_and(|(mask, _)| (route.unmapped_loss)(mask));
+        let unnamed = interruption
+            .loss()
+            .is_some_and(|(mask, _)| (route.unnamed_loss)(mask));
         let unexpected: Vec<_> = outcome
             .demotions
             .iter()
             .filter(|reason| match **reason {
-                DemotionReason::HoldsBudgetExceeded if outcome.schedule_demoted => false,
+                reason if outcome.schedule_demoted == Some(reason) => false,
                 DemotionReason::SevenZip(SevenZipRefusal::UnreadableMap) if unmapped => false,
+                DemotionReason::IdentityRosterUnfillable if unnamed => false,
+                // The unnamed volume belongs to no set, so its damage is
+                // damage no direct set can repair in place.
+                DemotionReason::Par2Damaged if unnamed => false,
                 reason => !(route.shape_demotion)(reason),
             })
             .collect();
@@ -255,11 +270,11 @@ impl ExtractionProfile {
             unexpected.is_empty(),
             "direct store demoted unexpectedly: {unexpected:?} trace={trace:?}"
         );
-        let schedule_only = outcome.schedule_demoted
+        let schedule_only = outcome.schedule_demoted.is_some()
             && outcome
                 .demotions
                 .iter()
-                .all(|reason| *reason == DemotionReason::HoldsBudgetExceeded);
+                .all(|reason| Some(*reason) == outcome.schedule_demoted);
         if self != Self::DirectStore {
             assert!(outcome.demotions.is_empty(), "{trace:?}");
         } else if route.direct && schedule_only {
@@ -269,6 +284,9 @@ impl ExtractionProfile {
                 route.sets - 1,
                 "a set the schedule left alone left the direct route: {trace:?}"
             );
+        } else if unnamed && outcome.demotions.is_empty() {
+            // A volume nothing could name may leave no set admitted at all.
+            assert!(outcome.finalized <= route.sets, "{trace:?}");
         } else if route.direct && outcome.demotions.is_empty() {
             assert_eq!(
                 outcome.finalized, route.sets,
@@ -289,7 +307,8 @@ impl ExtractionProfile {
         }
         if outcome.status == Some(JobStatus::Complete) {
             let expected: BTreeSet<String> = expected.iter().map(|name| (*name).into()).collect();
-            assert_eq!(outcome.published, expected, "published files: {trace:?}");
+            let published: BTreeSet<String> = outcome.published.iter().cloned().collect();
+            assert_eq!(published, expected, "published files: {trace:?}");
         }
         assert!(
             outcome.leftovers.is_empty(),
@@ -693,6 +712,20 @@ async fn deliver_schedule_refetches(
     }
 }
 
+/// What a schedule's demote action claims: which of the job's sets, and why.
+/// Both follow from the schedule, so across the arrival orders every boundary
+/// sees a budget demotion and a source-damage one against each set.
+fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize, DemotionReason) {
+    let (file, article) = order[0];
+    let seed = step + file as usize * 2 + article as usize;
+    let reason = if seed.is_multiple_of(2) {
+        DemotionReason::HoldsBudgetExceeded
+    } else {
+        DemotionReason::VolumeCrcMismatch
+    };
+    ((seed / 2) % sets.max(1), reason)
+}
+
 pub(super) async fn run_profile_schedule(
     profile: ExtractionProfile,
     spec: JobSpec,
@@ -739,7 +772,7 @@ pub(super) async fn run_described_schedule(
     let mut chase_consumed = 0;
     let mut finalized = 0;
     let mut demotions = Vec::new();
-    let mut schedule_demoted = false;
+    let mut schedule_demoted = None;
     let mut retired = None;
     let mut delivered = BTreeSet::new();
     let mut rerequested = BTreeSet::new();
@@ -785,8 +818,9 @@ pub(super) async fn run_described_schedule(
     };
     insert_active_job(&mut pipeline, job, spec.clone()).await;
     let mut trace = vec![];
-    if recovery.is_some() && index_first {
-        let (index, bytes) = recovery.as_ref().unwrap();
+    if let Some((index, bytes)) = recovery.as_ref()
+        && index_first
+    {
         retire_schedule_article(&mut pipeline, job, *index, 0);
         submit_decoded_segment(
             &mut pipeline,
@@ -807,10 +841,12 @@ pub(super) async fn run_described_schedule(
             BoundaryAction::Demote => {
                 if profile == ExtractionProfile::DirectStore {
                     let before = pipeline.direct_store.demotions.len();
-                    pipeline
-                        .demote_direct_set(job, 0, DemotionReason::HoldsBudgetExceeded)
-                        .await;
-                    schedule_demoted |= pipeline.direct_store.demotions.len() != before;
+                    let sets = pipeline.direct_store.sets_for(job).len();
+                    let (set, reason) = scheduled_demotion(&order, step, sets);
+                    pipeline.demote_direct_set(job, set, reason).await;
+                    if pipeline.direct_store.demotions.len() != before {
+                        schedule_demoted = Some(reason);
+                    }
                 }
                 // An incompatible set may already have left direct store and
                 // started chase. Withdraw that owner at the same boundary too.
@@ -963,8 +999,10 @@ pub(super) async fn run_described_schedule(
             pipeline.direct_store.sets_for(job)
         ));
     }
-    if recovery.is_some() && !index_first && retired.is_none() {
-        let (index, bytes) = recovery.as_ref().unwrap();
+    if let Some((index, bytes)) = recovery.as_ref()
+        && !index_first
+        && retired.is_none()
+    {
         retire_schedule_article(&mut pipeline, job, *index, 0);
         submit_decoded_segment(
             &mut pipeline,
@@ -1260,7 +1298,6 @@ impl Format {
             | Self::Rar5
             | Self::Rar4FourVolumes
             | Self::Rar5FourVolumes
-            | Self::Rar5Obfuscated
             | Self::Rar4EncryptedFourVolumes
             | Self::Rar4Encrypted
             | Self::Rar4Unsalted
@@ -1268,6 +1305,11 @@ impl Format {
             | Self::Rar5KeyedChecksum
             | Self::Rar5EncryptedHeaders
             | Self::QuickOpen => Route::DIRECT,
+            // Slots 0 and 2 are the two volumes' offset-zero articles.
+            Self::Rar5Obfuscated => Route {
+                unnamed_loss: |mask| mask & 0b0101 != 0,
+                ..Route::DIRECT
+            },
             Self::Rar5UncheckedHeaders => Route::refused(|reason| {
                 matches!(reason, DemotionReason::HeaderEncryptedRefused(_))
             }),
@@ -1296,10 +1338,13 @@ async fn conventional_campaign(format: Format, selection: Selection) {
 async fn profile_campaign(format: Format, selection: Selection, profile: ExtractionProfile) {
     let name = "nested/feature.mkv";
     let password = "moonlit-harbour";
-    let length = if matches!(format, Format::QuickOpen) {
-        193
-    } else {
-        6001
+    let length = match format {
+        Format::QuickOpen => 193,
+        // A described volume is bound by the fingerprint of its first 16 KiB,
+        // which its offset-zero article has to cover whole, as every real
+        // article does. Two articles a volume puts that at 32 KiB a volume.
+        Format::Rar5Obfuscated => 70_001,
+        _ => 6001,
     };
     let payload: Vec<u8> = (0..length)
         .map(|n| ((n * 7 + n / 251) % 253) as u8)
@@ -1662,9 +1707,45 @@ enum CompressedFormat {
     Rar5Solid,
     Rar5SolidEncrypted,
     Rar5SolidHeaders,
+    // One compressed member spanning every volume of the set.
+    Rar4LzTwoVolumes,
+    Rar5LzTwoVolumes,
+    Rar4LzFourVolumes,
+    Rar5LzFourVolumes,
 }
 
 impl CompressedFormat {
+    /// The posted volumes of a multi-volume set and its oracle key. Every
+    /// other format posts its one fixture archive whole.
+    fn volumes(self) -> Option<(&'static str, Vec<&'static [u8]>)> {
+        macro_rules! volumes {
+            ($set:literal, $($part:literal),+) => {
+                Some((
+                    $set,
+                    vec![$(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/extraction_profiles/",
+                        $set,
+                        ".part",
+                        $part,
+                        ".rar"
+                    ))
+                    .as_slice()),+],
+                ))
+            };
+        }
+        match self {
+            Self::Rar4LzTwoVolumes => volumes!("rar4_lz_two", "01", "02"),
+            Self::Rar5LzTwoVolumes => volumes!("rar5_lz_two", "01", "02"),
+            Self::Rar4LzFourVolumes => volumes!("rar4_lz_four", "01", "02", "03", "04"),
+            Self::Rar5LzFourVolumes => volumes!("rar5_lz_four", "01", "02", "03", "04"),
+            _ => None,
+        }
+    }
+
+    /// The archive the expected members are decoded from. A multi-volume set
+    /// packs the member its single-volume counterpart does, and the oracle
+    /// pins the bytes for the set under its own key.
     fn fixture(self) -> (&'static str, &'static [u8], Option<&'static str>) {
         // Real RAR encoders produced these archives. Embed them so the compiled
         // nextest archive remains self-contained on a matrix runner.
@@ -1684,7 +1765,9 @@ impl CompressedFormat {
         }
         match self {
             Self::Rar4Mixed => fixture!("rar4_multifile_lz.rar", None),
-            Self::Rar4Lz => fixture!("rar4_lz.rar", None),
+            Self::Rar4Lz | Self::Rar4LzTwoVolumes | Self::Rar4LzFourVolumes => {
+                fixture!("rar4_lz.rar", None)
+            }
             Self::Rar4Solid => fixture!("rar4_lz_solid_mv.rar", None),
             Self::Rar4SolidEncrypted => {
                 fixture!("rar4_solid_lz_encrypted.rar", Some("moonlit-harbour"))
@@ -1702,7 +1785,9 @@ impl CompressedFormat {
             Self::Rar4Encrypted => fixture!("rar4_enc_lz.rar", Some("testpass123")),
             Self::Rar4Headers => fixture!("rar4_hp_lz.rar", Some("secretpass")),
             Self::Rar5Mixed => fixture!("rar5_multifile_lz.rar", None),
-            Self::Rar5Lz => fixture!("rar5_lz.rar", None),
+            Self::Rar5Lz | Self::Rar5LzTwoVolumes | Self::Rar5LzFourVolumes => {
+                fixture!("rar5_lz.rar", None)
+            }
             Self::Rar5Encrypted => fixture!("rar5_enc_lz.rar", Some("testpass123")),
             Self::Rar5Headers => fixture!("rar5_hp_lz.rar", Some("secretpass")),
             Self::Rar5Solid => fixture!("rar5_solid_small.rar", None),
@@ -1727,7 +1812,12 @@ impl CompressedFormat {
             // The stored members route; the compressed one rides the member
             // tolerance and is extracted at finalization.
             Self::Rar4Mixed | Self::Rar5Mixed => Route::DIRECT,
-            Self::Rar4Lz | Self::Rar5Lz => {
+            Self::Rar4Lz
+            | Self::Rar5Lz
+            | Self::Rar4LzTwoVolumes
+            | Self::Rar5LzTwoVolumes
+            | Self::Rar4LzFourVolumes
+            | Self::Rar5LzFourVolumes => {
                 Route::refused(|reason| matches!(reason, MemberIneligible(Compressed)))
             }
             Self::Rar4Solid | Self::Rar4Ppmd | Self::Rar5Solid => Route::refused(|reason| {
@@ -1804,7 +1894,9 @@ async fn compressed_campaign(
         "/tests/fixtures/extraction_profiles/expected.json"
     )))
     .unwrap();
-    let oracle = oracle["archives"][fixture_name].as_object().unwrap();
+    let posted = format.volumes();
+    let oracle_key = posted.as_ref().map_or(fixture_name, |(set, _)| set);
+    let oracle = oracle["archives"][oracle_key].as_object().unwrap();
     assert_eq!(expected.len(), oracle.len());
     for (name, bytes) in &expected {
         use sha2::Digest;
@@ -1815,8 +1907,19 @@ async fn compressed_campaign(
         );
     }
     let wanted = expected.keys().map(String::as_str).collect::<Vec<_>>();
-    let volumes = vec![("compressed.rar".to_owned(), bytes.to_vec())];
-    let mut spec = direct_store_job_spec_with_articles("Compressed archive schedules", &volumes, 4);
+    let volumes: Vec<(String, Vec<u8>)> = match posted {
+        Some((_, parts)) => parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, part)| (format!("compressed.part{:02}.rar", index + 1), part.to_vec()))
+            .collect(),
+        None => vec![("compressed.rar".to_owned(), bytes.to_vec())],
+    };
+    let mut spec = direct_store_job_spec_with_articles(
+        "Compressed archive schedules",
+        &volumes,
+        4 / volumes.len(),
+    );
     spec.password = password.map(str::to_owned);
     for (order, interruption) in wrong_password_schedules(selection) {
         if !profile.includes(interruption) {
@@ -1961,6 +2064,22 @@ async fn compressed_rar5_solid_encrypted_arrival_schedules() {
 #[tokio::test]
 async fn compressed_rar5_solid_headers_arrival_schedules() {
     compressed_direct_campaign(CompressedFormat::Rar5SolidHeaders, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_lz_two_volume_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4LzTwoVolumes, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_lz_two_volume_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5LzTwoVolumes, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar4_lz_four_volume_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar4LzFourVolumes, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn compressed_rar5_lz_four_volume_arrival_schedules() {
+    compressed_direct_campaign(CompressedFormat::Rar5LzFourVolumes, Selection::Smoke).await;
 }
 
 // These are test names, not runner jobs. Nextest partitions the named shards
@@ -2495,5 +2614,65 @@ combined_campaign!(
 combined_campaign!(
     combined_compressed_conventional_rar4_ppmd_headers,
     CompressedFormat::Rar4PpmdHeaders,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_lz_two_volume,
+    CompressedFormat::Rar4LzTwoVolumes,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_lz_two_volume,
+    CompressedFormat::Rar5LzTwoVolumes,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar4_lz_four_volume,
+    CompressedFormat::Rar4LzFourVolumes,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_direct_rar5_lz_four_volume,
+    CompressedFormat::Rar5LzFourVolumes,
+    compressed_direct_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_lz_two_volume,
+    CompressedFormat::Rar4LzTwoVolumes,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_lz_two_volume,
+    CompressedFormat::Rar5LzTwoVolumes,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar4_lz_four_volume,
+    CompressedFormat::Rar4LzFourVolumes,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_chase_rar5_lz_four_volume,
+    CompressedFormat::Rar5LzFourVolumes,
+    compressed_chase_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_lz_two_volume,
+    CompressedFormat::Rar4LzTwoVolumes,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_lz_two_volume,
+    CompressedFormat::Rar5LzTwoVolumes,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar4_lz_four_volume,
+    CompressedFormat::Rar4LzFourVolumes,
+    compressed_conventional_campaign
+);
+combined_campaign!(
+    combined_compressed_conventional_rar5_lz_four_volume,
+    CompressedFormat::Rar5LzFourVolumes,
     compressed_conventional_campaign
 );
