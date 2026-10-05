@@ -163,8 +163,7 @@ fn demotes(interruption: Interruption) -> bool {
     )
 }
 
-/// Runs one schedule and holds it to what its profile and target allow,
-/// unless `held` recognises the outcome as a known defect.
+/// Runs one schedule and holds it to what its profile and target allow.
 async fn run_case(
     fixture: &Fixture,
     options: ScheduleOptions,
@@ -172,7 +171,6 @@ async fn run_case(
     case: usize,
     order: &[(u32, u32)],
     interruption: Interruption,
-    held: impl Fn(&Outcome) -> bool,
 ) {
     let wanted = fixture.wanted();
     let label = format!(
@@ -190,10 +188,6 @@ async fn run_case(
         interruption,
     )
     .await;
-    if held(&outcome) {
-        eprintln!("held: {label}");
-        return;
-    }
     if interruption.fails() {
         profile.assert_rejected(&outcome, &wanted);
         return;
@@ -217,48 +211,23 @@ async fn run_case(
 
 /// The matrix's loss schedules, answered by a PAR3 set instead of PAR2.
 async fn par3_campaign(format: Format, profile: ExtractionProfile, slice: Slice) {
-    let fixture = fixture(Target::Format(format));
+    let mut fixture = fixture(Target::Format(format));
+    if matches!(format, Format::Rar5Obfuscated) {
+        // A PAR3 set names a posted file by its whole image, and that image
+        // has to be a file before it can take the name. So a set whose names
+        // say nothing writes itself out from the bytes it routed, refetching
+        // none of them, whenever a loss sends it to its recovery set.
+        fixture.route.unnamed_loss = |_| true;
+    }
     let options = ScheduleOptions {
         recovery: RecoveryFormat::Par3,
         ..ScheduleOptions::MATRIX
     };
-    let held = |outcome: &Outcome| par3_known_defect(format, profile, outcome);
     for (case, (order, interruption)) in campaign_cases(slice, carries_loss, LOSS_CASES) {
         if !profile.includes(interruption) {
             continue;
         }
-        run_case(&fixture, options, profile, case, &order, interruption, held).await;
-    }
-}
-
-/// The PAR3 failures the campaigns hold rather than assert, each matched on
-/// the exact verdict it leaves so nothing else slips through.
-fn par3_known_defect(format: Format, profile: ExtractionProfile, outcome: &Outcome) -> bool {
-    let Some(JobStatus::Failed { error }) = &outcome.status else {
-        return false;
-    };
-    match format {
-        // KNOWN DEFECT: under direct store, a PAR3 repair of an encrypted set
-        // whose loss reaches both volumes fails the job ("PAR3 cipher edge plan
-        // is incomplete or exceeds the host budget") instead of completing it.
-        // The same schedules complete under PAR2, and under PAR3 with chase or
-        // conventional extraction.
-        Format::Rar4Encrypted | Format::Rar5Encrypted => {
-            profile == ExtractionProfile::DirectStore
-                && error == "PAR3 cipher edge plan is incomplete or exceeds the host budget"
-        }
-        // KNOWN DEFECT: an obfuscated set that loses any article is never
-        // repaired from PAR3, under any profile. Conventional and chase fail
-        // as if no recovery set were posted; direct store first demotes the set
-        // (identity roster unfillable) and can then fail the PAR3 assessment
-        // on a source it reports as changed. The same schedules complete
-        // under PAR2.
-        Format::Rar5Obfuscated => {
-            (error.starts_with("download incomplete after exhausting retries: ")
-                && error.ends_with(" no PAR2 metadata is available for repair"))
-                || error.starts_with("PAR3 assessment failed: PAR3 source changed: ")
-        }
-        _ => false,
+        run_case(&fixture, options, profile, case, &order, interruption).await;
     }
 }
 
@@ -324,7 +293,6 @@ async fn demotion_campaign(target: Target, forced: Forced, slice: Slice) {
                 case,
                 &order,
                 interruption,
-                |_: &Outcome| false,
             )
             .await;
         }
@@ -346,7 +314,6 @@ async fn demotion_smoke(target: Target, every: &[Forced]) {
             case,
             &order,
             interruption,
-            |_: &Outcome| false,
         )
         .await;
     }

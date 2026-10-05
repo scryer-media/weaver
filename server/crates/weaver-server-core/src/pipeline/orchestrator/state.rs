@@ -275,7 +275,7 @@ impl Pipeline {
         // The verdict that retired them is gone, so a reprocessed job rebuilds
         // its split topologies and asks the recovery set again.
         self.par2_joined_split_sets.remove(&job_id);
-        self.par2_unposted_outputs.remove(&job_id);
+        self.recovery_unposted_outputs.remove(&job_id);
         // The verdict is gone, so the post-verdict re-entry budget goes with it.
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
             && let Some(set_runtime) = runtime.served_mut()
