@@ -5,6 +5,7 @@
 use super::*;
 use crate::pipeline::direct_store::router::MemberIneligibility;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
+use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason as ChaseDemotion};
 
 fn enable_schedule_trace() {
     if std::env::var_os("WEAVER_ARCHIVE_SCHEDULE_TRACE").is_none() {
@@ -44,6 +45,8 @@ fn enable_schedule_trace() {
     let _ = tracing::subscriber::set_global_default(Trace(std::sync::atomic::AtomicU64::new(0)));
 }
 
+mod extended;
+
 pub(super) fn arrival_orders() -> Vec<Vec<(u32, u32)>> {
     fn permute(at: usize, items: &mut [(u32, u32)], output: &mut Vec<Vec<(u32, u32)>>) {
         if at == items.len() {
@@ -73,6 +76,40 @@ pub(super) fn duplicate_orders() -> Vec<Vec<(u32, u32)>> {
         }
     }
     result
+}
+
+/// Articles per volume for `slots` article slots over `volumes` volumes: four
+/// split evenly, and a fifth carried by the first volume.
+fn slot_layout(volumes: usize, slots: usize) -> Vec<usize> {
+    assert!(
+        4 % volumes == 0 && matches!(slots, 4 | 5),
+        "{volumes} x {slots}"
+    );
+    let mut layout = vec![4 / volumes; volumes];
+    layout[0] += slots - 4;
+    layout
+}
+
+/// A schedule names slot `file * 2 + article` whatever the volumes' own
+/// article counts; slots number the volumes' articles in file order.
+fn slot_article(layout: &[usize], slot: u32) -> (u32, u32) {
+    let mut first = 0;
+    for (file, &articles) in layout.iter().enumerate() {
+        if slot < first + articles as u32 {
+            return (file as u32, slot - first);
+        }
+        first += articles as u32;
+    }
+    panic!("slot {slot} beyond {layout:?}");
+}
+
+fn article_slot(layout: &[usize], file: u32, article: u32) -> u32 {
+    layout[..file as usize].iter().sum::<usize>() as u32 + article
+}
+
+/// Every slot once, in order, as a schedule names it.
+fn slot_arrivals(slots: usize) -> Vec<(u32, u32)> {
+    (0..slots as u32).map(|slot| (slot / 2, slot % 2)).collect()
 }
 
 pub(super) struct Outcome {
@@ -211,6 +248,14 @@ impl ExtractionProfile {
                         action: BoundaryAction::Demote,
                         ..
                     }
+                    | Interruption::Twice {
+                        first: BoundaryAction::Demote,
+                        ..
+                    }
+                    | Interruption::Twice {
+                        second: BoundaryAction::Demote,
+                        ..
+                    }
             )
     }
 
@@ -278,10 +323,20 @@ impl ExtractionProfile {
         if self != Self::DirectStore {
             assert!(outcome.demotions.is_empty(), "{trace:?}");
         } else if route.direct && schedule_only {
-            // The schedule claimed one set; the others stay direct.
+            // The schedule claimed one set; the others stay direct. A restart
+            // after the claim restores the job without it, and the claimed set
+            // then routes direct afresh.
+            let forgotten = matches!(
+                interruption,
+                Interruption::Twice {
+                    first: BoundaryAction::Demote,
+                    second: BoundaryAction::Restart | BoundaryAction::Crash,
+                    ..
+                }
+            ) && outcome.finalized == route.sets;
             assert_eq!(
                 outcome.finalized,
-                route.sets - 1,
+                route.sets - usize::from(!forgotten),
                 "a set the schedule left alone left the direct route: {trace:?}"
             );
         } else if unnamed && outcome.demotions.is_empty() {
@@ -358,6 +413,17 @@ pub(super) enum Interruption {
     Starved {
         mask: u8,
     },
+    /// Two boundary actions in one run, the first never after the second.
+    /// At a shared boundary both happen before that boundary's arrival, in
+    /// order. An empty mask loses nothing and posts no recovery set.
+    Twice {
+        mask: u8,
+        index_first: bool,
+        first: BoundaryAction,
+        first_at: usize,
+        second: BoundaryAction,
+        second_at: usize,
+    },
 }
 
 /// Which slice of a campaign one test runs.
@@ -382,6 +448,9 @@ impl Interruption {
                 mask, index_first, ..
             } => Some((mask, index_first)),
             Self::Starved { mask } => Some((mask, false)),
+            Self::Twice {
+                mask, index_first, ..
+            } if mask != 0 => Some((mask, index_first)),
             _ => None,
         }
     }
@@ -399,6 +468,36 @@ impl Interruption {
             Self::Combined { action, at, .. } if at == boundary => action,
             _ => BoundaryAction::None,
         }
+    }
+
+    /// Each boundary of a run over `arrivals` articles, with the action taken
+    /// there and whether that boundary's arrival follows it. A boundary with
+    /// two actions appears twice, and its arrival follows only the second.
+    fn boundaries(self, arrivals: usize) -> Vec<(usize, BoundaryAction, bool)> {
+        let mut boundaries = Vec::new();
+        for step in 0..=arrivals {
+            match self {
+                Self::Twice {
+                    first,
+                    first_at,
+                    second,
+                    second_at,
+                    ..
+                } => {
+                    if first_at == step {
+                        boundaries.push((step, first, second_at != step));
+                    }
+                    if second_at == step {
+                        boundaries.push((step, second, true));
+                    }
+                    if first_at != step && second_at != step {
+                        boundaries.push((step, BoundaryAction::None, true));
+                    }
+                }
+                _ => boundaries.push((step, self.action_at(step), true)),
+            }
+        }
+        boundaries
     }
 }
 
@@ -666,19 +765,22 @@ async fn deliver_schedule_refetches(
     pipeline: &mut Pipeline,
     job: JobId,
     volumes: &[(String, Vec<u8>)],
-    articles: usize,
+    layout: &[usize],
     mask: u8,
-    recovery: Option<&(u32, Vec<u8>)>,
+    recovery: &[ScheduleRecovery],
 ) {
-    let state = pipeline.jobs.get_mut(&job).unwrap();
+    // A job that failed while the queues settled has already been retired.
+    let Some(state) = pipeline.jobs.get_mut(&job) else {
+        return;
+    };
     let mut available = Vec::new();
     for queue in [&mut state.download_queue, &mut state.recovery_queue] {
         for work in queue.drain_all() {
             let file = work.segment_id.file_id.file_index;
             let article = work.segment_id.segment_number;
             if (file < volumes.len() as u32
-                && mask & (1 << (file * articles as u32 + article)) == 0)
-                || recovery.is_some_and(|(index, _)| file == *index)
+                && mask & (1 << article_slot(layout, file, article)) == 0)
+                || recovery.iter().any(|carrier| carrier.index == file)
             {
                 if !available.contains(&(file, article)) {
                     available.push((file, article));
@@ -691,21 +793,63 @@ async fn deliver_schedule_refetches(
     }
     for (file, article) in available {
         if file < volumes.len() as u32 {
+            let articles = layout[file as usize];
             deliver_schedule_article(pipeline, job, volumes, file, article, articles).await;
         } else {
-            let (index, bytes) = recovery.expect("queued recovery has fixture bytes");
-            retire_schedule_article(pipeline, job, *index, article);
+            let carrier = recovery
+                .iter()
+                .find(|carrier| carrier.index == file)
+                .expect("queued recovery has fixture bytes");
+            submit_schedule_recovery(pipeline, job, carrier, article).await;
+        }
+    }
+}
+
+/// A recovery file whose bytes the schedule holds, to hand over when due.
+struct ScheduleRecovery {
+    index: u32,
+    name: String,
+    bytes: Vec<u8>,
+    format: RecoveryFormat,
+}
+
+async fn submit_schedule_recovery(
+    pipeline: &mut Pipeline,
+    job: JobId,
+    recovery: &ScheduleRecovery,
+    article: u32,
+) {
+    retire_schedule_article(pipeline, job, recovery.index, article);
+    let file = NzbFileId {
+        job_id: job,
+        file_index: recovery.index,
+    };
+    match recovery.format {
+        RecoveryFormat::Par2 => {
             submit_decoded_segment(
                 pipeline,
-                NzbFileId {
-                    job_id: job,
-                    file_index: *index,
-                },
+                file,
                 article,
                 0,
-                bytes,
-                "silver.horizon.par2",
+                &recovery.bytes,
+                &recovery.name,
                 None,
+            )
+            .await;
+        }
+        // A carrier states its true length, as a poster's does.
+        RecoveryFormat::Par3 => {
+            submit_decoded_segment_declaring(
+                pipeline,
+                file,
+                article,
+                0,
+                &recovery.bytes,
+                &recovery.name,
+                None,
+                true,
+                None,
+                recovery.bytes.len() as u64,
             )
             .await;
         }
@@ -716,7 +860,9 @@ async fn deliver_schedule_refetches(
 /// Both follow from the schedule, so across the arrival orders every boundary
 /// sees a budget demotion and a source-damage one against each set.
 fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize, DemotionReason) {
-    let (file, article) = order[0];
+    // A schedule that lost every article has no set to claim and nothing to
+    // seed from.
+    let (file, article) = order.first().copied().unwrap_or_default();
     let seed = step + file as usize * 2 + article as usize;
     let reason = if seed.is_multiple_of(2) {
         DemotionReason::HoldsBudgetExceeded
@@ -724,6 +870,63 @@ fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize,
         DemotionReason::VolumeCrcMismatch
     };
     ((seed / 2) % sets.max(1), reason)
+}
+
+/// What a schedule's recovery set is authored as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RecoveryFormat {
+    /// One PAR2 file carrying the descriptions and every recovery block.
+    Par2,
+    /// A PAR3 index and its recovery volumes. The index arrives where the
+    /// PAR2 file would; a recovery volume arrives when the pipeline asks.
+    Par3,
+}
+
+/// Who a schedule's demote action claims, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DemotionChoice {
+    /// [`scheduled_demotion`] picks the set and the reason; speculative
+    /// extraction is withdrawn for good, as yielded memory.
+    Scheduled,
+    /// Every demote action claims `set` under `reason` and withdraws
+    /// speculative extraction under `chase`, latched by `latch`.
+    Fixed {
+        set: usize,
+        reason: DemotionReason,
+        chase: ChaseDemotion,
+        latch: AbortLatch,
+    },
+}
+
+impl DemotionChoice {
+    fn direct(self, order: &[(u32, u32)], step: usize, sets: usize) -> (usize, DemotionReason) {
+        match self {
+            Self::Scheduled => scheduled_demotion(order, step, sets),
+            Self::Fixed { set, reason, .. } => (set, reason),
+        }
+    }
+
+    fn chase(self) -> (AbortLatch, ChaseDemotion) {
+        match self {
+            Self::Scheduled => (AbortLatch::Permanent, ChaseDemotion::MemoryYielded),
+            Self::Fixed { chase, latch, .. } => (latch, chase),
+        }
+    }
+}
+
+/// How a schedule is driven besides its arrivals and its interruption.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ScheduleOptions {
+    pub recovery: RecoveryFormat,
+    pub demotion: DemotionChoice,
+}
+
+impl ScheduleOptions {
+    /// What every campaign of the archive matrix proper runs under.
+    pub(super) const MATRIX: Self = Self {
+        recovery: RecoveryFormat::Par2,
+        demotion: DemotionChoice::Scheduled,
+    };
 }
 
 pub(super) async fn run_profile_schedule(
@@ -743,6 +946,31 @@ pub(super) async fn run_profile_schedule(
 /// loss it arrives first and holds no recovery blocks.
 pub(super) async fn run_described_schedule(
     profile: ExtractionProfile,
+    spec: JobSpec,
+    volumes: &[(String, Vec<u8>)],
+    described: Option<&[String]>,
+    order: &[(u32, u32)],
+    wanted: &[&str],
+    interruption: Interruption,
+) -> Outcome {
+    run_schedule_with(
+        ScheduleOptions::MATRIX,
+        profile,
+        spec,
+        volumes,
+        described,
+        order,
+        wanted,
+        interruption,
+    )
+    .await
+}
+
+/// [`run_described_schedule`] under `options`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_schedule_with(
+    options: ScheduleOptions,
+    profile: ExtractionProfile,
     mut spec: JobSpec,
     volumes: &[(String, Vec<u8>)],
     described: Option<&[String]>,
@@ -751,19 +979,19 @@ pub(super) async fn run_described_schedule(
     interruption: Interruption,
 ) -> Outcome {
     enable_schedule_trace();
-    let articles = spec.files[0].segments.len();
-    assert_eq!(volumes.len() * articles, 4, "four scheduled article slots");
-    assert!(
-        spec.files[..volumes.len()]
-            .iter()
-            .all(|file| file.segments.len() == articles)
+    let layout: Vec<usize> = spec.files[..volumes.len()]
+        .iter()
+        .map(|file| file.segments.len())
+        .collect();
+    assert_eq!(
+        layout,
+        slot_layout(volumes.len(), layout.iter().sum()),
+        "four or five scheduled article slots"
     );
+    let articles = |file: u32| layout[file as usize];
     let order: Vec<_> = order
         .iter()
-        .map(|&(file, article)| {
-            let slot = file * 2 + article;
-            (slot / articles as u32, slot % articles as u32)
-        })
+        .map(|&(file, article)| slot_article(&layout, file * 2 + article))
         .collect();
     let root = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
@@ -810,39 +1038,55 @@ pub(super) async fn run_described_schedule(
         } else {
             blocks
         };
-        let bytes = build_test_par2_with_recovery(&described, slice as u64, blocks);
-        let index = append_par2_index(&mut spec, &bytes);
-        Some((index, bytes))
+        match options.recovery {
+            RecoveryFormat::Par2 => {
+                let bytes = build_test_par2_with_recovery(&described, slice as u64, blocks);
+                let index = append_par2_index(&mut spec, &bytes);
+                vec![ScheduleRecovery {
+                    index,
+                    name: "silver.horizon.par2".to_string(),
+                    bytes,
+                    format: RecoveryFormat::Par2,
+                }]
+            }
+            RecoveryFormat::Par3 => {
+                let described: Vec<_> = described
+                    .iter()
+                    .map(|(name, bytes)| (name.to_string(), bytes.to_vec()))
+                    .collect();
+                let mut carriers = par3_carriers_over(&described, slice as u64, blocks);
+                // The index leads: it is what arrives where a PAR2 file would.
+                carriers.sort_by_key(|(name, _)| name.contains(".vol"));
+                let indices = append_single_article_files(&mut spec, &carriers);
+                indices
+                    .into_iter()
+                    .zip(carriers)
+                    .map(|(index, (name, bytes))| ScheduleRecovery {
+                        index,
+                        name,
+                        bytes,
+                        format: RecoveryFormat::Par3,
+                    })
+                    .collect()
+            }
+        }
     } else {
-        None
+        Vec::new()
     };
     insert_active_job(&mut pipeline, job, spec.clone()).await;
     let mut trace = vec![];
-    if let Some((index, bytes)) = recovery.as_ref()
+    if let Some(index) = recovery.first()
         && index_first
     {
-        retire_schedule_article(&mut pipeline, job, *index, 0);
-        submit_decoded_segment(
-            &mut pipeline,
-            NzbFileId {
-                job_id: job,
-                file_index: *index,
-            },
-            0,
-            0,
-            bytes,
-            "silver.horizon.par2",
-            None,
-        )
-        .await;
+        submit_schedule_recovery(&mut pipeline, job, index, 0).await;
     }
-    for step in 0..=order.len() {
-        match interruption.action_at(step) {
+    for (step, action, arrives) in interruption.boundaries(order.len()) {
+        match action {
             BoundaryAction::Demote => {
                 if profile == ExtractionProfile::DirectStore {
                     let before = pipeline.direct_store.demotions.len();
                     let sets = pipeline.direct_store.sets_for(job).len();
-                    let (set, reason) = scheduled_demotion(&order, step, sets);
+                    let (set, reason) = options.demotion.direct(&order, step, sets);
                     pipeline.demote_direct_set(job, set, reason).await;
                     if pipeline.direct_store.demotions.len() != before {
                         schedule_demoted = Some(reason);
@@ -850,14 +1094,12 @@ pub(super) async fn run_described_schedule(
                 }
                 // An incompatible set may already have left direct store and
                 // started chase. Withdraw that owner at the same boundary too.
-                use crate::pipeline::direct_unpack::wiring::{
-                    AbortLatch, DemotionReason as ChaseDemotion,
-                };
+                let (latch, chase) = options.demotion.chase();
                 pipeline.direct_unpack_abort_job(
                     job,
                     "schedule withdraws speculative extraction",
-                    AbortLatch::Permanent,
-                    ChaseDemotion::MemoryYielded,
+                    latch,
+                    chase,
                 );
                 settle_direct_post_repair_work(&mut pipeline).await;
                 trace.push(format!("demote at {step}"));
@@ -868,6 +1110,13 @@ pub(super) async fn run_described_schedule(
                         .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
                         .await;
                 }
+                // A later interruption makes a promise of its own. What the run
+                // asked for again under an earlier one answers to that one:
+                // keep only the requests that broke it, and carry them over.
+                let broken = durable.take().map(|promise: BTreeSet<_>| {
+                    rerequested.retain(|article| promise.contains(article));
+                    rerequested.clone()
+                });
                 durable = Some(if action == BoundaryAction::Restart {
                     // What the barrier just published is what the restart may
                     // rely on. Bytes held without a destination are not in it.
@@ -880,7 +1129,7 @@ pub(super) async fn run_described_schedule(
                             let installed = snapshot::decode_installed(blob).unwrap();
                             for (_, file_index) in installed.volumes {
                                 kept.extend(
-                                    (0..articles as u32)
+                                    (0..articles(file_index) as u32)
                                         .map(|article| (file_index, article))
                                         .filter(|article| delivered.contains(article)),
                                 );
@@ -893,6 +1142,7 @@ pub(super) async fn run_described_schedule(
                             let Some((_, bytes)) = volumes.get(floor.file_index as usize) else {
                                 continue;
                             };
+                            let articles = articles(floor.file_index);
                             let covered = (0..articles as u32)
                                 .take_while(|article| {
                                     article_extent(bytes.len(), *article, articles).1 as u64
@@ -915,6 +1165,9 @@ pub(super) async fn run_described_schedule(
                 } else {
                     BTreeSet::new()
                 });
+                if let (Some(promise), Some(broken)) = (durable.as_mut(), broken) {
+                    promise.extend(broken);
+                }
                 let counters = pipeline.direct_unpack.counters();
                 chase_armed += counters.armed;
                 chase_consumed += counters.consumed;
@@ -985,13 +1238,17 @@ pub(super) async fn run_described_schedule(
             }
             BoundaryAction::None => {}
         }
+        if !arrives {
+            continue;
+        }
         let Some(&(file, article)) = order.get(step) else {
             break;
         };
-        if loss.is_some_and(|(mask, _)| mask & (1 << (file * articles as u32 + article)) != 0) {
+        if loss.is_some_and(|(mask, _)| mask & (1 << article_slot(&layout, file, article)) != 0) {
             trace.push(format!("lost {file}:{article}"));
             continue;
         }
+        let articles = articles(file);
         deliver_schedule_article(&mut pipeline, job, volumes, file, article, articles).await;
         delivered.insert((file, article));
         trace.push(format!(
@@ -999,24 +1256,11 @@ pub(super) async fn run_described_schedule(
             pipeline.direct_store.sets_for(job)
         ));
     }
-    if let Some((index, bytes)) = recovery.as_ref()
+    if let Some(index) = recovery.first()
         && !index_first
         && retired.is_none()
     {
-        retire_schedule_article(&mut pipeline, job, *index, 0);
-        submit_decoded_segment(
-            &mut pipeline,
-            NzbFileId {
-                job_id: job,
-                file_index: *index,
-            },
-            0,
-            0,
-            bytes,
-            "silver.horizon.par2",
-            None,
-        )
-        .await;
+        submit_schedule_recovery(&mut pipeline, job, index, 0).await;
     }
     // Every wait below is for a registered operation. A demotion can request
     // more articles; service those before waiting for an extraction result.
@@ -1030,9 +1274,9 @@ pub(super) async fn run_described_schedule(
                 &mut pipeline,
                 job,
                 volumes,
-                articles,
+                &layout,
                 mask,
-                recovery.as_ref(),
+                &recovery,
             )
             .await;
         }
@@ -1055,9 +1299,9 @@ pub(super) async fn run_described_schedule(
                     &mut pipeline,
                     job,
                     volumes,
-                    articles,
+                    &layout,
                     mask,
-                    recovery.as_ref(),
+                    &recovery,
                 )
                 .await;
             } else {
@@ -1069,7 +1313,8 @@ pub(super) async fn run_described_schedule(
                     ) {
                         break;
                     }
-                    dispatch_and_submit(&mut pipeline, job, volumes, file, article, articles).await;
+                    dispatch_and_submit(&mut pipeline, job, volumes, file, article, articles(file))
+                        .await;
                 }
                 continue;
             }
@@ -1100,7 +1345,7 @@ pub(super) async fn run_described_schedule(
                 .await
                 .expect("registered extraction receipt");
             pipeline.handle_extraction_done(done).await;
-        } else if recovery.is_none() {
+        } else if recovery.is_empty() {
             panic!(
                 "archive stalled without an outstanding operation: {} trace={trace:?}",
                 debug_job_state(&pipeline, job)
@@ -1282,6 +1527,7 @@ enum Format {
     /// Volume names that say nothing. The recovery set carries the real
     /// names, as an obfuscated post's does, and the set is admitted by them.
     Rar5Obfuscated,
+    Rar4Obfuscated,
 }
 
 impl Format {
@@ -1306,7 +1552,7 @@ impl Format {
             | Self::Rar5EncryptedHeaders
             | Self::QuickOpen => Route::DIRECT,
             // Slots 0 and 2 are the two volumes' offset-zero articles.
-            Self::Rar5Obfuscated => Route {
+            Self::Rar5Obfuscated | Self::Rar4Obfuscated => Route {
                 unnamed_loss: |mask| mask & 0b0101 != 0,
                 ..Route::DIRECT
             },
@@ -1336,6 +1582,36 @@ async fn conventional_campaign(format: Format, selection: Selection) {
 }
 
 async fn profile_campaign(format: Format, selection: Selection, profile: ExtractionProfile) {
+    let cases = selected_schedules(selection);
+    let wrong_password = wrong_password_schedules(selection);
+    slot_campaign(
+        format,
+        selection,
+        profile,
+        4,
+        wrong_password,
+        cases,
+        |_, _, _, _| false,
+    )
+    .await;
+}
+
+/// Adjusts a case's outcome for a product defect the campaign holds open,
+/// before the case's rules see it. True holds the whole case open: none of
+/// its rules apply.
+type KnownDefect = fn(Format, &[(u32, u32)], Interruption, &mut Outcome) -> bool;
+
+/// A format's campaign over `slots` article slots (see [`slot_layout`]): the
+/// given wrong-password schedules, then each case held to the same rules.
+async fn slot_campaign(
+    format: Format,
+    selection: Selection,
+    profile: ExtractionProfile,
+    slots: usize,
+    wrong_password: Vec<Schedule>,
+    cases: Vec<(usize, Schedule)>,
+    known_defect: KnownDefect,
+) {
     let name = "nested/feature.mkv";
     let password = "moonlit-harbour";
     let length = match format {
@@ -1343,7 +1619,7 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
         // A described volume is bound by the fingerprint of its first 16 KiB,
         // which its offset-zero article has to cover whole, as every real
         // article does. Two articles a volume puts that at 32 KiB a volume.
-        Format::Rar5Obfuscated => 70_001,
+        Format::Rar5Obfuscated | Format::Rar4Obfuscated => 70_001,
         _ => 6001,
     };
     let payload: Vec<u8> = (0..length)
@@ -1356,6 +1632,9 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
         }
         Format::Rar5 | Format::Rar5FourVolumes => single_member_store_set(name, &payload, count),
         Format::Rar5Obfuscated => obfuscate_volumes(&single_member_store_set(name, &payload, 2)),
+        Format::Rar4Obfuscated => {
+            obfuscate_volumes(&single_member_rar4_store_set(name, &payload, 2))
+        }
         Format::Rar4Encrypted | Format::Rar4EncryptedFourVolumes => {
             encrypted_rar4_store_set(name, &payload, count, password, Some(TEST_RAR4_SALT))
         }
@@ -1399,8 +1678,13 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
             .unwrap();
         assert_eq!(extracted, payload);
     }
-    let described = matches!(format, Format::Rar5Obfuscated).then(|| {
-        single_member_store_set(name, &payload, 2)
+    let described = match format {
+        Format::Rar5Obfuscated => Some(single_member_store_set(name, &payload, 2)),
+        Format::Rar4Obfuscated => Some(single_member_rar4_store_set(name, &payload, 2)),
+        _ => None,
+    }
+    .map(|volumes| {
+        volumes
             .into_iter()
             .map(|(name, _)| name)
             .collect::<Vec<_>>()
@@ -1417,26 +1701,36 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
     );
     let mut spec =
         direct_store_job_spec_with_articles("Archive schedules", &volumes, 4 / count);
+    for (file, articles) in slot_layout(count, slots).into_iter().enumerate() {
+        if articles != spec.files[file].segments.len() {
+            let volume = &volumes[file..=file];
+            spec.files[file] = direct_store_job_spec_with_articles("", volume, articles)
+                .files
+                .remove(0);
+        }
+    }
     spec.password = encrypted.then(|| password.to_string());
     let baseline = run_described_schedule(
         ExtractionProfile::Conventional,
         spec.clone(),
         &volumes,
         described.as_deref(),
-        &in_order_arrivals(2),
+        &slot_arrivals(slots),
         &[name],
         Interruption::None,
     )
     .await;
-    assert_eq!(baseline.status, Some(JobStatus::Complete));
-    ExtractionProfile::Conventional.assert_route(&baseline);
-    assert!(
-        baseline.files[name].as_deref() == Some(payload.as_slice()),
-        "conventional oracle {format:?}"
-    );
+    {
+        assert_eq!(baseline.status, Some(JobStatus::Complete));
+        ExtractionProfile::Conventional.assert_route(&baseline);
+        assert!(
+            baseline.files[name].as_deref() == Some(payload.as_slice()),
+            "conventional oracle {format:?}"
+        );
+    }
     // A password the archive does not open with. An archive that needs none
     // must not notice it.
-    for (order, interruption) in wrong_password_schedules(selection) {
+    for (order, interruption) in wrong_password {
         if !profile.includes(interruption) {
             continue;
         }
@@ -1464,14 +1758,14 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
             assert_eq!(outcome.files[name].as_deref(), Some(payload.as_slice()));
         }
     }
-    for (case, (order, interruption)) in selected_schedules(selection) {
+    for (case, (order, interruption)) in cases {
         if !profile.includes(interruption) {
             continue;
         }
         eprintln!(
             "{format:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        let actual = run_described_schedule(
+        let mut actual = run_described_schedule(
             profile,
             spec.clone(),
             &volumes,
@@ -1481,9 +1775,20 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
             interruption,
         )
         .await;
+        if known_defect(format, &order, interruption, &mut actual) {
+            continue;
+        }
         if interruption.fails() {
             profile.assert_rejected(&actual, &[name]);
             continue;
+        }
+        let mut route = format.route();
+        if matches!(format, Format::Rar4Obfuscated) {
+            // A RAR4 volume says nothing of its set in its own headers, so a
+            // recovery set that arrives last finds every volume already landed.
+            if interruption.loss().is_some_and(|(_, first)| !first) {
+                route.unnamed_loss = |_| true;
+            }
         }
         assert_eq!(
             actual.status,
@@ -1491,11 +1796,11 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
             "{format:?} case={case} order={order:?} interruption={interruption:?} trace={:?}",
             actual.trace
         );
-        profile.assert_delivery(&actual, format.route(), &[name], interruption);
+        profile.assert_delivery(&actual, route, &[name], interruption);
         // A duplicate can invalidate an already-running RAR chase. Clean
         // unique arrivals must consume chase; duplicate schedules still must
         // admit it and produce the same verified output through safe fallback.
-        let unique_arrivals = order.len() == 4;
+        let unique_arrivals = order.len() == slots;
         if profile == ExtractionProfile::Chase && matches!(interruption, Interruption::None) {
             assert!(actual.chase_armed > 0, "{format:?}: {:?}", actual.trace);
             if unique_arrivals {
@@ -1712,6 +2017,24 @@ enum CompressedFormat {
     Rar5LzTwoVolumes,
     Rar4LzFourVolumes,
     Rar5LzFourVolumes,
+    // A solid stream continued across every volume, with members after the
+    // spanning one; and data or headers encrypted across every volume.
+    Rar4SolidTwoVolumes,
+    Rar5SolidTwoVolumes,
+    Rar4SolidFourVolumes,
+    Rar5SolidFourVolumes,
+    Rar4EncryptedTwoVolumes,
+    Rar5EncryptedTwoVolumes,
+    Rar4EncryptedFourVolumes,
+    Rar5EncryptedFourVolumes,
+    Rar4HeadersTwoVolumes,
+    Rar5HeadersTwoVolumes,
+    Rar4HeadersFourVolumes,
+    Rar5HeadersFourVolumes,
+    Rar4SolidEncryptedTwoVolumes,
+    Rar5SolidEncryptedTwoVolumes,
+    Rar4SolidEncryptedFourVolumes,
+    Rar5SolidEncryptedFourVolumes,
 }
 
 impl CompressedFormat {
@@ -1739,6 +2062,26 @@ impl CompressedFormat {
             Self::Rar5LzTwoVolumes => volumes!("rar5_lz_two", "01", "02"),
             Self::Rar4LzFourVolumes => volumes!("rar4_lz_four", "01", "02", "03", "04"),
             Self::Rar5LzFourVolumes => volumes!("rar5_lz_four", "01", "02", "03", "04"),
+            Self::Rar4SolidTwoVolumes => volumes!("rar4_solid_two", "01", "02"),
+            Self::Rar5SolidTwoVolumes => volumes!("rar5_solid_two", "01", "02"),
+            Self::Rar4SolidFourVolumes => volumes!("rar4_solid_four", "01", "02", "03", "04"),
+            Self::Rar5SolidFourVolumes => volumes!("rar5_solid_four", "01", "02", "03", "04"),
+            Self::Rar4EncryptedTwoVolumes => volumes!("rar4_enc_two", "01", "02"),
+            Self::Rar5EncryptedTwoVolumes => volumes!("rar5_enc_two", "01", "02"),
+            Self::Rar4EncryptedFourVolumes => volumes!("rar4_enc_four", "01", "02", "03", "04"),
+            Self::Rar5EncryptedFourVolumes => volumes!("rar5_enc_four", "01", "02", "03", "04"),
+            Self::Rar4HeadersTwoVolumes => volumes!("rar4_hp_two", "01", "02"),
+            Self::Rar5HeadersTwoVolumes => volumes!("rar5_hp_two", "01", "02"),
+            Self::Rar4HeadersFourVolumes => volumes!("rar4_hp_four", "01", "02", "03", "04"),
+            Self::Rar5HeadersFourVolumes => volumes!("rar5_hp_four", "01", "02", "03", "04"),
+            Self::Rar4SolidEncryptedTwoVolumes => volumes!("rar4_solid_enc_two", "01", "02"),
+            Self::Rar5SolidEncryptedTwoVolumes => volumes!("rar5_solid_enc_two", "01", "02"),
+            Self::Rar4SolidEncryptedFourVolumes => {
+                volumes!("rar4_solid_enc_four", "01", "02", "03", "04")
+            }
+            Self::Rar5SolidEncryptedFourVolumes => {
+                volumes!("rar5_solid_enc_four", "01", "02", "03", "04")
+            }
             _ => None,
         }
     }
@@ -1782,13 +2125,34 @@ impl CompressedFormat {
             Self::Rar4PpmdHeaders => {
                 fixture!("rar4_solid_ppmd_headers.rar", Some("moonlit-harbour"))
             }
-            Self::Rar4Encrypted => fixture!("rar4_enc_lz.rar", Some("testpass123")),
+            // A header-encrypted set packs the member the data-encrypted one
+            // does, under the same password.
+            Self::Rar4Encrypted
+            | Self::Rar4EncryptedTwoVolumes
+            | Self::Rar4EncryptedFourVolumes
+            | Self::Rar4HeadersTwoVolumes
+            | Self::Rar4HeadersFourVolumes => fixture!("rar4_enc_lz.rar", Some("testpass123")),
             Self::Rar4Headers => fixture!("rar4_hp_lz.rar", Some("secretpass")),
             Self::Rar5Mixed => fixture!("rar5_multifile_lz.rar", None),
             Self::Rar5Lz | Self::Rar5LzTwoVolumes | Self::Rar5LzFourVolumes => {
                 fixture!("rar5_lz.rar", None)
             }
-            Self::Rar5Encrypted => fixture!("rar5_enc_lz.rar", Some("testpass123")),
+            Self::Rar5Encrypted
+            | Self::Rar5EncryptedTwoVolumes
+            | Self::Rar5EncryptedFourVolumes
+            | Self::Rar5HeadersTwoVolumes
+            | Self::Rar5HeadersFourVolumes => fixture!("rar5_enc_lz.rar", Some("testpass123")),
+            // The members decode the same from either format's archive.
+            Self::Rar4SolidTwoVolumes
+            | Self::Rar5SolidTwoVolumes
+            | Self::Rar4SolidFourVolumes
+            | Self::Rar5SolidFourVolumes => fixture!("rar5_solid_text.rar", None),
+            Self::Rar4SolidEncryptedTwoVolumes
+            | Self::Rar5SolidEncryptedTwoVolumes
+            | Self::Rar4SolidEncryptedFourVolumes
+            | Self::Rar5SolidEncryptedFourVolumes => {
+                fixture!("rar5_solid_text_encrypted.rar", Some("moonlit-harbour"))
+            }
             Self::Rar5Headers => fixture!("rar5_hp_lz.rar", Some("secretpass")),
             Self::Rar5Solid => fixture!("rar5_solid_small.rar", None),
             Self::Rar5SolidEncrypted => {
@@ -1820,20 +2184,38 @@ impl CompressedFormat {
             | Self::Rar5LzFourVolumes => {
                 Route::refused(|reason| matches!(reason, MemberIneligible(Compressed)))
             }
-            Self::Rar4Solid | Self::Rar4Ppmd | Self::Rar5Solid => Route::refused(|reason| {
+            Self::Rar4Solid
+            | Self::Rar4Ppmd
+            | Self::Rar5Solid
+            | Self::Rar4SolidTwoVolumes
+            | Self::Rar5SolidTwoVolumes
+            | Self::Rar4SolidFourVolumes
+            | Self::Rar5SolidFourVolumes => Route::refused(|reason| {
                 matches!(reason, MemberIneligible(Compressed | Solid))
             }),
             Self::Rar4Encrypted
             | Self::Rar4SolidEncrypted
             | Self::Rar4PpmdEncrypted
             | Self::Rar5Encrypted
-            | Self::Rar5SolidEncrypted => Route::refused(|reason| {
+            | Self::Rar5SolidEncrypted
+            | Self::Rar4EncryptedTwoVolumes
+            | Self::Rar5EncryptedTwoVolumes
+            | Self::Rar4EncryptedFourVolumes
+            | Self::Rar5EncryptedFourVolumes
+            | Self::Rar4SolidEncryptedTwoVolumes
+            | Self::Rar5SolidEncryptedTwoVolumes
+            | Self::Rar4SolidEncryptedFourVolumes
+            | Self::Rar5SolidEncryptedFourVolumes => Route::refused(|reason| {
                 matches!(reason, MemberIneligible(Compressed | Solid | Encrypted))
             }),
             Self::Rar4Headers
             | Self::Rar4SolidHeaders
             | Self::Rar4PpmdHeaders
             | Self::Rar5Headers
+            | Self::Rar4HeadersTwoVolumes
+            | Self::Rar5HeadersTwoVolumes
+            | Self::Rar4HeadersFourVolumes
+            | Self::Rar5HeadersFourVolumes
             // Headers that open with the password refuse the member they
             // describe, which is itself encrypted.
             | Self::Rar5SolidHeaders => Route::refused(|reason| {

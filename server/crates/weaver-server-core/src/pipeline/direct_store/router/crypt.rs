@@ -1173,6 +1173,14 @@ pub(crate) struct MemberCrypt {
     /// plaintext is written: recovering block *N−1* from the destination would
     /// mean re-encrypting the member from its IV.
     checkpoints: BTreeMap<u64, [u8; 16]>,
+    /// Checkpoints a restore seeded, which pruning leaves alone.
+    ///
+    /// The row does not say which of its checkpoints was a run's frontier and
+    /// which a run's own predecessor, and `decrypted` — what pruning reads —
+    /// starts empty in a resumed process. Guessing wrong drops the only seed of
+    /// a run that begins right after a hole. A row carries a handful, so
+    /// keeping them all costs nothing.
+    restored_checkpoints: std::collections::BTreeSet<u64>,
     /// Cipher ranges this process has decrypted. Only the run *ends* are read —
     /// they are what a checkpoint is allowed to sit at.
     decrypted: ByteRanges,
@@ -1268,6 +1276,7 @@ impl MemberCrypt {
             tail_padding: 0,
             edge_plain: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            restored_checkpoints: std::collections::BTreeSet::new(),
             decrypted: ByteRanges::new(),
             #[cfg(test)]
             decrypted_bytes: 0,
@@ -1451,6 +1460,8 @@ impl MemberCrypt {
         // when that block does not overlap the rewrite.
         self.checkpoints
             .retain(|end, _| *end <= from || end.saturating_sub(AES_BLOCK) >= to);
+        self.restored_checkpoints
+            .retain(|end| *end <= from || end.saturating_sub(AES_BLOCK) >= to);
         // The rewritten range is no longer decrypted by this process, so it can
         // neither hold a checkpoint of its own nor keep one alive through
         // `prune_checkpoints`. The span's own `decrypt_range` puts back exactly
@@ -1696,11 +1707,28 @@ impl MemberCrypt {
         };
         for (offset, block) in &stored.checkpoints {
             self.checkpoints.insert(*offset, *block);
+            self.restored_checkpoints.insert(*offset);
             // A checkpoint is a decrypted-run frontier, so the block it names is
             // decrypted by construction. Recording it keeps the pruning rule
             // from throwing the row away on the first live decrypt.
             self.decrypted
                 .insert(offset.saturating_sub(AES_BLOCK), AES_BLOCK);
+        }
+        // A checkpoint whose predecessor was carried beside it is a block this
+        // row can decrypt on its own, and the writer keeps such a pair for a
+        // block only part of which had been emitted. Its plaintext goes back
+        // where the unemitted share will look for it.
+        for (offset, block) in &stored.checkpoints {
+            let Some(block_start) = offset.checked_sub(AES_BLOCK) else {
+                continue;
+            };
+            let Some(preceding) = self.preceding_block(block_start) else {
+                continue;
+            };
+            let mut plain = *block;
+            if self.keys.key.decrypt_range(&preceding, &mut plain).is_ok() {
+                self.edge_plain.insert(block_start, plain);
+            }
         }
         Ok(())
     }
@@ -1714,9 +1742,25 @@ impl MemberCrypt {
     /// chain from the member's start. Both are answered off `decrypted`, so a
     /// checkpoint describing bytes this process no longer claims — a repair's,
     /// after [`Self::invalidate_repaired`] — is dropped by the same pass.
+    ///
+    /// A retained edge block keeps two more: its own cipher and that cipher's
+    /// predecessor. The block's plaintext is held only by this process, so a
+    /// restart that lands between its two shares leaves the unemitted share
+    /// with no source but these — the other share's cipher was routed and
+    /// dropped, and its article is not coming back.
     fn prune_checkpoints(&mut self) {
         let runs: Vec<(u64, u64)> = self.decrypted.ranges().to_vec();
+        let edges = &self.edge_plain;
+        let restored = &self.restored_checkpoints;
         self.checkpoints.retain(|offset, _| {
+            if restored.contains(offset)
+                || edges.contains_key(offset)
+                || offset
+                    .checked_sub(AES_BLOCK)
+                    .is_some_and(|block| edges.contains_key(&block))
+            {
+                return true;
+            }
             let strided = offset.is_multiple_of(CHECKPOINT_STRIDE);
             runs.iter().any(|(start, end)| {
                 // A frontier checkpoint sits exactly at a run's end, a run's

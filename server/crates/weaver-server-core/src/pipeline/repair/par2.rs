@@ -726,7 +726,25 @@ impl Pipeline {
             if let Some(canonical) = identity.canonical_filename.as_ref() {
                 by_canonical.insert(canonical.clone(), *file_id);
             }
-            if let weaver_model::files::FileRole::RarVolume { volume_number } = role {
+            // A probed volume whose headers state no number reads as volume 0
+            // in its role. That is right for a first volume and wrong for one
+            // that opens mid-member, and matching on it hands the first
+            // volume's described name to whichever volume happened to be
+            // probed. The headers do say which of the two this is.
+            let continues_a_member = identity
+                .classification
+                .as_ref()
+                .filter(|classification| classification.volume_index.is_none())
+                .and_then(|classification| {
+                    self.rar_sets
+                        .get(&(job_id, classification.set_name.clone()))
+                })
+                .and_then(|set| set.facts.get(&0))
+                .and_then(|facts| facts.members.first())
+                .is_some_and(|member| member.split_before);
+            if !continues_a_member
+                && let weaver_model::files::FileRole::RarVolume { volume_number } = role
+            {
                 by_rar_volume.insert(*volume_number, *file_id);
             }
         }

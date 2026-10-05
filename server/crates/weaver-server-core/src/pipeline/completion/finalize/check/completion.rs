@@ -294,6 +294,8 @@ impl Pipeline {
         {
             // An omitted index is protection metadata, not missing payload,
             // once alternate carriers authenticated and verified the set.
+            // Nor is the damaged posted copy of a file the set has since
+            // rebuilt under the name it describes.
             self.jobs[&job_id].assembly.files().any(|file| {
                 !file.is_complete()
                     && !matches!(
@@ -301,6 +303,7 @@ impl Pipeline {
                         weaver_model::files::FileRole::Par2 { .. }
                             | weaver_model::files::FileRole::Par3 { .. }
                     )
+                    && !self.recovery_superseded_source(job_id, file.file_id())
             })
         } else {
             complete_data_files < total_data_files

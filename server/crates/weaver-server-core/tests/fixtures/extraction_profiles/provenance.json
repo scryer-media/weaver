@@ -635,6 +635,808 @@
         ],
         "notes": "Volume 4 of 4: `rar a -ma5 -m3 -ep1 -v11k` over the 226 943-byte word-salad text. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_lz_four` in expected.json."
       }
+    },
+    {
+      "file": "rar4_solid_two.part01.rar",
+      "sha256": "0e81f54aceda7f13b955e77189997985beaafdbdf8996a7b51c055a3c6a2bb10",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -v24k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_two.part02.rar",
+      "sha256": "ca8b11498e1f68142fb3b1556ad264fcd6bec9cbc7374c2b0bbfedb4c4992447",
+      "size": 17518,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -v24k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_four.part01.rar",
+      "sha256": "a6fbce4eec0003f59a787814a961ceffca788cb2635b50ccbf6da9468f33ab71",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -v11k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_four.part02.rar",
+      "sha256": "8238fb15868da359c1234a660d56dddffef2440f1f9cc348d97dae0a1bc40318",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -v11k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_four.part03.rar",
+      "sha256": "f8fe131e0f85856618fbf95f44b34dc5309350ff87d1dc1e672f7ed4f9beabd6",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -v11k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_four.part04.rar",
+      "sha256": "c55a2e719fadbc6975085186da4571daba3499733eccdaca8ac6c8e7021576a9",
+      "size": 8488,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -v11k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_enc_two.part01.rar",
+      "sha256": "deb31d06dcec12380ed16873ab891b0d0eeb74ba1b8c3c0f943b0493e8330e5e",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -ptestpass123 -v24k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_enc_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_enc_two.part02.rar",
+      "sha256": "113b9e047f66a643997a1b4f7b7099aa3d8f737bf7f5d6eb6f401b4d2770c69f",
+      "size": 17386,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -ptestpass123 -v24k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_enc_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_enc_four.part01.rar",
+      "sha256": "18bd5ba0a86dda351f8e81e763ba2a5377158d73651240a712828bd2218ac98d",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -ptestpass123 -v11k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_enc_four.part02.rar",
+      "sha256": "f8e758b20666d4d895c6c435b3aa617ee4498a416347a759efb678c492a4576a",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -ptestpass123 -v11k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_enc_four.part03.rar",
+      "sha256": "6d833a8c1705cc1312c6c5b517dce6cf86e4d799393a2ba00abdfa6fc24fcb99",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -ptestpass123 -v11k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_enc_four.part04.rar",
+      "sha256": "76257c122c4324c8d3ff7579abc5e90ae9605a6cfe8620e37c3f057abc86e4a8",
+      "size": 8372,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -ptestpass123 -v11k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_hp_two.part01.rar",
+      "sha256": "6925760c82073f663ba7d7bd7c12581e194d60ba63aa310eda3fb15ea74ad279",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -hptestpass123 -v24k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_hp_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_hp_two.part02.rar",
+      "sha256": "d5e280bc9bea5f4a84098bb0828fd4821dd56fdae78ea81f1eccff803da49982",
+      "size": 17448,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -hptestpass123 -v24k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_hp_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_hp_four.part01.rar",
+      "sha256": "a5332baf74e9552f8a6465155c4cf3245686b082ccefa243d21be2998ca7077b",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -hptestpass123 -v11k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_hp_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_hp_four.part02.rar",
+      "sha256": "de4fb39d4e851111dbf4147197efa00ae315a4133e219a8e423af4834d4dc441",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -hptestpass123 -v11k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_hp_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_hp_four.part03.rar",
+      "sha256": "fa024784b78943b06114f2c28cc19208acf467c6d86da1415f645cdf683c5ee5",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -hptestpass123 -v11k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_hp_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_hp_four.part04.rar",
+      "sha256": "29b8ae2d1c87bc8dec54ab5fb23de9318faff2d493cff47a79dca326d84cef1c",
+      "size": 8496,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -hptestpass123 -v11k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_hp_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_enc_two.part01.rar",
+      "sha256": "ed87853362d0b33a8c80cdd1036079d48f44712238053f0658604d35ae422b62",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -pmoonlit-harbour -v24k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_enc_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_enc_two.part02.rar",
+      "sha256": "0b81e987c14a11565120db2e4d7b3be25602d64bd276e19c391b16adae29f068",
+      "size": 17575,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -pmoonlit-harbour -v24k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_enc_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_enc_four.part01.rar",
+      "sha256": "4580a30fdb75df2e0d130f41336433f46ab4e714b47b70bf43c3cc5a5f58206e",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -pmoonlit-harbour -v11k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_enc_four.part02.rar",
+      "sha256": "3600a9b951fb8b3024355a6ae3b26e1047e8f02dbf522c0bd588b1a80d99d129",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -pmoonlit-harbour -v11k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_enc_four.part03.rar",
+      "sha256": "8e4e967e73267bb46d8f3bcc85dd74e04acf83ee5581ec59730958b9d877a602",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -pmoonlit-harbour -v11k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar4_solid_enc_four.part04.rar",
+      "sha256": "18619bf6ffb2282e5daa10d432543f2b1e7d76120f5df01a1dec612b5725e05c",
+      "size": 8561,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma4 -s -pmoonlit-harbour -v11k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar4_solid_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_two.part01.rar",
+      "sha256": "efc03412e0bccfaa1b7ae505bb45d764307f20f145fa1ff87cf62e2a99833497",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -v24k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_two.part02.rar",
+      "sha256": "9401e8c04d54271b15f418bbde6d570a6aa18d7120325df0d6c2e91e811440bb",
+      "size": 17586,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -v24k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_four.part01.rar",
+      "sha256": "d61083c13514b7094175af6c4c7a40caa0cc0190cc832736aad15f4e992bfb0f",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -v11k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_four.part02.rar",
+      "sha256": "b9fe0a580f2cdd067b404f5ca5ba9bbc1cfe0d34ff51d3a9d173e9272f921c4a",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -v11k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_four.part03.rar",
+      "sha256": "6bfeab402ca808f8b025a2f51c4205692c8b1d1f42d7b7b4969fc23baf869d7c",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -v11k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_four.part04.rar",
+      "sha256": "d1a70ed9845e9f2365a624fcf99463d26749b98d643750b993d10e435428ffd0",
+      "size": 8723,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -v11k` over the 226 943-byte word-salad text and the two short text members, solid. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_enc_two.part01.rar",
+      "sha256": "516b74052874bfc7c141955a0d977b5a973ddc1431da660af5f555e8f15fdc0e",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -ptestpass123 -v24k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_enc_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_enc_two.part02.rar",
+      "sha256": "2e43a718d3de0d92e85ffc188f323a6b632c511efc921048dbe76f5dd4e8e081",
+      "size": 17629,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -ptestpass123 -v24k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_enc_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_enc_four.part01.rar",
+      "sha256": "5663829c885c41feb098079144717e4f376f8500f448580525b3aa1c0ec76c83",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -ptestpass123 -v11k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_enc_four.part02.rar",
+      "sha256": "5b478e2597915d64f498a493f9cc710f31dd6ed1e7dad41c76b5deb4137248b7",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -ptestpass123 -v11k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_enc_four.part03.rar",
+      "sha256": "0afbf3341b34489fb77d0e488dd121e00354133d4a87b3226f1b72d7cdce0e60",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -ptestpass123 -v11k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_enc_four.part04.rar",
+      "sha256": "79e99fb604247d91e2bdfbc1a39edc8b689dfa8a47c5d69fb2e8f6fc46c0f3cf",
+      "size": 8962,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -ptestpass123 -v11k` over the 226 943-byte word-salad text, data encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_hp_two.part01.rar",
+      "sha256": "ab1452e8efe0f5e3cb4fb47a80ff1a427aa7f910b28857929ddb8ccef998b39c",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -hptestpass123 -v24k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_hp_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_hp_two.part02.rar",
+      "sha256": "3df7a7351d0bf75d0d69157488aacd3710099f3a02cf478e348dbcba78abcfdf",
+      "size": 18094,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -hptestpass123 -v24k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_hp_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_hp_four.part01.rar",
+      "sha256": "105e844d98409bb734aaea7a54a22e74f0d9b1b9c2f66c652f3a24c32720aaab",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -hptestpass123 -v11k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_hp_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_hp_four.part02.rar",
+      "sha256": "5ce6f8442ec5a5fb0806cc464db7ec84b89a49a185d708fd0df3b33bd64a6ca7",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -hptestpass123 -v11k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_hp_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_hp_four.part03.rar",
+      "sha256": "e784a8c3a7ff63604265a79412abc85f719d08f5649d105c6f3422e43f13c8b1",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -hptestpass123 -v11k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_hp_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_hp_four.part04.rar",
+      "sha256": "21c806fc6bddd6c0c863e46ef39065dea423745190ffeb317180f151f00b0ca1",
+      "size": 9902,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -hptestpass123 -v11k` over the 226 943-byte word-salad text, headers encrypted under `testpass123`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_hp_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_enc_two.part01.rar",
+      "sha256": "36901e6214bce8785a6569338347ea6070718a5a1a51f6b77014d4a609cb35c9",
+      "size": 24576,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 1 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -pmoonlit-harbour -v24k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_enc_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_enc_two.part02.rar",
+      "sha256": "54a49f93f8c47350126f5b845e490f1023cb426e5a9524bfd87dff1c2ab294fd",
+      "size": 17896,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 2 of 2: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -pmoonlit-harbour -v24k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_enc_two` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_enc_four.part01.rar",
+      "sha256": "7f8a66a41e0e258ae4629cebdee158542ad27966ea914ee974b03e2b3a6884b7",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 1 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -pmoonlit-harbour -v11k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_enc_four.part02.rar",
+      "sha256": "6a22b1a1edf88c64cf1b8e8f013960858a5ecebd2c2f79ec468352fed3dad143",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 2 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -pmoonlit-harbour -v11k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_enc_four.part03.rar",
+      "sha256": "50f49fe5aa44868d647b3e4417a240d3f765ee1c1d38eb900fe93a5c391a7ef0",
+      "size": 11264,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 3 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -pmoonlit-harbour -v11k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_enc_four.part04.rar",
+      "sha256": "020796b99d63b049ab4ff4ef52f38f1a125f1a22a07fad258c2970ae2d0b2b70",
+      "size": 9229,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "Volume 4 of 4: `rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -pmoonlit-harbour -v11k` over the 226 943-byte word-salad text and the two short text members, solid and data encrypted under `moonlit-harbour`. Generated for this corpus rather than copied from the repository above; the set is keyed `rar5_solid_enc_four` in expected.json."
+      }
+    },
+    {
+      "file": "rar5_solid_text.rar",
+      "sha256": "8625d8ecae6763f19ebbd2c7dca0542b20ecc25c2f8925f0d7fe7d5b7da1b9ba",
+      "size": 41985,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "`rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s` over the 226 943-byte word-salad text and the two short text members: the single-volume counterpart the solid multi-volume sets decode their expected members from. Generated for this corpus rather than copied from the repository above."
+      }
+    },
+    {
+      "file": "rar5_solid_text_encrypted.rar",
+      "sha256": "08883b3720e72785aa44dfc6f39f823bafbae73024aad3ca2650c5e1454627de",
+      "size": 42197,
+      "provenance": {
+        "kind": "generated",
+        "toolchains": [
+          "rarlab-6.24"
+        ],
+        "inputs": [
+          "crates/unrar-rs/tests/fixtures/originals/compressible.txt",
+          "crates/unrar-rs/tests/fixtures/originals/hello.txt",
+          "crates/unrar-rs/tests/fixtures/originals/second.txt"
+        ],
+        "notes": "`rar a -cfg- -mt1 -idq -ep1 -m3 -ma5 -s -pmoonlit-harbour` over the 226 943-byte word-salad text and the two short text members: the single-volume counterpart the solid multi-volume sets decode their expected members from. Generated for this corpus rather than copied from the repository above."
+      }
     }
   ]
 }

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::jobs::{assembly::FileAssembly, repair_outputs::RepairOutput};
+use par3_rs::session_repair::InstalledFile;
 
 impl Pipeline {
     /// The assessed layout of one set, when the runtime is willing to show it.
@@ -202,4 +203,227 @@ impl Pipeline {
         }
         Ok(())
     }
+
+    /// A direct set holding a volume the repair is about to rebuild under
+    /// another name, when the repair will create an output no posted file
+    /// answers to.
+    ///
+    /// Such a volume is a posted file nothing could name. Its bytes sit in the
+    /// set's destinations, where neither the rebuilt archive nor the check
+    /// that retires the posted copy can reach them, and the set can never be
+    /// made whole from a file the repair writes beside it. The set writes
+    /// itself out first.
+    pub(super) fn par3_direct_set_behind_unposted_output(
+        &self,
+        job: JobId,
+        set: par3_rs::InputSetId,
+    ) -> Option<usize> {
+        let view = self.par3_view(job, set)?;
+        if !view.files.iter().any(|file| file.source.is_none()) {
+            return None;
+        }
+        let state = self.jobs.get(&job)?;
+        let runtime = self.par3_runtime.as_ref()?;
+        self.direct_store.sets_for(job).iter().position(|direct| {
+            !direct.is_demoted()
+                && !direct.is_finalized()
+                && state.assembly.files().any(|file| {
+                    direct
+                        .plan()
+                        .volume_for_file(file.file_id().file_index)
+                        .is_some()
+                        && !file.is_complete()
+                        && {
+                            let name = self.current_filename_for_file(job, file);
+                            !runtime
+                                .assessments(job)
+                                .any(|(_, view)| view.files.iter().any(|file| file.path == name))
+                        }
+                })
+        })
+    }
+
+    /// Find the posted files a repair's new outputs were rebuilt from.
+    ///
+    /// A posted file that cannot be named — its name says nothing and it lost
+    /// bytes, so no whole-image identity can be read from it — is rebuilt
+    /// under the name the set describes, and the posted copy is left beside
+    /// the output. The copy is superseded when the bytes that did arrive are
+    /// the output's own bytes at the same offsets, and those of no other
+    /// output. The output is a verified image on disk, so that is a direct
+    /// comparison and nothing is hashed.
+    ///
+    /// A posted file of which nothing arrived has no bytes to compare. It is
+    /// accounted for by count instead: every output the repair had to create
+    /// stands for one posted file that could not be named, so once the
+    /// comparison has claimed what it can, the outputs left over are owed
+    /// exactly that many posted files. When no more empty files than that
+    /// remain, each is one of them. When more remain, nothing says which, and
+    /// none is claimed.
+    ///
+    /// The comparison is deliberately small. It runs once per repair that
+    /// created an output no posted file answered to, only over incomplete
+    /// files no set describes, and reads at most [`SUPERSEDED_WINDOWS`]
+    /// windows of [`SUPERSEDED_WINDOW_BYTES`] from each.
+    pub(super) async fn note_par3_superseded_sources(
+        &mut self,
+        job: JobId,
+        installed: &[InstalledFile],
+    ) {
+        let Some(state) = self.jobs.get(&job) else {
+            return;
+        };
+        let outputs: Vec<PathBuf> = state
+            .assembly
+            .files()
+            .filter(|file| file.is_repair_output() && file.is_complete())
+            .map(|file| {
+                state
+                    .working_dir
+                    .join(self.current_filename_for_file(job, file))
+            })
+            .filter(|path| installed.iter().any(|output| output.path == *path))
+            .collect();
+        if outputs.is_empty() {
+            return;
+        }
+        let described = |name: &str| {
+            self.par3_runtime.as_ref().is_some_and(|runtime| {
+                runtime
+                    .assessments(job)
+                    .any(|(_, view)| view.files.iter().any(|file| file.path == name))
+            })
+        };
+        let candidates: Vec<(NzbFileId, PathBuf, Vec<(u64, usize)>)> = state
+            .assembly
+            .files()
+            .filter(|file| {
+                !file.is_complete()
+                    && !file.is_repair_output()
+                    && !file.role().is_recovery()
+                    && !self.recovery_superseded_source(job, file.file_id())
+            })
+            .filter_map(|file| {
+                let name = self.current_filename_for_file(job, file);
+                if described(&name) {
+                    return None;
+                }
+                // Where bytes arrived: the articles assembly placed, or for a
+                // file a demotion wrote out, the ranges that handback kept.
+                let mut windows: Vec<(u64, usize)> = (0..file.total_segments())
+                    .filter(|segment| file.has_segment(*segment))
+                    .filter_map(|segment| file.placement_of(segment))
+                    .map(|(offset, len)| (offset, len as usize))
+                    .filter(|(_, len)| *len != 0)
+                    .take(SUPERSEDED_WINDOWS)
+                    .collect();
+                if windows.is_empty() {
+                    windows = self
+                        .par3_runtime
+                        .as_ref()
+                        .and_then(|runtime| {
+                            runtime
+                                .materialized_ranges(
+                                    job,
+                                    SourceId(u64::from(file.file_id().file_index)),
+                                )
+                                .ok()
+                                .flatten()
+                        })
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|range| {
+                            let len = usize::try_from(range.end - range.start).unwrap_or(usize::MAX);
+                            (range.start, len)
+                        })
+                        .filter(|(_, len)| *len != 0)
+                        .take(SUPERSEDED_WINDOWS)
+                        .collect();
+                }
+                for (_, len) in &mut windows {
+                    *len = (*len).min(SUPERSEDED_WINDOW_BYTES);
+                }
+                Some((file.file_id(), state.working_dir.join(name), windows))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let probe = tokio::task::spawn_blocking(move || {
+            let mut claimed = vec![false; outputs.len()];
+            let mut superseded = Vec::new();
+            let mut empty = Vec::new();
+            for (file, path, windows) in candidates {
+                if windows.is_empty() {
+                    empty.push(file);
+                    continue;
+                }
+                let mut matches = (0..outputs.len())
+                    .filter(|output| holds_windows_of(&path, &outputs[*output], &windows));
+                if let (Some(output), None) = (matches.next(), matches.next()) {
+                    claimed[output] = true;
+                    superseded.push(file);
+                }
+            }
+            let owed = claimed.iter().filter(|claimed| !**claimed).count();
+            if empty.len() <= owed {
+                superseded.append(&mut empty);
+            }
+            superseded
+        })
+        .await;
+        let Ok(superseded) = probe else {
+            return;
+        };
+        if superseded.is_empty() {
+            return;
+        }
+        tracing::info!(
+            job_id = job.0,
+            superseded = superseded.len(),
+            "posted files accounted for by outputs the recovery set rebuilt"
+        );
+        self.recovery_unposted_outputs
+            .entry(job)
+            .or_default()
+            .superseded
+            .extend(superseded);
+    }
+}
+
+/// Windows of a posted copy compared against a rebuilt output.
+const SUPERSEDED_WINDOWS: usize = 3;
+/// Bytes compared from the front of each window.
+const SUPERSEDED_WINDOW_BYTES: usize = 64 * 1024;
+
+/// Whether every window of `copy` holds the bytes `output` has at the same
+/// offset, with something other than zeros in at least one of them.
+fn holds_windows_of(
+    copy: &std::path::Path,
+    output: &std::path::Path,
+    windows: &[(u64, usize)],
+) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let (Ok(mut copy), Ok(mut output)) = (std::fs::File::open(copy), std::fs::File::open(output))
+    else {
+        return false;
+    };
+    let mut ours = Vec::new();
+    let mut theirs = Vec::new();
+    let mut evidence = false;
+    for &(offset, len) in windows {
+        ours.resize(len, 0);
+        theirs.resize(len, 0);
+        for (file, bytes) in [(&mut copy, &mut ours), (&mut output, &mut theirs)] {
+            if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(bytes).is_err() {
+                return false;
+            }
+        }
+        if ours != theirs {
+            return false;
+        }
+        evidence |= ours.iter().any(|byte| *byte != 0);
+    }
+    evidence
 }

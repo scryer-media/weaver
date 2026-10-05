@@ -360,7 +360,7 @@ impl Pipeline {
         has_delivery_evidence: bool,
     ) -> TerminalFileClaim {
         if self.par2_join_consumed_split_part(job_id, file_id)
-            || self.par2_superseded_source(job_id, file_id)
+            || self.recovery_superseded_source(job_id, file_id)
         {
             return TerminalFileClaim::Discarded(TerminalDiscardKind::RepairLeftover);
         }

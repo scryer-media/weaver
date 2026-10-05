@@ -868,7 +868,7 @@ async fn replacement_edges_include_unrouted_neighbour_tails() {
     let plans: Vec<_> = (0..2)
         .map(|volume| {
             router
-                .cipher_replacement_edge_reads_bounded(volume, 16)
+                .cipher_replacement_edge_reads_bounded(volume, 16, &|_| false)
                 .unwrap()
         })
         .collect();
@@ -880,7 +880,7 @@ async fn replacement_edges_include_unrouted_neighbour_tails() {
     );
     assert!(
         router
-            .cipher_replacement_edge_reads_bounded(1, plans[1].len() - 1)
+            .cipher_replacement_edge_reads_bounded(1, plans[1].len() - 1, &|_| false)
             .is_none()
     );
     router.begin_repair_transaction(vec![0, 1]).unwrap();

@@ -2602,6 +2602,13 @@ impl Coordinator {
             }
             (WorkKey::Source(source), Ok(_)) => {
                 job.errors.remove(&source);
+                // Another source's work that tripped over this one changing
+                // mid-read saw a moment that no longer exists. This source has
+                // now been published and read whole, which is the fresh
+                // evidence that report was waiting on.
+                job.errors.retain(
+                    |_, error| !matches!(error, EngineError::SourceChanged(changed) if *changed == source),
+                );
             }
             (WorkKey::Source(source), Err(error)) => {
                 if pressure.is_some() {

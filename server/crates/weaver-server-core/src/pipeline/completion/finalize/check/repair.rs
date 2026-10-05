@@ -98,6 +98,7 @@ impl Pipeline {
         let mut outcome = Par2DeobfuscationOutcome::default();
         let mut touched_files = Vec::<NzbFileId>::new();
         let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
+        let mut renamed_away = HashSet::<String>::new();
         for (set_id, suggestion) in &suggestions {
             let old = &suggestion.current_path;
             let requested_correct_name = sanitize_download_filename(&suggestion.correct_name);
@@ -215,6 +216,68 @@ impl Pipeline {
                 );
                 continue;
             }
+            // A declared file whose described name is taken is the same
+            // question with two honest answers, and a duplicate name is
+            // neither. Either the holder is the repaired copy and this is the
+            // damaged original it replaced, or the holder is another file
+            // under the wrong name and the verified placement that follows
+            // moves both. Renaming here would strand the first as a sibling
+            // of the file that passed and pull the second out from under that
+            // placement.
+            if correct_name != requested_correct_name {
+                // The first of those answers, settled here: the holder is a
+                // file no NZB entry owns, at the described length, and this
+                // posted file answers the same description, whole or by the
+                // fingerprint of what arrived of it. The recovery set wrote
+                // the holder in its place, so the posted copy is a spent
+                // input and leaves with the others.
+                let holder = rename_dir.join(&requested_correct_name);
+                let holder_is_output = !by_current.contains_key(&requested_correct_name)
+                    && std::fs::metadata(&holder)
+                        .is_ok_and(|meta| meta.is_file() && meta.len() == description.length);
+                if let Some((file_id, _)) = matched
+                    && holder_is_output
+                {
+                    let unposted = self.recovery_unposted_outputs.entry(job_id).or_default();
+                    unposted.outputs.insert(requested_correct_name.clone());
+                    unposted.superseded.insert(file_id);
+                    // A roster or a chase still keyed by the posted copy's
+                    // name describes a set the output has replaced.
+                    self.direct_unpack_abort_sets_containing(
+                        job_id,
+                        &old_name,
+                        "a repaired output replaced this part",
+                    );
+                    renamed_away.insert(old_name.clone());
+                    // Both the set the posted copy was read into and the set
+                    // the output belongs to planned around bytes that are no
+                    // longer the ones at these names.
+                    let posted_set = file_rows
+                        .iter()
+                        .find(|(candidate, _, _)| *candidate == file_id)
+                        .and_then(|(_, identity, _)| identity.classification.clone());
+                    let output_set =
+                        Self::canonical_archive_identity_from_filename(&requested_correct_name);
+                    for classification in [posted_set, output_set].into_iter().flatten() {
+                        if matches!(
+                            classification.kind,
+                            crate::jobs::assembly::DetectedArchiveKind::Rar
+                        ) {
+                            touched_rar_files
+                                .entry(classification.set_name)
+                                .or_default()
+                                .insert(old_name.clone());
+                        }
+                    }
+                }
+                debug!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    requested = %requested_correct_name,
+                    "refusing PAR2 rename into a duplicate of a described name that is taken"
+                );
+                continue;
+            }
             if old.strip_prefix(&rename_dir).is_err() {
                 warn!(
                     job_id = job_id.0,
@@ -303,6 +366,7 @@ impl Pipeline {
                     continue;
                 };
                 let old_current_filename = identity.current_filename.clone();
+                renamed_away.insert(old_current_filename.clone());
                 let old_rar_set_name =
                     identity.classification.as_ref().and_then(|classification| {
                         matches!(
@@ -347,6 +411,39 @@ impl Pipeline {
 
         for (set_name, touched_filenames) in &touched_rar_files {
             self.invalidate_archive_set_for_identity_rebind(job_id, set_name, touched_filenames);
+        }
+        // A 7z or split roster keyed by a name that was just renamed away no
+        // longer designates a source file. It goes before readiness can queue
+        // an extraction for it, which would find no volume and fail the job
+        // beside the set that took its place.
+        let retired_sets: Vec<String> = self
+            .jobs
+            .get(&job_id)
+            .into_iter()
+            .flat_map(|state| state.assembly.archive_topologies().iter())
+            .filter(|(_, topology)| {
+                !matches!(
+                    topology.archive_type,
+                    crate::jobs::assembly::ArchiveType::Rar
+                ) && topology
+                    .volume_map
+                    .keys()
+                    .any(|filename| renamed_away.contains(filename))
+            })
+            .map(|(set_name, _)| set_name.clone())
+            .collect();
+        for set_name in retired_sets {
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.assembly.remove_archive_topology(&set_name);
+            }
+            if let Err(error) = self.db.clear_extraction_chunks_for_set(job_id, &set_name) {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to retire a renamed set's extraction state"
+                );
+            }
         }
         for file_id in touched_files {
             self.refresh_archive_state_for_completed_file(job_id, file_id, false)

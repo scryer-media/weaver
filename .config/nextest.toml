@@ -1,6 +1,6 @@
 [profile.default]
 # Large archive campaigns are opt-in; smoke and regression tests stay in the default suite.
-default-filter = 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_))'
+default-filter = 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/)))'
 # A test that leaves a child holding stdout or stderr open is a test failure.
 leak-timeout = { period = "2s", result = "fail" }
 # Tests wait on the events they check rather than racing a deadline of their
@@ -20,3 +20,8 @@ leak-timeout = { period = "2s", result = "pass" }
 # Run with: cargo nextest run --profile archive-matrix --run-ignored all --no-fail-fast
 [profile.archive-matrix]
 default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_)'
+
+# The extended campaigns are a separate, manually dispatched run.
+# Run with: cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast
+[profile.archive-matrix-extended]
+default-filter = '(test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/)'
