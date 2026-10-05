@@ -521,6 +521,47 @@ par3_smoke! {
     par3_conventional_rar5_obfuscated_loss_schedules Format::Rar5Obfuscated, ExtractionProfile::Conventional;
 }
 
+/// A posted file the PAR3 set must name from its bytes, whose first article
+/// arrives twice after that article was already held without a placement:
+/// once through a completed-file restore, once through a demotion handback.
+/// The duplicate's placement is the only one recorded, and publishing just
+/// that range hid the rest of the file, so the set rebuilt the volume beside
+/// the posted copy and left the copy's own archive set waiting on a volume.
+#[tokio::test]
+async fn par3_obfuscated_duplicate_after_unplaced_hold() {
+    let mut fixture = fixture(Target::Format(Format::Rar5Obfuscated));
+    fixture.route.unnamed_loss = |_| true;
+    let options = ScheduleOptions {
+        recovery: RecoveryFormat::Par3,
+        ..ScheduleOptions::MATRIX
+    };
+    let cases = [
+        (
+            ExtractionProfile::Conventional,
+            vec![(0, 0), (0, 1), (0, 0)],
+            Interruption::Combined {
+                mask: 12,
+                index_first: true,
+                action: BoundaryAction::Restart,
+                at: 2,
+            },
+        ),
+        (
+            ExtractionProfile::DirectStore,
+            vec![(0, 0), (0, 0), (1, 1), (0, 1)],
+            Interruption::Combined {
+                mask: 4,
+                index_first: false,
+                action: BoundaryAction::Demote,
+                at: 2,
+            },
+        ),
+    ];
+    for (case, (profile, order, interruption)) in cases.into_iter().enumerate() {
+        run_case(&fixture, options, profile, case, &order, interruption).await;
+    }
+}
+
 macro_rules! demotion_smoke {
     ($($name:ident $target:expr, $every:expr;)+) => {
         $(
