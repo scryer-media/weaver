@@ -515,6 +515,90 @@ async fn a_complete_volume_of_a_foreign_rar_set_is_kept_out_of_the_extra_scan() 
 }
 
 #[tokio::test]
+async fn a_numberless_volume_not_shown_to_open_a_set_stays_in_the_extra_scan() {
+    // Old-style numbering puts no volume number in the headers, and an
+    // obfuscated name puts none in the filename, so a later volume of this
+    // very set is classified under a set named after itself. That name is no
+    // evidence of a foreign set, and until the volume's headers show it
+    // opening one it must stay where the extra scan can find it — it is
+    // exactly the renamed source the scan exists for.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30935);
+    let own_volume = "silver.horizon.part01.rar";
+    let obfuscated = "000000000000000000000000c3a10001";
+    let own_bytes = fixture_bytes(79, 128);
+    let later_bytes = fixture_bytes(83, 128);
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Numberless Volume",
+            &[
+                (own_volume.to_string(), own_bytes.len() as u32),
+                (obfuscated.to_string(), later_bytes.len() as u32),
+            ],
+        ),
+    )
+    .await;
+    let served = build_repairable_par2_set_for_files(
+        &[
+            (own_volume, own_bytes.as_slice()),
+            ("silver.horizon.part02.rar", later_bytes.as_slice()),
+        ],
+        SLICE_SIZE,
+        1,
+    );
+    let served_id = served.recovery_set_id;
+    install_test_par2_runtime(&mut pipeline, job_id, served, &[]);
+    for (file_index, filename, set_name, volume_index) in [
+        (0u32, own_volume, "silver.horizon", Some(0)),
+        (1, obfuscated, obfuscated, None),
+    ] {
+        pipeline
+            .set_file_identity(
+                job_id,
+                crate::jobs::record::ActiveFileIdentity {
+                    file_index,
+                    source_filename: filename.to_string(),
+                    current_filename: filename.to_string(),
+                    canonical_filename: None,
+                    classification: Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                        kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                        set_name: set_name.to_string(),
+                        volume_index,
+                    }),
+                    classification_source: crate::jobs::record::FileIdentitySource::Probe,
+                },
+            )
+            .unwrap();
+    }
+    write_and_complete_file(&mut pipeline, job_id, 0, own_volume, &own_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, obfuscated, &later_bytes).await;
+    // A restored volume: its first article landed before the restart, so no
+    // prefix is left to bind it by content.
+    pipeline.file_prefix_16k.remove(&NzbFileId {
+        job_id,
+        file_index: 1,
+    });
+    assert!(
+        pipeline
+            .resolve_par2_file_binding(NzbFileId {
+                job_id,
+                file_index: 1,
+            })
+            .is_none(),
+        "non-vacuity: the obfuscated volume must be unbound, or set membership is never asked"
+    );
+
+    let exclusions = pipeline.par2_extra_scan_exclusions(job_id, served_id);
+    assert!(
+        !exclusions.contains(&working_dir.join(obfuscated)),
+        "a self-named numberless volume is not a foreign set, got {exclusions:?}"
+    );
+}
+
+#[tokio::test]
 async fn par2_extra_scan_excludes_what_a_repair_left_behind() {
     // Installing a repair moves the damaged file it replaces aside and leaves
     // the copy in the job directory until the whole job has settled. Without
