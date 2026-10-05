@@ -1481,7 +1481,22 @@ impl Pipeline {
                 bound = roster.bound.len(),
                 "identity admission re-armed a restored archive set from PAR2 descriptions"
             );
-            admission.rosters.insert(set_name, roster);
+            // A set restored whole came back only for its fingerprints, and
+            // retires as a live roster does on its last binding.
+            if roster.bound.len() < roster.volumes.len() {
+                admission.rosters.insert(set_name, roster);
+            }
+        }
+        if admission.rosters.is_empty()
+            && admission.restored_rosters.is_empty()
+            && admission.header_sets.is_empty()
+            && admission.leaked.is_empty()
+            && admission.no_match.is_empty()
+            && !admission.header_volume_sets_poisoned
+            && rosters.is_empty()
+        {
+            self.direct_store.identity.remove(&job_id);
+            return;
         }
         for (set_name, roster) in rosters {
             crate::runtime::perf_probe::record(
@@ -2331,12 +2346,9 @@ impl Pipeline {
                 .is_some_and(|expected| plan.volumes.len() as u32 == expected);
             match identity.kind {
                 super::plan::IdentityKind::Standalone => continue,
-                _ if whole => {}
-                super::plan::IdentityKind::HeaderVolumeSet => header_sets.push(HeaderSet {
-                    set_index,
-                    bound: plan.files.clone(),
-                    volume_set: true,
-                }),
+                // A whole described set binds nothing further, but its files'
+                // captured prefixes died with the process: only its
+                // descriptions can say again which description each file is.
                 super::plan::IdentityKind::Roster => {
                     restored_rosters.insert(
                         plan.set_name.clone(),
@@ -2346,6 +2358,12 @@ impl Pipeline {
                         },
                     );
                 }
+                _ if whole => {}
+                super::plan::IdentityKind::HeaderVolumeSet => header_sets.push(HeaderSet {
+                    set_index,
+                    bound: plan.files.clone(),
+                    volume_set: true,
+                }),
             }
             reprioritize.extend(
                 plan.volumes
@@ -2422,6 +2440,17 @@ impl Pipeline {
             })
             .unwrap_or_default();
         for (set_name, set_index) in unarmed {
+            // A whole set binds nothing further, so it is not waiting on its
+            // roster and loses nothing a demotion would give back.
+            let whole = self.direct_store.set(job_id, set_index).is_some_and(|set| {
+                let plan = set.plan();
+                plan.identity
+                    .and_then(|identity| identity.expected_volumes)
+                    .is_some_and(|expected| plan.volumes.len() as u32 == expected)
+            });
+            if whole {
+                continue;
+            }
             warn!(
                 job_id = job_id.0,
                 set_name = %set_name,
