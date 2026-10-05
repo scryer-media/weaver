@@ -255,23 +255,59 @@ pub(super) struct ContainerGeometry {
     pub(super) total: u64,
     /// How many volumes that is.
     pub(super) parts: u64,
+    /// Bytes posted after the container's end, in its one volume: an embedded
+    /// recovery set's packets. Zero for every split set and for a file that
+    /// ends where its end header does.
+    pub(super) tail: u64,
 }
 
 impl ContainerGeometry {
     /// Derives the geometry, or says why these two numbers do not describe one
     /// container.
-    pub(super) fn derive(part_size: u64, start: &StartHeader) -> Result<Self, SevenZipRefusal> {
+    ///
+    /// `single` says the set is one file. Such a file may state a length past
+    /// its end header — the packets of a recovery set written into it — and
+    /// that excess is its [`Self::tail`] rather than a second part, because a
+    /// file that is the whole set has no part boundary to put one at. Whether
+    /// the excess really is a recovery set is not decided here: see
+    /// [`EMBEDDED_TAIL_MAGIC`].
+    pub(super) fn derive(
+        part_size: u64,
+        start: &StartHeader,
+        single: bool,
+    ) -> Result<Self, SevenZipRefusal> {
         let total = start.end_header_end().ok_or(SevenZipRefusal::VolumeSize)?;
-        Self::derive_from_total(part_size, total)
+        let tail = if single {
+            part_size.saturating_sub(total)
+        } else {
+            0
+        };
+        Self::derive_from_total(part_size, total, tail)
     }
 
     /// The same derivation from a total already in hand — the restore path,
     /// where the start header's own bytes are long gone.
-    pub(super) fn derive_from_total(part_size: u64, total: u64) -> Result<Self, SevenZipRefusal> {
+    pub(super) fn derive_from_total(
+        part_size: u64,
+        total: u64,
+        tail: u64,
+    ) -> Result<Self, SevenZipRefusal> {
         if part_size == 0 {
             return Err(SevenZipRefusal::VolumeHintUnusable);
         }
         let total = total.max(1);
+        if tail != 0 {
+            // One file, holding the whole container and the tail after it.
+            if total.checked_add(tail) != Some(part_size) {
+                return Err(SevenZipRefusal::VolumeSize);
+            }
+            return Ok(Self {
+                part_size,
+                total,
+                parts: 1,
+                tail,
+            });
+        }
         let parts = total.div_ceil(part_size);
         if parts > MAX_CONTAINER_PARTS {
             return Err(SevenZipRefusal::VolumeSize);
@@ -280,6 +316,7 @@ impl ContainerGeometry {
             part_size,
             total,
             parts,
+            tail: 0,
         })
     }
 
@@ -294,7 +331,7 @@ impl ContainerGeometry {
             return None;
         }
         if index + 1 == self.parts {
-            return Some(self.total - (self.parts - 1) * self.part_size);
+            return Some(self.total - (self.parts - 1) * self.part_size + self.tail);
         }
         Some(self.part_size)
     }
@@ -355,7 +392,21 @@ pub(crate) struct SevenZipContainerFacts {
     /// restores no layout and parses again over its refetched tail.
     #[serde(default)]
     pub(crate) total: u64,
+    /// Bytes the one volume carries after the container: an embedded recovery
+    /// set, admitted on its own signature before this map was. Cached so a
+    /// restored set derives the same volume length it routed against, rather
+    /// than refusing its own posted length as a wrong one.
+    #[serde(default)]
+    pub(crate) embedded_tail: u64,
 }
+
+/// What an admitted tail opens with: the packet signature of a recovery set
+/// written into the file after its archive.
+///
+/// The only thing allowed to follow a container in its one volume. Anything
+/// else is the posting disagreeing with the archive about where the file
+/// ends, which is the [`SevenZipRefusal::VolumeSize`] it always was.
+pub(super) const EMBEDDED_TAIL_MAGIC: &[u8; 8] = par3_rs::MAGIC;
 
 /// One dataless entry finalization creates rather than routes.
 ///
@@ -445,7 +496,10 @@ impl SevenZipLayout {
             let end = start
                 .checked_add(entry.size)
                 .ok_or(SevenZipRefusal::Geometry)?;
-            if start < frontier || end > total {
+            // The container's own end as well as the volumes': an admitted
+            // tail follows the container, and no member may claim it.
+            let container_end = if facts.total == 0 { total } else { facts.total };
+            if start < frontier || end > total.min(container_end) {
                 return Err(SevenZipRefusal::Geometry);
             }
             frontier = end;
@@ -765,7 +819,11 @@ pub(super) fn container_facts(
         return Err(SevenZipRefusal::NothingToRoute);
     }
 
-    Ok(SevenZipContainerFacts { entries, total: 0 })
+    Ok(SevenZipContainerFacts {
+        entries,
+        total: 0,
+        embedded_tail: 0,
+    })
 }
 
 /// Which refusal a non-`Copy` block earns.
@@ -1001,5 +1059,47 @@ pub(super) fn parse_container(
             ParseOutcome::Facts(Box::new(facts))
         }
         Err(refusal) => ParseOutcome::Refused(refusal),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_one_volume_tail_is_its_own_length_not_a_second_part() {
+        let geometry = ContainerGeometry::derive_from_total(10_000, 7_000, 3_000).unwrap();
+        assert_eq!(geometry.parts, 1);
+        assert_eq!(geometry.tail, 3_000);
+        assert_eq!(geometry.expected_len(0), Some(10_000));
+        assert_eq!(geometry.expected_len(1), None);
+        assert_eq!(geometry.lengths(), BTreeMap::from([(0, 10_000)]));
+    }
+
+    #[test]
+    fn a_tail_that_does_not_close_the_volume_is_refused() {
+        for (part_size, total, tail) in [(10_000, 7_000, 2_999), (10_000, 7_000, 3_001)] {
+            assert_eq!(
+                ContainerGeometry::derive_from_total(part_size, total, tail),
+                Err(SevenZipRefusal::VolumeSize)
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_set_never_carries_a_tail() {
+        let geometry = ContainerGeometry::derive_from_total(4_000, 10_000, 0).unwrap();
+        assert_eq!((geometry.parts, geometry.tail), (3, 0));
+        assert_eq!(geometry.expected_len(2), Some(2_000));
+    }
+
+    #[test]
+    fn restored_facts_without_a_tail_read_as_none() {
+        let facts: SevenZipContainerFacts = serde_json::from_value(serde_json::json!({
+            "entries": [],
+            "total": 7_000,
+        }))
+        .unwrap_or_else(|error| panic!("facts written before the tail existed: {error}"));
+        assert_eq!(facts.embedded_tail, 0);
     }
 }

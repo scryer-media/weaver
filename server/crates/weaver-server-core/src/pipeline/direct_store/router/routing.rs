@@ -2417,7 +2417,44 @@ impl DirectSetRouter {
     ) -> Option<Result<sevenz::ContainerGeometry, sevenz::SevenZipRefusal>> {
         let start = self.sevenz_start.as_ref()?;
         let part_size = self.declared_volume_sizes.get(&0).copied()?;
-        Some(sevenz::ContainerGeometry::derive(part_size, start))
+        Some(sevenz::ContainerGeometry::derive(
+            part_size,
+            start,
+            self.plan.expected_volume_count() == Some(1),
+        ))
+    }
+
+    /// Where an admitted embedded recovery set begins in the set's one volume,
+    /// as `(volume, offset)`. `None` for a set with no tail, or one whose map
+    /// is not read yet.
+    ///
+    /// A fact the parse established, not a probe: the tail is admitted only
+    /// once its own signature has been read at this offset, so whoever wants
+    /// the recovery set's packets can start scanning here without opening a
+    /// byte of the volume to find them.
+    pub(crate) fn embedded_recovery_start(&self) -> Option<(u32, u64)> {
+        let geometry = self.sevenz_geometry?;
+        (geometry.tail != 0).then_some((0, geometry.total))
+    }
+
+    /// Whether the tail the geometry places after the container opens with a
+    /// recovery set's signature: `Some(true)` admitted, `Some(false)` refused,
+    /// `None` while those bytes are not staged yet.
+    ///
+    /// The one read the admission costs: eight bytes, out of what is already
+    /// staged, once per parse attempt and only for a one-volume set whose
+    /// stated length runs past its end header.
+    fn embedded_tail_opens_with_magic(&self, geometry: &sevenz::ContainerGeometry) -> Option<bool> {
+        let magic = sevenz::EMBEDDED_TAIL_MAGIC;
+        if geometry.tail < magic.len() as u64 {
+            return Some(false);
+        }
+        let staging = self.staging.get(&0)?;
+        let end = geometry.total + magic.len() as u64;
+        let mut image =
+            sevenz::ContainerImage::new(&[(0, &staging.chunks)], self.scratch.handle(), end);
+        let bytes = image.read_exact_at(geometry.total, magic.len())?;
+        Some(bytes.as_slice() == magic.as_slice())
     }
 
     /// What the set needs off the wire next in order to resolve its layout.
@@ -2528,6 +2565,22 @@ impl DirectSetRouter {
                 sevenz::SevenZipRefusal::VolumeSize,
             )));
         }
+        // A one-volume set stating more than its end header covers: admitted
+        // only as a recovery set written after the archive, which is the one
+        // thing a poster puts there. The map waits for the eight bytes that
+        // say so — they sit right behind the end header, so the tail probe
+        // walking back to the map reaches them first.
+        if geometry.tail != 0 {
+            match self.embedded_tail_opens_with_magic(&geometry) {
+                None => return Ok(()),
+                Some(false) => {
+                    return Err(self.fail(DemotionReason::SevenZip(
+                        sevenz::SevenZipRefusal::VolumeSize,
+                    )));
+                }
+                Some(true) => {}
+            }
+        }
         let lengths = geometry.lengths();
         let total = geometry.total;
 
@@ -2622,7 +2675,7 @@ impl DirectSetRouter {
     /// zero-length and checksum-free member gates.
     pub(super) fn adopt_container_facts(
         &mut self,
-        facts: sevenz::SevenZipContainerFacts,
+        mut facts: sevenz::SevenZipContainerFacts,
     ) -> Result<(), DemotionReason> {
         // Resolved against the geometry's lengths, not against what the volumes
         // declared. A declared length is a hint this router checks *for*
@@ -2635,8 +2688,13 @@ impl DirectSetRouter {
                 // Restart: the start header is never refetched, so the geometry
                 // comes back off the cached total instead.
                 let part_size = self.declared_volume_sizes.get(&0).copied()?;
-                (facts.total != 0)
-                    .then(|| sevenz::ContainerGeometry::derive_from_total(part_size, facts.total))
+                (facts.total != 0).then(|| {
+                    sevenz::ContainerGeometry::derive_from_total(
+                        part_size,
+                        facts.total,
+                        facts.embedded_tail,
+                    )
+                })
             })
             .ok_or_else(|| {
                 self.fail(DemotionReason::SevenZip(
@@ -2644,6 +2702,8 @@ impl DirectSetRouter {
                 ))
             })?
             .map_err(|refusal| self.fail(DemotionReason::SevenZip(refusal)))?;
+        // The live parse admitted the tail it read; a restored one carries it.
+        facts.embedded_tail = geometry.tail;
         let layout = sevenz::SevenZipLayout::build(&geometry.lengths(), &facts)
             .map_err(|refusal| self.fail(DemotionReason::SevenZip(refusal)))?;
         self.sevenz_geometry = Some(geometry);
