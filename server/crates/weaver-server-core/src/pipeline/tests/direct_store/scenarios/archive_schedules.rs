@@ -77,6 +77,40 @@ pub(super) fn duplicate_orders() -> Vec<Vec<(u32, u32)>> {
     result
 }
 
+/// Articles per volume for `slots` article slots over `volumes` volumes: four
+/// split evenly, and a fifth carried by the first volume.
+fn slot_layout(volumes: usize, slots: usize) -> Vec<usize> {
+    assert!(
+        4 % volumes == 0 && matches!(slots, 4 | 5),
+        "{volumes} x {slots}"
+    );
+    let mut layout = vec![4 / volumes; volumes];
+    layout[0] += slots - 4;
+    layout
+}
+
+/// A schedule names slot `file * 2 + article` whatever the volumes' own
+/// article counts; slots number the volumes' articles in file order.
+fn slot_article(layout: &[usize], slot: u32) -> (u32, u32) {
+    let mut first = 0;
+    for (file, &articles) in layout.iter().enumerate() {
+        if slot < first + articles as u32 {
+            return (file as u32, slot - first);
+        }
+        first += articles as u32;
+    }
+    panic!("slot {slot} beyond {layout:?}");
+}
+
+fn article_slot(layout: &[usize], file: u32, article: u32) -> u32 {
+    layout[..file as usize].iter().sum::<usize>() as u32 + article
+}
+
+/// Every slot once, in order, as a schedule names it.
+fn slot_arrivals(slots: usize) -> Vec<(u32, u32)> {
+    (0..slots as u32).map(|slot| (slot / 2, slot % 2)).collect()
+}
+
 pub(super) struct Outcome {
     pub status: Option<JobStatus>,
     pub files: BTreeMap<String, Option<Vec<u8>>>,
@@ -213,6 +247,14 @@ impl ExtractionProfile {
                         action: BoundaryAction::Demote,
                         ..
                     }
+                    | Interruption::Twice {
+                        first: BoundaryAction::Demote,
+                        ..
+                    }
+                    | Interruption::Twice {
+                        second: BoundaryAction::Demote,
+                        ..
+                    }
             )
     }
 
@@ -280,10 +322,20 @@ impl ExtractionProfile {
         if self != Self::DirectStore {
             assert!(outcome.demotions.is_empty(), "{trace:?}");
         } else if route.direct && schedule_only {
-            // The schedule claimed one set; the others stay direct.
+            // The schedule claimed one set; the others stay direct. A restart
+            // after the claim restores the job without it, and the claimed set
+            // then routes direct afresh.
+            let forgotten = matches!(
+                interruption,
+                Interruption::Twice {
+                    first: BoundaryAction::Demote,
+                    second: BoundaryAction::Restart | BoundaryAction::Crash,
+                    ..
+                }
+            ) && outcome.finalized == route.sets;
             assert_eq!(
                 outcome.finalized,
-                route.sets - 1,
+                route.sets - usize::from(!forgotten),
                 "a set the schedule left alone left the direct route: {trace:?}"
             );
         } else if unnamed && outcome.demotions.is_empty() {
@@ -360,6 +412,17 @@ pub(super) enum Interruption {
     Starved {
         mask: u8,
     },
+    /// Two boundary actions in one run, the first never after the second.
+    /// At a shared boundary both happen before that boundary's arrival, in
+    /// order. An empty mask loses nothing and posts no recovery set.
+    Twice {
+        mask: u8,
+        index_first: bool,
+        first: BoundaryAction,
+        first_at: usize,
+        second: BoundaryAction,
+        second_at: usize,
+    },
 }
 
 /// Which slice of a campaign one test runs.
@@ -384,6 +447,9 @@ impl Interruption {
                 mask, index_first, ..
             } => Some((mask, index_first)),
             Self::Starved { mask } => Some((mask, false)),
+            Self::Twice {
+                mask, index_first, ..
+            } if mask != 0 => Some((mask, index_first)),
             _ => None,
         }
     }
@@ -401,6 +467,36 @@ impl Interruption {
             Self::Combined { action, at, .. } if at == boundary => action,
             _ => BoundaryAction::None,
         }
+    }
+
+    /// Each boundary of a run over `arrivals` articles, with the action taken
+    /// there and whether that boundary's arrival follows it. A boundary with
+    /// two actions appears twice, and its arrival follows only the second.
+    fn boundaries(self, arrivals: usize) -> Vec<(usize, BoundaryAction, bool)> {
+        let mut boundaries = Vec::new();
+        for step in 0..=arrivals {
+            match self {
+                Self::Twice {
+                    first,
+                    first_at,
+                    second,
+                    second_at,
+                    ..
+                } => {
+                    if first_at == step {
+                        boundaries.push((step, first, second_at != step));
+                    }
+                    if second_at == step {
+                        boundaries.push((step, second, true));
+                    }
+                    if first_at != step && second_at != step {
+                        boundaries.push((step, BoundaryAction::None, true));
+                    }
+                }
+                _ => boundaries.push((step, self.action_at(step), true)),
+            }
+        }
+        boundaries
     }
 }
 
@@ -668,7 +764,7 @@ async fn deliver_schedule_refetches(
     pipeline: &mut Pipeline,
     job: JobId,
     volumes: &[(String, Vec<u8>)],
-    articles: usize,
+    layout: &[usize],
     mask: u8,
     recovery: Option<&(u32, Vec<u8>)>,
 ) {
@@ -679,7 +775,7 @@ async fn deliver_schedule_refetches(
             let file = work.segment_id.file_id.file_index;
             let article = work.segment_id.segment_number;
             if (file < volumes.len() as u32
-                && mask & (1 << (file * articles as u32 + article)) == 0)
+                && mask & (1 << article_slot(layout, file, article)) == 0)
                 || recovery.is_some_and(|(index, _)| file == *index)
             {
                 if !available.contains(&(file, article)) {
@@ -693,6 +789,7 @@ async fn deliver_schedule_refetches(
     }
     for (file, article) in available {
         if file < volumes.len() as u32 {
+            let articles = layout[file as usize];
             deliver_schedule_article(pipeline, job, volumes, file, article, articles).await;
         } else {
             let (index, bytes) = recovery.expect("queued recovery has fixture bytes");
@@ -718,7 +815,9 @@ async fn deliver_schedule_refetches(
 /// Both follow from the schedule, so across the arrival orders every boundary
 /// sees a budget demotion and a source-damage one against each set.
 fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize, DemotionReason) {
-    let (file, article) = order[0];
+    // A schedule that lost every article has no set to claim and nothing to
+    // seed from.
+    let (file, article) = order.first().copied().unwrap_or_default();
     let seed = step + file as usize * 2 + article as usize;
     let reason = if seed.is_multiple_of(2) {
         DemotionReason::HoldsBudgetExceeded
@@ -753,19 +852,19 @@ pub(super) async fn run_described_schedule(
     interruption: Interruption,
 ) -> Outcome {
     enable_schedule_trace();
-    let articles = spec.files[0].segments.len();
-    assert_eq!(volumes.len() * articles, 4, "four scheduled article slots");
-    assert!(
-        spec.files[..volumes.len()]
-            .iter()
-            .all(|file| file.segments.len() == articles)
+    let layout: Vec<usize> = spec.files[..volumes.len()]
+        .iter()
+        .map(|file| file.segments.len())
+        .collect();
+    assert_eq!(
+        layout,
+        slot_layout(volumes.len(), layout.iter().sum()),
+        "four or five scheduled article slots"
     );
+    let articles = |file: u32| layout[file as usize];
     let order: Vec<_> = order
         .iter()
-        .map(|&(file, article)| {
-            let slot = file * 2 + article;
-            (slot / articles as u32, slot % articles as u32)
-        })
+        .map(|&(file, article)| slot_article(&layout, file * 2 + article))
         .collect();
     let root = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
@@ -838,8 +937,8 @@ pub(super) async fn run_described_schedule(
         )
         .await;
     }
-    for step in 0..=order.len() {
-        match interruption.action_at(step) {
+    for (step, action, arrives) in interruption.boundaries(order.len()) {
+        match action {
             BoundaryAction::Demote => {
                 if profile == ExtractionProfile::DirectStore {
                     let before = pipeline.direct_store.demotions.len();
@@ -870,6 +969,13 @@ pub(super) async fn run_described_schedule(
                         .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
                         .await;
                 }
+                // A later interruption makes a promise of its own. What the run
+                // asked for again under an earlier one answers to that one:
+                // keep only the requests that broke it, and carry them over.
+                let broken = durable.take().map(|promise: BTreeSet<_>| {
+                    rerequested.retain(|article| promise.contains(article));
+                    rerequested.clone()
+                });
                 durable = Some(if action == BoundaryAction::Restart {
                     // What the barrier just published is what the restart may
                     // rely on. Bytes held without a destination are not in it.
@@ -882,7 +988,7 @@ pub(super) async fn run_described_schedule(
                             let installed = snapshot::decode_installed(blob).unwrap();
                             for (_, file_index) in installed.volumes {
                                 kept.extend(
-                                    (0..articles as u32)
+                                    (0..articles(file_index) as u32)
                                         .map(|article| (file_index, article))
                                         .filter(|article| delivered.contains(article)),
                                 );
@@ -895,6 +1001,7 @@ pub(super) async fn run_described_schedule(
                             let Some((_, bytes)) = volumes.get(floor.file_index as usize) else {
                                 continue;
                             };
+                            let articles = articles(floor.file_index);
                             let covered = (0..articles as u32)
                                 .take_while(|article| {
                                     article_extent(bytes.len(), *article, articles).1 as u64
@@ -917,6 +1024,9 @@ pub(super) async fn run_described_schedule(
                 } else {
                     BTreeSet::new()
                 });
+                if let (Some(promise), Some(broken)) = (durable.as_mut(), broken) {
+                    promise.extend(broken);
+                }
                 let counters = pipeline.direct_unpack.counters();
                 chase_armed += counters.armed;
                 chase_consumed += counters.consumed;
@@ -987,13 +1097,17 @@ pub(super) async fn run_described_schedule(
             }
             BoundaryAction::None => {}
         }
+        if !arrives {
+            continue;
+        }
         let Some(&(file, article)) = order.get(step) else {
             break;
         };
-        if loss.is_some_and(|(mask, _)| mask & (1 << (file * articles as u32 + article)) != 0) {
+        if loss.is_some_and(|(mask, _)| mask & (1 << article_slot(&layout, file, article)) != 0) {
             trace.push(format!("lost {file}:{article}"));
             continue;
         }
+        let articles = articles(file);
         deliver_schedule_article(&mut pipeline, job, volumes, file, article, articles).await;
         delivered.insert((file, article));
         trace.push(format!(
@@ -1032,7 +1146,7 @@ pub(super) async fn run_described_schedule(
                 &mut pipeline,
                 job,
                 volumes,
-                articles,
+                &layout,
                 mask,
                 recovery.as_ref(),
             )
@@ -1057,7 +1171,7 @@ pub(super) async fn run_described_schedule(
                     &mut pipeline,
                     job,
                     volumes,
-                    articles,
+                    &layout,
                     mask,
                     recovery.as_ref(),
                 )
@@ -1071,7 +1185,8 @@ pub(super) async fn run_described_schedule(
                     ) {
                         break;
                     }
-                    dispatch_and_submit(&mut pipeline, job, volumes, file, article, articles).await;
+                    dispatch_and_submit(&mut pipeline, job, volumes, file, article, articles(file))
+                        .await;
                 }
                 continue;
             }
@@ -1338,6 +1453,36 @@ async fn conventional_campaign(format: Format, selection: Selection) {
 }
 
 async fn profile_campaign(format: Format, selection: Selection, profile: ExtractionProfile) {
+    let cases = selected_schedules(selection);
+    let wrong_password = wrong_password_schedules(selection);
+    slot_campaign(
+        format,
+        selection,
+        profile,
+        4,
+        wrong_password,
+        cases,
+        |_, _, _, _| false,
+    )
+    .await;
+}
+
+/// Adjusts a case's outcome for a product defect the campaign holds open,
+/// before the case's rules see it. True holds the whole case open: none of
+/// its rules apply.
+type KnownDefect = fn(Format, &[(u32, u32)], Interruption, &mut Outcome) -> bool;
+
+/// A format's campaign over `slots` article slots (see [`slot_layout`]): the
+/// given wrong-password schedules, then each case held to the same rules.
+async fn slot_campaign(
+    format: Format,
+    selection: Selection,
+    profile: ExtractionProfile,
+    slots: usize,
+    wrong_password: Vec<Schedule>,
+    cases: Vec<(usize, Schedule)>,
+    known_defect: KnownDefect,
+) {
     let name = "nested/feature.mkv";
     let password = "moonlit-harbour";
     let length = match format {
@@ -1419,13 +1564,21 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
     );
     let mut spec =
         direct_store_job_spec_with_articles("Archive schedules", &volumes, 4 / count);
+    for (file, articles) in slot_layout(count, slots).into_iter().enumerate() {
+        if articles != spec.files[file].segments.len() {
+            let volume = &volumes[file..=file];
+            spec.files[file] = direct_store_job_spec_with_articles("", volume, articles)
+                .files
+                .remove(0);
+        }
+    }
     spec.password = encrypted.then(|| password.to_string());
     let baseline = run_described_schedule(
         ExtractionProfile::Conventional,
         spec.clone(),
         &volumes,
         described.as_deref(),
-        &in_order_arrivals(2),
+        &slot_arrivals(slots),
         &[name],
         Interruption::None,
     )
@@ -1438,7 +1591,7 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
     );
     // A password the archive does not open with. An archive that needs none
     // must not notice it.
-    for (order, interruption) in wrong_password_schedules(selection) {
+    for (order, interruption) in wrong_password {
         if !profile.includes(interruption) {
             continue;
         }
@@ -1466,14 +1619,14 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
             assert_eq!(outcome.files[name].as_deref(), Some(payload.as_slice()));
         }
     }
-    for (case, (order, interruption)) in selected_schedules(selection) {
+    for (case, (order, interruption)) in cases {
         if !profile.includes(interruption) {
             continue;
         }
         eprintln!(
             "{format:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        let actual = run_described_schedule(
+        let mut actual = run_described_schedule(
             profile,
             spec.clone(),
             &volumes,
@@ -1483,6 +1636,9 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
             interruption,
         )
         .await;
+        if known_defect(format, &order, interruption, &mut actual) {
+            continue;
+        }
         if interruption.fails() {
             profile.assert_rejected(&actual, &[name]);
             continue;
@@ -1497,7 +1653,7 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
         // A duplicate can invalidate an already-running RAR chase. Clean
         // unique arrivals must consume chase; duplicate schedules still must
         // admit it and produce the same verified output through safe fallback.
-        let unique_arrivals = order.len() == 4;
+        let unique_arrivals = order.len() == slots;
         if profile == ExtractionProfile::Chase && matches!(interruption, Interruption::None) {
             assert!(actual.chase_armed > 0, "{format:?}: {:?}", actual.trace);
             if unique_arrivals {
