@@ -1685,7 +1685,11 @@ fn superseded_source_probe(
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    let longest = outputs.iter().map(|(_, length, _)| *length).max().unwrap_or(0);
+    let longest = outputs
+        .iter()
+        .map(|(_, length, _)| *length)
+        .max()
+        .unwrap_or(0);
     if !file.metadata().is_ok_and(|meta| meta.len() <= longest) {
         return false;
     }

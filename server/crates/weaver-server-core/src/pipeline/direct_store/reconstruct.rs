@@ -468,12 +468,13 @@ fn reconstruct_volume(
             // and never past the restored bytes: anything beyond them is held
             // to the rules above.
             let unrecorded = match volume.partial_article {
-                PartialArticle::CarryThrough => restored_run_end(&volume.restored, start)
-                    .and_then(|restored_end| {
+                PartialArticle::CarryThrough => {
+                    restored_run_end(&volume.restored, start).and_then(|restored_end| {
                         volume
                             .crcs
                             .unrecorded_until(start, range_end.min(restored_end))
-                    }),
+                    })
+                }
                 PartialArticle::Refuse => None,
             };
             let end = match (unrecorded, volume.crcs.run_starting_at(start)) {

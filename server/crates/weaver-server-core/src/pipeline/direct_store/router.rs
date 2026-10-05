@@ -924,7 +924,8 @@ impl CrcRuns {
         let index = self
             .runs
             .partition_point(|(run_start, _, _)| *run_start <= offset);
-        if let Some(&(run_start, run_len, _)) = index.checked_sub(1).and_then(|at| self.runs.get(at))
+        if let Some(&(run_start, run_len, _)) =
+            index.checked_sub(1).and_then(|at| self.runs.get(at))
             && run_start.saturating_add(run_len) > offset
         {
             return None;
@@ -3061,7 +3062,11 @@ impl DirectSetRouter {
             let Some(member_id) = self.member_id_for_layout(index) else {
                 continue;
             };
-            for part in member.parts.iter().filter(|part| part.volume == volume_index) {
+            for part in member
+                .parts
+                .iter()
+                .filter(|part| part.volume == volume_index)
+            {
                 if let Some(low) = part.logical_offset {
                     ranges.push((member_id, low, low.saturating_add(part.data_size)));
                 }
