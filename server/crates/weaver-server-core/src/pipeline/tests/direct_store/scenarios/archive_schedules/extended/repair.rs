@@ -619,6 +619,73 @@ async fn two_sets_loss_in_the_demoted_set_leaves_the_other_direct() {
     }
 }
 
+/// The same two sets posted under obfuscated names, so the recovery set's
+/// descriptions are the only real names and each volume is admitted by its
+/// content. The demoted set's file lands on disk under its posted name, not
+/// the name its description declares, and its second article is lost. The
+/// repair still writes that file in place, through the identity its first
+/// article proved, and the set the schedule left alone stays direct.
+#[tokio::test]
+async fn two_sets_loss_in_a_renamed_demoted_set_leaves_the_other_direct() {
+    // Each offset-zero article has to cover its volume's 16 KiB fingerprint
+    // window whole, as every real article does.
+    let members: Vec<_> = [("alpha.mkv", 70_001, 7), ("nested/beta.mkv", 65_537, 11)]
+        .into_iter()
+        .map(|(name, len, step)| {
+            let payload = (0..len)
+                .map(|n| ((n * step + n / 251) % 253) as u8)
+                .collect::<Vec<_>>();
+            (name, payload)
+        })
+        .collect();
+    let named: Vec<_> = ["alpha", "beta"]
+        .into_iter()
+        .zip(&members)
+        .map(|(stem, (member, payload))| {
+            let (_, bytes) = single_member_store_set(member, payload, 1).remove(0);
+            (format!("{stem}.part01.rar"), bytes)
+        })
+        .collect();
+    let volumes = obfuscate_volumes(&named);
+    let fixture = Fixture {
+        spec: direct_store_job_spec("Two set schedules", &volumes),
+        volumes,
+        described: Some(named.into_iter().map(|(name, _)| name).collect()),
+        members,
+        route: Route {
+            sets: 2,
+            ..Route::DIRECT
+        },
+    };
+    let forced = Forced::Direct(DemotionReason::HoldsScratchCeiling);
+    // A set admitted by content takes its index from its first binding, so
+    // the set whose volume arrives first is set 0 and is the one demoted,
+    // right after that first article. Beta loses its second article, then
+    // alpha does.
+    for (case, (order, mask)) in [
+        (vec![(1, 0), (0, 0), (0, 1)], 8),
+        (vec![(0, 0), (1, 0), (1, 1)], 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        run_case(
+            &fixture,
+            forced.on(0),
+            forced.profile(),
+            case,
+            &order,
+            Interruption::Combined {
+                mask,
+                index_first: true,
+                action: BoundaryAction::Demote,
+                at: 1,
+            },
+        )
+        .await;
+    }
+}
+
 // Shards cut each campaign to well under a thousand cases, so no test
 // approaches the runner's per-test limit.
 macro_rules! par3_campaign {

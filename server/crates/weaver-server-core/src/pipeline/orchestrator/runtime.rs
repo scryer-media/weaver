@@ -68,13 +68,20 @@ impl Pipeline {
             propagation_delay,
         ) = {
             let cfg = config.read().await;
+            // An install that never chose one — every upgraded install — runs
+            // the profile this machine is recommended. A saved choice the
+            // machine can no longer honour falls back the same way.
+            let hardware_profile = cfg
+                .hardware_profile
+                .filter(|chosen| chosen.unmet_requirement(&profile).is_none())
+                .unwrap_or_else(|| crate::runtime::HardwareProfile::recommended(&profile));
+            // The resident holds default is sized once, under the profile in
+            // force at startup, like every other direct-store limit below.
+            let resident_default_cap = hardware_profile
+                .tuning(&profile)
+                .direct_store_resident_default_cap_bytes;
             (
-                // An install that never chose one — every upgraded install —
-                // runs the profile this machine is recommended. A saved choice
-                // the machine can no longer honour falls back the same way.
-                cfg.hardware_profile
-                    .filter(|chosen| chosen.unmet_requirement(&profile).is_none())
-                    .unwrap_or_else(|| crate::runtime::HardwareProfile::recommended(&profile)),
+                hardware_profile,
                 cfg.isp_bandwidth_cap.clone(),
                 // Config, with `WEAVER_RAR_DIRECT_STORE`
                 // overriding it. Resolved once here and held for the life of
@@ -85,7 +92,8 @@ impl Pipeline {
                 // mid-job.
                 crate::pipeline::direct_store::DirectStoreSettings::resolve_on(
                     &cfg,
-                    crate::pipeline::direct_store::HostFacts::probe(&intermediate_dir),
+                    crate::pipeline::direct_store::HostFacts::probe(&intermediate_dir)
+                        .with_resident_default_cap(resident_default_cap),
                 ),
                 // Same contract, same reason: resolved once so a set admitted
                 // under an enabled gate cannot find it disabled mid-chase.
@@ -96,6 +104,7 @@ impl Pipeline {
         let profile_tuning = hardware_profile.tuning(&profile);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
+        crate::pipeline::repair::par3::budget::set_memory_share(profile_tuning.par3_memory);
         shared_state.set_hardware_profile_in_force(crate::HardwareProfileInForce {
             active: hardware_profile,
             scheduled: None,

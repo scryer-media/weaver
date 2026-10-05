@@ -632,6 +632,21 @@ pub(in crate::pipeline) struct Coordinator {
     test_rx: Option<mpsc::Receiver<RepairWorkDone>>,
 }
 
+/// CPU workers PAR3 repair may run at once: every core but one, so the
+/// download path always keeps a core, and no more than `cap` when the
+/// hardware profile sets one. Never zero, or repair could not start.
+fn cpu_limit(cap: Option<usize>) -> usize {
+    cpu_limit_on(
+        std::thread::available_parallelism().map_or(1, usize::from),
+        cap,
+    )
+}
+
+fn cpu_limit_on(parallelism: usize, cap: Option<usize>) -> usize {
+    let host = parallelism.saturating_sub(1).max(1);
+    cap.map_or(host, |cap| host.min(cap)).max(1)
+}
+
 #[cfg(test)]
 impl Default for Coordinator {
     fn default() -> Self {
@@ -852,10 +867,7 @@ impl Coordinator {
             in_flight: BTreeMap::new(),
             worker_allowances: BTreeMap::new(),
             contended: std::collections::BTreeSet::new(),
-            cpu_limit: std::thread::available_parallelism()
-                .map_or(1, usize::from)
-                .saturating_sub(1)
-                .max(1),
+            cpu_limit: cpu_limit(None),
             next_ticket: 0,
             last_job: None,
             tx,
@@ -863,6 +875,14 @@ impl Coordinator {
             #[cfg(test)]
             test_rx: None,
         }
+    }
+
+    /// Hold PAR3 workers to the hardware profile's cap, or `None` for every
+    /// core but one. Dispatch reads the limit each time it hands out workers,
+    /// so work already running keeps its allowance and only the next dispatch
+    /// sees the new value.
+    pub(in crate::pipeline) fn set_cpu_cap(&mut self, cap: Option<usize>) {
+        self.cpu_limit = cpu_limit(cap);
     }
 
     /// Record this job's typed verdict, counting it once per distinct value.

@@ -792,6 +792,18 @@ fn is_admission_exhausted(error: &EngineError) -> bool {
 }
 
 impl Pipeline {
+    /// The PAR3 coordinator, created on first admission with its workers held
+    /// to the hardware profile in force.
+    pub(in crate::pipeline) fn par3_coordinator(&mut self) -> &mut work::Coordinator {
+        let cpu_cap = self.tuner.profile_tuning().par3_cpu_cap;
+        self.par3_runtime.get_or_insert_with(|| {
+            let mut coordinator =
+                work::Coordinator::new(self.repair_work_done_tx.clone(), Arc::clone(&self.metrics));
+            coordinator.set_cpu_cap(cpu_cap);
+            Box::new(coordinator)
+        })
+    }
+
     pub(in crate::pipeline) async fn try_load_par3_metadata(
         &mut self,
         job_id: JobId,
@@ -875,13 +887,8 @@ impl Pipeline {
             }
             return;
         }
-        let coordinator = self.par3_runtime.get_or_insert_with(|| {
-            Box::new(work::Coordinator::new(
-                self.repair_work_done_tx.clone(),
-                Arc::clone(&self.metrics),
-            ))
-        });
-        coordinator.admission_paused = self.shared_state.is_post_processing_paused();
+        let paused = self.shared_state.is_post_processing_paused();
+        self.par3_coordinator().admission_paused = paused;
         if let Err(error) = self.enqueue_par3_file_with_inside(job_id, file_id, embedded) {
             self.fail_job(job_id, format!("PAR3 discovery failed: {error}"));
             return;
