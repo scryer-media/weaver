@@ -107,45 +107,12 @@ jobs:
         with:
           name: archive-matrix-extended-linux-x86_64
           path: target
-      - name: Run assigned extended archive campaign partition
+      - name: Run assigned archive campaign partition
         run: >-
           cargo nextest run
-          --profile archive-matrix-extended
+          --profile archive-matrix-all
           --run-ignored all
           --archive-file target/archive-matrix-extended.tar.zst
           --workspace-remap .
           --partition count:${{ matrix.partition }}/128
-          --no-fail-fast
-
-  archive-matrix:
-    name: archive-matrix-linux-x86_64-${{ matrix.partition }}
-    if: ${{ !cancelled() && needs.archive-matrix-extended-build.result == 'success' }}
-    needs: [archive-matrix-extended-build]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      max-parallel: 48
-      matrix:
-        partition: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
-        with:
-          tool: nextest
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: archive-matrix-extended-linux-x86_64
-          path: target
-      - name: Run assigned archive matrix partition
-        run: >-
-          cargo nextest run
-          --profile archive-matrix
-          --run-ignored all
-          --archive-file target/archive-matrix-extended.tar.zst
-          --workspace-remap .
-          --partition count:${{ matrix.partition }}/48
           --no-fail-fast

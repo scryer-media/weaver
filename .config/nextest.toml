@@ -17,11 +17,21 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 platform = { host = 'cfg(target_os = "macos")' }
 leak-timeout = { period = "2s", result = "pass" }
 
+# The archive campaigns run whole schedules per test, so a healthy one can take
+# minutes on a shared runner: flag it every five minutes, kill it after twenty.
+
 # Run with: cargo nextest run --profile archive-matrix --run-ignored all --no-fail-fast
 [profile.archive-matrix]
 default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_)'
+slow-timeout = { period = "300s", terminate-after = 4 }
 
 # The extended campaigns are a separate, manually dispatched run.
 # Run with: cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast
 [profile.archive-matrix-extended]
 default-filter = '(test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/)'
+slow-timeout = { period = "300s", terminate-after = 4 }
+
+# The archive matrix and the extended campaigns together, as CI partitions them.
+[profile.archive-matrix-all]
+default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/))'
+slow-timeout = { period = "300s", terminate-after = 4 }
