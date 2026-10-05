@@ -99,13 +99,19 @@ combined_campaign!(
     conventional_campaign
 );
 
-// Every multi-volume compressed layout under each extraction profile.
+// Every multi-volume compressed layout under each extraction profile. A
+// layout marked `fine` runs long enough to need its shards cut finer.
 macro_rules! compressed_campaigns {
-    ($($direct:ident, $chase:ident, $conventional:ident => $variant:expr;)+) => {
+    ($($direct:ident, $chase:ident, $conventional:ident => $variant:expr $(, $fine:ident)?;)+) => {
         $(
-            combined_campaign!($direct, $variant, compressed_direct_campaign);
-            combined_campaign!($chase, $variant, compressed_chase_campaign);
-            combined_campaign!($conventional, $variant, compressed_conventional_campaign);
+            combined_campaign!($direct, $variant, compressed_direct_campaign $(, $fine)?);
+            combined_campaign!($chase, $variant, compressed_chase_campaign $(, $fine)?);
+            combined_campaign!(
+                $conventional,
+                $variant,
+                compressed_conventional_campaign
+                $(, $fine)?
+            );
         )+
     };
 }
@@ -153,11 +159,11 @@ compressed_campaigns! {
     combined_compressed_direct_rar4_headers_four_volume,
     combined_compressed_chase_rar4_headers_four_volume,
     combined_compressed_conventional_rar4_headers_four_volume
-        => CompressedFormat::Rar4HeadersFourVolumes;
+        => CompressedFormat::Rar4HeadersFourVolumes, fine;
     combined_compressed_direct_rar5_headers_four_volume,
     combined_compressed_chase_rar5_headers_four_volume,
     combined_compressed_conventional_rar5_headers_four_volume
-        => CompressedFormat::Rar5HeadersFourVolumes;
+        => CompressedFormat::Rar5HeadersFourVolumes, fine;
     combined_compressed_direct_rar4_solid_encrypted_two_volume,
     combined_compressed_chase_rar4_solid_encrypted_two_volume,
     combined_compressed_conventional_rar4_solid_encrypted_two_volume
