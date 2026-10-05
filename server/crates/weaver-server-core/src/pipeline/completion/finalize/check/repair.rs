@@ -111,6 +111,23 @@ impl Pipeline {
                 .copied()
                 .or_else(|| by_source.get(&old_name).copied())
                 .or_else(|| by_canonical.get(&old_name).copied());
+            // A live direct set's source volume is never written under its
+            // name; the set holds its proven bytes elsewhere. Whatever sits at
+            // that name is a superseded write from an earlier incarnation of
+            // the job, which matches the description by its first 16 KiB
+            // only. Naming it as the volume would hand verification a file
+            // that is not the one the set accounts for. The job's cleanup
+            // removes it once the set has delivered.
+            if let Some((file_id, _)) = matched
+                && self.is_direct_source_file(file_id)
+            {
+                debug!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    "refusing PAR2 rename of a file a direct set owns the bytes of"
+                );
+                continue;
+            }
             let Some(description) = self
                 .par2_set_for(job_id, *set_id)
                 .and_then(|set| set.file_description(&suggestion.file_id))

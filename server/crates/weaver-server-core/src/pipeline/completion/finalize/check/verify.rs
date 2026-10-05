@@ -852,9 +852,16 @@ impl Pipeline {
                 // verdict about bytes that are no longer anywhere. The
                 // exemption is therefore exactly as wide as the thing that
                 // earns it.
+                //
+                // A live virtual volume's verdict was taken over the set's own
+                // bytes, which are never written under the volume's names. A
+                // file at either name is then a superseded write from an
+                // earlier incarnation of the job, not what the verdict read,
+                // so it is not consulted.
+                let live_virtual = live_virtual_par2_files.contains(&file_verification.file_id);
                 let installed = [canonical_filename.as_str(), current_filename.as_str()]
                     .into_iter()
-                    .filter(|name| !name.is_empty())
+                    .filter(|name| !name.is_empty() && !live_virtual)
                     .find_map(|name| {
                         let path = working_dir.join(name);
                         std::fs::metadata(&path)
@@ -871,9 +878,7 @@ impl Pipeline {
                         continue;
                     }
                     Some((filename, _, _)) => filename,
-                    None if live_virtual_par2_files.contains(&file_verification.file_id) => {
-                        current_filename.clone()
-                    }
+                    None if live_virtual => current_filename.clone(),
                     None => {
                         report.length_mismatch.push(format!(
                             "{canonical_filename} (verdict vouched for bytes that are at neither \
