@@ -959,7 +959,7 @@ impl Pipeline {
     /// split set, and the damaged copies of outputs the verdict rebuilt.
     pub(in crate::pipeline) fn par2_spent_input_names(&self, job_id: JobId) -> Vec<String> {
         let mut names = self.par2_joined_split_part_names(job_id);
-        if let Some(unposted) = self.par2_unposted_outputs.get(&job_id) {
+        if let Some(unposted) = self.recovery_unposted_outputs.get(&job_id) {
             names.extend(
                 unposted
                     .superseded
@@ -972,12 +972,12 @@ impl Pipeline {
 
     /// Whether a posted file is the damaged copy of an output a recovery
     /// verdict has since delivered whole.
-    pub(in crate::pipeline) fn par2_superseded_source(
+    pub(in crate::pipeline) fn recovery_superseded_source(
         &self,
         job_id: JobId,
         file_id: NzbFileId,
     ) -> bool {
-        self.par2_unposted_outputs
+        self.recovery_unposted_outputs
             .get(&job_id)
             .is_some_and(|unposted| unposted.superseded.contains(&file_id))
     }
@@ -991,7 +991,7 @@ impl Pipeline {
         job_id: JobId,
     ) -> bool {
         let ignore_extensions = self.par2_ignore_extensions();
-        self.par2_unposted_outputs
+        self.recovery_unposted_outputs
             .get(&job_id)
             .is_some_and(|unposted| {
                 unposted
@@ -1017,7 +1017,7 @@ impl Pipeline {
     /// set, and it hashes at most [`SUPERSEDED_PROBE_SLICES`] slices of each
     /// before giving up. A slice of zeros is skipped unhashed — a hole where an
     /// article never arrived matches nothing worth matching.
-    pub(in crate::pipeline) async fn note_par2_unposted_outputs(
+    pub(in crate::pipeline) async fn note_recovery_unposted_outputs(
         &mut self,
         job_id: JobId,
         verification: &par2_rs::VerificationResult,
@@ -1069,7 +1069,7 @@ impl Pipeline {
         }
 
         let already: HashSet<NzbFileId> = self
-            .par2_unposted_outputs
+            .recovery_unposted_outputs
             .get(&job_id)
             .map(|unposted| unposted.superseded.clone())
             .unwrap_or_default();
@@ -1130,7 +1130,7 @@ impl Pipeline {
                 "posted files proven to be the damaged copies of outputs the recovery set rebuilt"
             );
         }
-        let unposted = self.par2_unposted_outputs.entry(job_id).or_default();
+        let unposted = self.recovery_unposted_outputs.entry(job_id).or_default();
         unposted.outputs.extend(names);
         unposted.superseded.extend(superseded);
     }

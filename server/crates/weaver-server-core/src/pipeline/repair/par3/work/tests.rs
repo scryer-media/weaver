@@ -893,6 +893,7 @@ fn readback_installation(path: PathBuf, options: &ExecutionOptions) -> Box<readb
             volume: 0,
             output: 0,
             cipher: false,
+            deferred: false,
             edges: Vec::new(),
         }],
         current: 0,
@@ -901,6 +902,7 @@ fn readback_installation(path: PathBuf, options: &ExecutionOptions) -> Box<readb
         settling_set: None,
         pending_gap: None,
         edge_reads: Vec::new(),
+        edge_budget: 0,
         preflight_failed: false,
         _edge_reservation: None,
     })

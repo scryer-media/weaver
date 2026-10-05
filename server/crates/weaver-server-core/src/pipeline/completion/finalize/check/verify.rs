@@ -1380,7 +1380,7 @@ impl Pipeline {
         let reconciliation = self
             .reconcile_verified_par2_files(job_id, verification)
             .await?;
-        self.note_par2_unposted_outputs(job_id, verification, &reconciliation.unbound)
+        self.note_recovery_unposted_outputs(job_id, verification, &reconciliation.unbound)
             .await;
         if reconciliation.completed > 0 || reconciliation.has_failures() {
             info!(
