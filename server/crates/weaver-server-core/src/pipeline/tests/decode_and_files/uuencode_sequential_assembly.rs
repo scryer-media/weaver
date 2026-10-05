@@ -1548,6 +1548,66 @@ async fn a_complete_content_match_with_the_wrong_length_is_refused() {
 }
 
 #[tokio::test]
+async fn a_proven_length_still_stands_beside_a_prefix_captured_again() {
+    // The restart shape. A restored set's binding was proven before the
+    // restart, so the file carries a proven fingerprint; then its first
+    // article is delivered a second time and a fresh prefix is captured. The
+    // file's own count is a restart recount and disagrees with the
+    // description, but the proven length does not, and that is the length the
+    // match is held to.
+    let payload = binding_payload(33, 49_152);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id) = obfuscated_binding_fixture(
+        &temp_dir,
+        JobId(20116),
+        "e5a0c37d.bin",
+        &[("silver-horizon.mkv", &payload)],
+        &payload[..crate::pipeline::PAR2_HASH_16K_BYTES],
+    )
+    .await;
+
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        &payload[..4_096],
+        "e5a0c37d.bin",
+        None,
+    )
+    .await;
+    pipeline.file_prefix_16k.insert(
+        file_id,
+        payload[..crate::pipeline::PAR2_HASH_16K_BYTES].to_vec(),
+    );
+    pipeline.file_declared_size.remove(&file_id);
+    let file = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("test file");
+    assert!(file.is_complete(), "the fixture must be complete");
+    assert_ne!(file.received_bytes(), payload.len() as u64);
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_none(),
+        "non-vacuity: without the proven length the recount refuses the match"
+    );
+
+    let set = pipeline.par2_set(file_id.job_id).cloned().expect("a set");
+    let (&expected, description) = set.files.iter().next().expect("one description");
+    pipeline
+        .file_proven_par2_fingerprint
+        .insert(file_id, (description.hash_16k, description.length));
+    assert_eq!(
+        pipeline
+            .resolve_par2_file_binding(file_id)
+            .map(|bound| bound.par2_file_id),
+        Some(expected),
+        "the proven length outlives the prefix that was captured again"
+    );
+}
+
+#[tokio::test]
 async fn an_incomplete_content_match_at_or_under_the_described_length_still_binds() {
     let payload = binding_payload(31, 49_152);
     let temp_dir = tempfile::tempdir().unwrap();

@@ -45,12 +45,24 @@ impl Family {
     }
 
     /// Shards a campaign is cut into: about a thousand cases a shard, fewer
-    /// where a case restarts the pipeline twice.
-    const fn shards(self) -> usize {
-        match self {
+    /// where a case restarts the pipeline twice, and twice as many for the
+    /// formats whose cases run long enough that a shard of the usual size
+    /// outruns the per-test limit.
+    const fn shards(self, format: Format) -> usize {
+        let shards = match self {
             Self::FifthArticle | Self::TwoInterruptions => 80,
             Self::SecondDuplicate => 40,
-        }
+        };
+        let finer = match self {
+            Self::FifthArticle => matches!(
+                format,
+                Format::Rar4Encrypted | Format::Rar5Encrypted | Format::Rar5FourVolumes
+            ),
+            Self::SecondDuplicate | Self::TwoInterruptions => {
+                matches!(format, Format::Rar4Encrypted)
+            }
+        };
+        if finer { 2 * shards } else { shards }
     }
 
     /// Every case of the family, by replay index.
@@ -95,25 +107,29 @@ impl Family {
     /// `WEAVER_ARCHIVE_SCHEDULE_CASE=<n>` or `WEAVER_ARCHIVE_COMBINED_CASE=<n>`
     /// (or `<start>..<end>`) replays those replay indices: a smoke run runs
     /// them, a shard the ones it owns.
-    fn selected(self, selection: Selection) -> Vec<(usize, Schedule)> {
+    fn selected(self, format: Format, selection: Selection) -> Vec<(usize, Schedule)> {
         let cases = self.cases();
         let replay = replayed(cases.len());
         let stride = cases.len() / SMOKE_SPREAD;
+        let shards = self.shards(format);
         let mut kinds = BTreeSet::new();
         cases
             .into_iter()
             .enumerate()
             .filter(|(case, (_, interruption))| match selection {
                 Selection::Shard(shard) => {
-                    assert!(shard < self.shards());
-                    case % self.shards() == shard
+                    assert!(shard < shards);
+                    case % shards == shard
                         && replay.as_ref().is_none_or(|range| range.contains(case))
                 }
                 Selection::Smoke => match &replay {
                     Some(range) => range.contains(case),
                     None => kinds.insert(kind(*interruption)) || case % stride == stride / 2,
                 },
-                Selection::WrongPassword => panic!("{self:?} carries no password schedules"),
+                Selection::FineShard(_) => panic!("{self:?} cuts its own shards"),
+                Selection::WrongPassword | Selection::WrongPasswordPart(_) => {
+                    panic!("{self:?} carries no password schedules")
+                }
             })
             .collect()
     }
@@ -391,7 +407,7 @@ async fn family_campaign(
     selection: Selection,
 ) {
     eprintln!("{family:?} {format:?} profile={profile:?} selection={selection:?}");
-    let cases = family.selected(selection);
+    let cases = family.selected(format, selection);
     let known_defect: KnownDefect = match family {
         Family::FifthArticle => |_, _, _, _| false,
         Family::SecondDuplicate => |_, _, _, _| false,
@@ -468,35 +484,24 @@ depth_smoke!(
 );
 
 // One module per family, format and profile, its shards named in decades so
-// a family's shard count is ten times the decades it lists. Every shard is
+// a format's shard count is ten times the decades it lists. Every shard is
 // independently replayable.
 macro_rules! depth_campaigns {
-    ($module:ident, $family:ident; $($decade:tt)+) => {
+    ($module:ident, $family:ident; $($name:ident $format:ident $decades:tt),+ $(,)?) => {
         mod $module {
             use super::*;
-            depth_campaigns!(
-                @formats $family, [$($decade)+];
-                rar4 Rar4,
-                rar5 Rar5,
-                rar4_encrypted Rar4Encrypted,
-                rar5_encrypted Rar5Encrypted,
-                rar4_four_volume Rar4FourVolumes,
-                rar5_four_volume Rar5FourVolumes
-            );
+            $(
+                mod $name {
+                    use super::*;
+                    depth_campaigns!(
+                        @profiles $family, $format, $decades;
+                        direct DirectStore,
+                        chase Chase,
+                        conventional Conventional
+                    );
+                }
+            )+
         }
-    };
-    (@formats $family:ident, $decades:tt; $($name:ident $format:ident),+) => {
-        $(
-            mod $name {
-                use super::*;
-                depth_campaigns!(
-                    @profiles $family, $format, $decades;
-                    direct DirectStore,
-                    chase Chase,
-                    conventional Conventional
-                );
-            }
-        )+
     };
     (@profiles $family:ident, $format:ident, $decades:tt; $($name:ident $profile:ident),+) => {
         $(
@@ -507,7 +512,9 @@ macro_rules! depth_campaigns {
         )+
     };
     (@decades $family:ident, $format:ident, $profile:ident, [$($decade:tt)+]) => {
-        const _: () = assert!(10 * [$($decade),+].len() == Family::$family.shards());
+        const _: () = assert!(
+            10 * [$($decade),+].len() == Family::$family.shards(Format::$format)
+        );
         $(depth_campaigns!(@decade $family, $format, $profile, $decade);)+
     };
     (@decade $family:ident, $format:ident, $profile:ident, 0) => {
@@ -550,6 +557,46 @@ macro_rules! depth_campaigns {
             shard_70 70, shard_71 71, shard_72 72, shard_73 73, shard_74 74,
             shard_75 75, shard_76 76, shard_77 77, shard_78 78, shard_79 79);
     };
+    (@decade $family:ident, $format:ident, $profile:ident, 8) => {
+        depth_campaigns!(@each $family, $format, $profile;
+            shard_80 80, shard_81 81, shard_82 82, shard_83 83, shard_84 84,
+            shard_85 85, shard_86 86, shard_87 87, shard_88 88, shard_89 89);
+    };
+    (@decade $family:ident, $format:ident, $profile:ident, 9) => {
+        depth_campaigns!(@each $family, $format, $profile;
+            shard_90 90, shard_91 91, shard_92 92, shard_93 93, shard_94 94,
+            shard_95 95, shard_96 96, shard_97 97, shard_98 98, shard_99 99);
+    };
+    (@decade $family:ident, $format:ident, $profile:ident, 10) => {
+        depth_campaigns!(@each $family, $format, $profile;
+            shard_100 100, shard_101 101, shard_102 102, shard_103 103, shard_104 104,
+            shard_105 105, shard_106 106, shard_107 107, shard_108 108, shard_109 109);
+    };
+    (@decade $family:ident, $format:ident, $profile:ident, 11) => {
+        depth_campaigns!(@each $family, $format, $profile;
+            shard_110 110, shard_111 111, shard_112 112, shard_113 113, shard_114 114,
+            shard_115 115, shard_116 116, shard_117 117, shard_118 118, shard_119 119);
+    };
+    (@decade $family:ident, $format:ident, $profile:ident, 12) => {
+        depth_campaigns!(@each $family, $format, $profile;
+            shard_120 120, shard_121 121, shard_122 122, shard_123 123, shard_124 124,
+            shard_125 125, shard_126 126, shard_127 127, shard_128 128, shard_129 129);
+    };
+    (@decade $family:ident, $format:ident, $profile:ident, 13) => {
+        depth_campaigns!(@each $family, $format, $profile;
+            shard_130 130, shard_131 131, shard_132 132, shard_133 133, shard_134 134,
+            shard_135 135, shard_136 136, shard_137 137, shard_138 138, shard_139 139);
+    };
+    (@decade $family:ident, $format:ident, $profile:ident, 14) => {
+        depth_campaigns!(@each $family, $format, $profile;
+            shard_140 140, shard_141 141, shard_142 142, shard_143 143, shard_144 144,
+            shard_145 145, shard_146 146, shard_147 147, shard_148 148, shard_149 149);
+    };
+    (@decade $family:ident, $format:ident, $profile:ident, 15) => {
+        depth_campaigns!(@each $family, $format, $profile;
+            shard_150 150, shard_151 151, shard_152 152, shard_153 153, shard_154 154,
+            shard_155 155, shard_156 156, shard_157 157, shard_158 158, shard_159 159);
+    };
     (@each $family:ident, $format:ident, $profile:ident; $($name:ident $shard:literal),+) => {
         $(
             #[tokio::test]
@@ -567,6 +614,27 @@ macro_rules! depth_campaigns {
     };
 }
 
-depth_campaigns!(combined_fifth_article, FifthArticle; 0 1 2 3 4 5 6 7);
-depth_campaigns!(combined_second_duplicate, SecondDuplicate; 0 1 2 3);
-depth_campaigns!(combined_two_interruptions, TwoInterruptions; 0 1 2 3 4 5 6 7);
+depth_campaigns!(combined_fifth_article, FifthArticle;
+    rar4 Rar4 [0 1 2 3 4 5 6 7],
+    rar5 Rar5 [0 1 2 3 4 5 6 7],
+    rar4_encrypted Rar4Encrypted [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15],
+    rar5_encrypted Rar5Encrypted [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15],
+    rar4_four_volume Rar4FourVolumes [0 1 2 3 4 5 6 7],
+    rar5_four_volume Rar5FourVolumes [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15],
+);
+depth_campaigns!(combined_second_duplicate, SecondDuplicate;
+    rar4 Rar4 [0 1 2 3],
+    rar5 Rar5 [0 1 2 3],
+    rar4_encrypted Rar4Encrypted [0 1 2 3 4 5 6 7],
+    rar5_encrypted Rar5Encrypted [0 1 2 3],
+    rar4_four_volume Rar4FourVolumes [0 1 2 3],
+    rar5_four_volume Rar5FourVolumes [0 1 2 3],
+);
+depth_campaigns!(combined_two_interruptions, TwoInterruptions;
+    rar4 Rar4 [0 1 2 3 4 5 6 7],
+    rar5 Rar5 [0 1 2 3 4 5 6 7],
+    rar4_encrypted Rar4Encrypted [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15],
+    rar5_encrypted Rar5Encrypted [0 1 2 3 4 5 6 7],
+    rar4_four_volume Rar4FourVolumes [0 1 2 3 4 5 6 7],
+    rar5_four_volume Rar5FourVolumes [0 1 2 3 4 5 6 7],
+);

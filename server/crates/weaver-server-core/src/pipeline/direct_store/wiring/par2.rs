@@ -2463,6 +2463,7 @@ impl Pipeline {
                     // after it — so refusing that run would demote every
                     // encrypted set the moment it needed a repair.
                     partial_article: super::super::reconstruct::PartialArticle::CarryThrough,
+                    restored: set.restored_volume_coverage(volume_index),
                 },
             });
         }

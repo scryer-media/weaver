@@ -515,6 +515,8 @@ impl Pipeline {
                     // what this sweep writes and nothing unverified may sit
                     // under one.
                     partial_article: super::super::reconstruct::PartialArticle::Refuse,
+                    // Nothing restored is carried under a published floor.
+                    restored: crate::pipeline::direct_store::ByteRanges::new(),
                 },
             ));
         }

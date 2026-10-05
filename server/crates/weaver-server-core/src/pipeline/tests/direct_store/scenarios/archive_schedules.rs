@@ -433,12 +433,25 @@ pub(super) enum Selection {
     Smoke,
     /// One shard of the combined matrix.
     Shard(usize),
+    /// One of [`FINE_SHARDS`] shards of the combined matrix, for a layout
+    /// whose cases run long enough that a shard of the usual size outruns the
+    /// per-test limit.
+    FineShard(usize),
     /// A wrong password across every arrival order and interruption boundary.
     WrongPassword,
+    /// One of [`WRONG_PASSWORD_PARTS`] parts of the wrong password's
+    /// schedules, for the same layouts.
+    WrongPasswordPart(usize),
 }
 
 /// Shards the combined matrix is cut into, each its own test.
 pub(super) const SHARDS: usize = 64;
+
+/// Shards a slow layout's combined matrix is cut into instead.
+pub(super) const FINE_SHARDS: usize = 2 * SHARDS;
+
+/// Parts a slow layout's wrong password schedules are cut into.
+pub(super) const WRONG_PASSWORD_PARTS: usize = 2;
 
 impl Interruption {
     fn loss(self) -> Option<(u8, bool)> {
@@ -503,11 +516,11 @@ impl Interruption {
 
 type Schedule = (Vec<(u32, u32)>, Interruption);
 
-pub(super) fn combined_schedules(shard: usize) -> Vec<(usize, Schedule)> {
-    assert!(shard < SHARDS);
+pub(super) fn combined_schedules(shard: usize, shards: usize) -> Vec<(usize, Schedule)> {
+    assert!(shard < shards);
     combined_schedule_cases()
         .into_iter()
-        .filter(|(case, _)| case % SHARDS == shard)
+        .filter(|(case, _)| case % shards == shard)
         .collect()
 }
 
@@ -515,8 +528,9 @@ pub(super) fn combined_schedules(shard: usize) -> Vec<(usize, Schedule)> {
 pub(super) fn selected_schedules(selection: Selection) -> Vec<(usize, Schedule)> {
     match selection {
         Selection::Smoke => schedules().into_iter().enumerate().collect(),
-        Selection::Shard(shard) => combined_schedules(shard),
-        Selection::WrongPassword => Vec::new(),
+        Selection::Shard(shard) => combined_schedules(shard, SHARDS),
+        Selection::FineShard(shard) => combined_schedules(shard, FINE_SHARDS),
+        Selection::WrongPassword | Selection::WrongPasswordPart(_) => Vec::new(),
     }
 }
 
@@ -525,10 +539,14 @@ pub(super) fn selected_schedules(selection: Selection) -> Vec<(usize, Schedule)>
 /// orders; the matrix runs them all as a test of its own.
 pub(super) fn wrong_password_schedules(selection: Selection) -> Vec<Schedule> {
     let mut result = Vec::new();
-    if selection == Selection::Smoke || selection == Selection::WrongPassword {
+    let every = matches!(
+        selection,
+        Selection::WrongPassword | Selection::WrongPasswordPart(_)
+    );
+    if selection == Selection::Smoke || every {
         for order in arrival_orders() {
             result.push((order.clone(), Interruption::None));
-            if selection == Selection::WrongPassword {
+            if every {
                 for at in 0..order.len() {
                     result.push((order.clone(), Interruption::Restart(at)));
                     result.push((order.clone(), Interruption::Crash(at)));
@@ -536,6 +554,15 @@ pub(super) fn wrong_password_schedules(selection: Selection) -> Vec<Schedule> {
                 }
             }
         }
+    }
+    if let Selection::WrongPasswordPart(part) = selection {
+        assert!(part < WRONG_PASSWORD_PARTS);
+        result = result
+            .into_iter()
+            .enumerate()
+            .filter(|(schedule, _)| schedule % WRONG_PASSWORD_PARTS == part)
+            .map(|(_, schedule)| schedule)
+            .collect();
     }
     result
 }
@@ -2478,6 +2505,66 @@ macro_rules! combined_campaign {
                 $run($variant, Selection::WrongPassword).await;
             }
         }
+    };
+    // A layout slow enough to need [`FINE_SHARDS`] shards and its password
+    // schedules in [`WRONG_PASSWORD_PARTS`] parts.
+    ($module:ident, $variant:expr, $run:ident, fine) => {
+        mod $module {
+            use super::*;
+            combined_campaign!(@fine_shards $variant, $run);
+            #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
+            async fn wrong_password_part_0() {
+                $run($variant, Selection::WrongPasswordPart(0)).await;
+            }
+            #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
+            async fn wrong_password_part_1() {
+                $run($variant, Selection::WrongPasswordPart(1)).await;
+            }
+            const _: () = assert!(WRONG_PASSWORD_PARTS == 2);
+        }
+    };
+    (@fine_shards $variant:expr, $run:ident) => {
+        combined_campaign!(
+            @each_fine $variant, $run;
+                shard_000 0, shard_001 1, shard_002 2, shard_003 3, shard_004 4,
+                shard_005 5, shard_006 6, shard_007 7, shard_008 8, shard_009 9,
+                shard_010 10, shard_011 11, shard_012 12, shard_013 13, shard_014 14,
+                shard_015 15, shard_016 16, shard_017 17, shard_018 18, shard_019 19,
+                shard_020 20, shard_021 21, shard_022 22, shard_023 23, shard_024 24,
+                shard_025 25, shard_026 26, shard_027 27, shard_028 28, shard_029 29,
+                shard_030 30, shard_031 31, shard_032 32, shard_033 33, shard_034 34,
+                shard_035 35, shard_036 36, shard_037 37, shard_038 38, shard_039 39,
+                shard_040 40, shard_041 41, shard_042 42, shard_043 43, shard_044 44,
+                shard_045 45, shard_046 46, shard_047 47, shard_048 48, shard_049 49,
+                shard_050 50, shard_051 51, shard_052 52, shard_053 53, shard_054 54,
+                shard_055 55, shard_056 56, shard_057 57, shard_058 58, shard_059 59,
+                shard_060 60, shard_061 61, shard_062 62, shard_063 63, shard_064 64,
+                shard_065 65, shard_066 66, shard_067 67, shard_068 68, shard_069 69,
+                shard_070 70, shard_071 71, shard_072 72, shard_073 73, shard_074 74,
+                shard_075 75, shard_076 76, shard_077 77, shard_078 78, shard_079 79,
+                shard_080 80, shard_081 81, shard_082 82, shard_083 83, shard_084 84,
+                shard_085 85, shard_086 86, shard_087 87, shard_088 88, shard_089 89,
+                shard_090 90, shard_091 91, shard_092 92, shard_093 93, shard_094 94,
+                shard_095 95, shard_096 96, shard_097 97, shard_098 98, shard_099 99,
+                shard_100 100, shard_101 101, shard_102 102, shard_103 103, shard_104 104,
+                shard_105 105, shard_106 106, shard_107 107, shard_108 108, shard_109 109,
+                shard_110 110, shard_111 111, shard_112 112, shard_113 113, shard_114 114,
+                shard_115 115, shard_116 116, shard_117 117, shard_118 118, shard_119 119,
+                shard_120 120, shard_121 121, shard_122 122, shard_123 123, shard_124 124,
+                shard_125 125, shard_126 126, shard_127 127
+        );
+        const _: () = assert!(FINE_SHARDS == 128);
+    };
+    (@each_fine $variant:expr, $run:ident; $($name:ident $shard:literal),+) => {
+        $(
+            #[tokio::test]
+            #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
+            async fn $name() {
+                $run($variant, Selection::FineShard($shard)).await;
+            }
+        )+
     };
     (@shards $variant:expr, $run:ident) => {
         combined_campaign!(

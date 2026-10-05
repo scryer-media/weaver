@@ -2962,9 +2962,12 @@ pub struct Pipeline {
     /// not survive a restart.
     ///
     /// A restored set's files routed their offset-zero articles before the
-    /// restart, so no prefix is ever captured again; the roster binding the
-    /// checkpoint kept is the evidence instead. Consulted only where no
-    /// prefix exists, and dropped with the rest of the job's per-file runtime.
+    /// restart, so a prefix is captured again only when one of those articles
+    /// is delivered a second time; the roster binding the checkpoint kept is
+    /// the evidence instead. Its hash is consulted only where no prefix
+    /// exists; its length stands even beside a prefix captured again, because
+    /// the file's own count after a restart does not. It
+    /// is dropped with the rest of the job's per-file runtime.
     pub(super) file_proven_par2_fingerprint: HashMap<NzbFileId, ([u8; 16], u64)>,
     /// First non-zero decoded size declared by a yEnc header for each file.
     ///

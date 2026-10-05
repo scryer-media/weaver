@@ -1512,6 +1512,7 @@ fn whole_volume_rewrite_requires_actual_end_to_end_ranges() {
             covered: ByteRanges::new(),
             crcs: CrcRuns::default(),
             partial_article: PartialArticle::CarryThrough,
+            restored: ByteRanges::new(),
         },
     };
     for ranges in [
@@ -1567,6 +1568,7 @@ fn an_encrypted_sets_read_back_carries_the_posted_bytes_on_both_sides_of_a_span(
             covered: ByteRanges::new(),
             crcs: CrcRuns::default(),
             partial_article: PartialArticle::CarryThrough,
+            restored: ByteRanges::new(),
         },
     };
 

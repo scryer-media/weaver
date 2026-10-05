@@ -1,7 +1,7 @@
 //! One live direct set: its router, its coverage barrier, and the bookkeeping
 //! that keeps the two agreeing.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use super::ByteRanges;
@@ -124,8 +124,11 @@ pub(crate) struct DirectSet {
     resumed: Option<CoverageSnapshot>,
     /// Volumes whose logical length must be read off the coverage map rather
     /// than off the assembly's `received_bytes` — see
-    /// [`Self::virtual_volume_len`].
-    restart_seeded_volumes: BTreeSet<u32>,
+    /// [`Self::virtual_volume_len`] — with the physical coverage a checkpoint
+    /// seeded into each. Those bytes were placed by a process that is gone, so
+    /// no article record of this one accounts for them; see
+    /// [`Self::restored_volume_coverage`].
+    restart_seeded_volumes: BTreeMap<u32, ByteRanges>,
     /// The demotion's one-time cleanup (delete output, retire the row, refetch)
     /// has already run. The *status* alone cannot say so: the router demotes
     /// the set from inside `route`, so by the time the wiring seam is told, the
@@ -192,7 +195,7 @@ impl DirectSet {
             placed: BTreeMap::new(),
             placed_envelope: BTreeMap::new(),
             resumed: None,
-            restart_seeded_volumes: BTreeSet::new(),
+            restart_seeded_volumes: BTreeMap::new(),
             demotion_cleaned_up: false,
             repair_attempted: false,
             latched_direct: false,
@@ -318,8 +321,9 @@ impl DirectSet {
                 continue;
             }
             self.latched_direct = true;
-            self.restart_seeded_volumes.insert(volume_index);
+            let seeded = self.restart_seeded_volumes.entry(volume_index).or_default();
             for &(start, end) in covered.ranges() {
+                seeded.insert(start, end - start);
                 self.placed
                     .entry(volume_index)
                     .or_default()
@@ -360,7 +364,7 @@ impl DirectSet {
     /// them from parity it did not need to spend.
     pub(crate) fn virtual_volume_len(&self, volume_index: u32, received_bytes: u64) -> u64 {
         let covered_end = self.volume_coverage_with_holds(volume_index).end();
-        if self.restart_seeded_volumes.contains(&volume_index) {
+        if self.restart_seeded_volumes.contains_key(&volume_index) {
             return covered_end;
         }
         received_bytes.max(covered_end)
@@ -377,6 +381,18 @@ impl DirectSet {
     /// they came from, not whether they are trusted yet.
     pub(crate) fn was_restored(&self) -> bool {
         !self.restart_seeded_volumes.is_empty()
+    }
+
+    /// The physical ranges of one volume a checkpoint seeded, in the space
+    /// [`Self::volume_coverage`] answers in. Latched for the same reason as
+    /// [`Self::was_restored`]: it says where the bytes came from, and a later
+    /// re-read of a member does not change that this process holds no article
+    /// record for them.
+    pub(crate) fn restored_volume_coverage(&self, volume_index: u32) -> ByteRanges {
+        self.restart_seeded_volumes
+            .get(&volume_index)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn plan(&self) -> &DirectSetPlan {
