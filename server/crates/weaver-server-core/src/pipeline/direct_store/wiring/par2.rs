@@ -2227,11 +2227,11 @@ impl Pipeline {
             let job_failed = self.jobs.get(&job_id).is_none_or(|state| {
                 matches!(state.status, crate::JobStatus::Failed { .. })
             });
-            return if already_demoted || job_failed {
+            if already_demoted || job_failed {
                 DirectRepairAnswer::Acted
             } else {
                 DirectRepairAnswer::Declined
-            };
+            }
             }
         }
     }
