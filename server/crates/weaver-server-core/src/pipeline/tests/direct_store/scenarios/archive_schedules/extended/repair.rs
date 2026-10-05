@@ -548,6 +548,36 @@ demotion_smoke! {
     chase_demotion_reasons_rar5_four_volume Target::Format(Format::Rar5FourVolumes), CHASE_DEMOTIONS;
 }
 
+/// One recovery set covers both archive sets, and the loss lands in the set
+/// that was demoted: wholly (the other set clean), beside a loss in the set
+/// still direct, and everywhere at once. The repair reads the direct set's
+/// volumes virtually and writes the demoted set's files in place, so the set
+/// the schedule left alone stays direct.
+#[tokio::test]
+async fn two_sets_loss_in_the_demoted_set_leaves_the_other_direct() {
+    let fixture = fixture(Target::TwoSets);
+    let forced = Forced::Direct(DemotionReason::HoldsScratchCeiling);
+    let cases = combined_schedule_cases();
+    // (replay index, demoted set): mask 12 with beta demoted, mask 14 and
+    // mask 15 with alpha demoted.
+    for (case, set) in [(36, 1), (14, 0), (5, 0)] {
+        let (_, (order, interruption)) = cases
+            .iter()
+            .find(|(index, _)| *index == case)
+            .cloned()
+            .expect("the combined matrix keeps this case");
+        run_case(
+            &fixture,
+            forced.on(set),
+            forced.profile(),
+            case,
+            &order,
+            interruption,
+        )
+        .await;
+    }
+}
+
 // Shards cut each campaign to well under a thousand cases, so no test
 // approaches the runner's per-test limit.
 macro_rules! par3_campaign {

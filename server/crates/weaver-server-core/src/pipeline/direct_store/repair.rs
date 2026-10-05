@@ -453,6 +453,7 @@ pub(crate) fn repair_damaged_volumes(
     inner: par2_rs::PlacementFileAccess,
     virtual_volumes: &[super::par2_access::VirtualPar2Volume],
     damaged: &[DamagedDirectVolume],
+    conventional_targets: &std::collections::HashSet<FileId>,
     memory_limit: Option<usize>,
     sparse: super::sparse::SparseMarking,
 ) -> Result<DirectRepairOutcome, DirectRepairFailure> {
@@ -514,12 +515,11 @@ pub(crate) fn repair_damaged_volumes(
     // so this can only fire if the two drifted. It is checked anyway, because
     // the failure it prevents is a repair writing into a still-virtual volume —
     // which `write_file_range` would refuse, but only after the plan had already
-    // spent its recovery blocks.
-    if plan
-        .missing_slices
-        .iter()
-        .any(|(file_id, _)| !materialized_ids.contains(file_id))
-    {
+    // spent its recovery blocks. A conventional target is a real file outside
+    // every direct set, which the caller already admitted as writable in place.
+    if plan.missing_slices.iter().any(|(file_id, _)| {
+        !materialized_ids.contains(file_id) && !conventional_targets.contains(file_id)
+    }) {
         return Err(cleanup(DirectRepairFailure::UnmaterializedWriteTarget));
     }
 
@@ -724,18 +724,30 @@ fn read_span_chunked(
     }))
 }
 
+/// A damage verdict split by who owns each damaged file.
+#[derive(Debug, Default)]
+pub(crate) struct DamagedFiles {
+    /// Damaged files a live direct set owns, by set.
+    pub(crate) by_set: HashMap<usize, Vec<FileId>>,
+    /// Damaged files no live direct set owns. The caller decides whether each
+    /// is a real file the repair may write in place, or damage this seam has
+    /// no business touching.
+    pub(crate) unowned: Vec<FileId>,
+}
+
 /// Groups damaged verification entries by the direct set that owns them.
 ///
 /// `owner` answers "which live direct set owns this PAR2 file", which is exactly
 /// the binding `direct_par2_overlay` resolved. A damaged file with no owner is
-/// [`DirectRepairFailure::DamageOutsideDirectSets`]: repairing half a recovery
-/// set through this seam while the conventional repairer owns the other half is
-/// not a shape worth having.
+/// returned apart rather than refused here: PAR2 repairs a recovery set's
+/// damaged files together, so one of them sitting in a demoted set's real file
+/// is a write target for the same repair, not a reason to give up on the set
+/// that stayed direct.
 pub(crate) fn damaged_files_by_set(
     verification: &VerificationResult,
     owner: impl Fn(&FileId) -> Option<usize>,
-) -> Result<HashMap<usize, Vec<FileId>>, DirectRepairFailure> {
-    let mut by_set: HashMap<usize, Vec<FileId>> = HashMap::new();
+) -> DamagedFiles {
+    let mut damaged = DamagedFiles::default();
     for file in &verification.files {
         if matches!(
             file.status,
@@ -744,9 +756,13 @@ pub(crate) fn damaged_files_by_set(
             continue;
         }
         match owner(&file.file_id) {
-            Some(set_index) => by_set.entry(set_index).or_default().push(file.file_id),
-            None => return Err(DirectRepairFailure::DamageOutsideDirectSets),
+            Some(set_index) => damaged
+                .by_set
+                .entry(set_index)
+                .or_default()
+                .push(file.file_id),
+            None => damaged.unowned.push(file.file_id),
         }
     }
-    Ok(by_set)
+    damaged
 }

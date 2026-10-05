@@ -71,6 +71,14 @@ pub(crate) struct PreparedDirectRepair {
     rewrite_bytes: u64,
 }
 
+/// A damaged file outside every live direct set that a direct repair may
+/// write in place: a demoted set's volume, or any other real file of the job
+/// sitting at its declared PAR2 name.
+pub(crate) struct ConventionalRepairTarget {
+    par2_file_id: par2_rs::FileId,
+    file_id: NzbFileId,
+}
+
 impl Pipeline {
     /// Take any set claiming this file off the direct path, because its
     /// articles arrived uuencoded.
@@ -1843,10 +1851,17 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn direct_sets_repaired_in_place(&self, job_id: JobId) -> bool {
+        // A repair that rewrote only files outside every direct set changed
+        // bytes this pass would otherwise answer from wire evidence, so it
+        // makes the pass a read-back exactly as a set's own repair does.
         self.direct_store
-            .sets_for(job_id)
-            .iter()
-            .any(|set| !set.is_demoted() && set.repair_attempted())
+            .conventional_targets_repaired
+            .contains(&job_id)
+            || self
+                .direct_store
+                .sets_for(job_id)
+                .iter()
+                .any(|set| !set.is_demoted() && set.repair_attempted())
     }
 
     /// The `FileVerification` entries the dual-CRC grid can stand in for, in
@@ -2052,16 +2067,27 @@ impl Pipeline {
             return DirectRepairAnswer::Declined;
         }
 
-        let by_set = match super::super::repair::damaged_files_by_set(verification, |file_id| {
-            overlay.owner_of(file_id)
-        }) {
-            Ok(by_set) => by_set,
-            Err(failure) => {
-                Self::record_direct_repair_failure(job_id, &failure);
-                return DirectRepairAnswer::Declined;
+        let super::super::repair::DamagedFiles { by_set, unowned } =
+            super::super::repair::damaged_files_by_set(verification, |file_id| {
+                overlay.owner_of(file_id)
+            });
+        let conventional = if unowned.is_empty() {
+            Vec::new()
+        } else {
+            match self.conventional_direct_repair_targets(
+                job_id,
+                &par2_set,
+                &unowned,
+                payload_settled,
+            ) {
+                Ok(conventional) => conventional,
+                Err(failure) => {
+                    Self::record_direct_repair_failure(job_id, &failure);
+                    return DirectRepairAnswer::Declined;
+                }
             }
         };
-        if by_set.is_empty() {
+        if by_set.is_empty() && conventional.is_empty() {
             return DirectRepairAnswer::Declined;
         }
 
@@ -2099,6 +2125,9 @@ impl Pipeline {
                             && !set.repair_attempted()
                     })
             });
+            // Admitted conventional targets could use it too: they are only
+            // admitted settled and unrepaired.
+            let any_set_could_use_it = any_set_could_use_it || !conventional.is_empty();
             if blocks_needed > 0
                 && any_set_could_use_it
                 && self.defer_direct_repair_for_recovery(
@@ -2127,7 +2156,7 @@ impl Pipeline {
                             && (payload_settled || set.all_volumes_complete())
                     })
             });
-            if any_live_settled {
+            if any_live_settled || !conventional.is_empty() {
                 Self::record_direct_repair_failure(
                     job_id,
                     &super::super::repair::DirectRepairFailure::Unrepairable,
@@ -2145,6 +2174,7 @@ impl Pipeline {
         // conclusion whichever way it goes.
         self.direct_store.repair_defer_waves.remove(&job_id);
 
+        let damaged_sets = by_set.len();
         let mut prepared = Vec::new();
         let mut refused = None;
         for (set_index, files) in by_set {
@@ -2193,13 +2223,31 @@ impl Pipeline {
         // writes every one of them, so a repair that materialized one set's
         // volumes and left another's virtual would be refused for the write
         // target it was never given.
+        //
+        // The same holds for conventional targets, and more sharply: they are
+        // only worth writing when every damaged direct set was prepared beside
+        // them, because a set skipped above keeps damage the plan would still
+        // try to write into a virtual volume. That is refused here, for free,
+        // and falls back to the demotion the skipped set was headed for anyway.
+        if !conventional.is_empty() && prepared.len() != damaged_sets && refused.is_none() {
+            return DirectRepairAnswer::Declined;
+        }
         let attempted: Vec<usize> = prepared.iter().map(|repair| repair.set_index).collect();
         let result = match refused {
             Some(failure) => Err(failure),
-            None if prepared.is_empty() => return DirectRepairAnswer::Declined,
+            None if prepared.is_empty() && conventional.is_empty() => {
+                return DirectRepairAnswer::Declined;
+            }
             None => {
-                self.repair_prepared_direct_sets(job_id, prepared, &par2_set, verification, &overlay)
-                    .await
+                self.repair_prepared_direct_sets(
+                    job_id,
+                    prepared,
+                    &conventional,
+                    &par2_set,
+                    verification,
+                    &overlay,
+                )
+                .await
             }
         };
         match result {
@@ -2338,6 +2386,101 @@ impl Pipeline {
             std::time::Duration::from_nanos(1),
         );
         debug!(job_id = job_id.0, failure = %failure, "direct-store repair refused");
+    }
+
+    /// Admits the damaged files no live direct set owns as in-place write
+    /// targets for the direct repair, or refuses the lot.
+    ///
+    /// One recovery set routinely covers two archive sets, and when one of
+    /// them was demoted its damage is still the recovery set's damage. PAR2
+    /// repairs a recovery set's damaged files together, so refusing here used
+    /// to demote the set that stayed direct and clean for damage it never
+    /// had. The repair does not need that set's volumes on disk: it reads them
+    /// virtually, as source, and only ever writes the damaged files.
+    ///
+    /// A file is admitted only when the repair will write the very file the
+    /// verdict measured. The verdict this repair is planned from reads every
+    /// file outside a direct set at its declared PAR2 name, and so does the
+    /// repair's fallback access, so the job's file must bind uniquely to that
+    /// description and sit at exactly that name. A file still owned by a
+    /// direct set that has not been demoted is never written: a finalized
+    /// set's volumes are not the repair's to recreate. Anything else refuses,
+    /// and the caller demotes exactly as before.
+    ///
+    /// The settle guard is the repair's own, applied to the job as a whole:
+    /// these files have no per-set completeness to fall back on, so the job's
+    /// payload must be settled and no demoted volume may still be on its way
+    /// to disk.
+    pub(super) fn conventional_direct_repair_targets(
+        &self,
+        job_id: JobId,
+        par2_set: &std::sync::Arc<par2_rs::Par2FileSet>,
+        unowned: &[par2_rs::FileId],
+        payload_settled: bool,
+    ) -> Result<Vec<ConventionalRepairTarget>, super::super::repair::DirectRepairFailure> {
+        use super::super::repair::DirectRepairFailure;
+
+        // The bound, as for a set: a job whose conventional damage survived
+        // one in-place repair demotes rather than repairing it again.
+        if self
+            .direct_store
+            .conventional_targets_repaired
+            .contains(&job_id)
+        {
+            return Err(DirectRepairFailure::AlreadyRepaired);
+        }
+        if !payload_settled
+            || self
+                .direct_store
+                .pending_materializations
+                .contains_key(&job_id)
+        {
+            return Err(DirectRepairFailure::DamageOutsideDirectSets);
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Err(DirectRepairFailure::DamageOutsideDirectSets);
+        };
+        let direct_files: HashSet<u32> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| !set.is_demoted())
+            .flat_map(|set| set.plan().volumes.values().copied())
+            .collect();
+        let unowned: HashSet<par2_rs::FileId> = unowned.iter().copied().collect();
+        let mut bound: HashMap<par2_rs::FileId, NzbFileId> = HashMap::new();
+        for file in state.assembly.files() {
+            let file_id = file.file_id();
+            let Some(binding) =
+                self.resolve_par2_file_binding_in_set(file_id, par2_set.recovery_set_id)
+            else {
+                continue;
+            };
+            if !unowned.contains(&binding.par2_file_id) {
+                continue;
+            }
+            let declared = par2_set
+                .file_description(&binding.par2_file_id)
+                .map(|desc| state.working_dir.join(&desc.filename));
+            if direct_files.contains(&file_id.file_index)
+                || declared.as_ref() != Some(&binding.path)
+                || bound.insert(binding.par2_file_id, file_id).is_some()
+            {
+                return Err(DirectRepairFailure::DamageOutsideDirectSets);
+            }
+        }
+        unowned
+            .into_iter()
+            .map(|par2_file_id| {
+                bound
+                    .get(&par2_file_id)
+                    .map(|file_id| ConventionalRepairTarget {
+                        par2_file_id,
+                        file_id: *file_id,
+                    })
+                    .ok_or(DirectRepairFailure::DamageOutsideDirectSets)
+            })
+            .collect()
     }
 
     /// Everything one set's repair can refuse for free: which of its volumes
@@ -2506,10 +2649,29 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         prepared: Vec<PreparedDirectRepair>,
+        conventional: &[ConventionalRepairTarget],
         par2_set: &std::sync::Arc<par2_rs::Par2FileSet>,
         verification: &par2_rs::VerificationResult,
         overlay: &DirectPar2Overlay,
     ) -> Result<(), super::super::repair::DirectRepairFailure> {
+        // The conventional targets' share of the same first irreversible step:
+        // their latch, and the retirement of every claim over bytes the repair
+        // is about to write. The grid's verdicts for these files describe what
+        // the wire delivered, and a retained session's sources were scanned
+        // before the rewrite, so neither may answer for them afterwards.
+        if !conventional.is_empty() {
+            self.direct_store
+                .conventional_targets_repaired
+                .insert(job_id);
+            for target in conventional {
+                self.block_crcs.forget_file(target.file_id);
+            }
+            self.evict_par2_repair_session(job_id, par2_set.recovery_set_id);
+        }
+        let conventional_ids: HashSet<par2_rs::FileId> = conventional
+            .iter()
+            .map(|target| target.par2_file_id)
+            .collect();
         for repair in &prepared {
             let set_index = repair.set_index;
             let set_name = &repair.set_name;
@@ -2614,6 +2776,7 @@ impl Pipeline {
                     inner,
                     &volumes,
                     &damaged_for_task,
+                    &conventional_ids,
                     memory_limit,
                     sparse,
                 )
@@ -2636,6 +2799,7 @@ impl Pipeline {
         info!(
             job_id = job_id.0,
             sets = prepared.len(),
+            conventional_files = conventional.len(),
             volumes = outcome.materialized_volumes,
             recovery_blocks = outcome.recovery_blocks_used,
             rewrite_bytes,
