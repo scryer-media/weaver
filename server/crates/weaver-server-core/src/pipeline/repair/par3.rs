@@ -433,7 +433,22 @@ impl Par3Job {
             let matrix = set.cauchy_matrix.ok_or(EngineError::InvalidState(
                 "embedded recovery matrix unavailable",
             ))?;
-            return inside::repair(&mut set.native, matrix, output, &self.options);
+            // A carrier published off a direct set's image has no file: the
+            // replacement is the first copy of that volume on disk, and the
+            // readback hands it to the set the way an external repair's is.
+            let virtual_carrier = layout.files().first().is_some_and(|file| {
+                self.bindings
+                    .get(&file.path)
+                    .and_then(|source| self.carriers.get(source))
+                    .is_some_and(|carrier| carrier.path.is_none())
+            });
+            return inside::repair(
+                &mut set.native,
+                matrix,
+                output,
+                virtual_carrier,
+                &self.options,
+            );
         }
         set.native.execute(Par3RepairRequest {
             output,
@@ -502,6 +517,55 @@ impl Par3Job {
             self.scan(source)?;
         }
         Ok(())
+    }
+
+    /// [`Self::scan_embedded`] over a direct volume's image.
+    ///
+    /// The scan starts where the volume's router placed the tail, which the
+    /// container's own start header fixed, so no damaged-framing rewind is
+    /// needed to find it. The same image is the set's protected source.
+    fn scan_embedded_virtual(
+        &mut self,
+        source: SourceId,
+        image: virtual_source::VirtualInput,
+        name: String,
+        start: u64,
+    ) -> EngineResult<()> {
+        bindings::check_source(source)?;
+        if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
+            return Err(budget::host_limit("PAR3 source bindings"));
+        }
+        let ranges = image
+            .volume
+            .readable_ranges()
+            .into_iter()
+            .map(|(start, end)| start..end)
+            .collect();
+        let access = virtual_source::VirtualSource::new(
+            source,
+            image,
+            self.options.clone(),
+            Arc::clone(&self.virtual_readers),
+        )?;
+        let len = access
+            .snapshot(source)?
+            .ok_or(EngineError::Unavailable {
+                source_id: source,
+                offset: 0,
+            })?
+            .len;
+        self.retire_name_bindings(source, &name)?;
+        self.bindings.retain(|_, bound| *bound != source);
+        self.bindings.insert(name, source);
+        self.publish_carrier(source, Arc::new(access), len, ranges, false)?;
+        for set in self.sets.values_mut() {
+            set.invalidate(source);
+        }
+        let carrier = self.carriers.get_mut(&source).expect("published carrier");
+        carrier.scanner.seek(start)?;
+        carrier.scan_start = start;
+        carrier.scan.start_at(start);
+        self.scan(source)
     }
 
     fn scan_file_from(
@@ -813,8 +877,12 @@ impl Pipeline {
         if !file.is_complete() && self.job_has_pending_download_pipeline_work(job_id) {
             return;
         }
+        // A volume of a live direct set has no file to probe, and its router
+        // already knows whether a recovery tail follows the container; see
+        // `discover_direct_embedded_par3`.
         let embedded = if !self.par3_inside_probes.contains(file_id)
             && !signature
+            && self.live_direct_set_of(file_id).is_none()
             && (container_signature
                 || matches!(
                     file.role(),
@@ -875,6 +943,18 @@ impl Pipeline {
             }
             return;
         }
+        self.admit_par3_carrier(job_id, file_id, embedded, admitted);
+    }
+
+    /// Admits a carrier the job just found, publishes it, and on a job's
+    /// first carrier also the protected files already committed.
+    fn admit_par3_carrier(
+        &mut self,
+        job_id: JobId,
+        file_id: NzbFileId,
+        embedded: Option<u64>,
+        admitted: bool,
+    ) {
         let coordinator = self.par3_runtime.get_or_insert_with(|| {
             Box::new(work::Coordinator::new(
                 self.repair_work_done_tx.clone(),
@@ -938,6 +1018,14 @@ impl Pipeline {
         if self.job_has_pending_download_pipeline_work(job_id) {
             return;
         }
+        self.discover_direct_embedded_par3(job_id);
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| matches!(state.status, JobStatus::Failed { .. }))
+        {
+            return;
+        }
         loop {
             let candidate = self.jobs.get(&job_id).and_then(|state| {
                 state
@@ -948,6 +1036,7 @@ impl Pipeline {
                             file.role(),
                             FileRole::ZipArchive | FileRole::SevenZipArchive
                         ) && !self.par3_inside_probes.contains(file.file_id())
+                            && self.live_direct_set_of(file.file_id()).is_none()
                             && (file.is_complete()
                                 || (0..file.total_segments()).any(|part| file.has_segment(part)))
                     })
@@ -959,6 +1048,55 @@ impl Pipeline {
             self.try_load_par3_metadata(job_id, file).await;
             // A source still awaiting publication must not cause a retry loop.
             if !self.par3_inside_probes.contains(file) {
+                return;
+            }
+        }
+    }
+
+    /// The direct set that owns `file_id` as a volume, unless it was demoted.
+    /// Such a volume is never a file in the working directory.
+    fn live_direct_set_of(&self, file_id: NzbFileId) -> Option<usize> {
+        self.direct_store
+            .sets_for(file_id.job_id)
+            .iter()
+            .position(|set| {
+                !set.is_demoted() && set.plan().volume_for_file(file_id.file_index).is_some()
+            })
+    }
+
+    /// Admits the recovery set a live direct container carries after its end
+    /// header.
+    ///
+    /// The router admitted that tail when it parsed the start header, so where
+    /// the packets begin is already known and nothing is read to find them. A
+    /// set that can finalize on its own members' checksums never asks:
+    /// checking it against the tail as well would be a pass over every byte
+    /// that nothing needs.
+    fn discover_direct_embedded_par3(&mut self, job_id: JobId) {
+        let found: Vec<(NzbFileId, u64)> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| !set.is_demoted() && !set.is_finalized() && !set.ready_to_finalize())
+            .filter_map(|set| {
+                let (volume, start) = set.router.embedded_recovery_start()?;
+                let file_index = *set.plan().volumes.get(&volume)?;
+                Some((NzbFileId { job_id, file_index }, start))
+            })
+            .filter(|(file, _)| !self.par3_inside_probes.contains(*file))
+            .collect();
+        for (file_id, start) in found {
+            self.par3_inside_probes.insert(file_id);
+            let admitted = self
+                .par3_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.contains_job(job_id));
+            self.admit_par3_carrier(job_id, file_id, Some(start), admitted);
+            if self
+                .jobs
+                .get(&job_id)
+                .is_none_or(|state| matches!(state.status, JobStatus::Failed { .. }))
+            {
                 return;
             }
         }
@@ -1014,6 +1152,9 @@ impl Pipeline {
                 .par3_runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.is_carrier(job_id, source));
+        // An embedded carrier in a live direct set is that set's volume: its
+        // protected bytes and its packets are both read off the set's image.
+        let direct_embedded = embedded.is_some() && self.live_direct_set_of(file_id).is_some();
         // A direct volume's image is its set's coverage over the set's
         // destinations, and a set with a placement out has bytes on disk, or
         // about to be, that its coverage does not record yet. An image taken
@@ -1024,7 +1165,7 @@ impl Pipeline {
         // destinations. Not publishing leaves the source due — the routing
         // marked it so, or it was never published — and the lane draining
         // publishes it whole; see `republish_par3_awaiting_placements`.
-        if !carrier
+        if (!carrier || direct_embedded)
             && let Some(set_index) = self.direct_store.sets_for(job_id).iter().position(|set| {
                 !set.is_demoted() && set.plan().volume_for_file(file_id.file_index).is_some()
             })
@@ -1068,11 +1209,16 @@ impl Pipeline {
                 ranges.push(offset..end);
             }
         }
-        let virtual_volume = if carrier {
+        let virtual_volume = if carrier && !direct_embedded {
             None
         } else {
             self.par3_virtual_volume(file_id)
         };
+        if direct_embedded && virtual_volume.is_none() {
+            // A finalized set with nothing retained has no image left to
+            // offer, and its volume was never a file to fall back on.
+            return Ok(());
+        }
         if virtual_volume.is_none()
             && let Some(materialized) = self
                 .par3_runtime
@@ -1136,7 +1282,12 @@ impl Pipeline {
             virtual_volume = virtual_volume.is_some(), complete_disk_image, ranges = ?ranges,
             "PAR3 committed source publication queued");
         let coordinator = self.par3_runtime.as_mut().expect("admitted PAR3 job");
-        if let Some(start) = embedded {
+        if let Some(start) = embedded
+            && direct_embedded
+        {
+            let volume = virtual_volume.expect("a live direct set's image");
+            coordinator.enqueue_embedded_virtual(job_id, source, volume, name, start)?;
+        } else if let Some(start) = embedded {
             coordinator.enqueue_embedded(
                 job_id,
                 source,
