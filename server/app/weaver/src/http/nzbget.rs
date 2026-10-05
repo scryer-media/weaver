@@ -40,11 +40,10 @@ pub(super) struct NzbgetFacadeContext {
     scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     rss: weaver_server_api::RssService,
     watch_folder: weaver_server_core::watch_folder::WatchFolderService,
-    /// TTL-cached free-disk-space reading: `(epoch_secs, available_bytes)`.
-    /// `statvfs`/`GetDiskFreeSpaceExW` is a blocking syscall that can stall
-    /// for seconds against an unhealthy NAS/NFS mount; `status()` reuses this
-    /// for a few seconds instead of calling it on every poll.
-    disk_cache: Arc<tokio::sync::Mutex<Option<(u64, u64)>>>,
+    /// The complete root's latest free-space reading, from the pipeline's
+    /// background sampler. `status()` reads it and never stats the
+    /// filesystem, so a stalled mount cannot hold a poll.
+    complete_capacity: weaver_server_core::operations::CapacityReader,
     /// Memoized PARSE of DB-row (immutable) history, keyed by job id ->
     /// `(completed_at, HistoryItem)`. A history row's `completed_at` never
     /// changes once written, so a cache hit reuses the parsed item instead of
@@ -71,6 +70,7 @@ impl NzbgetFacadeContext {
         rss: weaver_server_api::RssService,
         watch_folder: weaver_server_core::watch_folder::WatchFolderService,
         scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
+        complete_capacity: weaver_server_core::operations::CapacityReader,
     ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -91,42 +91,18 @@ impl NzbgetFacadeContext {
             scheduled_resume,
             rss,
             watch_folder,
-            disk_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            complete_capacity,
             history_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
-    /// Cached free-disk-space lookup used by `status()`. The actual syscall
-    /// runs off the tokio runtime thread (`spawn_blocking`) and the result is
-    /// reused for up to `DISK_CACHE_TTL_SECS` seconds, so a stalled NAS/NFS
-    /// mount can neither pin a worker thread nor (since callers read this
-    /// only after releasing the config guard) convoy config readers behind
-    /// it on every `status` poll.
-    async fn free_disk_space_bytes(&self, complete_dir: String) -> u64 {
-        const DISK_CACHE_TTL_SECS: u64 = 5;
-        let now = unix_now_secs();
-        if let Some((epoch_secs, bytes)) = *self.disk_cache.lock().await
-            && now.saturating_sub(epoch_secs) < DISK_CACHE_TTL_SECS
-        {
-            return bytes;
-        }
-        let available = tokio::task::spawn_blocking(move || {
-            weaver_server_core::operations::disk_space(Path::new(&complete_dir))
-                .map(|space| space.available_bytes)
-        })
-        .await
-        .ok()
-        .flatten();
-        match available {
-            // Only cache a real reading, so a transient statvfs failure (a
-            // briefly-unavailable mount, a join error) reports 0 for THIS poll
-            // without poisoning the cache with 0 for the next 5s.
-            Some(bytes) => {
-                *self.disk_cache.lock().await = Some((now, bytes));
-                bytes
-            }
-            None => 0,
-        }
+    /// Free bytes on the complete root from the sampler's last reading, or 0
+    /// before its first reading arrives.
+    fn free_disk_space_bytes(&self) -> u64 {
+        self.complete_capacity
+            .current()
+            .best_available_bytes()
+            .unwrap_or(0)
     }
 }
 
@@ -1491,7 +1467,6 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let download_limit = config.max_download_speed.unwrap_or(0);
     let arr_download_limit = download_limit.min(i32::MAX as u64);
     let scan_paused = config.watch_folder.scanning_paused;
-    let complete_dir = config.complete_dir();
     let news_servers = config
         .servers
         .iter()
@@ -1503,16 +1478,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         })
         .collect::<Vec<_>>();
     drop(config);
-    // Query free disk space only after the config guard is released and off
-    // the async runtime thread: `disk_space` calls `statvfs` (or
-    // `GetDiskFreeSpaceExW`), a blocking syscall that can stall for seconds
-    // against an unhealthy NAS/NFS mount. Doing that while holding
-    // `config.read()` would pin a tokio worker AND -- this being a
-    // write-preferring `RwLock` -- convoy every other config reader behind
-    // the stall. `free_disk_space_bytes` additionally caches the result for a
-    // few seconds so a client polling `status` frequently doesn't hit the
-    // syscall on every request.
-    let free_disk = ctx.free_disk_space_bytes(complete_dir).await;
+    let free_disk = ctx.free_disk_space_bytes();
     // "Article cache" maps to weaver's in-flight decoded/buffered article
     // bytes: queued for decode, being decoded, and buffered for write.
     let article_cache = metrics

@@ -297,8 +297,8 @@ fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Resu
 }
 
 /// Scan a completed PAR2 carrier into per-set packet groups. The packet scan
-/// authenticates metadata, but intentionally defers recovery-payload hashes;
-/// validate those here before any caller can merge or count a slice.
+/// authenticates metadata and recovery payloads before accepting their packet
+/// boundaries, so every caller receives only authenticated slices.
 fn scan_completed_par2_packet_groups(
     path: &Path,
     budget: &SharedPar2ScanBudget,
@@ -321,22 +321,7 @@ fn scan_completed_par2_packet_groups(
             });
             index
         };
-        let packet_is_valid = match &scanned_packet.packet {
-            par2_rs::Packet::RecoverySlice(recovery) => {
-                recovery
-                    .data
-                    .validate_packet_hash(
-                        scanned_packet.recovery_set_id.as_bytes(),
-                        recovery.exponent,
-                    )
-                    .ok()
-                    == Some(true)
-            }
-            _ => true,
-        };
-        if packet_is_valid {
-            groups[index].packets.push(scanned_packet.packet);
-        }
+        groups[index].packets.push(scanned_packet.packet);
     }
     Ok(groups)
 }
@@ -673,6 +658,35 @@ impl Pipeline {
         }
     }
 
+    /// Whether a probed RAR volume whose headers state no volume number has
+    /// yet to show where it sits in its set.
+    ///
+    /// Old-style volume numbering puts no number in the headers, and an
+    /// obfuscated name puts none in the filename, so such a volume is
+    /// classified under a set named after itself and reads as volume 0. The
+    /// headers settle which it really is: a volume whose first member does not
+    /// continue from an earlier volume opens a set, and one whose first member
+    /// does is a later volume, number unknown, of a set that began somewhere
+    /// else. Only the first is placed: the role and the self-named set are
+    /// right for it and wrong for the second. Until the headers have been read
+    /// — a restart or a re-probe drops them — neither is evidence of anything.
+    fn numberless_rar_volume_position_unknown(
+        &self,
+        job_id: JobId,
+        classification: &crate::jobs::assembly::DetectedArchiveIdentity,
+    ) -> bool {
+        matches!(
+            classification.kind,
+            crate::jobs::assembly::DetectedArchiveKind::Rar
+        ) && classification.volume_index.is_none()
+            && !self
+                .rar_sets
+                .get(&(job_id, classification.set_name.clone()))
+                .and_then(|set| set.facts.get(&0))
+                .and_then(|facts| facts.members.first())
+                .is_some_and(|member| !member.split_before)
+    }
+
     async fn apply_par2_authoritative_identity(
         &mut self,
         job_id: JobId,
@@ -741,7 +755,20 @@ impl Pipeline {
             if let Some(canonical) = identity.canonical_filename.as_ref() {
                 by_canonical.insert(canonical.clone(), *file_id);
             }
-            if let weaver_model::files::FileRole::RarVolume { volume_number } = role {
+            // A probed volume whose headers state no number reads as volume 0
+            // in its role. That is right for a first volume and wrong for one
+            // that opens mid-member, and matching on it hands the first
+            // volume's described name to whichever volume happened to be
+            // probed.
+            let position_unknown = identity
+                .classification
+                .as_ref()
+                .is_some_and(|classification| {
+                    self.numberless_rar_volume_position_unknown(job_id, classification)
+                });
+            if !position_unknown
+                && let weaver_model::files::FileRole::RarVolume { volume_number } = role
+            {
                 by_rar_volume.insert(*volume_number, *file_id);
             }
         }
@@ -1470,13 +1497,24 @@ impl Pipeline {
     /// would be a guess. The file is then unbound, which costs it in-stream
     /// verification and nothing else: it is read at completion like every file
     /// was before the grid existed.
+    ///
+    /// A file with no captured prefix but a fingerprint an identity roster
+    /// already proved (see
+    /// [`crate::pipeline::Pipeline::file_proven_par2_fingerprint`]) is matched
+    /// on that fingerprint and its proven length, under the same uniqueness
+    /// rule. A prefix captured again later is what the bytes are matched on,
+    /// but the length stays the proven one.
     fn content_bound_par2_file_id(
         &self,
         file_id: NzbFileId,
         set: &Par2FileSet,
     ) -> Option<par2_rs::FileId> {
-        let prefix = self.file_prefix_16k.get(&file_id)?;
-        if prefix.is_empty() {
+        let prefix = self
+            .file_prefix_16k
+            .get(&file_id)
+            .filter(|prefix| !prefix.is_empty());
+        let proven = self.file_proven_par2_fingerprint.get(&file_id).copied();
+        if prefix.is_none() && proven.is_none() {
             return None;
         }
         let state = self.jobs.get(&file_id.job_id)?;
@@ -1489,10 +1527,17 @@ impl Pipeline {
             .files
             .iter()
             .filter(|(_, desc)| {
-                let length_contradicts = if file.is_complete() {
-                    file.received_bytes() != desc.length
-                } else {
-                    file.received_bytes() > desc.length
+                // A proven fingerprint carries the length it was proven at.
+                // The file's own count cannot stand in for it: articles a
+                // restart found already delivered are recounted at their
+                // declared, encoded sizes. That holds even once a prefix has
+                // been captured again, from a first article delivered a second
+                // time after the restart: the bytes are fresh, the count is
+                // not.
+                let length_contradicts = match proven {
+                    Some((_, proven_length)) => proven_length != desc.length,
+                    None if file.is_complete() => file.received_bytes() != desc.length,
+                    None => file.received_bytes() > desc.length,
                 };
                 if length_contradicts
                     || crate::pipeline::is_split_fragment_of(&current_filename, &desc.filename)
@@ -1506,9 +1551,15 @@ impl Pipeline {
                 // A zero-length description has no content to be identified by.
                 // A window the capture does not reach cannot be tested without
                 // inventing the bytes it is missing.
-                window > 0
-                    && prefix.len() >= window
-                    && par2_rs::checksum::md5(&prefix[..window]) == desc.hash_16k
+                match (prefix, proven) {
+                    (Some(prefix), _) => {
+                        window > 0
+                            && prefix.len() >= window
+                            && par2_rs::checksum::md5(&prefix[..window]) == desc.hash_16k
+                    }
+                    (None, Some((proven_hash, _))) => window > 0 && proven_hash == desc.hash_16k,
+                    (None, None) => false,
+                }
             })
             .map(|(par2_file_id, _)| *par2_file_id)
             .collect::<Vec<_>>();
@@ -2066,7 +2117,10 @@ impl Pipeline {
     ///    archive set the recovery set is for; with nothing to compare against,
     ///    every volume stays discoverable. Incomplete volumes are left alone: a
     ///    file still being written is not yet the archive its name claims, and
-    ///    its bytes may still be rearranged.
+    ///    its bytes may still be rearranged. So is a numberless volume whose
+    ///    headers have not shown it opening a set: the set it is classified
+    ///    under is named after the volume itself, and an obfuscated later
+    ///    volume of this very set looks exactly like that.
     ///  - A file a repair left behind: it appeared in the directory after the
     ///    pre-repair snapshot and neither the NZB nor any servable set names
     ///    it, so it is the damaged original a repair moved aside. Named by
@@ -2098,10 +2152,10 @@ impl Pipeline {
                 .effective_file_identity(job_id, file_id)
                 .and_then(|identity| identity.classification)
                 .and_then(|classification| {
-                    matches!(
+                    (matches!(
                         classification.kind,
                         crate::jobs::assembly::DetectedArchiveKind::Rar
-                    )
+                    ) && !self.numberless_rar_volume_position_unknown(job_id, &classification))
                     .then_some(classification.set_name)
                 });
             match self.resolve_par2_file_binding(file_id) {
@@ -2146,6 +2200,17 @@ impl Pipeline {
                     .into_iter()
                     .map(|name| working_dir.join(name)),
             );
+        }
+        // Direct scratch has its own lifetime: demotion queues its unlink
+        // behind cached write handles and can return before that unlink lands.
+        // A directory scan must not borrow it as an extra repair source while
+        // the closer is free to remove it. Only stable volume files may cross
+        // the handoff from direct storage to conventional repair.
+        for set in self.direct_store.sets_for(job_id) {
+            let plan = set.plan();
+            excluded.extend(plan.envelope_paths());
+            excluded.extend(plan.repair_paths());
+            excluded.push(plan.holds_scratch_path());
         }
         // A path this set itself resolves to is never an exclusion, whatever
         // else claimed it: the set's own sources are scanned as canonical

@@ -1,10 +1,13 @@
 [profile.default]
+# Large archive campaigns are opt-in; smoke and regression tests stay in the default suite.
+default-filter = 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/)))'
 # A test that leaves a child holding stdout or stderr open is a test failure.
 leak-timeout = { period = "2s", result = "fail" }
 # Tests wait on the events they check rather than racing a deadline of their
 # own, so a hang is the runner's to end: flag a test after a minute, kill it
-# after ten. This bounds a stuck run; it asserts nothing about speed.
-slow-timeout = { period = "60s", terminate-after = 10 }
+# after an hour. That is far above any real run, so a loaded runner cannot
+# fail a test; it only bounds a stuck run and asserts nothing about speed.
+slow-timeout = { period = "60s", terminate-after = 60 }
 
 # macOS has no pipe2, so the standard library creates a test's stdio pipes and
 # sets close-on-exec in two steps. A sibling test spawned inside that window
@@ -14,3 +17,22 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 platform = { host = 'cfg(target_os = "macos")' }
 leak-timeout = { period = "2s", result = "pass" }
+
+# The archive campaigns run whole schedules per test, so a healthy one can take
+# minutes on a shared runner: flag it every five minutes, kill it after twenty.
+
+# Run with: cargo nextest run --profile archive-matrix --run-ignored all --no-fail-fast
+[profile.archive-matrix]
+default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_)'
+slow-timeout = { period = "300s", terminate-after = 12 }
+
+# The extended campaigns are a separate, manually dispatched run.
+# Run with: cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast
+[profile.archive-matrix-extended]
+default-filter = '(test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/)'
+slow-timeout = { period = "300s", terminate-after = 12 }
+
+# The archive matrix and the extended campaigns together, as CI partitions them.
+[profile.archive-matrix-all]
+default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/))'
+slow-timeout = { period = "300s", terminate-after = 12 }

@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 
 use weaver_nntp::pool::NntpPool;
-use weaver_server_core::operations::disk::DiskSpaceCollector;
+use weaver_server_core::operations::disk::StorageCapacity;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{PerJobSeries, SharedConfig};
 use weaver_server_core::{Database, SchedulerHandle};
@@ -186,7 +186,7 @@ impl PrometheusMetricsExporter {
 
     pub(crate) async fn render(
         &self,
-        disk_space: &Arc<DiskSpaceCollector>,
+        disk_space: &Arc<StorageCapacity>,
         http_metrics: &super::HttpMetricsHandle,
     ) -> String {
         let snapshot = self.handle.get_metrics();
@@ -210,26 +210,11 @@ impl PrometheusMetricsExporter {
             .zip(self.handle.get_extraction_rejections())
             .collect();
 
-        // Both of these touch a blocking resource — the database executor and
-        // the filesystem — so they share one blocking task rather than stalling
-        // the async runtime. The free-space sample is TTL-cached, so most
-        // scrapes do not stat anything at all.
-        // Post-processing counters live in the executor, so only the free-space
-        // sample still needs the blocking pool.
         let post_processing =
             Some(weaver_server_core::post_processing::executor::metrics_snapshot());
-        let disk_collector = Arc::clone(disk_space);
-        let disk_space = match tokio::task::spawn_blocking(move || {
-            disk_collector.sample(super::DISK_SPACE_SAMPLE_TTL)
-        })
-        .await
-        {
-            Ok(disk) => disk,
-            Err(error) => {
-                tracing::debug!(error = %error, "scrape-time blocking collection failed");
-                Vec::new()
-            }
-        };
+        // The samplers' last readings: a scrape never stats a filesystem, so a
+        // slow mount cannot hold it.
+        let disk_space = disk_space.snapshots();
 
         let server_metrics = self.handle.server_metrics_snapshot();
         let job_lifecycle = self.handle.job_lifecycle_metrics_snapshot();
@@ -283,7 +268,7 @@ pub(super) async fn metrics_handler(
     // `build_router` consumes the `ServerRuntime` and re-publishes these two
     // scrape-time collectors as extensions; taking them here is how the
     // exporter reaches them without a second copy in its own state.
-    Extension(disk_space): Extension<Arc<DiskSpaceCollector>>,
+    Extension(disk_space): Extension<Arc<StorageCapacity>>,
     Extension(http_metrics): Extension<super::HttpMetricsHandle>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {

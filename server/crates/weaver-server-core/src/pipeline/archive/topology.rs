@@ -2346,9 +2346,19 @@ impl Pipeline {
             let state = self.rar_sets.entry((job_id, set_name.clone())).or_default();
             state.facts.clear();
             state.volume_files.clear();
+            // Rows that no longer decode, usually every row of a set written
+            // by an earlier facts schema. One line per set, not per volume.
+            let mut dropped: usize = 0;
+            let mut first_dropped: Option<(u32, String)> = None;
             for (volume_index, blob) in facts_rows {
-                match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
-                    Ok(facts) => {
+                // Decoded through the direct-store envelope, which also reads a
+                // bare row: direct-store writes its RAR facts into this same
+                // table under a tag, and those are RAR volume headers exactly
+                // like a bare row. Reading only the bare form dropped every
+                // one of them as undecodable.
+                match DirectVolumeFacts::decode(&blob) {
+                    Ok(DirectVolumeFacts::Rar(facts)) => {
+                        let facts = *facts;
                         // The row key is the volume registration keyed by; the
                         // blob's own number is whatever the header stated,
                         // which for an old-numbering RAR4 set is nothing.
@@ -2367,28 +2377,31 @@ impl Pipeline {
                         }
                         state.facts.insert(volume_index, facts);
                     }
+                    // A direct-store 7z set caches its container map on these
+                    // rows, which is not a RAR volume header and never was one.
+                    // Note the set so the emptiness check below does not read
+                    // its rows as a cache gone stale, and leave them where they
+                    // are.
+                    Ok(DirectVolumeFacts::SevenZip(_)) => {
+                        container_sets.insert(set_name.clone());
+                    }
                     Err(error) => {
-                        // A direct-store 7z set caches its container map on
-                        // these rows under a tagged envelope, which is not a
-                        // RAR volume header and never was one. Note the set so
-                        // the emptiness check below does not read its rows as a
-                        // cache gone stale, and leave them where they are.
-                        if matches!(
-                            DirectVolumeFacts::decode(&blob),
-                            Ok(DirectVolumeFacts::SevenZip(_))
-                        ) {
-                            container_sets.insert(set_name.clone());
-                            continue;
+                        dropped += 1;
+                        if first_dropped.is_none() {
+                            first_dropped = Some((volume_index, error.to_string()));
                         }
-                        warn!(
-                            job_id = job_id.0,
-                            set_name = %set_name,
-                            volume_index,
-                            error = %error,
-                            "dropping invalid persisted RAR volume facts"
-                        );
                     }
                 }
+            }
+            if let Some((volume_index, error)) = first_dropped {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    dropped,
+                    first_volume_index = volume_index,
+                    error = %error,
+                    "dropping invalid persisted RAR volume facts"
+                );
             }
         }
 
@@ -2515,6 +2528,19 @@ impl Pipeline {
                 // its archive. Deleting its rows would cost it the container
                 // map it restores from and make the whole set refetch.
                 if container_sets.contains(set_name) {
+                    continue;
+                }
+                // The same steady state for a RAR set whose checkpoint direct
+                // restore accepted: its volumes never exist as files, and these
+                // rows are the only thing its layout rebuilds from. Deleting
+                // them here turns the next restart into a refusal of a set this
+                // one resumed, and the whole set refetches.
+                if self.direct_store.sets_for(job_id).iter().any(|set| {
+                    set.set_name() == set_name
+                        && set.was_restored()
+                        && !set.is_demoted()
+                        && !set.is_finalized()
+                }) {
                     continue;
                 }
                 if let Err(error) = self.db.delete_rar_volume_facts_for_set(job_id, set_name) {

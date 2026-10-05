@@ -713,6 +713,13 @@ impl Pipeline {
                     .and_then(|_| std::fs::create_dir_all(&complete_dir))
                     .map_err(crate::SchedulerError::Io)
                     .map(|_| {
+                        use crate::operations::StorageRoot;
+                        self.storage_capacity
+                            .retarget(StorageRoot::Data, data_dir.clone());
+                        self.storage_capacity
+                            .retarget(StorageRoot::Intermediate, intermediate_dir.clone());
+                        self.storage_capacity
+                            .retarget(StorageRoot::Complete, complete_dir.clone());
                         self.intermediate_dir = intermediate_dir;
                         self.complete_dir = complete_dir;
                         self.nzb_dir = data_dir.join(".weaver-nzbs");

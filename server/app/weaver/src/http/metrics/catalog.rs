@@ -176,6 +176,12 @@ metric_families! {
         "Article handouts cut by the per-server scheduler, by kind.");
     SCHEDULER_IDLE_WITH_SERVABLE = ("weaver_pipeline_download_scheduler_idle_with_servable_total", Counter, [],
         "Scheduler answered idle while a job still had a servable article on that server; always zero when the scheduler is correct.");
+    SCHEDULER_SCAN_ITEMS_SKIPPED = ("weaver_pipeline_download_scheduler_scan_items_skipped_total", Counter, [],
+        "Queued articles a scheduler queue scan looked at and passed over.");
+    SCHEDULER_SCAN_NO_MATCH = ("weaver_pipeline_download_scheduler_scan_no_match_total", Counter, [],
+        "Scheduler queue scans that found no article the asking server may fetch.");
+    SCHEDULER_HOT_BLOCKED = ("weaver_pipeline_download_scheduler_hot_blocked_total", Counter, ["clause"],
+        "Times the hot job had nothing for the asking server, once per clause that refused it.");
 
     // ---- BODY pipelining proof -------------------------------------------
     BODY_PROOF_EVENTS = ("weaver_pipeline_body_proof_events_total", Counter, ["event"],

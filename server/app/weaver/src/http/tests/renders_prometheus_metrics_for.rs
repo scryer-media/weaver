@@ -79,6 +79,11 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         rendered.contains("weaver_pipeline_download_scheduler_handouts_total{kind=\"probe\"} 204")
     );
     assert!(rendered.contains("weaver_pipeline_download_scheduler_idle_with_servable_total 201"));
+    assert!(rendered.contains("weaver_pipeline_download_scheduler_scan_items_skipped_total 205"));
+    assert!(rendered.contains("weaver_pipeline_download_scheduler_scan_no_match_total 206"));
+    assert!(rendered.contains(
+        "weaver_pipeline_download_scheduler_hot_blocked_total{clause=\"sweep_held\"} 207"
+    ));
     assert!(
         rendered.contains("weaver_pipeline_body_proof_events_total{event=\"trial_success\"} 46")
     );
@@ -225,6 +230,9 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_scheduler_handouts_total_hot: 0,
         download_scheduler_handouts_total_spill: 0,
         download_scheduler_handouts_total_probe: 0,
+        download_scheduler_scan_items_skipped_total: 0,
+        download_scheduler_scan_no_match_total: 0,
+        download_scheduler_hot_blocked_total: [0; weaver_server_core::SchedulerBlockClause::COUNT],
         download_lane_inflight_bytes: 0,
         download_jobs_eligible: 0,
         download_jobs_hot: 0,
@@ -580,6 +588,22 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
         "weaver_pipeline_download_scheduler_handouts_total",
         "kind",
         &["hot", "spill", "probe"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_pipeline_download_scheduler_hot_blocked_total",
+        "clause",
+        &[
+            "propagation",
+            "retention",
+            "direct_store",
+            "sweep_held",
+            "server_exclusion",
+            "backfill",
+            "par2_bootstrap",
+            "uu_cursor",
+            "checkpoint",
+        ],
     );
     assert_label_set(
         &rendered,

@@ -334,6 +334,15 @@ impl Pipeline {
                         "PAR3 set carries option packets weaver does not apply"
                     );
                 }
+                if let Some(index) = self.par3_direct_set_behind_unposted_output(job_id, set) {
+                    self.demote_direct_set(
+                        job_id,
+                        index,
+                        crate::pipeline::direct_store::router::DemotionReason::IdentityRosterUnfillable,
+                    )
+                    .await;
+                    return true;
+                }
                 self.prepare_direct_unpack_for_par3_repair(job_id);
                 if self.job_has_active_extraction_tasks(job_id) {
                     return true;
@@ -581,6 +590,8 @@ impl Pipeline {
                     }
                 };
                 let _ = self.event_tx.send(event);
+                self.note_par3_superseded_sources(job_id, &report.installed)
+                    .await;
                 self.release_direct_unpack_after_repair(job_id);
                 self.transition_postprocessing_status(
                     job_id,

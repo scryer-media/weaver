@@ -2,6 +2,61 @@ use super::*;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+fn scan_extraction_directory(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<ScannedExtractionFile>,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("failed to read {}: {error}", current.display())),
+    };
+    scan_extraction_children(root, current, files, entries)
+}
+
+fn scan_extraction_children(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<ScannedExtractionFile>,
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> Result<(), String> {
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("failed to read entry in {}: {error}", current.display()))?;
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            // Direct-store cleanup can remove a partial after enumeration.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("failed to stat {}: {error}", path.display())),
+        };
+        if metadata.is_dir() {
+            scan_extraction_directory(root, &path, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "extraction tree contains non-file/non-directory entry {}",
+                path.display()
+            ));
+        }
+        let relative_path = path
+            .strip_prefix(root)
+            .map_err(|error| format!("failed to relativize {}: {error}", path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let declared_role = weaver_model::files::FileRole::from_filename(&relative_path);
+        files.push(ScannedExtractionFile {
+            relative_path,
+            declared_role,
+            detected_archive: None,
+            size: metadata.len(),
+        });
+    }
+    Ok(())
+}
+
 impl Pipeline {
     fn nested_declared_archive_identity(
         filename: &str,
@@ -222,56 +277,9 @@ impl Pipeline {
         root: &Path,
         password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     ) -> Result<Vec<ScannedExtractionFile>, String> {
-        fn walk(
-            root: &Path,
-            current: &Path,
-            files: &mut Vec<ScannedExtractionFile>,
-        ) -> Result<(), String> {
-            let entries = std::fs::read_dir(current)
-                .map_err(|error| format!("failed to read {}: {error}", current.display()))?;
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    format!("failed to read entry in {}: {error}", current.display())
-                })?;
-                let path = entry.path();
-                let file_type = entry
-                    .file_type()
-                    .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
-                if file_type.is_dir() {
-                    walk(root, &path, files)?;
-                    continue;
-                }
-                if !file_type.is_file() {
-                    return Err(format!(
-                        "extraction tree contains non-file/non-directory entry {}",
-                        path.display()
-                    ));
-                }
-
-                let relative_path = path
-                    .strip_prefix(root)
-                    .map_err(|error| format!("failed to relativize {}: {error}", path.display()))?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let declared_role = weaver_model::files::FileRole::from_filename(&relative_path);
-                let size = entry
-                    .metadata()
-                    .map_err(|error| format!("failed to stat {}: {error}", path.display()))?
-                    .len();
-
-                files.push(ScannedExtractionFile {
-                    relative_path,
-                    declared_role,
-                    detected_archive: None,
-                    size,
-                });
-            }
-            Ok(())
-        }
-
         let mut files = Vec::new();
         if root.exists() {
-            walk(root, root, &mut files)?;
+            scan_extraction_directory(root, root, &mut files)?;
         }
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         Self::detect_nested_archive_identities(root, &mut files, password_candidates).await?;
@@ -480,8 +488,17 @@ impl Pipeline {
             .and_then(|state| state.staging_dir.as_ref())
             .is_some_and(|staging| staging == &scan_root)
         {
+            // Opening the root and walking the whole tree is filesystem work
+            // proportional to the job's output; it must not run on the
+            // pipeline task. The errors, rejections included, are the walk's
+            // own, unchanged.
             let budget = self.extraction_budget(job_id, &scan_root)?;
-            ExtractionRoot::open(&scan_root)?.scan_no_links(&budget)?;
+            let root_for_scan = scan_root.clone();
+            tokio::task::spawn_blocking(move || {
+                ExtractionRoot::open(&root_for_scan)?.scan_no_links(&budget)
+            })
+            .await
+            .map_err(|error| format!("extraction root link scan task failed: {error}"))??;
         }
         let password_candidates = self.archive_password_candidates_for_job(job_id);
         let scanned_files = Self::scan_extraction_root(&scan_root, password_candidates).await?;
@@ -538,6 +555,7 @@ impl Pipeline {
         // refresh". The set already delivered everything it was for — its
         // members are the very bytes being rebuilt over.
         self.direct_store.clear_job(job_id);
+        self.drop_direct_placements_for_job(job_id);
         self.forget_direct_tolerated_work(job_id);
         // A damaged-path verdict names files by path against the assembly
         // being replaced here, so it cannot be allowed to reach the rebuilt one.
@@ -611,5 +629,110 @@ impl Pipeline {
         }
 
         Ok(NestedExtractionDecision::Started)
+    }
+}
+
+#[cfg(test)]
+mod cleanup_scan_tests {
+    use super::*;
+
+    #[test]
+    fn nested_scan_ignores_entries_removed_after_enumeration() {
+        for nested in [false, true] {
+            for remove_directory in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let current = if nested {
+                    root.path().join("nested")
+                } else {
+                    root.path().to_path_buf()
+                };
+                std::fs::create_dir_all(&current).unwrap();
+                std::fs::write(current.join("kept.bin"), b"keep").unwrap();
+                let removed = current.join("partial");
+                if remove_directory {
+                    std::fs::create_dir(&removed).unwrap();
+                } else {
+                    std::fs::write(&removed, b"discard").unwrap();
+                }
+                let entries: Vec<_> = std::fs::read_dir(&current).unwrap().collect();
+                assert_eq!(entries.len(), 2);
+                if remove_directory {
+                    std::fs::remove_dir(&removed).unwrap();
+                } else {
+                    std::fs::remove_file(&removed).unwrap();
+                }
+                let mut files = Vec::new();
+                scan_extraction_children(root.path(), &current, &mut files, entries).unwrap();
+                assert_eq!(files.len(), 1);
+                assert_eq!(
+                    files[0].relative_path,
+                    if nested {
+                        "nested/kept.bin"
+                    } else {
+                        "kept.bin"
+                    }
+                );
+                assert_eq!(files[0].size, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_scan_tolerates_directory_removal_after_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("partial");
+        std::fs::create_dir(&child).unwrap();
+        assert!(std::fs::symlink_metadata(&child).unwrap().is_dir());
+        std::fs::remove_dir(&child).unwrap();
+        let mut files = Vec::new();
+        scan_extraction_directory(root.path(), &child, &mut files).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_scan_rejects_dangling_links_after_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.partial"), b"discard").unwrap();
+        symlink("a.partial", root.path().join("z.link")).unwrap();
+        let mut entries: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        std::fs::remove_file(root.path().join("a.partial")).unwrap();
+        let mut files = Vec::new();
+        let error = scan_extraction_children(
+            root.path(),
+            root.path(),
+            &mut files,
+            entries.into_iter().map(Ok),
+        )
+        .unwrap_err();
+        assert!(error.contains("non-file/non-directory"), "{error}");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn nested_scan_preserves_entry_read_errors() {
+        let root = tempfile::tempdir().unwrap();
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let mut files = Vec::new();
+            let error = scan_extraction_children(
+                root.path(),
+                root.path(),
+                &mut files,
+                [Err(std::io::Error::new(kind, "entry enumeration failed"))],
+            )
+            .unwrap_err();
+            assert!(error.contains("entry enumeration failed"), "{error}");
+            assert!(files.is_empty());
+        }
     }
 }

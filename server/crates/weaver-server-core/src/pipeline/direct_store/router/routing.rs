@@ -131,6 +131,7 @@ impl DirectSetRouter {
     /// hold its trailing region, leave repaired bytes with nowhere to go, and
     /// demote the set under [`DemotionReason::RepairRerouteFailed`] after the
     /// recovery had already been downloaded.
+    #[cfg(test)]
     pub(crate) fn route_repaired(
         &mut self,
         volume_index: u32,

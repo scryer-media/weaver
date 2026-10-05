@@ -123,6 +123,7 @@ fn snapshot_round_trips_exactly() {
                 complete: false,
             },
         ],
+        identity: None,
     };
 
     let blob = encode(&snapshot).unwrap();
@@ -195,6 +196,7 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
             crypt: None,
         }],
         floors,
+        identity: None,
     };
 
     let blob = encode(&snapshot).unwrap();
@@ -204,6 +206,96 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
         blob.len()
     );
     assert_eq!(decode(&blob).unwrap(), snapshot);
+}
+
+/// The body a v6 writer produced: the v7 fields but the identity binding, in
+/// the same positional order.
+fn encode_v6(snapshot: &CoverageSnapshot) -> Vec<u8> {
+    let body = rmp_serde::to_vec(&(
+        snapshot.generation,
+        snapshot.plan_digest,
+        &snapshot.destinations,
+        &snapshot.floors,
+    ))
+    .unwrap();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&SNAPSHOT_MAGIC);
+    blob.extend_from_slice(&6u16.to_le_bytes());
+    blob.extend_from_slice(&body);
+    blob
+}
+
+fn sample_identity_snapshot() -> CoverageSnapshot {
+    CoverageSnapshot {
+        identity: Some(IdentityBinding {
+            kind: IdentityKind::HeaderVolumeSet,
+            volumes: vec![(0, 0)],
+            expected_volumes: None,
+            discriminator: 0,
+        }),
+        ..sample_snapshot()
+    }
+}
+
+#[test]
+fn a_snapshot_with_an_identity_binding_round_trips_byte_identically() {
+    let snapshot = sample_identity_snapshot();
+    let blob = encode(&snapshot).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([blob[4], blob[5]]),
+        SNAPSHOT_SCHEMA_VERSION
+    );
+    let decoded = decode(&blob).unwrap();
+    assert_eq!(decoded, snapshot);
+    assert_eq!(encode(&decoded).unwrap(), blob);
+
+    // Canonical: the binding's volumes are ordered by the encoder, so the
+    // order they were gathered in never changes the row.
+    let mut wide = snapshot.clone();
+    wide.identity.as_mut().unwrap().volumes = vec![(2, 7), (0, 0), (1, 4)];
+    let mut sorted = wide.clone();
+    sorted.identity.as_mut().unwrap().volumes = vec![(0, 0), (1, 4), (2, 7)];
+    assert_eq!(encode(&wide).unwrap(), encode(&sorted).unwrap());
+
+    // And a body that bypassed the encoder with them out of order is refused.
+    let mut forged = Vec::new();
+    forged.extend_from_slice(&SNAPSHOT_MAGIC);
+    forged.extend_from_slice(&SNAPSHOT_SCHEMA_VERSION.to_le_bytes());
+    forged.extend_from_slice(&rmp_serde::to_vec(&wide).unwrap());
+    assert!(matches!(decode(&forged), Err(SnapshotError::Malformed(_))));
+}
+
+#[tokio::test]
+async fn a_version_6_row_decodes_and_restores_with_no_identity_binding() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let roots = sample_roots(temp_dir.path());
+    write_destination(
+        &roots.destination_dir,
+        "silver-horizon.mkv.f0.direct.partial",
+        60,
+    );
+    let blob = encode_v6(&sample_snapshot());
+
+    assert_eq!(
+        decode(&blob),
+        Ok(sample_snapshot()),
+        "a v6 row is a v7 row with no identity binding"
+    );
+    let snapshot = restore_set(&roots, &blob, &sample_expected())
+        .await
+        .expect("a checkpoint written before the upgrade must still restore");
+    assert_eq!(snapshot.identity, None);
+    assert_eq!(snapshot.generation, 3);
+    assert_eq!(refetch_floors(&snapshot), HashMap::from([(0u32, 60u64)]));
+
+    // Only ever read: what the next barrier writes is the current version.
+    assert_eq!(
+        u16::from_le_bytes({
+            let rewritten = encode(&snapshot).unwrap();
+            [rewritten[4], rewritten[5]]
+        }),
+        SNAPSHOT_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -3460,6 +3552,160 @@ fn a_carried_remainder_still_verifies_the_articles_before_it() {
     // are harmless because they are not in `verified`: every article over them
     // is refetched and overwritten, and no floor is published across them.
     assert!(path.exists());
+}
+
+/// Article records for `articles`, each `(start, len)` taken off `bytes`: the
+/// composition a process that placed only those articles would hold.
+fn article_crcs_for(bytes: &[u8], articles: &[(usize, usize)]) -> CrcRuns {
+    let mut runs = CrcRuns::default();
+    for &(start, len) in articles {
+        runs.insert(
+            start as u64,
+            len as u64,
+            par2_rs::checksum::crc32(&bytes[start..start + len]),
+        );
+    }
+    runs
+}
+
+/// After a restart the composition holds nothing for the bytes a checkpoint
+/// restored, so a volume that needs repair would refuse every byte placed
+/// before the restart and demote. The repair scratch carries a restored
+/// stretch with no record through, and still verifies every article this
+/// process recorded after it.
+#[test]
+fn a_repair_scratch_carries_restored_bytes_with_no_record() {
+    let fixture = provider_fixture(whole_volume_covered());
+    // Two articles placed before the restart, two after it.
+    let crcs = article_crcs_for(&fixture.conventional, &[(200, 100), (300, 100)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 400);
+    let mut restored = ByteRanges::new();
+    restored.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered, crcs);
+    target.restored = restored;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let rebuilt = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect("the restored stretch is carried and the recorded articles verify");
+
+    let mut verified = ByteRanges::new();
+    verified.insert(200, 200);
+    assert_eq!(
+        rebuilt[0].verified, verified,
+        "only the articles this process recorded are claimed as verified"
+    );
+    assert_eq!(rebuilt[0].contiguous, 0);
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..400], &fixture.conventional[..400]);
+}
+
+/// The carry stops where the restored bytes do. A covered stretch past them
+/// that no record accounts for is bytes this process placed and cannot vouch
+/// for, and is refused exactly as it would be without a restart.
+#[test]
+fn a_restored_carry_never_reaches_past_the_restored_bytes() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 300);
+    let mut restored = ByteRanges::new();
+    restored.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered, CrcRuns::default());
+    target.restored = restored;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("an unrecorded stretch past the restored bytes has no reference");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 200,
+        }
+    );
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..200], &fixture.conventional[..200]);
+    assert!(
+        written[200..].iter().all(|byte| *byte == 0),
+        "the refused stretch is left as a hole"
+    );
+}
+
+/// A record this process holds inside the restored bytes — an article fetched
+/// again after the restart — is checked like any other, so a restored byte
+/// that disagrees with it is still caught.
+#[test]
+fn a_record_inside_restored_bytes_is_still_verified() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let mut corrupted = fixture.conventional.clone();
+    corrupted[150] ^= 0xFF;
+    let crcs = article_crcs_for(&corrupted, &[(100, 100)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered.clone(), crcs);
+    target.restored = covered;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("the recorded article fails its reference");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::ChecksumMismatch {
+            volume_index: 0,
+            offset: 100,
+        }
+    );
+}
+
+/// The demotion sweep publishes a floor over what it writes, so restored bytes
+/// with no record are refused there whatever the repair scratch does.
+#[test]
+fn a_demotion_sweep_does_not_carry_restored_bytes() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 200);
+    let mut target =
+        reconstruction_target(&fixture, path.clone(), covered.clone(), CrcRuns::default());
+    target.restored = covered;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("a floor may not cover restored bytes nothing checked");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 0,
+        }
+    );
 }
 
 #[test]

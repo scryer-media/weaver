@@ -76,7 +76,7 @@ filetime = { version = "0.2.29", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 zstd = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-sevenz-turbo = { version = "0.26.0", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
+sevenz-turbo = { version = "0.26.1", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
 lzma-turbo = { version = "0.6.0", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
 semver = { version = "1.0", default-features = false, features = ["serde", "std"] }
@@ -114,7 +114,8 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.10.6", default-features = false, features = ["crypto-aws-lc"] }
+# Authenticated recovery scanning and source-change handling.
+par2-rs = { version = "=0.10.7", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -126,7 +127,7 @@ par2-rs = { version = "0.10.6", default-features = false, features = ["crypto-aw
 # not use: it verifies and repairs sets other producers wrote.
 # 0.4.3 adds an opt-in `wasm-simd` feature for wasm builds. Weaver is native
 # and does not forward it.
-par3-rs = { version = "0.4.3", default-features = false }
+par3-rs = { version = "=0.4.4", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
@@ -169,7 +170,8 @@ debug = 0
 split-debuginfo = "off"
 incremental = false
 
-# Rarpar crates use crates.io.
+# Rarpar crates normally use crates.io; the PAR2 revision above is a temporary
+# pin to the authenticated-scanner and source-change fixes.
 # Do not add a `[patch.crates-io]` block that points outside this
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a

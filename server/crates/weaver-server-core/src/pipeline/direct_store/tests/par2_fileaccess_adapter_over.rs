@@ -603,6 +603,94 @@ fn a_rearm_run_that_matches_clears_its_seeded_range() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn restart_reread_preserves_crc_atoms_created_by_a_later_repair() {
+    let bytes: Vec<u8> = (0..400).map(|index| (index % 251) as u8).collect();
+    for (seeded, corrupt) in [vec![(0, 100)], vec![(100, 300)], vec![(0, 100), (200, 300)]]
+        .into_iter()
+        .flat_map(|seeded| [false, true].map(|corrupt| (seeded.clone(), corrupt)))
+    {
+        let (mut router, member_id) = straddle_router(&bytes, 64);
+        let partial = router.member_partials()[0].2.to_string();
+        router.restore_member_coverage(&partial, &seeded).unwrap();
+        router.begin_repair_transaction(vec![0]).unwrap();
+        router
+            .route_repaired_batch(
+                0,
+                &[(64, bytes::Bytes::copy_from_slice(&bytes))],
+                &[],
+                false,
+                true,
+            )
+            .unwrap();
+        router.finish_repair_transaction().unwrap();
+        let plan = router.restart_read_plan();
+        assert_eq!(plan.len(), 1, "seeded={seeded:?}");
+        assert_eq!((plan[0].logical_offset, plan[0].len), (0, 400));
+        assert!(!router.all_members_verified());
+        let mut reread = bytes.clone();
+        if corrupt {
+            reread[399] ^= 0x80;
+        }
+        let result =
+            router.note_restored_member_crc(member_id, 0, 400, par2_rs::checksum::crc32(&reread));
+        if corrupt {
+            assert_eq!(result, Err(DemotionReason::MemberChecksumMismatch));
+            assert!(!router.all_members_verified());
+            continue;
+        }
+        result.unwrap();
+        assert!(!router.has_restart_seeded_coverage());
+        assert!(!router.has_stale_gaps());
+        assert!(router.all_members_verified());
+    }
+}
+
+#[test]
+fn restart_reread_expansion_does_not_bridge_unavailable_bytes() {
+    let bytes: Vec<u8> = (0..400).map(|index| (index % 251) as u8).collect();
+    let (mut router, member_id) = straddle_router(&bytes, 64);
+    let partial = router.member_partials()[0].2.to_string();
+    router
+        .restore_member_coverage(&partial, &[(10, 50), (250, 270)])
+        .unwrap();
+    router.begin_repair_transaction(vec![0]).unwrap();
+    router
+        .route_repaired_batch(
+            0,
+            &[
+                (64, bytes::Bytes::copy_from_slice(&bytes[..100])),
+                (264, bytes::Bytes::copy_from_slice(&bytes[200..300])),
+            ],
+            &[],
+            false,
+            true,
+        )
+        .unwrap();
+    router.finish_repair_transaction().unwrap();
+    let plan = router.restart_read_plan();
+    assert_eq!(
+        plan.iter()
+            .map(|run| (run.logical_offset, run.len))
+            .collect::<Vec<_>>(),
+        vec![(0, 100), (200, 100)]
+    );
+    for run in plan {
+        let start = run.logical_offset as usize;
+        let end = start + run.len as usize;
+        router
+            .note_restored_member_crc(
+                member_id,
+                run.logical_offset,
+                run.len,
+                par2_rs::checksum::crc32(&bytes[start..end]),
+            )
+            .unwrap();
+    }
+    assert!(!router.has_restart_seeded_coverage());
+    assert!(!router.all_members_verified());
+}
+
+#[test]
 fn holds_scratch_hands_out_stable_regions_and_reads_them_back() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".weaver-holds.silver.horizon.f0");
@@ -1424,6 +1512,7 @@ fn whole_volume_rewrite_requires_actual_end_to_end_ranges() {
             covered: ByteRanges::new(),
             crcs: CrcRuns::default(),
             partial_article: PartialArticle::CarryThrough,
+            restored: ByteRanges::new(),
         },
     };
     for ranges in [
@@ -1479,6 +1568,7 @@ fn an_encrypted_sets_read_back_carries_the_posted_bytes_on_both_sides_of_a_span(
             covered: ByteRanges::new(),
             crcs: CrcRuns::default(),
             partial_article: PartialArticle::CarryThrough,
+            restored: ByteRanges::new(),
         },
     };
 

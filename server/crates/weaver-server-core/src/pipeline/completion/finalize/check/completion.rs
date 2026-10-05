@@ -298,6 +298,8 @@ impl Pipeline {
         {
             // An omitted index is protection metadata, not missing payload,
             // once alternate carriers authenticated and verified the set.
+            // Nor is the damaged posted copy of a file the set has since
+            // rebuilt under the name it describes.
             self.jobs[&job_id].assembly.files().any(|file| {
                 !file.is_complete()
                     && !matches!(
@@ -305,6 +307,7 @@ impl Pipeline {
                         weaver_model::files::FileRole::Par2 { .. }
                             | weaver_model::files::FileRole::Par3 { .. }
                     )
+                    && !self.recovery_superseded_source(job_id, file.file_id())
             })
         } else {
             complete_data_files < total_data_files
@@ -320,6 +323,8 @@ impl Pipeline {
                 JobStatus::Paused
                     | JobStatus::Checking
                     | JobStatus::Moving
+                    | JobStatus::QueuedPostProcessing
+                    | JobStatus::PostProcessing
                     | JobStatus::Complete
                     | JobStatus::Failed { .. }
             ) {
@@ -459,6 +464,29 @@ impl Pipeline {
         // and fail a job whose bytes are all present. The ticket's completion
         // applies the bookkeeping and schedules this check again.
         if self.direct_demotion_in_flight.contains_key(&job_id) {
+            return;
+        }
+        // A restart-seeded re-read detached from that pass. Until it returns
+        // the set's member gates cannot compose, so the set is neither ready
+        // to finalize nor demoted; judged now, the job would read as complete
+        // with an archive nothing on disk answers for. The ticket's completion
+        // re-arms the gates and schedules this check again.
+        if self
+            .direct_rearm_in_flight
+            .iter()
+            .any(|(rearm_job, _)| *rearm_job == job_id)
+        {
+            return;
+        }
+        // Every article recorded and a placement still out: a set's trailing
+        // region is writing. Its set is byte-complete but neither finalized
+        // nor a conventional archive — no volume is on disk to extract — so it
+        // is the same shape as the tickets above. The landing finalizes the
+        // set, and its lane draining queues this check again. While files
+        // are still short the verdicts below ask the download pipeline,
+        // which counts the placement, so mid-download checks are left to run.
+        if !has_incomplete_data_files && self.has_direct_placements(job_id) {
+            self.completion_checks_awaiting_placements.insert(job_id);
             return;
         }
 
@@ -1098,6 +1126,11 @@ impl Pipeline {
             // has is the merged set, and so is the fail-fast arithmetic that
             // decides whether to wait, repair, or give up.
             self.salvage_partial_promoted_recovery_volumes(job_id).await;
+            // The salvage reads recovery volumes back, and a read the job
+            // cannot survive ends it there.
+            if !self.jobs.contains_key(&job_id) {
+                return;
+            }
 
             // Latched, so an indexless recovery set is named once rather than
             // on every entry to this gate.
@@ -1203,7 +1236,10 @@ impl Pipeline {
             // that pass read only the unproven remainder instead of the set.
             let mut quick_partial: Option<QuickPar2PartialEvidence> = None;
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
-                let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                let Some(state) = self.jobs.get(&job_id) else {
+                    return;
+                };
+                let working_dir = state.working_dir.clone();
                 Self::trip_par2_verification_started_failpoint();
                 match self
                     .quick_verify_par2_with_placement(
@@ -1316,7 +1352,12 @@ impl Pipeline {
 
             if let Some(par2_set) = par2_set {
                 let set_id = par2_set.recovery_set_id;
-                let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                // Every await above can end the job — a starved set fails it
+                // outright — and an ended job has nothing left to verify.
+                let Some(state) = self.jobs.get(&job_id) else {
+                    return;
+                };
+                let working_dir = state.working_dir.clone();
                 // Two direct-store preconditions for *any*
                 // authoritative pass below, whichever branch it takes. Both are
                 // no-ops for a job with no live direct set, so a conventional
@@ -2861,7 +2902,7 @@ impl Pipeline {
                     for topology in state.assembly.archive_topologies().values() {
                         cleanup_files.extend(topology.volume_map.keys().cloned());
                     }
-                    cleanup_files.extend(self.par2_joined_split_part_names(job_id));
+                    cleanup_files.extend(self.par2_spent_input_names(job_id));
                     cleanup_files
                 };
                 let nested_decision = match self.maybe_start_nested_extraction(job_id).await {

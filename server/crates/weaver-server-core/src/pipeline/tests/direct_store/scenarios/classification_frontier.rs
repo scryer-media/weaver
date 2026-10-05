@@ -1397,6 +1397,9 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
+    // The last article's placement must land before the check that gates the
+    // pass may judge the set.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
 
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
@@ -1537,6 +1540,9 @@ async fn a_mid_download_direct_set_is_neither_verified_against_nor_demoted_for_i
         pipeline.direct_sets_ready_for_authoritative_par2(job_id),
         "once every volume has completed the set is ready to be verified"
     );
+    // The pass reads the set back on a detached ticket; its verdict lands on
+    // the completion check the ticket re-arms.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
     let settled = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
         pipeline.par2_authoritative_verify_calls > verifies_before || settled.contains("Finalized"),

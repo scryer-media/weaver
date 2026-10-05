@@ -1,7 +1,7 @@
 //! One live direct set: its router, its coverage barrier, and the bookkeeping
 //! that keeps the two agreeing.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use super::ByteRanges;
@@ -124,8 +124,11 @@ pub(crate) struct DirectSet {
     resumed: Option<CoverageSnapshot>,
     /// Volumes whose logical length must be read off the coverage map rather
     /// than off the assembly's `received_bytes` — see
-    /// [`Self::virtual_volume_len`].
-    restart_seeded_volumes: BTreeSet<u32>,
+    /// [`Self::virtual_volume_len`] — with the physical coverage a checkpoint
+    /// seeded into each. Those bytes were placed by a process that is gone, so
+    /// no article record of this one accounts for them; see
+    /// [`Self::restored_volume_coverage`].
+    restart_seeded_volumes: BTreeMap<u32, ByteRanges>,
     /// The demotion's one-time cleanup (delete output, retire the row, refetch)
     /// has already run. The *status* alone cannot say so: the router demotes
     /// the set from inside `route`, so by the time the wiring seam is told, the
@@ -192,7 +195,7 @@ impl DirectSet {
             placed: BTreeMap::new(),
             placed_envelope: BTreeMap::new(),
             resumed: None,
-            restart_seeded_volumes: BTreeSet::new(),
+            restart_seeded_volumes: BTreeMap::new(),
             demotion_cleaned_up: false,
             repair_attempted: false,
             latched_direct: false,
@@ -318,8 +321,9 @@ impl DirectSet {
                 continue;
             }
             self.latched_direct = true;
-            self.restart_seeded_volumes.insert(volume_index);
+            let seeded = self.restart_seeded_volumes.entry(volume_index).or_default();
             for &(start, end) in covered.ranges() {
+                seeded.insert(start, end - start);
                 self.placed
                     .entry(volume_index)
                     .or_default()
@@ -360,7 +364,7 @@ impl DirectSet {
     /// them from parity it did not need to spend.
     pub(crate) fn virtual_volume_len(&self, volume_index: u32, received_bytes: u64) -> u64 {
         let covered_end = self.volume_coverage_with_holds(volume_index).end();
-        if self.restart_seeded_volumes.contains(&volume_index) {
+        if self.restart_seeded_volumes.contains_key(&volume_index) {
             return covered_end;
         }
         received_bytes.max(covered_end)
@@ -377,6 +381,18 @@ impl DirectSet {
     /// they came from, not whether they are trusted yet.
     pub(crate) fn was_restored(&self) -> bool {
         !self.restart_seeded_volumes.is_empty()
+    }
+
+    /// The physical ranges of one volume a checkpoint seeded, in the space
+    /// [`Self::volume_coverage`] answers in. Latched for the same reason as
+    /// [`Self::was_restored`]: it says where the bytes came from, and a later
+    /// re-read of a member does not change that this process holds no article
+    /// record for them.
+    pub(crate) fn restored_volume_coverage(&self, volume_index: u32) -> ByteRanges {
+        self.restart_seeded_volumes
+            .get(&volume_index)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn plan(&self) -> &DirectSetPlan {
@@ -420,6 +436,16 @@ impl DirectSet {
 
     pub(crate) fn is_finalized(&self) -> bool {
         matches!(self.status, DirectSetStatus::Finalized)
+    }
+
+    /// The reason the set left direct mode under, which is the router's own
+    /// when it demoted from inside `route` before the wiring seam was asked.
+    #[cfg(test)]
+    pub(crate) fn demotion_reason(&self) -> Option<DemotionReason> {
+        match self.status {
+            DirectSetStatus::Demoted(reason) => Some(reason),
+            _ => None,
+        }
     }
 
     /// Leaves direct mode. Refuses once the set is terminal in either
@@ -560,9 +586,13 @@ impl DirectSet {
         self.router.holds_budget()
     }
 
-    /// Routes one repaired span back through the router with replacement
-    /// semantics. A refusal demotes the set, exactly as [`Self::route`] does.
-    pub(crate) fn route_repaired(
+    /// Routes one volume's complete rewrite inside an open repair transaction.
+    ///
+    /// Unlike [`Self::route_repaired`] this does not settle: a repaired byte
+    /// that needs another volume's rewrite — an encrypted block straddling the
+    /// seam, a trailing region awaiting confirmation — stays staged until
+    /// [`Self::finish_repair_transaction`] answers for it.
+    pub(crate) fn route_repaired_volume(
         &mut self,
         volume_index: u32,
         spans: &[super::router::RepairedChunk],
@@ -571,12 +601,10 @@ impl DirectSet {
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         match self
             .router
-            .route_repaired(volume_index, spans, lead_in, whole_volume)
+            .route_repaired_batch(volume_index, spans, lead_in, whole_volume, true)
         {
             Ok(spans) => {
-                if !spans.is_empty() {
-                    self.latched_direct = true;
-                }
+                self.latched_direct |= !spans.is_empty();
                 Ok(spans)
             }
             Err(reason) => {
@@ -828,8 +856,18 @@ impl DirectSet {
         // minutes later, and every row written after that was refused at restart
         // for a set in perfect health. Re-pushed here, where every registration
         // already passes, and only when the router says the facts moved.
+        //
+        // Or when the volume map grew. The digest binds the mapping too, and an
+        // identity-admitted set's mapping grows file by file as later volumes
+        // bind — without a single member fact moving. A digest stamped at the
+        // first binding would label every later row with a one-volume plan the
+        // set stopped being, and the restart that rebuilds the plan from the
+        // row's own binding would refuse it. A name-admitted set's map is whole
+        // from admission, so for it this only recomputes the same value.
         let revision = self.router.member_facts_revision();
-        if self.digest_revision != Some(revision) {
+        if self.digest_revision != Some(revision)
+            || self.registered_volumes != self.router.plan().volumes.len()
+        {
             let digest = self.plan_digest();
             if let Some(barrier) = self.barrier.as_mut() {
                 barrier.set_plan_digest(digest);
@@ -1044,9 +1082,64 @@ impl DirectSet {
         // the retained tail padding and the cipher checkpoints are both produced
         // by the same routing call that produced the bytes being claimed.
         let crypt = self.router.member_crypt_snapshots();
+        let identity = self.router.plan().identity_binding();
         let barrier = self.barrier.as_mut()?;
         barrier.set_member_crypt(crypt);
+        barrier.set_identity_binding(identity);
         Some(barrier.barrier(trigger, now, drain, sync, persist))
+    }
+
+    /// The first half of [`Self::run_barrier`]: the same guards and the same
+    /// leveling, then a [`super::barrier::PreparedBarrier`] whose sync the
+    /// caller runs wherever it likes before [`Self::commit_barrier`].
+    pub(crate) fn prepare_barrier<D>(
+        &mut self,
+        trigger: BarrierTrigger,
+        now: Instant,
+        drain: &mut D,
+    ) -> Option<Result<super::barrier::PreparedBarrier, BarrierError>>
+    where
+        D: super::barrier::BarrierDrain + ?Sized,
+    {
+        if self.router.repair_batch_in_progress() || self.is_finalized() {
+            return None;
+        }
+        if self.barrier.is_some() {
+            self.ensure_registered();
+        }
+        let crypt = self.router.member_crypt_snapshots();
+        let identity = self.router.plan().identity_binding();
+        let barrier = self.barrier.as_mut()?;
+        barrier.set_member_crypt(crypt);
+        barrier.set_identity_binding(identity);
+        Some(barrier.prepare(trigger, now, drain))
+    }
+
+    /// The second half of [`Self::run_barrier`] for a prepared barrier.
+    ///
+    /// `None` means the barrier was abandoned rather than run: the set was
+    /// demoted, finalized, or entered a repair while the sync ran, so the
+    /// prepared snapshot no longer describes bytes the row may claim. The
+    /// interval it captured goes back to the controller for the next barrier.
+    pub(crate) fn commit_barrier<S, P>(
+        &mut self,
+        prepared: super::barrier::PreparedBarrier,
+        now: Instant,
+        sync: &mut S,
+        persist: &mut P,
+    ) -> Option<Result<BarrierReport, BarrierError>>
+    where
+        S: super::barrier::DestinationSync + ?Sized,
+        P: CoveragePersist + ?Sized,
+    {
+        let stale =
+            self.router.repair_batch_in_progress() || self.is_finalized() || self.is_demoted();
+        let barrier = self.barrier.as_mut()?;
+        if stale {
+            barrier.abandon(prepared);
+            return None;
+        }
+        Some(barrier.commit(prepared, now, sync, persist))
     }
 
     /// Deletes the set's checkpoint row and keeps everything else (repair while
@@ -1124,10 +1217,9 @@ impl DirectSet {
     /// staging ([`super::router::DirectSetRouter::held_runs`]), so a repair
     /// sweep that only claimed the placed bytes would leave a hole exactly
     /// where an encrypted member's edge block waits for a lost article, and
-    /// refuse a volume whose every posted byte is in hand. For the in-place
-    /// repair only: the demotion sweep hands the set to the conventional path,
-    /// which owns those holds as articles to re-place, and must not
-    /// materialize them.
+    /// refuse a volume whose every posted byte is in hand. The demotion sweep
+    /// reads it only for a set demoted for room, with any handed-off article's
+    /// range cut out first: that article belongs to the conventional path.
     pub(crate) fn volume_coverage_with_holds(&self, volume_index: u32) -> ByteRanges {
         let mut coverage = self.volume_coverage(volume_index);
         for (start, end) in self.router.held_ranges(volume_index) {

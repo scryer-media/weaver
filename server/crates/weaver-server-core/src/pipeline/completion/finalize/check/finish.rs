@@ -253,6 +253,7 @@ impl Pipeline {
         // Outputs the NZB never carried have no file id to travel through the
         // refresh set, so their sets are invalidated from the registration.
         let adopted_numbered_parts = registration.numbered_parts;
+        let registered_rar_outputs = registration.registered;
         self.invalidate_rar_plans_for_repaired_sets(job_id, registration.set_names);
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.refresh_topologies", stage_start);
@@ -344,8 +345,14 @@ impl Pipeline {
         // same situation in the other archive's terms: the set was short a
         // part, now is not, and the extraction that was never attempted (or
         // failed on the truncated set) is what this job is waiting for.
+        //
+        // So is a RAR volume the repair rebuilt under a name the NZB never
+        // carried. When every posted volume was unnameable the job had no RAR
+        // set at all until this registration, so nothing is waiting on it and
+        // nothing else would start its extraction.
         if has_crc_failures
             || adopted_numbered_parts > 0
+            || registered_rar_outputs > 0
             || self.job_has_live_rar_waiting_for_missing_volumes(job_id)
         {
             self.retry_archive_extraction_after_verify_or_repair(job_id)
@@ -948,6 +955,186 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
+    /// Every posted file a recovery verdict has spent: the parts of a joined
+    /// split set, and the damaged copies of outputs the verdict rebuilt.
+    pub(in crate::pipeline) fn par2_spent_input_names(&self, job_id: JobId) -> Vec<String> {
+        let mut names = self.par2_joined_split_part_names(job_id);
+        if let Some(unposted) = self.recovery_unposted_outputs.get(&job_id) {
+            names.extend(
+                unposted
+                    .superseded
+                    .iter()
+                    .filter_map(|file_id| self.current_filename_for_file_id(job_id, *file_id)),
+            );
+        }
+        names
+    }
+
+    /// Whether a posted file is the damaged copy of an output a recovery
+    /// verdict has since delivered whole.
+    pub(in crate::pipeline) fn recovery_superseded_source(
+        &self,
+        job_id: JobId,
+        file_id: NzbFileId,
+    ) -> bool {
+        self.recovery_unposted_outputs
+            .get(&job_id)
+            .is_some_and(|unposted| unposted.superseded.contains(&file_id))
+    }
+
+    /// Whether a recovery verdict delivered payload no posted file answers to.
+    ///
+    /// Furniture does not count, for the reason it never counts as a delivery:
+    /// a rebuilt `.nfo` is not something a payload can hide behind.
+    pub(in crate::pipeline) fn par2_verdict_delivered_unposted_payload(
+        &self,
+        job_id: JobId,
+    ) -> bool {
+        let ignore_extensions = self.par2_ignore_extensions();
+        self.recovery_unposted_outputs
+            .get(&job_id)
+            .is_some_and(|unposted| {
+                unposted
+                    .outputs
+                    .iter()
+                    .any(|name| !par2_damage_ignorable(name, &ignore_extensions))
+            })
+    }
+
+    /// Record the outputs a verdict proved complete that no posted file bound
+    /// to, and find the posted files they were rebuilt from.
+    ///
+    /// A posted file that lost the bytes its identity is read from cannot be
+    /// named, so the recovery set rebuilds the file it describes under the
+    /// described name and the posted copy is left beside it. Nothing about the
+    /// posted copy's name says which output it belongs to, and nothing should:
+    /// the claim is made only on content. A posted file is superseded when a
+    /// slice of it, at the offset the set describes, carries both checksums
+    /// the set holds for that slice of the rebuilt output.
+    ///
+    /// The probe is deliberately small. It runs only when a verdict left an
+    /// output no posted file answers to, only over incomplete files bound to no
+    /// set, and it hashes at most [`SUPERSEDED_PROBE_SLICES`] slices of each
+    /// before giving up. A slice of zeros is skipped unhashed — a hole where an
+    /// article never arrived matches nothing worth matching.
+    pub(in crate::pipeline) async fn note_recovery_unposted_outputs(
+        &mut self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+        unbound: &[String],
+    ) {
+        if unbound.is_empty() {
+            return;
+        }
+        let Some(par2_set) = self.par2_set(job_id).cloned() else {
+            return;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let working_dir = state.working_dir.clone();
+
+        let mut outputs: Vec<(String, PathBuf, u64, Vec<par2_rs::SliceChecksum>)> = Vec::new();
+        for file in &verification.files {
+            if !matches!(file.status, par2_rs::verify::FileStatus::Complete)
+                || !unbound.contains(&file.filename)
+            {
+                continue;
+            }
+            let path = Path::new(&file.filename);
+            if file.filename.is_empty()
+                || !path.is_relative()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let Some(description) = par2_set.file_description(&file.file_id) else {
+                continue;
+            };
+            let checksums = par2_set
+                .file_checksums(&file.file_id)
+                .map(<[par2_rs::SliceChecksum]>::to_vec)
+                .unwrap_or_default();
+            outputs.push((
+                file.filename.clone(),
+                working_dir.join(path),
+                description.length,
+                checksums,
+            ));
+        }
+        if outputs.is_empty() {
+            return;
+        }
+
+        let already: HashSet<NzbFileId> = self
+            .recovery_unposted_outputs
+            .get(&job_id)
+            .map(|unposted| unposted.superseded.clone())
+            .unwrap_or_default();
+        let candidates: Vec<(NzbFileId, PathBuf)> = state
+            .assembly
+            .files()
+            .filter(|file| {
+                !file.is_complete()
+                    && !already.contains(&file.file_id())
+                    && !matches!(
+                        file.role(),
+                        weaver_model::files::FileRole::Par2 { .. }
+                            | weaver_model::files::FileRole::Par3 { .. }
+                    )
+                    && self.resolve_par2_file_binding(file.file_id()).is_none()
+            })
+            .map(|file| {
+                (
+                    file.file_id(),
+                    working_dir.join(self.current_filename_for_file(job_id, file)),
+                )
+            })
+            .collect();
+
+        let slice_size = par2_set.slice_size;
+        let probe = tokio::task::spawn_blocking(move || {
+            let present: Vec<(String, u64, Vec<par2_rs::SliceChecksum>)> = outputs
+                .into_iter()
+                .filter(|(_, path, length, _)| {
+                    std::fs::metadata(path)
+                        .is_ok_and(|meta| meta.is_file() && meta.len() == *length)
+                })
+                .map(|(name, _, length, checksums)| (name, length, checksums))
+                .collect();
+            let superseded: Vec<NzbFileId> = if present.is_empty() {
+                Vec::new()
+            } else {
+                candidates
+                    .into_iter()
+                    .filter(|(_, path)| superseded_source_probe(path, slice_size, &present))
+                    .map(|(file_id, _)| file_id)
+                    .collect()
+            };
+            let names: Vec<String> = present.into_iter().map(|(name, _, _)| name).collect();
+            (names, superseded)
+        })
+        .await;
+        let Ok((names, superseded)) = probe else {
+            return;
+        };
+        if names.is_empty() {
+            return;
+        }
+        if !superseded.is_empty() {
+            info!(
+                job_id = job_id.0,
+                superseded = superseded.len(),
+                "posted files proven to be the damaged copies of outputs the recovery set rebuilt"
+            );
+        }
+        let unposted = self.recovery_unposted_outputs.entry(job_id).or_default();
+        unposted.outputs.extend(names);
+        unposted.superseded.extend(superseded);
+    }
+
     /// Delete the parts a verified join consumed, before finalization ships
     /// them alongside the file they joined into.
     ///
@@ -955,7 +1142,7 @@ impl Pipeline {
     /// sources of an archive that was extracted, on the same unconditional
     /// terms: the join happened, so the parts are spent inputs.
     pub(in crate::pipeline) async fn cleanup_par2_joined_split_parts(&mut self, job_id: JobId) {
-        let parts = self.par2_joined_split_part_names(job_id);
+        let parts = self.par2_spent_input_names(job_id);
         if parts.is_empty() {
             return;
         }
@@ -978,7 +1165,7 @@ impl Pipeline {
             job_id = job_id.0,
             removed,
             total = parts.len(),
-            "removed the split parts a verified join consumed"
+            "removed the posted files a recovery verdict spent"
         );
     }
 
@@ -1142,15 +1329,45 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(false);
         };
-        let Some(topology_name) = state
+        let known = state
             .assembly
             .archive_topologies()
             .iter()
             .find(|(name, topology)| {
                 topology.archive_type == archive_type && sanitize_download_filename(name) == set_key
             })
-            .map(|(name, _)| name.clone())
-        else {
+            .map(|(name, _)| name.clone());
+        let topology_name = match known {
+            Some(name) => name,
+            // A 7z set none of whose posted volumes could be named has no
+            // roster at all, and its rebuilt volumes would be delivered as
+            // they stand. The first one adopted opens the roster the rest
+            // join.
+            None if archive_type == crate::jobs::assembly::ArchiveType::SevenZip => {
+                let Some(state) = self.jobs.get_mut(&job_id) else {
+                    return Ok(false);
+                };
+                state.assembly.set_archive_topology(
+                    set_name.clone(),
+                    crate::jobs::assembly::ArchiveTopology {
+                        archive_type,
+                        volume_map: std::collections::HashMap::new(),
+                        complete_volumes: std::collections::HashSet::new(),
+                        expected_volume_count: None,
+                        members: vec![crate::jobs::assembly::ArchiveMember {
+                            name: set_name.clone(),
+                            first_volume: 0,
+                            last_volume: 0,
+                            unpacked_size: 0,
+                        }],
+                        unresolved_spans: vec![],
+                    },
+                );
+                set_name.clone()
+            }
+            None => return Ok(false),
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
             return Ok(false);
         };
         let already_listed = state
@@ -1184,6 +1401,20 @@ impl Pipeline {
         };
         topology.volume_map.insert(filename.to_string(), number);
         topology.complete_volumes.insert(number);
+        // On record before anything arms against the set: a chase reads a
+        // part's length from its download, and this part never had one.
+        self.recovery_unposted_outputs
+            .entry(job_id)
+            .or_default()
+            .outputs
+            .insert(filename.to_string());
+        let Some(topology) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for_mut(&topology_name))
+        else {
+            return Ok(false);
+        };
         let expected = topology
             .expected_volume_count
             .map_or(number.saturating_add(1), |expected| {
@@ -1422,4 +1653,80 @@ impl Pipeline {
         }
         candidates.push(name.to_string());
     }
+}
+
+/// The most slices of one candidate the superseded-source probe will hash.
+///
+/// The first slice past a hole usually straddles the hole's edge and matches
+/// nothing; the one after it lies wholly inside what arrived. Three leaves room
+/// for a slice larger than an article without turning a probe into a read of
+/// the file.
+const SUPERSEDED_PROBE_SLICES: usize = 3;
+
+/// Whether the file at `path` holds a slice of one of `outputs` at the offset
+/// the recovery set describes it.
+///
+/// Slices are compared index for index — a posted copy of a described file has
+/// its surviving bytes exactly where the description puts them — and a match
+/// needs both the CRC32 and the MD5 the set carries for that slice.
+fn superseded_source_probe(
+    path: &Path,
+    slice_size: u64,
+    outputs: &[(String, u64, Vec<par2_rs::SliceChecksum>)],
+) -> bool {
+    use std::io::Read;
+
+    let Ok(slice_len) = usize::try_from(slice_size) else {
+        return false;
+    };
+    if slice_len == 0 {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let longest = outputs.iter().map(|(_, length, _)| *length).max().unwrap_or(0);
+    if !file.metadata().is_ok_and(|meta| meta.len() <= longest) {
+        return false;
+    }
+    let mut buffer = vec![0u8; slice_len];
+    let mut hashed = 0usize;
+    let mut index = 0usize;
+    while hashed < SUPERSEDED_PROBE_SLICES {
+        let mut filled = 0usize;
+        while filled < slice_len {
+            match file.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        if filled == 0 {
+            return false;
+        }
+        let end = (index as u64) * slice_size + filled as u64;
+        if buffer[..filled].iter().any(|byte| *byte != 0) {
+            let mut state = par2_rs::checksum::SliceChecksumState::new();
+            state.update(&buffer[..filled]);
+            let (crc32, md5) = state.finalize(Some(slice_size));
+            hashed += 1;
+            // A short read is a described slice only when it ends where the
+            // description does; anywhere else it is a truncated copy whose
+            // padding the set never checksummed.
+            if outputs.iter().any(|(_, length, checksums)| {
+                (filled == slice_len || end == *length)
+                    && checksums
+                        .get(index)
+                        .is_some_and(|expected| expected.crc32 == crc32 && expected.md5 == md5)
+            }) {
+                return true;
+            }
+        }
+        if filled < slice_len {
+            return false;
+        }
+        index += 1;
+    }
+    false
 }

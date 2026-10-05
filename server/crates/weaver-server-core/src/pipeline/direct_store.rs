@@ -30,7 +30,8 @@
 //! [`router`] splits every decoded source span across its destinations,
 //! [`plan`] admits sets and names those destinations, and [`set`] joins a router
 //! to its [`barrier::CoverageBarrier`] so a routed write becomes durable
-//! coverage. The [`DirectStoreGate`] still defaults **off**.
+//! coverage. The [`DirectStoreGate`] defaults **on**; see
+//! [`DirectStoreSettings::resolve_parts`].
 //!
 //! Three things sit on top of that:
 //!
@@ -95,8 +96,9 @@
 //! - **A real config surface.** [`DirectStoreSettings`] resolves the gate and
 //!   the per-set scratch ceiling from `Config`, with the `WEAVER_*` variables
 //!   overriding it in both directions for incident response: config *and* env
-//!   rather than either alone. The gate still defaults **off**; flipping that
-//!   default is a release decision.
+//!   rather than either alone. The gate defaults **on** — an absent variable and
+//!   an absent config key both resolve to enabled, so an operator who wants the
+//!   conventional path must say so explicitly with `WEAVER_RAR_DIRECT_STORE=off`.
 //! - **Quick Open, dropped.** QO priming was permitted behind mandatory
 //!   physical-header confirmation, on the understanding that it would be deleted
 //!   if the confirmation erased the benefit. It does — see the decision recorded
@@ -519,6 +521,28 @@ impl ByteRanges {
         }
         self.ranges.splice(first..first + removed, [merged]);
         len - overlapped
+    }
+
+    /// Removes `[start, start + len)`, splitting a range that straddles it.
+    pub(crate) fn remove(&mut self, start: u64, len: u64) {
+        let end = start.saturating_add(len);
+        if len == 0 {
+            return;
+        }
+        let mut kept = Vec::with_capacity(self.ranges.len() + 1);
+        for &(range_start, range_end) in &self.ranges {
+            if range_end <= start || range_start >= end {
+                kept.push((range_start, range_end));
+                continue;
+            }
+            if range_start < start {
+                kept.push((range_start, start));
+            }
+            if range_end > end {
+                kept.push((end, range_end));
+            }
+        }
+        self.ranges = kept;
     }
 
     /// Extends `floor` through every range that continues it — the volume's

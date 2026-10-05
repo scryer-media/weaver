@@ -14,6 +14,7 @@ use crate::pipeline::direct_unpack::start_header::MAGIC;
 use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
 
 mod repair_guards;
+mod staging;
 
 /// Turn the feature on for one pipeline, the way config would.
 fn enable_direct_unpack(pipeline: &mut Pipeline) {
@@ -781,6 +782,8 @@ async fn a_tainted_outcome_is_discarded_and_the_set_is_extracted_conventionally(
 
     assert_eq!(pipeline.direct_unpack.counters().consumed, 0);
     assert_eq!(pipeline.direct_unpack.counters().discarded, 1);
+    // The delete runs on a task of its own; wait for it, not for time.
+    pipeline.settle_direct_unpack_staging_cleanups().await;
     assert!(
         !chase_staging.exists(),
         "a discarded chase's staging is removed"

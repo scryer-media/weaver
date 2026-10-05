@@ -306,7 +306,7 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run Rust tests
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        run: cargo nextest run --workspace --locked --no-fail-fast -E 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_))'
       - name: Build the archive e2e binary
         run: cargo build --locked -p weaver
       - name: Prove direct unpack and PAR2 recovery for every sequential format
@@ -471,7 +471,11 @@ jobs:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
       - name: Run Rust tests
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        run: >-
+          cargo nextest run --workspace --locked --no-fail-fast
+          -E 'not (test(archive_schedules::) | test(sevenz_store::schedules::) |
+          test(par2::tests::schedules::) | test(direct_store::tests::par2_schedules::) |
+          test(par2_completion::schedules::))'
 
   rust-test-arm:
     name: rust-test-arm-yenc

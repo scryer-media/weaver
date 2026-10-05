@@ -545,6 +545,7 @@ async fn member_checksum_demotion_hands_the_live_tail_to_a_reconstructed_prefix(
         !payload_root(&temp_dir, job_id).join(member_name).exists(),
         "a member failing its whole-member gate must not be committed as if it passed"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(
         !direct_partial(&temp_dir, job_id, member_name).exists(),
         "demotion must delete the set's partial direct output"
@@ -1211,6 +1212,9 @@ async fn an_unmatched_obfuscated_extra_stays_conventional_beside_an_identity_set
         state.recovery_queue = crate::DownloadQueue::new();
     }
     pipeline.check_job_completion(job_id).await;
+    // The verification reads the set back on a detached ticket; settle that
+    // round so the verdict, and the finalization it clears, have landed.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     drain_rar_refreshes(&mut pipeline).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
@@ -1812,6 +1816,9 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
+    // The verification reads the set back on a detached ticket; settle that
+    // round so the verdict, and the finalization it clears, have landed.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
 
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
@@ -2119,6 +2126,7 @@ async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
         Some(volumes[0].1.as_slice()),
         "and the volume the set had covered end to end is materialized then, byte for byte"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(
         !direct_partial(&temp_dir, job_id, member_name).exists(),
         "with the routed output deleted behind it"
@@ -2238,6 +2246,7 @@ async fn a_volume_the_sweep_has_finished_goes_back_into_dispatch_before_its_sibl
         pipeline.direct_demotion_in_flight.is_empty(),
         "the finish retires the ticket"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(
         !direct_partial(&temp_dir, job_id, member_name).exists(),
         "deletes the routed output"
@@ -2247,6 +2256,73 @@ async fn a_volume_the_sweep_has_finished_goes_back_into_dispatch_before_its_sibl
         "and retires the coverage row"
     );
     assert_eq!(pipeline.demotion_sweep_held_file_indices(job_id), None);
+}
+
+#[tokio::test]
+async fn a_queue_held_whole_by_its_demotion_sweep_is_answered_without_a_scan() {
+    use crate::operations::metrics::SchedulerBlockClause;
+    use crate::pipeline::download::scheduler::Handout;
+
+    let member_name = "Silver.Horizon.S01E28.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41063);
+    let (mut pipeline, _, _) = demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+        &temp_dir,
+        job_id,
+        &volumes,
+        DemotionReason::HoldsBudgetExceeded,
+        true,
+        |_, _| {},
+    )
+    .await;
+    assert_eq!(
+        pipeline.demotion_sweep_held_file_indices(job_id),
+        Some(vec![0, 1, 2]),
+        "every volume of the set is held while the sweep runs"
+    );
+    let queued = pipeline.jobs[&job_id].download_queue.len();
+    assert!(queued > 0, "the held volumes still have queued articles");
+    let metrics = std::sync::Arc::clone(&pipeline.metrics);
+    let skipped = || {
+        metrics
+            .download_scheduler_scan_items_skipped_total
+            .load(Ordering::Relaxed)
+    };
+    let no_match = || {
+        metrics
+            .download_scheduler_scan_no_match_total
+            .load(Ordering::Relaxed)
+    };
+    let sweep_blocks = || {
+        metrics.download_scheduler_hot_blocked_total[SchedulerBlockClause::SweepHeld.index()]
+            .load(Ordering::Relaxed)
+    };
+    let (skipped_before, no_match_before, sweep_blocks_before) =
+        (skipped(), no_match(), sweep_blocks());
+
+    let pressure = pipeline.refresh_download_pressure();
+    assert!(matches!(
+        pipeline.next_works(0, 4, None, pressure),
+        Handout::Idle
+    ));
+
+    assert_eq!(
+        skipped(),
+        skipped_before,
+        "no queued article was looked at: the per-file answer refused the whole queue"
+    );
+    assert_eq!(
+        no_match(),
+        no_match_before,
+        "and no scan ran to come up empty"
+    );
+    assert_eq!(
+        sweep_blocks(),
+        sweep_blocks_before + 1,
+        "the hot job's block is put down to the sweep"
+    );
+    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), queued);
 }
 
 #[tokio::test]
@@ -2643,6 +2719,7 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
 
     // The direct outputs are gone: a sparse half-written member would
     // masquerade as finished work, and the envelopes are scratch.
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(!direct_partial(&temp_dir, JobId(41015), member_name).exists());
     for volume_index in 0..volumes.len() as u32 {
         assert!(
@@ -3234,7 +3311,17 @@ async fn the_disk_reserve_refuses_a_spill_before_it_is_written() {
             scratch_bytes: u64::MAX,
             disk_reserve_bytes: 1000,
         },
-        Box::new(|_| Some(1200)),
+        {
+            let taken = std::time::Instant::now();
+            crate::operations::CapacityReader::from_fn(move || {
+                crate::operations::Capacity::Known(crate::operations::CapacityReading {
+                    available_bytes: 1200,
+                    total_bytes: u64::MAX,
+                    sampled_at: taken,
+                    stale: false,
+                })
+            })
+        },
     );
     let job_id = JobId(41024);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
@@ -3968,6 +4055,7 @@ async fn direct_store_demotes_a_volume_whose_yenc_whole_file_crc_disagrees() {
         "a volume whose composed yEnc CRC32 disagrees with its trailer must demote \
          at volume completion, long before any member gate could run, got {shape}"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
     assert!(!direct_partial(&temp_dir, JobId(41022), member_name).exists());
 }
 

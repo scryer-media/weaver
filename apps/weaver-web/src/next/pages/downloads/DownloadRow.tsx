@@ -8,8 +8,9 @@ import { CheckBox } from "@/next/components/controls";
 import { Icon, type IconName } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { ListRow, ValueCell } from "@/next/components/rows";
-import { EM_DASH, formatSize } from "@/next/data/format";
+import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { statusColor, WV } from "@/next/data/palette";
+import { useDownloadRate } from "@/next/data/use-download-rate";
 
 /**
  * One queue row.
@@ -51,6 +52,7 @@ export const DownloadRow = memo(function DownloadRow({
 }) {
   const t = useTranslate();
   const progress = useJobProgress(job);
+  const rate = useDownloadRate(job);
   const name = formatJobReleaseName(job);
   const isPaused = statusToken(job.status) === "paused";
   // The phase the label names, or failing that the last one with a bar; a
@@ -94,14 +96,18 @@ export const DownloadRow = memo(function DownloadRow({
               <span className="truncate text-[12.5px] text-wv-secondary">
                 {statusLabel(progress.status)}
               </span>
-              {hold === null ? null : (
+              {hold !== null ? (
                 <span
                   className="truncate font-wv-mono text-[10px] tracking-[0.08em] uppercase"
                   style={{ color: WV.warn }}
                 >
                   {hold}
                 </span>
-              )}
+              ) : rate > 0 ? (
+                <span className="truncate font-wv-mono text-[10px] tabular-nums text-wv-muted">
+                  {formatRate(rate)}
+                </span>
+              ) : null}
             </span>
           </div>
           <ValueCell>{formatSize(job.totalBytes)}</ValueCell>

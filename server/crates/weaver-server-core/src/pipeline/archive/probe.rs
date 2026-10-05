@@ -381,6 +381,7 @@ impl Pipeline {
                         | FileRole::SevenZipArchive
                         | FileRole::SevenZipSplit { .. }
                 ) && !self.direct_set_already_installed(job_id, file)
+                    && !self.recovery_superseded_source(job_id, file.file_id())
             });
             if has_archive {
                 return ExtractionReadiness::Blocked {
@@ -398,7 +399,10 @@ impl Pipeline {
                     FileRole::RarVolume { .. }
                     | FileRole::SevenZipArchive
                     | FileRole::SevenZipSplit { .. } => {
+                        // A posted copy a repaired output replaced belongs to
+                        // no set: the output's roster is the one that extracts.
                         self.direct_set_already_installed(job_id, file)
+                            || self.recovery_superseded_source(job_id, file.file_id())
                             || state
                                 .assembly
                                 .archive_topologies()

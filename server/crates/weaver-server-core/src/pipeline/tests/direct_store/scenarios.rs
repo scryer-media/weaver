@@ -4,15 +4,19 @@
 
 use super::*;
 
+mod archive_schedules;
+
 mod chasing;
 mod classification_frontier;
 #[cfg(unix)]
 mod cross_device;
 mod cross_device_probe;
 mod delayed_header_admission;
+mod demotion_sweep_chase;
 mod header_encrypted_parse_cost;
 mod header_encrypted_restart;
 mod par3_spill;
+mod placement_flights;
 mod quick_open;
 mod rar4_rar3_file_encryption;
 mod repaired_encrypted_spans;
@@ -344,6 +348,7 @@ async fn encrypted_routing_outcome(
     let volume_file_seen = volumes
         .iter()
         .any(|(filename, _)| working_dir.join(filename).exists());
+    settle_direct_output_removals(temp_dir.path()).await;
     let partial_seen = any_direct_partial(&payload_root(&temp_dir, job_id));
     EncryptedRoutingOutcome {
         shape,
@@ -860,6 +865,7 @@ async fn hp_routing_outcome_named(
     let volume_file_seen = volumes
         .iter()
         .any(|(filename, _)| working_dir.join(filename).exists());
+    settle_direct_output_removals(temp_dir.path()).await;
     let partial_seen = any_direct_partial(&payload_root(&temp_dir, job_id));
     EncryptedRoutingOutcome {
         shape,
@@ -973,6 +979,7 @@ async fn hp_fallback_outcome(
         corrected == corrected_password.is_some(),
         "a caller that supplied a corrected password expects a refusal to apply it to"
     );
+    settle_direct_output_removals(temp_dir.path()).await;
 
     let routing = EncryptedRoutingOutcome {
         shape: format!("{:?}", pipeline.direct_store.sets_for(job_id)),
@@ -1189,6 +1196,10 @@ async fn grid_fed_direct_job(
             .await;
         }
     }
+    // A set whose volumes all completed reaches its verdict on a detached read
+    // ticket; settle that one round so the verdict has landed, as the doc on
+    // `withhold_last_article` promises.
+    settle_direct_verification_read(&mut pipeline, job_id).await;
     (pipeline, working_dir, complete_dir)
 }
 

@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
@@ -473,63 +473,345 @@ impl CapacitySampler {
     }
 }
 
-/// TTL-cached capacity sampler for the configured directory roles.
+/// How often each storage root's sampler re-reads its filesystem.
 ///
-/// `statvfs`/`GetDiskFreeSpaceExW` are cheap but not free, and a metrics scrape
-/// can arrive far more often than free space meaningfully changes. The cache
-/// keeps a scrape storm from turning into a syscall storm. Nothing here runs on
-/// a pipeline path — it is called only from the exporter.
-#[derive(Debug)]
-pub struct DiskSpaceCollector {
-    roles: Vec<(&'static str, PathBuf)>,
-    cache: Mutex<Option<(Instant, Vec<DiskSpaceSnapshot>)>>,
+/// A capacity probe is a filesystem round trip that a slow or overloaded
+/// mount can hold for as long as its request queue is deep, so it never runs
+/// where a caller is waiting on it. Every consumer — admission checks,
+/// metrics, the NZBGet status — reads the last completed reading instead,
+/// which is at most this old plus however long the probe itself took.
+pub const STORAGE_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The configured storage roots whose free space the runtime tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StorageRoot {
+    Data,
+    Intermediate,
+    Complete,
 }
 
-impl DiskSpaceCollector {
-    /// `roles` pairs a stable role label (`data`, `intermediate`, `complete`)
-    /// with the directory configured for it.
-    pub fn new(roles: Vec<(&'static str, PathBuf)>) -> Self {
-        Self {
-            roles,
-            cache: Mutex::new(None),
+impl StorageRoot {
+    pub const ALL: [Self; 3] = [Self::Data, Self::Intermediate, Self::Complete];
+
+    /// Stable label for metrics and logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Intermediate => "intermediate",
+            Self::Complete => "complete",
         }
     }
 
-    /// Sample every role, re-using the previous result while it is younger than
-    /// `ttl`. Roles whose path cannot be stat'd (not created yet, unmounted)
-    /// are omitted rather than reported as zero-capacity.
-    pub fn sample(&self, ttl: Duration) -> Vec<DiskSpaceSnapshot> {
-        let now = Instant::now();
-        {
-            let cache = self
-                .cache
+    fn index(self) -> usize {
+        match self {
+            Self::Data => 0,
+            Self::Intermediate => 1,
+            Self::Complete => 2,
+        }
+    }
+}
+
+/// A non-blocking view of one filesystem's latest capacity reading.
+///
+/// Reading it never touches the filesystem unless it was built with
+/// [`Self::probing`]. Consumers that spend against the reading between
+/// refreshes keep their own [`CapacityDebits`].
+#[derive(Clone)]
+pub struct CapacityReader(Arc<dyn Fn() -> Capacity + Send + Sync>);
+
+impl fmt::Debug for CapacityReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CapacityReader")
+            .field(&self.current())
+            .finish()
+    }
+}
+
+impl CapacityReader {
+    /// A reader backed by `read`. Tests inject readings through it.
+    pub fn from_fn(read: impl Fn() -> Capacity + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    /// A reader with no reading, which every consumer treats as a failed
+    /// probe: nothing to enforce against.
+    pub fn unknown() -> Self {
+        Self::from_fn(|| Capacity::Unknown)
+    }
+
+    /// A reader that probes `path` itself, at most once per `ttl`, on the
+    /// calling thread. Only for callers already off the pipeline with no
+    /// runtime-owned sampler to read (a standalone extraction).
+    pub fn probing(path: PathBuf, ttl: Duration) -> Self {
+        let sampler = Mutex::new(CapacitySampler::new(path, ttl));
+        Self::from_fn(move || {
+            sampler
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some((sampled_at, snapshots)) = cache.as_ref()
-                && now.duration_since(*sampled_at) < ttl
-            {
-                return snapshots.clone();
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .sample()
+        })
+    }
+
+    pub fn current(&self) -> Capacity {
+        (self.0)()
+    }
+}
+
+/// Bytes one consumer has admitted against a shared reading since that
+/// reading was taken, so a burst of admissions between refreshes cannot each
+/// see the same headroom.
+///
+/// The debits belong to the reading they were made against: a newer reading
+/// already reflects the bytes written since, so it starts the count again. A
+/// stale reading keeps its timestamp, so debits keep accumulating across a
+/// probe outage.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CapacityDebits {
+    basis: Option<Instant>,
+    debited: u64,
+}
+
+impl CapacityDebits {
+    /// `capacity` less everything debited against the same reading.
+    pub fn apply(&mut self, capacity: Capacity) -> Capacity {
+        let Capacity::Known(reading) = capacity else {
+            return Capacity::Unknown;
+        };
+        if self.basis != Some(reading.sampled_at) {
+            self.basis = Some(reading.sampled_at);
+            self.debited = 0;
+        }
+        Capacity::Known(CapacityReading {
+            available_bytes: reading.available_bytes.saturating_sub(self.debited),
+            ..reading
+        })
+    }
+
+    pub fn debit(&mut self, bytes: u64) {
+        self.debited = self.debited.saturating_add(bytes);
+    }
+
+    /// Undo a `debit` whose admission was rolled back.
+    pub fn credit(&mut self, bytes: u64) {
+        self.debited = self.debited.saturating_sub(bytes);
+    }
+}
+
+type SharedProbeFn = Arc<ProbeFn>;
+
+#[derive(Debug)]
+struct RootState {
+    path: PathBuf,
+    capacity: Capacity,
+    refresh_requested: bool,
+    stopped: bool,
+    completed_probes: u64,
+}
+
+#[derive(Debug)]
+struct RootSlot {
+    root: StorageRoot,
+    state: Mutex<RootState>,
+    wake: Condvar,
+}
+
+impl RootSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RootState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// One background capacity sampler per configured storage root.
+///
+/// Each root has its own thread that probes, publishes, and then waits a full
+/// interval after the probe finished, so probes of one root never overlap and
+/// a stalled mount delays only its own next reading. A failed probe keeps the
+/// last good reading, flagged stale ([`CapacitySampler`]). Until a root's
+/// first probe completes its readers see [`Capacity::Unknown`].
+///
+/// Dropping it stops the threads; one stuck in a probe exits when the probe
+/// returns.
+pub struct StorageCapacity {
+    slots: [Arc<RootSlot>; 3],
+}
+
+impl fmt::Debug for StorageCapacity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for slot in &self.slots {
+            let state = slot.lock();
+            list.entry(&(slot.root.label(), &state.path, state.capacity));
+        }
+        list.finish()
+    }
+}
+
+impl StorageCapacity {
+    /// Start sampling the real filesystems behind the three roots.
+    pub fn start(data: PathBuf, intermediate: PathBuf, complete: PathBuf) -> Self {
+        Self::with_probe(
+            [data, intermediate, complete],
+            STORAGE_CAPACITY_REFRESH_INTERVAL,
+            Arc::new(probe_disk_space),
+        )
+    }
+
+    /// Like [`Self::start`] with a caller-supplied probe and interval. `roots`
+    /// is in [`StorageRoot::ALL`] order.
+    pub fn with_probe(roots: [PathBuf; 3], interval: Duration, probe: SharedProbeFn) -> Self {
+        let slots = StorageRoot::ALL.map(|root| {
+            Arc::new(RootSlot {
+                root,
+                state: Mutex::new(RootState {
+                    path: roots[root.index()].clone(),
+                    capacity: Capacity::Unknown,
+                    refresh_requested: false,
+                    stopped: false,
+                    completed_probes: 0,
+                }),
+                wake: Condvar::new(),
+            })
+        });
+        for slot in &slots {
+            let thread_slot = Arc::clone(slot);
+            let thread_probe = Arc::clone(&probe);
+            let spawned = std::thread::Builder::new()
+                .name(format!("weaver-capacity-{}", slot.root.label()))
+                .spawn(move || run_root_sampler(&thread_slot, interval, thread_probe));
+            if let Err(error) = spawned {
+                warn!(
+                    root = slot.root.label(),
+                    error = %error,
+                    "could not start the storage capacity sampler; readings stay unknown"
+                );
             }
         }
+        Self { slots }
+    }
 
-        let snapshots = self
-            .roles
+    fn slot(&self, root: StorageRoot) -> &Arc<RootSlot> {
+        &self.slots[root.index()]
+    }
+
+    /// The latest reading for `root`, without touching the filesystem.
+    pub fn current(&self, root: StorageRoot) -> Capacity {
+        self.slot(root).lock().capacity
+    }
+
+    /// A cloneable reader of `root`'s latest reading.
+    pub fn reader(&self, root: StorageRoot) -> CapacityReader {
+        let slot = Arc::clone(self.slot(root));
+        CapacityReader::from_fn(move || slot.lock().capacity)
+    }
+
+    /// Point `root` at a new directory. The old directory's reading is
+    /// dropped and the new one is probed as soon as the thread is free.
+    pub fn retarget(&self, root: StorageRoot, path: PathBuf) {
+        let slot = self.slot(root);
+        let mut state = slot.lock();
+        if state.path == path {
+            return;
+        }
+        state.path = path;
+        state.capacity = Capacity::Unknown;
+        state.refresh_requested = true;
+        slot.wake.notify_all();
+    }
+
+    /// Ask `root`'s thread to probe again without waiting out its interval.
+    /// A request made while a probe is running is served after it finishes.
+    pub fn request_refresh(&self, root: StorageRoot) {
+        let slot = self.slot(root);
+        slot.lock().refresh_requested = true;
+        slot.wake.notify_all();
+    }
+
+    /// One row per root with a reading, fresh or held from the last good
+    /// probe. A root that has never produced a reading is omitted rather than
+    /// reported as zero capacity.
+    pub fn snapshots(&self) -> Vec<DiskSpaceSnapshot> {
+        self.slots
             .iter()
-            .filter_map(|(role, path)| {
-                disk_space(path).map(|space| DiskSpaceSnapshot {
-                    role,
-                    path: path.display().to_string(),
-                    total_bytes: space.total_bytes,
-                    available_bytes: space.available_bytes,
+            .filter_map(|slot| {
+                let state = slot.lock();
+                state.capacity.reading().map(|reading| DiskSpaceSnapshot {
+                    role: slot.root.label(),
+                    path: state.path.display().to_string(),
+                    total_bytes: reading.total_bytes,
+                    available_bytes: reading.available_bytes,
                 })
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
 
-        *self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((now, snapshots.clone()));
-        snapshots
+    /// Block until `root` has completed at least `probes` probes.
+    #[cfg(test)]
+    pub(crate) fn wait_for_probes(&self, root: StorageRoot, probes: u64) {
+        let slot = self.slot(root);
+        let state = slot.lock();
+        drop(
+            slot.wake
+                .wait_while(state, |state| state.completed_probes < probes)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+}
+
+impl Drop for StorageCapacity {
+    fn drop(&mut self) {
+        for slot in &self.slots {
+            slot.lock().stopped = true;
+            slot.wake.notify_all();
+        }
+    }
+}
+
+fn run_root_sampler(slot: &RootSlot, interval: Duration, probe: SharedProbeFn) {
+    let mut sampler: Option<CapacitySampler> = None;
+    loop {
+        let path = {
+            let mut state = slot.lock();
+            if state.stopped {
+                return;
+            }
+            state.refresh_requested = false;
+            state.path.clone()
+        };
+        if sampler
+            .as_ref()
+            .is_none_or(|sampler| sampler.path() != path)
+        {
+            let probe = Arc::clone(&probe);
+            sampler = Some(CapacitySampler::with_probe(
+                path.clone(),
+                Duration::ZERO,
+                Box::new(move |path| probe(path)),
+            ));
+        }
+        let capacity = sampler
+            .as_mut()
+            .expect("a sampler for the current path")
+            .refresh();
+        let mut state = slot.lock();
+        // A retarget while the probe ran makes this reading the old
+        // directory's; the thread probes the new one straight away.
+        if state.path == path {
+            state.capacity = capacity;
+        }
+        state.completed_probes += 1;
+        slot.wake.notify_all();
+        let state = slot
+            .wake
+            .wait_timeout_while(state, interval, |state| {
+                !state.stopped && !state.refresh_requested
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+        if state.stopped {
+            return;
+        }
     }
 }
 
@@ -808,30 +1090,171 @@ mod tests {
         assert!(!reading.stale);
     }
 
-    #[test]
-    fn collector_reports_a_row_per_stattable_role() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let collector = DiskSpaceCollector::new(vec![
-            ("data", dir.path().to_path_buf()),
-            ("intermediate", dir.path().join("does-not-exist")),
-        ]);
-        let snapshots = collector.sample(Duration::from_secs(30));
-        assert_eq!(snapshots.len(), 1, "unstattable roles are omitted");
-        assert_eq!(snapshots[0].role, "data");
-        assert!(snapshots[0].total_bytes > 0);
+    /// A year: long enough that no test ever sees an interval refresh, so
+    /// every probe a test counts is one it asked for.
+    const NEVER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+    fn counting_probe(calls: Arc<Mutex<Vec<PathBuf>>>) -> SharedProbeFn {
+        Arc::new(move |path: &Path| {
+            calls.lock().unwrap().push(path.to_path_buf());
+            if path.ends_with("unmounted") {
+                return Err(DiskProbeError::Io(io::Error::from(io::ErrorKind::NotFound)));
+            }
+            Ok(DiskSpace {
+                total_bytes: 1000,
+                available_bytes: path.as_os_str().len() as u64,
+            })
+        })
+    }
+
+    fn roots() -> [PathBuf; 3] {
+        [
+            PathBuf::from("/data"),
+            PathBuf::from("/intermediate"),
+            PathBuf::from("/unmounted"),
+        ]
     }
 
     #[test]
-    fn collector_serves_the_cache_within_the_ttl() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let collector = DiskSpaceCollector::new(vec![("data", dir.path().to_path_buf())]);
-        let first = collector.sample(Duration::from_secs(3600));
-        let second = collector.sample(Duration::from_secs(3600));
-        assert_eq!(first, second);
+    fn storage_readers_and_snapshots_serve_the_cached_reading_without_probing() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let storage = StorageCapacity::with_probe(roots(), NEVER, counting_probe(calls.clone()));
+        for root in StorageRoot::ALL {
+            storage.wait_for_probes(root, 1);
+        }
+        assert_eq!(calls.lock().unwrap().len(), 3, "one probe per root");
 
-        // A zero TTL always re-samples; the shape must stay stable.
-        let third = collector.sample(Duration::ZERO);
-        assert_eq!(third.len(), 1);
-        assert_eq!(third[0].role, "data");
+        let reader = storage.reader(StorageRoot::Intermediate);
+        for _ in 0..5 {
+            let snapshots = storage.snapshots();
+            assert_eq!(
+                snapshots
+                    .iter()
+                    .map(|snapshot| (snapshot.role, snapshot.available_bytes))
+                    .collect::<Vec<_>>(),
+                vec![("data", 5), ("intermediate", 13)],
+                "a root that never read is omitted, not reported as empty"
+            );
+            assert_eq!(reader.current().fresh_available_bytes(), Some(13));
+            assert_eq!(storage.current(StorageRoot::Complete), Capacity::Unknown);
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "reading the cache never probes"
+        );
+    }
+
+    #[test]
+    fn a_storage_root_never_runs_two_probes_at_once() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let most_in_flight = Arc::new(AtomicUsize::new(0));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let probe: SharedProbeFn = {
+            let in_flight = in_flight.clone();
+            let most_in_flight = most_in_flight.clone();
+            let probes = probes.clone();
+            Arc::new(move |path: &Path| {
+                if path != Path::new("/data") {
+                    return Ok(DiskSpace {
+                        total_bytes: 1,
+                        available_bytes: 1,
+                    });
+                }
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                most_in_flight.fetch_max(now, Ordering::SeqCst);
+                if probes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // The first probe stalls, as a slow mount would.
+                    entered_tx.lock().unwrap().send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(DiskSpace {
+                    total_bytes: 1000,
+                    available_bytes: 500,
+                })
+            })
+        };
+        let storage = StorageCapacity::with_probe(roots(), NEVER, probe);
+
+        entered_rx.recv().unwrap();
+        assert_eq!(storage.current(StorageRoot::Data), Capacity::Unknown);
+        // Refresh demands during the stalled probe queue behind it.
+        storage.request_refresh(StorageRoot::Data);
+        storage.request_refresh(StorageRoot::Data);
+        release_tx.send(()).unwrap();
+
+        storage.wait_for_probes(StorageRoot::Data, 2);
+        assert_eq!(most_in_flight.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            storage.current(StorageRoot::Data).fresh_available_bytes(),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn a_retargeted_root_drops_the_old_reading_and_reads_the_new_path() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let storage = StorageCapacity::with_probe(roots(), NEVER, counting_probe(calls.clone()));
+        storage.wait_for_probes(StorageRoot::Data, 1);
+        assert_eq!(
+            storage.current(StorageRoot::Data).fresh_available_bytes(),
+            Some(5)
+        );
+
+        storage.retarget(StorageRoot::Data, PathBuf::from("/moved/data"));
+        storage.wait_for_probes(StorageRoot::Data, 2);
+        assert_eq!(
+            storage.current(StorageRoot::Data).fresh_available_bytes(),
+            Some(11)
+        );
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&PathBuf::from("/moved/data"))
+        );
+    }
+
+    #[test]
+    fn debits_apply_to_the_reading_they_were_made_against() {
+        let taken = Instant::now();
+        let reading = |available_bytes, sampled_at, stale| {
+            Capacity::Known(CapacityReading {
+                available_bytes,
+                total_bytes: 10_000,
+                sampled_at,
+                stale,
+            })
+        };
+        let mut debits = CapacityDebits::default();
+        assert_eq!(debits.apply(Capacity::Unknown), Capacity::Unknown);
+        assert_eq!(
+            debits
+                .apply(reading(1000, taken, false))
+                .best_available_bytes(),
+            Some(1000)
+        );
+        debits.debit(300);
+        debits.credit(100);
+        assert_eq!(
+            debits
+                .apply(reading(1000, taken, true))
+                .best_available_bytes(),
+            Some(800),
+            "debits survive a stale reading of the same probe"
+        );
+        let next = taken + Duration::from_secs(5);
+        assert_eq!(
+            debits
+                .apply(reading(900, next, false))
+                .best_available_bytes(),
+            Some(900),
+            "a newer reading already reflects what was written"
+        );
     }
 }

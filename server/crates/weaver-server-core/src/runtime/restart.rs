@@ -64,8 +64,23 @@ impl RestartCapability {
 /// `None` when either is untrue. An upgrade that replaced the binary under the
 /// running process must not cost the operator that process.
 pub fn resolvable_executable() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    executable.is_file().then_some(executable)
+    let executable = launched_executable()?;
+    executable.is_file().then(|| executable.to_path_buf())
+}
+
+/// The program file this process was started from, asked of the operating
+/// system once and kept.
+///
+/// Linux answers from the file the process has open, not from the name it was
+/// started by, so the answer follows a rename. An upgrade renames the running
+/// program to its backup and puts the new build under the old name; asked
+/// after that, Linux names the backup, and a restart would start the build
+/// the upgrade just replaced. Serving asks before anything can be renamed.
+fn launched_executable() -> Option<&'static Path> {
+    static LAUNCHED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    LAUNCHED
+        .get_or_init(|| std::env::current_exe().ok())
+        .as_deref()
 }
 
 /// Settle the restart rules for one deployment.

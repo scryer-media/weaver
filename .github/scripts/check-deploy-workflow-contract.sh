@@ -74,3 +74,14 @@ require_secret_in_step() {
 
 require_secret_in_step 'secrets.TAP_PUSH_TOKEN' 'Publish Homebrew tap update'
 require_secret_in_step 'secrets.WEB_DISPATCH_TOKEN' 'Trigger marketing site rebuild'
+
+# The archive matrix and the extended campaigns are manually dispatched from
+# their own workflow; this one runs only the ordinary test suite.
+awk '
+  /--profile archive-matrix/ || /--run-ignored/ {
+    printf "%s:%d: the archive matrix must not run from this workflow\n", FILENAME, FNR > "/dev/stderr"
+    invalid = 1
+  }
+
+  END { exit invalid }
+' "$workflow"

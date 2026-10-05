@@ -23,7 +23,7 @@ impl Pipeline {
         job_id: JobId,
     ) -> bool {
         let uu_capped = !self.uu_files.is_empty() && self.uu_spool_dispatch_capped();
-        let direct_admission = self.direct_store_admission(job_id, &[]);
+        let direct_admission = self.direct_store_admission(job_id);
         let sweep_held = self.demotion_sweep_held_file_indices(job_id);
         let checkpoint = self.checkpoint_admission(job_id);
         self.jobs.get(&job_id).is_some_and(|state| {

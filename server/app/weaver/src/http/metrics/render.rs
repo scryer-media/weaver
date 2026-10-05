@@ -19,7 +19,8 @@ use weaver_server_core::settings::PerJobSeries;
 use weaver_server_core::{
     DownloadPressureReason, DownloadPressureState, JobInfo, JobStatus, MetricsSnapshot,
     PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3EngineNarrowing, Par3EngineRefusal,
-    Par3MetricsSnapshot, Par3OutcomeClass, Par3Phase, Par3Stage, par3_memory_category_names,
+    Par3MetricsSnapshot, Par3OutcomeClass, Par3Phase, Par3Stage, SchedulerBlockClause,
+    par3_memory_category_names,
 };
 
 use super::catalog as f;
@@ -827,6 +828,23 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &[],
         snapshot.download_scheduler_idle_with_servable_total,
     );
+    out.sample(
+        &f::SCHEDULER_SCAN_ITEMS_SKIPPED,
+        &[],
+        snapshot.download_scheduler_scan_items_skipped_total,
+    );
+    out.sample(
+        &f::SCHEDULER_SCAN_NO_MATCH,
+        &[],
+        snapshot.download_scheduler_scan_no_match_total,
+    );
+    for clause in SchedulerBlockClause::ALL {
+        out.sample(
+            &f::SCHEDULER_HOT_BLOCKED,
+            &[("clause", clause.as_str())],
+            snapshot.download_scheduler_hot_blocked_total[clause.index()],
+        );
+    }
 
     for (event, value) in [
         (
