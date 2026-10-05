@@ -89,6 +89,10 @@ pub(super) struct Target {
     pub volume: u32,
     pub output: usize,
     pub cipher: bool,
+    /// Edges are planned when this target comes up, not before the first
+    /// stripe: an earlier target's image has to be routed before this
+    /// volume's part has a place in its member.
+    pub deferred: bool,
     pub edges: Vec<CipherEdge>,
 }
 
@@ -161,6 +165,8 @@ pub(super) struct Installation {
     pub settling_set: Option<usize>,
     pub pending_gap: Option<GapRead>,
     pub edge_reads: Vec<EdgeRead>,
+    /// Edge reads still admitted under the reservation.
+    pub edge_budget: usize,
     pub preflight_failed: bool,
     pub _edge_reservation: Option<assessment::ViewReservation>,
 }
@@ -319,7 +325,8 @@ impl Pipeline {
                         .expect("matched volume"),
                     output,
                     cipher: set.router.routes_encrypted(),
-                    edges: Vec::new(),
+                    deferred: false,
+                edges: Vec::new(),
                 });
             }
         }
@@ -339,45 +346,32 @@ impl Pipeline {
         } else {
             None
         };
+        for index in 0..targets.len() {
+            let target = &targets[index];
+            let deferred = target.cipher
+                && targets[..index].iter().any(|earlier| earlier.set == target.set)
+                && self
+                    .direct_store
+                    .set(job_id, target.set)
+                    .expect("matched set")
+                    .router
+                    .cipher_part_unplaced(target.volume);
+            targets[index].deferred = deferred;
+        }
         let mut edge_reads = Vec::new();
-        for (index, target) in targets
-            .iter()
-            .enumerate()
-            .filter(|(_, target)| target.cipher)
-        {
-            let set = self
-                .direct_store
-                .set(job_id, target.set)
-                .expect("matched set");
-            let Some(reads) = set
-                .router
-                .cipher_replacement_edge_reads_bounded(target.volume, MAX_EDGES - edge_reads.len())
-            else {
-                self.fail_job(
-                    job_id,
-                    "PAR3 cipher edge plan is incomplete or exceeds the host budget".into(),
-                );
-                return;
-            };
-            for (volume, offset, len) in reads {
-                let Some(file) = set.plan().volumes.get(&volume) else {
-                    self.fail_job(job_id, "PAR3 cipher neighbour has no job binding".into());
+        for index in 0..targets.len() {
+            if !targets[index].cipher || targets[index].deferred {
+                continue;
+            }
+            match self.plan_par3_edges(job_id, &targets, index, MAX_EDGES - edge_reads.len()) {
+                Ok(reads) => edge_reads.extend(reads),
+                Err(error) => {
+                    self.fail_job(job_id, error.into());
                     return;
-                };
-                let output = targets
-                    .iter()
-                    .find(|target| target.file.file_index == *file)
-                    .map(|target| target.output);
-                edge_reads.push(EdgeRead {
-                    target: index,
-                    source: SourceId(u64::from(*file)),
-                    volume,
-                    offset,
-                    len,
-                    output,
-                });
+                }
             }
         }
+        let edge_budget = MAX_EDGES - edge_reads.len();
         let installation = Box::new(Installation {
             completion,
             targets,
@@ -387,6 +381,7 @@ impl Pipeline {
             settling_set: None,
             pending_gap: None,
             edge_reads,
+            edge_budget,
             preflight_failed: false,
             _edge_reservation: edge_reservation,
         });
@@ -398,6 +393,51 @@ impl Pipeline {
         {
             self.fail_job(job_id, format!("PAR3 readback dispatch failed: {error}"));
         }
+    }
+
+    /// Plans the cipher neighbours one replacement image needs, bound to the
+    /// verified output or retained source that holds each.
+    fn plan_par3_edges(
+        &self,
+        job_id: JobId,
+        targets: &[Target],
+        index: usize,
+        limit: usize,
+    ) -> Result<Vec<EdgeRead>, &'static str> {
+        let target = &targets[index];
+        let set = self
+            .direct_store
+            .set(job_id, target.set)
+            .ok_or("missing PAR3 direct set")?;
+        let reads = set
+            .router
+            .cipher_replacement_edge_reads_bounded(target.volume, limit, &|volume| {
+                targets
+                    .iter()
+                    .any(|other| other.set == target.set && other.volume == volume)
+            })
+            .ok_or("PAR3 cipher edge plan is incomplete or exceeds the host budget")?;
+        let mut edge_reads = Vec::with_capacity(reads.len());
+        for (volume, offset, len) in reads {
+            let file = set
+                .plan()
+                .volumes
+                .get(&volume)
+                .ok_or("PAR3 cipher neighbour has no job binding")?;
+            let output = targets
+                .iter()
+                .find(|target| target.file.file_index == *file)
+                .map(|target| target.output);
+            edge_reads.push(EdgeRead {
+                target: index,
+                source: SourceId(u64::from(*file)),
+                volume,
+                offset,
+                len,
+                output,
+            });
+        }
+        Ok(edge_reads)
     }
 
     pub(super) async fn apply_par3_readback(
@@ -643,6 +683,23 @@ impl Pipeline {
             self.complete_par3_repair(job_id, installation.completion)
                 .await;
         } else {
+            if installation.offset == 0
+                && installation.pending_gap.is_none()
+                && installation.targets[installation.current].deferred
+            {
+                // Every earlier image of this set is routed and placed, so
+                // the part has its place and its neighbours have coordinates.
+                let reads = self.plan_par3_edges(
+                    job_id,
+                    &installation.targets,
+                    installation.current,
+                    installation.edge_budget,
+                )?;
+                installation.edge_budget -= reads.len();
+                installation.edge_reads.extend(reads);
+                let current = installation.current;
+                installation.targets[current].deferred = false;
+            }
             self.par3_runtime
                 .as_mut()
                 .expect("admitted job")
@@ -827,6 +884,7 @@ mod tests {
                 volume: 0,
                 output: 0,
                 cipher: true,
+                deferred: false,
                 edges: Vec::new(),
             }],
             current: 0,
@@ -842,6 +900,7 @@ mod tests {
                 len: 31,
                 output: None,
             }],
+            edge_budget: 0,
             preflight_failed: false,
             _edge_reservation: Some(
                 assessment::ViewReservation::acquire(EDGE_RESERVATION).unwrap(),
