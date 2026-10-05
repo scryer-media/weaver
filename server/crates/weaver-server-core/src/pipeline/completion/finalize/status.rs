@@ -931,7 +931,7 @@ impl Pipeline {
             return;
         };
         let cleanup_dir = state.working_dir.clone();
-        let volume_files: Vec<String> = state
+        let mut volume_files: std::collections::HashSet<String> = state
             .assembly
             .files()
             .filter(|f| {
@@ -943,6 +943,10 @@ impl Pipeline {
             })
             .map(|f| self.current_filename_for_file(job_id, f))
             .collect();
+        // Whatever an earlier incarnation of the job wrote at a finalized
+        // set's volume names is left over too, under any format and under
+        // names no role classifies.
+        volume_files.extend(self.finalized_direct_volume_filenames(job_id));
 
         let mut removed = 0u32;
         for filename in &volume_files {
