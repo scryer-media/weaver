@@ -95,7 +95,8 @@ Status: **Landed** ships; **Building** has an owner now; **Exploring** is a meas
 | CRC32 fold width: 256-bit `vpclmulqdq` versus the current 128-bit fold; `crc-fast` as a candidate | yEnc, PAR2 verify, direct-store integrity | Exploring | decision from the measured gap against rapidyenc |
 | GF(2^16) folded tier for AVX2 hosts without GFNI (Zen 2, pre-Ice-Lake) | PAR2 repair | Watch | measured gap on Zen 2 is 2.4x wall against par2cmdline-turbo |
 | AVX512BMM GF(2^16) tier (Zen 6 `VBMACXOR16x16x16`) | PAR2, PAR3 | Watch | no Zen 6 instances on EC2 yet |
-| SME2 GF(2) outer-product GEMM (`BMOPA`) for Reed-Solomon encode and solve | PAR2, PAR3 Cauchy | Exploring | bench-first spike on Apple M4-class silicon; shared SME unit per cluster |
+| SME2 GF(2) outer-product GEMM (`BMOPA`) for Reed-Solomon encode and solve | PAR2, PAR3 Cauchy | Watch | spike measured: slower than NEON at the 12–16 source groups the engines issue and at 8–18 workers (SME unit shared per cluster); wins 2–3x only at 64 or more sources per product |
+| Wide-K engine restructure: stage 64 or more source stripes per matrix product instead of 16 | PAR2, PAR3 Cauchy, matrix-unit ISAs | Watch | pays only on outer-product units (SME2 today, AVX512BMM if it has the same shape); changes the memory planner and read pattern; a wash for lookup kernels |
 | SME streaming-width multi-buffer hashing (MD5, BLAKE3) | PAR2 verify, PAR3 planning | Watch | unproven; mode-switch cost |
 | AVX10.2 and APX | every x86 kernel | Watch | Diamond Rapids and Nova Lake; EVEX kernels carry over, APX helps register-bound grouped kernels |
 | mimalloc v3 allocator with purge tuning | resident memory | Landed | |
