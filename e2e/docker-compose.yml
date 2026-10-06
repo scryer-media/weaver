@@ -278,6 +278,9 @@ services:
         condition: service_healthy
     volumes:
       - weaver-data:/weaver-data
+      # Weaver's SQLite datastore lives beside its config; datastore
+      # assertions open it read-only.
+      - weaver-config:/weaver-config
       - weaver-downloads:/weaver-downloads:ro
       - weaver-e2e-clock:/e2e-clock
       - weaver-watch-folder:/watch-folder
@@ -306,6 +309,8 @@ services:
       E2E_WEAVER_RATE_LIMIT_STAGE: "${E2E_WEAVER_RATE_LIMIT_STAGE:-initial}"
       E2E_WEAVER_UI_STAGE: "${E2E_WEAVER_UI_STAGE:-initial}"
       E2E_WEAVER_CLOCK_FILE: "/e2e-clock/now"
+      # Set in Postgres phases so datastore assertions reach the same database.
+      E2E_WEAVER_DATABASE_URL: "${E2E_WEAVER_DATABASE_URL:-}"
       # Staged flows (a Weaver restart between Playwright runs) name the stage
       # here; a spec keeps its cross-stage state under /artifacts.
       E2E_WEAVER_STAGE: "${E2E_WEAVER_STAGE:-initial}"

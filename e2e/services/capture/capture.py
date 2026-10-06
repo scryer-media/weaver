@@ -25,7 +25,7 @@ PORT = int(os.environ.get("CAPTURE_CONTROL_PORT", "8099"))
 EXCLUDE = "not port {} and not port 9090 and not port 5432".format(PORT)
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 IFACE = re.compile(r"^[A-Za-z0-9_.@-]{1,15}$")
-FILTER = re.compile(r"^[A-Za-z0-9 .:/()-]{0,200}$")
+FILTER = re.compile(r"^[A-Za-z0-9 .:/()\[\]=&!-]{0,200}$")
 
 running = []
 lock = threading.Lock()
