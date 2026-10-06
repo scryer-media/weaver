@@ -281,6 +281,24 @@ pub fn decode_with_options(
         });
     }
 
+    if options.dot_unstuffing
+        && let Some(result) = decode_raw_single_pass(input, output)?
+    {
+        return Ok(result);
+    }
+
+    decode_with_line_scan(input, output, options)
+}
+
+/// The whole-buffer decode that locates the trailer by walking the body's lines
+/// before decoding it. Used for articles without dot-stuffing (the kernel's end
+/// detection only runs in raw mode) and for the raw articles the single pass
+/// defers on.
+fn decode_with_line_scan(
+    input: &[u8],
+    output: &mut [u8],
+    options: DecodeOptions,
+) -> Result<DecodeResult, YencError> {
     let parsed = header::parse_headers_with_options(input, options)?;
 
     let data_end = parsed.data_end.max(parsed.data_start);
@@ -297,18 +315,7 @@ pub fn decode_with_options(
 
     let part_crc = crc.finalize();
 
-    // The whole-buffer entry has no chunk boundaries to checkpoint against and
-    // no PAR2 block size to checkpoint at, so it reports the same single
-    // segment a streaming decode with no segment plan would.
-    let segments = if bytes_written > 0 && parsed.metadata.file_offset_is_known() {
-        vec![Segment {
-            file_offset: parsed.metadata.article_file_offset(),
-            len: bytes_written as u64,
-            crc32: part_crc,
-        }]
-    } else {
-        Vec::new()
-    };
+    let segments = whole_buffer_segments(&parsed.metadata, bytes_written, part_crc);
 
     finalize_decode(
         parsed.metadata,
@@ -319,6 +326,106 @@ pub fn decode_with_options(
         CheckpointPlan::None,
         None,
     )
+}
+
+/// The whole-buffer entry has no chunk boundaries to checkpoint against and no
+/// PAR2 block size to checkpoint at, so it reports the same single segment a
+/// streaming decode with no segment plan would.
+fn whole_buffer_segments(
+    metadata: &YencMetadata,
+    bytes_written: usize,
+    part_crc: u32,
+) -> Vec<Segment> {
+    if bytes_written > 0 && metadata.file_offset_is_known() {
+        vec![Segment {
+            file_offset: metadata.article_file_offset(),
+            len: bytes_written as u64,
+            crc32: part_crc,
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whole-buffer decode of a raw (dot-stuffed) article in one pass over the
+/// body: the kernel's own end detection finds the `=y` that ends the body, as
+/// the streaming and fused decoders do, instead of a separate line walk over
+/// the body before the decode.
+///
+/// Returns `None` where the two readings of the body boundary could differ, and
+/// the caller falls back to the line-scanning path for an identical result: an
+/// NNTP terminator (`\r\n.\r\n`) inside the article, which the line scan
+/// decodes past, and a body that ends inside an escape, which the line scan
+/// fails.
+fn decode_raw_single_pass(
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<Option<DecodeResult>, YencError> {
+    let (metadata, data_start) = header::parse_leading_headers(input)?;
+    let outcome = crate::simd::decode_raw_body_until_end_with_line_length(
+        &input[data_start..],
+        output,
+        Some(metadata.line_length),
+    )?;
+    let yend = match outcome.end {
+        RapidyencDecodeEnd::Article => return Ok(None),
+        RapidyencDecodeEnd::Control => {
+            // The kernel consumes the `=y` it stopped at.
+            let keyword_start = data_start + outcome.consumed - 2;
+            if ends_in_open_escape(&input[data_start..body_end(input, data_start, keyword_start)]) {
+                // The kernel decodes a final `=` as the escape of the line's
+                // `\r`; the line scan cuts the body before that `\r` and fails
+                // the article on the dangling escape. Keep that verdict.
+                return Ok(None);
+            }
+            Some(header::parse_trailer_at(input, keyword_start)?)
+        }
+        // At the end of the input the kernel holds a line-start `=` open as a
+        // possible control line, where the line scan fails the article on the
+        // dangling escape. Keep that verdict.
+        RapidyencDecodeEnd::None if ends_in_open_escape(&input[data_start..]) => {
+            return Ok(None);
+        }
+        RapidyencDecodeEnd::None => None,
+    };
+
+    let bytes_written = outcome.written;
+    let mut crc = Crc32::new();
+    if bytes_written > 0 {
+        crc.update(&output[..bytes_written]);
+    }
+    let part_crc = crc.finalize();
+
+    let segments = whole_buffer_segments(&metadata, bytes_written, part_crc);
+
+    finalize_decode(
+        metadata,
+        yend,
+        bytes_written,
+        part_crc,
+        segments,
+        CheckpointPlan::None,
+        None,
+    )
+    .map(Some)
+}
+
+/// First byte after the body for a control line whose `=y` begins at
+/// `keyword_start`: the `\r` of the line break before it, before the stuffed
+/// `.` if there is one. A control line at the very start of the body leaves it
+/// empty.
+fn body_end(input: &[u8], data_start: usize, keyword_start: usize) -> usize {
+    if keyword_start < data_start + 2 {
+        return data_start;
+    }
+    let dot = usize::from(input[keyword_start - 1] == b'.');
+    keyword_start - 2 - dot
+}
+
+/// True when `body` ends inside an escape: an odd run of trailing `=`, since
+/// each `=` that opens an escape takes the next byte, including a `=`.
+fn ends_in_open_escape(body: &[u8]) -> bool {
+    body.iter().rev().take_while(|&&b| b == b'=').count() % 2 == 1
 }
 
 /// Result of incrementally decoding a full NNTP yEnc article.
@@ -2721,6 +2828,328 @@ mod tests {
                     decoded, expected,
                     "len {len}, dot_unstuffing {dot_unstuffing}"
                 );
+            }
+        }
+    }
+
+    /// The single-pass raw decode must give exactly what the line-scanning
+    /// decode gives — same result, same defects, same error, same bytes — on
+    /// every article, including the ones that exercise the trailer rules: a
+    /// bare-LF `=yend` (not a trailer), a dot-stuffed `.=yend` (a trailer in
+    /// raw mode), a non-`=yend` control line (an error), garbage after
+    /// `=yend`, a missing trailer, a lone `=` or `\r` before the trailer, and an
+    /// NNTP terminator inside the article (the single pass defers to the scan).
+    fn assert_single_pass_matches_line_scan(article: &[u8]) {
+        let options = DecodeOptions {
+            dot_unstuffing: true,
+        };
+        let mut scan_out = vec![0u8; max_decoded_len(article.len())];
+        let mut pass_out = vec![0u8; max_decoded_len(article.len())];
+        let scan = decode_with_line_scan(article, &mut scan_out, options);
+        let pass = match decode_raw_single_pass(article, &mut pass_out) {
+            Ok(Some(result)) => Ok(result),
+            // Deferred to the line scan, which `decode_with_options` then runs.
+            Ok(None) => return,
+            Err(err) => Err(err),
+        };
+        match (&scan, &pass) {
+            (Ok(scan), Ok(pass)) => {
+                assert_eq!(
+                    format!("{scan:?}"),
+                    format!("{pass:?}"),
+                    "article {:?}",
+                    String::from_utf8_lossy(article)
+                );
+                assert_eq!(
+                    scan_out[..scan.bytes_written],
+                    pass_out[..pass.bytes_written],
+                    "article {:?}",
+                    String::from_utf8_lossy(article)
+                );
+            }
+            (Err(scan), Err(pass)) => assert_eq!(
+                format!("{scan:?}"),
+                format!("{pass:?}"),
+                "article {:?}",
+                String::from_utf8_lossy(article)
+            ),
+            _ => panic!(
+                "scan {scan:?} vs single pass {pass:?} for {:?}",
+                String::from_utf8_lossy(article)
+            ),
+        }
+    }
+
+    fn nntp(article: &[u8]) -> Result<(DecodeResult, Vec<u8>), YencError> {
+        let mut out = vec![0u8; max_decoded_len(article.len())];
+        let result = decode_nntp(article, &mut out)?;
+        out.truncate(result.bytes_written);
+        Ok((result, out))
+    }
+
+    const ONE_PART: &[u8] =
+        b"=ybegin part=1 total=2 line=128 size=4 name=a\r\n=ypart begin=1 end=2\r\n";
+
+    #[test]
+    fn raw_article_trailer_after_crlf_ends_the_body() {
+        let (result, data) = nntp(&[ONE_PART, b"kl\r\n=yend size=2 part=1\r\n"].concat()).unwrap();
+        assert!(result.has_trailer);
+        assert_eq!(data, b"AB");
+        assert!(!result.defects.yend_size_mismatch);
+    }
+
+    #[test]
+    fn raw_article_dot_stuffed_trailer_ends_the_body() {
+        let (result, data) = nntp(&[ONE_PART, b"kl\r\n.=yend size=2\r\n"].concat()).unwrap();
+        assert!(result.has_trailer);
+        assert_eq!(data, b"AB");
+    }
+
+    /// A bare `\n` does not reach line start, so `=yend` after it is body data
+    /// (an escape of `y`) and the article has no trailer.
+    #[test]
+    fn raw_article_trailer_after_bare_lf_is_body_data() {
+        let (result, _) = nntp(&[ONE_PART, b"kl\n=yend size=2\r\n"].concat()).unwrap();
+        assert!(!result.has_trailer);
+        assert_eq!(result.expected_part_crc, None);
+    }
+
+    #[test]
+    fn raw_article_without_trailer_decodes_to_the_end() {
+        let (result, data) = nntp(&[ONE_PART, b"kl\r\n"].concat()).unwrap();
+        assert!(!result.has_trailer);
+        assert_eq!(data, b"AB");
+    }
+
+    #[test]
+    fn raw_article_garbage_after_trailer_is_ignored() {
+        let (result, data) =
+            nntp(&[ONE_PART, b"kl\r\n=yend size=2\r\n-- \r\nsig\r\n=ybogus\r\n"].concat()).unwrap();
+        assert!(result.has_trailer);
+        assert_eq!(data, b"AB");
+    }
+
+    #[test]
+    fn raw_article_non_yend_control_line_fails() {
+        let err = nntp(&[ONE_PART, b"kl\r\n=ybogus size=2\r\n"].concat()).unwrap_err();
+        assert!(matches!(err, YencError::InvalidHeader { ref field, .. } if field == "=yend"));
+    }
+
+    /// A body whose last line ends in a lone `=` fails on the dangling escape,
+    /// with or without a trailer after it.
+    #[test]
+    fn raw_article_dangling_escape_before_trailer_fails() {
+        for tail in [
+            &b"kl=\r\n=yend size=2\r\n"[..],
+            b"kl=\r\n.=yend size=2\r\n",
+            b"\r\n=",
+            b".=",
+        ] {
+            let err = nntp(&[ONE_PART, tail].concat()).unwrap_err();
+            assert!(
+                matches!(err, YencError::MalformedEscape(_)),
+                "{tail:?}: {err:?}"
+            );
+        }
+        // An escaped `=` (an even run) is data, not a dangling escape.
+        let (result, data) = nntp(&[ONE_PART, b"k==\r\n=yend size=2\r\n"].concat()).unwrap();
+        assert!(result.has_trailer);
+        assert_eq!(data, [b'A', b'='.wrapping_sub(106)]);
+    }
+
+    /// An NNTP terminator inside the article does not stop the whole-buffer
+    /// decode; the trailer after it still counts.
+    #[test]
+    fn raw_article_terminator_inside_body_keeps_decoding() {
+        let (result, data) = nntp(&[ONE_PART, b"kl\r\n.\r\n=yend size=2\r\n"].concat()).unwrap();
+        assert!(result.has_trailer);
+        assert_eq!(data, b"AB");
+    }
+
+    #[test]
+    fn raw_article_unanchored_part_and_missing_ypart_rules_hold() {
+        let unanchored = b"=ybegin part=2 line=128 size=9 name=a\r\n=ypart begin=0 end=1\r\nkl\r\n=yend size=2 part=2\r\n";
+        let (result, data) = nntp(unanchored).unwrap();
+        assert!(result.metadata.defects.invalid_ypart_begin);
+        assert!(!result.metadata.file_offset_is_known());
+        assert!(result.segments.is_empty());
+        assert_eq!(data, b"AB");
+
+        let missing = b"=ybegin part=2 line=128 size=9 name=a\r\nkl\r\n=yend size=2\r\n";
+        assert!(matches!(nntp(missing), Err(YencError::MissingField(ref f)) if f == "=ypart"));
+
+        let mismatched = [ONE_PART, b"klm\r\n=yend size=2\r\n"].concat();
+        let (result, _) = nntp(&mismatched).unwrap();
+        assert!(result.defects.yend_size_mismatch);
+        assert!(result.defects.ypart_size_mismatch);
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const HEADERS: &[&[u8]] = &[
+        b"=ybegin line=128 size=100 name=a.bin\r\n",
+        b"=ybegin part=2 total=9 line=128 size=9000 name=a.bin\r\n=ypart begin=1001 end=1100\r\n",
+        b"=ybegin part=2 line=128 size=9000 name=a.bin\r\n=ypart begin=0 end=7\r\n",
+        b"=ybegin line=128 size=100 name=a.bin\r\n=ypart begin=5 end=104\r\n",
+        b"junk\r\n=ybegin line=64 name=a.bin\r\n",
+        b"=ybegin line=128 size=100 name=a.bin\n",
+        b"=ybegin part=1 total=2 line=128 size=50 name=a.bin\r\nnot-a-part\r\n=ypart begin=1 end=50\r\n",
+        b"=ybegin part=1 line=128 size=50 name=a.bin\r\n",
+        b"=ybegin\r\n",
+    ];
+
+    const PIECES: &[&[u8]] = &[
+        b"\r\n",
+        b"\n",
+        b"\r",
+        b".",
+        b"..",
+        b"=",
+        b"=y",
+        b"\r\n=yend size=4 crc32=0\r\n",
+        b"\r\n=yend size=4 part=2 pcrc32=1234abcd crc32=ffffffff\r\n",
+        b"\r\n.=yend size=4\r\n",
+        b"\n=yend size=4\r\n",
+        b"\r\n=ybogus\r\n",
+        b"\r\n=yend\r\n",
+        b"\r\n=yend size=4",
+        b"\r\n=yendx\r\n",
+        b"\r\n.\r\n",
+        b"\r\n..\r\n",
+        b"=\r\n",
+        b"garbage after\r\n",
+        b"=}",
+        b"=@",
+        b"\t ",
+    ];
+
+    fn random_article(rng: &mut XorShift, max_body: usize) -> Vec<u8> {
+        let mut article = HEADERS[rng.below(HEADERS.len())].to_vec();
+        let body_len = rng.below(max_body + 1);
+        while article.len() < body_len {
+            if rng.below(8) == 0 {
+                article.extend_from_slice(PIECES[rng.below(PIECES.len())]);
+            } else {
+                let run = 1 + rng.below(40);
+                for _ in 0..run {
+                    article.push(b'!' + rng.below(90) as u8);
+                }
+            }
+        }
+        if rng.below(2) == 0 {
+            article.extend_from_slice(b"\r\n=yend size=");
+            article.extend_from_slice(rng.below(5000).to_string().as_bytes());
+            article.extend_from_slice(b" crc32=deadbeef\r\n");
+            if rng.below(4) == 0 {
+                article.extend_from_slice(PIECES[rng.below(PIECES.len())]);
+            }
+        }
+        article
+    }
+
+    #[test]
+    fn single_pass_matches_line_scan_on_adversarial_articles() {
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..60_000 {
+            assert_single_pass_matches_line_scan(&random_article(&mut rng, 200));
+        }
+        // Long bodies so the SIMD kernels, not only their scalar tails, meet
+        // every piece.
+        for _ in 0..3_000 {
+            assert_single_pass_matches_line_scan(&random_article(&mut rng, 5_000));
+        }
+    }
+
+    /// Bodies drawn only from the bytes the boundary rules look at, so every
+    /// ordering of line breaks, stuffed dots, escapes and `=y` turns up.
+    #[test]
+    fn single_pass_matches_line_scan_on_dense_control_bytes() {
+        const ALPHABET: &[u8] = b"\r\n.=yea";
+        let mut rng = XorShift(0x1234_5678_9abc_def1);
+        for _ in 0..40_000 {
+            let mut article = HEADERS[rng.below(HEADERS.len())].to_vec();
+            for _ in 0..rng.below(48) {
+                article.push(ALPHABET[rng.below(ALPHABET.len())]);
+            }
+            assert_single_pass_matches_line_scan(&article);
+        }
+        // The same bytes sparse in long bodies, so they land inside the SIMD
+        // kernels' blocks and at every block offset.
+        for _ in 0..4_000 {
+            let mut article = HEADERS[rng.below(HEADERS.len())].to_vec();
+            let spacing = 1 + rng.below(30);
+            for _ in 0..rng.below(1_500) {
+                if rng.below(spacing) == 0 {
+                    article.push(ALPHABET[rng.below(ALPHABET.len())]);
+                } else {
+                    article.push(b'A' + rng.below(20) as u8);
+                }
+            }
+            assert_single_pass_matches_line_scan(&article);
+        }
+    }
+
+    /// The fuzz corpus seeds are the repository's hand-built edge-case articles
+    /// (bare-LF and dot-prefixed trailers, leading junk, truncation, missing
+    /// fields); each one, and each one cut short at every byte, decodes the
+    /// same both ways.
+    #[test]
+    fn single_pass_matches_line_scan_on_fuzz_seed_articles() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/yenc_article");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let article = std::fs::read(entry.unwrap().path()).unwrap();
+            for cut in 0..=article.len() {
+                assert_single_pass_matches_line_scan(&article[..cut]);
+            }
+            seen += 1;
+        }
+        assert!(seen >= 10, "fuzz seeds missing from {}", dir.display());
+    }
+
+    #[test]
+    fn single_pass_matches_line_scan_on_encoded_articles() {
+        let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+        for len in [0usize, 1, 2, 63, 64, 65, 127, 128, 129, 1000, 4096, 70_000] {
+            let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            for line in [1usize, 2, 64, 128, 997] {
+                let mut article = Vec::new();
+                crate::encode(&data, &mut article, line, "invented.bin").unwrap();
+                assert_single_pass_matches_line_scan(&article);
+                let mut part = Vec::new();
+                crate::encode_part(
+                    &data,
+                    &mut part,
+                    line,
+                    "invented.bin",
+                    3,
+                    7,
+                    1001,
+                    1000 + len.max(1) as u64,
+                    1_000_000,
+                )
+                .unwrap();
+                assert_single_pass_matches_line_scan(&part);
+                // Trailing garbage after =yend, and an LF-only trailer.
+                let mut garbage = part.clone();
+                garbage.extend_from_slice(b"-- \r\nposted by invented\r\n");
+                assert_single_pass_matches_line_scan(&garbage);
+                let lf_only: Vec<u8> = part.iter().copied().filter(|&b| b != b'\r').collect();
+                assert_single_pass_matches_line_scan(&lf_only);
             }
         }
     }

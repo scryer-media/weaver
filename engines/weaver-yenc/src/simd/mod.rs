@@ -181,6 +181,17 @@ pub(crate) fn decode_body_into_with_line_length(
     Ok(decode_kernel(input, output, &mut state, dot_unstuffing, false, false)?.written)
 }
 
+/// Decode a whole raw (dot-stuffed) body, stopping where the kernel's end
+/// detection stops: the first `=y` at a line start, or the NNTP terminator.
+pub(crate) fn decode_raw_body_until_end_with_line_length(
+    input: &[u8],
+    output: &mut [u8],
+    line_length: Option<u32>,
+) -> Result<KernelOutcome, YencError> {
+    let mut state = KernelState::body_with_line_length(line_length);
+    decode_kernel(input, output, &mut state, true, false, true)
+}
+
 /// Decode one streaming body chunk with carry state preserved across calls.
 pub(crate) fn decode_chunk_into(
     input: &[u8],
