@@ -2237,7 +2237,12 @@ impl Pipeline {
                 continue;
             }
             match self.prepare_direct_set_repair(
-                job_id, set_index, &par2_set, verification, &overlay, &files,
+                job_id,
+                set_index,
+                &par2_set,
+                verification,
+                &overlay,
+                &files,
             ) {
                 Ok(repair) => prepared.push(repair),
                 Err(failure) => {
@@ -2281,33 +2286,34 @@ impl Pipeline {
         match result {
             Ok(()) => DirectRepairAnswer::Acted,
             Err(failure) => {
-            Self::record_direct_repair_failure(job_id, &failure);
-            warn!(
-                job_id = job_id.0,
-                failure = %failure,
-                "repairing a direct set in place was not possible; demoting it"
-            );
-            // A refusal that got as far as routing has already demoted
-            // the set itself — a destination write failed, a repaired
-            // span found no destination — and a demoted set is a state
-            // change the caller has to act on exactly as a repair is:
-            // its volumes are materializing, so the job's next move is a
-            // fresh pass over them, not another lap of the verdict that
-            // sent it here. A write the destination refused fails the
-            // job instead, which ends the job's moves altogether.
-            let already_demoted = attempted.iter().any(|set_index| {
-                self.direct_store
-                    .set(job_id, *set_index)
-                    .is_some_and(DirectSet::is_demoted)
-            });
-            let job_failed = self.jobs.get(&job_id).is_none_or(|state| {
-                matches!(state.status, crate::JobStatus::Failed { .. })
-            });
-            if already_demoted || job_failed {
-                DirectRepairAnswer::Acted
-            } else {
-                DirectRepairAnswer::Declined
-            }
+                Self::record_direct_repair_failure(job_id, &failure);
+                warn!(
+                    job_id = job_id.0,
+                    failure = %failure,
+                    "repairing a direct set in place was not possible; demoting it"
+                );
+                // A refusal that got as far as routing has already demoted
+                // the set itself — a destination write failed, a repaired
+                // span found no destination — and a demoted set is a state
+                // change the caller has to act on exactly as a repair is:
+                // its volumes are materializing, so the job's next move is a
+                // fresh pass over them, not another lap of the verdict that
+                // sent it here. A write the destination refused fails the
+                // job instead, which ends the job's moves altogether.
+                let already_demoted = attempted.iter().any(|set_index| {
+                    self.direct_store
+                        .set(job_id, *set_index)
+                        .is_some_and(DirectSet::is_demoted)
+                });
+                let job_failed = self
+                    .jobs
+                    .get(&job_id)
+                    .is_none_or(|state| matches!(state.status, crate::JobStatus::Failed { .. }));
+                if already_demoted || job_failed {
+                    DirectRepairAnswer::Acted
+                } else {
+                    DirectRepairAnswer::Declined
+                }
             }
         }
     }
@@ -3008,9 +3014,7 @@ impl Pipeline {
         // repaired byte that still has no destination, or a gate the rewrite
         // fails, becomes the demotion.
         let finished = match self.direct_store.set_mut(job_id, set_index) {
-            Some(set) if set.router.repair_batch_in_progress() => {
-                set.finish_repair_transaction()
-            }
+            Some(set) if set.router.repair_batch_in_progress() => set.finish_repair_transaction(),
             // No volume carried a rewrite, so no transaction was opened.
             Some(_) => Ok(()),
             None => {

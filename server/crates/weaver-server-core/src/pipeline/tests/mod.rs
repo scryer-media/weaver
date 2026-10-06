@@ -2854,7 +2854,11 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(job_id) = idle.iter().copied().find(|job_id| republished.insert(*job_id)) {
+        if let Some(job_id) = idle
+            .iter()
+            .copied()
+            .find(|job_id| republished.insert(*job_id))
+        {
             pipeline.check_job_completion(job_id).await;
             continue;
         }

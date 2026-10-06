@@ -333,7 +333,8 @@ impl Pipeline {
                         .unwrap_or_default()
                         .iter()
                         .map(|range| {
-                            let len = usize::try_from(range.end - range.start).unwrap_or(usize::MAX);
+                            let len =
+                                usize::try_from(range.end - range.start).unwrap_or(usize::MAX);
                             (range.start, len)
                         })
                         .filter(|(_, len)| *len != 0)

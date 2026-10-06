@@ -1,7 +1,7 @@
 //! Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    ExtractionProfile, Interruption, Route, Selection, combined_campaign,
-    run_described_schedule, selected_schedules, wrong_password_schedules,
+    ExtractionProfile, Interruption, Route, Selection, combined_campaign, run_described_schedule,
+    selected_schedules, wrong_password_schedules,
 };
 use super::*;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
@@ -225,7 +225,12 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         if password.is_some() {
             profile.assert_rejected(&outcome, &wanted);
         } else {
-            assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
+            assert_eq!(
+                outcome.status,
+                Some(JobStatus::Complete),
+                "{:?}",
+                outcome.trace
+            );
             profile.assert_delivery(&outcome, route, &wanted, interruption);
             for (name, bytes) in &expected {
                 assert_eq!(
@@ -327,11 +332,7 @@ async fn encrypted_compressed_schedules() {
 }
 
 combined_campaign!(combined_copy, Shape::Copy, campaign);
-combined_campaign!(
-    combined_copy_four_volume,
-    Shape::CopyFourVolumes,
-    campaign
-);
+combined_campaign!(combined_copy_four_volume, Shape::CopyFourVolumes, campaign);
 combined_campaign!(
     combined_chase_copy_four_volume,
     Shape::CopyFourVolumes,

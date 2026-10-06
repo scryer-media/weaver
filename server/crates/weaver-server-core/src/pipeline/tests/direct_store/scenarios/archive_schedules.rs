@@ -347,10 +347,7 @@ impl ExtractionProfile {
                 outcome.finalized, route.sets,
                 "set left the direct route: {trace:?}"
             );
-            let refetched: Vec<_> = outcome
-                .rerequested
-                .intersection(&outcome.durable)
-                .collect();
+            let refetched: Vec<_> = outcome.rerequested.intersection(&outcome.durable).collect();
             assert!(
                 refetched.is_empty(),
                 "direct set refetched durable articles {refetched:?}: {trace:?}"
@@ -1297,15 +1294,7 @@ pub(super) async fn run_schedule_with(
         }
         note_rerequests(&mut pipeline, job, &delivered, &mut rerequested);
         if let Some((mask, _)) = loss {
-            deliver_schedule_refetches(
-                &mut pipeline,
-                job,
-                volumes,
-                &layout,
-                mask,
-                &recovery,
-            )
-            .await;
+            deliver_schedule_refetches(&mut pipeline, job, volumes, &layout, mask, &recovery).await;
         }
         drain_rar_refreshes(&mut pipeline).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
@@ -1322,15 +1311,8 @@ pub(super) async fn run_schedule_with(
                 // A container probe can re-request its missing first article
                 // while the queues settle. Answer that request as unavailable
                 // before completion checks exhaustion, just like a server does.
-                deliver_schedule_refetches(
-                    &mut pipeline,
-                    job,
-                    volumes,
-                    &layout,
-                    mask,
-                    &recovery,
-                )
-                .await;
+                deliver_schedule_refetches(&mut pipeline, job, volumes, &layout, mask, &recovery)
+                    .await;
             } else {
                 trace.push(format!("refetch {queued:?}"));
                 for (file, article) in queued {
@@ -1583,9 +1565,9 @@ impl Format {
                 unnamed_loss: |mask| mask & 0b0101 != 0,
                 ..Route::DIRECT
             },
-            Self::Rar5UncheckedHeaders => Route::refused(|reason| {
-                matches!(reason, DemotionReason::HeaderEncryptedRefused(_))
-            }),
+            Self::Rar5UncheckedHeaders => {
+                Route::refused(|reason| matches!(reason, DemotionReason::HeaderEncryptedRefused(_)))
+            }
             Self::Blake2 => Route::refused(|reason| {
                 matches!(
                     reason,
@@ -1726,8 +1708,7 @@ async fn slot_campaign(
             | Format::Rar5EncryptedHeaders
             | Format::Rar5UncheckedHeaders
     );
-    let mut spec =
-        direct_store_job_spec_with_articles("Archive schedules", &volumes, 4 / count);
+    let mut spec = direct_store_job_spec_with_articles("Archive schedules", &volumes, 4 / count);
     for (file, articles) in slot_layout(count, slots).into_iter().enumerate() {
         if articles != spec.files[file].segments.len() {
             let volume = &volumes[file..=file];
@@ -1766,21 +1747,25 @@ async fn slot_campaign(
         eprintln!(
             "wrong password {format:?} profile={profile:?} order={order:?} interruption={interruption:?}"
         );
-        let outcome =
-            run_described_schedule(
-                profile,
-                wrong,
-                &volumes,
-                described.as_deref(),
-                &order,
-                &[name],
-                interruption,
-            )
-            .await;
+        let outcome = run_described_schedule(
+            profile,
+            wrong,
+            &volumes,
+            described.as_deref(),
+            &order,
+            &[name],
+            interruption,
+        )
+        .await;
         if encrypted {
             profile.assert_rejected(&outcome, &[name]);
         } else {
-            assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
+            assert_eq!(
+                outcome.status,
+                Some(JobStatus::Complete),
+                "{:?}",
+                outcome.trace
+            );
             profile.assert_delivery(&outcome, format.route(), &[name], interruption);
             assert_eq!(outcome.files[name].as_deref(), Some(payload.as_slice()));
         }
@@ -1854,7 +1839,8 @@ async fn slot_campaign(
         assert_eq!(
             actual.files[name].as_deref(),
             Some(payload.as_slice()),
-            "{format:?} case={case} order={order:?} {:?}", actual.trace
+            "{format:?} case={case} order={order:?} {:?}",
+            actual.trace
         );
     }
 }
@@ -1923,7 +1909,11 @@ async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
     let members = ["alpha.mkv", "nested/beta.mkv"];
     let payloads: Vec<Vec<u8>> = [(6001, 7), (4093, 11)]
         .into_iter()
-        .map(|(len, step)| (0..len).map(|n| ((n * step + n / 251) % 253) as u8).collect())
+        .map(|(len, step)| {
+            (0..len)
+                .map(|n| ((n * step + n / 251) % 253) as u8)
+                .collect()
+        })
         .collect();
     let volumes: Vec<_> = ["alpha", "beta"]
         .into_iter()
@@ -2320,7 +2310,12 @@ async fn compressed_campaign(
         Some((_, parts)) => parts
             .into_iter()
             .enumerate()
-            .map(|(index, part)| (format!("compressed.part{:02}.rar", index + 1), part.to_vec()))
+            .map(|(index, part)| {
+                (
+                    format!("compressed.part{:02}.rar", index + 1),
+                    part.to_vec(),
+                )
+            })
             .collect(),
         None => vec![("compressed.rar".to_owned(), bytes.to_vec())],
     };
@@ -2344,7 +2339,12 @@ async fn compressed_campaign(
         if password.is_some() {
             profile.assert_rejected(&outcome, &wanted);
         } else {
-            assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
+            assert_eq!(
+                outcome.status,
+                Some(JobStatus::Complete),
+                "{:?}",
+                outcome.trace
+            );
             profile.assert_delivery(&outcome, format.route(), &wanted, interruption);
             for (name, bytes) in &expected {
                 assert_eq!(outcome.files[name].as_deref(), Some(bytes.as_slice()));
@@ -2769,11 +2769,7 @@ combined_campaign!(
     ExtractionProfile::Conventional,
     two_set_campaign
 );
-combined_campaign!(
-    combined_rar4_four_volume,
-    Format::Rar4FourVolumes,
-    campaign
-);
+combined_campaign!(combined_rar4_four_volume, Format::Rar4FourVolumes, campaign);
 combined_campaign!(
     combined_chase_rar4_four_volume,
     Format::Rar4FourVolumes,
@@ -2784,11 +2780,7 @@ combined_campaign!(
     Format::Rar4FourVolumes,
     conventional_campaign
 );
-combined_campaign!(
-    combined_rar5_four_volume,
-    Format::Rar5FourVolumes,
-    campaign
-);
+combined_campaign!(combined_rar5_four_volume, Format::Rar5FourVolumes, campaign);
 combined_campaign!(
     combined_chase_rar5_four_volume,
     Format::Rar5FourVolumes,
@@ -2814,11 +2806,7 @@ combined_campaign!(
     Format::Rar4EncryptedFourVolumes,
     conventional_campaign
 );
-combined_campaign!(
-    combined_rar5_obfuscated,
-    Format::Rar5Obfuscated,
-    campaign
-);
+combined_campaign!(combined_rar5_obfuscated, Format::Rar5Obfuscated, campaign);
 combined_campaign!(
     combined_chase_rar5_obfuscated,
     Format::Rar5Obfuscated,

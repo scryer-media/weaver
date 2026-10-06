@@ -1448,7 +1448,12 @@ impl MemberCrypt {
     /// asks `edge_plain` for the head and tail blocks it cannot decrypt alone,
     /// and would otherwise be handed the plaintext of the damage it is replacing.
     pub(crate) fn invalidate_repaired(&mut self, cipher_offset: u64, len: u64) {
-        if len == 0 || self.repair_invalidated.missing(cipher_offset, len).is_empty() {
+        if len == 0
+            || self
+                .repair_invalidated
+                .missing(cipher_offset, len)
+                .is_empty()
+        {
             return;
         }
         self.repair_invalidated.insert(cipher_offset, len);
