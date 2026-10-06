@@ -265,6 +265,12 @@ export async function saveRoute(request: APIRequestContext, kind: ConsumerKind, 
     { kind, id, input: route })).saveNetworkRoute;
 }
 
+/** Every saved route, keyed `server:<id>` / `rss:<id>`. */
+export async function networkRoutes(request: APIRequestContext): Promise<Array<{ consumer: string; legs: Route["legs"]; failover: Failover }>> {
+  return (await graphql<{ networkRoutes: Array<{ consumer: string; legs: Route["legs"]; failover: Failover }> }>(request,
+    `query { networkRoutes { consumer ${ROUTE} } }`)).networkRoutes;
+}
+
 /** Send a GraphQL document expected to fail; returns the error messages. */
 export async function graphqlErrors(request: APIRequestContext, query: string, variables: Record<string, unknown> = {}): Promise<string[]> {
   await networkFlow(request); // opens the API session the same way `graphql` does

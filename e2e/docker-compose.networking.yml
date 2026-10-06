@@ -9,6 +9,10 @@ services:
       # Docker's default capability set already includes NET_RAW; the
       # entrypoint keeps it for Weaver only when this is true.
       WEAVER_RETAIN_NET_RAW: "${E2E_WEAVER_RETAIN_NET_RAW:-true}"
+    # Weaver sizes its WireGuard instance budget from the memory it may use
+    # at boot (memory / 4 / 516 MiB, clamped to 1-8). A fixed limit makes the
+    # budget two on any runner with at least this much memory available.
+    mem_limit: 5g
 
   proxy-fixture:
     environment:

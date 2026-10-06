@@ -46,6 +46,22 @@ export async function waitRows(sql: string, predicate: (rows: Row[]) => boolean,
   return rows;
 }
 
+/**
+ * Run a statement that changes rows. Used only where a scenario needs a row
+ * changed behind Weaver's back before a restart (a restored egress that has
+ * gone missing); Weaver reads the change when it next boots.
+ */
+export async function execute(sql: string): Promise<void> {
+  if (datastoreKind() === "postgres") { await postgresQuery(postgresUrl(), sql); return; }
+  const database = new DatabaseSync(SQLITE_PATH);
+  try {
+    database.exec("PRAGMA busy_timeout = 60000");
+    database.exec(sql);
+  } finally {
+    database.close();
+  }
+}
+
 export async function setting(key: string): Promise<string | null | undefined> {
   const rows = await query(`SELECT value FROM settings WHERE key = ${literal(key)}`);
   return rows.length === 0 ? undefined : rows[0]!.value;
@@ -54,6 +70,7 @@ export async function setting(key: string): Promise<string | null | undefined> {
 function sqliteQuery(sql: string): Row[] {
   const database = new DatabaseSync(SQLITE_PATH, { readOnly: true });
   try {
+    database.exec("PRAGMA busy_timeout = 60000");
     return (database.prepare(sql).all() as Array<Record<string, unknown>>).map(row =>
       Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value === null || value === undefined ? null : String(value)])));
   } finally {

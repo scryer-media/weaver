@@ -29,7 +29,8 @@ export type WireGuardPeer = {
 export type TunnelState = {
   sequence: number;
   endpoints: Record<string, { transport: "tcp" | "udp"; port: number; up: boolean; active: number; upstream: string }>;
-  ssh: Record<string, { forwarded: string[]; acceptedAuth: string[] }>;
+  /** Per SSH endpoint: forwarded (host, port) targets and accepted auth methods, in order. */
+  ssh: Record<string, { forwarded: Array<[string, number]>; acceptedAuth: string[] }>;
   sshSwitch: "primary" | "other" | null;
   hostKeys: { primary: string; other: string };
   sshClient: { username: string; password: string; privateKey: string; privateKeyWithPassphrase: string; passphrase: string };
