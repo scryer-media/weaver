@@ -11,6 +11,11 @@ Everything below is new since 0.14.4.
 
 ## What changed
 
+- Completion checks now skip a job that is queued for or running
+  post-processing. A late completion checkpoint during scripts previously
+  ran the final move a second time, parked the output under `<name>.#<id>`,
+  and repointed the job's output directory out from under the running
+  script.
 - The extended archive campaigns' schedule smokes and demotion-reason
   campaigns no longer run in the default test suite. They run only from the
   manually dispatched `archive-matrix-extended` workflow, alongside the
