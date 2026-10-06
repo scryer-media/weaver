@@ -1,6 +1,9 @@
 [profile.default]
-# Large archive campaigns are opt-in; smoke and regression tests stay in the default suite.
-default-filter = 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/)))'
+# The archive matrix is opt-in, and so is everything the extended campaigns
+# schedule: their shards and their smokes alike run only from the manually
+# dispatched workflow. The extended modules keep their small regression tests
+# in the default suite; only their schedule smokes and reason campaigns leave.
+default-filter = 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & (test(/::combined_/) | test(/_schedules$/) | test(/demotion_reasons_/))))'
 # A test that leaves a child holding stdout or stderr open is a test failure.
 leak-timeout = { period = "2s", result = "fail" }
 # Tests wait on the events they check rather than racing a deadline of their
@@ -29,10 +32,10 @@ slow-timeout = { period = "300s", terminate-after = 12 }
 # The extended campaigns are a separate, manually dispatched run.
 # Run with: cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast
 [profile.archive-matrix-extended]
-default-filter = '(test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/)'
+default-filter = '(test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & (test(/::combined_/) | test(/_schedules$/) | test(/demotion_reasons_/))'
 slow-timeout = { period = "300s", terminate-after = 12 }
 
 # The archive matrix and the extended campaigns together, as CI partitions them.
 [profile.archive-matrix-all]
-default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & test(/::combined_/))'
+default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & (test(/::combined_/) | test(/_schedules$/) | test(/demotion_reasons_/)))'
 slow-timeout = { period = "300s", terminate-after = 12 }
