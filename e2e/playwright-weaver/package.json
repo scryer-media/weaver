@@ -19,7 +19,7 @@
     "test:advanced-networking": "playwright test tests/network- --grep-invert \"@no-net-raw|@extended\"",
     "test:advanced-networking-no-net-raw": "playwright test tests/network-egress.spec.ts --grep @no-net-raw --grep-invert @extended",
     "test:advanced-networking-extended": "playwright test tests/network- --grep @extended",
-    "test:event-scripts": "playwright test tests/event-scripts.spec.ts tests/scan-scripts.spec.ts --grep-invert @extended",
+    "test:event-scripts": "playwright test tests/event-scripts.spec.ts tests/scan-scripts.spec.ts tests/script-restart.spec.ts --grep-invert @extended",
     "test:scheduling": "playwright test tests/scheduling.spec.ts tests/auto-backup.spec.ts --grep-invert \"@dst|@extended\"",
     "test:scheduling-dst": "playwright test tests/auto-backup.spec.ts --grep @dst --grep-invert @extended",
     "test:two-nic": "playwright test tests/two-nic.spec.ts --grep-invert @extended",

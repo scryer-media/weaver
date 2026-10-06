@@ -10,7 +10,7 @@ import {
   waitingGates, writeBareScript, writeFixturePackage, writeFixtureScript,
 } from "./support/script-fixtures";
 import {
-  type ListEntry, WEAVER_SCRIPTS_DIR, loadStageState, nzbDocument, nzbgetRpc, queueRows, saveStageState, scriptOutput,
+  type ListEntry, type ScriptResult, WEAVER_SCRIPTS_DIR, loadStageState, nzbDocument, nzbgetRpc, queueRows, saveStageState, scriptOutput,
   scriptResults, scriptSettings, setScriptLists, submitNzb, useScripts, waitJobLessResults, waitQueueRows, waitResults,
   withControlKey,
 } from "./support/script-settings";
@@ -25,7 +25,8 @@ import {
  * server, so a test that holds a run at its gate releases it (or removes the
  * gate of a run that is gone) before it ends.
  *
- * Q12 is last: its initial stage leaves a run started for the restart.
+ * Q12 lives in script-restart.spec.ts, the last file of the stage: its
+ * initial stage leaves a run started for the restart.
  */
 
 const token = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -47,6 +48,12 @@ async function job(request: APIRequestContext, name: string, files = 1, extraInp
   return result.jobId!;
 }
 
+/**
+ * A queue run whose job has already left the queue is skipped (only
+ * NZB_DELETED and NZB_MARKED run for a gone job), and a one-file probe job can
+ * finish before its NZB_ADDED run is claimed. Tests that need that run hold
+ * downloads paused until it has started.
+ */
 const forJob = (jobId: number) => (record: ScriptRecord) => (record.env.NZBNA_NZBID ?? record.env.NZBPP_NZBID) === String(jobId);
 const forEvent = (event: string) => (record: ScriptRecord) => record.env.NZBNA_EVENT === event;
 
@@ -79,6 +86,12 @@ async function drainGates(script: string, done: () => Promise<boolean>, describe
     return done();
   }, { message: describe, timeout: 0 }).toBe(true);
 }
+
+/**
+ * A listed script also gets a post-processing result (SKIPPED when it does not
+ * declare post-processing), so a queue run's result is matched on its event.
+ */
+const queueRun = (script: string, event: string) => (result: ScriptResult) => result.script === script && result.event === `queue:${event}`;
 
 const terminal = (request: APIRequestContext, jobId: number) => async () => ["COMPLETED", "FAILED"].includes(await jobState(request, jobId));
 
@@ -133,15 +146,18 @@ test("Q01 an NZB_ADDED script sees the job id, name and category", async ({ requ
   const script = writeFixtureScript(tag, { kinds: ["QUEUE"], queueEvents: ["NZB_ADDED"] });
   const categoryId = await addCategory(request, tag);
   const restore = await useScripts(request, { global: [{ script }] });
+  await pauseAll(request);
   try {
     const jobId = await job(request, tag, 1, { category: tag });
     const [record] = await waitRecords(script, 1, forJob(jobId));
     expect(record!.env).toMatchObject({ NZBNA_EVENT: "NZB_ADDED", NZBNA_NZBID: String(jobId), NZBNA_CATEGORY: tag });
     expect(record!.env.NZBNA_NZBNAME).toContain(tag);
-    const results = await waitResults(request, jobId, all => all.some(result => result.script === script), `Q01 result of ${script}`);
-    expect(results.find(result => result.script === script)!.status).toBe("SUCCEEDED");
+    const results = await waitResults(request, jobId, all => all.some(queueRun(script, "NZB_ADDED")), `Q01 result of ${script}`);
+    expect(results.find(queueRun(script, "NZB_ADDED"))!.status).toBe("SUCCEEDED");
+    await resumeAll(request);
     await waitTerminal(request, jobId);
   } finally {
+    await resumeAll(request);
     await restore();
     removeFixtureScripts([script]);
     await removeCategory(request, categoryId);
@@ -419,16 +435,19 @@ test("Q10 an event script past eventScriptTimeoutSeconds ends TIMED_OUT", async 
   const tag = `q10-${token()}`;
   const script = writeFixtureScript(tag, { kinds: ["QUEUE"], queueEvents: ["NZB_ADDED"], body: `echo q10-started\n${scriptBodies.sleepForever}` });
   const restore = await useScripts(request, { global: [{ script }] }, { eventScriptTimeoutSeconds: 2 });
+  await pauseAll(request);
   try {
     const jobId = await job(request, tag);
-    const results = await waitResults(request, jobId, all => all.some(result => result.script === script), `Q10 result of ${script}`);
-    const result = results.find(candidate => candidate.script === script)!;
+    const results = await waitResults(request, jobId, all => all.some(queueRun(script, "NZB_ADDED")), `Q10 result of ${script}`);
+    const result = results.find(queueRun(script, "NZB_ADDED"))!;
     expect(result.status).toBe("TIMED_OUT");
     expect(result.errorMessage).toBe("post-processing script timed out");
     expect(result.outputTail).toContain("q10-started");
     note("observed", `the termination is recorded in errorMessage; output tail: ${JSON.stringify(result.outputTail)}`);
+    await resumeAll(request);
     expect(await waitTerminal(request, jobId)).toBe("COMPLETED");
   } finally {
+    await resumeAll(request);
     await restore();
     removeFixtureScripts([script]);
   }
@@ -444,8 +463,8 @@ test("Q11 cancelling a job ends its blocked NZB_ADDED run", async ({ request }) 
     jobId = await job(request, tag);
     await expect.poll(() => gateWaiting(script, jobId), { message: "NZB_ADDED run at its gate", timeout: 0 }).toBe(true);
     await cancelJob(request, jobId);
-    const results = await waitResults(request, jobId, all => all.some(result => result.script === script), `Q11 result of ${script}`);
-    const result = results.find(candidate => candidate.script === script)!;
+    const results = await waitResults(request, jobId, all => all.some(queueRun(script, "NZB_ADDED")), `Q11 result of ${script}`);
+    const result = results.find(queueRun(script, "NZB_ADDED"))!;
     note("observed", `cancelled run: status ${result.status}, error ${result.errorMessage}`);
     expect(["CANCELLED", "FAILED", "SKIPPED"]).toContain(result.status);
     await waitQueueRows(jobId, rows => rows.every(row => row.state !== "started"), "no NZB_ADDED row left started");
@@ -801,6 +820,9 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
   const feed = writeFixtureScript(`${tag}-feed`, { kinds: ["FEED"], exitCode: 93 });
   const restore = await useScripts(request, { global: [queue, scheduler, scan, feed].map(script => ({ script })) });
   try {
+    // These selectors are the classic interface's; a browser that never chose
+    // gets the new one.
+    await page.addInitScript(() => window.localStorage.setItem("weaver.ui-variant", "classic"));
     await page.goto("/settings/post-processing");
     await expect(page.locator("#pp-script-directory")).toHaveValue(WEAVER_SCRIPTS_DIR);
     await expect(page.getByRole("group", { name: "Event scripts and output retention" })).toBeVisible();
@@ -815,7 +837,10 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
     await expect(entry(scan)).toContainText("Scan");
     await expect(entry(feed)).toContainText("Feed");
 
+    await pauseAll(request);
     const jobId = await job(request, tag);
+    await waitResults(request, jobId, all => all.some(queueRun(queue, "NZB_ADDED")), "the NZB_ADDED run of the queue script");
+    await resumeAll(request);
     expect(await waitTerminal(request, jobId)).toBe("COMPLETED");
     const results = (await waitResults(request, jobId, all => all.filter(result => result.script === queue).length >= 3, "three runs of the queue script"))
       .filter(result => result.script === queue);
@@ -831,29 +856,9 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
       await expect(page.getByText(status, { exact: true }).first()).toBeVisible();
     }
   } finally {
+    await resumeAll(request);
     await restore();
     removeFixtureScripts([queue, scheduler, scan, feed]);
   }
 });
 
-test("Q12 a restart marks a started queue run interrupted and the job carries on", async ({ request }) => {
-  const script = "q12-recovery";
-  if (stage() === "initial") {
-    writeFixtureScript(script, { kinds: ["QUEUE"], queueEvents: ["NZB_ADDED"], gate: true });
-    // Deliberately not restored: the run must still be started when Weaver restarts.
-    await useScripts(request, await withCurrentLists(request, [{ script }]));
-    const jobId = await job(request, `q12-${token()}`);
-    await expect.poll(() => gateWaiting(script, jobId), { message: "NZB_ADDED run at its gate", timeout: 0 }).toBe(true);
-    await waitQueueRows(jobId, rows => rows.some(row => row.event === "NZB_ADDED" && row.state === "started"), "NZB_ADDED run started");
-    saveStageState("q12", { jobId });
-    return;
-  }
-  const { jobId } = loadStageState<{ jobId: number }>("q12");
-  const current = (await scriptSettings(request)).lists;
-  await setScriptLists(request, { global: current.global.filter(entry => entry.script !== script), categories: current.categories });
-  // The restart killed the run that read this gate.
-  removeStaleGate(script, jobId);
-  removeFixtureScripts([script]);
-  expect((await queueRows(jobId, "NZB_ADDED")).map(row => row.state)).toEqual(["interrupted"]);
-  expect(await waitTerminal(request, jobId)).toBe("COMPLETED");
-});

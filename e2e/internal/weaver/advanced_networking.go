@@ -139,7 +139,7 @@ func eventScriptsReleaseFlow() weaverReleaseFlowSpec {
 		Name:             "event-scripts",
 		Kind:             weaverReleaseFlowBehavior,
 		PlaywrightScript: "event-scripts",
-		SpecFiles:        []string{"event-scripts.spec.ts", "scan-scripts.spec.ts"},
+		SpecFiles:        []string{"event-scripts.spec.ts", "scan-scripts.spec.ts", "script-restart.spec.ts"},
 		Services:         []string{"nntp", "nntp2", "weaver", "proxy-fixture"},
 		Datastores:       releaseDatastoreMatrix(),
 		Artifacts:        append(defaultWeaverReleaseArtifacts(), "script-records"),
