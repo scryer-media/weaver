@@ -611,6 +611,34 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
     .await
 }
 
+/// End a pipeline incarnation before the next one opens its database.
+///
+/// A process that exits takes every database handle with it at once; dropping
+/// a `Pipeline` does not. It drops only the pipeline's own `Database`: the
+/// writer task keeps committing what was queued to it, other holders keep
+/// their clones, and each pooled connection is closed later on its own sqlx
+/// thread — the last one in WAL mode under an exclusive lock while it
+/// checkpoints. A reopen that runs while any of that is still going on races
+/// it for the file, and loses with `database is locked` once the race outlasts
+/// the busy timeout.
+///
+/// So the queued writes land first — the same writes the old writer task would
+/// have committed after the drop, now ordered before the reopen — and then the
+/// pool is closed, which waits for every checked-out connection to come back
+/// and closes each one before it returns.
+async fn retire_pipeline_database(pipeline: Pipeline) {
+    let db = pipeline.db.clone();
+    drop(pipeline);
+    db.flush_write_queue().await.unwrap();
+    // `close` blocks on the database thread until the pool has closed, and a
+    // connection checked out on this runtime returns through a task spawned
+    // here; block elsewhere so that task can run.
+    tokio::task::spawn_blocking(move || db.close())
+        .await
+        .expect("closing the database should not panic")
+        .unwrap();
+}
+
 /// [`new_direct_pipeline`] whose direct-store gate comes from configuration.
 async fn new_config_gated_direct_pipeline(
     temp_dir: &TempDir,
