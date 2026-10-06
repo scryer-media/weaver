@@ -3175,6 +3175,12 @@ impl Pipeline {
         damaged: &[super::super::repair::DamagedDirectVolume],
         lengths: &std::collections::BTreeMap<u32, u64>,
     ) -> bool {
+        // The repaired bytes reach the router's header parse, which is where
+        // an `-hp` set proves its archive key. Articles hand the job's
+        // passwords to the router as they route, so a set that resumed from a
+        // restart with every article lost has never been offered one, and the
+        // parse would refuse a password the job holds.
+        self.refresh_direct_passwords(job_id);
         // An encrypted member's repaired span decrypts on the way
         // in, and every byte its CBC chain needs was dropped from staging when
         // the original article was routed. Two sources put them back, and
