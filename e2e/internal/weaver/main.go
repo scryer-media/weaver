@@ -348,6 +348,8 @@ func Run(args []string, programName string) {
 		cmdWeaverReleaseFlow(args[1:])
 	case "release-finalize":
 		cmdWeaverReleaseFinalize(args[1:])
+	case "two-nic":
+		cmdTwoNIC(args[1:])
 	case "test-all":
 		cmdTestAll()
 	case "test":
@@ -400,6 +402,7 @@ Commands:
   full                  Seed fixtures, then run functional, chaos, Docker restart, and managed restart phases
   release-gate [flow]   Run the independent Weaver product-behavior release gate
   release-console [run] Serve the latest or selected Weaver release-gate artifacts
+  two-nic <M|L>         Run the two-NIC lanes against real interfaces (see two-nic with no lane for its environment)
   test <slug> [slug...] Run specific test(s) by slug
   test-all              Submit all NZBs, poll all simultaneously
   pgo [slug...]         Run representative managed-Weaver flows for LLVM PGO data
