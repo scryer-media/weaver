@@ -253,7 +253,12 @@ async fn run_shape(
         if password.is_some() {
             profile.assert_rejected(&outcome, &wanted);
         } else {
-            assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
+            assert_eq!(
+                outcome.status,
+                Some(JobStatus::Complete),
+                "{:?}",
+                outcome.trace
+            );
             profile.assert_delivery(&outcome, route, &wanted, interruption);
             for (name, bytes) in &expected {
                 assert_eq!(
@@ -357,11 +362,7 @@ async fn encrypted_compressed_schedules() {
 }
 
 combined_campaign!(combined_copy, Shape::Copy, campaign);
-combined_campaign!(
-    combined_copy_four_volume,
-    Shape::CopyFourVolumes,
-    campaign
-);
+combined_campaign!(combined_copy_four_volume, Shape::CopyFourVolumes, campaign);
 combined_campaign!(
     combined_chase_copy_four_volume,
     Shape::CopyFourVolumes,

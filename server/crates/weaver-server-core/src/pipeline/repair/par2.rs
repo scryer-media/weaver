@@ -810,12 +810,10 @@ impl Pipeline {
                 .or_else(|| by_canonical.get(&canonical_filename).copied())
                 .or_else(|| {
                     match weaver_model::files::FileRole::from_filename(&canonical_filename) {
-                        weaver_model::files::FileRole::RarVolume { volume_number } => {
-                            by_rar_volume
-                                .get(&volume_number)
-                                .copied()
-                                .filter(|file_id| !named.contains(file_id))
-                        }
+                        weaver_model::files::FileRole::RarVolume { volume_number } => by_rar_volume
+                            .get(&volume_number)
+                            .copied()
+                            .filter(|file_id| !named.contains(file_id)),
                         _ => None,
                     }
                 });
