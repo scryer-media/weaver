@@ -6153,6 +6153,7 @@ version = "0.14.5"
 dependencies = [
  "cc",
  "crc-fast",
+ "crc32fast",
  "criterion",
  "libloading",
  "memchr",

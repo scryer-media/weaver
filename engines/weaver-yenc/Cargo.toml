@@ -11,6 +11,11 @@ thiserror = { workspace = true }
 crc-fast = { workspace = true }
 memchr = { workspace = true }
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# Its AVX2 VPCLMULQDQ tier folds four 256-bit lanes (128 B per iteration); the
+# CRC wrapper routes large updates there where crc-fast has no 256-bit tier.
+crc32fast = "1.5.2"
+
 [build-dependencies]
 cc = "1"
 
