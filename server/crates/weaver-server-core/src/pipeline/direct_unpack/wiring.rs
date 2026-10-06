@@ -2667,6 +2667,13 @@ impl Pipeline {
                 }
             }
 
+            // The outcome still owns the set, so the batch scheduler will not
+            // touch it, and a chase that finished on its own may have no file
+            // completion left to join it — one armed by the idle restart over
+            // parts that were all complete has none. Completion is the one
+            // place that consumes an outcome, so ask it now rather than leave
+            // the job extracting until something else happens to.
+            let job_id = key.0;
             self.direct_unpack.outcomes.insert(
                 key,
                 ChaseOutcome {
@@ -2679,6 +2686,7 @@ impl Pipeline {
                     damage_reported,
                 },
             );
+            self.schedule_job_completion_check(job_id);
         }
     }
 
