@@ -429,13 +429,61 @@ mod x86_vpclmul {
     use std::arch::x86_64::*;
     use std::sync::OnceLock;
 
+    /// `x^n mod P` in the reflected representation (`x^0` is bit 31), by
+    /// square-and-multiply in `const` context.
+    const fn xnmodp(mut n: u64) -> u32 {
+        let mut power = 1u32 << 31; // x^0
+        let mut square = 1u32 << 30; // x^1, then x^2, x^4, ...
+        while n != 0 {
+            if n & 1 != 0 {
+                power = super::multmodp(square, power);
+            }
+            square = super::multmodp(square, square);
+            n >>= 1;
+        }
+        power
+    }
+
+    /// Folding constant for a distance of `n` bits: `x^n mod P`, reflected and
+    /// shifted left one bit, the 33-bit form PCLMULQDQ folding multiplies by.
+    const fn fold_constant(n: u64) -> u64 {
+        (xnmodp(n) as u64) << 1
+    }
+
+    /// The multiplicative order of `x` modulo `P`: `x^ORDER == x^0`, so
+    /// `x^(ORDER - n)` is `x^-n`.
+    const X_ORDER: u64 = (1 << 32) - 1;
+
+    /// Main loop: each 128-bit lane moves 512 bits forward, so its high and low
+    /// 64-bit halves fold by `x^(512 + 32)` and `x^(512 - 32)`.
+    const FOLD_512_HI: i64 = fold_constant(544) as i64;
+    const FOLD_512_LO: i64 = fold_constant(480) as i64;
+    /// Tail reduction of four 128-bit lanes into one: fold by 128 bits.
+    const FOLD_128_HI: i64 = fold_constant(160) as i64;
+    const FOLD_128_LO: i64 = fold_constant(96) as i64;
+    /// 128 to 64 bits.
+    const FOLD_64: i64 = fold_constant(64) as i64;
+    /// Barrett reduction to 32 bits: `refl_33(mu)` without its `x^0` term,
+    /// which only reaches bits the reduction discards, and `refl_33(P)` without
+    /// its `x^32` term.
+    const BARRETT_MU: i64 = (super::clmul::MU_REFLECTED & 0xffff_ffff) as i64;
+    const BARRETT_P: i64 = fold_constant(32) as i64;
+    /// The initial CRC is multiplied by about `x^512` as it enters the first
+    /// fold, so it is rolled back first: multiplied by `x^-480`.
+    const INITIAL_ROLLBACK: i32 = fold_constant(X_ORDER - 480) as u32 as i32;
+
+    /// The CPU features the kernel is compiled for.
+    pub(super) fn capable() -> bool {
+        is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("pclmulqdq")
+            && is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("vpclmulqdq")
+    }
+
     pub(super) fn available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| {
-            is_x86_feature_detected!("avx2")
-                && is_x86_feature_detected!("pclmulqdq")
-                && is_x86_feature_detected!("sse4.1")
-                && is_x86_feature_detected!("vpclmulqdq")
+            capable()
                 // Tier logic: crc-fast only enables its own VPCLMULQDQ kernel when
                 // AVX512VL is present as well (`has_vpclmulqdq = has_avx512vl &&
                 // is_x86_feature_detected!("vpclmulqdq")`), and that kernel is a
@@ -484,22 +532,8 @@ mod x86_vpclmul {
     }
 
     #[inline(always)]
-    unsafe fn setr_epi32(a: u32, b: u32, c: u32, d: u32) -> __m128i {
-        unsafe { _mm_set_epi32(d as i32, c as i32, b as i32, a as i32) }
-    }
-
-    #[inline(always)]
     unsafe fn do_one_fold(src: __m256i, data: __m256i) -> __m256i {
-        let fold4 = _mm256_set_epi32(
-            0x0000_0001u32 as i32,
-            0x5444_2bd4u32 as i32,
-            0x0000_0001u32 as i32,
-            0xc6e4_1596u32 as i32,
-            0x0000_0001u32 as i32,
-            0x5444_2bd4u32 as i32,
-            0x0000_0001u32 as i32,
-            0xc6e4_1596u32 as i32,
-        );
+        let fold4 = _mm256_set_epi64x(FOLD_512_HI, FOLD_512_LO, FOLD_512_HI, FOLD_512_LO);
         unsafe {
             _mm256_xor_si256(
                 _mm256_xor_si256(data, _mm256_clmulepi64_epi128::<0x01>(src, fold4)),
@@ -554,7 +588,7 @@ mod x86_vpclmul {
         let xmm_t0 = unsafe {
             _mm_clmulepi64_si128(
                 _mm_cvtsi32_si128((!initial) as i32),
-                _mm_cvtsi32_si128(0xdfde_d7ecu32 as i32),
+                _mm_cvtsi32_si128(INITIAL_ROLLBACK),
                 0,
             )
         };
@@ -590,7 +624,7 @@ mod x86_vpclmul {
         let mut xmm_crc2 = _mm256_castsi256_si128(crc1);
         let mut xmm_crc3 = _mm256_extracti128_si256::<1>(crc1);
 
-        let mut fold = unsafe { setr_epi32(0xccaa_009e, 0x0000_0000, 0x7519_97d0, 0x0000_0001) };
+        let mut fold = _mm_set_epi64x(FOLD_128_HI, FOLD_128_LO);
         let tmp0 = _mm_clmulepi64_si128(xmm_crc0, fold, 0x10);
         xmm_crc0 = _mm_clmulepi64_si128(xmm_crc0, fold, 0x01);
         xmm_crc1 = unsafe { xor3_128(xmm_crc1, tmp0, xmm_crc0) };
@@ -603,7 +637,7 @@ mod x86_vpclmul {
         xmm_crc2 = _mm_clmulepi64_si128(xmm_crc2, fold, 0x01);
         xmm_crc3 = unsafe { xor3_128(xmm_crc3, tmp2, xmm_crc2) };
 
-        fold = unsafe { setr_epi32(0xccaa_009e, 0x0000_0000, 0x63cd_6124, 0x0000_0001) };
+        fold = _mm_set_epi64x(FOLD_64, FOLD_128_LO);
         xmm_crc0 = xmm_crc3;
         xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, fold, 0);
         xmm_crc0 = _mm_srli_si128::<8>(xmm_crc0);
@@ -615,7 +649,7 @@ mod x86_vpclmul {
         xmm_crc0 = _mm_and_si128(xmm_crc0, mask);
         xmm_crc3 = _mm_xor_si128(xmm_crc3, xmm_crc0);
 
-        fold = unsafe { setr_epi32(0xf701_1641, 0x0000_0000, 0xdb71_0640, 0x0000_0001) };
+        fold = _mm_set_epi64x(BARRETT_P, BARRETT_MU);
         xmm_crc1 = xmm_crc3;
         xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, fold, 0);
         xmm_crc3 = _mm_clmulepi64_si128(xmm_crc3, fold, 0x10);
@@ -625,9 +659,35 @@ mod x86_vpclmul {
         _mm_extract_epi32::<2>(xmm_crc3) as u32
     }
 
+    /// Runs the kernel wherever the CPU can execute it, including the AVX-512
+    /// parts where production stands aside for `crc-fast`, so those CI hosts
+    /// cover it too.
     #[cfg(test)]
     pub(super) fn test_update_forced(initial: u32, data: &[u8]) -> Option<u32> {
-        available().then(|| unsafe { update(initial, data) })
+        capable().then(|| unsafe { update(initial, data) })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn fold_constants_are_the_powers_they_name() {
+            // `fold_constant(n) >> 1` is `x^n mod P`; walking `x^n` one bit at a
+            // time with the scalar multiply must land on every exponent used.
+            let x = 1u32 << 30;
+            let mut power = 1u32 << 31;
+            for n in 0..=544u64 {
+                assert_eq!(xnmodp(n), power, "x^{n}");
+                power = super::super::multmodp(power, x);
+            }
+            assert_eq!(BARRETT_P as u64, super::super::clmul::P_REFLECTED ^ 1);
+            // The rollback really is `x^-480`, and fits the 32 bits it is loaded as.
+            assert_eq!(fold_constant(X_ORDER - 480) >> 32, 0);
+            let rollback = (INITIAL_ROLLBACK as u32) >> 1;
+            assert_eq!(super::super::multmodp(rollback, xnmodp(480)), 1 << 31);
+            assert_eq!(xnmodp(X_ORDER), 1 << 31, "x has order 2^32 - 1");
+        }
     }
 }
 
@@ -1028,9 +1088,8 @@ mod tests {
                     continue;
                 };
                 let Some(actual) = x86_vpclmul::test_update_forced(0, input) else {
-                    // Visible skip: without this line a host where `available()`
-                    // is false (no vpclmulqdq, or avx512vl present so the
-                    // crc-fast ZMM tier wins) reports `ok` while executing
+                    // Visible skip: without this line a host that cannot run
+                    // the kernel (no vpclmulqdq) reports `ok` while executing
                     // nothing — indistinguishable from real coverage in logs.
                     eprintln!(
                         "skipping crc32_forced_vpclmul_matches_crc_fast: VPCLMUL port unavailable on this CPU"
@@ -1042,6 +1101,67 @@ mod tests {
                     crc_fast::crc32_iso_hdlc(input),
                     "offset {offset} len {len}"
                 );
+            }
+        }
+    }
+
+    /// Every length through the tail and partial-fold boundaries, from a
+    /// non-zero carried CRC as well as the init state, over byte patterns that
+    /// stress the reductions, checked against a bitwise CRC built up one byte
+    /// at a time.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn crc32_forced_vpclmul_matches_bitwise_over_adversarial_inputs() {
+        const MAX_LEN: usize = 1100;
+        let mut seed = 0x2545_f491u32;
+        let random: Vec<u8> = (0..MAX_LEN + 31)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let patterns: [(&str, Vec<u8>); 4] = [
+            ("random", random),
+            ("zeros", vec![0u8; MAX_LEN + 31]),
+            ("ones", vec![0xffu8; MAX_LEN + 31]),
+            (
+                "alternating",
+                (0..MAX_LEN + 31)
+                    .map(|i| if i % 2 == 0 { 0xaa } else { 0x55 })
+                    .collect(),
+            ),
+        ];
+
+        for (name, data) in &patterns {
+            for offset in [0usize, 1, 15, 31] {
+                for initial in [0u32, 0x9e37_79b9, 0xffff_ffff] {
+                    // Bitwise register for `initial` extended by input[..len].
+                    let mut register = !initial;
+                    for len in 0..=MAX_LEN {
+                        let input = &data[offset..offset + len];
+                        let Some(actual) = x86_vpclmul::test_update_forced(initial, input) else {
+                            eprintln!(
+                                "skipping crc32_forced_vpclmul_matches_bitwise_over_adversarial_inputs: \
+                                 VPCLMUL port unavailable on this CPU"
+                            );
+                            return;
+                        };
+                        assert_eq!(
+                            actual, !register,
+                            "{name} offset {offset} initial {initial:#x} len {len}"
+                        );
+                        if len < MAX_LEN {
+                            register ^= u32::from(data[offset + len]);
+                            for _ in 0..8 {
+                                register = if register & 1 != 0 {
+                                    (register >> 1) ^ CRC32_POLY_REFLECTED
+                                } else {
+                                    register >> 1
+                                };
+                            }
+                        }
+                    }
+                }
             }
         }
     }
