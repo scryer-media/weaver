@@ -2380,10 +2380,8 @@ func isWeaverBrowserCrash(err error) bool {
 	}
 	message := strings.ToLower(err.Error())
 	for _, marker := range []string{
-		"browser has been closed",
 		"browser closed unexpectedly",
 		"browser process exited",
-		"target page, context or browser has been closed",
 		"failed to launch browser",
 		"browser crashed",
 	} {
@@ -2391,7 +2389,12 @@ func isWeaverBrowserCrash(err error) bool {
 			return true
 		}
 	}
-	return false
+	// Playwright closes a timed-out test's context, so a call still in flight
+	// reports the browser as closed. That is the test failing, not the browser.
+	if strings.Contains(message, "test timeout of") {
+		return false
+	}
+	return strings.Contains(message, "browser has been closed")
 }
 
 type weaverReleaseNntpConnections struct {

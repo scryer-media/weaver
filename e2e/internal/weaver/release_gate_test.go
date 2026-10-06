@@ -708,3 +708,20 @@ func TestProbeHostPortHeldSeesAListener(t *testing.T) {
 		t.Fatalf("a released port must read as free: %v", err)
 	}
 }
+
+func TestWeaverBrowserCrashIgnoresATestTimeout(t *testing.T) {
+	closed := "Error: apiRequestContext.post: Target page, context or browser has been closed"
+	for _, tc := range []struct {
+		output string
+		crash  bool
+	}{
+		{closed, true},
+		{"Test timeout of 300000ms exceeded.\n" + closed, false},
+		{"Test timeout of 300000ms exceeded.\nbrowserType.launch: Browser closed unexpectedly", true},
+		{"Error: expect(received).toBe(expected)", false},
+	} {
+		if got := isWeaverBrowserCrash(errors.New(tc.output)); got != tc.crash {
+			t.Errorf("isWeaverBrowserCrash(%q) = %v, want %v", tc.output, got, tc.crash)
+		}
+	}
+}
