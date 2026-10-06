@@ -7,6 +7,53 @@ use super::*;
 // Restart
 // ---------------------------------------------------------------------------
 
+/// The next incarnation opens the database only once the old one has let go
+/// of it. Here the old one still has a write transaction open on one of its
+/// pooled connections when the restart begins — the shape of a writer the drop
+/// did not stop — and the reopen must wait for that connection to be returned
+/// and closed rather than meet its lock.
+#[tokio::test]
+async fn restart_reopens_the_database_only_after_the_old_incarnation_released_it() {
+    use crate::persistence::sql_runtime::StoreDatastore;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let StoreDatastore::Sqlite { pool, .. } = pipeline.db.datastore() else {
+        panic!("the harness database is SQLite");
+    };
+    let mut held = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let closing = pool.close_event();
+
+    let mut restart = tokio::spawn(async move {
+        retire_pipeline_database(pipeline).await;
+        let (restarted, _, _) = new_direct_pipeline(&temp_dir).await;
+        (restarted, temp_dir)
+    });
+    // The pool closes before the reopen and cannot finish closing while the
+    // transaction is held, so the close is the only thing that can come first.
+    tokio::pin!(closing);
+    tokio::select! {
+        _ = &mut closing => {}
+        outcome = &mut restart => panic!(
+            "the restart reopened the database while the old incarnation held a write \
+             transaction on it: {:?}",
+            outcome.map(|_| ())
+        ),
+    }
+    sqlx::query("COMMIT").execute(&mut *held).await.unwrap();
+    drop(held);
+
+    let (restarted, _temp_dir) = restart.await.unwrap();
+    assert!(
+        restarted.db.load_active_jobs().unwrap().is_empty(),
+        "the restarted incarnation reads the database it reopened"
+    );
+}
+
 #[tokio::test]
 async fn restart_after_refetch_demotion_restores_incomplete_source_ownership() {
     let member_name = "Silver.Horizon.S01E25.mkv";

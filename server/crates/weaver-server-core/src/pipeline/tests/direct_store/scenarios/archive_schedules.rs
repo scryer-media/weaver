@@ -1212,7 +1212,7 @@ pub(super) async fn run_schedule_with(
                 demotions.append(&mut pipeline.direct_store.demotions);
                 let status = job_status_for_assert(&pipeline, job);
                 pipeline.direct_unpack_shutdown("schedule restart").await;
-                drop(pipeline);
+                retire_pipeline_database(pipeline).await;
                 // The write handles are process-wide; a dead process takes its
                 // handles with it, so the next incarnation must open its own.
                 settle_direct_output_removals(root.path()).await;
