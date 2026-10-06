@@ -31,6 +31,11 @@ Everything below is new since 0.14.5.
   never armed. The arming gate now also accepts the part's committed first
   segment. The job still finished before this fix, but through conventional
   extraction instead of the direct path.
+- A chase that arms over a set whose parts are already complete is always
+  consumed. The completion check joins a chase it armed itself instead of
+  returning, and a chase that finishes on its own now schedules a
+  completion check, so a resumed job no longer waits on the periodic
+  reconcile pass, or forever, with its output left in staging.
 - The direct-store campaign tests model 7z map slots from the container and
   wait for an in-flight RAR topology refresh before declaring a schedule
   stalled. Both were test-side defects that reported product failures that
