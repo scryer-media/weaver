@@ -149,13 +149,15 @@ func eventScriptsReleaseFlow() weaverReleaseFlowSpec {
 	}
 }
 
+// schedulingReleaseFlow runs the schedule and automatic-backup specs. The
+// RSS fixture's counted feeds show how often a scheduled fetch ran.
 func schedulingReleaseFlow() weaverReleaseFlowSpec {
 	return weaverReleaseFlowSpec{
 		Name:             "scheduling",
 		Kind:             weaverReleaseFlowBehavior,
 		PlaywrightScript: "scheduling",
 		SpecFiles:        []string{"scheduling.spec.ts", "auto-backup.spec.ts"},
-		Services:         []string{"nntp", "nntp2", "weaver"},
+		Services:         []string{"nntp", "nntp2", "weaver", "rss-fixture"},
 		Datastores:       releaseDatastoreMatrix(),
 		Artifacts:        append(defaultWeaverReleaseArtifacts(), "script-records"),
 		Timeout:          25 * time.Minute,
@@ -169,6 +171,7 @@ func schedulingDSTReleaseFlow() weaverReleaseFlowSpec {
 	spec.Name = "scheduling-dst"
 	spec.PlaywrightScript = "scheduling-dst"
 	spec.SpecFiles = []string{"auto-backup.spec.ts"}
+	spec.Services = []string{"nntp", "nntp2", "weaver"}
 	spec.Datastores = []weaverDatastore{weaverDatastoreSQLite}
 	spec.Timeout = 10 * time.Minute
 	spec.Stages = []string{"initial"}

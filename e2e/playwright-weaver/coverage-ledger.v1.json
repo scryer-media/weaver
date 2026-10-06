@@ -539,6 +539,11 @@
       "oracle": "browser"
     },
     {
+      "name": "updateAutoBackupSettings",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "createEgressInterface",
       "owner": "advanced-networking",
       "oracle": "api-metrics"
@@ -623,6 +628,21 @@
     {
       "name": "egress-legs-ladders-pools-and-sessions",
       "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-hold-and-one-shot-evaluators",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "automatic-and-upgrade-backups",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "nzbget-and-sab-script-adapters",
+      "owner": "event-scripts",
       "oracle": "api-metrics"
     }
   ]
