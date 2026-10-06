@@ -2729,6 +2729,98 @@ async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_c
     assert!(dest.join("E02.mkv").exists());
 }
 
+/// A chase armed after the download is over finishes with nothing left to
+/// join it, so the reap has to bring the job back to completion.
+///
+/// The idle-restart pass offers each set to a RAR chase before the batch
+/// scheduler, and a set the chase takes is no longer the batch scheduler's.
+/// Every part is already complete, so no file completion is left to join that
+/// chase; the reap stored its outcome and nothing ever consumed it, leaving the
+/// job in extraction with its output sitting in staging.
+#[tokio::test]
+async fn a_rar_chase_armed_by_idle_restart_is_joined_once_it_finishes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_unpack =
+        crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime::with_settings(
+            crate::pipeline::direct_unpack::settings::DirectUnpackSettings {
+                gate: crate::pipeline::direct_unpack::settings::DirectUnpackGate::Enabled,
+            },
+        );
+    let job_id = JobId(10075);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("Idle Restart RAR Chase", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    // Paused while the volumes land, so neither a chase nor a member worker
+    // claims the set before the download is over.
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        drain_rar_refreshes(&mut pipeline).await;
+    }
+    let set_name = pipeline
+        .rar_sets
+        .keys()
+        .find(|(job, _)| *job == job_id)
+        .map(|(_, set_name)| set_name.clone())
+        .expect("the volumes form one RAR set");
+    assert!(!pipeline.direct_unpack.is_armed(job_id, &set_name));
+    // The download is over: nothing is queued, so completion reads the
+    // pipeline as drained and takes its idle-restart pass.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    pipeline.check_job_completion(job_id).await;
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, &set_name),
+        "the idle restart offers the complete set to a chase"
+    );
+    assert!(
+        !pipeline.job_has_active_extraction_tasks(job_id),
+        "the batch scheduler leaves a chased set alone"
+    );
+
+    while !pipeline
+        .direct_unpack
+        .armed_worker_finished(job_id, &set_name)
+    {
+        tokio::task::yield_now().await;
+    }
+    pipeline.reap_direct_unpack().await;
+    assert!(
+        pipeline.direct_unpack.outcome(job_id, &set_name).is_some(),
+        "the reap records the finished chase"
+    );
+    while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+        pipeline.check_job_completion(queued_job).await;
+    }
+    assert!(
+        pipeline.job_has_active_extraction_tasks(job_id),
+        "a finished chase nothing else will join must be handed to extraction"
+    );
+
+    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Idle Restart RAR Chase",
+    ));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert_eq!(
+        tokio::fs::read(dest.join("E01.mkv")).await.unwrap(),
+        b"episode-a-payload"
+    );
+    assert_eq!(
+        tokio::fs::read(dest.join("E02.mkv")).await.unwrap(),
+        b"episode-b-payload"
+    );
+}
+
 #[tokio::test]
 async fn upstream_probe_falls_back_from_rar_to_7z_for_obfuscated_split_files() {
     let temp_dir = tempfile::tempdir().unwrap();
