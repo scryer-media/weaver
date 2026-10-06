@@ -6,7 +6,9 @@
 //! header leaves the set nothing to route by, so it demotes and the ordinary
 //! path repairs the volumes on disk. Shapes direct store refuses repair the
 //! same way they always extract: from the volumes.
-use super::super::super::super::archive_schedules::{RecoveryFormat, combined_schedule_cases, schedules};
+use super::super::super::super::archive_schedules::{
+    RecoveryFormat, combined_schedule_cases, schedules,
+};
 use super::*;
 
 /// Combined cases that carry a loss, and so a recovery set.
@@ -29,7 +31,9 @@ fn loss_cases(slice: Slice) -> Vec<(usize, Schedule)> {
     let carries_loss = |interruption: &Interruption| {
         matches!(
             interruption,
-            Interruption::Loss { .. } | Interruption::Combined { .. } | Interruption::Starved { .. }
+            Interruption::Loss { .. }
+                | Interruption::Combined { .. }
+                | Interruption::Starved { .. }
         )
     };
     match slice {

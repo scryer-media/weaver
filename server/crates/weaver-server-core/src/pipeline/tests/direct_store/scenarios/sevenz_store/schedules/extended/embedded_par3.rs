@@ -83,7 +83,8 @@ fn cases() -> Vec<(usize, Case)> {
     let mut cases = BTreeSet::new();
     for order in orders() {
         for mask in 0u8..16 {
-            let available = |&&(file, article): &&(u32, u32)| mask & (1 << (file * 2 + article)) == 0;
+            let available =
+                |&&(file, article): &&(u32, u32)| mask & (1 << (file * 2 + article)) == 0;
             let received: Vec<_> = order.iter().filter(available).copied().collect();
             if mask == 0 {
                 cases.insert((received.clone(), Interruption::None));
@@ -214,7 +215,12 @@ pub(super) async fn embedded_campaign(profile: ExtractionProfile, selection: Sel
                     Interruption::None,
                 )
                 .await;
-                assert_eq!(outcome.status, Some(JobStatus::Complete), "{:?}", outcome.trace);
+                assert_eq!(
+                    outcome.status,
+                    Some(JobStatus::Complete),
+                    "{:?}",
+                    outcome.trace
+                );
                 profile.assert_delivery(&outcome, route, &wanted, Interruption::None);
             }
             return;
@@ -227,7 +233,9 @@ pub(super) async fn embedded_campaign(profile: ExtractionProfile, selection: Sel
         if !profile.includes(interruption) {
             continue;
         }
-        eprintln!("embedded PAR3 profile={profile:?} case={case} order={order:?} interruption={interruption:?}");
+        eprintln!(
+            "embedded PAR3 profile={profile:?} case={case} order={order:?} interruption={interruption:?}"
+        );
         let outcome = run_schedule_with(
             options,
             profile,
