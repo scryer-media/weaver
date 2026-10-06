@@ -75,14 +75,11 @@ func TestWeaverReleaseFlowRegistryIsUniqueAndSelectable(t *testing.T) {
 			if !slices.Contains(want.Services, "weaver") {
 				t.Fatalf("registered Weaver release flow %q does not start Weaver", want.Name)
 			}
-			specPath := filepath.Join(
-				weaverE2ETestRoot(t),
-				"playwright-weaver",
-				"tests",
-				want.PlaywrightScript+".spec.ts",
-			)
-			if _, err := os.Stat(specPath); err != nil {
-				t.Fatalf("registered Weaver release flow %q has no Playwright spec %s: %v", want.Name, specPath, err)
+			for _, specFile := range weaverReleaseFlowSpecFiles(want) {
+				specPath := filepath.Join(weaverE2ETestRoot(t), "playwright-weaver", "tests", specFile)
+				if _, err := os.Stat(specPath); err != nil {
+					t.Fatalf("registered Weaver release flow %q has no Playwright spec %s: %v", want.Name, specPath, err)
+				}
 			}
 		}
 
@@ -99,12 +96,21 @@ func TestWeaverReleaseFlowRegistryIsUniqueAndSelectable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve all Weaver release flows: %v", err)
 	}
-	if len(all) != len(weaverReleaseFlowSpecs) {
-		t.Fatalf("all resolved %d Weaver flows, want %d", len(all), len(weaverReleaseFlowSpecs))
+	wantAll := 0
+	for _, spec := range weaverReleaseFlowSpecs {
+		if !spec.ExtendedOnly {
+			wantAll++
+		}
+	}
+	if len(all) != wantAll {
+		t.Fatalf("all resolved %d Weaver flows, want %d", len(all), wantAll)
 	}
 	for _, spec := range all {
 		if _, ok := seen[spec.Name]; !ok {
 			t.Fatalf("all contains unregistered Weaver flow %q", spec.Name)
+		}
+		if spec.ExtendedOnly {
+			t.Fatalf("all contains extended-only Weaver flow %q", spec.Name)
 		}
 	}
 
@@ -241,9 +247,9 @@ func TestWeaverReleaseFlowDatastoreMatrix(t *testing.T) {
 		}
 
 		switch spec.Name {
-		case "adaptive-dispatch":
+		case "adaptive-dispatch", "advanced-networking-no-net-raw", "advanced-networking-extended", "scheduling-dst":
 			if !reflect.DeepEqual(spec.Datastores, []weaverDatastore{weaverDatastoreSQLite}) {
-				t.Fatalf("adaptive-dispatch datastores = %v, want SQLite only", spec.Datastores)
+				t.Fatalf("%s datastores = %v, want SQLite only", spec.Name, spec.Datastores)
 			}
 		default:
 			if !reflect.DeepEqual(spec.Datastores, releaseDatastoreMatrix()) {
@@ -273,7 +279,7 @@ func TestWeaverReleasePhasesHaveIndependentOwnership(t *testing.T) {
 		t.Fatalf("create Weaver release phases: %v", err)
 	}
 
-	const wantPhaseCount = 27
+	const wantPhaseCount = 35
 	if len(phases) != wantPhaseCount {
 		t.Fatalf("release phase count = %d, want %d", len(phases), wantPhaseCount)
 	}

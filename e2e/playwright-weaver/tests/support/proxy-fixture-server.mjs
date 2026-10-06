@@ -19,15 +19,65 @@ function containerNameservers() {
   try { return parseNameservers(readFileSync("/etc/resolv.conf", "utf8")); } catch { return []; }
 }
 
+// Pool-member routes beyond the original ladder. CONNECT members listen on
+// 8101-8106 and SOCKS5 members on 8201-8204; they exist only when asked for,
+// so the proxy-routing flow keeps exactly the four routes it was built on.
+export const EXTRA_ROUTES = Object.freeze({
+  connect1: { kind: "connect", port: 8101 }, connect2: { kind: "connect", port: 8102 },
+  connect3: { kind: "connect", port: 8103 }, connect4: { kind: "connect", port: 8104 },
+  connect5: { kind: "connect", port: 8105 }, connect6: { kind: "connect", port: 8106 },
+  socks1: { kind: "socks", port: 8201 }, socks2: { kind: "socks", port: 8202 },
+  socks3: { kind: "socks", port: 8203 }, socks4: { kind: "socks", port: 8204 },
+});
+
+// "all" or a comma list of EXTRA_ROUTES names.
+export function parseRouteList(text) {
+  const value = String(text ?? "").trim();
+  if (!value) return [];
+  if (value === "all") return Object.keys(EXTRA_ROUTES);
+  const names = value.split(",").map(name => name.trim()).filter(Boolean);
+  for (const name of names) if (!EXTRA_ROUTES[name]) throw new Error(`unknown proxy fixture route ${name}`);
+  return [...new Set(names)];
+}
+
+// Comma list of IPv4 addresses the fixture owns, one per attached network.
+export function parseAddressList(text, fallback) {
+  const list = String(text ?? "").split(",").map(address => address.trim()).filter(Boolean);
+  for (const address of list) if (!net.isIPv4(address)) throw new Error(`invalid fixture address ${address}`);
+  return list.length ? list : [fallback];
+}
+
+// JSON object of infrastructure name -> IPv4 addresses answered locally, so a
+// multi-network flow can hand each egress the destination address on its own
+// network instead of whatever the container resolver would pick.
+export function parseHostTable(text) {
+  if (!text) return {};
+  const table = JSON.parse(text);
+  const out = {};
+  for (const [name, addresses] of Object.entries(table)) {
+    const list = Array.isArray(addresses) ? addresses : [addresses];
+    for (const address of list) if (!net.isIPv4(address)) throw new Error(`invalid address ${address} for ${name}`);
+    out[name.toLowerCase()] = list;
+  }
+  return out;
+}
+
 export async function startProxyFixture(options = {}) {
   const ip = options.ip ?? process.env.PROXY_FIXTURE_IP;
   if (!net.isIPv4(ip)) throw new Error("PROXY_FIXTURE_IP must be an IPv4 address");
   const nameservers = options.nameservers ?? containerNameservers();
-  const ports = { primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090, ...options.ports };
+  const extraRoutes = options.routes ?? parseRouteList(process.env.PROXY_FIXTURE_ROUTES);
+  const addresses = options.addresses ?? parseAddressList(process.env.PROXY_FIXTURE_ADDRESSES, ip);
+  const hosts = options.hosts ?? parseHostTable(process.env.PROXY_FIXTURE_HOSTS);
+  const ports = {
+    primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090,
+    ...Object.fromEntries(extraRoutes.map(name => [name, EXTRA_ROUTES[name].port])),
+    ...options.ports,
+  };
   const events = [];
   const sockets = new Set();
   const resolvers = new Set();
-  const routes = Object.fromEntries(["primary", "secondary", "tertiary", "direct"].map(name => [name, { up: true, hold: false, sockets: new Set() }]));
+  const routes = Object.fromEntries(["primary", "secondary", "tertiary", "direct", ...extraRoutes].map(name => [name, { up: true, hold: false, connectStatus: null, socksReply: null, sockets: new Set() }]));
   const servers = [];
   const held = new Set();
   let sequence = 0;
@@ -76,12 +126,13 @@ export async function startProxyFixture(options = {}) {
     return upstream;
   }
   function forward(client, route, host, port, reply) {
-    record("attempt", { route, host, port });
-    const allowedHost = host === ip || /^[a-z0-9-]+\.proxy\.test$/.test(host);
+    const peer = client.remoteAddress;
+    record("attempt", { route, host, port, client: peer });
+    const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.test$/.test(host);
     if (!allowedHost || ![ports.dns, ports.nntp, ports.http].includes(port) || !routes[route].up) {
       reply(false); client.end(); return;
     }
-    record("connected", { route, host, port });
+    record("connected", { route, host, port, client: peer });
     reply(true);
     const targetHost = port === ports.nntp ? (options.nntpHost ?? "nntp") : "127.0.0.1";
     const targetPort = port === ports.nntp ? (options.nntpPort ?? 119) : port;
@@ -109,7 +160,9 @@ export async function startProxyFixture(options = {}) {
       },
     };
   }
-  for (const route of ["primary", "tertiary"]) {
+  const connectRoutes = ["primary", "tertiary", ...extraRoutes.filter(name => EXTRA_ROUTES[name].kind === "connect")];
+  const socksRoutes = ["secondary", ...extraRoutes.filter(name => EXTRA_ROUTES[name].kind === "socks")];
+  for (const route of connectRoutes) {
     await listen(net.createServer(client => {
       if (!own(client)) return;
       const input = reader(client);
@@ -123,11 +176,16 @@ export async function startProxyFixture(options = {}) {
         if (!match || authorization !== Buffer.from("fixture:fixture").toString("base64")) {
           client.end("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"); return;
         }
+        const status = routes[route].connectStatus;
+        if (status !== null) {
+          record("attempt", { route, host: match[1], port: Number(match[2]), client: client.remoteAddress, status });
+          client.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? "Fixture Status"}\r\n\r\n`); return;
+        }
         forward(client, route, match[1], Number(match[2]), ok => client.write(`HTTP/1.1 ${ok ? "200 Connection Established" : "502 Bad Gateway"}\r\n\r\n`));
       });
     }), route);
   }
-  await listen(net.createServer(client => {
+  for (const route of socksRoutes) await listen(net.createServer(client => {
     if (!own(client)) return;
     const input = reader(client);
     let stage = 0;
@@ -152,9 +210,14 @@ export async function startProxyFixture(options = {}) {
       const host = buffer[3] === 1 ? [...buffer.subarray(start, start + length)].join(".") : buffer.subarray(start, start + length).toString();
       const port = buffer.readUInt16BE(start + length);
       input.finish(start + length + 2);
-      forward(client, "secondary", host, port, ok => client.write(Buffer.from([5, ok ? 0 : 5, 0, 1, 0, 0, 0, 0, 0, 0])));
+      const refusal = routes[route].socksReply;
+      if (refusal !== null) {
+        record("attempt", { route, host, port, client: client.remoteAddress, socksReply: refusal });
+        client.end(Buffer.from([5, refusal, 0, 1, 0, 0, 0, 0, 0, 0])); return;
+      }
+      forward(client, route, host, port, ok => client.write(Buffer.from([5, ok ? 0 : 5, 0, 1, 0, 0, 0, 0, 0, 0])));
     });
-  }), "secondary");
+  }), route);
   await listen(net.createServer(client => {
     if (!own(client)) return;
     record("direct-nntp");
@@ -173,9 +236,10 @@ export async function startProxyFixture(options = {}) {
     const name = labels.join(".").toLowerCase();
     const type = query.readUInt16BE(cursor + 1);
     const fixture = name.endsWith(".proxy.test");
+    const local = hosts[name];
     // Resolve only infrastructure names through the container's own resolvers.
     // Every destination name above is answered locally, even when direct.
-    if (["nntp", "nntp2", "weaver-postgres"].includes(name)) {
+    if (!local && ["nntp", "nntp2", "weaver-postgres"].includes(name)) {
       // Every resolver is asked at once and the first answer is used. One
       // that stays silent costs nothing; when none answers, neither does this
       // fixture, and the client asks again as it would of any resolver.
@@ -207,12 +271,13 @@ export async function startProxyFixture(options = {}) {
     const question = query.subarray(12, cursor + 5);
     const header = Buffer.alloc(12);
     query.copy(header, 0, 0, 2);
-    header.writeUInt16BE(fixture ? 0x8180 : 0x8183, 2);
+    const known = fixture || Boolean(local);
+    header.writeUInt16BE(known ? 0x8180 : 0x8183, 2);
     header.writeUInt16BE(1, 4);
-    if (fixture && type === 1) {
-      header.writeUInt16BE(1, 6);
-      const answer = Buffer.from([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, ...ip.split(".").map(Number)]);
-      return Buffer.concat([header, question, answer]);
+    if (known && type === 1) {
+      const answers = (local ?? addresses).map(address => Buffer.from([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, ...address.split(".").map(Number)]));
+      header.writeUInt16BE(answers.length, 6);
+      return Buffer.concat([header, question, ...answers]);
     }
     return Buffer.concat([header, question]);
   }
@@ -241,16 +306,30 @@ export async function startProxyFixture(options = {}) {
   await listen(http.createServer((request, response) => {
     record(request.socket.remoteAddress === "127.0.0.1" ? "routed-http" : "direct-http", { path: request.url, host: request.headers.host });
     const origin = `http://download.proxy.test:${ports.http}`;
+    const pathname = new URL(request.url ?? "/", "http://fixture.invalid").pathname;
     if (request.url?.startsWith("/redirect")) { response.writeHead(302, { location: `${origin}/feed.xml` }).end(); return; }
+    // A body that is not an NZB, for URL submissions that must fail to scan.
+    if (pathname === "/not-an-nzb.nzb") { response.writeHead(200, { "content-type": "application/x-nzb" }).end("<html><body>not an nzb</body></html>"); return; }
     if (request.url === "/feed.xml") {
       response.writeHead(200, { "content-type": "application/rss+xml" }).end(`<rss version="2.0"><channel><title>Proxy fixture</title><item><title>proxy-${feedToken}</title><guid>${feedToken}</guid><enclosure url="${origin}/probe.nzb" length="${Buffer.byteLength(nzb)}" type="application/x-nzb" /></item></channel></rss>`); return;
     }
-    if (request.url === "/probe.nzb") { response.writeHead(200, { "content-type": "application/x-nzb" }).end(nzb); return; }
+    // The query string is ignored so URL submissions can carry a secret that
+    // the script-output redaction must remove.
+    if (pathname === "/probe.nzb") { response.writeHead(200, { "content-type": "application/x-nzb" }).end(nzb); return; }
     response.writeHead(404).end();
   }), "http");
   await listen(http.createServer(async (request, response) => {
     response.setHeader("content-type", "application/json");
-    if (request.method === "GET") { response.end(JSON.stringify({ ip, ports, events, active: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, route.sockets.size])) })); return; }
+    if (request.method === "GET") {
+      const url = new URL(request.url ?? "/", "http://fixture.invalid");
+      if (url.pathname === "/events") {
+        // Watermark reads: only events after the sequence the caller saw.
+        const after = Number(url.searchParams.get("after") ?? 0);
+        if (!Number.isInteger(after) || after < 0) { response.writeHead(400).end(JSON.stringify({ error: "after must be a non-negative integer" })); return; }
+        response.end(JSON.stringify({ sequence, events: events.filter(event => event.sequence > after) })); return;
+      }
+      response.end(JSON.stringify({ ip, addresses, ports, sequence, events, active: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, route.sockets.size])) })); return;
+    }
     try {
       let body = "";
       for await (const chunk of request) { body += chunk; if (body.length > 65536) throw new Error("control body too large"); }
@@ -260,6 +339,14 @@ export async function startProxyFixture(options = {}) {
         if (!route) throw new Error("unknown route");
         if (typeof command.up === "boolean") route.up = command.up;
         if (typeof command.hold === "boolean") route.hold = command.hold;
+        if ("connectStatus" in command) {
+          if (command.connectStatus !== null && !(Number.isInteger(command.connectStatus) && command.connectStatus >= 100 && command.connectStatus <= 599)) throw new Error("connectStatus must be an HTTP status or null");
+          route.connectStatus = command.connectStatus;
+        }
+        if ("socksReply" in command) {
+          if (command.socksReply !== null && !(Number.isInteger(command.socksReply) && command.socksReply >= 1 && command.socksReply <= 255)) throw new Error("socksReply must be a non-zero byte or null");
+          route.socksReply = command.socksReply;
+        }
         if (command.cut) for (const socket of route.sockets) socket.destroy();
       }
       if (typeof command.nzb === "string") nzb = command.nzb;

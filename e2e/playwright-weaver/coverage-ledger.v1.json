@@ -537,6 +537,56 @@
       "name": "updateSettings",
       "owner": "ui-settings-crud",
       "oracle": "browser"
+    },
+    {
+      "name": "updateAutoBackupSettings",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "createEgressInterface",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "updateEgressInterface",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "deleteEgressInterface",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "createProxyPool",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "updateProxyPool",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "deleteProxyPool",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "saveNetworkRoute",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "testEgressInterface",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "testProxyPool",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
     }
   ],
   "behaviors": [
@@ -574,6 +624,26 @@
       "name": "transport-chaos",
       "owner": "existing-download-pipeline",
       "oracle": "existing-pipeline"
+    },
+    {
+      "name": "egress-legs-ladders-pools-and-sessions",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-hold-and-one-shot-evaluators",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "automatic-and-upgrade-backups",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "nzbget-and-sab-script-adapters",
+      "owner": "event-scripts",
+      "oracle": "api-metrics"
     }
   ]
 }
