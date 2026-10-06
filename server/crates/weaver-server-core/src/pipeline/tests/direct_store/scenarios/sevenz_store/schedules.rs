@@ -23,6 +23,98 @@ fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Reads one 7z variable-length number at `*at`, advancing past it.
+fn sevenz_number(bytes: &[u8], at: &mut usize) -> u64 {
+    let first = bytes[*at];
+    *at += 1;
+    let extra = first.leading_ones() as usize;
+    let mut value = 0u64;
+    for index in 0..extra {
+        value |= u64::from(bytes[*at + index]) << (8 * index);
+    }
+    *at += extra;
+    if extra < 8 {
+        value |= u64::from(u16::from(first) & (0xFF >> (extra + 1))) << (8 * extra);
+    }
+    value
+}
+
+/// The archive byte ranges a reader needs before it knows the container's
+/// layout: the start header, the end header it points at, and, when that end
+/// header only names a compressed header stored earlier, that stream too. An
+/// encrypted header refuses the set from the end header alone, so its stream
+/// is never needed.
+fn map_extents(archive: &[u8]) -> Vec<(usize, usize)> {
+    const SIGNATURE_HEADER: usize = 32;
+    const ENCODED_HEADER: u8 = 0x17;
+    const PACK_INFO: u8 = 0x06;
+    const AES_CODER: [u8; 4] = [0x06, 0xF1, 0x07, 0x01];
+    let offset = u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize;
+    let size = u64::from_le_bytes(archive[20..28].try_into().unwrap()) as usize;
+    let start = SIGNATURE_HEADER + offset;
+    let header = &archive[start..start + size];
+    let mut extents = vec![(0, SIGNATURE_HEADER), (start, start + size)];
+    if header.first() == Some(&ENCODED_HEADER)
+        && header.get(1) == Some(&PACK_INFO)
+        && !header.windows(AES_CODER.len()).any(|id| id == AES_CODER)
+    {
+        let mut at = 2;
+        let pack_position = sevenz_number(header, &mut at) as usize;
+        let streams = sevenz_number(header, &mut at);
+        assert_eq!(streams, 1, "one packed header stream");
+        assert_eq!(header[at], 0x09, "packed sizes follow");
+        at += 1;
+        let packed = sevenz_number(header, &mut at) as usize;
+        let packed_start = SIGNATURE_HEADER + pack_position;
+        extents.push((packed_start, packed_start + packed));
+    }
+    extents
+}
+
+/// The schedule slots holding any byte of [`map_extents`], as a loss mask.
+fn map_slots(archive: &[u8], count: usize, articles: usize) -> u8 {
+    let chunk = archive.len().div_ceil(count);
+    let extents = map_extents(archive);
+    let mut slots = 0u8;
+    for volume in 0..count {
+        let volume_start = volume * chunk;
+        let volume_len = archive.len().min(volume_start + chunk) - volume_start;
+        for article in 0..articles {
+            let (from, to) = article_extent(volume_len, article as u32, articles);
+            let (from, to) = (volume_start + from, volume_start + to);
+            if extents.iter().any(|&(start, end)| start < to && from < end) {
+                slots |= 1 << (volume * articles + article);
+            }
+        }
+    }
+    slots
+}
+
+/// `mask` loses an article of `MAP`.
+fn loses<const MAP: u8>(mask: u8) -> bool {
+    mask & MAP != 0
+}
+
+/// [`loses`] for every four-slot map, indexed by the map's own mask.
+const LOSES: [fn(u8) -> bool; 16] = [
+    loses::<0>,
+    loses::<1>,
+    loses::<2>,
+    loses::<3>,
+    loses::<4>,
+    loses::<5>,
+    loses::<6>,
+    loses::<7>,
+    loses::<8>,
+    loses::<9>,
+    loses::<10>,
+    loses::<11>,
+    loses::<12>,
+    loses::<13>,
+    loses::<14>,
+    loses::<15>,
+];
+
 #[derive(Clone, Copy, Debug)]
 enum Shape {
     Copy,
@@ -155,12 +247,15 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         shape,
         Shape::Copy | Shape::CopyFourVolumes | Shape::Multiple | Shape::EmptyEntry | Shape::Nested
     );
-    // A 7z set's layout lives in two articles of its own: the start header
-    // opens the first volume and the end header closing the last volume holds
-    // the map. Every schedule spans four article slots, so those are always
-    // slots 0 and 3. While either is lost no byte has a destination, and
+    // A 7z set's layout lives in articles of its own: the start header opens
+    // the first volume and the end header closing the last volume holds the
+    // map. Every schedule spans four article slots, so those are slots 0 and
+    // 3, plus whichever slot holds the compressed header an end header may
+    // only point at. While any of them is lost no byte has a destination, and
     // only a repair of the whole payload brings it back.
-    let unmapped_loss: fn(u8) -> bool = |mask| mask & 0b1001 != 0;
+    let map = map_slots(&archive, count, 4 / count);
+    assert_eq!(map & 0b1001, 0b1001, "{shape:?}: map slots {map:#06b}");
+    let unmapped_loss = LOSES[usize::from(map)];
     let route = match shape {
         _ if direct_compatible => Route {
             unmapped_loss,
