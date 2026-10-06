@@ -9,7 +9,7 @@ import {
 } from "./support/network-flow";
 import { NetworkWorld, PROXIED_HOST } from "./support/network-scenario";
 
-/** Reload, persistence, consumers (checkpoint 5.6). */
+/** Reload, persistence, consumers. */
 let world: NetworkWorld;
 test.beforeEach(async ({ request }) => { world = await NetworkWorld.create(request); });
 test.afterEach(async ({}, info) => { await world.cleanup(info); });

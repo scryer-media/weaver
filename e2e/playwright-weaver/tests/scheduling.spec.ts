@@ -12,7 +12,7 @@ import { stage } from "./support/network-flow";
 import { loadStageState, nzbDocument, nzbgetRpc, saveStageState, withControlKey } from "./support/script-settings";
 
 /**
- * Schedule rules (checkpoint section 8, T01-T16). Weaver reads the e2e clock
+ * Schedule rules (T01-T16). Weaver reads the e2e clock
  * on every evaluator tick, so each test moves the clock across its rule times
  * and waits for the effect the crossing produces.
  *
@@ -327,7 +327,7 @@ async function cancelledJob(request: APIRequestContext, name: string): Promise<n
 const localOutput = (outputDir: string) => outputDir.replace(/^\/data\/complete/, "/weaver-downloads");
 
 // ---------------------------------------------------------------------------
-// Tests, in the order the checkpoint's evaluator state needs (T13 last).
+// Tests, in the order the evaluator state needs (T13 last).
 
 test("T03 a legacy resume rule resumes downloads only", async ({ request }) => {
   initialOnly();

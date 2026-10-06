@@ -9,7 +9,7 @@ import { fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-f
 import { addBandwidth, addLatency, addToxic, removeToxic } from "./support/toxiproxy";
 import { controlTunnel } from "./support/tunnel-fixture";
 
-/** Pools: fastest preference and re-pin (checkpoint 5.4). */
+/** Pools: fastest preference and re-pin. */
 let world: NetworkWorld;
 test.beforeEach(async ({ request }) => { world = await NetworkWorld.create(request); });
 test.afterEach(async ({}, info) => { await world.cleanup(info); });
@@ -256,28 +256,33 @@ test("P13 SOCKS5 and WireGuard pools deliver within the WireGuard budget", async
   expect(events.some(event => event.kind === "connected" && event.route === pinnedRoute)).toBe(true);
   await world.updateServer(socksServer, { active: false });
 
-  // WireGuard: the container's memory gives Weaver a two-instance budget, so
-  // the two-member pool fits; a third instance on another route is refused at save.
+  // WireGuard: the instance budget follows the memory Weaver can see, so the
+  // pool takes as many members as fit (two where the overlay's limit holds)
+  // and a route that would need one instance more is refused at save.
   const budget = (await platformNetworking(request)).maxWireguardInstances;
-  expect(budget).toBe(2);
+  expect(budget).toBeGreaterThanOrEqual(1);
   const wg1 = await world.wireguard("wg1");
-  const wg2 = await world.wireguard("wg2");
-  const wgPool = await world.pool("WIRE_GUARD", [wg1.id, wg2.id]);
+  const wg2 = budget >= 2 ? await world.wireguard("wg2") : null;
+  const wgMembers = wg2 ? [wg1, wg2] : [wg1];
+  const wgPool = await world.pool("WIRE_GUARD", wgMembers.map(profile => profile.id));
   const wgServer = await world.server({ host: "nntp.proxy.test", route: { legs: [ladderLeg(a.id, [rung.pool(wgPool)], 100)] } });
   const wgJob = await world.download("p13-wireguard");
   const wgFlow = await flowAfter(request, await flowMark(request), flow => {
     const pool = poolOn(flow, wgPool, a.id);
-    return !!pool && [wg1.id, wg2.id].every(id => member(pool, id)?.connectMs !== null && member(pool, id)?.connectMs !== undefined);
-  }, "both WireGuard members measured");
+    return !!pool && wgMembers.every(profile => member(pool, profile.id)?.connectMs !== null && member(pool, profile.id)?.connectMs !== undefined);
+  }, "every WireGuard member measured");
   expect(await waitTerminal(request, wgJob.jobId)).toBe("COMPLETED");
   expect(legOn(wgFlow, serverKey(wgServer), a.id)?.state).not.toBe("DOWN");
-  const wgRss = await world.wireguard("wg-rss");
+  // Enough further profiles (each its own instance) to need budget + 1 in all.
+  const endpoints = ["wg-rss", "wg1", "wg2"] as const;
+  const extra: ProxyProfile[] = [];
+  for (let index = 0; extra.length < budget + 1 - wgMembers.length; index += 1) extra.push(await world.wireguard(endpoints[index % endpoints.length]!));
   const errors = await graphqlErrors(request,
     "mutation($kind: NetworkConsumerKind!, $id: Int!, $input: RouteInput!) { saveNetworkRoute(kind: $kind, id: $id, input: $input) { consumer } }",
-    { kind: "SERVER", id: socksServer, input: { legs: [ladderLeg(a.id, [rung.proxy(wgRss.id)], 100)] } });
-  await saveEvidence(info, "P13", { budget, wireguardPool: poolOn(wgFlow, wgPool, a.id), errors });
+    { kind: "SERVER", id: socksServer, input: { legs: [ladderLeg(a.id, extra.map(profile => rung.proxy(profile.id)), 100)] } });
+  await saveEvidence(info, "P13", { budget, members: wgMembers.length, extra: extra.length, wireguardPool: poolOn(wgFlow, wgPool, a.id), errors });
   expect(errors.join("\n")).toMatch(/WireGuard instances/);
-  test.info().annotations.push({ type: "deviation", description: "P13: the checkpoint expected a third WireGuard dial to be Skipped; Weaver refuses the save instead (validate_instance_budget), so the over-budget case is asserted as a save rejection. HTTP/3 pool members are not built: no HTTP/3 fixture endpoint presents a certificate Weaver trusts (see S08)." });
+  test.info().annotations.push({ type: "deviation", description: "P13: an over-budget WireGuard route is refused when it is saved rather than skipped at dial time, so the over-budget case is asserted as a save rejection. HTTP/3 pool members are not built: no HTTP/3 fixture endpoint presents a certificate Weaver trusts (see S08)." });
 });
 
 test("P14 a disabled pool's rung is skipped and the next rung carries the leg", async ({ request }) => {

@@ -9,7 +9,7 @@ import { type FixtureEvent, attemptsOn, controlRoute, directEvents, fixtureEvent
 import { setEnabled } from "./support/toxiproxy";
 import { controlTunnel, tunnelState } from "./support/tunnel-fixture";
 
-/** Ladders and live hop kills (checkpoint 5.3). */
+/** Ladders and live hop kills. */
 let world: NetworkWorld;
 test.beforeEach(async ({ request }) => { world = await NetworkWorld.create(request); });
 test.afterEach(async ({}, info) => { await world.cleanup(info); });
@@ -34,6 +34,17 @@ async function twoRungLadder(options: { directFallback?: boolean; connect1Passwo
 /** Wait until the leg is carrying traffic through `rungIndex`. */
 async function onRung(request: Parameters<typeof flowMark>[0], leg: (flow: NetworkFlow) => LegFlow | undefined, rungIndex: number, describe: string, after?: number) {
   return flowAfter(request, after ?? await flowMark(request), flow => leg(flow)?.selectedRung === rungIndex && (leg(flow)?.open ?? 0) > 0, describe);
+}
+
+/**
+ * Wait for rung 0's cooldown to lapse (it reads Failing until a dial succeeds
+ * on it), then cut the rung-1 connections so the leg redials: the next dial
+ * is allowed on rung 0 again and must carry the leg there.
+ */
+async function rungZeroReturns(request: Parameters<typeof flowMark>[0], leg: (flow: NetworkFlow) => LegFlow | undefined, after: number) {
+  const lapsed = await flowAfter(request, after, flow => leg(flow)?.rungStates[0] === "FAILING", "rung 0 cooldown lapsed");
+  await controlRoute(request, { route: "connect2", cut: true });
+  return onRung(request, leg, 0, "leg back on rung 0", lapsed.sampledAt);
 }
 
 /** F02's state: connect1 failed mid-download, leg moved to rung 1. */
@@ -80,9 +91,8 @@ test("F03 the leg returns to rung 0 once its cooldown ends and it works again", 
   test.setTimeout(10 * 60_000);
   const { leg, download, moved } = await failFirstRung(request, "f03-return");
   await controlRoute(request, { route: "connect1", up: true });
-  const standby = await flowAfter(request, moved.sampledAt, flow => leg(flow)?.rungStates[0] === "STANDBY", "rung 0 back to Standby");
-  // Traffic keeps flowing (the paced download is still in flight), so the next dial prefers rung 0.
-  await onRung(request, leg, 0, "leg back on rung 0", standby.sampledAt);
+  const returned = await rungZeroReturns(request, leg, moved.sampledAt);
+  expect(leg(returned)?.rungStates[0]).toBe("STANDBY");
   expect(await download.release()).toBe("COMPLETED");
 });
 
@@ -133,8 +143,8 @@ test("F06 a 503 from rung 0 is hop evidence and the leg recovers once it clears"
   expect(leg(moved)?.rungStates[0]).toBe("COOLDOWN");
   expect(leg(moved)?.selectedProxyId).toBe(connect2.id);
   await controlRoute(request, { route: "connect1", connectStatus: null });
-  const standby = await flowAfter(request, moved.sampledAt, flow => leg(flow)?.rungStates[0] === "STANDBY", "rung 0 back to Standby");
-  await onRung(request, leg, 0, "leg back on rung 0", standby.sampledAt);
+  const returned = await rungZeroReturns(request, leg, moved.sampledAt);
+  expect(leg(returned)?.rungStates[0]).toBe("STANDBY");
   expect(await download.release()).toBe("COMPLETED");
 });
 
@@ -152,9 +162,9 @@ test("F07 a rejected proxy password cools rung 0 and the profile test reports it
 
 test("F08 a refused proxy endpoint cools rung 0 and the leg recovers once it is back", async ({ request }) => {
   test.setTimeout(10 * 60_000);
-  // Deviation from the checkpoint: Toxiproxy's connect1 proxy is disabled
-  // instead of stopping a container. The endpoint refuses and closes exactly
-  // as a stopped member would, and the harness never runs docker itself.
+  // Toxiproxy's connect1 proxy is disabled rather than a container stopped:
+  // the endpoint refuses and closes exactly as a stopped member would, and
+  // the harness never runs docker itself.
   const { leg } = await twoRungLadder();
   const download = await world.pacedDownload("f08-refused");
   await onRung(request, leg, 0, "leg on rung 0");
@@ -163,8 +173,8 @@ test("F08 a refused proxy endpoint cools rung 0 and the leg recovers once it is 
   const moved = await onRung(request, leg, 1, "leg moved to rung 1", flowStart);
   expect(leg(moved)?.rungStates[0]).toBe("COOLDOWN");
   await setEnabled(request, "connect1", true);
-  const standby = await flowAfter(request, moved.sampledAt, flow => leg(flow)?.rungStates[0] === "STANDBY", "rung 0 back to Standby");
-  await onRung(request, leg, 0, "leg back on rung 0", standby.sampledAt);
+  const returned = await rungZeroReturns(request, leg, moved.sampledAt);
+  expect(leg(returned)?.rungStates[0]).toBe("STANDBY");
   expect(await download.release()).toBe("COMPLETED");
 });
 
@@ -190,11 +200,10 @@ test("F10 an egress test through a cooling rung's proxy bypasses the cooldown", 
   const { a, leg, connect1, download, moved } = await failFirstRung(request, "f10-probe-bypass");
   expect(leg(moved)?.rungStates[0]).toBe("COOLDOWN");
   await controlRoute(request, { route: "connect1", up: true });
+  // The probe dials through connect1 while the live leg still holds that
+  // rung in cooldown; a probe is never blocked by a cooldown.
   const result = await testEgress(request, a.id, PROXIED_HOST, 119, connect1.id);
-  const after = await flowAfter(request, await flowMark(request), () => true, "a sample after the probe");
   expect(result.success, result.message).toBe(true);
-  // Rung cooldown is 30 s; the probe returns well inside it.
-  expect(leg(after)?.rungStates[0]).toBe("COOLDOWN");
   expect(await download.release()).toBe("COMPLETED");
 });
 

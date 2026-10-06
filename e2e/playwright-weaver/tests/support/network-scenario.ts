@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import type { APIRequestContext, TestInfo } from "@playwright/test";
-import { expect, graphql, setNntpChaos, submitProbeNzb, updateConfiguredServer } from "../helpers";
+import { expect, graphql, postProbeArticle, setNntpChaos, submitProbeNzb, updateConfiguredServer } from "../helpers";
 import { postProbeFile, waitTerminal } from "./downloads";
 import {
   type ConsumerKind, type Egress, type ProxyProfile, type ProxyProfileInput, type RouteInput,
@@ -10,7 +10,6 @@ import {
   saveProxyProfile, saveRoute,
 } from "./network-flow";
 import { fixtureState, resetRoutes, setFixtureNzb } from "./proxy-fixture";
-import { postProbeArticle } from "../helpers";
 import { TOXIPROXY_PORTS, resetToxiproxy, type ToxiproxyName } from "./toxiproxy";
 import { resetTunnels, tunnelState, TUNNEL_PORTS, type TunnelEndpoint } from "./tunnel-fixture";
 import { stopCapture } from "./capture";

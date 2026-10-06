@@ -176,12 +176,11 @@ export function scriptRecords(script?: string): ScriptRecord[] {
   if (!fs.existsSync(RECORDS_DIR)) return [];
   return fs.readdirSync(RECORDS_DIR)
     .filter(file => file.endsWith(".env") && !file.startsWith("."))
-    .sort((left, right) => {
-      const [leftTime, leftPid] = left.split("-").map(Number);
-      const [rightTime, rightPid] = right.split("-").map(Number);
-      return (leftTime! - rightTime!) || (leftPid! - rightPid!);
-    })
-    .map(file => parseScriptRecord(file.replace(/\.env$/, ""), fs.readFileSync(path.join(RECORDS_DIR, file), "utf8")))
+    // The id carries whole seconds, so order by the file's own write time
+    // (rename keeps it) and fall back to the id for files written together.
+    .map(file => ({ file, writtenAt: fs.statSync(path.join(RECORDS_DIR, file)).mtimeMs }))
+    .sort((left, right) => (left.writtenAt - right.writtenAt) || left.file.localeCompare(right.file))
+    .map(({ file }) => parseScriptRecord(file.replace(/\.env$/, ""), fs.readFileSync(path.join(RECORDS_DIR, file), "utf8")))
     .filter(record => script === undefined || record.script === script);
 }
 

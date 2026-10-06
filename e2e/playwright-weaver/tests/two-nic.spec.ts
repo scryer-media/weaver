@@ -11,7 +11,7 @@ import { saveEvidence } from "./support/network-scenario";
 import { controlRoute, resetRoutes } from "./support/proxy-fixture";
 
 /**
- * Two-NIC lanes (checkpoint 6), run only by the `two-nic` command against
+ * Two-NIC lanes, run only by the `two-nic` command against
  * real machines. Lane M: native macOS Weaver with Wi-Fi and LAN egresses.
  * Lane L: Weaver's Linux image with host networking. Lane L scenario titles
  * carry a "Lane L" prefix because L01-L05 are also the network-legs IDs.
@@ -305,6 +305,7 @@ test.describe("lane L", () => {
     const src = await egress(request, "src");
     const id = await server(request, { legs: [directLeg(lan.id, 50), directLeg(src.id, 50)] });
     const download = await pacedDownload(request, "lane-l-02", 320);
+    test.info().annotations.push({ type: "observed", description: `kernel ${process.env.E2E_TWO_NIC_KERNEL ?? "unknown"}: ${kernelAtLeast57() ? "unprivileged bind branch" : "refusal branch"}` });
     if (kernelAtLeast57()) {
       await flowAfter(request, await flowMark(request), sample => legOn(sample, serverKey(id), lan.id)?.state === "UP", "LAN leg Up (unprivileged bind on 5.7+)");
     } else {

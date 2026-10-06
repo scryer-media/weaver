@@ -6,7 +6,7 @@ import { graphqlErrors, stage } from "./support/network-flow";
 import { loadStageState, saveStageState } from "./support/script-settings";
 
 /**
- * Automatic backups (checkpoint section 8, B01-B06). The daily scheduler
+ * Automatic backups (B01-B06). The daily scheduler
  * reads Weaver's e2e clock, so each test moves the clock across its backup
  * time and waits for the backup the crossing produces.
  *
@@ -85,7 +85,7 @@ const initialOnly = () => test.skip(stage() !== "initial", "runs in the initial 
 
 test("B02 enabling without a key is refused and no backup runs", async ({ request }) => {
   initialOnly();
-  note("discrepancy", "The checkpoint expects the save to succeed and simply produce no backup; the product refuses to enable automatic backups without a key, so nothing is ever scheduled.");
+  note("discrepancy", "Enabling automatic backups without a key is refused outright rather than accepted and left idle, so nothing is ever scheduled.");
   await disableAuto(request);
   const day = freshDay();
   setClock(at(day, 2, 58));

@@ -6,7 +6,7 @@ import { clearScriptRecords, removeFixtureScripts, scriptBodies, scriptRecords, 
 import { useScripts } from "./support/script-settings";
 import { tunnelState } from "./support/tunnel-fixture";
 
-/** RSS through routes (checkpoint 5.7). */
+/** RSS through routes. */
 let world: NetworkWorld;
 test.beforeEach(async ({ request }) => { world = await NetworkWorld.create(request); });
 test.afterEach(async ({}, info) => { await world.cleanup(info); });
@@ -48,12 +48,15 @@ test("RS02 a feed moves to its second rung while the first is down and returns a
   expect(connectedOn(down.events, "connect2").length).toBeGreaterThan(0);
   const cooling = await flowAfter(request, await flowMark(request), flow => leg(flow)?.rungStates[0] === "COOLDOWN", "rung 0 cooling");
   await controlRoute(request, { route: "connect1", up: true });
-  await flowAfter(request, cooling.sampledAt, flow => leg(flow)?.rungStates[0] === "STANDBY", "rung 0 cooldown over");
+  // The rung reads Failing once its cooldown lapses; only a dial that
+  // succeeds on it takes it back to Standby.
+  await flowAfter(request, cooling.sampledAt, flow => leg(flow)?.rungStates[0] === "FAILING", "rung 0 cooldown over");
   await world.armFeed(`rs02-back-${Date.now()}`);
   const back = await syncedEvents(request, feed);
   expect(back.report.errors).toEqual([]);
   expect(connectedOn(back.events, "connect1").length).toBeGreaterThan(0);
   expect(connectedOn(back.events, "connect2")).toEqual([]);
+  await flowAfter(request, await flowMark(request), flow => leg(flow)?.rungStates[0] === "STANDBY", "rung 0 Standby after the successful fetch");
 });
 
 test("RS03 with every rung down, direct fallback resolves and fetches directly", async ({ request }) => {

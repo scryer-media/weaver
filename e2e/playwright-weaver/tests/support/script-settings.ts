@@ -39,8 +39,10 @@ export async function scriptSettings(request: APIRequestContext): Promise<Script
     `query { postProcessingSettings { ${SETTINGS_FIELDS} lists { ${LIST_FIELDS} } } }`)).postProcessingSettings;
 }
 
-function settingsInput(settings: ScriptSettings): Record<string, unknown> {
-  const { scriptDirectory: _directory, strictSecurityRefusesExecution: _strict, ...input } = settings;
+function settingsInput(settings: ScriptSettings & { lists?: ScriptLists }): Record<string, unknown> {
+  // The query also carries the read-only directory and policy flag and the
+  // script lists, none of which the settings input accepts.
+  const { scriptDirectory: _directory, strictSecurityRefusesExecution: _strict, lists: _lists, ...input } = settings;
   return input;
 }
 

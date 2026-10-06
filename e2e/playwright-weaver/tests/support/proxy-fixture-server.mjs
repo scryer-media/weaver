@@ -83,9 +83,20 @@ export async function startProxyFixture(options = {}) {
   let sequence = 0;
   let feedToken = "initial";
   let nzb = "";
+  // Article bytes arrive in many chunks per connection; consecutive chunks on
+  // one route fold into the last event so a long download cannot push the
+  // events a test asserts (connections, DNS, held bodies) out of the log. The
+  // log keeps the newest events; sequence numbers stay monotonic across drops.
+  const EVENT_LIMIT = 20000;
   const record = (kind, fields = {}) => {
-    if (events.length >= 20000) throw new Error("proxy fixture event limit exceeded");
+    const last = events[events.length - 1];
+    if (kind === "nntp-bytes" && last?.kind === "nntp-bytes" && last.route === fields.route) {
+      last.bytes += fields.bytes;
+      last.chunks = (last.chunks ?? 1) + 1;
+      return;
+    }
     events.push({ sequence: ++sequence, at: Date.now(), kind, ...fields });
+    if (events.length > EVENT_LIMIT) events.splice(0, events.length - EVENT_LIMIT);
   };
   const own = socket => {
     if (sockets.size >= 256) { socket.destroy(); return; }

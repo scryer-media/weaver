@@ -8,7 +8,7 @@ import {
 } from "./support/script-settings";
 
 /**
- * SCAN scripts (checkpoint section 7, SC01-SC14). Each test lists one SCAN
+ * SCAN scripts (SC01-SC14). Each test lists one SCAN
  * script that prints NZBGet directives, submits an NZB and reads what the
  * queue item became. Downloads are paused for the whole spec so the items
  * stay queued; every job a test creates is cancelled after it.

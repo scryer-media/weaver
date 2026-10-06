@@ -8,7 +8,7 @@ import { NetworkWorld, PROXIED_HOST, saveEvidence } from "./support/network-scen
 import { fixtureEvents, fixtureMark } from "./support/proxy-fixture";
 import { controlTunnel, tunnelMark, tunnelState, waitTunnelEvents } from "./support/tunnel-fixture";
 
-/** Sessions: SSH, WireGuard, HTTP/3 (checkpoint 5.5). */
+/** Sessions: SSH, WireGuard, HTTP/3. */
 let world: NetworkWorld;
 test.beforeEach(async ({ request }) => { world = await NetworkWorld.create(request); });
 test.afterEach(async ({}, info) => { await world.cleanup(info); });
@@ -22,6 +22,13 @@ function resaveInput(profile: ProxyProfile, overrides: Partial<ProxyProfileInput
   };
 }
 
+/** Distinct auth methods the fixture accepted after the first `seen` entries; the list grows for the fixture's lifetime. */
+function authSince(accepted: string[], seen: number): string[] {
+  const since = accepted.slice(seen);
+  expect(since.length, "at least one authentication since the snapshot").toBeGreaterThan(0);
+  return [...new Set(since)].sort();
+}
+
 async function sshServer(profile: ProxyProfile) {
   const a = await world.egress("a");
   const server = await world.server({ host: "nntp", route: { legs: [ladderLeg(a.id, [rung.proxy(profile.id)], 100)] } });
@@ -32,11 +39,12 @@ async function sshServer(profile: ProxyProfile) {
 test("S01 SSH password auth forwards to the NNTP server", async ({ request }) => {
   test.setTimeout(10 * 60_000);
   const ssh1 = await world.ssh("ssh1");
+  const seen = (await tunnelState(request)).ssh.ssh1!.acceptedAuth.length;
   await sshServer(ssh1);
   const download = await world.download("s01-password");
   expect(await waitTerminal(request, download.jobId)).toBe("COMPLETED");
   const state = (await tunnelState(request)).ssh.ssh1!;
-  expect([...new Set(state.acceptedAuth)]).toEqual(["password"]);
+  expect(authSince(state.acceptedAuth, seen)).toEqual(["password"]);
   expect(state.forwarded).toContainEqual(["nntp", 119]);
 });
 
@@ -44,19 +52,24 @@ test("S02 SSH key and passphrase-protected key auth; a wrong passphrase takes th
   test.setTimeout(10 * 60_000);
   for (const [endpoint, auth] of [["ssh2", "key"], ["ssh3", "passphrase"]] as const) {
     const profile = await world.ssh(endpoint, { auth });
+    const seen = (await tunnelState(request)).ssh[endpoint]!.acceptedAuth.length;
     const { server } = await sshServer(profile);
     const download = await world.download(`s02-${auth}`);
     expect(await waitTerminal(request, download.jobId)).toBe("COMPLETED");
-    expect([...new Set((await tunnelState(request)).ssh[endpoint]!.acceptedAuth)], endpoint).toEqual(["publickey"]);
+    expect(authSince((await tunnelState(request)).ssh[endpoint]!.acceptedAuth, seen), endpoint).toEqual(["publickey"]);
     await world.updateServer(server, { active: false });
   }
   const wrong = await world.ssh("ssh3", { auth: "wrong-passphrase" });
   const { leg } = await sshServer(wrong);
   const mark = await flowMark(request);
   const download = await world.download("s02-wrong-passphrase");
-  const flow = await flowAfter(request, mark, sample => leg(sample)?.state === "DOWN" || leg(sample)?.state === "BLOCKED", "leg Down on the key error");
-  expect(leg(flow)?.reason?.trim()).toBeTruthy();
-  test.info().annotations.push({ type: "job", description: `s02-wrong-passphrase job ${download.jobId} is left to cleanup` });
+  try {
+    const flow = await flowAfter(request, mark, sample => leg(sample)?.state === "DOWN" || leg(sample)?.state === "BLOCKED", "leg Down on the key error");
+    expect(leg(flow)?.reason?.trim()).toBeTruthy();
+  } finally {
+    // The job can never download through a leg that cannot authenticate.
+    await graphql(request, "mutation($id: Int!) { cancelJob(id: $id) }", { id: download.jobId });
+  }
 });
 
 test("S03 a host key that changes after first use blocks the leg until reset", async ({ request }) => {
@@ -100,8 +113,12 @@ test("S05 two servers on one SSH profile share a session that closes when both r
   const mark = await tunnelMark(request);
   const first = await world.server({ host: "nntp", route: { legs: [ladderLeg(a.id, [rung.proxy(ssh1.id)], 100)] } });
   const second = await world.server({ host: "nntp", route: { legs: [ladderLeg(a.id, [rung.proxy(ssh1.id)], 100)] } });
-  const jobs = [await world.download("s05-one"), await world.download("s05-two")];
-  for (const job of jobs) expect(await waitTerminal(request, job.jobId)).toBe("COMPLETED");
+  // Both jobs are in flight together, so the session is busy throughout and
+  // one connect is the only correct count.
+  const paced = await world.pacedDownload("s05-one", { parts: 64, slowMs: 500 });
+  const second = await world.download("s05-two");
+  expect(await paced.release()).toBe("COMPLETED");
+  expect(await waitTerminal(request, second.jobId)).toBe("COMPLETED");
   const flow = await flowAfter(request, await flowMark(request), sample => [first, second].every(id => legOn(sample, serverKey(id), a.id) !== undefined), "both legs present");
   const connects = (await waitTunnelEvents(request, mark, events => events.some(event => event.kind === "connect" && event.endpoint === "ssh1"), "an SSH session on ssh1"))
     .filter(event => event.kind === "connect" && event.endpoint === "ssh1");
@@ -115,10 +132,10 @@ test("S05 two servers on one SSH profile share a session that closes when both r
   await waitTunnelEvents(request, removed, events => events.some(event => event.kind === "disconnect" && event.endpoint === "ssh1"), "the shared session closed");
 });
 
-test("S06 an idle SSH session is retired when its server goes away and rebuilt when it returns", async ({ request }) => {
+test("S06 a lost SSH endpoint takes the leg Down and the session is rebuilt when it returns", async ({ request }) => {
   test.setTimeout(10 * 60_000);
-  // Deviation from the checkpoint: the endpoint is taken down through the
-  // tunnel fixture's control API instead of stopping its container.
+  // The endpoint is taken down through the tunnel fixture's control API,
+  // which refuses and closes exactly as a stopped container would.
   const ssh1 = await world.ssh("ssh1");
   const { leg } = await sshServer(ssh1);
   const warm = await world.download("s06-warm");

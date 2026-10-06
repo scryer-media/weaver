@@ -16,7 +16,7 @@ import {
 } from "./support/script-settings";
 
 /**
- * Queue, scheduler and feed scripts (checkpoint section 7). Every fixture
+ * Queue, scheduler and feed scripts. Every fixture
  * records the environment it was given; assertions read those records, the
  * public results and the durable `script_event_queue` rows.
  *

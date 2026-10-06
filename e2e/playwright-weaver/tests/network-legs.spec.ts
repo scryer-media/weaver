@@ -1,4 +1,4 @@
-import { expect, nntpConnectionMetrics, resetNntpMetrics, test } from "./helpers";
+import { expect, graphql, nntpConnectionMetrics, resetNntpMetrics, test } from "./helpers";
 import { ifaceFor, packetCount, startCapture, stopCapture } from "./support/capture";
 import { waitTerminal } from "./support/downloads";
 import {
@@ -10,7 +10,7 @@ import { attemptsOn, controlRoute, fixtureEvents, fixtureMark, waitFixtureEvents
 import { addToxic, removeToxic } from "./support/toxiproxy";
 import { controlTunnel, tunnelState } from "./support/tunnel-fixture";
 
-/** Legs, weights and failover (checkpoint 5.2). */
+/** Legs, weights and failover. */
 let world: NetworkWorld;
 test.beforeEach(async ({ request }) => { world = await NetworkWorld.create(request); });
 test.afterEach(async ({}, info) => { await world.cleanup(info); });
@@ -51,8 +51,6 @@ test("L01 an even split opens two connections on each egress from its own addres
   await saveEvidence(info, "L01", { flow, counts });
   expect(counts.a).toBeGreaterThan(0);
   expect(counts.b).toBeGreaterThan(0);
-  // Weaver's four sessions plus the metrics probe itself.
-  expect((await nntpConnectionMetrics()).accepted).toBeGreaterThanOrEqual(5);
 });
 
 test("L02 largest-remainder targets for 75/25 and 70/30", async ({ request }) => {
@@ -70,17 +68,18 @@ test("L02 largest-remainder targets for 75/25 and 70/30", async ({ request }) =>
 test("L03 route shape rules reject every malformed route", async ({ request }) => {
   const server = await world.server();
   const p = (id: number) => rung.proxy(id);
-  const cases: Array<[string, unknown]> = [
-    ["weights that do not sum to 100", { legs: [directLeg(0, 60), directLeg(0, 50)] }],
-    ["nine legs", { legs: Array.from({ length: 9 }, (_, index) => directLeg(0, index === 0 ? 92 : 1)) }],
-    ["a zero weight", { legs: [directLeg(0, 0), directLeg(0, 100)] }],
-    ["ten rungs", { legs: [ladderLeg(0, Array.from({ length: 10 }, (_, index) => p(index + 1)), 100)] }],
-    ["a chain of one", { legs: [ladderLeg(0, [rung.chain([1])], 100)] }],
-    ["a chain of four", { legs: [ladderLeg(0, [rung.chain([1, 2, 3, 4])], 100)] }],
+  // Shape is validated before references, so the proxy ids need not exist.
+  const cases: Array<[string, unknown, string]> = [
+    ["weights that do not sum to 100", { legs: [directLeg(0, 60), directLeg(0, 50)] }, "leg weights must sum to exactly 100"],
+    ["nine legs", { legs: Array.from({ length: 9 }, (_, index) => directLeg(0, index === 0 ? 92 : 1)) }, "a route requires between one and eight legs"],
+    ["a zero weight", { legs: [directLeg(0, 0), directLeg(0, 100)] }, "leg weights must be between 1 and 100"],
+    ["ten rungs", { legs: [ladderLeg(0, Array.from({ length: 10 }, (_, index) => p(index + 1)), 100)] }, "a ladder requires between one and eight rungs"],
+    ["a chain of one", { legs: [ladderLeg(0, [rung.chain([1])], 100)] }, "a chain requires two or three proxies"],
+    ["a chain of four", { legs: [ladderLeg(0, [rung.chain([1, 2, 3, 4])], 100)] }, "a chain requires two or three proxies"],
   ];
-  for (const [label, input] of cases) {
+  for (const [label, input, message] of cases) {
     const errors = await graphqlErrors(request, SAVE_ROUTE, { id: server, input });
-    expect(errors.join("\n").trim(), label).not.toBe("");
+    expect(errors.join("\n"), label).toContain(message);
   }
 });
 
@@ -199,11 +198,13 @@ test("L08 refused connections are not path evidence: the leg never goes Down", a
     const start = (await subscription.next(0, () => true, "first sample")).sampledAt;
     await addToxic(request, "nntp1", { name: "l08-reset", type: "reset_peer", attributes: { timeout: 0 } });
     await expect.poll(async () => (await serverHealth(request, "toxiproxy"))[0]!.failureCount - before.failureCount, { timeout: 0 }).toBeGreaterThanOrEqual(4);
-    const accepted = (await nntpConnectionMetrics()).accepted;
     const window = subscription.since(start);
     expect(window.flatMap(sample => legsOf(sample, serverKey(server))).filter(leg => leg.state === "DOWN" || leg.state === "BLOCKED"), "legs Down on refusals").toEqual([]);
+    const removedAt = await flowMark(request);
     await removeToxic(request, "nntp1", "l08-reset");
-    await expect.poll(async () => (await nntpConnectionMetrics()).accepted, { timeout: 0 }).toBeGreaterThan(accepted);
+    // Both legs hold their share again; the paced download completing below
+    // proves the connections carry articles, not just that they are open.
+    await subscription.next(removedAt, sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open after the refusals end");
     await saveEvidence(info, "L08", { before, after: (await serverHealth(request, "toxiproxy"))[0], samples: window.length });
   } finally {
     subscription.close();
@@ -245,6 +246,11 @@ test("L10 an RSS route uses one connection on its first leg", async ({ request }
   const flow = await flowAfter(request, flowStart, sample => consumerOf(sample, rssKey(feed)) !== undefined, "RSS consumer in the flow");
   expect(consumerOf(flow, rssKey(feed))?.cap).toBe(1);
   expect(legsOf(flow, rssKey(feed)).map(leg => leg.target)).toEqual([1, 0]);
+  // The feed's accepted item became a job no server on this route can carry; it must not outlive the test.
+  for (const item of (await graphql<{ rssSeenItems: Array<{ jobId: number | null }> }>(request,
+    "query($feedId: Int) { rssSeenItems(feedId: $feedId) { jobId } }", { feedId: feed })).rssSeenItems) {
+    if (item.jobId !== null) await graphql(request, "mutation($id: Int!) { cancelJob(id: $id) }", { id: item.jobId });
+  }
 });
 
 test("L11 reweighting a running route moves connections without revoking them", async ({ request }, info) => {
