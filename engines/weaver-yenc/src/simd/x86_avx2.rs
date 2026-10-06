@@ -535,16 +535,32 @@ pub(super) unsafe fn decode_kernel_avx2(
     // same length as the raw path, so short inputs keep today's routing exactly.
     let mut head_src = 0usize;
     let mut head_dst = 0usize;
-    if search_end
-        && dot_unstuffing
-        && input.len() > WIDTH * 2
-        && x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)?
-    {
-        return Ok(KernelOutcome {
-            consumed: head_src,
-            written: head_dst,
-            end: state.end.into(),
-        });
+    if search_end && dot_unstuffing && input.len() > WIDTH * 2 {
+        // Head-align the span to a 64-byte boundary with the scalar machine
+        // (at most 63 steps), as the SE=false oracle kernel and rapidyenc's own
+        // driver do, so no window load splits a cache line. The entry shapes
+        // the flat loop cannot see are re-resolved after every step.
+        loop {
+            if x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)? {
+                return Ok(KernelOutcome {
+                    consumed: head_src,
+                    written: head_dst,
+                    end: state.end.into(),
+                });
+            }
+            if (input.as_ptr() as usize + head_src).is_multiple_of(WIDTH)
+                || !decode_scalar_step(input, &mut head_src, output, &mut head_dst, state, mode)?
+            {
+                break;
+            }
+        }
+        if state.end != DecodeEnd::None || head_src >= input.len() {
+            return Ok(KernelOutcome {
+                consumed: head_src,
+                written: head_dst,
+                end: state.end.into(),
+            });
+        }
     }
 
     // Hot path: faithful rapidyenc do_decode_avx2 port (raw dot-unstuffing),

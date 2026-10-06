@@ -7,6 +7,7 @@
 //!
 //!   cargo run --release --example article_profile
 //!   cargo run --release --example article_profile -- mt <threads> <iters> [rapidyenc]
+//!   cargo run --release --example article_profile -- kernels
 //!
 //! With `WEAVER_RAPIDYENC_SRC` set, a rapidyenc lane times the same article
 //! driven the way sabctools drives rapidyenc, as a comparison point.
@@ -288,6 +289,11 @@ fn per_stage() {
 unsafe extern "C" {
     fn weaver_rapidyenc_decode_init();
     fn weaver_rapidyenc_crc32_init();
+    fn weaver_rapidyenc_decode(
+        src: *const core::ffi::c_void,
+        dest: *mut core::ffi::c_void,
+        len: u64,
+    ) -> u64;
     fn weaver_rapidyenc_crc32(data: *const core::ffi::c_void, len: u64, init: u32) -> u32;
     fn weaver_rapidyenc_decode_end(
         src: *const core::ffi::c_void,
@@ -361,6 +367,129 @@ fn rapidyenc_article(art: &[u8], out: &mut [u8]) -> (usize, u32, u32) {
     (written, crc, expected)
 }
 
+/// The body decoders alone, with and without end detection, at several
+/// alignments of the body start, so the end-detection cost is separated from
+/// where the body happens to sit in the article buffer.
+fn kernels() {
+    let art = article();
+    let (_, after_ypart, yend, _) = lines(&art);
+    let rounds: usize = std::env::var("ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9);
+    let iters = 400;
+    #[cfg(rapidyenc_linked)]
+    unsafe {
+        weaver_rapidyenc_decode_init();
+    }
+    let mut stages: Vec<Stage> = Vec::new();
+    for off in [0usize, 16, 32, 48, 61] {
+        // A 64-byte aligned copy of the body (and its trailer) at `off`.
+        let tail = &art[after_ypart..];
+        let body_len = yend - 2 - after_ypart;
+        let tail_len = tail.len();
+        let mut backing = vec![0u8; tail.len() + 128];
+        let base = backing.as_ptr().align_offset(64) + off;
+        backing[base..base + tail.len()].copy_from_slice(tail);
+        let backing = std::rc::Rc::new(backing);
+        {
+            // The whole article, placed so its body starts `off` bytes past a
+            // 64-byte boundary.
+            let mut whole = vec![0u8; art.len() + 128];
+            let start = whole.as_ptr().align_offset(64) + (off + 64 - after_ypart % 64) % 64;
+            whole[start..start + art.len()].copy_from_slice(&art);
+            let len = art.len();
+            let mut o = vec![0u8; max_decoded_len(len)];
+            stages.push((
+                Box::leak(format!("article decode_nntp @{off}").into_boxed_str()),
+                Box::new(move || {
+                    let r = decode_nntp(black_box(&whole[start..start + len]), &mut o).unwrap();
+                    black_box(r.part_crc);
+                }),
+                vec![],
+            ));
+        }
+        let label = |s: &str| -> &'static str { Box::leak(format!("{s} @{off}").into_boxed_str()) };
+        {
+            let b = backing.clone();
+            let mut o = vec![0u8; tail.len() + 64];
+            stages.push((
+                label("weaver no end"),
+                Box::new(move || {
+                    black_box(
+                        decode_rapidyenc(black_box(&b[base..base + body_len]), &mut o).unwrap(),
+                    );
+                }),
+                vec![],
+            ));
+        }
+        {
+            let b = backing.clone();
+            let mut o = vec![0u8; tail.len() + 64];
+            stages.push((
+                label("weaver end search"),
+                Box::new(move || {
+                    let mut st = RapidyencDecodeState::CrLf;
+                    black_box(
+                        decode_rapidyenc_incremental(
+                            black_box(&b[base..base + tail_len]),
+                            &mut o,
+                            &mut st,
+                        )
+                        .unwrap(),
+                    );
+                }),
+                vec![],
+            ));
+        }
+        #[cfg(rapidyenc_linked)]
+        {
+            let b = backing.clone();
+            let mut o = vec![0u8; tail.len() + 64];
+            stages.push((
+                label("rapidyenc no end"),
+                Box::new(move || unsafe {
+                    black_box(weaver_rapidyenc_decode(
+                        b[base..].as_ptr().cast(),
+                        o.as_mut_ptr().cast(),
+                        body_len as u64,
+                    ));
+                }),
+                vec![],
+            ));
+            let b = backing.clone();
+            let mut o = vec![0u8; tail.len() + 64];
+            let n = tail_len as u64;
+            stages.push((
+                label("rapidyenc end search"),
+                Box::new(move || unsafe {
+                    let (mut c, mut w) = (0u64, 0u64);
+                    black_box(weaver_rapidyenc_decode_end(
+                        b[base..].as_ptr().cast(),
+                        o.as_mut_ptr().cast(),
+                        n,
+                        &mut c,
+                        &mut w,
+                    ));
+                }),
+                vec![],
+            ));
+        }
+    }
+    for r in 0..rounds {
+        let n = stages.len();
+        for k in 0..n {
+            let idx = if r % 2 == 0 { k } else { n - 1 - k };
+            let (_, f, v) = &mut stages[idx];
+            f();
+            v.push(time(iters, f.as_mut()));
+        }
+    }
+    for (name, _, v) in stages {
+        println!("{name:<32} {:>9.2} us", med(v));
+    }
+}
+
 fn multi_thread(threads: usize, iters: usize, rapidyenc: bool) {
     #[cfg(rapidyenc_linked)]
     unsafe {
@@ -407,6 +536,8 @@ fn main() {
         let iters = args[3].parse().unwrap();
         let rapidyenc = args.get(4).map(String::as_str) == Some("rapidyenc");
         multi_thread(threads, iters, rapidyenc);
+    } else if args.get(1).map(String::as_str) == Some("kernels") {
+        kernels();
     } else {
         per_stage();
     }
