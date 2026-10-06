@@ -8,6 +8,7 @@
 use super::*;
 
 mod embedded_par3;
+mod obfuscated_split;
 mod schedules;
 
 use sevenz_turbo::encoder_options::AesEncoderOptions;

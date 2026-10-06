@@ -186,7 +186,8 @@ async fn run_shape(
             | Shape::Multiple
             | Shape::EmptyEntry
             | Shape::Nested
-    );
+    ) || (matches!(shape, Shape::CopyObfuscated)
+        && options.recovery != RecoveryFormat::Par3);
     // A 7z set's layout lives in two articles of its own: the start header
     // opens the first volume and the end header closing the last volume holds
     // the map. Every schedule spans four article slots, so those are always
@@ -207,6 +208,23 @@ async fn run_shape(
             },
             ..Route::DIRECT
         },
+        // A PAR3 set says which file is which only once the bytes are on
+        // disk, so nothing names a part in time: the set extracts from the
+        // volumes once they carry their names.
+        Shape::CopyObfuscated if options.recovery == RecoveryFormat::Par3 => Route {
+            unmapped_loss,
+            ..Route::refused(|_| false)
+        },
+        // The parts carry nothing that says which part they are, so only the
+        // recovery set's descriptions name them: the set routes direct when
+        // they arrive before its body, and a part whose front is lost is
+        // never named. Slots 0 and 2 are the two parts' offset-zero articles.
+        Shape::CopyObfuscated => Route {
+            unmapped_loss,
+            unnamed_loss: |mask| mask & 0b0101 != 0,
+            named_by_early_index: true,
+            ..Route::DIRECT
+        },
         _ if direct_compatible => Route {
             unmapped_loss,
             ..Route::DIRECT
@@ -217,13 +235,6 @@ async fn run_shape(
             ..Route::refused(|reason| {
                 matches!(reason, DemotionReason::SevenZip(SevenZipRefusal::Coder))
             })
-        },
-        // The recovery set's descriptions admit RAR volumes only, so an
-        // obfuscated 7z set is never admitted and nothing in it routes
-        // direct: it extracts from the volumes once they carry their names.
-        Shape::CopyObfuscated => Route {
-            unmapped_loss,
-            ..Route::refused(|_| false)
         },
         // Ciphertext is not the member's bytes either, and a header that is
         // itself encrypted hides the layout.

@@ -2465,7 +2465,10 @@ impl DirectSetRouter {
             // whole rule.
             return HeaderProbe::Earliest;
         }
-        if self.layout.is_some() {
+        // A described set still binding its parts cannot say which volume is
+        // first or last; the identity probe is already asking for the fronts
+        // that bind them.
+        if self.layout.is_some() || !self.plan.is_whole() {
             return HeaderProbe::Settled;
         }
         // A split container is a byte split at a fixed part size, so its whole
@@ -2502,7 +2505,8 @@ impl DirectSetRouter {
     /// arrive: every server ruled it missing, or its retries or decodes ran
     /// out.
     pub(crate) fn note_end_article_lost(&mut self) {
-        if self.plan.format == SetFormat::SevenZip && self.layout.is_none() {
+        if self.plan.format == SetFormat::SevenZip && self.layout.is_none() && self.plan.is_whole()
+        {
             self.sevenz_end_article_lost = true;
         }
     }
@@ -2534,7 +2538,10 @@ impl DirectSetRouter {
     /// that: unlike a RAR volume, whose longer prefix can reveal a header the
     /// last walk could not reach, a 7z end header is read whole or not at all.
     pub(super) fn try_parse_container(&mut self) -> Result<(), DemotionReason> {
-        if self.layout.is_some() {
+        // A described set still binding its parts holds what it routes: until
+        // every part is bound, no volume number is known to be the first or
+        // the last, so nothing can be placed.
+        if self.layout.is_some() || !self.plan.is_whole() {
             return Ok(());
         }
         // First, because the gate below is built out of what it reads: the

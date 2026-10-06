@@ -111,6 +111,8 @@ pub(crate) struct IdentityRoster {
     /// set. Stable: sets are only ever pushed, never removed, while a job
     /// lives.
     pub(crate) set_index: Option<usize>,
+    /// The container family the descriptions name.
+    pub(crate) format: super::plan::SetFormat,
 }
 
 /// Per-job identity-admission state: rosters awaiting or holding bindings,
@@ -1205,6 +1207,8 @@ impl Pipeline {
         let set_ids = runtime.ordered_set_ids();
         let mut candidates: BTreeMap<String, Vec<(u32, IdentityRosterVolume)>> = BTreeMap::new();
         let mut described_by: HashMap<String, HashSet<par2_rs::RecoverySetId>> = HashMap::new();
+        // `None` once two families claimed one name.
+        let mut formats: HashMap<String, Option<super::plan::SetFormat>> = HashMap::new();
         for set_id in set_ids {
             let Some(set) = self.par2_set_for(job_id, set_id) else {
                 continue;
@@ -1212,12 +1216,24 @@ impl Pipeline {
             for desc in set.files.values() {
                 let name = weaver_model::files::sanitize_download_filename(&desc.filename);
                 let role = weaver_model::files::FileRole::from_filename(&name);
-                let weaver_model::files::FileRole::RarVolume { volume_number } = role else {
-                    continue;
+                // A whole `.7z` is not here: its own signature header admits
+                // it, with no description needed.
+                let (format, volume_number) = match role {
+                    weaver_model::files::FileRole::RarVolume { volume_number } => {
+                        (super::plan::SetFormat::Rar, volume_number)
+                    }
+                    weaver_model::files::FileRole::SevenZipSplit { number } => {
+                        (super::plan::SetFormat::SevenZip, number)
+                    }
+                    _ => continue,
                 };
                 let Some(set_name) = weaver_model::files::archive_base_name(&name, &role) else {
                     continue;
                 };
+                let named = formats.entry(set_name.clone()).or_insert(Some(format));
+                if *named != Some(format) {
+                    *named = None;
+                }
                 candidates.entry(set_name.clone()).or_default().push((
                     volume_number,
                     IdentityRosterVolume {
@@ -1249,6 +1265,10 @@ impl Pipeline {
             {
                 continue;
             }
+            // Two families under one name: one of them is not this archive.
+            let Some(Some(format)) = formats.get(&set_name).copied() else {
+                continue;
+            };
             if self
                 .direct_store
                 .identity
@@ -1280,6 +1300,7 @@ impl Pipeline {
                     volumes,
                     bound: HashMap::new(),
                     set_index: None,
+                    format,
                 },
             );
         }
@@ -1296,14 +1317,15 @@ impl Pipeline {
                     admission.restored_rosters.insert(set_name, restored);
                     continue;
                 };
-                let expected = self
+                let identity = self
                     .direct_store
                     .sets
                     .get(&job_id)
                     .and_then(|sets| sets.get(restored.set_index))
-                    .and_then(|set| set.plan().identity)
-                    .and_then(|identity| identity.expected_volumes);
+                    .and_then(|set| set.plan().identity);
+                let expected = identity.and_then(|identity| identity.expected_volumes);
                 let consistent = expected == Some(roster.volumes.len() as u32)
+                    && identity.is_some_and(|identity| identity.kind.format() == roster.format)
                     && restored
                         .bound
                         .values()
@@ -1735,19 +1757,22 @@ impl Pipeline {
         let state = self.jobs.get(&job_id)?;
         let working_dir = state.working_dir.clone();
         let password = state.spec.password.clone();
-        let expected_volumes = self
+        let (expected_volumes, format) = self
             .direct_store
             .identity
             .get(&job_id)
             .and_then(|admission| admission.rosters.get(&set_name))
-            .map(|roster| roster.volumes.len() as u32)?;
+            .map(|roster| (roster.volumes.len() as u32, roster.format))?;
         let plan = DirectSetPlan {
             set_name: set_name.clone(),
-            format: crate::pipeline::direct_store::plan::SetFormat::Rar,
+            format,
             volumes: BTreeMap::from([(volume_index, file_index)]),
             files: HashMap::from([(file_index, volume_index)]),
             identity: Some(IdentityPlanFacts {
-                kind: super::plan::IdentityKind::Roster,
+                kind: match format {
+                    super::plan::SetFormat::Rar => super::plan::IdentityKind::Roster,
+                    super::plan::SetFormat::SevenZip => super::plan::IdentityKind::SevenZipRoster,
+                },
                 expected_volumes: Some(expected_volumes),
                 // The first bound file's index: stable by construction, which
                 // the derived minimum is not while the mapping grows.
@@ -2485,7 +2510,7 @@ impl Pipeline {
                 // A whole described set binds nothing further, but its files'
                 // captured prefixes died with the process: only its
                 // descriptions can say again which description each file is.
-                super::plan::IdentityKind::Roster => {
+                super::plan::IdentityKind::Roster | super::plan::IdentityKind::SevenZipRoster => {
                     restored_rosters.insert(
                         plan.set_name.clone(),
                         RestoredRoster {

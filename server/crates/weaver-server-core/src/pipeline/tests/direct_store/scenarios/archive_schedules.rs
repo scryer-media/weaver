@@ -162,6 +162,10 @@ pub(super) struct Route {
     /// alone. A file that never receives one cannot be bound to its volume, and
     /// its set cannot be made whole.
     pub unnamed_loss: fn(u8) -> bool,
+    /// Only the recovery set's descriptions can name the volumes, so an index
+    /// that arrives after the body names nothing in time and the set goes
+    /// conventional.
+    pub named_by_early_index: bool,
 }
 
 impl Route {
@@ -171,6 +175,7 @@ impl Route {
         shape_demotion: |_| false,
         unmapped_loss: |_| false,
         unnamed_loss: |_| false,
+        named_by_early_index: false,
     };
 
     /// A set the layout refuses to route: it demotes for its shape and
@@ -182,6 +187,7 @@ impl Route {
             shape_demotion,
             unmapped_loss: |_| false,
             unnamed_loss: |_| false,
+            named_by_early_index: false,
         }
     }
 }
@@ -295,9 +301,9 @@ impl ExtractionProfile {
         let unmapped = interruption
             .loss()
             .is_some_and(|(mask, _)| (route.unmapped_loss)(mask));
-        let unnamed = interruption
-            .loss()
-            .is_some_and(|(mask, _)| (route.unnamed_loss)(mask));
+        let unnamed = interruption.loss().is_some_and(|(mask, index_first)| {
+            (route.unnamed_loss)(mask) || (route.named_by_early_index && !index_first)
+        });
         let unexpected: Vec<_> = outcome
             .demotions
             .iter()
