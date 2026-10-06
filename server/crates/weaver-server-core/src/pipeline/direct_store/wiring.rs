@@ -1983,6 +1983,16 @@ impl Pipeline {
         {
             return None;
         }
+        // A file a set already owns reaches this rung only once that set has
+        // left the direct path; its refetched front must not admit it again.
+        if self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.plan().volume_for_file(file_index).is_some())
+        {
+            return None;
+        }
         {
             let admission = self.direct_store.identity.get(&job_id);
             if admission.is_some_and(|admission| {
@@ -2019,12 +2029,22 @@ impl Pipeline {
         ) {
             return None;
         }
-        let sniff = super::sniff::sniff_rar_prefix(self.file_prefix_16k.get(&file_id)?);
+        let prefix = self.file_prefix_16k.get(&file_id)?;
+        let sniff = super::sniff::sniff_rar_prefix(prefix);
         let super::sniff::PrefixSniff::Rar5 {
             volume_number,
             is_volume,
         } = sniff
         else {
+            if sniff == super::sniff::PrefixSniff::NotRar
+                && super::sniff::sniff_sevenz_prefix(
+                    prefix,
+                    self.file_declared_size.get(&file_id).copied(),
+                ) == super::sniff::SevenZipSniff::Whole
+                && !leaked
+            {
+                return self.admit_standalone_sevenz(file_id);
+            }
             if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
                 admission.no_match.insert(file_index);
             }
@@ -2185,10 +2205,100 @@ impl Pipeline {
             "direct-store admitted a standalone archive from its own RAR5 head"
         );
         let set_index = self.admit_identity_set(job_id, plan, password.as_deref());
+        self.prove_direct_standalone_fingerprint(file_id);
         Some(DirectFileTarget::Route {
             set_index,
             volume_index: 0,
         })
+    }
+
+    /// The header rung's 7z answer: an unclassified file whose signature
+    /// header closes the container exactly at the file's own length is a whole
+    /// container, a set of one closed at admission like a standalone RAR5
+    /// archive. The start header places the end header, so the tail probe can
+    /// fetch the map without a name ever saying what the file is.
+    fn admit_standalone_sevenz(&mut self, file_id: NzbFileId) -> Option<DirectFileTarget> {
+        let job_id = file_id.job_id;
+        let file_index = file_id.file_index;
+        let destination_dir = self.deterministic_extraction_staging_dir(job_id);
+        let state = self.jobs.get(&job_id)?;
+        let working_dir = state.working_dir.clone();
+        let password = state.spec.password.clone();
+        let plan = DirectSetPlan {
+            set_name: format!("obfuscated-archive.f{file_index}"),
+            format: crate::pipeline::direct_store::plan::SetFormat::SevenZip,
+            volumes: BTreeMap::from([(0, file_index)]),
+            files: HashMap::from([(file_index, 0)]),
+            identity: Some(IdentityPlanFacts {
+                kind: super::plan::IdentityKind::SevenZipStandalone,
+                expected_volumes: Some(1),
+                discriminator: file_index,
+            }),
+            working_dir,
+            destination_dir,
+        };
+        crate::runtime::perf_probe::record(
+            "direct_store.identity.header_admitted",
+            std::time::Duration::from_nanos(1),
+        );
+        info!(
+            job_id = job_id.0,
+            set_name = %plan.set_name,
+            "direct-store admitted a whole 7z container from its own signature header"
+        );
+        let set_index = self.admit_identity_set(job_id, plan, password.as_deref());
+        self.prove_direct_standalone_fingerprint(file_id);
+        Some(DirectFileTarget::Route {
+            set_index,
+            volume_index: 0,
+        })
+    }
+
+    /// Takes a standalone set's recovery-set fingerprint for one of its files,
+    /// once, as soon as the file's opening bytes are all in memory.
+    ///
+    /// A standalone set is admitted by its file's own header, so nothing but
+    /// those bytes can say which recovery-set description the file is, and they
+    /// do not survive a restart. Without that binding, a repair after a restart
+    /// counts the whole file as missing. The checkpoint carries the
+    /// fingerprint instead, the way a roster set's carries the description it
+    /// matched.
+    ///
+    /// Called at admission and when the prefix capture completes, whichever
+    /// comes last. One MD5 over at most 16 KiB per standalone file, never per
+    /// article.
+    pub(crate) fn prove_direct_standalone_fingerprint(&mut self, file_id: NzbFileId) {
+        let job_id = file_id.job_id;
+        let file_index = file_id.file_index;
+        let Some(set_index) = self.direct_store.sets_for(job_id).iter().position(|set| {
+            !set.is_demoted()
+                && !set.is_finalized()
+                && set.plan().files.contains_key(&file_index)
+                && set.plan().identity.is_some_and(|identity| {
+                    matches!(
+                        identity.kind,
+                        super::plan::IdentityKind::Standalone
+                            | super::plan::IdentityKind::SevenZipStandalone
+                    )
+                })
+                && !set.proven_fingerprints().contains_key(&file_index)
+        }) else {
+            return;
+        };
+        let Some(length) = self.file_declared_size.get(&file_id).copied() else {
+            return;
+        };
+        let window = (length as usize).min(crate::pipeline::PAR2_HASH_16K_BYTES);
+        let Some(prefix) = self.file_prefix_16k.get(&file_id) else {
+            return;
+        };
+        if window == 0 || prefix.len() < window {
+            return;
+        }
+        let hash_16k = par2_rs::checksum::md5(&prefix[..window]);
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            set.record_proven_fingerprint(file_index, hash_16k, length);
+        }
     }
 
     /// Routes a freshly bound file's parked reorder-stage segments into its
@@ -2346,6 +2456,7 @@ impl Pipeline {
         let mut restored_rosters: HashMap<String, RestoredRoster> = HashMap::new();
         let mut owned_files: HashSet<u32> = HashSet::new();
         let mut reprioritize: Vec<(u32, u32)> = Vec::new();
+        let mut fingerprints: Vec<(u32, ([u8; 16], u64))> = Vec::new();
         for (set_index, set) in self.direct_store.sets_for(job_id).iter().enumerate() {
             let plan = set.plan();
             owned_files.extend(plan.files.keys().copied());
@@ -2359,7 +2470,18 @@ impl Pipeline {
                 .expected_volumes
                 .is_some_and(|expected| plan.volumes.len() as u32 == expected);
             match identity.kind {
-                super::plan::IdentityKind::Standalone => continue,
+                // Its file's opening bytes routed before the restart; the
+                // fingerprint its checkpoint kept is what binds the file to
+                // its description again.
+                super::plan::IdentityKind::Standalone
+                | super::plan::IdentityKind::SevenZipStandalone => {
+                    fingerprints.extend(
+                        set.proven_fingerprints()
+                            .iter()
+                            .map(|(&file_index, &fingerprint)| (file_index, fingerprint)),
+                    );
+                    continue;
+                }
                 // A whole described set binds nothing further, but its files'
                 // captured prefixes died with the process: only its
                 // descriptions can say again which description each file is.
@@ -2384,6 +2506,13 @@ impl Pipeline {
                     .iter()
                     .map(|(volume_index, file_index)| (*file_index, *volume_index)),
             );
+        }
+        for (file_index, fingerprint) in fingerprints {
+            let file_id = NzbFileId { job_id, file_index };
+            if !self.file_prefix_16k.contains_key(&file_id) {
+                self.file_proven_par2_fingerprint
+                    .insert(file_id, fingerprint);
+            }
         }
         if header_sets.is_empty() && restored_rosters.is_empty() {
             return;
@@ -2699,58 +2828,6 @@ impl Pipeline {
         }
     }
 
-    /// Ends the wait of a container set whose map will never be read.
-    ///
-    /// A 7z set resolves its layout from two ends — volume zero's front, which
-    /// states the part size and carries the start header, and the tail, which
-    /// carries the map. Whichever of those is missing, the symptom is one and
-    /// the same: a parse that is not settled, with no article left anywhere in
-    /// the set that could settle it. The probe planner asks for nothing it
-    /// cannot get, so the gate stays shut with no request outstanding to
-    /// reopen it. On a set large enough to reach them the holds ceilings would
-    /// eventually end it; on a small one nothing would, and the job would sit
-    /// at its last article forever.
-    ///
-    /// Judged for the whole set rather than per volume, because that is the
-    /// shape of the question: nothing outstanding anywhere means nothing can
-    /// change the parse, whether what is missing is volume zero, a volume in
-    /// the middle or the tail.
-    ///
-    /// The verdict is the demotion the set would have reached the slow way. Its
-    /// volumes materialize and the conventional path takes them, which is also
-    /// where the missing articles become a repair the recovery set can answer.
-    ///
-    /// Judged against the same evidence the probe planner admits on, and one
-    /// conservative addition: a released lane result is attributable only to
-    /// the job, so while any is outstanding nothing is called unreachable — the
-    /// article it answers may be the one that would have settled the parse.
-    pub(crate) async fn demote_direct_sets_with_an_unreadable_map(&mut self, job_id: JobId) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        if self
-            .pending_released_download_result_bytes_by_job
-            .get(&job_id)
-            .copied()
-            .unwrap_or(0)
-            != 0
-        {
-            return;
-        }
-        let stranded: Vec<usize> = self
-            .direct_store
-            .sets_for(job_id)
-            .iter()
-            .enumerate()
-            .filter(|(_, set)| {
-                set.plan().format == super::plan::SetFormat::SevenZip
-                    && !set.is_demoted()
-                    && !set.is_finalized()
-                    && matches!(set.header_probe(), HeaderProbe::Container { .. })
-            })
-            .filter(|(_, set)| {
-                set.plan().volumes.values().all(|file_index| {
-                    let file_id = NzbFileId {
     /// Notes a terminal verdict on an article against the container set whose
     /// last volume it closes.
     ///
@@ -2835,6 +2912,58 @@ impl Pipeline {
         }
     }
 
+    /// Ends the wait of a container set whose map will never be read.
+    ///
+    /// A 7z set resolves its layout from two ends — volume zero's front, which
+    /// states the part size and carries the start header, and the tail, which
+    /// carries the map. Whichever of those is missing, the symptom is one and
+    /// the same: a parse that is not settled, with no article left anywhere in
+    /// the set that could settle it. The probe planner asks for nothing it
+    /// cannot get, so the gate stays shut with no request outstanding to
+    /// reopen it. On a set large enough to reach them the holds ceilings would
+    /// eventually end it; on a small one nothing would, and the job would sit
+    /// at its last article forever.
+    ///
+    /// Judged for the whole set rather than per volume, because that is the
+    /// shape of the question: nothing outstanding anywhere means nothing can
+    /// change the parse, whether what is missing is volume zero, a volume in
+    /// the middle or the tail.
+    ///
+    /// The verdict is the demotion the set would have reached the slow way. Its
+    /// volumes materialize and the conventional path takes them, which is also
+    /// where the missing articles become a repair the recovery set can answer.
+    ///
+    /// Judged against the same evidence the probe planner admits on, and one
+    /// conservative addition: a released lane result is attributable only to
+    /// the job, so while any is outstanding nothing is called unreachable — the
+    /// article it answers may be the one that would have settled the parse.
+    pub(crate) async fn demote_direct_sets_with_an_unreadable_map(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if self
+            .pending_released_download_result_bytes_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            != 0
+        {
+            return;
+        }
+        let stranded: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                set.plan().format == super::plan::SetFormat::SevenZip
+                    && !set.is_demoted()
+                    && !set.is_finalized()
+                    && matches!(set.header_probe(), HeaderProbe::Container { .. })
+            })
+            .filter(|(_, set)| {
+                set.plan().volumes.values().all(|file_index| {
+                    let file_id = NzbFileId {
                         job_id,
                         file_index: *file_index,
                     };

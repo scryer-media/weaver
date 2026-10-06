@@ -1,4 +1,5 @@
-//! Byte-sniffing an unclassified file's first bytes for a RAR volume head.
+//! Byte-sniffing an unclassified file's first bytes for a RAR volume head or a
+//! 7z signature header.
 //!
 //! The identity seam's second rung. The first rung binds by PAR2 fingerprint
 //! and needs the recovery set's descriptions; a post with no PAR2 anywhere
@@ -142,9 +143,129 @@ pub(crate) fn sniff_rar_prefix(prefix: &[u8]) -> PrefixSniff {
     }
 }
 
+/// The 7z signature: `7z\xBC\xAF\x27\x1C`.
+const SEVEN_Z_SIGNATURE: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
+/// The signature header's length: magic, version, start-header CRC32, and the
+/// end header's offset, length and CRC32.
+const SEVEN_Z_SIGNATURE_HEADER_LEN: u64 = 32;
+
+/// What one offset-zero prefix says about a file that might be a 7z container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SevenZipSniff {
+    /// A whole container: its start header places the end header so that it
+    /// closes exactly at the file's declared length.
+    Whole,
+    /// The opening part of a container split across files: the end header
+    /// lies past the file's declared length.
+    FirstPart,
+    /// Not a 7z signature header, or one whose coordinates fit no reading.
+    NotSevenZip,
+}
+
+/// Classifies an offset-zero prefix against the file's declared length.
+///
+/// A 7z container states its own length in its first 32 bytes — the end
+/// header is the last thing in it — so the signature header alone tells a
+/// whole container from the first part of a split one. Without a declared
+/// length the two cannot be told apart, and the answer is
+/// [`SevenZipSniff::NotSevenZip`]: nothing is admitted on a guess.
+pub(crate) fn sniff_sevenz_prefix(prefix: &[u8], declared_len: Option<u64>) -> SevenZipSniff {
+    if prefix.len() < SEVEN_Z_SIGNATURE_HEADER_LEN as usize
+        || prefix[..SEVEN_Z_SIGNATURE.len()] != SEVEN_Z_SIGNATURE
+        // A major version this build does not know places its fields
+        // elsewhere.
+        || prefix[6] != 0
+    {
+        return SevenZipSniff::NotSevenZip;
+    }
+    let Some(declared_len) = declared_len.filter(|len| *len > 0) else {
+        return SevenZipSniff::NotSevenZip;
+    };
+    let word = |at: usize| {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&prefix[at..at + 8]);
+        u64::from_le_bytes(bytes)
+    };
+    let (offset, size) = (word(12), word(20));
+    let Some(end) = SEVEN_Z_SIGNATURE_HEADER_LEN
+        .checked_add(offset)
+        .and_then(|start| start.checked_add(size))
+    else {
+        return SevenZipSniff::NotSevenZip;
+    };
+    // An empty end header names nothing; a container shorter than its own
+    // file is not one this reading can vouch for.
+    if size == 0 || end < declared_len {
+        return SevenZipSniff::NotSevenZip;
+    }
+    if end == declared_len {
+        SevenZipSniff::Whole
+    } else {
+        SevenZipSniff::FirstPart
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sevenz_head(offset: u64, size: u64) -> Vec<u8> {
+        let mut bytes = SEVEN_Z_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&[0, 4]);
+        bytes.extend_from_slice(&[0xAA; 4]); // start-header crc: unchecked
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend_from_slice(&[0xBB; 4]);
+        bytes
+    }
+
+    #[test]
+    fn a_container_that_closes_at_its_file_length_is_whole() {
+        assert_eq!(
+            sniff_sevenz_prefix(&sevenz_head(1_000, 40), Some(1_072)),
+            SevenZipSniff::Whole
+        );
+    }
+
+    #[test]
+    fn a_container_that_runs_past_its_file_is_a_first_part() {
+        assert_eq!(
+            sniff_sevenz_prefix(&sevenz_head(1_000, 40), Some(500)),
+            SevenZipSniff::FirstPart
+        );
+    }
+
+    #[test]
+    fn a_container_without_a_usable_length_or_shape_is_refused() {
+        let head = sevenz_head(1_000, 40);
+        assert_eq!(sniff_sevenz_prefix(&head, None), SevenZipSniff::NotSevenZip);
+        assert_eq!(
+            sniff_sevenz_prefix(&head, Some(0)),
+            SevenZipSniff::NotSevenZip
+        );
+        assert_eq!(
+            sniff_sevenz_prefix(&head, Some(2_000)),
+            SevenZipSniff::NotSevenZip
+        );
+        assert_eq!(
+            sniff_sevenz_prefix(&sevenz_head(1_000, 0), Some(1_032)),
+            SevenZipSniff::NotSevenZip
+        );
+        assert_eq!(
+            sniff_sevenz_prefix(&sevenz_head(u64::MAX, 40), Some(1_072)),
+            SevenZipSniff::NotSevenZip
+        );
+        let mut major = head.clone();
+        major[6] = 1;
+        assert_eq!(
+            sniff_sevenz_prefix(&major, Some(1_072)),
+            SevenZipSniff::NotSevenZip
+        );
+        assert_eq!(
+            sniff_sevenz_prefix(&head[..31], Some(1_072)),
+            SevenZipSniff::NotSevenZip
+        );
+    }
 
     fn vint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();

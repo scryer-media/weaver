@@ -25,3 +25,24 @@ combined_campaign!(
     Shape::CopyObfuscated,
     conventional_campaign
 );
+
+#[tokio::test]
+async fn copy_single_obfuscated_arrival_schedules() {
+    campaign(Shape::CopySingleObfuscated, Selection::Smoke).await;
+}
+
+combined_campaign!(
+    combined_copy_single_obfuscated,
+    Shape::CopySingleObfuscated,
+    campaign
+);
+combined_campaign!(
+    combined_chase_copy_single_obfuscated,
+    Shape::CopySingleObfuscated,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_copy_single_obfuscated,
+    Shape::CopySingleObfuscated,
+    conventional_campaign
+);

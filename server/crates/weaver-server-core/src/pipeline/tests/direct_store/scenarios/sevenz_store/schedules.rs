@@ -1,6 +1,6 @@
 //! Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    ExtractionProfile, Interruption, Route, Schedule, ScheduleOptions, Selection,
+    ExtractionProfile, Interruption, RecoveryFormat, Route, Schedule, ScheduleOptions, Selection,
     combined_campaign, run_schedule_with, selected_schedules, wrong_password_schedules,
 };
 use super::*;
@@ -44,6 +44,9 @@ enum Shape {
     /// Volume names that say nothing. The recovery set carries the real
     /// names, as an obfuscated post's does.
     CopyObfuscated,
+    /// One whole container under a name that says nothing: its own signature
+    /// header is the only identity it needs.
+    CopySingleObfuscated,
 }
 
 async fn campaign(shape: Shape, selection: Selection) {
@@ -80,7 +83,7 @@ async fn run_shape(
 ) {
     // A described volume is bound by the fingerprint of its first 16 KiB,
     // which its offset-zero article has to cover whole.
-    let first = if matches!(shape, Shape::CopyObfuscated) {
+    let first = if matches!(shape, Shape::CopyObfuscated | Shape::CopySingleObfuscated) {
         unrepeated_payload(13, 70_001)
     } else {
         payload(13, 6001)
@@ -160,16 +163,17 @@ async fn run_shape(
     };
     let count = match shape {
         Shape::CopyFourVolumes => 4,
-        Shape::CopySingle => 1,
+        Shape::CopySingle | Shape::CopySingleObfuscated => 1,
         _ => 2,
     };
     let volumes = split_volumes(&archive, count);
-    let (volumes, described) = if matches!(shape, Shape::CopyObfuscated) {
-        let described = volumes.iter().map(|(name, _)| name.clone()).collect();
-        (obfuscate_volumes(&volumes), Some(described))
-    } else {
-        (volumes, None::<Vec<String>>)
-    };
+    let (volumes, described) =
+        if matches!(shape, Shape::CopyObfuscated | Shape::CopySingleObfuscated) {
+            let described = volumes.iter().map(|(name, _)| name.clone()).collect();
+            (obfuscate_volumes(&volumes), Some(described))
+        } else {
+            (volumes, None::<Vec<String>>)
+        };
     let mut spec = sevenz_job_spec(&volumes, 4 / count);
     spec.password = password.map(str::to_owned);
     let wanted = expected.keys().copied().collect::<Vec<_>>();
@@ -178,6 +182,7 @@ async fn run_shape(
         Shape::Copy
             | Shape::CopyFourVolumes
             | Shape::CopySingle
+            | Shape::CopySingleObfuscated
             | Shape::Multiple
             | Shape::EmptyEntry
             | Shape::Nested
@@ -189,6 +194,19 @@ async fn run_shape(
     // only a repair of the whole payload brings it back.
     let unmapped_loss: fn(u8) -> bool = |mask| mask & 0b1001 != 0;
     let route = match shape {
+        // Its own front is the only thing that names the container, so
+        // while that article is lost nothing admits it. A PAR3 set names a
+        // file only once its bytes are on disk, so any damage it has to
+        // repair hands the container back to be named there.
+        Shape::CopySingleObfuscated => Route {
+            unmapped_loss,
+            unnamed_loss: if options.recovery == RecoveryFormat::Par3 {
+                |mask| mask != 0
+            } else {
+                |mask| mask & 0b0001 != 0
+            },
+            ..Route::DIRECT
+        },
         _ if direct_compatible => Route {
             unmapped_loss,
             ..Route::DIRECT

@@ -156,6 +156,19 @@ pub(crate) enum IdentityKind {
     HeaderVolumeSet,
     /// A single file whose RAR5 head says it is a whole archive.
     Standalone,
+    /// A single file whose 7z signature header closes the container exactly
+    /// at the file's own length.
+    SevenZipStandalone,
+}
+
+impl IdentityKind {
+    /// The archive family the evidence proved.
+    pub(crate) fn format(self) -> SetFormat {
+        match self {
+            Self::Roster | Self::HeaderVolumeSet | Self::Standalone => SetFormat::Rar,
+            Self::SevenZipStandalone => SetFormat::SevenZip,
+        }
+    }
 }
 
 /// One admitted archive set: its identity, its volume-to-file mapping, and the
@@ -438,7 +451,7 @@ impl DirectSetPlan {
                     return Err("a header volume set under a name its rung does not give");
                 }
             }
-            IdentityKind::Standalone => {
+            IdentityKind::Standalone | IdentityKind::SevenZipStandalone => {
                 if binding.expected_volumes != Some(1)
                     || volumes.len() != 1
                     || !volumes.contains_key(&0)
@@ -450,7 +463,7 @@ impl DirectSetPlan {
         }
         Ok(Self {
             set_name: set_name.to_string(),
-            format: SetFormat::Rar,
+            format: binding.kind.format(),
             volumes,
             files,
             identity: Some(IdentityPlanFacts {

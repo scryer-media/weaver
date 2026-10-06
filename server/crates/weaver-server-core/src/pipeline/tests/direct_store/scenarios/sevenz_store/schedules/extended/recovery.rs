@@ -85,6 +85,7 @@ par3_smoke! {
     par3_encrypted_copy_loss_schedules Shape::EncryptedCopy, ExtractionProfile::DirectStore;
     par3_encrypted_header_loss_schedules Shape::EncryptedHeaders, ExtractionProfile::DirectStore;
     par3_copy_obfuscated_loss_schedules Shape::CopyObfuscated, ExtractionProfile::DirectStore;
+    par3_copy_single_obfuscated_loss_schedules Shape::CopySingleObfuscated, ExtractionProfile::DirectStore;
     par3_chase_copy_loss_schedules Shape::Copy, ExtractionProfile::Chase;
     par3_conventional_copy_loss_schedules Shape::Copy, ExtractionProfile::Conventional;
 }
@@ -142,6 +143,8 @@ par3_campaigns! {
         combined_par3_conventional_encrypted_header Shape::EncryptedHeaders;
     combined_par3_copy_obfuscated combined_par3_chase_copy_obfuscated
         combined_par3_conventional_copy_obfuscated Shape::CopyObfuscated;
+    combined_par3_copy_single_obfuscated combined_par3_chase_copy_single_obfuscated
+        combined_par3_conventional_copy_single_obfuscated Shape::CopySingleObfuscated;
 }
 
 // The one-volume set under the matrix's own PAR2 campaign.

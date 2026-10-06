@@ -1233,6 +1233,15 @@ impl Pipeline {
                     }
                     continue;
                 }
+                // A whole container is its own part zero: rebuilt under the
+                // name the recovery set gives it, it is as absent from every
+                // topology as a rebuilt numbered part.
+                weaver_model::files::FileRole::SevenZipArchive => {
+                    if self.adopt_verified_par2_numbered_part(job_id, &file.filename, &role, 0)? {
+                        registration.numbered_parts += 1;
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             let Some(set_name) = weaver_model::files::archive_base_name(&file.filename, &role)
@@ -1314,7 +1323,8 @@ impl Pipeline {
         number: u32,
     ) -> Result<bool, String> {
         let archive_type = match role {
-            weaver_model::files::FileRole::SevenZipSplit { .. } => {
+            weaver_model::files::FileRole::SevenZipSplit { .. }
+            | weaver_model::files::FileRole::SevenZipArchive => {
                 crate::jobs::assembly::ArchiveType::SevenZip
             }
             weaver_model::files::FileRole::SplitFile { .. } => {
