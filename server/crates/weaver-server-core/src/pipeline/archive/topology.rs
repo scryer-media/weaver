@@ -2760,6 +2760,30 @@ impl Pipeline {
 
                 if state.assembly.archive_topology_for(&set_name).is_some() {
                     let state = self.jobs.get_mut(&job_id).unwrap();
+                    // A part that took its name after the topology was built —
+                    // an obfuscated part a recovery set named, or one it rebuilt
+                    // — is not yet listed. Without the listing the job waits on
+                    // a description that already has every part it needs.
+                    if let Some(topology) = state.assembly.archive_topology_for_mut(&set_name)
+                        && !topology.volume_map.contains_key(&filename)
+                        && !topology
+                            .volume_map
+                            .values()
+                            .any(|listed| *listed == completing_number)
+                    {
+                        topology
+                            .volume_map
+                            .insert(filename.clone(), completing_number);
+                        let expected = completing_number.saturating_add(1);
+                        topology.expected_volume_count = Some(
+                            topology
+                                .expected_volume_count
+                                .map_or(expected, |count| count.max(expected)),
+                        );
+                        for member in &mut topology.members {
+                            member.last_volume = member.last_volume.max(completing_number);
+                        }
+                    }
                     state
                         .assembly
                         .mark_volume_complete(&set_name, completing_number);

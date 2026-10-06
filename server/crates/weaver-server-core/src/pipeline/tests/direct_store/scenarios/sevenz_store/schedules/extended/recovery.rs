@@ -80,6 +80,7 @@ par3_smoke! {
     par3_lzma2_loss_schedules Shape::Lzma2Fallback, ExtractionProfile::DirectStore;
     par3_encrypted_copy_loss_schedules Shape::EncryptedCopy, ExtractionProfile::DirectStore;
     par3_encrypted_header_loss_schedules Shape::EncryptedHeaders, ExtractionProfile::DirectStore;
+    par3_copy_obfuscated_loss_schedules Shape::CopyObfuscated, ExtractionProfile::DirectStore;
     par3_chase_copy_loss_schedules Shape::Copy, ExtractionProfile::Chase;
     par3_conventional_copy_loss_schedules Shape::Copy, ExtractionProfile::Conventional;
 }
