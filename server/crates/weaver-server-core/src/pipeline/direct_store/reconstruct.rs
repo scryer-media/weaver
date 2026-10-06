@@ -72,6 +72,16 @@
 //! it and rewrites the ones that failed, and the bytes past the boundary are
 //! exactly the valid slices the repair needs as input — see
 //! [`PartialArticle`].
+//!
+//! Bytes a checkpoint restored are the same case reached from the other side.
+//! The composition does not survive a restart, so a restored stretch has no
+//! article record at all, and a volume that needs repair after a restart would
+//! otherwise refuse every byte placed before it. The repair scratch carries
+//! such a stretch through on the same authority: the slice verdicts that size
+//! the repair were read off the disk by this process — the in-stream grid
+//! only ever holds articles this process decoded — and the post-repair pass
+//! reads every rewritten volume back, so a wrong input byte surfaces as a
+//! failed repair rather than a wrong file.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -115,6 +125,13 @@ pub(crate) struct VolumeReconstruction {
     pub(crate) crcs: CrcRuns,
     /// What to do with a covered run that stops inside an article.
     pub(crate) partial_article: PartialArticle,
+    /// The part of `covered` a checkpoint seeded. A previous process placed
+    /// those bytes and its article records went with it, so the composition
+    /// has nothing to vouch for them by. Under [`PartialArticle::CarryThrough`]
+    /// a stretch of it no record of this process accounts for is written with
+    /// no reference, on the same authority as a carried remainder; under
+    /// [`PartialArticle::Refuse`] it changes nothing.
+    pub(crate) restored: ByteRanges,
 }
 
 /// What the sweep does with a covered run that stops **inside** an article.
@@ -445,9 +462,25 @@ fn reconstruct_volume(
             // the covered range. Otherwise the remainder of the range: the
             // shape the composition can only refuse or, for the repair scratch,
             // carry through.
-            let end = match volume.crcs.run_starting_at(start) {
-                Some((_, len)) if start.saturating_add(len) <= range_end => start + len,
-                _ => range_end,
+            //
+            // A stretch a previous process placed has no article record to
+            // walk by, so it runs to the next article this process recorded,
+            // and never past the restored bytes: anything beyond them is held
+            // to the rules above.
+            let unrecorded = match volume.partial_article {
+                PartialArticle::CarryThrough => {
+                    restored_run_end(&volume.restored, start).and_then(|restored_end| {
+                        volume
+                            .crcs
+                            .unrecorded_until(start, range_end.min(restored_end))
+                    })
+                }
+                PartialArticle::Refuse => None,
+            };
+            let end = match (unrecorded, volume.crcs.run_starting_at(start)) {
+                (Some(boundary), _) => boundary,
+                (None, Some((_, len))) if start.saturating_add(len) <= range_end => start + len,
+                (None, _) => range_end,
             };
             // Composed against the range the sweep is about to read — clipped end
             // included — so a clamp can never lose the reference value the way a
@@ -461,6 +494,9 @@ fn reconstruct_volume(
             // on.
             let composed: Result<(u64, u32), u64> = match volume.crcs.compose(start, end - start) {
                 Some(reference) => Ok((end, reference)),
+                // A restored stretch with no record: nothing of it is verified
+                // here, all of it is carried, and PAR2 judges it slice by slice.
+                None if unrecorded.is_some() => Ok((start, 0)),
                 None => match volume.partial_article {
                     PartialArticle::Refuse => Err(start),
                     PartialArticle::CarryThrough => {
@@ -561,8 +597,8 @@ fn reconstruct_volume(
                     volume_index = volume.volume_index,
                     offset = verified_end,
                     len = end - verified_end,
-                    "reconstruction carried a run that stops inside an article through with no \
-                     composed reference; PAR2 judges those bytes slice by slice"
+                    "reconstruction carried a run with no composed reference through; PAR2 \
+                     judges those bytes slice by slice"
                 );
                 match copy_run(
                     &mut reader,
@@ -635,6 +671,14 @@ fn reconstruct_volume(
         md5: complete.then(|| md5.finalize()),
         failure: refused,
     })
+}
+
+/// The end of the restored range holding `offset`, when one does.
+fn restored_run_end(restored: &ByteRanges, offset: u64) -> Option<u64> {
+    let ranges = restored.ranges();
+    let index = ranges.partition_point(|&(start, _)| start <= offset);
+    let &(_, end) = ranges.get(index.checked_sub(1)?)?;
+    (offset < end).then_some(end)
 }
 
 /// Copies `[start, end)` of the volume from the provider into the file and

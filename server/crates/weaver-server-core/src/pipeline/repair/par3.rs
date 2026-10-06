@@ -792,6 +792,18 @@ fn is_admission_exhausted(error: &EngineError) -> bool {
 }
 
 impl Pipeline {
+    /// The PAR3 coordinator, created on first admission with its workers held
+    /// to the hardware profile in force.
+    pub(in crate::pipeline) fn par3_coordinator(&mut self) -> &mut work::Coordinator {
+        let cpu_cap = self.tuner.profile_tuning().par3_cpu_cap;
+        self.par3_runtime.get_or_insert_with(|| {
+            let mut coordinator =
+                work::Coordinator::new(self.repair_work_done_tx.clone(), Arc::clone(&self.metrics));
+            coordinator.set_cpu_cap(cpu_cap);
+            Box::new(coordinator)
+        })
+    }
+
     pub(in crate::pipeline) async fn try_load_par3_metadata(
         &mut self,
         job_id: JobId,
@@ -875,12 +887,7 @@ impl Pipeline {
             }
             return;
         }
-        self.par3_runtime.get_or_insert_with(|| {
-            Box::new(work::Coordinator::new(
-                self.repair_work_done_tx.clone(),
-                Arc::clone(&self.metrics),
-            ))
-        });
+        self.par3_coordinator();
         if let Err(error) = self.enqueue_par3_file_with_inside(job_id, file_id, embedded) {
             self.fail_job(job_id, format!("PAR3 discovery failed: {error}"));
             return;
@@ -1033,12 +1040,21 @@ impl Pipeline {
                 .insert((job_id, set_index));
             return Ok(());
         }
+        // A held ordinal is on disk whether its article was placed this run or
+        // a demotion handback rebuilt it. One with neither was held by a
+        // completed-file restore, which keeps no placements; a duplicate of
+        // its article placed later must not shrink the file to that one range.
         let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        let mut held_unplaced = false;
         for segment in 0..file.total_segments() {
             if !file.has_segment(segment) {
                 continue;
             }
-            let Some((offset, len)) = file.placement_of(segment) else {
+            let Some((offset, len)) = file
+                .placement_of(segment)
+                .or_else(|| file.reconstructed_placement_of(segment))
+            else {
+                held_unplaced = true;
                 continue;
             };
             if len == 0 {
@@ -1117,6 +1133,7 @@ impl Pipeline {
         let complete_disk_image = file.is_complete()
             && virtual_volume.is_none()
             && (ranges.is_empty()
+                || held_unplaced
                 || self
                     .par3_runtime
                     .as_ref()

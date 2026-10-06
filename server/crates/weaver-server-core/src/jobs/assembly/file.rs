@@ -226,6 +226,13 @@ impl FileAssembly {
         self.placements.get(&segment_number).copied()
     }
 
+    /// Where a demotion handback rebuilt an ordinal, if it did. These bytes
+    /// are on disk but carry no streamed checksum evidence, which is why
+    /// [`placement_of`](Self::placement_of) does not report them.
+    pub(crate) fn reconstructed_placement_of(&self, segment_number: u32) -> Option<(u64, u32)> {
+        self.reconstructed_placements.get(&segment_number).copied()
+    }
+
     /// How many ordinals have a recorded placement.
     pub(crate) fn placed_segment_count(&self) -> usize {
         self.placements.len()

@@ -658,6 +658,35 @@ impl Pipeline {
         }
     }
 
+    /// Whether a probed RAR volume whose headers state no volume number has
+    /// yet to show where it sits in its set.
+    ///
+    /// Old-style volume numbering puts no number in the headers, and an
+    /// obfuscated name puts none in the filename, so such a volume is
+    /// classified under a set named after itself and reads as volume 0. The
+    /// headers settle which it really is: a volume whose first member does not
+    /// continue from an earlier volume opens a set, and one whose first member
+    /// does is a later volume, number unknown, of a set that began somewhere
+    /// else. Only the first is placed: the role and the self-named set are
+    /// right for it and wrong for the second. Until the headers have been read
+    /// — a restart or a re-probe drops them — neither is evidence of anything.
+    fn numberless_rar_volume_position_unknown(
+        &self,
+        job_id: JobId,
+        classification: &crate::jobs::assembly::DetectedArchiveIdentity,
+    ) -> bool {
+        matches!(
+            classification.kind,
+            crate::jobs::assembly::DetectedArchiveKind::Rar
+        ) && classification.volume_index.is_none()
+            && !self
+                .rar_sets
+                .get(&(job_id, classification.set_name.clone()))
+                .and_then(|set| set.facts.get(&0))
+                .and_then(|facts| facts.members.first())
+                .is_some_and(|member| !member.split_before)
+    }
+
     async fn apply_par2_authoritative_identity(
         &mut self,
         job_id: JobId,
@@ -730,24 +759,36 @@ impl Pipeline {
             // in its role. That is right for a first volume and wrong for one
             // that opens mid-member, and matching on it hands the first
             // volume's described name to whichever volume happened to be
-            // probed. The headers do say which of the two this is.
-            let continues_a_member = identity
+            // probed.
+            let position_unknown = identity
                 .classification
                 .as_ref()
-                .filter(|classification| classification.volume_index.is_none())
-                .and_then(|classification| {
-                    self.rar_sets
-                        .get(&(job_id, classification.set_name.clone()))
-                })
-                .and_then(|set| set.facts.get(&0))
-                .and_then(|facts| facts.members.first())
-                .is_some_and(|member| member.split_before);
-            if !continues_a_member
+                .is_some_and(|classification| {
+                    self.numberless_rar_volume_position_unknown(job_id, classification)
+                });
+            if !position_unknown
                 && let weaver_model::files::FileRole::RarVolume { volume_number } = role
             {
                 by_rar_volume.insert(*volume_number, *file_id);
             }
         }
+        // A file some description names is that description's. The volume
+        // number speaks only for a file whose name says nothing, and numbers
+        // repeat across sets: two single-volume sets are both volume 0, so a
+        // set that never reached disk had its description handed to the other
+        // set's volume once that one was renamed to its own description.
+        let named: HashSet<NzbFileId> = par2_set
+            .files
+            .values()
+            .filter_map(|desc| {
+                let name = sanitize_download_filename(&desc.filename);
+                by_current
+                    .get(&name)
+                    .or_else(|| by_source.get(&name))
+                    .or_else(|| by_canonical.get(&name))
+                    .copied()
+            })
+            .collect();
         let mut occupied_filenames = HashSet::<String>::new();
         for (_, identity, _, _) in &files {
             reserve_identity_filenames(identity, &mut occupied_filenames);
@@ -769,9 +810,10 @@ impl Pipeline {
                 .or_else(|| by_canonical.get(&canonical_filename).copied())
                 .or_else(|| {
                     match weaver_model::files::FileRole::from_filename(&canonical_filename) {
-                        weaver_model::files::FileRole::RarVolume { volume_number } => {
-                            by_rar_volume.get(&volume_number).copied()
-                        }
+                        weaver_model::files::FileRole::RarVolume { volume_number } => by_rar_volume
+                            .get(&volume_number)
+                            .copied()
+                            .filter(|file_id| !named.contains(file_id)),
                         _ => None,
                     }
                 });
@@ -1478,7 +1520,8 @@ impl Pipeline {
     /// already proved (see
     /// [`crate::pipeline::Pipeline::file_proven_par2_fingerprint`]) is matched
     /// on that fingerprint and its proven length, under the same uniqueness
-    /// rule.
+    /// rule. A prefix captured again later is what the bytes are matched on,
+    /// but the length stays the proven one.
     fn content_bound_par2_file_id(
         &self,
         file_id: NzbFileId,
@@ -1488,10 +1531,10 @@ impl Pipeline {
             .file_prefix_16k
             .get(&file_id)
             .filter(|prefix| !prefix.is_empty());
-        let proven = match prefix {
-            Some(_) => None,
-            None => Some(*self.file_proven_par2_fingerprint.get(&file_id)?),
-        };
+        let proven = self.file_proven_par2_fingerprint.get(&file_id).copied();
+        if prefix.is_none() && proven.is_none() {
+            return None;
+        }
         let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
@@ -1505,7 +1548,10 @@ impl Pipeline {
                 // A proven fingerprint carries the length it was proven at.
                 // The file's own count cannot stand in for it: articles a
                 // restart found already delivered are recounted at their
-                // declared, encoded sizes.
+                // declared, encoded sizes. That holds even once a prefix has
+                // been captured again, from a first article delivered a second
+                // time after the restart: the bytes are fresh, the count is
+                // not.
                 let length_contradicts = match proven {
                     Some((_, proven_length)) => proven_length != desc.length,
                     None if file.is_complete() => file.received_bytes() != desc.length,
@@ -2089,7 +2135,10 @@ impl Pipeline {
     ///    archive set the recovery set is for; with nothing to compare against,
     ///    every volume stays discoverable. Incomplete volumes are left alone: a
     ///    file still being written is not yet the archive its name claims, and
-    ///    its bytes may still be rearranged.
+    ///    its bytes may still be rearranged. So is a numberless volume whose
+    ///    headers have not shown it opening a set: the set it is classified
+    ///    under is named after the volume itself, and an obfuscated later
+    ///    volume of this very set looks exactly like that.
     ///  - A file a repair left behind: it appeared in the directory after the
     ///    pre-repair snapshot and neither the NZB nor any servable set names
     ///    it, so it is the damaged original a repair moved aside. Named by
@@ -2121,10 +2170,10 @@ impl Pipeline {
                 .effective_file_identity(job_id, file_id)
                 .and_then(|identity| identity.classification)
                 .and_then(|classification| {
-                    matches!(
+                    (matches!(
                         classification.kind,
                         crate::jobs::assembly::DetectedArchiveKind::Rar
-                    )
+                    ) && !self.numberless_rar_volume_position_unknown(job_id, &classification))
                     .then_some(classification.set_name)
                 });
             match self.resolve_par2_file_binding(file_id) {

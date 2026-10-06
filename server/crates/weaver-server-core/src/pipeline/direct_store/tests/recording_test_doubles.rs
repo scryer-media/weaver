@@ -1923,6 +1923,7 @@ fn settings_derive_the_shared_limits_from_the_host() {
     let host = |memory: u64, fs: u64| HostFacts {
         total_memory_bytes: Some(memory),
         working_fs_total_bytes: Some(fs),
+        resident_default_cap_bytes: None,
     };
     assert_eq!(
         resolve(None, none, host(8 * GIB, 100 * GIB)).holds_resident_limit_bytes,
@@ -1997,6 +1998,112 @@ fn settings_derive_the_shared_limits_from_the_host() {
             scratch_bytes: 20,
             disk_reserve_bytes: 30,
         }
+    );
+}
+
+/// A hardware profile caps only the resident limit Weaver derives: the widest
+/// profiles leave it where the host puts it, the efficient one holds it to
+/// 256 MiB, and a configured or environment limit is never capped.
+#[test]
+fn settings_cap_the_derived_resident_limit_by_hardware_profile() {
+    use super::super::{DirectStoreEnv, DirectStoreSettings, HostFacts};
+    use crate::runtime::HardwareProfile;
+    use crate::runtime::system_profile::*;
+    use crate::settings::DirectStoreOverrides;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let machine = |cores: usize, memory: u64| SystemProfile {
+        cpu: CpuProfile {
+            physical_cores: cores,
+            logical_cores: cores * 2,
+            simd: SimdSupport::default(),
+            cgroup_limit: None,
+        },
+        memory: MemoryProfile {
+            total_bytes: memory,
+            available_bytes: memory / 2,
+            cgroup_limit: None,
+        },
+        disk: DiskProfile {
+            storage_class: StorageClass::Ssd,
+            filesystem: FilesystemType::Ext4,
+            sequential_write_mbps: 2000.0,
+            random_read_iops: 50000.0,
+            same_filesystem: true,
+        },
+    };
+    let resident = |profile: HardwareProfile,
+                    cores: usize,
+                    memory: Option<u64>,
+                    config: Option<&DirectStoreOverrides>,
+                    env: DirectStoreEnv| {
+        let cap = profile
+            .tuning(&machine(cores, memory.unwrap_or(GIB)))
+            .direct_store_resident_default_cap_bytes;
+        let host = HostFacts {
+            total_memory_bytes: memory,
+            working_fs_total_bytes: Some(100 * GIB),
+            resident_default_cap_bytes: None,
+        }
+        .with_resident_default_cap(cap);
+        DirectStoreSettings::resolve_parts(config, env, host).holds_resident_limit_bytes
+    };
+    let none = DirectStoreEnv::default();
+
+    // (cores, memory, efficient, balanced, performance)
+    for (cores, memory, efficient, balanced, performance) in [
+        (4, Some(8 * GIB), 256 * MIB, 512 * MIB, 512 * MIB),
+        (16, Some(64 * GIB), 256 * MIB, GIB, GIB),
+        (2, Some(2 * GIB), 128 * MIB, 128 * MIB, 128 * MIB),
+        (4, None, 256 * MIB, 256 * MIB, 256 * MIB),
+    ] {
+        assert_eq!(
+            resident(HardwareProfile::Efficient, cores, memory, None, none),
+            efficient
+        );
+        assert_eq!(
+            resident(HardwareProfile::Balanced, cores, memory, None, none),
+            balanced
+        );
+        assert_eq!(
+            resident(HardwareProfile::Performance, cores, memory, None, none),
+            performance
+        );
+        // The widest profile is exactly the uncapped derivation.
+        assert_eq!(
+            performance,
+            super::super::default_resident_limit_bytes(memory)
+        );
+    }
+
+    // Config and the environment are the operator's numbers, above any cap.
+    let config = DirectStoreOverrides {
+        holds_resident_limit_bytes: Some(2 * GIB),
+        ..Default::default()
+    };
+    assert_eq!(
+        resident(
+            HardwareProfile::Efficient,
+            16,
+            Some(64 * GIB),
+            Some(&config),
+            none
+        ),
+        2 * GIB
+    );
+    assert_eq!(
+        resident(
+            HardwareProfile::Efficient,
+            16,
+            Some(64 * GIB),
+            None,
+            DirectStoreEnv {
+                resident_limit: Some(3 * GIB),
+                ..Default::default()
+            }
+        ),
+        3 * GIB
     );
 }
 
@@ -3552,6 +3659,160 @@ fn a_carried_remainder_still_verifies_the_articles_before_it() {
     // are harmless because they are not in `verified`: every article over them
     // is refetched and overwritten, and no floor is published across them.
     assert!(path.exists());
+}
+
+/// Article records for `articles`, each `(start, len)` taken off `bytes`: the
+/// composition a process that placed only those articles would hold.
+fn article_crcs_for(bytes: &[u8], articles: &[(usize, usize)]) -> CrcRuns {
+    let mut runs = CrcRuns::default();
+    for &(start, len) in articles {
+        runs.insert(
+            start as u64,
+            len as u64,
+            par2_rs::checksum::crc32(&bytes[start..start + len]),
+        );
+    }
+    runs
+}
+
+/// After a restart the composition holds nothing for the bytes a checkpoint
+/// restored, so a volume that needs repair would refuse every byte placed
+/// before the restart and demote. The repair scratch carries a restored
+/// stretch with no record through, and still verifies every article this
+/// process recorded after it.
+#[test]
+fn a_repair_scratch_carries_restored_bytes_with_no_record() {
+    let fixture = provider_fixture(whole_volume_covered());
+    // Two articles placed before the restart, two after it.
+    let crcs = article_crcs_for(&fixture.conventional, &[(200, 100), (300, 100)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 400);
+    let mut restored = ByteRanges::new();
+    restored.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered, crcs);
+    target.restored = restored;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let rebuilt = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect("the restored stretch is carried and the recorded articles verify");
+
+    let mut verified = ByteRanges::new();
+    verified.insert(200, 200);
+    assert_eq!(
+        rebuilt[0].verified, verified,
+        "only the articles this process recorded are claimed as verified"
+    );
+    assert_eq!(rebuilt[0].contiguous, 0);
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..400], &fixture.conventional[..400]);
+}
+
+/// The carry stops where the restored bytes do. A covered stretch past them
+/// that no record accounts for is bytes this process placed and cannot vouch
+/// for, and is refused exactly as it would be without a restart.
+#[test]
+fn a_restored_carry_never_reaches_past_the_restored_bytes() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 300);
+    let mut restored = ByteRanges::new();
+    restored.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered, CrcRuns::default());
+    target.restored = restored;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("an unrecorded stretch past the restored bytes has no reference");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 200,
+        }
+    );
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[..200], &fixture.conventional[..200]);
+    assert!(
+        written[200..].iter().all(|byte| *byte == 0),
+        "the refused stretch is left as a hole"
+    );
+}
+
+/// A record this process holds inside the restored bytes — an article fetched
+/// again after the restart — is checked like any other, so a restored byte
+/// that disagrees with it is still caught.
+#[test]
+fn a_record_inside_restored_bytes_is_still_verified() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let mut corrupted = fixture.conventional.clone();
+    corrupted[150] ^= 0xFF;
+    let crcs = article_crcs_for(&corrupted, &[(100, 100)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 200);
+    let mut target = repair_scratch_target(&fixture, path.clone(), covered.clone(), crcs);
+    target.restored = covered;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("the recorded article fails its reference");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::ChecksumMismatch {
+            volume_index: 0,
+            offset: 100,
+        }
+    );
+}
+
+/// The demotion sweep publishes a floor over what it writes, so restored bytes
+/// with no record are refused there whatever the repair scratch does.
+#[test]
+fn a_demotion_sweep_does_not_carry_restored_bytes() {
+    let fixture = provider_fixture(whole_volume_covered());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 200);
+    let mut target =
+        reconstruction_target(&fixture, path.clone(), covered.clone(), CrcRuns::default());
+    target.restored = covered;
+
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = sweep_volumes(
+        &provider,
+        &[target],
+        super::super::sparse::SparseMarking::Platform,
+    )
+    .expect_err("a floor may not cover restored bytes nothing checked");
+    assert_eq!(
+        failure,
+        super::super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 0,
+        }
+    );
 }
 
 #[test]

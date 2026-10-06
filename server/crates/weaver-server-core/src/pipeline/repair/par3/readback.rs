@@ -326,7 +326,7 @@ impl Pipeline {
                     output,
                     cipher: set.router.routes_encrypted(),
                     deferred: false,
-                edges: Vec::new(),
+                    edges: Vec::new(),
                 });
             }
         }
@@ -349,7 +349,9 @@ impl Pipeline {
         for index in 0..targets.len() {
             let target = &targets[index];
             let deferred = target.cipher
-                && targets[..index].iter().any(|earlier| earlier.set == target.set)
+                && targets[..index]
+                    .iter()
+                    .any(|earlier| earlier.set == target.set)
                 && self
                     .direct_store
                     .set(job_id, target.set)

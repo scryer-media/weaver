@@ -248,6 +248,15 @@ pub(crate) struct DirectStoreRuntime {
     /// restart the damage is re-detected from scratch and the defer re-derives
     /// itself, so a stale count would only shorten a fresh job's budget.
     repair_defer_waves: HashMap<JobId, u32>,
+    /// Jobs whose direct repair rewrote files outside every direct set.
+    ///
+    /// One recovery set can cover a live direct set and a demoted one, and
+    /// damage confined to the demoted set's files is still repaired through
+    /// the direct seam, reading the live set's volumes virtually. That repair
+    /// burns no set's latch, because it rewrote no direct volume, so this is
+    /// its latch instead: it makes the next pass a disk read-back, and a job
+    /// whose damage survived it demotes rather than repairing a second time.
+    pub(crate) conventional_targets_repaired: HashSet<JobId>,
     /// Demoted source volumes that have not reached the conventional durable
     /// seam yet, grouped by the direct set that owned them.
     pending_materializations: HashMap<JobId, HashMap<usize, PendingDemotionMaterialization>>,
@@ -500,6 +509,7 @@ impl DirectStoreRuntime {
         self.prepared_destinations.remove(&job_id);
         self.direct_extracted_members.remove(&job_id);
         self.repair_defer_waves.remove(&job_id);
+        self.conventional_targets_repaired.remove(&job_id);
         self.pending_materializations.remove(&job_id);
         self.identity.remove(&job_id);
     }

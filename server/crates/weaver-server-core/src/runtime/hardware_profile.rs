@@ -35,6 +35,36 @@ pub struct ProfileTuning {
     /// of downloads in flight, which is the whole point of the efficient
     /// profile; `None` leaves the configured connection count alone.
     pub max_concurrent_downloads_cap: Option<usize>,
+    /// The most streaming member extractions that run at once. Each holds a
+    /// decoder and its output buffers, so this is the bound fast storage
+    /// scales up to with the cores; slow storage stays below it on its own.
+    pub max_concurrent_extractions: usize,
+    /// How much of the machine's memory PAR3 repair may hold, split between
+    /// the engine and weaver's own retained state.
+    pub par3_memory: MemoryShare,
+    /// A cap on the CPU workers PAR3 repair may run at once. `None` leaves
+    /// repair every core but one, as the widest profile wants; the smaller
+    /// profiles hold it to their post-processing thread count so a repair
+    /// cannot take the cores they left free.
+    pub par3_cpu_cap: Option<usize>,
+    /// A cap on the direct-store resident holds limit Weaver derives from the
+    /// machine's memory. It never touches a configured limit. `None` leaves
+    /// the derived value alone.
+    pub direct_store_resident_default_cap_bytes: Option<u64>,
+}
+
+/// A share of the machine's memory: a fraction of it, up to a ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryShare {
+    pub divisor: u64,
+    pub cap_bytes: u64,
+}
+
+impl MemoryShare {
+    /// This share of `memory_bytes`.
+    pub fn of(self, memory_bytes: u64) -> u64 {
+        (memory_bytes / self.divisor.max(1)).min(self.cap_bytes)
+    }
 }
 
 /// One profile's whole definition: what it needs, and what it decides.
@@ -51,6 +81,9 @@ struct ProfileRow {
     /// The share of the machine's memory extraction may reserve.
     extraction_memory_divisor: u64,
     max_concurrent_downloads_cap: Option<usize>,
+    max_concurrent_extractions: usize,
+    par3_memory: MemoryShare,
+    direct_store_resident_default_cap_bytes: Option<u64>,
 }
 
 /// Ordered from the least demanding to the most: `available` preserves this
@@ -63,6 +96,12 @@ const TABLE: [ProfileRow; 3] = [
         sevenz_decode_memory_bytes: 512 * MIB,
         extraction_memory_divisor: 4,
         max_concurrent_downloads_cap: Some(10),
+        max_concurrent_extractions: 2,
+        par3_memory: MemoryShare {
+            divisor: 16,
+            cap_bytes: 256 * MIB,
+        },
+        direct_store_resident_default_cap_bytes: Some(256 * MIB),
     },
     ProfileRow {
         profile: HardwareProfile::Balanced,
@@ -71,6 +110,12 @@ const TABLE: [ProfileRow; 3] = [
         sevenz_decode_memory_bytes: GIB,
         extraction_memory_divisor: 2,
         max_concurrent_downloads_cap: None,
+        max_concurrent_extractions: 4,
+        par3_memory: MemoryShare {
+            divisor: 8,
+            cap_bytes: GIB,
+        },
+        direct_store_resident_default_cap_bytes: None,
     },
     ProfileRow {
         profile: HardwareProfile::Performance,
@@ -79,6 +124,12 @@ const TABLE: [ProfileRow; 3] = [
         sevenz_decode_memory_bytes: 4 * GIB,
         extraction_memory_divisor: 2,
         max_concurrent_downloads_cap: None,
+        max_concurrent_extractions: 6,
+        par3_memory: MemoryShare {
+            divisor: 8,
+            cap_bytes: 2 * GIB,
+        },
+        direct_store_resident_default_cap_bytes: None,
     },
 ];
 
@@ -204,6 +255,10 @@ impl HardwareProfile {
         let row = self.row();
         let memory = Self::effective_memory_bytes(probe);
         let cores = Self::effective_cores(probe);
+        let extract_threads = match self {
+            Self::Efficient => (cores / 2).clamp(1, 4),
+            Self::Balanced | Self::Performance => (cores / 2).clamp(1, 8),
+        };
         ProfileTuning {
             sevenz_decode_memory_bytes: row.sevenz_decode_memory_bytes,
             extraction_memory_bytes: memory / row.extraction_memory_divisor,
@@ -212,11 +267,15 @@ impl HardwareProfile {
                 Self::Balanced => cores.min(4),
                 Self::Performance => cores.min(16),
             },
-            extract_threads: match self {
-                Self::Efficient => (cores / 2).clamp(1, 4),
-                Self::Balanced | Self::Performance => (cores / 2).clamp(1, 8),
-            },
+            extract_threads,
             max_concurrent_downloads_cap: row.max_concurrent_downloads_cap,
+            max_concurrent_extractions: row.max_concurrent_extractions,
+            par3_memory: row.par3_memory,
+            par3_cpu_cap: match self {
+                Self::Efficient | Self::Balanced => Some(extract_threads),
+                Self::Performance => None,
+            },
+            direct_store_resident_default_cap_bytes: row.direct_store_resident_default_cap_bytes,
         }
     }
 

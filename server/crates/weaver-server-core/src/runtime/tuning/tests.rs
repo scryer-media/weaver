@@ -140,11 +140,73 @@ fn set_connection_limit_decreases_capacity() {
 
 #[test]
 fn fast_storage_extractions_follow_the_cpus_the_process_may_use() {
+    use crate::runtime::hardware_profile::HardwareProfile;
+
     let mut profile = ssd_profile(16);
     profile.cpu.logical_cores = 3;
-    let mut tuner = RuntimeTuner::with_connection_limit(profile, 8);
+    let tuning = HardwareProfile::Performance.tuning(&profile);
+    let mut tuner = RuntimeTuner::with_profile_tuning(profile, 8, tuning);
     tuner.max_concurrent_extractions_override = None;
     assert_eq!(tuner.max_concurrent_extractions(), 3);
+}
+
+/// The profile caps how many extractions run at once on fast storage; the
+/// widest one keeps the cores-between-2-and-6 rule exactly.
+#[test]
+fn each_profile_caps_concurrent_extractions() {
+    use crate::runtime::hardware_profile::HardwareProfile;
+
+    // (cores, efficient, balanced, performance) on fast storage.
+    for (cores, efficient, balanced, performance) in
+        [(1, 2, 2, 2), (4, 2, 4, 4), (8, 2, 4, 6), (16, 2, 4, 6)]
+    {
+        for (hardware, expected) in [
+            (HardwareProfile::Efficient, efficient),
+            (HardwareProfile::Balanced, balanced),
+            (HardwareProfile::Performance, performance),
+        ] {
+            let profile = ssd_profile(cores);
+            let tuning = hardware.tuning(&profile);
+            let mut tuner = RuntimeTuner::with_profile_tuning(profile, TEST_CONNECTIONS, tuning);
+            tuner.max_concurrent_extractions_override = None;
+            assert_eq!(
+                tuner.max_concurrent_extractions(),
+                expected,
+                "{} on {cores} cores",
+                hardware.as_str()
+            );
+        }
+        assert_eq!(
+            performance,
+            cores.clamp(2, 6),
+            "the widest profile is unchanged"
+        );
+    }
+
+    // Slow storage is already below every cap.
+    for hardware in HardwareProfile::ALL {
+        let mut profile = hdd_profile(16);
+        let tuning = hardware.tuning(&profile);
+        profile.disk.random_read_iops = 800.0;
+        let mut tuner = RuntimeTuner::with_profile_tuning(profile, TEST_CONNECTIONS, tuning);
+        tuner.max_concurrent_extractions_override = None;
+        assert_eq!(tuner.max_concurrent_extractions(), 2);
+        tuner.set_random_read_iops(200.0);
+        assert_eq!(tuner.max_concurrent_extractions(), 1);
+    }
+
+    // A live profile change moves the next admission, and the environment
+    // override still beats every profile.
+    let profile = ssd_profile(16);
+    let performance = HardwareProfile::Performance.tuning(&profile);
+    let efficient = HardwareProfile::Efficient.tuning(&profile);
+    let mut tuner = RuntimeTuner::with_profile_tuning(profile, TEST_CONNECTIONS, performance);
+    tuner.max_concurrent_extractions_override = None;
+    assert_eq!(tuner.max_concurrent_extractions(), 6);
+    tuner.set_profile_tuning(efficient);
+    assert_eq!(tuner.max_concurrent_extractions(), 2);
+    tuner.max_concurrent_extractions_override = Some(5);
+    assert_eq!(tuner.max_concurrent_extractions(), 5);
 }
 
 #[test]

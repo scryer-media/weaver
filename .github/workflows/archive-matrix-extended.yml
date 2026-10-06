@@ -1,8 +1,8 @@
 name: archive-matrix-extended
 
-# The extended archive campaigns: wider formats, further repair and demotion
-# axes, and deeper schedules. Manually dispatched only; the archive matrix
-# proper runs with every pull request from the main workflow.
+# The archive matrix and the extended archive campaigns: wider formats,
+# further repair and demotion axes, and deeper schedules. Manually dispatched
+# only; pull requests and release tags run the ordinary test suite.
 on:
   workflow_dispatch:
 
@@ -107,10 +107,10 @@ jobs:
         with:
           name: archive-matrix-extended-linux-x86_64
           path: target
-      - name: Run assigned extended archive campaign partition
+      - name: Run assigned archive campaign partition
         run: >-
           cargo nextest run
-          --profile archive-matrix-extended
+          --profile archive-matrix-all
           --run-ignored all
           --archive-file target/archive-matrix-extended.tar.zst
           --workspace-remap .

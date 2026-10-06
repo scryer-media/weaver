@@ -294,7 +294,7 @@ impl Pipeline {
                     .any(|(_, view)| view.files.iter().any(|file| file.path == name))
             })
         };
-        let candidates: Vec<(NzbFileId, PathBuf, Vec<(u64, usize)>)> = state
+        let candidates: Vec<_> = state
             .assembly
             .files()
             .filter(|file| {
@@ -333,7 +333,8 @@ impl Pipeline {
                         .unwrap_or_default()
                         .iter()
                         .map(|range| {
-                            let len = usize::try_from(range.end - range.start).unwrap_or(usize::MAX);
+                            let len =
+                                usize::try_from(range.end - range.start).unwrap_or(usize::MAX);
                             (range.start, len)
                         })
                         .filter(|(_, len)| *len != 0)

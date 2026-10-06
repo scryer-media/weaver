@@ -720,6 +720,7 @@ fn reconstruction_target(
         covered,
         crcs,
         partial_article: super::reconstruct::PartialArticle::Refuse,
+        restored: ByteRanges::new(),
     }
 }
 

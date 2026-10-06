@@ -10,10 +10,74 @@ fn limits_scale_with_effective_memory_without_exceeding_the_cap() {
         (Some(u64::MAX), 2 << 30, 64 << 20),
         (Some(0), 0, 0),
     ] {
-        let limits = Limits::for_memory(memory);
+        let limits = Limits::for_memory(memory, DEFAULT_SHARE);
         assert_eq!(limits.native + limits.metadata + limits.payload, total);
         assert_eq!(limits.native, total / 2);
         assert_eq!(limits.metadata, metadata);
+    }
+}
+
+/// The total each profile gives PAR3: the widest profile is exactly the share
+/// a process with no profile gets, the smaller ones less, and none of them
+/// takes a small host below an eighth of its memory up to 128 MiB.
+#[test]
+fn each_hardware_profile_sizes_the_total_and_the_widest_matches_the_default() {
+    use crate::runtime::HardwareProfile;
+    use crate::runtime::system_profile::*;
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    let machine = |cores: usize, memory: u64| SystemProfile {
+        cpu: CpuProfile {
+            physical_cores: cores,
+            logical_cores: cores * 2,
+            simd: SimdSupport::default(),
+            cgroup_limit: None,
+        },
+        memory: MemoryProfile {
+            total_bytes: memory,
+            available_bytes: memory / 2,
+            cgroup_limit: None,
+        },
+        disk: DiskProfile {
+            storage_class: StorageClass::Ssd,
+            filesystem: FilesystemType::Ext4,
+            sequential_write_mbps: 2000.0,
+            random_read_iops: 50000.0,
+            same_filesystem: true,
+        },
+    };
+    let total = |profile: HardwareProfile, cores: usize, memory: Option<u64>| {
+        let share = profile
+            .tuning(&machine(cores, memory.unwrap_or(GIB)))
+            .par3_memory;
+        let limits = Limits::for_memory(memory, share);
+        (limits.native + limits.metadata + limits.payload) as u64
+    };
+
+    assert_eq!(
+        HardwareProfile::Performance
+            .tuning(&machine(16, 64 * GIB))
+            .par3_memory,
+        DEFAULT_SHARE
+    );
+    // (cores, memory, efficient, balanced, performance)
+    for (cores, memory, efficient, balanced, performance) in [
+        (4, Some(8 * GIB), 256 * MIB, GIB, GIB),
+        (16, Some(64 * GIB), 256 * MIB, GIB, 2 * GIB),
+        (2, Some(GIB), 128 * MIB, 128 * MIB, 128 * MIB),
+        (1, Some(512 * MIB), 64 * MIB, 64 * MIB, 64 * MIB),
+        (4, None, 256 * MIB, 256 * MIB, 256 * MIB),
+    ] {
+        assert_eq!(total(HardwareProfile::Efficient, cores, memory), efficient);
+        assert_eq!(total(HardwareProfile::Balanced, cores, memory), balanced);
+        assert_eq!(
+            total(HardwareProfile::Performance, cores, memory),
+            performance
+        );
+        // Today's sizing, before any profile took part.
+        let unprofiled = memory.map_or(256 * MIB, |bytes| (bytes / 8).min(2 * GIB));
+        assert_eq!(performance, unprofiled);
     }
 }
 

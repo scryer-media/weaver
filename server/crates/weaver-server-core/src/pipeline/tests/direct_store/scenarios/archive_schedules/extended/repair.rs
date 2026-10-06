@@ -521,6 +521,47 @@ par3_smoke! {
     par3_conventional_rar5_obfuscated_loss_schedules Format::Rar5Obfuscated, ExtractionProfile::Conventional;
 }
 
+/// A posted file the PAR3 set must name from its bytes, whose first article
+/// arrives twice after that article was already held without a placement:
+/// once through a completed-file restore, once through a demotion handback.
+/// The duplicate's placement is the only one recorded, and publishing just
+/// that range hid the rest of the file, so the set rebuilt the volume beside
+/// the posted copy and left the copy's own archive set waiting on a volume.
+#[tokio::test]
+async fn par3_obfuscated_duplicate_after_unplaced_hold() {
+    let mut fixture = fixture(Target::Format(Format::Rar5Obfuscated));
+    fixture.route.unnamed_loss = |_| true;
+    let options = ScheduleOptions {
+        recovery: RecoveryFormat::Par3,
+        ..ScheduleOptions::MATRIX
+    };
+    let cases = [
+        (
+            ExtractionProfile::Conventional,
+            vec![(0, 0), (0, 1), (0, 0)],
+            Interruption::Combined {
+                mask: 12,
+                index_first: true,
+                action: BoundaryAction::Restart,
+                at: 2,
+            },
+        ),
+        (
+            ExtractionProfile::DirectStore,
+            vec![(0, 0), (0, 0), (1, 1), (0, 1)],
+            Interruption::Combined {
+                mask: 4,
+                index_first: false,
+                action: BoundaryAction::Demote,
+                at: 2,
+            },
+        ),
+    ];
+    for (case, (profile, order, interruption)) in cases.into_iter().enumerate() {
+        run_case(&fixture, options, profile, case, &order, interruption).await;
+    }
+}
+
 macro_rules! demotion_smoke {
     ($($name:ident $target:expr, $every:expr;)+) => {
         $(
@@ -546,6 +587,103 @@ demotion_smoke! {
     chase_demotion_reasons_rar5_encrypted Target::Format(Format::Rar5Encrypted), CHASE_DEMOTIONS;
     chase_demotion_reasons_rar4_four_volume Target::Format(Format::Rar4FourVolumes), CHASE_DEMOTIONS;
     chase_demotion_reasons_rar5_four_volume Target::Format(Format::Rar5FourVolumes), CHASE_DEMOTIONS;
+}
+
+/// One recovery set covers both archive sets, and the loss lands in the set
+/// that was demoted: wholly (the other set clean), beside a loss in the set
+/// still direct, and everywhere at once. The repair reads the direct set's
+/// volumes virtually and writes the demoted set's files in place, so the set
+/// the schedule left alone stays direct.
+#[tokio::test]
+async fn two_sets_loss_in_the_demoted_set_leaves_the_other_direct() {
+    let fixture = fixture(Target::TwoSets);
+    let forced = Forced::Direct(DemotionReason::HoldsScratchCeiling);
+    let cases = combined_schedule_cases();
+    // (replay index, demoted set): mask 12 with beta demoted, mask 14 and
+    // mask 15 with alpha demoted.
+    for (case, set) in [(36, 1), (14, 0), (5, 0)] {
+        let (_, (order, interruption)) = cases
+            .iter()
+            .find(|(index, _)| *index == case)
+            .cloned()
+            .expect("the combined matrix keeps this case");
+        run_case(
+            &fixture,
+            forced.on(set),
+            forced.profile(),
+            case,
+            &order,
+            interruption,
+        )
+        .await;
+    }
+}
+
+/// The same two sets posted under obfuscated names, so the recovery set's
+/// descriptions are the only real names and each volume is admitted by its
+/// content. The demoted set's file lands on disk under its posted name, not
+/// the name its description declares, and its second article is lost. The
+/// repair still writes that file in place, through the identity its first
+/// article proved, and the set the schedule left alone stays direct.
+#[tokio::test]
+async fn two_sets_loss_in_a_renamed_demoted_set_leaves_the_other_direct() {
+    // Each offset-zero article has to cover its volume's 16 KiB fingerprint
+    // window whole, as every real article does.
+    let members: Vec<_> = [("alpha.mkv", 70_001, 7), ("nested/beta.mkv", 65_537, 11)]
+        .into_iter()
+        .map(|(name, len, step)| {
+            let payload = (0..len)
+                .map(|n| ((n * step + n / 251) % 253) as u8)
+                .collect::<Vec<_>>();
+            (name, payload)
+        })
+        .collect();
+    let named: Vec<_> = ["alpha", "beta"]
+        .into_iter()
+        .zip(&members)
+        .map(|(stem, (member, payload))| {
+            let (_, bytes) = single_member_store_set(member, payload, 1).remove(0);
+            (format!("{stem}.part01.rar"), bytes)
+        })
+        .collect();
+    let volumes = obfuscate_volumes(&named);
+    let fixture = Fixture {
+        spec: direct_store_job_spec("Two set schedules", &volumes),
+        volumes,
+        described: Some(named.into_iter().map(|(name, _)| name).collect()),
+        members,
+        route: Route {
+            sets: 2,
+            ..Route::DIRECT
+        },
+    };
+    let forced = Forced::Direct(DemotionReason::HoldsScratchCeiling);
+    // A set admitted by content takes its index from its first binding, so
+    // the set whose volume arrives first is set 0 and is the one demoted,
+    // right after that first article. Beta loses its second article, then
+    // alpha does.
+    for (case, (order, mask)) in [
+        (vec![(1, 0), (0, 0), (0, 1)], 8),
+        (vec![(0, 0), (1, 0), (1, 1)], 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        run_case(
+            &fixture,
+            forced.on(0),
+            forced.profile(),
+            case,
+            &order,
+            Interruption::Combined {
+                mask,
+                index_first: true,
+                action: BoundaryAction::Demote,
+                at: 1,
+            },
+        )
+        .await;
+    }
 }
 
 // Shards cut each campaign to well under a thousand cases, so no test
