@@ -81,6 +81,26 @@ This sends `Authorization: Bearer <key>` without reusing browser credentials.
 
 See [docs/metrics.md](docs/metrics.md) for the full metric catalogue, label conventions, and useful PromQL. Ready-made [Grafana dashboard](contrib/grafana/weaver-overview.json) and [Prometheus alert rules](contrib/prometheus/weaver-alerts.yml) live under `contrib/`.
 
+## Technology Radar
+
+Kernel and platform work tracked across weaver and the rarpar crates it consumes (PAR2, PAR3, RAR, yEnc). The rarpar README carries the engine-side radar.
+
+Rules that govern every row: one binary with runtime dispatch; a kernel tier is never dropped because no local host has its instruction set; a tier is kept only when it wins at least 5% end to end where it engages and regresses nothing else by more than 1%; disk work (fsyncs, opens, read and write calls) is a regression axis on its own.
+
+Status: **Landed** ships; **Building** has an owner now; **Exploring** is a measured spike before a decision; **Watch** waits on hardware or evidence.
+
+| Item | Serves | Status | Needs |
+|---|---|---|---|
+| yEnc decode, 512-bit AVX-512 VBMI2 tier (`vpcompressb` compaction) | yEnc | Landed, validated under emulation | hardware A/B on Zen 4 and Sapphire Rapids |
+| CRC32 fold width: 256-bit `vpclmulqdq` versus the current 128-bit fold; `crc-fast` as a candidate | yEnc, PAR2 verify, direct-store integrity | Exploring | decision from the measured gap against rapidyenc |
+| GF(2^16) folded tier for AVX2 hosts without GFNI (Zen 2, pre-Ice-Lake) | PAR2 repair | Watch | measured gap on Zen 2 is 2.4x wall against par2cmdline-turbo |
+| AVX512BMM GF(2^16) tier (Zen 6 `VBMACXOR16x16x16`) | PAR2, PAR3 | Watch | no Zen 6 instances on EC2 yet |
+| SME2 GF(2) outer-product GEMM (`BMOPA`) for Reed-Solomon encode and solve | PAR2, PAR3 Cauchy | Exploring | bench-first spike on Apple M4-class silicon; shared SME unit per cluster |
+| SME streaming-width multi-buffer hashing (MD5, BLAKE3) | PAR2 verify, PAR3 planning | Watch | unproven; mode-switch cost |
+| AVX10.2 and APX | every x86 kernel | Watch | Diamond Rapids and Nova Lake; EVEX kernels carry over, APX helps register-bound grouped kernels |
+| mimalloc v3 allocator with purge tuning | resident memory | Landed | |
+
+
 ## License
 
 Weaver-authored source code is licensed under GPL-3.0-or-later. Official builds include `unrar-rs` for RAR support; that component remains subject to the UnRAR restriction; Weaver's GPL code combines with it under a GPLv3 section 7 linking permission. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
