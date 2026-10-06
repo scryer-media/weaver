@@ -2538,3 +2538,145 @@ fn forced_tier_kernels_match_scalar_in_production_shape() {
         }
     }
 }
+
+/// Every tier kernel against the scalar oracle with the input placed at every
+/// offset from a 64-byte boundary and entered in every decoder state, in the
+/// end-detecting shape. The AVX2 end search head-aligns its span with scalar
+/// steps, so the bytes those steps cover (stuffed dots, escapes, `=y` and
+/// terminators straddling the alignment point) must decode exactly as the
+/// scalar machine decodes them. Each boundary sequence is spliced at every
+/// position around the alignment point, and random bodies dense in the bytes
+/// the boundary rules read cover the remaining orderings.
+#[test]
+fn forced_tier_end_search_matches_scalar_at_every_alignment() {
+    const ALPHABET: &[u8] = b"\r\n.=yAB";
+    const SEQUENCES: [&[u8]; 9] = [
+        b"\r\n=y",
+        b"\r\n.=y",
+        b"\r\n.\r\n",
+        b"\r\n..",
+        b"\r\n.",
+        b"\r\n=",
+        b"=\r\n",
+        b"==",
+        b"\r\r\n",
+    ];
+    const STATES: [DecoderState; 7] = [
+        DecoderState::None,
+        DecoderState::Eq,
+        DecoderState::Cr,
+        DecoderState::CrLf,
+        DecoderState::CrLfDot,
+        DecoderState::CrLfDotCr,
+        DecoderState::CrLfEq,
+    ];
+    let tiers = forced_tier_kernels();
+    let mut seed = 0x6a09_e667_f3bc_c909u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut bodies: Vec<(usize, Vec<u8>)> = Vec::new();
+    for offset in 0..64usize {
+        // The first byte the aligned span starts on, relative to the input.
+        let align_at = (64 - offset) % 64;
+        for seq in SEQUENCES {
+            for shift in 0..9usize {
+                let Some(at) = (align_at + shift).checked_sub(5) else {
+                    continue;
+                };
+                let mut body = production_line_body(320, 128);
+                body[at..at + seq.len()].copy_from_slice(seq);
+                bodies.push((offset, body));
+            }
+        }
+    }
+    for round in 0..600usize {
+        let len = 129 + (next() % 700) as usize;
+        let spacing = 1 + (next() % 24);
+        let body = (0..len)
+            .map(|_| {
+                if next() % spacing == 0 {
+                    ALPHABET[(next() % ALPHABET.len() as u64) as usize]
+                } else {
+                    b'A' + (next() % 20) as u8
+                }
+            })
+            .collect();
+        bodies.push((round % 64, body));
+    }
+
+    let mut backing = vec![0u8; 1024 + 128];
+    let base = backing.as_ptr().align_offset(64);
+    for (offset, body) in &bodies {
+        let len = body.len();
+        backing[base + offset..base + offset + len].copy_from_slice(body);
+        let input = &backing[base + offset..base + offset + len];
+        for entry in STATES {
+            for preserve in [true, false] {
+                let mut reference = vec![0u8; len + 64];
+                let mut reference_state = KernelState {
+                    state: entry,
+                    ..KernelState::body()
+                };
+                let reference_outcome = decode_kernel_scalar(
+                    input,
+                    &mut reference,
+                    &mut reference_state,
+                    true,
+                    preserve,
+                    true,
+                );
+                for &(name, available, kernel) in &tiers {
+                    if !available {
+                        continue;
+                    }
+                    let mut output = vec![0u8; len + 64];
+                    let mut state = KernelState {
+                        state: entry,
+                        ..KernelState::body()
+                    };
+                    let outcome =
+                        unsafe { kernel(input, &mut output, &mut state, true, preserve, true) };
+                    let context = || {
+                        format!(
+                            "tier {name} offset {offset} entry {entry:?} preserve {preserve} \
+                             body {:?}",
+                            String::from_utf8_lossy(input)
+                        )
+                    };
+                    match (&reference_outcome, outcome) {
+                        (Ok(expected), Ok(actual)) => {
+                            assert_eq!(
+                                (
+                                    &output[..actual.written],
+                                    actual.consumed,
+                                    actual.end,
+                                    state
+                                ),
+                                (
+                                    &reference[..expected.written],
+                                    expected.consumed,
+                                    expected.end,
+                                    reference_state,
+                                ),
+                                "{}",
+                                context()
+                            );
+                        }
+                        (expected, actual) => {
+                            assert_eq!(
+                                format!("{:?}", expected.as_ref().map(|_| ())),
+                                format!("{:?}", actual.map(|_| ())),
+                                "{}",
+                                context()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
