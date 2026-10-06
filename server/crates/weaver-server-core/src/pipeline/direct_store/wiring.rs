@@ -111,6 +111,8 @@ pub(crate) struct IdentityRoster {
     /// set. Stable: sets are only ever pushed, never removed, while a job
     /// lives.
     pub(crate) set_index: Option<usize>,
+    /// The container family the descriptions name.
+    pub(crate) format: super::plan::SetFormat,
 }
 
 /// Per-job identity-admission state: rosters awaiting or holding bindings,
@@ -223,6 +225,10 @@ pub(crate) struct DirectStoreRuntime {
     /// passing through the admission seam, and its sets still need candidates.
     header_harvest: HashMap<JobId, Vec<crate::jobs::model::ArchivePasswordCandidate>>,
     sets: HashMap<JobId, Vec<DirectSet>>,
+    /// Jobs with a container set whose end header was lost with its article,
+    /// to be handed over on the next turn. The booking that rules an article
+    /// missing cannot demote a set itself, so it notes the job here.
+    end_header_verdicts: std::collections::BTreeSet<JobId>,
     /// Destinations already created and marked sparse, per job. A member stored
     /// inside a directory names a partial inside that directory and nothing
     /// else creates it, and every destination has to carry the sparse attribute
@@ -1201,6 +1207,8 @@ impl Pipeline {
         let set_ids = runtime.ordered_set_ids();
         let mut candidates: BTreeMap<String, Vec<(u32, IdentityRosterVolume)>> = BTreeMap::new();
         let mut described_by: HashMap<String, HashSet<par2_rs::RecoverySetId>> = HashMap::new();
+        // `None` once two families claimed one name.
+        let mut formats: HashMap<String, Option<super::plan::SetFormat>> = HashMap::new();
         for set_id in set_ids {
             let Some(set) = self.par2_set_for(job_id, set_id) else {
                 continue;
@@ -1208,12 +1216,24 @@ impl Pipeline {
             for desc in set.files.values() {
                 let name = weaver_model::files::sanitize_download_filename(&desc.filename);
                 let role = weaver_model::files::FileRole::from_filename(&name);
-                let weaver_model::files::FileRole::RarVolume { volume_number } = role else {
-                    continue;
+                // A whole `.7z` is not here: its own signature header admits
+                // it, with no description needed.
+                let (format, volume_number) = match role {
+                    weaver_model::files::FileRole::RarVolume { volume_number } => {
+                        (super::plan::SetFormat::Rar, volume_number)
+                    }
+                    weaver_model::files::FileRole::SevenZipSplit { number } => {
+                        (super::plan::SetFormat::SevenZip, number)
+                    }
+                    _ => continue,
                 };
                 let Some(set_name) = weaver_model::files::archive_base_name(&name, &role) else {
                     continue;
                 };
+                let named = formats.entry(set_name.clone()).or_insert(Some(format));
+                if *named != Some(format) {
+                    *named = None;
+                }
                 candidates.entry(set_name.clone()).or_default().push((
                     volume_number,
                     IdentityRosterVolume {
@@ -1245,6 +1265,10 @@ impl Pipeline {
             {
                 continue;
             }
+            // Two families under one name: one of them is not this archive.
+            let Some(Some(format)) = formats.get(&set_name).copied() else {
+                continue;
+            };
             if self
                 .direct_store
                 .identity
@@ -1276,6 +1300,7 @@ impl Pipeline {
                     volumes,
                     bound: HashMap::new(),
                     set_index: None,
+                    format,
                 },
             );
         }
@@ -1292,14 +1317,15 @@ impl Pipeline {
                     admission.restored_rosters.insert(set_name, restored);
                     continue;
                 };
-                let expected = self
+                let identity = self
                     .direct_store
                     .sets
                     .get(&job_id)
                     .and_then(|sets| sets.get(restored.set_index))
-                    .and_then(|set| set.plan().identity)
-                    .and_then(|identity| identity.expected_volumes);
+                    .and_then(|set| set.plan().identity);
+                let expected = identity.and_then(|identity| identity.expected_volumes);
                 let consistent = expected == Some(roster.volumes.len() as u32)
+                    && identity.is_some_and(|identity| identity.kind.format() == roster.format)
                     && restored
                         .bound
                         .values()
@@ -1731,19 +1757,22 @@ impl Pipeline {
         let state = self.jobs.get(&job_id)?;
         let working_dir = state.working_dir.clone();
         let password = state.spec.password.clone();
-        let expected_volumes = self
+        let (expected_volumes, format) = self
             .direct_store
             .identity
             .get(&job_id)
             .and_then(|admission| admission.rosters.get(&set_name))
-            .map(|roster| roster.volumes.len() as u32)?;
+            .map(|roster| (roster.volumes.len() as u32, roster.format))?;
         let plan = DirectSetPlan {
             set_name: set_name.clone(),
-            format: crate::pipeline::direct_store::plan::SetFormat::Rar,
+            format,
             volumes: BTreeMap::from([(volume_index, file_index)]),
             files: HashMap::from([(file_index, volume_index)]),
             identity: Some(IdentityPlanFacts {
-                kind: super::plan::IdentityKind::Roster,
+                kind: match format {
+                    super::plan::SetFormat::Rar => super::plan::IdentityKind::Roster,
+                    super::plan::SetFormat::SevenZip => super::plan::IdentityKind::SevenZipRoster,
+                },
                 expected_volumes: Some(expected_volumes),
                 // The first bound file's index: stable by construction, which
                 // the derived minimum is not while the mapping grows.
@@ -1979,6 +2008,16 @@ impl Pipeline {
         {
             return None;
         }
+        // A file a set already owns reaches this rung only once that set has
+        // left the direct path; its refetched front must not admit it again.
+        if self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.plan().volume_for_file(file_index).is_some())
+        {
+            return None;
+        }
         {
             let admission = self.direct_store.identity.get(&job_id);
             if admission.is_some_and(|admission| {
@@ -2015,12 +2054,22 @@ impl Pipeline {
         ) {
             return None;
         }
-        let sniff = super::sniff::sniff_rar_prefix(self.file_prefix_16k.get(&file_id)?);
+        let prefix = self.file_prefix_16k.get(&file_id)?;
+        let sniff = super::sniff::sniff_rar_prefix(prefix);
         let super::sniff::PrefixSniff::Rar5 {
             volume_number,
             is_volume,
         } = sniff
         else {
+            if sniff == super::sniff::PrefixSniff::NotRar
+                && super::sniff::sniff_sevenz_prefix(
+                    prefix,
+                    self.file_declared_size.get(&file_id).copied(),
+                ) == super::sniff::SevenZipSniff::Whole
+                && !leaked
+            {
+                return self.admit_standalone_sevenz(file_id);
+            }
             if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
                 admission.no_match.insert(file_index);
             }
@@ -2181,10 +2230,100 @@ impl Pipeline {
             "direct-store admitted a standalone archive from its own RAR5 head"
         );
         let set_index = self.admit_identity_set(job_id, plan, password.as_deref());
+        self.prove_direct_standalone_fingerprint(file_id);
         Some(DirectFileTarget::Route {
             set_index,
             volume_index: 0,
         })
+    }
+
+    /// The header rung's 7z answer: an unclassified file whose signature
+    /// header closes the container exactly at the file's own length is a whole
+    /// container, a set of one closed at admission like a standalone RAR5
+    /// archive. The start header places the end header, so the tail probe can
+    /// fetch the map without a name ever saying what the file is.
+    fn admit_standalone_sevenz(&mut self, file_id: NzbFileId) -> Option<DirectFileTarget> {
+        let job_id = file_id.job_id;
+        let file_index = file_id.file_index;
+        let destination_dir = self.deterministic_extraction_staging_dir(job_id);
+        let state = self.jobs.get(&job_id)?;
+        let working_dir = state.working_dir.clone();
+        let password = state.spec.password.clone();
+        let plan = DirectSetPlan {
+            set_name: format!("obfuscated-archive.f{file_index}"),
+            format: crate::pipeline::direct_store::plan::SetFormat::SevenZip,
+            volumes: BTreeMap::from([(0, file_index)]),
+            files: HashMap::from([(file_index, 0)]),
+            identity: Some(IdentityPlanFacts {
+                kind: super::plan::IdentityKind::SevenZipStandalone,
+                expected_volumes: Some(1),
+                discriminator: file_index,
+            }),
+            working_dir,
+            destination_dir,
+        };
+        crate::runtime::perf_probe::record(
+            "direct_store.identity.header_admitted",
+            std::time::Duration::from_nanos(1),
+        );
+        info!(
+            job_id = job_id.0,
+            set_name = %plan.set_name,
+            "direct-store admitted a whole 7z container from its own signature header"
+        );
+        let set_index = self.admit_identity_set(job_id, plan, password.as_deref());
+        self.prove_direct_standalone_fingerprint(file_id);
+        Some(DirectFileTarget::Route {
+            set_index,
+            volume_index: 0,
+        })
+    }
+
+    /// Takes a standalone set's recovery-set fingerprint for one of its files,
+    /// once, as soon as the file's opening bytes are all in memory.
+    ///
+    /// A standalone set is admitted by its file's own header, so nothing but
+    /// those bytes can say which recovery-set description the file is, and they
+    /// do not survive a restart. Without that binding, a repair after a restart
+    /// counts the whole file as missing. The checkpoint carries the
+    /// fingerprint instead, the way a roster set's carries the description it
+    /// matched.
+    ///
+    /// Called at admission and when the prefix capture completes, whichever
+    /// comes last. One MD5 over at most 16 KiB per standalone file, never per
+    /// article.
+    pub(crate) fn prove_direct_standalone_fingerprint(&mut self, file_id: NzbFileId) {
+        let job_id = file_id.job_id;
+        let file_index = file_id.file_index;
+        let Some(set_index) = self.direct_store.sets_for(job_id).iter().position(|set| {
+            !set.is_demoted()
+                && !set.is_finalized()
+                && set.plan().files.contains_key(&file_index)
+                && set.plan().identity.is_some_and(|identity| {
+                    matches!(
+                        identity.kind,
+                        super::plan::IdentityKind::Standalone
+                            | super::plan::IdentityKind::SevenZipStandalone
+                    )
+                })
+                && !set.proven_fingerprints().contains_key(&file_index)
+        }) else {
+            return;
+        };
+        let Some(length) = self.file_declared_size.get(&file_id).copied() else {
+            return;
+        };
+        let window = (length as usize).min(crate::pipeline::PAR2_HASH_16K_BYTES);
+        let Some(prefix) = self.file_prefix_16k.get(&file_id) else {
+            return;
+        };
+        if window == 0 || prefix.len() < window {
+            return;
+        }
+        let hash_16k = par2_rs::checksum::md5(&prefix[..window]);
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            set.record_proven_fingerprint(file_index, hash_16k, length);
+        }
     }
 
     /// Routes a freshly bound file's parked reorder-stage segments into its
@@ -2342,6 +2481,7 @@ impl Pipeline {
         let mut restored_rosters: HashMap<String, RestoredRoster> = HashMap::new();
         let mut owned_files: HashSet<u32> = HashSet::new();
         let mut reprioritize: Vec<(u32, u32)> = Vec::new();
+        let mut fingerprints: Vec<(u32, ([u8; 16], u64))> = Vec::new();
         for (set_index, set) in self.direct_store.sets_for(job_id).iter().enumerate() {
             let plan = set.plan();
             owned_files.extend(plan.files.keys().copied());
@@ -2355,11 +2495,22 @@ impl Pipeline {
                 .expected_volumes
                 .is_some_and(|expected| plan.volumes.len() as u32 == expected);
             match identity.kind {
-                super::plan::IdentityKind::Standalone => continue,
+                // Its file's opening bytes routed before the restart; the
+                // fingerprint its checkpoint kept is what binds the file to
+                // its description again.
+                super::plan::IdentityKind::Standalone
+                | super::plan::IdentityKind::SevenZipStandalone => {
+                    fingerprints.extend(
+                        set.proven_fingerprints()
+                            .iter()
+                            .map(|(&file_index, &fingerprint)| (file_index, fingerprint)),
+                    );
+                    continue;
+                }
                 // A whole described set binds nothing further, but its files'
                 // captured prefixes died with the process: only its
                 // descriptions can say again which description each file is.
-                super::plan::IdentityKind::Roster => {
+                super::plan::IdentityKind::Roster | super::plan::IdentityKind::SevenZipRoster => {
                     restored_rosters.insert(
                         plan.set_name.clone(),
                         RestoredRoster {
@@ -2380,6 +2531,13 @@ impl Pipeline {
                     .iter()
                     .map(|(volume_index, file_index)| (*file_index, *volume_index)),
             );
+        }
+        for (file_index, fingerprint) in fingerprints {
+            let file_id = NzbFileId { job_id, file_index };
+            if !self.file_prefix_16k.contains_key(&file_id) {
+                self.file_proven_par2_fingerprint
+                    .insert(file_id, fingerprint);
+            }
         }
         if header_sets.is_empty() && restored_rosters.is_empty() {
             return;
@@ -2692,6 +2850,90 @@ impl Pipeline {
         }
         for set_index in condemned_header_sets {
             self.condemn_header_set(job_id, set_index).await;
+        }
+    }
+
+    /// Notes a terminal verdict on an article against the container set whose
+    /// last volume it closes.
+    ///
+    /// Called on the edge into the terminal state, so only a verdict reaches
+    /// it — an article that is merely slow, or still has a server or a retry
+    /// left, never does. The set is not demoted here: the booking is not a
+    /// place a demotion can run, so the job is noted for the next turn.
+    pub(crate) fn note_direct_article_terminal(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        let file_index = segment_id.file_id.file_index;
+        let Some(closing) = self.jobs.get(&job_id).and_then(|state| {
+            state
+                .spec
+                .files
+                .get(file_index as usize)?
+                .segments
+                .iter()
+                .map(|segment| segment.ordinal)
+                .max()
+        }) else {
+            return;
+        };
+        if segment_id.segment_number != closing {
+            return;
+        }
+        let mut lost = false;
+        for index in 0..self.direct_store.sets_for(job_id).len() {
+            let Some(set) = self.direct_store.set_mut(job_id, index) else {
+                continue;
+            };
+            if set.plan().format != super::plan::SetFormat::SevenZip
+                || set.is_demoted()
+                || set.is_finalized()
+                || set.plan().volumes.values().next_back() != Some(&file_index)
+            {
+                continue;
+            }
+            set.router.note_end_article_lost();
+            lost |= set.router.end_header_lost();
+        }
+        if lost {
+            self.direct_store.end_header_verdicts.insert(job_id);
+        }
+    }
+
+    /// Whether a lost end header is waiting to be acted on.
+    pub(crate) fn has_direct_end_header_verdicts(&self) -> bool {
+        !self.direct_store.end_header_verdicts.is_empty()
+    }
+
+    /// Hands over every container set whose end header was lost with its
+    /// article.
+    ///
+    /// The map cannot be read, so the set will demote whatever arrives next;
+    /// doing it now is what keeps the rest of the container from being held,
+    /// and paged out to scratch, for nothing.
+    pub(crate) async fn settle_direct_end_header_verdicts(&mut self) {
+        let jobs = std::mem::take(&mut self.direct_store.end_header_verdicts);
+        for job_id in jobs {
+            let lost: Vec<usize> = self
+                .direct_store
+                .sets_for(job_id)
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| {
+                    !set.is_demoted() && !set.is_finalized() && set.router.end_header_lost()
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for set_index in lost {
+                warn!(
+                    job_id = job_id.0,
+                    set_index, "a container's end header was lost with the article that closes it"
+                );
+                self.demote_direct_set(
+                    job_id,
+                    set_index,
+                    DemotionReason::SevenZip(SevenZipRefusal::EndHeaderLost),
+                )
+                .await;
+            }
         }
     }
 

@@ -162,6 +162,10 @@ pub(super) struct Route {
     /// alone. A file that never receives one cannot be bound to its volume, and
     /// its set cannot be made whole.
     pub unnamed_loss: fn(u8) -> bool,
+    /// Only the recovery set's descriptions can name the volumes, so an index
+    /// that arrives after the body names nothing in time and the set goes
+    /// conventional.
+    pub named_by_early_index: bool,
 }
 
 impl Route {
@@ -171,6 +175,7 @@ impl Route {
         shape_demotion: |_| false,
         unmapped_loss: |_| false,
         unnamed_loss: |_| false,
+        named_by_early_index: false,
     };
 
     /// A set the layout refuses to route: it demotes for its shape and
@@ -182,6 +187,7 @@ impl Route {
             shape_demotion,
             unmapped_loss: |_| false,
             unnamed_loss: |_| false,
+            named_by_early_index: false,
         }
     }
 }
@@ -295,15 +301,16 @@ impl ExtractionProfile {
         let unmapped = interruption
             .loss()
             .is_some_and(|(mask, _)| (route.unmapped_loss)(mask));
-        let unnamed = interruption
-            .loss()
-            .is_some_and(|(mask, _)| (route.unnamed_loss)(mask));
+        let unnamed = interruption.loss().is_some_and(|(mask, index_first)| {
+            (route.unnamed_loss)(mask) || (route.named_by_early_index && !index_first)
+        });
         let unexpected: Vec<_> = outcome
             .demotions
             .iter()
             .filter(|reason| match **reason {
                 reason if outcome.schedule_demoted == Some(reason) => false,
                 DemotionReason::SevenZip(SevenZipRefusal::UnreadableMap) if unmapped => false,
+                DemotionReason::SevenZip(SevenZipRefusal::EndHeaderLost) if unmapped => false,
                 DemotionReason::IdentityRosterUnfillable if unnamed => false,
                 // The unnamed volume belongs to no set, so its damage is
                 // damage no direct set can repair in place.
@@ -511,7 +518,7 @@ impl Interruption {
     }
 }
 
-type Schedule = (Vec<(u32, u32)>, Interruption);
+pub(super) type Schedule = (Vec<(u32, u32)>, Interruption);
 
 pub(super) fn combined_schedules(shard: usize, shards: usize) -> Vec<(usize, Schedule)> {
     assert!(shard < shards);
@@ -564,7 +571,7 @@ pub(super) fn wrong_password_schedules(selection: Selection) -> Vec<Schedule> {
     result
 }
 
-fn combined_schedule_cases() -> Vec<(usize, Schedule)> {
+pub(super) fn combined_schedule_cases() -> Vec<(usize, Schedule)> {
     let mut orders = std::collections::BTreeSet::new();
     for order in arrival_orders() {
         orders.insert(order.clone());
@@ -877,6 +884,7 @@ async fn submit_schedule_recovery(
             )
             .await;
         }
+        RecoveryFormat::Embedded => unreachable!("an embedded set posts no recovery file"),
     }
 }
 
@@ -904,6 +912,8 @@ pub(super) enum RecoveryFormat {
     /// A PAR3 index and its recovery volumes. The index arrives where the
     /// PAR2 file would; a recovery volume arrives when the pipeline asks.
     Par3,
+    /// The volumes carry their own recovery set and nothing else is posted.
+    Embedded,
 }
 
 /// Who a schedule's demote action claims, and why.
@@ -1033,7 +1043,9 @@ pub(super) async fn run_schedule_with(
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let loss = interruption.loss();
     let index_first = loss.map_or(described.is_some(), |(_, first)| first);
-    let recovery = if loss.is_some() || described.is_some() {
+    let recovery = if options.recovery == RecoveryFormat::Embedded {
+        Vec::new()
+    } else if loss.is_some() || described.is_some() {
         // Keep several repair blocks per article even for larger compressed
         // fixtures, without turning extraction scheduling into a codec benchmark.
         let slice = volumes
@@ -1093,6 +1105,7 @@ pub(super) async fn run_schedule_with(
                     })
                     .collect()
             }
+            RecoveryFormat::Embedded => unreachable!("handled above"),
         }
     } else {
         Vec::new()
@@ -1354,7 +1367,9 @@ pub(super) async fn run_schedule_with(
                 .await
                 .expect("registered extraction receipt");
             pipeline.handle_extraction_done(done).await;
-        } else if recovery.is_empty() {
+        } else if recovery.is_empty() && options.recovery != RecoveryFormat::Embedded {
+            // An embedded set's verification and repair are settled by the
+            // pump above and may take another completion round to land.
             panic!(
                 "archive stalled without an outstanding operation: {} trace={trace:?}",
                 debug_job_state(&pipeline, job)

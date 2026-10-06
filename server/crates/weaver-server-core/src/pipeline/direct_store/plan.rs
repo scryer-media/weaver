@@ -156,6 +156,23 @@ pub(crate) enum IdentityKind {
     HeaderVolumeSet,
     /// A single file whose RAR5 head says it is a whole archive.
     Standalone,
+    /// A single file whose 7z signature header closes the container exactly
+    /// at the file's own length.
+    SevenZipStandalone,
+    /// The recovery set's descriptions of a split 7z container's parts,
+    /// matched like [`Self::Roster`]. The parts carry nothing that says which
+    /// part they are, so the descriptions are the only evidence there is.
+    SevenZipRoster,
+}
+
+impl IdentityKind {
+    /// The archive family the evidence proved.
+    pub(crate) fn format(self) -> SetFormat {
+        match self {
+            Self::Roster | Self::HeaderVolumeSet | Self::Standalone => SetFormat::Rar,
+            Self::SevenZipStandalone | Self::SevenZipRoster => SetFormat::SevenZip,
+        }
+    }
 }
 
 /// One admitted archive set: its identity, its volume-to-file mapping, and the
@@ -366,6 +383,15 @@ impl DirectSetPlan {
     /// What a checkpoint records about an identity-admitted plan so a restart
     /// can rebuild it exactly. `None` for a name-admitted plan, which the spec
     /// rediscovers on its own.
+    /// Every volume the set will ever have is bound. Always true for a set its
+    /// file names admitted; an identity set is whole once its last expected
+    /// volume binds.
+    pub(crate) fn is_whole(&self) -> bool {
+        self.identity
+            .and_then(|identity| identity.expected_volumes)
+            .is_none_or(|expected| self.volumes.len() as u32 == expected)
+    }
+
     pub(crate) fn identity_binding(&self) -> Option<super::snapshot::IdentityBinding> {
         let identity = self.identity?;
         Some(super::snapshot::IdentityBinding {
@@ -428,7 +454,7 @@ impl DirectSetPlan {
             return Err("the identity binding binds a volume past the set's end");
         }
         match binding.kind {
-            IdentityKind::Roster => {
+            IdentityKind::Roster | IdentityKind::SevenZipRoster => {
                 if binding.expected_volumes.is_none() {
                     return Err("a described set without its volume count");
                 }
@@ -438,7 +464,7 @@ impl DirectSetPlan {
                     return Err("a header volume set under a name its rung does not give");
                 }
             }
-            IdentityKind::Standalone => {
+            IdentityKind::Standalone | IdentityKind::SevenZipStandalone => {
                 if binding.expected_volumes != Some(1)
                     || volumes.len() != 1
                     || !volumes.contains_key(&0)
@@ -450,7 +476,7 @@ impl DirectSetPlan {
         }
         Ok(Self {
             set_name: set_name.to_string(),
-            format: SetFormat::Rar,
+            format: binding.kind.format(),
             volumes,
             files,
             identity: Some(IdentityPlanFacts {

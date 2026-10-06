@@ -102,7 +102,9 @@ fn pending_phase(input: &PendingInput) -> Par3Phase {
         PendingInput::Donors => Par3Phase::DonorSearch,
         PendingInput::Readback(_) => Par3Phase::Readback,
         PendingInput::Repair { .. } => Par3Phase::Repairing,
-        PendingInput::Carrier { .. } | PendingInput::Embedded { .. } => Par3Phase::ScanningCarriers,
+        PendingInput::Carrier { .. }
+        | PendingInput::Embedded { .. }
+        | PendingInput::EmbeddedVirtual { .. } => Par3Phase::ScanningCarriers,
         PendingInput::Virtual { .. }
         | PendingInput::CompleteFile { .. }
         | PendingInput::File { .. } => Par3Phase::ResolvingMetadata,
@@ -362,6 +364,12 @@ enum PendingInput {
         image: virtual_source::VirtualInput,
         name: String,
     },
+    /// A direct volume that carries its own recovery set after the container.
+    EmbeddedVirtual {
+        image: virtual_source::VirtualInput,
+        name: String,
+        start: u64,
+    },
     Repair {
         set: par3_rs::InputSetId,
         path: PathBuf,
@@ -392,7 +400,7 @@ impl PendingInput {
         let (path, extra) = match self {
             Self::Donors | Self::Assess => return Ok(1024),
             Self::Readback(_) => return Ok(readback::STRIPE_RESERVATION),
-            Self::Virtual { name, .. } => {
+            Self::Virtual { name, .. } | Self::EmbeddedVirtual { name, .. } => {
                 return name
                     .capacity()
                     .checked_mul(2)
@@ -1156,6 +1164,25 @@ impl Coordinator {
         )
     }
 
+    /// [`Self::enqueue_virtual`] for a direct volume whose recovery set
+    /// follows its container at `start`.
+    pub(super) fn enqueue_embedded_virtual(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        volume: crate::pipeline::direct_store::provider::VirtualVolume,
+        name: String,
+        start: u64,
+    ) -> EngineResult<()> {
+        self.admit(job_id)?;
+        let image = virtual_source::VirtualInput::new(volume, &execution_options())?;
+        self.enqueue_input(
+            job_id,
+            source,
+            PendingInput::EmbeddedVirtual { image, name, start },
+        )
+    }
+
     pub(super) fn embedded_start(&self, job_id: JobId, source: SourceId) -> Option<u64> {
         self.jobs.get(&job_id)?.known.get(&source)?.embedded_start
     }
@@ -1870,7 +1897,9 @@ impl Coordinator {
         }
         let carrier = matches!(
             input,
-            PendingInput::Carrier { .. } | PendingInput::Embedded { .. }
+            PendingInput::Carrier { .. }
+                | PendingInput::Embedded { .. }
+                | PendingInput::EmbeddedVirtual { .. }
         );
         // This records byte availability, never a hash verdict. Explicit full
         // disk publications supersede article holes until a later source write
@@ -1882,7 +1911,9 @@ impl Coordinator {
                 | PendingInput::Embedded { ranges: None, .. }
         );
         let embedded_start = match &input {
-            PendingInput::Embedded { start, .. } => Some(*start),
+            PendingInput::Embedded { start, .. } | PendingInput::EmbeddedVirtual { start, .. } => {
+                Some(*start)
+            }
             _ => None,
         };
         if let Some(known) = job.known.get_mut(&source) {
@@ -2278,6 +2309,9 @@ impl Coordinator {
                 let result = match input.input {
                     PendingInput::Virtual { image, name } => {
                         runtime.publish_virtual(source, image, name)
+                    }
+                    PendingInput::EmbeddedVirtual { image, name, start } => {
+                        runtime.scan_embedded_virtual(source, image, name, start)
                     }
                     PendingInput::Repair { .. }
                     | PendingInput::Readback(_)

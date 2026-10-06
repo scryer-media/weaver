@@ -167,6 +167,10 @@ pub(crate) struct DirectSet {
     /// envelopes were deleted the moment it committed — which is every set of a
     /// job with no live neighbour, i.e. the overwhelming majority.
     retained: Option<Vec<VirtualVolume>>,
+    /// The recovery-set fingerprints this set's checkpoints carry, by NZB file
+    /// index. Taken once per file of a standalone set, and given back by a
+    /// restored checkpoint.
+    proven_fingerprints: BTreeMap<u32, ([u8; 16], u64)>,
 }
 
 impl std::fmt::Debug for DirectSet {
@@ -202,7 +206,39 @@ impl DirectSet {
             latched_materialized: false,
             status: DirectSetStatus::Routing,
             retained: None,
+            proven_fingerprints: BTreeMap::new(),
         }
+    }
+
+    /// The recovery-set fingerprints this set holds, by NZB file index.
+    pub(crate) fn proven_fingerprints(&self) -> &BTreeMap<u32, ([u8; 16], u64)> {
+        &self.proven_fingerprints
+    }
+
+    /// Records the fingerprint of one of this set's files. The first one
+    /// recorded for a file stands.
+    pub(crate) fn record_proven_fingerprint(
+        &mut self,
+        file_index: u32,
+        hash_16k: [u8; 16],
+        length: u64,
+    ) {
+        self.proven_fingerprints
+            .entry(file_index)
+            .or_insert((hash_16k, length));
+    }
+
+    fn fingerprint_rows(&self) -> Vec<super::snapshot::ProvenFingerprint> {
+        self.proven_fingerprints
+            .iter()
+            .map(
+                |(&file_index, &(hash_16k, length))| super::snapshot::ProvenFingerprint {
+                    file_index,
+                    hash_16k,
+                    length,
+                },
+            )
+            .collect()
     }
 
     /// Rebuilds the set's layout from its cached volume facts.
@@ -300,6 +336,24 @@ impl DirectSet {
                 .restore_member_coverage(&claim.relative_path, &extents);
         }
 
+        // Only for files this plan binds: a fingerprint naming another file
+        // would bind that file to a description it was never measured against.
+        self.proven_fingerprints = rekeyed
+            .fingerprints
+            .iter()
+            .filter(|fingerprint| {
+                self.router
+                    .plan()
+                    .files
+                    .contains_key(&fingerprint.file_index)
+            })
+            .map(|fingerprint| {
+                (
+                    fingerprint.file_index,
+                    (fingerprint.hash_16k, fingerprint.length),
+                )
+            })
+            .collect();
         self.resumed = Some(rekeyed);
         self.ensure_registered();
 
@@ -1083,9 +1137,11 @@ impl DirectSet {
         // by the same routing call that produced the bytes being claimed.
         let crypt = self.router.member_crypt_snapshots();
         let identity = self.router.plan().identity_binding();
+        let fingerprints = self.fingerprint_rows();
         let barrier = self.barrier.as_mut()?;
         barrier.set_member_crypt(crypt);
         barrier.set_identity_binding(identity);
+        barrier.set_proven_fingerprints(fingerprints);
         Some(barrier.barrier(trigger, now, drain, sync, persist))
     }
 
@@ -1109,9 +1165,11 @@ impl DirectSet {
         }
         let crypt = self.router.member_crypt_snapshots();
         let identity = self.router.plan().identity_binding();
+        let fingerprints = self.fingerprint_rows();
         let barrier = self.barrier.as_mut()?;
         barrier.set_member_crypt(crypt);
         barrier.set_identity_binding(identity);
+        barrier.set_proven_fingerprints(fingerprints);
         Some(barrier.prepare(trigger, now, drain))
     }
 

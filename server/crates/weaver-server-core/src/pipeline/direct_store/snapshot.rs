@@ -92,6 +92,13 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   identity sets at restart). So v6 is **read** and lifted rather than
 ///   refused, and a set mid-flight across the upgrade resumes the way it would
 ///   have without it.
+/// - 8: `CoverageSnapshot::fingerprints` added. A standalone set is admitted
+///   by its file's own header, so after a restart nothing can say again which
+///   recovery-set description that file is: its first bytes routed before the
+///   restart and were never kept. Without that binding a repair counts the
+///   whole file as missing. The fingerprint is what the binding is made from,
+///   so the checkpoint carries it. Additive again, so v6 and v7 are read and
+///   lifted with no fingerprints, exactly what their writers knew.
 ///
 /// # The v3 refusal is a release note
 ///
@@ -101,11 +108,12 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 /// redownload per set that was mid-download across the upgrade — but it is
 /// user-visible traffic and belongs in the notes rather than in a support
 /// thread.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 7;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 8;
 
-/// The one older version [`decode`] still reads, lifted into the current shape
-/// with `identity: None`. Nothing writes it.
-pub(crate) const SNAPSHOT_LIFTED_VERSION: u16 = 6;
+/// The older versions [`decode`] still reads, lifted into the current shape
+/// with what they did not carry absent. Nothing writes them.
+const SNAPSHOT_V6: u16 = 6;
+const SNAPSHOT_V7: u16 = 7;
 
 const FRAME_HEADER_LEN: usize = 6;
 
@@ -251,6 +259,20 @@ pub(crate) struct CoverageSnapshot {
     /// Present exactly for a set admitted by identity; `None` for a set its
     /// file names admitted.
     pub(crate) identity: Option<IdentityBinding>,
+    /// Sorted by `file_index`. Empty for every set but a standalone one whose
+    /// file's opening bytes have arrived.
+    pub(crate) fingerprints: Vec<ProvenFingerprint>,
+}
+
+/// The recovery-set fingerprint of a standalone set's file, taken from its
+/// opening bytes while they were still in memory: the MD5 of the first
+/// `min(length, 16 KiB)` bytes, the same window a PAR2 description's
+/// `hash_16k` covers, and the file's decoded length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProvenFingerprint {
+    pub(crate) file_index: u32,
+    pub(crate) hash_16k: [u8; 16],
+    pub(crate) length: u64,
 }
 
 /// The v6 body, positionally: everything v7 has but the identity binding.
@@ -270,6 +292,30 @@ impl From<CoverageSnapshotV6> for CoverageSnapshot {
             destinations: old.destinations,
             floors: old.floors,
             identity: None,
+            fingerprints: Vec::new(),
+        }
+    }
+}
+
+/// The v7 body, positionally: everything v8 has but the fingerprints.
+#[derive(Deserialize)]
+struct CoverageSnapshotV7 {
+    generation: u64,
+    plan_digest: [u8; 32],
+    destinations: Vec<DestinationClaim>,
+    floors: Vec<VolumeFloor>,
+    identity: Option<IdentityBinding>,
+}
+
+impl From<CoverageSnapshotV7> for CoverageSnapshot {
+    fn from(old: CoverageSnapshotV7) -> Self {
+        Self {
+            generation: old.generation,
+            plan_digest: old.plan_digest,
+            destinations: old.destinations,
+            floors: old.floors,
+            identity: old.identity,
+            fingerprints: Vec::new(),
         }
     }
 }
@@ -308,6 +354,9 @@ impl CoverageSnapshot {
         if let Some(identity) = &mut normalized.identity {
             identity.volumes.sort_unstable();
         }
+        normalized
+            .fingerprints
+            .sort_by_key(|fingerprint| fingerprint.file_index);
         normalized
     }
 }
@@ -372,7 +421,7 @@ pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
         return Err(SnapshotError::BadMagic);
     }
     let version = u16::from_le_bytes([blob[4], blob[5]]);
-    if version != SNAPSHOT_SCHEMA_VERSION && version != SNAPSHOT_LIFTED_VERSION {
+    if version != SNAPSHOT_SCHEMA_VERSION && version != SNAPSHOT_V6 && version != SNAPSHOT_V7 {
         return Err(SnapshotError::UnsupportedVersion {
             found: version,
             supported: SNAPSHOT_SCHEMA_VERSION,
@@ -386,10 +435,14 @@ pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
     // row, and neither is something to partially trust.
     let body = &blob[FRAME_HEADER_LEN..];
     let mut deserializer = rmp_serde::Deserializer::new(std::io::Cursor::new(body));
-    let snapshot = if version == SNAPSHOT_LIFTED_VERSION {
-        CoverageSnapshotV6::deserialize(&mut deserializer).map(CoverageSnapshot::from)
-    } else {
-        CoverageSnapshot::deserialize(&mut deserializer)
+    let snapshot = match version {
+        SNAPSHOT_V6 => {
+            CoverageSnapshotV6::deserialize(&mut deserializer).map(CoverageSnapshot::from)
+        }
+        SNAPSHOT_V7 => {
+            CoverageSnapshotV7::deserialize(&mut deserializer).map(CoverageSnapshot::from)
+        }
+        _ => CoverageSnapshot::deserialize(&mut deserializer),
     }
     .map_err(|error| SnapshotError::Malformed(error.to_string()))?;
     let consumed = deserializer.position();
@@ -459,6 +512,16 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
             }
             previous_volume = Some(volume_index);
         }
+    }
+
+    let mut previous_file: Option<u32> = None;
+    for fingerprint in &snapshot.fingerprints {
+        if previous_file.is_some_and(|previous| previous >= fingerprint.file_index) {
+            return Err(SnapshotError::Malformed(
+                "fingerprints are not sorted by file index".into(),
+            ));
+        }
+        previous_file = Some(fingerprint.file_index);
     }
 
     Ok(())

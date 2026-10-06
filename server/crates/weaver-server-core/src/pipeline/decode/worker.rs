@@ -2371,6 +2371,9 @@ impl Pipeline {
         if prefix_complete || replaced_prefix {
             self.refresh_par2_md5_substitution_binding(file_id);
         }
+        if prefix_complete {
+            self.prove_direct_standalone_fingerprint(file_id);
+        }
     }
 
     /// Retain the first yEnc size hint for metadata probing, never identity rejection.

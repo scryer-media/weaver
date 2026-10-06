@@ -7,6 +7,8 @@
 
 use super::*;
 
+mod embedded_par3;
+mod obfuscated_split;
 mod schedules;
 
 use sevenz_turbo::encoder_options::AesEncoderOptions;
@@ -2392,6 +2394,171 @@ async fn a_sevenz_set_missing_a_middle_volume_still_reads_its_map() {
     assert!(
         !starved.contains("UnreadableMap"),
         "and running out of articles is not a verdict on a map already read\nsets: {starved}"
+    );
+}
+
+/// What a container set did around a terminal verdict on one article of its
+/// last volume — `lost`, an ordinal of that volume, or none — while the rest
+/// of the container kept arriving: the demotions it took, the shapes it went
+/// through, and the most holds scratch it ever had written.
+///
+/// A split set's last volume arrives after everything else, and a one-volume
+/// set's closing article does; either way the closing article, unless it is
+/// the one lost, lands last of all.
+async fn sevenz_set_around_a_lost_tail_article(
+    job_id: JobId,
+    volume_count: usize,
+    lost: Option<u32>,
+) -> (Vec<DemotionReason>, String, u64) {
+    const ARTICLES: usize = 20;
+    let closing = ARTICLES as u32 - 1;
+    let member = payload(43, 32_600);
+    let archive = build_7z(
+        &[Entry::file(MEMBER, member.clone())],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, volume_count);
+    let article = (volumes[0].1.len() as u64).div_ceil(ARTICLES as u64);
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    // Two articles of RAM, so whatever the set holds past them is paged out
+    // to its scratch, where it can be counted.
+    pipeline.direct_store.set_holds_budget(2 * article);
+    let spec = sevenz_job_spec(&volumes, ARTICLES);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let last = volumes.len() as u32 - 1;
+    let segment = |file_index: u32, segment_number: u32| SegmentId {
+        file_id: NzbFileId { job_id, file_index },
+        segment_number,
+    };
+
+    // The front, which states the part size and the start header.
+    take_queued_segment(&mut pipeline, job_id, segment(0, 0));
+    submit_volume_article_of(&mut pipeline, job_id, &volumes, 0, 0, ARTICLES).await;
+    // The tail probe's article, ruled missing on every server.
+    if let Some(lost) = lost {
+        take_queued_segment(&mut pipeline, job_id, segment(last, lost));
+        pipeline.book_failed_segment(segment(last, lost));
+    }
+    pipeline.settle_direct_end_header_verdicts().await;
+    let mut witness = SetWitness::default();
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+
+    // A split set whose closing article is lost has lost its whole last
+    // volume; otherwise the last volume follows the body, closing article
+    // last.
+    let tail: Vec<(u32, u32)> = if volume_count == 1 {
+        vec![(last, closing)]
+    } else {
+        (0..ARTICLES as u32)
+            .map(|article| (last, article))
+            .collect()
+    };
+    let body = (0..volumes.len() as u32)
+        .flat_map(|file_index| (0..ARTICLES as u32).map(move |article| (file_index, article)))
+        .filter(|arrival| *arrival != (0, 0) && !tail.contains(arrival));
+    let tail = tail
+        .clone()
+        .into_iter()
+        .filter(|_| lost != Some(closing))
+        .filter(|(_, article)| Some(*article) != lost);
+    let mut peak_scratch = 0u64;
+    for (file_index, segment_number) in body.chain(tail) {
+        take_queued_segment(&mut pipeline, job_id, segment(file_index, segment_number));
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+        // The set's own scratch, and the process-wide ledger every set's
+        // scratch is charged to.
+        if let Some(set) = pipeline.direct_store.set(job_id, 0) {
+            peak_scratch = peak_scratch.max(set.router.scratch_bytes());
+        }
+        peak_scratch = peak_scratch.max(pipeline.direct_store.holds_accountant().scratch_bytes());
+        witness.observe(&pipeline, job_id);
+    }
+    pipeline.settle_direct_end_header_verdicts().await;
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+    let demotions = std::mem::take(&mut pipeline.direct_store.demotions);
+    (demotions, witness.render(), peak_scratch)
+}
+
+/// A container whose end-header article is ruled missing hands over the
+/// moment that verdict lands: its map is gone with that article, and no
+/// byte that arrives afterwards could bring it back. Waiting for every other
+/// article to land first only pages the whole container out to scratch for
+/// the conventional path to take back.
+#[tokio::test]
+async fn a_sevenz_set_whose_end_header_is_lost_demotes_before_holding_its_body() {
+    let (demotions, sets, peak_scratch) =
+        sevenz_set_around_a_lost_tail_article(JobId(9_617), 4, Some(19)).await;
+    assert_eq!(
+        demotions,
+        vec![DemotionReason::SevenZip(
+            crate::pipeline::direct_store::router::sevenz::SevenZipRefusal::EndHeaderLost
+        )],
+        "sets: {sets}"
+    );
+    assert_eq!(
+        peak_scratch, 0,
+        "the body was held after the map was lost\nsets: {sets}"
+    );
+}
+
+/// The same for a one-volume container: the end header closes the volume,
+/// so the volume's last article carries it.
+#[tokio::test]
+async fn a_one_volume_sevenz_set_whose_end_header_is_lost_demotes_before_holding_its_body() {
+    let (demotions, sets, peak_scratch) =
+        sevenz_set_around_a_lost_tail_article(JobId(9_618), 1, Some(19)).await;
+    assert_eq!(
+        demotions,
+        vec![DemotionReason::SevenZip(
+            crate::pipeline::direct_store::router::sevenz::SevenZipRefusal::EndHeaderLost
+        )],
+        "sets: {sets}"
+    );
+    assert_eq!(
+        peak_scratch, 0,
+        "the body was held after the map was lost\nsets: {sets}"
+    );
+}
+
+/// A closing article that is only late is not a verdict: the set holds what
+/// arrives ahead of it, reads its map when it lands, and stays direct.
+#[tokio::test]
+async fn a_sevenz_set_whose_end_header_is_late_still_reads_its_map() {
+    for (job_id, volume_count) in [(JobId(9_619), 4), (JobId(9_620), 1)] {
+        let (demotions, sets, peak_scratch) =
+            sevenz_set_around_a_lost_tail_article(job_id, volume_count, None).await;
+        assert!(demotions.is_empty(), "volumes={volume_count} sets: {sets}");
+        // What the lost case is spared: the body, held and paged out.
+        assert!(peak_scratch > 0, "volumes={volume_count} sets: {sets}");
+    }
+}
+
+/// Losing an article of the last volume other than the one that closes it
+/// says nothing about the end header, so the set keeps waiting for it.
+#[tokio::test]
+async fn a_sevenz_set_that_loses_another_tail_article_keeps_its_end_header() {
+    let (demotions, sets, _) =
+        sevenz_set_around_a_lost_tail_article(JobId(9_621), 4, Some(3)).await;
+    assert!(
+        !demotions.contains(&DemotionReason::SevenZip(
+            crate::pipeline::direct_store::router::sevenz::SevenZipRefusal::EndHeaderLost
+        )),
+        "sets: {sets}"
+    );
+    assert!(
+        sets.contains("Routing") && !sets.contains("Demoted"),
+        "sets: {sets}"
     );
 }
 

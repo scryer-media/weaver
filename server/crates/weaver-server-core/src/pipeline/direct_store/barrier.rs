@@ -354,6 +354,9 @@ pub(crate) struct CoverageBarrier {
     /// identity-admitted set was admitted with, so restart can rebuild it.
     /// `None` for a set its file names admitted.
     identity: Option<super::snapshot::IdentityBinding>,
+    /// The fingerprints the next checkpoint carries, pushed beside the
+    /// identity binding.
+    fingerprints: Vec<super::snapshot::ProvenFingerprint>,
     /// A [`PreparedBarrier`] is out, its sync running elsewhere. While it is,
     /// no automatic trigger is due and no second one can be prepared: two
     /// barriers in flight would both persist generation `n + 1`, and the one
@@ -411,6 +414,7 @@ impl CoverageBarrier {
             cooldown_until: None,
             member_crypt: BTreeMap::new(),
             identity: None,
+            fingerprints: Vec::new(),
             in_flight: false,
             row_epoch: 0,
         }
@@ -437,6 +441,14 @@ impl CoverageBarrier {
         identity: Option<super::snapshot::IdentityBinding>,
     ) {
         self.identity = identity;
+    }
+
+    /// Hands the barrier the fingerprints its next checkpoint must carry.
+    pub(crate) fn set_proven_fingerprints(
+        &mut self,
+        fingerprints: Vec<super::snapshot::ProvenFingerprint>,
+    ) {
+        self.fingerprints = fingerprints;
     }
 
     /// Points the next snapshot at the plan the set is **currently** routing
@@ -521,6 +533,7 @@ impl CoverageBarrier {
         let mut barrier = Self::new(job_id, set_name, snapshot.plan_digest);
         barrier.committed_generation = snapshot.generation;
         barrier.identity = snapshot.identity.clone();
+        barrier.fingerprints = snapshot.fingerprints.clone();
         for entry in &snapshot.floors {
             let volume = barrier.volumes.entry(entry.volume_index).or_default();
             volume.file_index = entry.file_index;
@@ -839,6 +852,7 @@ impl CoverageBarrier {
                 })
                 .collect(),
             identity: self.identity.clone(),
+            fingerprints: self.fingerprints.clone(),
         }
     }
 

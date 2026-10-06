@@ -124,6 +124,7 @@ fn snapshot_round_trips_exactly() {
             },
         ],
         identity: None,
+        fingerprints: Vec::new(),
     };
 
     let blob = encode(&snapshot).unwrap();
@@ -197,6 +198,7 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
         }],
         floors,
         identity: None,
+        fingerprints: Vec::new(),
     };
 
     let blob = encode(&snapshot).unwrap();
@@ -296,6 +298,62 @@ async fn a_version_6_row_decodes_and_restores_with_no_identity_binding() {
         }),
         SNAPSHOT_SCHEMA_VERSION
     );
+}
+
+#[test]
+fn a_version_7_row_decodes_with_its_identity_and_no_fingerprints() {
+    let snapshot = sample_identity_snapshot();
+    let body = rmp_serde::to_vec(&(
+        snapshot.generation,
+        snapshot.plan_digest,
+        &snapshot.destinations,
+        &snapshot.floors,
+        &snapshot.identity,
+    ))
+    .unwrap();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&SNAPSHOT_MAGIC);
+    blob.extend_from_slice(&7u16.to_le_bytes());
+    blob.extend_from_slice(&body);
+
+    let decoded = decode(&blob).expect("a row written before the upgrade must still decode");
+    assert_eq!(decoded, snapshot);
+    assert!(
+        decoded.identity.is_some(),
+        "non-vacuity: the binding survived"
+    );
+    assert!(decoded.fingerprints.is_empty());
+}
+
+#[test]
+fn a_snapshot_with_fingerprints_round_trips_and_refuses_them_unsorted() {
+    let fingerprint = |file_index: u32| super::super::snapshot::ProvenFingerprint {
+        file_index,
+        hash_16k: [file_index as u8; 16],
+        length: 70_001,
+    };
+    let snapshot = CoverageSnapshot {
+        identity: Some(IdentityBinding {
+            kind: IdentityKind::SevenZipStandalone,
+            volumes: vec![(0, 0)],
+            expected_volumes: Some(1),
+            discriminator: 0,
+        }),
+        fingerprints: vec![fingerprint(0), fingerprint(3)],
+        ..sample_snapshot()
+    };
+    let blob = encode(&snapshot).unwrap();
+    assert_eq!(decode(&blob).unwrap(), snapshot);
+
+    let mut reversed = snapshot.clone();
+    reversed.fingerprints.reverse();
+    assert_eq!(encode(&reversed).unwrap(), blob, "the encoder orders them");
+
+    let mut forged = Vec::new();
+    forged.extend_from_slice(&SNAPSHOT_MAGIC);
+    forged.extend_from_slice(&SNAPSHOT_SCHEMA_VERSION.to_le_bytes());
+    forged.extend_from_slice(&rmp_serde::to_vec(&reversed).unwrap());
+    assert!(matches!(decode(&forged), Err(SnapshotError::Malformed(_))));
 }
 
 #[test]

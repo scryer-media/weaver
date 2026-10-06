@@ -258,6 +258,7 @@ fn sample_snapshot() -> CoverageSnapshot {
             complete: false,
         }],
         identity: None,
+        fingerprints: Vec::new(),
     }
 }
 

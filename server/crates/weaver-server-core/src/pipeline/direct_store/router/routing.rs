@@ -2417,7 +2417,44 @@ impl DirectSetRouter {
     ) -> Option<Result<sevenz::ContainerGeometry, sevenz::SevenZipRefusal>> {
         let start = self.sevenz_start.as_ref()?;
         let part_size = self.declared_volume_sizes.get(&0).copied()?;
-        Some(sevenz::ContainerGeometry::derive(part_size, start))
+        Some(sevenz::ContainerGeometry::derive(
+            part_size,
+            start,
+            self.plan.expected_volume_count() == Some(1),
+        ))
+    }
+
+    /// Where an admitted embedded recovery set begins in the set's one volume,
+    /// as `(volume, offset)`. `None` for a set with no tail, or one whose map
+    /// is not read yet.
+    ///
+    /// A fact the parse established, not a probe: the tail is admitted only
+    /// once its own signature has been read at this offset, so whoever wants
+    /// the recovery set's packets can start scanning here without opening a
+    /// byte of the volume to find them.
+    pub(crate) fn embedded_recovery_start(&self) -> Option<(u32, u64)> {
+        let geometry = self.sevenz_geometry?;
+        (geometry.tail != 0).then_some((0, geometry.total))
+    }
+
+    /// Whether the tail the geometry places after the container opens with a
+    /// recovery set's signature: `Some(true)` admitted, `Some(false)` refused,
+    /// `None` while those bytes are not staged yet.
+    ///
+    /// The one read the admission costs: eight bytes, out of what is already
+    /// staged, once per parse attempt and only for a one-volume set whose
+    /// stated length runs past its end header.
+    fn embedded_tail_opens_with_magic(&self, geometry: &sevenz::ContainerGeometry) -> Option<bool> {
+        let magic = sevenz::EMBEDDED_TAIL_MAGIC;
+        if geometry.tail < magic.len() as u64 {
+            return Some(false);
+        }
+        let staging = self.staging.get(&0)?;
+        let end = geometry.total + magic.len() as u64;
+        let mut image =
+            sevenz::ContainerImage::new(&[(0, &staging.chunks)], self.scratch.handle(), end);
+        let bytes = image.read_exact_at(geometry.total, magic.len())?;
+        Some(bytes.as_slice() == magic.as_slice())
     }
 
     /// What the set needs off the wire next in order to resolve its layout.
@@ -2428,7 +2465,10 @@ impl DirectSetRouter {
             // whole rule.
             return HeaderProbe::Earliest;
         }
-        if self.layout.is_some() {
+        // A described set still binding its parts cannot say which volume is
+        // first or last; the identity probe is already asking for the fronts
+        // that bind them.
+        if self.layout.is_some() || !self.plan.is_whole() {
             return HeaderProbe::Settled;
         }
         // A split container is a byte split at a fixed part size, so its whole
@@ -2461,13 +2501,47 @@ impl DirectSetRouter {
         HeaderProbe::Container { front, tail }
     }
 
+    /// Records that the article closing the set's last volume will never
+    /// arrive: every server ruled it missing, or its retries or decodes ran
+    /// out.
+    pub(crate) fn note_end_article_lost(&mut self) {
+        if self.plan.format == SetFormat::SevenZip && self.layout.is_none() && self.plan.is_whole()
+        {
+            self.sevenz_end_article_lost = true;
+        }
+    }
+
+    /// Whether the map went with the lost closing article, so that nothing
+    /// still to arrive could let the set read it.
+    ///
+    /// A container ends with its end header, so the article that closes the
+    /// last volume carries the header's last bytes — unless a recovery set
+    /// was written after the container, which only a one-volume set may
+    /// carry. A split set is therefore judged without waiting for anything; a
+    /// one-volume set once its start header and stated length have placed the
+    /// container's end, which the parse does again with every article.
+    pub(crate) fn end_header_lost(&self) -> bool {
+        if !self.sevenz_end_article_lost || self.layout.is_some() {
+            return false;
+        }
+        match self.container_geometry() {
+            Some(Ok(geometry)) => geometry.tail == 0,
+            // A geometry that does not hold is refused by the parse itself.
+            Some(Err(_)) => false,
+            None => self.plan.expected_volume_count() != Some(1) && self.plan.volumes.len() > 1,
+        }
+    }
+
     /// Reads the container's map, if enough of it has arrived.
     ///
     /// Runs on every routed article until it succeeds, and never again after
     /// that: unlike a RAR volume, whose longer prefix can reveal a header the
     /// last walk could not reach, a 7z end header is read whole or not at all.
     pub(super) fn try_parse_container(&mut self) -> Result<(), DemotionReason> {
-        if self.layout.is_some() {
+        // A described set still binding its parts holds what it routes: until
+        // every part is bound, no volume number is known to be the first or
+        // the last, so nothing can be placed.
+        if self.layout.is_some() || !self.plan.is_whole() {
             return Ok(());
         }
         // First, because the gate below is built out of what it reads: the
@@ -2526,6 +2600,27 @@ impl DirectSetRouter {
         if wrong_length {
             return Err(self.fail(DemotionReason::SevenZip(
                 sevenz::SevenZipRefusal::VolumeSize,
+            )));
+        }
+        // A one-volume set stating more than its end header covers: admitted
+        // only as a recovery set written after the archive, which is the one
+        // thing a poster puts there. The map waits for the eight bytes that
+        // say so — they sit right behind the end header, so the tail probe
+        // walking back to the map reaches them first.
+        if geometry.tail != 0 {
+            match self.embedded_tail_opens_with_magic(&geometry) {
+                None => return Ok(()),
+                Some(false) => {
+                    return Err(self.fail(DemotionReason::SevenZip(
+                        sevenz::SevenZipRefusal::VolumeSize,
+                    )));
+                }
+                Some(true) => {}
+            }
+        } else if self.sevenz_end_article_lost {
+            // The closing article carried the end header, and it is gone.
+            return Err(self.fail(DemotionReason::SevenZip(
+                sevenz::SevenZipRefusal::EndHeaderLost,
             )));
         }
         let lengths = geometry.lengths();
@@ -2622,7 +2717,7 @@ impl DirectSetRouter {
     /// zero-length and checksum-free member gates.
     pub(super) fn adopt_container_facts(
         &mut self,
-        facts: sevenz::SevenZipContainerFacts,
+        mut facts: sevenz::SevenZipContainerFacts,
     ) -> Result<(), DemotionReason> {
         // Resolved against the geometry's lengths, not against what the volumes
         // declared. A declared length is a hint this router checks *for*
@@ -2635,8 +2730,13 @@ impl DirectSetRouter {
                 // Restart: the start header is never refetched, so the geometry
                 // comes back off the cached total instead.
                 let part_size = self.declared_volume_sizes.get(&0).copied()?;
-                (facts.total != 0)
-                    .then(|| sevenz::ContainerGeometry::derive_from_total(part_size, facts.total))
+                (facts.total != 0).then(|| {
+                    sevenz::ContainerGeometry::derive_from_total(
+                        part_size,
+                        facts.total,
+                        facts.embedded_tail,
+                    )
+                })
             })
             .ok_or_else(|| {
                 self.fail(DemotionReason::SevenZip(
@@ -2644,6 +2744,8 @@ impl DirectSetRouter {
                 ))
             })?
             .map_err(|refusal| self.fail(DemotionReason::SevenZip(refusal)))?;
+        // The live parse admitted the tail it read; a restored one carries it.
+        facts.embedded_tail = geometry.tail;
         let layout = sevenz::SevenZipLayout::build(&geometry.lengths(), &facts)
             .map_err(|refusal| self.fail(DemotionReason::SevenZip(refusal)))?;
         self.sevenz_geometry = Some(geometry);
