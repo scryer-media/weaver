@@ -306,6 +306,12 @@ services:
       E2E_WEAVER_RATE_LIMIT_STAGE: "${E2E_WEAVER_RATE_LIMIT_STAGE:-initial}"
       E2E_WEAVER_UI_STAGE: "${E2E_WEAVER_UI_STAGE:-initial}"
       E2E_WEAVER_CLOCK_FILE: "/e2e-clock/now"
+      # Staged flows (a Weaver restart between Playwright runs) name the stage
+      # here; a spec keeps its cross-stage state under /artifacts.
+      E2E_WEAVER_STAGE: "${E2E_WEAVER_STAGE:-initial}"
+      # Long-form scenarios (@extended) run only when the operator asks.
+      E2E_WEAVER_EXTENDED: "${E2E_WEAVER_EXTENDED:-0}"
+      E2E_WEAVER_TIMEZONE: "${E2E_WEAVER_TIMEZONE:-UTC}"
 
   # Nyuu — real usenet binary poster (yEnc encoding + NNTP posting + NZB generation)
   nyuu:

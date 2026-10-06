@@ -3,7 +3,7 @@ import { test } from "node:test";
 import net from "node:net";
 import dgram from "node:dgram";
 import { once } from "node:events";
-import { parseNameservers, startProxyFixture } from "../tests/support/proxy-fixture-server.mjs";
+import { parseAddressList, parseHostTable, parseNameservers, parseRouteList, startProxyFixture } from "../tests/support/proxy-fixture-server.mjs";
 
 const dnsQuery = (id, name) => Buffer.concat([
   Buffer.from([0, id, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
@@ -136,5 +136,116 @@ test("SOCKS5 accepts a pipelined authenticated handshake", async () => {
     assert.deepEqual([...body.subarray(0, 4)], [5, 2, 1, 0]);
     assert.match(body.toString(), /<rss/);
     assert.equal(fixture.events.find(event => event.kind === "connected")?.route, "secondary");
+  } finally { await fixture.close(); }
+});
+
+const zeroPorts = { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 };
+const control = async (fixture, path, body) => {
+  const response = await fetch(`http://127.0.0.1:${fixture.ports.control}${path}`, body ? { method: "POST", body: JSON.stringify(body) } : undefined);
+  return { status: response.status, body: await response.json() };
+};
+const exchange = async (port, payload) => {
+  const socket = net.connect(port, "127.0.0.1");
+  socket.setTimeout(3000, () => socket.destroy(new Error("fixture timeout")));
+  const chunks = [];
+  socket.on("data", chunk => chunks.push(chunk));
+  socket.write(payload);
+  await once(socket, "close");
+  return Buffer.concat(chunks);
+};
+const socksHandshake = port => {
+  const portBytes = Buffer.alloc(2); portBytes.writeUInt16BE(port);
+  return Buffer.concat([
+    Buffer.from([5, 1, 2, 1, 7]), Buffer.from("fixture"), Buffer.from([7]), Buffer.from("fixture"),
+    Buffer.from([5, 1, 0, 1, 127, 0, 0, 1]), portBytes,
+    Buffer.from("GET /feed.xml HTTP/1.1\r\nHost: news.proxy.test\r\nConnection: close\r\n\r\n"),
+  ]);
+};
+
+test("route, address and host lists parse strictly", () => {
+  assert.deepEqual(parseRouteList(""), []);
+  assert.deepEqual(parseRouteList("connect1, socks2,connect1"), ["connect1", "socks2"]);
+  assert.equal(parseRouteList("all").length, 10);
+  assert.throws(() => parseRouteList("connect9"), /unknown proxy fixture route/);
+  assert.deepEqual(parseAddressList("", "10.0.0.1"), ["10.0.0.1"]);
+  assert.deepEqual(parseAddressList("10.1.0.23,10.2.0.23", "10.0.0.1"), ["10.1.0.23", "10.2.0.23"]);
+  assert.throws(() => parseAddressList("nntp", "10.0.0.1"), /invalid fixture address/);
+  assert.deepEqual(parseHostTable('{"NNTP":["10.1.0.20","10.2.0.20"],"nntp2":"10.1.0.21"}'), { nntp: ["10.1.0.20", "10.2.0.20"], nntp2: ["10.1.0.21"] });
+  assert.throws(() => parseHostTable('{"nntp":["bad"]}'), /invalid address/);
+});
+
+test("pool member routes answer forced CONNECT statuses and SOCKS replies, then recover", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", routes: ["connect3", "socks2"], ports: { ...zeroPorts, connect3: 0, socks2: 0 } });
+  try {
+    const connect = () => exchange(fixture.ports.connect3, `CONNECT news.proxy.test:${fixture.ports.http} HTTP/1.1\r\nProxy-Authorization: Basic ${Buffer.from("fixture:fixture").toString("base64")}\r\n\r\nGET /feed.xml HTTP/1.1\r\nHost: news.proxy.test\r\nConnection: close\r\n\r\n`);
+    assert.equal((await control(fixture, "/", { route: "connect3", connectStatus: 503 })).status, 200);
+    assert.match((await connect()).toString(), /^HTTP\/1\.1 503 Service Unavailable/);
+    assert.equal((await control(fixture, "/", { route: "connect3", connectStatus: null })).status, 200);
+    assert.match((await connect()).toString(), /<rss/);
+
+    await control(fixture, "/", { route: "socks2", socksReply: 2 });
+    const refused = await exchange(fixture.ports.socks2, socksHandshake(fixture.ports.http));
+    assert.deepEqual([...refused.subarray(0, 6)], [5, 2, 1, 0, 5, 2]);
+    await control(fixture, "/", { route: "socks2", socksReply: null });
+    assert.match((await exchange(fixture.ports.socks2, socksHandshake(fixture.ports.http))).toString(), /<rss/);
+
+    const connected = fixture.events.filter(event => event.kind === "connected");
+    assert.deepEqual(connected.map(event => event.route), ["connect3", "socks2"]);
+    assert.ok(connected.every(event => event.client === "127.0.0.1"));
+    assert.equal((await control(fixture, "/", { route: "connect3", connectStatus: 42 })).status, 400);
+    assert.equal((await control(fixture, "/", { route: "socks2", socksReply: 0 })).status, 400);
+  } finally { await fixture.close(); }
+});
+
+test("event reads after a watermark return only newer events", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: zeroPorts });
+  try {
+    await exchange(fixture.ports.primary, `CONNECT unrelated.invalid:443 HTTP/1.1\r\nProxy-Authorization: Basic ${Buffer.from("fixture:fixture").toString("base64")}\r\n\r\n`);
+    const first = await control(fixture, "/events?after=0");
+    assert.equal(first.body.events.length, 1);
+    const watermark = first.body.sequence;
+    assert.deepEqual((await control(fixture, `/events?after=${watermark}`)).body.events, []);
+    await exchange(fixture.ports.primary, `CONNECT unrelated.invalid:443 HTTP/1.1\r\nProxy-Authorization: Basic ${Buffer.from("fixture:fixture").toString("base64")}\r\n\r\n`);
+    const next = await control(fixture, `/events?after=${watermark}`);
+    assert.equal(next.body.events.length, 1);
+    assert.ok(next.body.events[0].sequence > watermark);
+    assert.equal((await control(fixture, "/events?after=-1")).status, 400);
+  } finally { await fixture.close(); }
+});
+
+test("multi-network DNS answers every fixture address and the host table", async () => {
+  const fixture = await startProxyFixture({
+    ip: "127.0.0.1", ports: zeroPorts,
+    addresses: ["10.1.0.23", "10.2.0.23"],
+    hosts: { nntp: ["10.1.0.20", "10.2.0.20"] },
+    nameservers: [],
+  });
+  const socket = dgram.createSocket("udp4");
+  const ask = async query => {
+    const response = once(socket, "message");
+    socket.send(query, fixture.ports.dnsUdp, "127.0.0.1");
+    return (await response)[0];
+  };
+  try {
+    const fixtureName = await ask(dnsQuery(3, "news.proxy.test"));
+    assert.equal(fixtureName.readUInt16BE(6), 2);
+    assert.deepEqual([...fixtureName.subarray(-4)], [10, 2, 0, 23]);
+    const infra = await ask(dnsQuery(4, "nntp"));
+    assert.equal(infra.readUInt16BE(2), 0x8180);
+    assert.equal(infra.readUInt16BE(6), 2);
+    assert.deepEqual([...infra.subarray(-20, -16)], [10, 1, 0, 20]);
+    assert.deepEqual([...infra.subarray(-4)], [10, 2, 0, 20]);
+  } finally { socket.close(); await fixture.close(); }
+});
+
+test("download paths ignore the query string and the non-NZB body is served", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: zeroPorts });
+  try {
+    await control(fixture, "/", { nzb: "<nzb/>" });
+    const probe = await fetch(`http://127.0.0.1:${fixture.ports.http}/probe.nzb?apikey=fixture-secret`);
+    assert.equal(probe.status, 200);
+    assert.equal(await probe.text(), "<nzb/>");
+    const junk = await fetch(`http://127.0.0.1:${fixture.ports.http}/not-an-nzb.nzb`);
+    assert.match(await junk.text(), /not an nzb/);
   } finally { await fixture.close(); }
 });
