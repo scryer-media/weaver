@@ -626,6 +626,12 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
 /// have committed after the drop, now ordered before the reopen — and then the
 /// pool is closed, which waits for every checked-out connection to come back
 /// and closes each one before it returns.
+///
+/// A test that stands the drop in for a crash retires the same way. The drop
+/// never lost a queued write — the writer task goes on committing its queue
+/// after the drop — so the flush moves those writes ahead of the reopen
+/// instead of racing it, and loses nothing a plain drop would have kept. What
+/// a crash does lose is the state that was never queued, and that stays lost.
 async fn retire_pipeline_database(pipeline: Pipeline) {
     let db = pipeline.db.clone();
     drop(pipeline);

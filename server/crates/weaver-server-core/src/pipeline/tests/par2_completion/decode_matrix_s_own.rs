@@ -1235,7 +1235,7 @@ async fn a_failed_full_carrier_scan_preserves_prefix_discovery_and_restart_reope
             .contains("metadata discovery exhausted")
     );
 
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
     restored
         .restore_job(RestoreJobRequest {

@@ -47,6 +47,7 @@ async fn hp_before_restart(
     pipeline
         .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
         .await;
+    retire_pipeline_database(pipeline).await;
     working_dir
 }
 

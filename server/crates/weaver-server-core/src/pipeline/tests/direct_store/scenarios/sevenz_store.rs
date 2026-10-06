@@ -1359,6 +1359,7 @@ async fn restart_a_sevenz_set(
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 

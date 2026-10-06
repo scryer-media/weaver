@@ -2450,7 +2450,7 @@ fn no_volume_file(working_dir: &std::path::Path, volumes: &[(String, Vec<u8>)]) 
 /// The "before" half of a restart differential.
 ///
 /// Runs a job's first articles with routing on, demands a barrier so the
-/// coverage is durable, and drops the pipeline — which is the process going
+/// coverage is durable, and retires the pipeline — which is the process going
 /// away. The database and the working directory both live under `temp_dir`, so
 /// the "after" half opens exactly the state a real restart would find.
 async fn direct_store_before_restart(
@@ -2493,6 +2493,7 @@ async fn direct_store_before_restart_with_password(
     pipeline
         .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
         .await;
+    retire_pipeline_database(pipeline).await;
     working_dir
 }
 

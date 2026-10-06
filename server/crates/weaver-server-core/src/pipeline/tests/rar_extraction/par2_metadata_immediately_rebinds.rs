@@ -261,7 +261,7 @@ async fn restore_job_scrubs_stale_par2_rar_set_state_before_rar_runtime_rebuild(
         .unwrap()
         .remove(&job_id)
         .unwrap();
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
 
     let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
     restored
@@ -842,6 +842,7 @@ async fn restore_job_does_not_rehydrate_lossy_extraction_attempt_state() {
             .db
             .set_active_job_normalization_retried(job_id, true)
             .unwrap();
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
