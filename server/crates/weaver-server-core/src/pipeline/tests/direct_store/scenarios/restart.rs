@@ -93,7 +93,7 @@ async fn restart_after_refetch_demotion_restores_incomplete_source_ownership() {
         volumes.len(),
         "the live process still owns the demotion gate before the crash"
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
 
     let (mut restarted, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     restarted.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -209,7 +209,7 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         retained_facts.values().any(|rows| !rows.is_empty()),
         "conventional restore must retain facts owned by the accepted direct checkpoint"
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let mut pipeline = direct_store_after_restart(
         &temp_dir,
         DirectStoreGate::Enabled,
@@ -728,6 +728,7 @@ async fn a_digest_mismatch_sweeps_the_sets_files_and_deletes_the_row() {
             .db
             .save_direct_coverage(job_id, &set_name, &corrupted)
             .unwrap();
+        retire_pipeline_database(pipeline).await;
     }
 
     let partial = direct_partial(&temp_dir, JobId(41065), member_name);
@@ -815,6 +816,7 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
     let committed = {
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        retire_pipeline_database(pipeline).await;
         rows.into_iter()
             .next()
             .expect("the shutdown barrier must have committed a row")
@@ -985,6 +987,7 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
     let committed = {
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        retire_pipeline_database(pipeline).await;
         rows.into_iter()
             .next()
             .expect("the shutdown barrier must have committed a row")
@@ -1221,6 +1224,7 @@ async fn an_identity_binding_whose_file_now_classifies_is_refused_and_swept() {
             !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
             "non-vacuity: the identity set must have checkpointed"
         );
+        retire_pipeline_database(pipeline).await;
     }
     // An `.envelope` at the top level whose name rebuilds from no set the job's
     // rows name is not direct-store's, and the sweep must leave it alone.
@@ -1401,6 +1405,7 @@ async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_ident
             )),
             "the checkpoint must carry the plan the header rung admitted"
         );
+        retire_pipeline_database(pipeline).await;
     }
 
     // Twice, as the headline differential does: the second restore rebuilds
@@ -1420,7 +1425,7 @@ async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_ident
         "obfuscated-set.f0",
         crate::pipeline::direct_store::plan::IdentityKind::HeaderVolumeSet,
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let mut pipeline = direct_store_after_restart(
         &temp_dir,
         DirectStoreGate::Enabled,
@@ -1528,6 +1533,7 @@ async fn a_standalone_identity_archive_restarts_from_its_floor_and_completes_byt
             )),
             "non-vacuity: the header rung admitted a standalone archive"
         );
+        retire_pipeline_database(pipeline).await;
     }
 
     let pipeline = direct_store_after_restart(
@@ -1545,7 +1551,7 @@ async fn a_standalone_identity_archive_restarts_from_its_floor_and_completes_byt
         "obfuscated-archive.f0",
         crate::pipeline::direct_store::plan::IdentityKind::Standalone,
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let mut pipeline = direct_store_after_restart(
         &temp_dir,
         DirectStoreGate::Enabled,
@@ -1671,6 +1677,7 @@ async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_id
         // The names the recovery set's content binding learned for the
         // obfuscated files, which the job persists and a restart reads back.
         let file_identities = pipeline.jobs[&job_id].file_identities.clone();
+        retire_pipeline_database(pipeline).await;
         (working_dir, file_identities)
     };
     let set_name = {
@@ -1691,6 +1698,7 @@ async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_id
             )),
             "the checkpoint must carry the plan the roster admitted"
         );
+        retire_pipeline_database(pipeline).await;
         rows.keys().next().unwrap().clone()
     };
 
@@ -1709,7 +1717,7 @@ async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_id
         &set_name,
         crate::pipeline::direct_store::plan::IdentityKind::Roster,
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let mut pipeline = restore_with_downloaded_index(
         &temp_dir,
         job_id,
@@ -1811,6 +1819,7 @@ async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -1975,6 +1984,7 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -2072,6 +2082,7 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
     let (mut rar_pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -2177,7 +2188,7 @@ async fn a_restart_inside_a_handback_window_refuses_the_row_and_keeps_the_rebuil
         .into_iter()
         .map(|file_index| NzbFileId { job_id, file_index })
         .collect();
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
 
     let (mut restarted, _, _) = new_direct_pipeline(&temp_dir).await;
     restarted.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -2556,6 +2567,7 @@ async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
              complete: restart would skip every segment of a volume whose bytes do not \
              exist ({entry:?})"
         );
+        retire_pipeline_database(probe).await;
     }
 
     let mut pipeline = direct_store_after_restart(
@@ -3790,6 +3802,7 @@ async fn folder_tree_set_installed_before_restart(
     pipeline
         .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
         .await;
+    retire_pipeline_database(pipeline).await;
     (files, working_dir)
 }
 
@@ -3927,6 +3940,7 @@ async fn a_barrier_demanded_after_finalization_keeps_the_set_installed() {
                     .all(|blob| crate::pipeline::direct_store::snapshot::is_installed_marker(blob)),
             "the set's row must still be its installation marker after every demand"
         );
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 

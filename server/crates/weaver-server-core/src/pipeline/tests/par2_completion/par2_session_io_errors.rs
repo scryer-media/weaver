@@ -292,6 +292,7 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
         tokio::fs::write(working_dir.join(par2_filename), &par2_bytes)
             .await
             .unwrap();
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -419,6 +420,7 @@ async fn restored_unknown_par2_is_inspected_on_completion_not_startup() {
         tokio::fs::write(working_dir.join(payload_filename), payload)
             .await
             .unwrap();
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -1844,6 +1846,7 @@ async fn restore_job_reparses_par2_without_promoted_recovery_state() {
             .db
             .upsert_par2_file(job_id, 1, recovery_filename, 1, true)
             .unwrap();
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 

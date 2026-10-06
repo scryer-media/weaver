@@ -169,7 +169,7 @@ async fn blocked_placement_restore_stays_visible_across_restart_and_resume() {
             "completion" => std::fs::write(journal_dir.join("retained-note"), b"keep").unwrap(),
             _ => unreachable!(),
         }
-        drop(pipeline);
+        retire_pipeline_database(pipeline).await;
         for _ in 0..2 {
             let (mut restored, _, _) = new_direct_pipeline(&temp).await;
             restored.restore_job(request.clone()).await.unwrap();
@@ -235,6 +235,7 @@ async fn blocked_placement_restore_stays_visible_across_restart_and_resume() {
                 .unwrap()
                 .request;
             assert_eq!(request.status, JobStatus::Paused);
+            retire_pipeline_database(restored).await;
         }
         let (mut restored, _, _) = new_direct_pipeline(&temp).await;
         restored.restore_job(request.clone()).await.unwrap();
@@ -281,7 +282,7 @@ async fn blocked_restore_recovered_on_startup_stays_paused_and_cancel_clears_gat
     let path = journal_dir.join("journal.json");
     let original = std::fs::read(&path).unwrap();
     std::fs::write(&path, b"broken").unwrap();
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _, _) = new_direct_pipeline(&temp).await;
     restored.restore_job(request.clone()).await.unwrap();
     let job_id = request.job_id;
@@ -296,7 +297,7 @@ async fn blocked_restore_recovered_on_startup_stays_paused_and_cancel_clears_gat
     assert!(restored.resume_restored_job(job_id).await.is_err());
     assert_eq!(restored.job_order, order);
     request.status = JobStatus::Paused;
-    drop(restored);
+    retire_pipeline_database(restored).await;
     std::fs::write(&path, &original).unwrap();
     let (mut restored, _, _) = new_direct_pipeline(&temp).await;
     restored.restore_job(request.clone()).await.unwrap();
@@ -311,7 +312,7 @@ async fn blocked_restore_recovered_on_startup_stays_paused_and_cancel_clears_gat
     // A second failure demonstrates cancel cleanup without needing recovery.
     std::fs::create_dir_all(&journal_dir).unwrap();
     std::fs::write(&path, b"broken").unwrap();
-    drop(restored);
+    retire_pipeline_database(restored).await;
     let (mut restored, _, _) = new_direct_pipeline(&temp).await;
     restored.restore_job(request).await.unwrap();
     assert!(restored.blocked_restores.contains_key(&job_id));
@@ -527,7 +528,7 @@ async fn restore_job_replays_placement_before_building_download_queue() {
             .unwrap()
             .remove(&job_id)
             .unwrap();
-        drop(pipeline);
+        retire_pipeline_database(pipeline).await;
         let (mut restored, _, _) = new_direct_pipeline(&temp).await;
         restored
             .restore_job(RestoreJobRequest {
@@ -657,7 +658,7 @@ async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
         .unwrap()
         .remove(&job_id)
         .unwrap();
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     restored
         .restore_job(RestoreJobRequest {
@@ -1359,6 +1360,7 @@ async fn restore_job_skips_eager_delete_for_ownerless_restored_volumes() {
         let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
         pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
         write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 

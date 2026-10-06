@@ -214,7 +214,7 @@ async fn a_restart_mid_sample_still_reaches_the_verdict() {
         pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
     }
     assert!(job_failed(&pipeline, job_id).is_none());
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
 
     let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
     restored

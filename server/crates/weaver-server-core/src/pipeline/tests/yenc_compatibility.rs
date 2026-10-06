@@ -814,7 +814,7 @@ async fn restart_refetches_retained_damage_and_overwrites_it() {
         .unwrap();
     assert!(recovered.complete_files.is_empty());
     assert!(recovered.file_progress.is_empty());
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _, _) = new_direct_pipeline(&temp).await;
     restored
         .restore_job(RestoreJobRequest {
@@ -991,7 +991,7 @@ async fn restart_partial(mut pipeline: Pipeline, temp: &TempDir, file_id: NzbFil
         .remove(&job_id)
         .unwrap();
     assert!(recovered.complete_files.is_empty());
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _, _) = new_direct_pipeline(temp).await;
     restored
         .restore_job(RestoreJobRequest {

@@ -952,6 +952,7 @@ async fn a_job_that_dies_inside_the_retention_window_sweeps_its_envelopes_on_res
             direct_envelopes_left(&working_dir) > 0,
             "non-vacuity: the job must die holding retained envelopes"
         );
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -1488,6 +1489,7 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -3156,6 +3158,7 @@ async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_comple
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         (working_dir, index_file_index)
     };
 

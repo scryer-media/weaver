@@ -2822,7 +2822,7 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
         .unwrap()
         .remove(&job_id)
         .unwrap();
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _intermediate_dir, complete_dir_restored) =
         new_direct_pipeline(&temp_dir).await;
     restored
@@ -3356,6 +3356,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
             .add_extracted_member(job_id, "E01.mkv", &working_dir.join("E01.mkv"))
             .unwrap();
         pipeline.try_delete_volumes(job_id, "show");
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
