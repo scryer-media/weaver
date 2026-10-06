@@ -866,7 +866,22 @@ impl Pipeline {
                             .entry(file_id)
                             .or_insert(proven);
                     }
-                    self.file_prefix_16k.entry(file_id).or_insert(prefix);
+                    // A prefix already held is only ever shorter than the
+                    // window read back here: a longer one was served from the
+                    // cache above and never read. Content binding prefers any
+                    // held prefix over the proven fingerprint, so a short one,
+                    // left in place, would hold the window closed and demote
+                    // a set whose bytes prove it. The longer capture wins.
+                    match self.file_prefix_16k.entry(file_id) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(prefix);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut slot) => {
+                            if slot.get().len() < prefix.len() {
+                                slot.insert(prefix);
+                            }
+                        }
+                    }
                 }
             }
             Err(error) => {
