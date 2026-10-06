@@ -3,6 +3,17 @@
 
 use super::*;
 
+/// Give the UU spool a known free-space reading so a spill is judged on it.
+///
+/// The pipeline reads spool headroom from the background storage sampler, and
+/// until that sampler's first probe lands the reading is unknown. A spill with
+/// no reading is refused and the part requeued, so a test that expects a part
+/// to spill must not race the sampler: it seeds the reading it wants instead.
+fn seed_uu_spool_headroom(pipeline: &mut Pipeline) {
+    pipeline.uu_spool_available_bytes_for_test =
+        Some(Some(pipeline.uu_spool_min_free_bytes + 64 * 1024 * 1024));
+}
+
 // ---- uuencode sequential assembly ----
 
 #[tokio::test]
@@ -107,6 +118,7 @@ async fn uu_spills_reassemble_before_obfuscated_sfv_verification() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.write_backlog_budget_bytes = 1;
+    seed_uu_spool_headroom(&mut pipeline);
 
     let job_id = JobId(20169);
     let payload_filename = "silver-horizon.bin";
@@ -237,6 +249,7 @@ async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     // The comparison is strict: part 2 stays resident, then part 1 spills.
     pipeline.write_backlog_budget_bytes = 600;
+    seed_uu_spool_headroom(&mut pipeline);
     let job_id = JobId(20170);
     let parts: Vec<Vec<u8>> = vec![vec![b'a'; 500], vec![b'b'; 450], vec![b'c'; 300]];
     let working_dir = insert_active_job(
@@ -499,6 +512,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.write_backlog_budget_bytes = 1;
     pipeline.uu_park_max_segments = 2;
+    seed_uu_spool_headroom(&mut pipeline);
     let job_id = JobId(20171);
     let parts: Vec<Vec<u8>> = vec![vec![b'a'; 100], vec![b'b'; 110], vec![b'c'; 120]];
     insert_active_job(
@@ -622,6 +636,7 @@ async fn uu_missing_spool_file_fails_job_without_leaking_accounting() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.write_backlog_budget_bytes = 1;
+    seed_uu_spool_headroom(&mut pipeline);
     let job_id = JobId(20174);
     let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90]];
     insert_active_job(
