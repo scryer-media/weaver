@@ -1,8 +1,2 @@
 [alias]
 xtask = "run -p xtask --"
-
-# Local development with the companion transport worktree until its API is published.
-[patch."https://github.com/scryer-media/proxy-tunnels.git"]
-proxy-tunnels = { path = "../../../proxy-tunnels/.worktrees/inner-transports" }
-h3 = { path = "../../../proxy-tunnels/.worktrees/inner-transports/vendor/h3" }
-h3-quinn = { path = "../../../proxy-tunnels/.worktrees/inner-transports/vendor/h3-quinn" }
