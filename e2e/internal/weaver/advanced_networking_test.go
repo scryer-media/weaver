@@ -2,6 +2,7 @@ package weaver
 
 import (
 	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -278,5 +279,30 @@ func TestTwoNICCommandsStayInsideTheirProject(t *testing.T) {
 		if !strings.Contains(run, want) {
 			t.Fatalf("remote Weaver run %q lacks %s", run, want)
 		}
+	}
+}
+
+func TestFetchableNetworkCandidatesAreOutsideTheBlockedRanges(t *testing.T) {
+	benchmarking := netip.MustParsePrefix("198.18.0.0/15")
+	candidates := weaverReleaseFetchableNetworkCandidates([]*weaverReleasePhase{{Project: "weaver-release-event-scripts"}})
+	if len(candidates) != 512 {
+		t.Fatalf("got %d candidates, want 512", len(candidates))
+	}
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		prefix := netip.MustParsePrefix(candidate)
+		if !benchmarking.Contains(prefix.Addr()) || prefix.Bits() != 24 {
+			t.Fatalf("candidate %s is not a /24 in %s", candidate, benchmarking)
+		}
+		if prefix.Addr().IsPrivate() || prefix.Addr().IsLoopback() || prefix.Addr().IsLinkLocalUnicast() {
+			t.Fatalf("candidate %s is in a range Weaver refuses to fetch from", candidate)
+		}
+		if seen[candidate] {
+			t.Fatalf("candidate %s repeats", candidate)
+		}
+		seen[candidate] = true
+	}
+	if !weaverNetworkLayoutFixtureAddress.servesNzbUrls() || weaverNetworkLayoutEgress.servesNzbUrls() {
+		t.Fatal("only the fixture-address layout serves NZB URLs")
 	}
 }

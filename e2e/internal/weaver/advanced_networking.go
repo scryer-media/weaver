@@ -35,6 +35,12 @@ const (
 	weaverNetworkLayoutFixtureAddress weaverReleaseNetworkLayout = "fixture-address"
 )
 
+// servesNzbUrls reports whether the layout's proxy fixture serves NZB URLs
+// that Weaver must be allowed to fetch.
+func (layout weaverReleaseNetworkLayout) servesNzbUrls() bool {
+	return layout == weaverNetworkLayoutFixtureAddress
+}
+
 func (layout weaverReleaseNetworkLayout) egressNetworks() int {
 	if layout == weaverNetworkLayoutEgress {
 		return 2

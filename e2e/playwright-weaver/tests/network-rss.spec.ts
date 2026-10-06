@@ -3,6 +3,7 @@ import { type NetworkFlow, flowAfter, flowMark, ladderLeg, legOn, rssKey, rung }
 import { NetworkWorld, saveEvidence } from "./support/network-scenario";
 import { type FixtureEvent, controlRoute, directEvents, fixtureEvents, fixtureMark } from "./support/proxy-fixture";
 import { clearScriptRecords, removeFixtureScripts, scriptBodies, scriptRecords, writeFixtureScript } from "./support/script-fixtures";
+import { useScripts } from "./support/script-settings";
 import { tunnelState } from "./support/tunnel-fixture";
 
 /** RSS through routes (checkpoint 5.7). */
@@ -71,8 +72,11 @@ test("RS03 with every rung down, direct fallback resolves and fetches directly",
 test("RS04 a FEED script rewrites the routed feed and the rewritten item is queued", async ({ request }) => {
   const a = await world.egress("a");
   const connect1 = await world.connect("connect1");
-  const script = writeFixtureScript(`rs04-feed-${Date.now()}.sh`, { kinds: ["FEED"], body: scriptBodies.rewriteFeedTitles("rewritten-") });
+  // A FEED script must exit 93 (NZBGet's success) or the feed is not used;
+  // scripts only run with execution switched on.
+  const script = writeFixtureScript(`rs04-feed-${Date.now()}.sh`, { kinds: ["FEED"], body: scriptBodies.rewriteFeedTitles("rewritten-"), exitCode: 93 });
   clearScriptRecords();
+  const restoreScripts = await useScripts(request, {});
   try {
     const token = `rs04-${Date.now()}`;
     const feed = await world.feed({ url: await world.armFeed(token), route: { legs: [ladderLeg(a.id, [rung.proxy(connect1.id)], 100)] }, scripts: [script] });
@@ -86,6 +90,7 @@ test("RS04 a FEED script rewrites the routed feed and the rewritten item is queu
     const jobs = (await graphql<{ jobs: Array<{ id: number; name: string; originalTitle: string }> }>(request, "query { jobs { id name originalTitle } }")).jobs;
     expect(jobs.filter(job => `${job.name} ${job.originalTitle}`.includes(`rewritten-proxy-${token}`))).toHaveLength(1);
   } finally {
+    await restoreScripts();
     removeFixtureScripts([script]);
   }
 });

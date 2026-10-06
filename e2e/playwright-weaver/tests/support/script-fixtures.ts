@@ -128,6 +128,26 @@ exit ${options.exitCode ?? 0}
   return name;
 }
 
+/** A bare script with no NZBGet header, which Weaver runs with the SABnzbd adapter. */
+export function writeBareScript(name: string, options: { body?: string; exitCode?: number } = {}): string {
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`invalid fixture script name ${name}`);
+  const target = path.join(SCRIPTS_DIR, name);
+  fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.writeFileSync(`${target}.tmp`, `#!/bin/sh\n${recorder(name)}${options.body ?? ""}\nexit ${options.exitCode ?? 0}\n`, { mode: 0o755 });
+  fs.renameSync(`${target}.tmp`, target);
+  return name;
+}
+
+/**
+ * Remove a gate whose run is gone (cancelled, timed out or killed by a
+ * restart). Never release such a gate: with no reader, opening it for write
+ * would block for good.
+ */
+export function removeStaleGate(script: string, jobKey: string | number): void {
+  fs.rmSync(path.join(GATES_DIR, `${script}-${jobKey}`), { force: true });
+}
+
 export function removeFixtureScripts(names: string[]): void {
   for (const name of names) fs.rmSync(path.join(SCRIPTS_DIR, name), { recursive: true, force: true });
 }

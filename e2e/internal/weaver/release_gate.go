@@ -461,22 +461,42 @@ func assignWeaverReleaseNetworkSubnets(
 	if err != nil {
 		return fmt.Errorf("inspect Docker networks for Weaver release gate: %w", err)
 	}
-	count := 0
+	// Weaver refuses to fetch an NZB URL from a private address, so a phase
+	// whose fixture serves NZB URLs gets a subnet from the benchmarking range
+	// (198.18.0.0/15), which is neither private nor publicly routed.
+	count, fetchableCount := 0, 0
 	for _, phase := range phases {
+		if phase.Spec.NetworkLayout.servesNzbUrls() {
+			fetchableCount++
+			continue
+		}
 		count += 1 + phase.Spec.NetworkLayout.egressNetworks()
 	}
-	subnets, err := composeutil.SelectNonOverlappingSubnets(
-		count,
-		weaverReleaseNetworkCandidates(phases),
+	fetchable, err := composeutil.SelectNonOverlappingSubnets(
+		fetchableCount,
+		weaverReleaseFetchableNetworkCandidates(phases),
 		used,
 	)
 	if err != nil {
 		return err
 	}
-	next := 0
+	subnets, err := composeutil.SelectNonOverlappingSubnets(
+		count,
+		weaverReleaseNetworkCandidates(phases),
+		append(append([]string(nil), used...), fetchable...),
+	)
+	if err != nil {
+		return err
+	}
+	next, nextFetchable := 0, 0
 	for _, phase := range phases {
-		phase.NetworkSubnet = subnets[next]
-		next++
+		if phase.Spec.NetworkLayout.servesNzbUrls() {
+			phase.NetworkSubnet = fetchable[nextFetchable]
+			nextFetchable++
+		} else {
+			phase.NetworkSubnet = subnets[next]
+			next++
+		}
 		extra := phase.Spec.NetworkLayout.egressNetworks()
 		phase.EgressSubnets = append([]string(nil), subnets[next:next+extra]...)
 		next += extra
@@ -497,6 +517,24 @@ func assignWeaverReleaseNetworkSubnets(
 		}
 	}
 	return nil
+}
+
+// weaverReleaseFetchableNetworkCandidates are /24s in 198.18.0.0/15, the
+// range reserved for network benchmarking. Weaver's URL fetch policy blocks
+// private, loopback and link-local destinations, not this range, so a fixture
+// on it can serve NZB URLs the way a public indexer would.
+func weaverReleaseFetchableNetworkCandidates(phases []*weaverReleasePhase) []string {
+	hasher := fnv.New32a()
+	for _, phase := range phases {
+		_, _ = hasher.Write([]byte(phase.Project))
+	}
+	start := int(hasher.Sum32() % 512)
+	candidates := make([]string, 0, 512)
+	for offset := range 512 {
+		index := (start + offset) % 512
+		candidates = append(candidates, fmt.Sprintf("198.%d.%d.0/24", 18+index/256, index%256))
+	}
+	return candidates
 }
 
 func weaverReleaseNetworkCandidates(phases []*weaverReleasePhase) []string {
