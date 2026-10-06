@@ -274,6 +274,9 @@ impl Pipeline {
         // end a download without completing a file. One iteration over the
         // job's direct sets, and nothing at all for a job with no container set
         // still routing.
+        if self.has_direct_end_header_verdicts() {
+            self.settle_direct_end_header_verdicts().await;
+        }
         self.demote_direct_sets_with_an_unreadable_map(job_id).await;
         let current_status = {
             let Some(state) = self.jobs.get(&job_id) else {

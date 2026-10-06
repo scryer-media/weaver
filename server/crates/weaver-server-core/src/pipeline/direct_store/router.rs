@@ -2357,6 +2357,10 @@ pub(crate) struct DirectSetRouter {
     /// completes. That check is the authoritative one — a yEnc `size=` is a
     /// hint, and what decodes is the fact.
     sevenz_geometry: Option<sevenz::ContainerGeometry>,
+    /// Whether the article that closes the last volume was ruled missing for
+    /// good before the map was read. Without an embedded recovery set that
+    /// article carries the end header's last bytes, so the map went with it.
+    sevenz_end_article_lost: bool,
     /// What each volume actually decoded to, recorded as it completed.
     ///
     /// A volume can finish arriving before the map is read — the tail it lives
@@ -2625,6 +2629,7 @@ impl DirectSetRouter {
             declared_volume_sizes: BTreeMap::new(),
             sevenz_start: None,
             sevenz_geometry: None,
+            sevenz_end_article_lost: false,
             sevenz_decoded_volume_lengths: BTreeMap::new(),
             sevenz_facts: None,
             volume_facts: BTreeMap::new(),

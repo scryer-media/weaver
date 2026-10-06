@@ -2498,6 +2498,36 @@ impl DirectSetRouter {
         HeaderProbe::Container { front, tail }
     }
 
+    /// Records that the article closing the set's last volume will never
+    /// arrive: every server ruled it missing, or its retries or decodes ran
+    /// out.
+    pub(crate) fn note_end_article_lost(&mut self) {
+        if self.plan.format == SetFormat::SevenZip && self.layout.is_none() {
+            self.sevenz_end_article_lost = true;
+        }
+    }
+
+    /// Whether the map went with the lost closing article, so that nothing
+    /// still to arrive could let the set read it.
+    ///
+    /// A container ends with its end header, so the article that closes the
+    /// last volume carries the header's last bytes — unless a recovery set
+    /// was written after the container, which only a one-volume set may
+    /// carry. A split set is therefore judged without waiting for anything; a
+    /// one-volume set once its start header and stated length have placed the
+    /// container's end, which the parse does again with every article.
+    pub(crate) fn end_header_lost(&self) -> bool {
+        if !self.sevenz_end_article_lost || self.layout.is_some() {
+            return false;
+        }
+        match self.container_geometry() {
+            Some(Ok(geometry)) => geometry.tail == 0,
+            // A geometry that does not hold is refused by the parse itself.
+            Some(Err(_)) => false,
+            None => self.plan.expected_volume_count() != Some(1) && self.plan.volumes.len() > 1,
+        }
+    }
+
     /// Reads the container's map, if enough of it has arrived.
     ///
     /// Runs on every routed article until it succeeds, and never again after
@@ -2580,6 +2610,11 @@ impl DirectSetRouter {
                 }
                 Some(true) => {}
             }
+        } else if self.sevenz_end_article_lost {
+            // The closing article carried the end header, and it is gone.
+            return Err(self.fail(DemotionReason::SevenZip(
+                sevenz::SevenZipRefusal::EndHeaderLost,
+            )));
         }
         let lengths = geometry.lengths();
         let total = geometry.total;

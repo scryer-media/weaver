@@ -131,6 +131,15 @@ pub(crate) enum SevenZipRefusal {
     /// concatenation, and it is reached by the set running out of articles
     /// rather than by it spending a ceiling.
     UnreadableMap,
+    /// The article that closes the container was ruled missing on every
+    /// server, or ran out of retries or decodes, before the map was read.
+    ///
+    /// A container ends with its end header, so that article carries the
+    /// header's last bytes and the map is gone with it. Judged on that one
+    /// terminal verdict rather than once every other article has landed, so
+    /// the set hands over before it holds the rest of the container. A late
+    /// article is not a verdict: only a terminal one reaches this.
+    EndHeaderLost,
     /// A volume whose length is not the one the container's own coordinates
     /// require of it.
     ///
@@ -168,6 +177,7 @@ impl SevenZipRefusal {
             Self::UnsafeDestination => "7z_unsafe_destination",
             Self::VolumeHintUnusable => "7z_volume_hint_unusable",
             Self::UnreadableMap => "7z_unreadable_map",
+            Self::EndHeaderLost => "7z_end_header_lost",
             Self::VolumeSize => "7z_volume_size",
             Self::Geometry => "7z_geometry",
         }

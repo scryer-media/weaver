@@ -135,6 +135,8 @@ impl Pipeline {
                 slot.insert(terminal_state);
             }
         }
+        // A container set whose map this article closed cannot read it now.
+        self.note_direct_article_terminal(seg_id);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
             // The failing-file set follows the same rule as the bytes: a lost

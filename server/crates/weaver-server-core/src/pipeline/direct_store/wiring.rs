@@ -223,6 +223,10 @@ pub(crate) struct DirectStoreRuntime {
     /// passing through the admission seam, and its sets still need candidates.
     header_harvest: HashMap<JobId, Vec<crate::jobs::model::ArchivePasswordCandidate>>,
     sets: HashMap<JobId, Vec<DirectSet>>,
+    /// Jobs with a container set whose end header was lost with its article,
+    /// to be handed over on the next turn. The booking that rules an article
+    /// missing cannot demote a set itself, so it notes the job here.
+    end_header_verdicts: std::collections::BTreeSet<JobId>,
     /// Destinations already created and marked sparse, per job. A member stored
     /// inside a directory names a partial inside that directory and nothing
     /// else creates it, and every destination has to carry the sparse attribute
@@ -2747,6 +2751,90 @@ impl Pipeline {
             .filter(|(_, set)| {
                 set.plan().volumes.values().all(|file_index| {
                     let file_id = NzbFileId {
+    /// Notes a terminal verdict on an article against the container set whose
+    /// last volume it closes.
+    ///
+    /// Called on the edge into the terminal state, so only a verdict reaches
+    /// it — an article that is merely slow, or still has a server or a retry
+    /// left, never does. The set is not demoted here: the booking is not a
+    /// place a demotion can run, so the job is noted for the next turn.
+    pub(crate) fn note_direct_article_terminal(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        let file_index = segment_id.file_id.file_index;
+        let Some(closing) = self.jobs.get(&job_id).and_then(|state| {
+            state
+                .spec
+                .files
+                .get(file_index as usize)?
+                .segments
+                .iter()
+                .map(|segment| segment.ordinal)
+                .max()
+        }) else {
+            return;
+        };
+        if segment_id.segment_number != closing {
+            return;
+        }
+        let mut lost = false;
+        for index in 0..self.direct_store.sets_for(job_id).len() {
+            let Some(set) = self.direct_store.set_mut(job_id, index) else {
+                continue;
+            };
+            if set.plan().format != super::plan::SetFormat::SevenZip
+                || set.is_demoted()
+                || set.is_finalized()
+                || set.plan().volumes.values().next_back() != Some(&file_index)
+            {
+                continue;
+            }
+            set.router.note_end_article_lost();
+            lost |= set.router.end_header_lost();
+        }
+        if lost {
+            self.direct_store.end_header_verdicts.insert(job_id);
+        }
+    }
+
+    /// Whether a lost end header is waiting to be acted on.
+    pub(crate) fn has_direct_end_header_verdicts(&self) -> bool {
+        !self.direct_store.end_header_verdicts.is_empty()
+    }
+
+    /// Hands over every container set whose end header was lost with its
+    /// article.
+    ///
+    /// The map cannot be read, so the set will demote whatever arrives next;
+    /// doing it now is what keeps the rest of the container from being held,
+    /// and paged out to scratch, for nothing.
+    pub(crate) async fn settle_direct_end_header_verdicts(&mut self) {
+        let jobs = std::mem::take(&mut self.direct_store.end_header_verdicts);
+        for job_id in jobs {
+            let lost: Vec<usize> = self
+                .direct_store
+                .sets_for(job_id)
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| {
+                    !set.is_demoted() && !set.is_finalized() && set.router.end_header_lost()
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for set_index in lost {
+                warn!(
+                    job_id = job_id.0,
+                    set_index, "a container's end header was lost with the article that closes it"
+                );
+                self.demote_direct_set(
+                    job_id,
+                    set_index,
+                    DemotionReason::SevenZip(SevenZipRefusal::EndHeaderLost),
+                )
+                .await;
+            }
+        }
+    }
+
                         job_id,
                         file_index: *file_index,
                     };

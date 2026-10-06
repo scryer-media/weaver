@@ -304,6 +304,7 @@ impl ExtractionProfile {
             .filter(|reason| match **reason {
                 reason if outcome.schedule_demoted == Some(reason) => false,
                 DemotionReason::SevenZip(SevenZipRefusal::UnreadableMap) if unmapped => false,
+                DemotionReason::SevenZip(SevenZipRefusal::EndHeaderLost) if unmapped => false,
                 DemotionReason::IdentityRosterUnfillable if unnamed => false,
                 // The unnamed volume belongs to no set, so its damage is
                 // damage no direct set can repair in place.

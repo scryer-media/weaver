@@ -970,6 +970,11 @@ impl Pipeline {
                 self.release_settled_unanchored_runs().await;
                 self.pump_decode_queue();
             }
+            // A container set whose end header was ruled missing hands over
+            // before it holds anything more.
+            if self.has_direct_end_header_verdicts() {
+                self.settle_direct_end_header_verdicts().await;
+            }
 
             let pending_completion_checks = self.pending_completion_checks.len();
             for _ in 0..pending_completion_checks {
