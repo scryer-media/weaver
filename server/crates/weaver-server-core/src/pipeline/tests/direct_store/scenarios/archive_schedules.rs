@@ -1367,6 +1367,10 @@ pub(super) async fn run_schedule_with(
                 .await
                 .expect("registered extraction receipt");
             pipeline.handle_extraction_done(done).await;
+        } else if pipeline.job_has_pending_rar_refresh_for_current_sets(job) {
+            // A topology refresh the completion pass launched runs off the
+            // actor, and the job cannot settle before its result lands.
+            drain_rar_refreshes(&mut pipeline).await;
         } else if recovery.is_empty() && options.recovery != RecoveryFormat::Embedded {
             // An embedded set's verification and repair are settled by the
             // pump above and may take another completion round to land.

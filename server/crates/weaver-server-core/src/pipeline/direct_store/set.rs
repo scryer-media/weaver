@@ -424,6 +424,11 @@ impl DirectSet {
         received_bytes.max(covered_end)
     }
 
+    /// Whether the volume's download finished and its bytes are all placed.
+    pub(crate) fn volume_is_complete(&self, volume_index: u32) -> bool {
+        self.complete_volumes.contains_key(&volume_index)
+    }
+
     /// Whether the set is carrying restart-seeded coverage no gate has verified.
     pub(crate) fn has_restart_seeded_coverage(&self) -> bool {
         self.router.has_restart_seeded_coverage()

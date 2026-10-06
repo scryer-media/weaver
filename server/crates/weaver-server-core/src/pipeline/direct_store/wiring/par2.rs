@@ -768,6 +768,113 @@ impl Pipeline {
         block
     }
 
+    /// Restores the content evidence a live direct volume lost to a restart,
+    /// for every volume that has nothing else to bind by.
+    ///
+    /// A volume bound by content answers to its PAR2 description only through
+    /// the 16 KiB prefix its first article delivered, and that capture lives
+    /// in memory. A restart that resumes the set from its coverage checkpoint
+    /// skips the durable first article, so nothing captures it again, and the
+    /// length the assembly restored is the posted, encoded one, which
+    /// contradicts every description. The bytes are still in the set's
+    /// destinations and a complete volume's served extent is its exact decoded
+    /// length, so the window is read back once, off the actor, and a complete
+    /// volume's fingerprint is proven at that length, instead of demoting a
+    /// healthy set for facts it already held. A window the set cannot serve
+    /// whole is left alone; nothing is ever padded.
+    async fn recapture_restored_direct_prefixes(&mut self, job_id: JobId) {
+        let window = crate::pipeline::PAR2_HASH_16K_BYTES as u64;
+        let mut reads = Vec::new();
+        for set in self.direct_store.sets_for(job_id) {
+            if set.is_demoted() || set.is_finalized() {
+                continue;
+            }
+            let mut lengths = std::collections::BTreeMap::new();
+            let mut wanted = Vec::new();
+            for (volume_index, file_index) in &set.plan().volumes {
+                let file_id = NzbFileId {
+                    job_id,
+                    file_index: *file_index,
+                };
+                if self.file_proven_par2_fingerprint.contains_key(&file_id)
+                    || self.resolve_par2_file_binding(file_id).is_some()
+                {
+                    continue;
+                }
+                let received = self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|state| state.assembly.file(file_id))
+                    .map(|file| file.received_bytes())
+                    .unwrap_or(0);
+                let len = set.virtual_volume_len(*volume_index, received);
+                if len == 0 {
+                    continue;
+                }
+                let exact_len = set.volume_is_complete(*volume_index).then_some(len);
+                let window = len.min(window) as usize;
+                let held = self
+                    .file_prefix_16k
+                    .get(&file_id)
+                    .filter(|prefix| prefix.len() >= window)
+                    .map(|prefix| prefix[..window].to_vec());
+                if held.is_some() && exact_len.is_none() {
+                    continue;
+                }
+                if held.is_none() {
+                    lengths.insert(*volume_index, len);
+                }
+                wanted.push((file_id, *volume_index, window, exact_len, held));
+            }
+            if !wanted.is_empty() {
+                reads.push((set.virtual_provider(&lengths), wanted));
+            }
+        }
+        if reads.is_empty() {
+            return;
+        }
+        let read = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut prefixes = Vec::new();
+            for (provider, wanted) in reads {
+                for (file_id, volume_index, window, exact_len, held) in wanted {
+                    let prefix = match held {
+                        Some(prefix) => prefix,
+                        None => {
+                            let Some(mut reader) = provider.open(volume_index) else {
+                                continue;
+                            };
+                            let mut prefix = vec![0u8; window];
+                            if reader.read_exact(&mut prefix).is_err() {
+                                continue;
+                            }
+                            prefix
+                        }
+                    };
+                    let proven = exact_len.map(|len| (par2_rs::checksum::md5(&prefix), len));
+                    prefixes.push((file_id, prefix, proven));
+                }
+            }
+            prefixes
+        })
+        .await;
+        match read {
+            Ok(prefixes) => {
+                for (file_id, prefix, proven) in prefixes {
+                    if let Some(proven) = proven {
+                        self.file_proven_par2_fingerprint
+                            .entry(file_id)
+                            .or_insert(proven);
+                    }
+                    self.file_prefix_16k.entry(file_id).or_insert(prefix);
+                }
+            }
+            Err(error) => {
+                warn!(job_id = job_id.0, %error, "failed to join direct prefix read-back");
+            }
+        }
+    }
+
     /// Demotes every live direct set of `job_id` holding a source volume that
     /// cannot be bound, unambiguously, to a PAR2 description.
     ///
@@ -826,6 +933,7 @@ impl Pipeline {
             )
             .await;
         }
+        self.recapture_restored_direct_prefixes(job_id).await;
         let unbindable: Vec<(usize, u32)> = self
             .direct_store
             .sets_for(job_id)
@@ -3067,6 +3175,12 @@ impl Pipeline {
         damaged: &[super::super::repair::DamagedDirectVolume],
         lengths: &std::collections::BTreeMap<u32, u64>,
     ) -> bool {
+        // The repaired bytes reach the router's header parse, which is where
+        // an `-hp` set proves its archive key. Articles hand the job's
+        // passwords to the router as they route, so a set that resumed from a
+        // restart with every article lost has never been offered one, and the
+        // parse would refuse a password the job holds.
+        self.refresh_direct_passwords(job_id);
         // An encrypted member's repaired span decrypts on the way
         // in, and every byte its CBC chain needs was dropped from staging when
         // the original article was routed. Two sources put them back, and

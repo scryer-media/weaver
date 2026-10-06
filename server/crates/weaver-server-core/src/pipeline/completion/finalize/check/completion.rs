@@ -26,7 +26,16 @@ impl Pipeline {
             return;
         }
 
-        if self.has_active_rar_workers(job_id) {
+        // A full-set extraction of a set with no runtime state of its own (a
+        // name only a file classification still carries) counts no workers,
+        // so its in-flight entry is the only sign it is running. Starting
+        // another one, or finalizing the job and removing the volume it is
+        // about to open, both race that task.
+        let full_set_extraction_inflight = self
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| set_names.iter().any(|name| sets.contains(name)));
+        if full_set_extraction_inflight || self.has_active_rar_workers(job_id) {
             if self
                 .jobs
                 .get(&job_id)

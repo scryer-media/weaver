@@ -885,11 +885,7 @@ impl Pipeline {
         let Ok(paths) = self.rar_chase_part_paths(job_id, set_name) else {
             return;
         };
-        if self
-            .direct_unpack_progress_floor(job_id, &paths[0])
-            .unwrap_or(0)
-            < SIGNATURE_HEADER_LEN
-        {
+        if !self.direct_unpack_part_opens_with(job_id, &paths[0], SIGNATURE_HEADER_LEN) {
             return;
         }
         self.arm_prepared_direct_unpack(job_id, set_name, paths, None, ChaseFormat::Rar);
@@ -1700,6 +1696,32 @@ impl Pipeline {
                 .or_else(|| self.persisted_file_progress.get(&file_id).copied())
                 .unwrap_or(0),
         )
+    }
+
+    /// Whether a part's first `len` bytes are committed.
+    ///
+    /// The progress floor answers this while the part downloads, but file
+    /// completion retires the floor, so a complete part — or one completed
+    /// again by a duplicate article — reads as floor zero. Its committed
+    /// first segment still answers the question.
+    fn direct_unpack_part_opens_with(
+        &self,
+        job_id: JobId,
+        path: &std::path::Path,
+        len: u64,
+    ) -> bool {
+        if self.direct_unpack_progress_floor(job_id, path).unwrap_or(0) >= len {
+            return true;
+        }
+        let Some(file_id) = self.direct_unpack_file_id_for_part(job_id, path) else {
+            return false;
+        };
+        self.jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .filter(|file| file.has_segment(0))
+            .and_then(|file| file.placement_of(0))
+            .is_some_and(|(offset, segment_len)| offset == 0 && u64::from(segment_len) >= len)
     }
 
     /// The job file a part path belongs to, by its current name.
