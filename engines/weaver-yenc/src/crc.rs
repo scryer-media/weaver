@@ -2,8 +2,8 @@
 /// during yEnc decode.
 ///
 /// On x86_64 CPUs with AVX2 + VPCLMULQDQ but no AVX512VL, large updates fold
-/// through `crc32fast`'s 4x256-bit VPCLMULQDQ tier instead, because `crc-fast`
-/// drops to its 128-bit SSE tier there. `crc-fast` remains the fallback and
+/// through the in-tree 4x256-bit VPCLMULQDQ kernel (`x86_vpclmul`) instead,
+/// because `crc-fast` drops to its 128-bit SSE tier there. `crc-fast` remains the fallback and
 /// small-update path, so externally visible CRC semantics stay identical.
 ///
 /// While the folding path is running the authoritative value is the plain `u32`
@@ -13,8 +13,8 @@
 /// once `folded` has been used, so `crc_fast::Digest::get_amount`/`combine` must
 /// not be surfaced through this wrapper without first tracking the folded bytes
 /// here.
-/// Whether large updates on this host fold through `crc32fast`'s 256-bit
-/// carry-less multiply tier rather than `crc-fast`. Reads the gate
+/// Whether large updates on this host fold through the in-tree 256-bit
+/// carry-less multiply kernel rather than `crc-fast`. Reads the gate
 /// [`Crc32::new`] reads.
 pub fn wide_fold_selected() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -425,13 +425,54 @@ impl std::fmt::Debug for Crc32 {
 
 #[cfg(target_arch = "x86_64")]
 mod x86_vpclmul {
+    use std::arch::x86_64::*;
     use std::sync::OnceLock;
 
-    /// The CPU features `crc32fast`'s 256-bit VPCLMULQDQ tier runs on.
+    /// `x^n mod P` in the reflected representation (`x^0` is bit 31), by
+    /// square-and-multiply in `const` context.
+    const fn xnmodp(mut n: u64) -> u32 {
+        let mut power = 1u32 << 31; // x^0
+        let mut square = 1u32 << 30; // x^1, then x^2, x^4, ...
+        while n != 0 {
+            if n & 1 != 0 {
+                power = super::multmodp(square, power);
+            }
+            square = super::multmodp(square, square);
+            n >>= 1;
+        }
+        power
+    }
+
+    /// Folding constant for a distance of `n` bits: `x^n mod P`, reflected and
+    /// shifted left one bit, the 33-bit form PCLMULQDQ folding multiplies by.
+    const fn fold_constant(n: u64) -> u64 {
+        (xnmodp(n) as u64) << 1
+    }
+
+    /// Main loop: eight 128-bit streams (four YMM registers) each move 1024
+    /// bits forward, so a stream's low and high 64-bit halves fold by
+    /// `x^(1024 + 32)` and `x^(1024 - 32)`.
+    const FOLD_1024_LO: i64 = fold_constant(1024 + 32) as i64;
+    const FOLD_1024_HI: i64 = fold_constant(1024 - 32) as i64;
+    /// Collapsing the streams and folding the tail: fold by 128 bits.
+    const FOLD_128_LO: i64 = fold_constant(128 + 32) as i64;
+    const FOLD_128_HI: i64 = fold_constant(128 - 32) as i64;
+    /// The 96-to-64-bit step of the 128-to-32-bit reduction.
+    const FOLD_64: i64 = fold_constant(64) as i64;
+    /// Barrett reduction to 32 bits.
+    const BARRETT_P: i64 = super::clmul::P_REFLECTED as i64;
+    const BARRETT_MU: i64 = super::clmul::MU_REFLECTED as i64;
+
+    /// Below this a single 128-bit stream folds the input; at and above it the
+    /// eight-stream loop runs at least once.
+    const WIDE_MIN: usize = 256;
+
+    /// The CPU features the kernel is compiled for.
     pub(super) fn capable() -> bool {
         is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("pclmulqdq")
             && is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("ssse3")
             && is_x86_feature_detected!("vpclmulqdq")
     }
 
@@ -447,22 +488,173 @@ mod x86_vpclmul {
         })
     }
 
-    /// CRC32 of `data` continuing from `initial` (finalized domain), through
-    /// `crc32fast`, whose runtime dispatch selects its 4x256-bit VPCLMULQDQ
-    /// fold (128 bytes per iteration) on every CPU [`capable`] accepts.
+    /// CRC32 of `data` continuing from `initial` (finalized domain).
     #[inline]
     pub(super) fn update(initial: u32, data: &[u8]) -> u32 {
-        let mut hasher = crc32fast::Hasher::new_with_initial(initial);
-        hasher.update(data);
-        hasher.finalize()
+        debug_assert!(capable());
+        // SAFETY: callers reach this only after `capable()` (through
+        // `available()` or the forced test hook) accepted the CPU.
+        unsafe { fold(initial, data) }
     }
 
-    /// Runs the wide path wherever the CPU has the features, including the
+    /// Four 256-bit registers hold eight 128-bit streams; each iteration folds
+    /// 128 bytes. The streams are collapsed into one in increasing byte
+    /// offset, the remaining whole blocks and the final partial block fold
+    /// into it, and a Barrett reduction yields the CRC.
+    #[target_feature(enable = "avx2,pclmulqdq,sse4.1,ssse3,vpclmulqdq")]
+    fn fold(crc: u32, mut data: &[u8]) -> u32 {
+        if data.len() < 16 {
+            let mut digest = crc_fast::Digest::new_with_init_state(
+                crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+                u64::from(!crc),
+            );
+            digest.update(data);
+            return digest.finalize() as u32;
+        }
+        let initial = _mm_cvtsi32_si128(!crc as i32);
+        if data.len() < WIDE_MIN {
+            let x = _mm_xor_si128(take128(&mut data), initial);
+            return reduce_to_crc(x, data);
+        }
+
+        let mut v0 = _mm256_xor_si256(take256(&mut data), _mm256_castsi128_si256(initial));
+        let mut v1 = take256(&mut data);
+        let mut v2 = take256(&mut data);
+        let mut v3 = take256(&mut data);
+        let k = _mm256_set_epi64x(FOLD_1024_HI, FOLD_1024_LO, FOLD_1024_HI, FOLD_1024_LO);
+        while data.len() >= 128 {
+            v0 = fold256(v0, take256(&mut data), k);
+            v1 = fold256(v1, take256(&mut data), k);
+            v2 = fold256(v2, take256(&mut data), k);
+            v3 = fold256(v3, take256(&mut data), k);
+        }
+
+        let k = _mm_set_epi64x(FOLD_128_HI, FOLD_128_LO);
+        let mut x = _mm256_castsi256_si128(v0);
+        x = fold128(x, _mm256_extracti128_si256::<1>(v0), k);
+        for v in [v1, v2, v3] {
+            x = fold128(x, _mm256_castsi256_si128(v), k);
+            x = fold128(x, _mm256_extracti128_si256::<1>(v), k);
+        }
+        reduce_to_crc(x, data)
+    }
+
+    /// Folds the remaining whole 16-byte blocks into `x`, then the final
+    /// partial block, and reduces the 128-bit remainder to the CRC.
+    #[target_feature(enable = "pclmulqdq,sse4.1,ssse3")]
+    fn reduce_to_crc(mut x: __m128i, mut data: &[u8]) -> u32 {
+        let k = _mm_set_epi64x(FOLD_128_HI, FOLD_128_LO);
+        while data.len() >= 16 {
+            x = fold128(x, take128(&mut data), k);
+        }
+
+        // The last `n` (1..=15) bytes: shift the accumulator down by `n`
+        // bytes, append the new bytes in the vacated top, and fold the `n`
+        // bytes shifted out back in by 128 bits. The shuffle controls come
+        // from the length, so no mask table is needed.
+        let n = data.len();
+        if n > 0 {
+            let seq = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            let shl = _mm_add_epi8(seq, _mm_set1_epi8(n as i8 - 16));
+            let shr = _mm_xor_si128(shl, _mm_set1_epi8(-128));
+            let overflow = _mm_shuffle_epi8(x, shl);
+            let mut part = [0u8; 16];
+            part[..n].copy_from_slice(data);
+            // SAFETY: `part` is 16 readable bytes.
+            let part = unsafe { _mm_loadu_si128(part.as_ptr().cast()) };
+            x = _mm_xor_si128(_mm_shuffle_epi8(x, shr), _mm_shuffle_epi8(part, shl));
+            x = fold128(overflow, x, k);
+        }
+
+        // 128 to 96 bits, then 96 to 64.
+        let low32 = _mm_set_epi32(0, 0, 0, -1);
+        let x = _mm_xor_si128(_mm_clmulepi64_si128::<0x10>(x, k), _mm_srli_si128::<8>(x));
+        let x = _mm_xor_si128(
+            _mm_clmulepi64_si128::<0x00>(_mm_and_si128(x, low32), _mm_set_epi64x(0, FOLD_64)),
+            _mm_srli_si128::<4>(x),
+        );
+
+        // Barrett reduction, bit-reflected: the CRC is the upper half of the
+        // low 64 bits of `R ^ floor(floor(R mod x^32) * mu mod x^32) * P`.
+        let pu = _mm_set_epi64x(BARRETT_MU, BARRETT_P);
+        let t1 = _mm_clmulepi64_si128::<0x10>(_mm_and_si128(x, low32), pu);
+        let t2 = _mm_clmulepi64_si128::<0x00>(_mm_and_si128(t1, low32), pu);
+        !(_mm_extract_epi32::<1>(_mm_xor_si128(x, t2)) as u32)
+    }
+
+    /// `b ^ a.lo * k.lo ^ a.hi * k.hi`: `a` moved forward by the distance
+    /// `k` encodes and added into `b`.
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse2")]
+    fn fold128(a: __m128i, b: __m128i, k: __m128i) -> __m128i {
+        _mm_xor_si128(
+            _mm_xor_si128(b, _mm_clmulepi64_si128::<0x00>(a, k)),
+            _mm_clmulepi64_si128::<0x11>(a, k),
+        )
+    }
+
+    /// [`fold128`] on both 128-bit lanes at once.
+    #[inline]
+    #[target_feature(enable = "avx2,vpclmulqdq")]
+    fn fold256(a: __m256i, b: __m256i, k: __m256i) -> __m256i {
+        _mm256_xor_si256(
+            _mm256_xor_si256(b, _mm256_clmulepi64_epi128::<0x00>(a, k)),
+            _mm256_clmulepi64_epi128::<0x11>(a, k),
+        )
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    fn take128(data: &mut &[u8]) -> __m128i {
+        let (head, rest) = data.split_at(16);
+        *data = rest;
+        // SAFETY: `head` is 16 readable bytes.
+        unsafe { _mm_loadu_si128(head.as_ptr().cast()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx")]
+    fn take256(data: &mut &[u8]) -> __m256i {
+        let (head, rest) = data.split_at(32);
+        *data = rest;
+        // SAFETY: `head` is 32 readable bytes.
+        unsafe { _mm256_loadu_si256(head.as_ptr().cast()) }
+    }
+
+    /// Runs the kernel wherever the CPU has the features, including the
     /// AVX-512 parts where production stays on `crc-fast`, so those hosts
     /// cover it too.
     #[cfg(test)]
     pub(super) fn test_update_forced(initial: u32, data: &[u8]) -> Option<u32> {
         capable().then(|| update(initial, data))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn fold_constants_are_the_powers_they_name() {
+            // `fold_constant(n) >> 1` is `x^n mod P`; walking `x^n` one bit at a
+            // time with the scalar multiply must land on every exponent used.
+            let x = 1u32 << 30;
+            let mut power = 1u32 << 31;
+            for n in 0..=1056u64 {
+                assert_eq!(xnmodp(n), power, "x^{n}");
+                power = super::super::multmodp(power, x);
+            }
+            for (constant, n) in [
+                (FOLD_1024_LO, 1056),
+                (FOLD_1024_HI, 992),
+                (FOLD_128_LO, 160),
+                (FOLD_128_HI, 96),
+                (FOLD_64, 64),
+            ] {
+                assert_eq!(constant as u64 >> 1, u64::from(xnmodp(n)), "x^{n}");
+            }
+            // The Barrett modulus is P itself in its 33-bit reflected form.
+            assert_eq!(BARRETT_P as u64, fold_constant(32) | 1);
+        }
     }
 }
 
@@ -876,6 +1068,46 @@ mod tests {
                     crc_fast::crc32_iso_hdlc(input),
                     "offset {offset} len {len}"
                 );
+            }
+        }
+    }
+
+    /// Lengths across the eight-stream loop, its collapse and the tail, from
+    /// carried CRC values, against `crc-fast` continuing from the same state.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn crc32_forced_wide_fold_matches_crc_fast_from_carried_state() {
+        let mut seed = 0x9e37_79b9u32;
+        let data: Vec<u8> = (0..768_000 + 31)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let mut lengths: Vec<usize> = (256..=1300).collect();
+        lengths.extend([4095, 4096, 4097, 65_535, 65_536, 65_537, 768_000]);
+        for offset in [0usize, 7, 31] {
+            for initial in [0u32, 0x1234_5678, 0xffff_ffff] {
+                for &len in &lengths {
+                    let input = &data[offset..offset + len];
+                    let Some(actual) = x86_vpclmul::test_update_forced(initial, input) else {
+                        eprintln!(
+                            "skipping crc32_forced_wide_fold_matches_crc_fast_from_carried_state: \
+                             no VPCLMULQDQ on this CPU"
+                        );
+                        return;
+                    };
+                    let mut expected = crc_fast::Digest::new_with_init_state(
+                        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+                        u64::from(!initial),
+                    );
+                    expected.update(input);
+                    assert_eq!(
+                        actual,
+                        expected.finalize() as u32,
+                        "offset {offset} initial {initial:#x} len {len}"
+                    );
+                }
             }
         }
     }

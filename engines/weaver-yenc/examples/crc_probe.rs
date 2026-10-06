@@ -307,7 +307,7 @@ fn weaver_attribution() {
         !avx512vl
     );
     if available {
-        println!("    weaver runs: crc32fast 4x256-bit VPCLMULQDQ fold (crc.rs x86_vpclmul)");
+        println!("    weaver runs: in-tree 4x256-bit VPCLMULQDQ fold (crc.rs x86_vpclmul)");
         println!(
             "      for every update >= {} bytes; smaller updates fall through to crc-fast.",
             256
