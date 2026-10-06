@@ -451,6 +451,15 @@ func runTwoNICPlaywright(ctx context.Context, cfg twoNICConfig, stage string) er
 		"TOXIPROXY_URL=http://"+net.JoinHostPort(stack, "8474"),
 		"E2E_NNTP_HOST="+stack,
 	)
+	if cfg.Lane == twoNICLaneL {
+		// L02's expectation depends on the remote kernel: from Linux 5.7 an
+		// unprivileged interface bind succeeds without CAP_NET_RAW.
+		release, err := exec.CommandContext(ctx, "ssh", cfg.Remote, "uname -r").Output()
+		if err != nil {
+			return fmt.Errorf("read the remote kernel release: %w", err)
+		}
+		cmd.Env = append(cmd.Env, "E2E_TWO_NIC_KERNEL="+strings.TrimSpace(string(release)))
+	}
 	return runExternalCommand(cmd, "playwright two-nic "+stage)
 }
 
