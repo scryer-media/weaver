@@ -295,7 +295,9 @@ fn egress_gql(
         .filter(|interface| interface.up)
         .flat_map(|interface| {
             interface.addresses.iter().filter(|address| {
+                // Loopback can never be the source of an outbound connection.
                 address.usable()
+                    && !address.address.is_loopback()
                     && match &e.binding {
                         core::EgressBinding::System => true,
                         core::EgressBinding::Interface { name } => name == &interface.name,
