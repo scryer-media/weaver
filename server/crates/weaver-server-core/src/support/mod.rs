@@ -431,7 +431,7 @@ fn providers(contributions: &[JobServerContribution]) -> Vec<ProviderOutcome> {
             wire_bytes: contribution.wire_bytes,
         })
         .collect();
-    providers.sort_by(|left, right| right.articles.cmp(&left.articles));
+    providers.sort_by_key(|provider| std::cmp::Reverse(provider.articles));
     providers
 }
 
