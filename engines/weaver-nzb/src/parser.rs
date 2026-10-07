@@ -63,22 +63,71 @@ pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
     parse_nzb_reader(Cursor::new(xml))
 }
 
+/// What the parser dropped, repaired, or reordered on its way to an [`Nzb`].
+///
+/// The parsed document is the clean view the pipeline downloads from; these
+/// counts are the part of the original document that view no longer shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParseDiagnostics {
+    /// `<file>` elements dropped because no segment survived.
+    pub files_without_segments: u32,
+    /// `<file>` elements whose `date` attribute did not parse.
+    pub invalid_dates: u32,
+    /// Malformed segments inside the dropped files, which have no entry in
+    /// `files`.
+    pub malformed_segments_in_dropped_files: u32,
+    /// One entry per file in [`Nzb::files`], in the same order.
+    pub files: Vec<FileParseDiagnostics>,
+}
+
+/// Per-file parse findings, aligned with [`Nzb::files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileParseDiagnostics {
+    /// Segments skipped for a missing or invalid number, size, or message-ID.
+    pub malformed_segments: u32,
+    /// Segments skipped because their number was already listed.
+    pub duplicate_segment_numbers: u32,
+    /// Segments skipped because their message-ID was already listed.
+    pub duplicate_message_ids: u32,
+    /// The document listed a segment number lower than one before it.
+    pub out_of_order: bool,
+}
+
+/// Parse an NZB XML document from bytes, keeping what the parse dropped.
+pub fn parse_nzb_with_diagnostics(xml: &[u8]) -> Result<(Nzb, ParseDiagnostics), NzbError> {
+    let mut diagnostics = ParseDiagnostics::default();
+    let nzb = parse_nzb_reader_limited(
+        Cursor::new(xml),
+        ParserLimits::from_env()?,
+        &mut diagnostics,
+    )?;
+    Ok((nzb, diagnostics))
+}
+
 #[cfg(test)]
 fn parse_nzb_with_limits(xml: &[u8], limits: ParserLimits) -> Result<Nzb, NzbError> {
-    parse_nzb_reader_limited(Cursor::new(xml), limits)
+    parse_nzb_reader_limited(Cursor::new(xml), limits, &mut ParseDiagnostics::default())
 }
 
 /// Parse an NZB XML document incrementally from a buffered reader.
 pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
-    parse_nzb_reader_limited(reader, ParserLimits::from_env()?)
+    parse_nzb_reader_limited(
+        reader,
+        ParserLimits::from_env()?,
+        &mut ParseDiagnostics::default(),
+    )
 }
 
-fn parse_nzb_reader_limited<R: BufRead>(reader: R, limits: ParserLimits) -> Result<Nzb, NzbError> {
+fn parse_nzb_reader_limited<R: BufRead>(
+    reader: R,
+    limits: ParserLimits,
+    diagnostics: &mut ParseDiagnostics,
+) -> Result<Nzb, NzbError> {
     let read_limit = limits.max_xml_bytes.checked_add(1).ok_or_else(|| {
         NzbError::ResourceLimit("XML byte cap is too large to enforce".to_string())
     })?;
     let mut reader = reader.take(u64::try_from(read_limit).unwrap_or(u64::MAX));
-    let result = parse_nzb_reader_with_limits(&mut reader, limits);
+    let result = parse_nzb_reader_with_limits(&mut reader, limits, diagnostics);
     if reader.limit() == 0 {
         return Err(NzbError::ResourceLimit(format!(
             "XML document exceeds {} bytes",
@@ -91,6 +140,7 @@ fn parse_nzb_reader_limited<R: BufRead>(reader: R, limits: ParserLimits) -> Resu
 fn parse_nzb_reader_with_limits<R: BufRead>(
     reader: R,
     limits: ParserLimits,
+    diagnostics: &mut ParseDiagnostics,
 ) -> Result<Nzb, NzbError> {
     let mut reader = Reader::from_reader(reader);
     reader.config_mut().trim_text(true);
@@ -158,6 +208,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                                 value = %val,
                                                 "invalid NZB file date; defaulting to 0"
                                             );
+                                            diagnostics.invalid_dates =
+                                                diagnostics.invalid_dates.saturating_add(1);
                                             date = Some(0);
                                         }
                                     }
@@ -189,6 +241,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             segment_numbers: HashSet::new(),
                             message_ids: HashSet::new(),
                             duplicates: DuplicateSegmentTally::default(),
+                            notes: FileParseDiagnostics::default(),
+                            last_number: None,
                         });
                     }
                     "groups" if current_file.is_some() => in_groups = true,
@@ -272,6 +326,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 .trim_end_matches('>')
                                 .to_owned();
                             if let Some(reason) = seg.skip_reason(&message_id) {
+                                f.notes.malformed_segments =
+                                    f.notes.malformed_segments.saturating_add(1);
                                 tracing::warn!(
                                     subject = %f.subject,
                                     message_id = %message_id,
@@ -281,11 +337,19 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             } else {
                                 let number = seg.number.expect("validated segment number");
                                 let bytes = seg.bytes.expect("validated segment byte count");
+                                if f.last_number.is_some_and(|last| number < last) {
+                                    f.notes.out_of_order = true;
+                                }
+                                f.last_number = Some(number);
 
                                 if f.segment_numbers.contains(&number) {
                                     f.duplicates.note_number(&message_id);
+                                    f.notes.duplicate_segment_numbers =
+                                        f.notes.duplicate_segment_numbers.saturating_add(1);
                                 } else if f.message_ids.contains(&message_id) {
                                     f.duplicates.note_message_id(&message_id);
+                                    f.notes.duplicate_message_ids =
+                                        f.notes.duplicate_message_ids.saturating_add(1);
                                 } else {
                                     f.segment_numbers.insert(number);
                                     f.message_ids.insert(message_id.clone());
@@ -323,6 +387,11 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                         if let Some(f) = current_file.take() {
                             f.duplicates.report(&f.subject);
                             if f.segments.is_empty() {
+                                diagnostics.files_without_segments =
+                                    diagnostics.files_without_segments.saturating_add(1);
+                                diagnostics.malformed_segments_in_dropped_files = diagnostics
+                                    .malformed_segments_in_dropped_files
+                                    .saturating_add(f.notes.malformed_segments);
                                 tracing::warn!(
                                     subject = %f.subject,
                                     "skipping file with no segments"
@@ -336,6 +405,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 }
                                 let mut segments = f.segments;
                                 segments.sort_by_key(|s| s.number);
+                                diagnostics.files.push(f.notes);
                                 files.push(NzbFile {
                                     poster: f.poster,
                                     subject: f.subject,
@@ -412,6 +482,8 @@ struct FileBuilder {
     segment_numbers: HashSet<u32>,
     message_ids: HashSet<String>,
     duplicates: DuplicateSegmentTally,
+    notes: FileParseDiagnostics,
+    last_number: Option<u32>,
 }
 
 /// The duplicate segments skipped while one file's `<segments>` were read.
@@ -1098,6 +1170,7 @@ mod tests {
                 max_xml_bytes: 3,
                 ..test_limits()
             },
+            &mut ParseDiagnostics::default(),
         )
         .unwrap_err();
         assert!(matches!(err, NzbError::ResourceLimit(_)));
@@ -1110,11 +1183,19 @@ mod tests {
             max_xml_bytes: xml.len(),
             ..test_limits()
         };
-        assert!(parse_nzb_reader_limited(Cursor::new(xml), limits).is_ok());
+        assert!(
+            parse_nzb_reader_limited(Cursor::new(xml), limits, &mut ParseDiagnostics::default())
+                .is_ok()
+        );
 
         let mut oversized = xml.to_vec();
         oversized.push(b' ');
-        let err = parse_nzb_reader_limited(Cursor::new(oversized), limits).unwrap_err();
+        let err = parse_nzb_reader_limited(
+            Cursor::new(oversized),
+            limits,
+            &mut ParseDiagnostics::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, NzbError::ResourceLimit(_)));
     }
 
