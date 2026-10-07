@@ -430,6 +430,46 @@ pub(crate) fn normalize_uploaded_nzb_reader(
     )))
 }
 
+/// Read NZB bytes that arrived inline, decompressing them when their magic
+/// says gzip, zstd or xz. Inline bytes carry no filename or content type, so
+/// the bytes themselves are the only evidence; the upload limits still apply.
+pub(crate) fn read_inline_nzb_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, SubmitNzbError> {
+    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
+    const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
+    const XZ_MAGIC: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0x00];
+
+    let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
+    if bytes.len() as u64 > limits.nzb_upload_limit_bytes {
+        return Err(SubmitNzbError::Upload(Error::new(
+            ErrorKind::InvalidData,
+            format!("NZB upload exceeds {} bytes", limits.nzb_upload_limit_bytes),
+        )));
+    }
+    let source = std::io::Cursor::new(bytes);
+    let magic = source.get_ref().as_slice();
+    let decoded: Box<dyn Read + Send> = if magic.starts_with(GZIP_MAGIC) {
+        Box::new(flate2::read::GzDecoder::new(source))
+    } else if magic.starts_with(ZSTD_MAGIC) {
+        Box::new(zstd::stream::read::Decoder::new(source).map_err(SubmitNzbError::Upload)?)
+    } else if magic.starts_with(XZ_MAGIC) {
+        Box::new(
+            xz_multistream_decoder(source, XZ_DECODER_MEMORY_LIMIT_BYTES)
+                .map_err(SubmitNzbError::Upload)?,
+        )
+    } else {
+        Box::new(source)
+    };
+    let mut xml = Vec::new();
+    LimitedReader::new(
+        decoded,
+        limits.nzb_decompressed_limit_bytes,
+        "decompressed NZB",
+    )
+    .read_to_end(&mut xml)
+    .map_err(SubmitNzbError::Upload)?;
+    Ok(xml)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

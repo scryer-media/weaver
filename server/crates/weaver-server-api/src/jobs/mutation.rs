@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use async_graphql::{Context, Object, Result, UploadValue};
 use base64::Engine;
 
-use crate::auth::{CallerIdentity, ControlGuard, graphql_error};
+use crate::auth::{CallerIdentity, ControlGuard, ReadGuard, graphql_error};
 use crate::history::types::{
     AcceptHistoryDeleteInput, HistoryCommandResult, HistoryDeleteAcceptance, HistoryItem,
     history_delete_row_state_from_core, history_item_from_row,
@@ -63,6 +63,18 @@ fn upsert_metadata_entry(metadata: &mut Vec<(String, String)>, key: &str, value:
 
 #[Object]
 impl JobsMutation {
+    /// Analyze an NZB without submitting it. Reads nothing and changes
+    /// nothing, so read access suffices; it is a mutation only because file
+    /// uploads travel as mutations.
+    #[graphql(guard = "ReadGuard")]
+    async fn analyze_nzb(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::jobs::support_report::AnalyzeNzbInput,
+    ) -> Result<crate::jobs::support_report::SupportReport> {
+        crate::jobs::support_report::resolve_analyze_nzb(ctx, input).await
+    }
+
     /// Submit an NZB for download through the public integration facade.
     #[graphql(guard = "ControlGuard")]
     async fn submit_nzb(

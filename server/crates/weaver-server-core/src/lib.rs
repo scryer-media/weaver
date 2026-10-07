@@ -23,6 +23,7 @@ pub mod schema_upgrade;
 pub mod security;
 pub mod servers;
 pub mod settings;
+pub mod support;
 pub mod update_check;
 /// Transitional, removed in 0.9.1. See the module docs.
 pub mod upgrade_compat;
