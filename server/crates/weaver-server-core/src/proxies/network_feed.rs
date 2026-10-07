@@ -22,6 +22,9 @@ pub struct FeedAttempt {
     transport_error: Mutex<Option<Arc<DialError>>>,
     setups: Mutex<Vec<weaver_tunnel::pipe::SetupHandle>>,
     last_member: bool,
+    /// The leg's final attempt this sync: no later rung, and no direct
+    /// fallback, remains after it.
+    last_attempt: bool,
 }
 impl FeedAttempt {
     pub async fn cancelled(&self) {
@@ -54,6 +57,14 @@ impl FeedAttempt {
             }
             (None, id) => self.legacy_status.success(id),
             _ => {}
+        }
+        // A failed rung is not a failed leg while a later rung, or the direct
+        // fallback, is still to be tried this sync. A connection's dialer
+        // reports one outcome to its leg after every rung has had its turn;
+        // the feed's attempts report the same way, or two cooling rungs would
+        // take the leg down before the fallback behind them ever ran.
+        if error.is_some() && !self.last_attempt {
+            return;
         }
         self.route.weighted.report_external(
             self.position,
@@ -253,6 +264,7 @@ impl NetworkRuntime {
             };
             let direct_rung = rungs.len();
             let probing = matches!(health[position].health, LegHealthState::Probing);
+            let mut leg_attempts = Vec::new();
             for (rung_index, rung) in rungs.into_iter().enumerate() {
                 if leg
                     .ladder
@@ -290,7 +302,7 @@ impl NetworkRuntime {
                 };
                 let count = stages.len();
                 for (member_index, (stage, last)) in stages.into_iter().enumerate() {
-                    attempts.push(Arc::new(FeedAttempt {
+                    leg_attempts.push(FeedAttempt {
                         route: route.clone(),
                         guard: leg.stage.clone(),
                         stage,
@@ -313,7 +325,8 @@ impl NetworkRuntime {
                         transport_error: Mutex::new(None),
                         setups: Mutex::new(Vec::new()),
                         last_member: member_index + 1 == count,
-                    }));
+                        last_attempt: false,
+                    });
                 }
             }
             if direct
@@ -322,7 +335,7 @@ impl NetworkRuntime {
                     .as_ref()
                     .is_none_or(|ladder| ladder.allows_rung(direct_rung, probing))
             {
-                attempts.push(Arc::new(FeedAttempt {
+                leg_attempts.push(FeedAttempt {
                     route: route.clone(),
                     guard: leg.stage.clone(),
                     stage: bottom,
@@ -341,8 +354,13 @@ impl NetworkRuntime {
                     transport_error: Mutex::new(None),
                     setups: Mutex::new(Vec::new()),
                     last_member: true,
-                }));
+                    last_attempt: false,
+                });
             }
+            if let Some(last) = leg_attempts.last_mut() {
+                last.last_attempt = true;
+            }
+            attempts.extend(leg_attempts.into_iter().map(Arc::new));
         }
         Ok(attempts)
     }

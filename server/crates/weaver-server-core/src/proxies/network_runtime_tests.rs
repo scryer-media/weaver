@@ -235,3 +235,68 @@ async fn probe_of_a_saved_profile_shares_the_live_session() {
     assert!(!Arc::ptr_eq(&live, &edited));
     runtime.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_failed() {
+    let db = Database::open_in_memory().unwrap();
+    let runtime = NetworkRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.consumers.insert(Consumer::Rss(1).key());
+    for (id, host) in [(1, "first.invalid"), (2, "second.invalid")] {
+        let mut profile = proxy();
+        profile.id = id;
+        profile.name = format!("fixture-{id}");
+        profile.host = host.into();
+        config.profiles.insert(id, profile);
+    }
+    config.policies.insert(
+        Consumer::Rss(1).key(),
+        RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: 0,
+                weight: 100,
+                path: LegPath::Ladder {
+                    rungs: vec![Rung::Proxy { id: 1 }, Rung::Proxy { id: 2 }],
+                    direct_fallback: true,
+                },
+            }],
+            ..Default::default()
+        },
+    );
+    runtime.apply_configuration(config).unwrap();
+    let legacy = ProxyRuntime::new(db, tokio::runtime::Handle::current())
+        .unwrap()
+        .draft_route(RoutingPolicy::default(), Duration::from_secs(1))
+        .unwrap();
+    let route = runtime
+        .route(Consumer::Rss(1), 1, Duration::from_secs(1))
+        .unwrap();
+    let health = || route.weighted.allocations()[0].health.clone();
+    let refused = |proxy| DialError::Hop {
+        proxy,
+        source: weaver_tunnel::TunnelError::Engine("refused".into()),
+    };
+    let unreachable = || DialError::Egress(std::io::Error::other("no route to host"));
+
+    // Both proxy rungs fail; the direct fallback has not run yet.
+    let attempts = runtime.feed_attempts(1, legacy.clone()).unwrap();
+    assert_eq!(attempts.len(), 3, "two rungs and the direct fallback");
+    attempts[0].report(Some(&refused(1)));
+    attempts[1].report(Some(&refused(2)));
+    assert_eq!(health(), LegHealthState::Up, "two failed rungs must not take the leg down before its fallback runs");
+    // The fallback fails too: that is the leg's one failure for this sync.
+    attempts[2].report(Some(&unreachable()));
+    assert_eq!(health(), LegHealthState::Up);
+
+    // Once the rungs' own cooldowns lapse, the next sync fails the same way;
+    // two whole failed syncs cool the leg.
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let attempts = runtime.feed_attempts(1, legacy).unwrap();
+    assert_eq!(attempts.len(), 3);
+    attempts[0].report(Some(&refused(1)));
+    attempts[1].report(Some(&refused(2)));
+    assert_eq!(health(), LegHealthState::Up);
+    attempts[2].report(Some(&unreachable()));
+    assert!(matches!(health(), LegHealthState::Down(_)), "{:?}", health());
+    runtime.shutdown().await;
+}
