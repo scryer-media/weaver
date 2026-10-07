@@ -72,11 +72,15 @@ fn clock_config() -> &'static ClockConfig {
     })
 }
 
-fn configured_clock_path() -> Option<PathBuf> {
-    let enabled = std::env::var(E2E_MODE_ENV)
+/// Whether `WEAVER_E2E_MODE` is `1` or `true`.
+pub fn e2e_mode_enabled() -> bool {
+    std::env::var(E2E_MODE_ENV)
         .ok()
-        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"));
-    if !enabled {
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+fn configured_clock_path() -> Option<PathBuf> {
+    if !e2e_mode_enabled() {
         return None;
     }
     std::env::var_os(E2E_CLOCK_FILE_ENV)

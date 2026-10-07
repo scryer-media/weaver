@@ -1,4 +1,8 @@
 use super::*;
+use crate::address_plan::{
+    ADDRESS_REPLAN_INTERVAL, DELIVERY_EVIDENCE_AGE, DELIVERY_VERDICT_INTERVAL, FAILED_RACE_HOLDOFF,
+    SHADOW_INTERVAL, SHADOW_MIN_PIN_AGE,
+};
 
 fn pinned<C: Candidate>(candidates: &[C], now: Instant) -> CandidatePlan<C> {
     let mut plan = CandidatePlan::default();

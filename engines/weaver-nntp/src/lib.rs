@@ -49,6 +49,7 @@ pub mod egress;
 pub mod error;
 pub mod fused_yenc;
 pub mod health;
+pub mod plan_timing;
 pub mod pool;
 mod proxy;
 pub mod recovery;

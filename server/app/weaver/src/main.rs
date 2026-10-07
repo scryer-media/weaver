@@ -260,6 +260,7 @@ async fn async_main() {
         error!("invalid Weaver e2e clock: {error}");
         std::process::exit(1);
     }
+    install_e2e_network_time_scale();
 
     let restore_locator_dir =
         weaver_server_core::persistence::setup::default_data_dir_for_config_path(&config_path);
@@ -483,6 +484,38 @@ fn load_dotenv_path(path: &Path) -> Result<bool, dotenvy::Error> {
         Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// In e2e mode only, divides the connection plans' timers by
+/// `WEAVER_E2E_NETWORK_TIME_SCALE` so a harness need not wait them out in real
+/// time. Without e2e mode, or without a scale above 1, nothing is installed and
+/// the process runs on production timing.
+fn install_e2e_network_time_scale() {
+    if !weaver_server_core::e2e_clock::e2e_mode_enabled() {
+        return;
+    }
+    let Some(scale) = std::env::var("WEAVER_E2E_NETWORK_TIME_SCALE")
+        .ok()
+        .and_then(|value| value.trim().parse::<std::num::NonZeroU32>().ok())
+        .filter(|scale| scale.get() > 1)
+    else {
+        return;
+    };
+    let timing = weaver_nntp::plan_timing::PlanTiming::scaled(scale);
+    if weaver_nntp::plan_timing::install(timing).is_err() {
+        error!("e2e network time scale {scale}: plan timing was already in use before startup");
+        std::process::exit(1);
+    }
+    tracing::info!(
+        scale = scale.get(),
+        delivery_verdict_interval = ?timing.delivery_verdict_interval,
+        shadow_interval = ?timing.shadow_interval,
+        shadow_min_pin_age = ?timing.shadow_min_pin_age,
+        route_cooldown = ?timing.route_cooldown,
+        leg_cooldown_initial = ?timing.leg_cooldown_initial,
+        replan_interval = ?timing.replan_interval,
+        "e2e network time scale installed"
+    );
 }
 
 fn install_panic_hook() {

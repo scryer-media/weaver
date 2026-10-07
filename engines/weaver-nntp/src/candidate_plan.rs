@@ -1,10 +1,9 @@
 //! Pure candidate selection shared by address races and proxy-member races.
 use crate::address_plan::{
-    ADDRESS_REPLAN_INTERVAL, DELIVERY_EVIDENCE_AGE, DELIVERY_MIN_SAMPLES, DELIVERY_MIN_WIRE,
-    DELIVERY_REPIN_RATIO, DELIVERY_VERDICT_INTERVAL, FAILED_RACE_HOLDOFF, RaceReason,
-    SHADOW_EVERY_CONNECTS, SHADOW_INTERVAL, SHADOW_MIN_PIN_AGE, SHADOW_RETRIES,
+    DELIVERY_MIN_SAMPLES, DELIVERY_REPIN_RATIO, RaceReason, SHADOW_EVERY_CONNECTS, SHADOW_RETRIES,
     SUSPECT_AFTER_FAILURES,
 };
+use crate::plan_timing::timing;
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
@@ -120,8 +119,8 @@ impl Delivery {
     pub(crate) fn measured_rate(self, now: Instant) -> Option<f64> {
         let fresh = self
             .last_at
-            .is_some_and(|at| now.saturating_duration_since(at) < DELIVERY_EVIDENCE_AGE);
-        (fresh && self.samples >= DELIVERY_MIN_SAMPLES && self.wire >= DELIVERY_MIN_WIRE)
+            .is_some_and(|at| now.saturating_duration_since(at) < timing().delivery_evidence_age);
+        (fresh && self.samples >= DELIVERY_MIN_SAMPLES && self.wire >= timing().delivery_min_wire)
             .then(|| self.bytes_per_second())
             .flatten()
     }
@@ -142,7 +141,7 @@ enum DeliveryVerdict<C> {
         pin_rate: f64,
     },
     /// The pin or every challenger is short of [`DELIVERY_MIN_SAMPLES`] or
-    /// [`DELIVERY_MIN_WIRE`], or its evidence has gone stale.
+    /// the timing's `delivery_min_wire`, or its evidence has gone stale.
     Unmeasured,
 }
 
@@ -246,7 +245,7 @@ pub struct CandidatePlan<C: Candidate> {
     /// worth of samples from one connection never moves the pin by itself.
     pub(crate) delivery_leader: Option<C>,
     /// When delivery was last judged, since the last race. The next verdict
-    /// waits [`DELIVERY_VERDICT_INTERVAL`] from it, or from the pin's choice
+    /// waits the timing's `delivery_verdict_interval` from it, or from the pin's choice
     /// when there has been none.
     pub(crate) last_verdict_at: Option<Instant>,
     /// Bumped whenever a race finishes, so a caller waiting on one can tell
@@ -258,7 +257,7 @@ pub struct CandidatePlan<C: Candidate> {
     /// Why the last race found nothing, handed to callers that waited on it.
     pub(crate) last_race_error: Option<(io::ErrorKind, String)>,
     /// When a race last found no address while nothing was pinned. Holds
-    /// further races off for [`FAILED_RACE_HOLDOFF`].
+    /// further races off for the timing's `failed_race_holdoff`.
     pub(crate) last_race_failed_at: Option<Instant>,
     pub(crate) races_won: u64,
     pub(crate) races_failed: u64,
@@ -329,11 +328,11 @@ impl<C: Candidate> CandidatePlan<C> {
     }
 
     /// A verdict may run: the pin was chosen, or last judged, at least
-    /// [`DELIVERY_VERDICT_INTERVAL`] ago.
+    /// the timing's `delivery_verdict_interval` ago.
     pub(crate) fn verdict_is_allowed(&self, now: Instant) -> bool {
-        self.last_verdict_at
-            .or(self.chosen_at)
-            .is_some_and(|at| now.saturating_duration_since(at) >= DELIVERY_VERDICT_INTERVAL)
+        self.last_verdict_at.or(self.chosen_at).is_some_and(|at| {
+            now.saturating_duration_since(at) >= timing().delivery_verdict_interval
+        })
     }
 
     /// Judge the pin on the delivery booked since it was last judged, when
@@ -486,7 +485,7 @@ impl<C: Candidate> CandidatePlan<C> {
     /// and leave the pin unjudged for good.
     pub(crate) fn shadow_candidate(&self, now: Instant) -> Option<(C, C)> {
         let pin = self.pinned?;
-        if now.saturating_duration_since(self.chosen_at?) < SHADOW_MIN_PIN_AGE {
+        if now.saturating_duration_since(self.chosen_at?) < timing().shadow_min_pin_age {
             return None;
         }
         // The pin must be measured before any challenger is worth a look.
@@ -503,7 +502,7 @@ impl<C: Candidate> CandidatePlan<C> {
         }
         if self
             .last_shadow_at
-            .is_some_and(|at| now.saturating_duration_since(at) < SHADOW_INTERVAL)
+            .is_some_and(|at| now.saturating_duration_since(at) < timing().shadow_interval)
         {
             return None;
         }
@@ -550,12 +549,12 @@ impl<C: Candidate> CandidatePlan<C> {
 
     pub(crate) fn failed_race_is_recent(&self, now: Instant) -> bool {
         self.last_race_failed_at
-            .is_some_and(|at| now.saturating_duration_since(at) < FAILED_RACE_HOLDOFF)
+            .is_some_and(|at| now.saturating_duration_since(at) < timing().failed_race_holdoff)
     }
 
     pub(crate) fn pin_is_due(&self, now: Instant) -> bool {
         self.chosen_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= ADDRESS_REPLAN_INTERVAL)
+            .is_none_or(|at| now.saturating_duration_since(at) >= timing().replan_interval)
     }
 
     /// The pin first, then every other candidate: the ones that last

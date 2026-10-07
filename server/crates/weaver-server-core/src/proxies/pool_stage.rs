@@ -484,6 +484,9 @@ impl PoolStage {
         });
         let weak = Arc::downgrade(&state);
         let retirement = handle.spawn(async move {
+            // Only sweeps for members idle past POOL_IDLE_RETIRE; it never
+            // decides which member new connections use, so it stays outside
+            // the plan timing.
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;

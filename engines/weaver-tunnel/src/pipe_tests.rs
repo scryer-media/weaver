@@ -499,3 +499,17 @@ fn an_ssh_forwarding_refusal_is_hop_evidence_and_an_unreachable_destination_is_n
     );
     assert!(!unreachable.is_path_evidence());
 }
+
+#[test]
+fn cooldown_doubles_from_thirty_seconds_to_five_minutes() {
+    let secs: Vec<u64> = (0..8).map(|n| cooldown(n).as_secs()).collect();
+    assert_eq!(secs, [30, 30, 60, 120, 240, 300, 300, 300]);
+}
+
+#[test]
+fn cooldown_from_scales_the_whole_ladder() {
+    let initial = Duration::from_secs(3);
+    for failures in 0..8 {
+        assert_eq!(cooldown_from(initial, failures), cooldown(failures) / 10);
+    }
+}

@@ -875,5 +875,13 @@ impl Dialer for Fallback {
 }
 
 pub fn cooldown(failures: u32) -> Duration {
-    Duration::from_secs((30_u64.saturating_mul(1 << failures.saturating_sub(1).min(4))).min(300))
+    cooldown_from(Duration::from_secs(30), failures)
+}
+
+/// [`cooldown`] starting from `initial` instead of 30 seconds: doubling per
+/// failure, never longer than ten times `initial`.
+pub fn cooldown_from(initial: Duration, failures: u32) -> Duration {
+    initial
+        .saturating_mul(1 << failures.saturating_sub(1).min(4))
+        .min(initial.saturating_mul(10))
 }

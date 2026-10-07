@@ -8,7 +8,7 @@ use tokio::{
     sync::{Notify, watch},
     time::Instant,
 };
-use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Resolution, Target, cooldown};
+use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Resolution, Target, cooldown_from};
 
 use super::{EgressHealth, Route};
 
@@ -106,7 +106,12 @@ impl LegState {
         self.failures = self.failures.saturating_add(1);
         if self.failures >= 2 || self.until.is_some() {
             self.cooldowns = self.cooldowns.saturating_add(1);
-            self.until = Some(now + cooldown(self.cooldowns));
+            self.until = Some(
+                now + cooldown_from(
+                    weaver_nntp::plan_timing::timing().leg_cooldown_initial,
+                    self.cooldowns,
+                ),
+            );
         }
     }
     fn succeeded(&mut self) {

@@ -226,12 +226,15 @@ pub const OVER_LIMIT_HOLDOFF_MAX: Duration = Duration::from_secs(10 * 60);
 /// caller may take it over. Longer than any connect timeout, so a probe that
 /// is still dialling is never doubled up; short enough that a probe whose
 /// caller vanished does not hold the server closed for long.
-const OVER_LIMIT_PROBE_WINDOW: Duration = Duration::from_secs(30);
+pub(crate) const OVER_LIMIT_PROBE_WINDOW: Duration = Duration::from_secs(30);
 
-/// The pause the `refusals`th consecutive refused connect of an episode earns.
+/// The pause the `refusals`th consecutive refused connect of an episode earns,
+/// doubling from the plan timing's initial holdoff (production:
+/// [`OVER_LIMIT_HOLDOFF_INITIAL`]) up to [`OVER_LIMIT_HOLDOFF_MAX`].
 pub fn over_limit_holdoff(refusals: u32) -> Duration {
     let doublings = refusals.saturating_sub(1).min(16);
-    OVER_LIMIT_HOLDOFF_INITIAL
+    crate::plan_timing::timing()
+        .over_limit_holdoff_initial
         .saturating_mul(1u32 << doublings)
         .min(OVER_LIMIT_HOLDOFF_MAX)
 }
@@ -1158,8 +1161,9 @@ impl NntpPool {
         // The pause is over but the episode is not: while one caller's probe
         // is out, everyone else is still held, until that probe answers.
         let probe_started = self.over_limit_episode(server.0)?.probe_started;
-        let probe_until =
-            probe_started.saturating_add(duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW));
+        let probe_until = probe_started.saturating_add(duration_to_epoch_ms(
+            crate::plan_timing::timing().over_limit_probe_window,
+        ));
         (probe_started != 0 && probe_until > now).then_some(probe_until)
     }
 
@@ -1217,9 +1221,9 @@ impl NntpPool {
             });
         }
         if episode.probe_started != 0 {
-            let probe_until = episode
-                .probe_started
-                .saturating_add(duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW));
+            let probe_until = episode.probe_started.saturating_add(duration_to_epoch_ms(
+                crate::plan_timing::timing().over_limit_probe_window,
+            ));
             if probe_until > now {
                 return Err(NntpError::ServerOverLimit {
                     until_epoch_ms: probe_until,

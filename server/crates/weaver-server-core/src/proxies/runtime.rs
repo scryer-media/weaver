@@ -171,7 +171,7 @@ impl ConsumerRoute {
         self.cooldowns.lock().expect("route cooldown").insert(
             id,
             Cooldown {
-                until: Instant::now() + Duration::from_secs(30),
+                until: Instant::now() + weaver_nntp::plan_timing::timing().route_cooldown,
                 probing: false,
             },
         );
