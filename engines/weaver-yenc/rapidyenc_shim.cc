@@ -33,6 +33,26 @@ extern "C" int weaver_rapidyenc_decode_end(
     return (int)end;
 }
 
+// The same decoder carrying its state across calls, the way an incremental
+// caller (sabctools) feeds a body in chunks. `state` is a YencDecoderState.
+extern "C" int weaver_rapidyenc_decode_end_state(
+    const void* src,
+    void* dest,
+    unsigned long long len,
+    unsigned long long* consumed,
+    unsigned long long* written,
+    int* state
+) {
+    RapidYenc::YencDecoderState st = (RapidYenc::YencDecoderState)*state;
+    const void* s = src;
+    void* d = dest;
+    RapidYenc::YencDecoderEnd end = RapidYenc::decode_end(&s, &d, (size_t)len, &st);
+    *state = (int)st;
+    *consumed = (unsigned long long)((const unsigned char*)s - (const unsigned char*)src);
+    *written = (unsigned long long)((unsigned char*)d - (unsigned char*)dest);
+    return (int)end;
+}
+
 // CRC32 counterpart, for the crc_probe attribution harness. `crc32_init()` is a
 // separate initializer from `decoder_init()` (it builds the slice table and then
 // installs the PCLMUL/VPCLMUL/ARM function pointers), so it must be called

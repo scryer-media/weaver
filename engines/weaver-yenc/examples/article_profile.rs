@@ -6,7 +6,7 @@
 //! difference between the article total and the body decode is attributed.
 //!
 //!   cargo run --release --example article_profile
-//!   cargo run --release --example article_profile -- mt <threads> <iters> [rapidyenc]
+//!   cargo run --release --example article_profile -- mt <threads> <iters> [weaver|rapidyenc|rapidyenc-whole]
 //!   cargo run --release --example article_profile -- kernels
 //!
 //! With `WEAVER_RAPIDYENC_SRC` set, a rapidyenc lane times the same article
@@ -258,7 +258,7 @@ fn per_stage() {
         stages.push((
             "rapidyenc article (SAB shape)",
             Box::new(move || {
-                black_box(rapidyenc_article(black_box(&art), &mut o));
+                black_box(rapidyenc_article(black_box(&art), &mut o, SAB_CHUNK));
             }),
             vec![],
         ));
@@ -302,15 +302,28 @@ unsafe extern "C" {
         consumed: *mut u64,
         written: *mut u64,
     ) -> i32;
+    fn weaver_rapidyenc_decode_end_state(
+        src: *const core::ffi::c_void,
+        dest: *mut core::ffi::c_void,
+        len: u64,
+        consumed: *mut u64,
+        written: *mut u64,
+        state: *mut i32,
+    ) -> i32;
 }
+
+/// Input bytes per decoder call in the SAB-shape lane.
+#[cfg(rapidyenc_linked)]
+const SAB_CHUNK: usize = 64 * 1024;
 
 /// One article the way sabctools drives rapidyenc: header lines parsed one at
 /// a time by substring search until the body starts, the body decoded in
-/// 64 KiB chunks by the end-detecting decoder with the CRC folded per chunk,
-/// then the `=yend` line parsed where the decoder stopped. Returns
-/// (bytes written, crc, crc expected) so nothing is optimised away.
+/// `chunk`-byte pieces by the end-detecting decoder, its state carried from
+/// one call to the next, with the CRC folded per piece, then the `=yend` line
+/// parsed where the decoder stopped. Returns (bytes written, crc, crc
+/// expected) so nothing is optimised away.
 #[cfg(rapidyenc_linked)]
-fn rapidyenc_article(art: &[u8], out: &mut [u8]) -> (usize, u32, u32) {
+fn rapidyenc_article(art: &[u8], out: &mut [u8], chunk: usize) -> (usize, u32, u32) {
     fn field(line: &[u8], key: &[u8]) -> Option<u64> {
         let at = memchr::memmem::find(line, key)? + key.len();
         let digits = line[at..].iter().take_while(|b| b.is_ascii_digit());
@@ -333,16 +346,19 @@ fn rapidyenc_article(art: &[u8], out: &mut [u8]) -> (usize, u32, u32) {
         }
     }
     let (mut crc, mut written) = (0u32, 0usize);
+    // YDEC_STATE_CRLF: the body starts at a line start.
+    let mut state = 0i32;
     loop {
-        let chunk = (art.len() - pos).min(64 * 1024);
+        let piece = (art.len() - pos).min(chunk);
         let (mut consumed, mut produced) = (0u64, 0u64);
         let end = unsafe {
-            weaver_rapidyenc_decode_end(
+            weaver_rapidyenc_decode_end_state(
                 art[pos..].as_ptr().cast(),
                 out[written..].as_mut_ptr().cast(),
-                chunk as u64,
+                piece as u64,
                 &mut consumed,
                 &mut produced,
+                &mut state,
             )
         };
         crc = unsafe { weaver_rapidyenc_crc32(out[written..].as_ptr().cast(), produced, crc) };
@@ -490,7 +506,16 @@ fn kernels() {
     }
 }
 
-fn multi_thread(threads: usize, iters: usize, rapidyenc: bool) {
+/// The `mt` lanes: weaver's `decode_nntp`, rapidyenc in the SAB shape, and
+/// rapidyenc fed the whole body in one call with the CRC after it.
+#[derive(Clone, Copy, PartialEq)]
+enum Lane {
+    Weaver,
+    Rapidyenc,
+    RapidyencWhole,
+}
+
+fn multi_thread(threads: usize, iters: usize, lane: Lane) {
     #[cfg(rapidyenc_linked)]
     unsafe {
         weaver_rapidyenc_decode_init();
@@ -498,20 +523,43 @@ fn multi_thread(threads: usize, iters: usize, rapidyenc: bool) {
     }
     #[cfg(not(rapidyenc_linked))]
     assert!(
-        !rapidyenc,
-        "build with WEAVER_RAPIDYENC_SRC for the rapidyenc lane"
+        lane == Lane::Weaver,
+        "build with WEAVER_RAPIDYENC_SRC for the rapidyenc lanes"
     );
     let art = article();
+    // Every lane must do the same work: the same bytes out, the same CRC.
+    #[cfg(rapidyenc_linked)]
+    {
+        let mut out = vec![0u8; max_decoded_len(art.len())];
+        let ours = decode_nntp(&art, &mut out).unwrap();
+        for chunk in [SAB_CHUNK, usize::MAX] {
+            let (written, crc, expected) = rapidyenc_article(&art, &mut out, chunk);
+            assert_eq!((written, crc), (ours.bytes_written, ours.part_crc));
+            assert_eq!(crc, expected);
+        }
+    }
+    // The articles are a shared pool every thread draws from, so the wall
+    // time is the pool's, not the slowest thread's: on a hybrid CPU a fixed
+    // share per thread leaves the cores that finish early idle while the
+    // E-core threads finish theirs.
+    let total = threads * iters;
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let t = Instant::now();
     std::thread::scope(|s| {
         for _ in 0..threads {
             let art = &art;
+            let next = &next;
             s.spawn(move || {
                 let mut out = vec![0u8; max_decoded_len(art.len())];
-                for _ in 0..iters {
+                while next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < total {
                     #[cfg(rapidyenc_linked)]
-                    if rapidyenc {
-                        black_box(rapidyenc_article(black_box(art), &mut out));
+                    if lane != Lane::Weaver {
+                        let chunk = if lane == Lane::Rapidyenc {
+                            SAB_CHUNK
+                        } else {
+                            usize::MAX
+                        };
+                        black_box(rapidyenc_article(black_box(art), &mut out, chunk));
                         continue;
                     }
                     let r = decode_nntp(black_box(art), &mut out).unwrap();
@@ -521,8 +569,12 @@ fn multi_thread(threads: usize, iters: usize, rapidyenc: bool) {
         }
     });
     let wall = t.elapsed().as_secs_f64();
-    let bytes = (art.len() * iters * threads) as f64;
-    let lane = if rapidyenc { "rapidyenc" } else { "weaver" };
+    let bytes = (art.len() * total) as f64;
+    let lane = match lane {
+        Lane::Weaver => "weaver",
+        Lane::Rapidyenc => "rapidyenc",
+        Lane::RapidyencWhole => "rapidyenc-whole",
+    };
     println!(
         "mt lane={lane} threads={threads} iters={iters} wall_s={wall:.4} GB/s={:.2}",
         bytes / wall / 1e9
@@ -534,8 +586,13 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("mt") {
         let threads = args[2].parse().unwrap();
         let iters = args[3].parse().unwrap();
-        let rapidyenc = args.get(4).map(String::as_str) == Some("rapidyenc");
-        multi_thread(threads, iters, rapidyenc);
+        let lane = match args.get(4).map(String::as_str) {
+            None | Some("weaver") => Lane::Weaver,
+            Some("rapidyenc") => Lane::Rapidyenc,
+            Some("rapidyenc-whole") => Lane::RapidyencWhole,
+            Some(other) => panic!("unknown lane {other}"),
+        };
+        multi_thread(threads, iters, lane);
     } else if args.get(1).map(String::as_str) == Some("kernels") {
         kernels();
     } else {
