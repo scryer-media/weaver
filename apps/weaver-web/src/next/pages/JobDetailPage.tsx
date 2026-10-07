@@ -57,6 +57,7 @@ import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/
 import { useNextData } from "../data/next-data";
 import { countLabel } from "../i18n/labels";
 import { NextShell, RailBlock } from "../shell/NextShell";
+import { SupportReportActions } from "../features/SupportReportActions";
 
 /**
  * One job, end to end.
@@ -427,6 +428,7 @@ function JobDetailContent() {
             >
               {t("next.job.downloadNzb")}
             </SecondaryButton>
+            <SupportReportActions jobId={job.id} size="compact" onReport={setReport} />
             {/* Only while scripts run: a job waiting for a script slot reports itself as queued. */}
             {job.status === "POST_PROCESSING" ? (
               <SecondaryButton

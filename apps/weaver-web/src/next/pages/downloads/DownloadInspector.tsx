@@ -19,6 +19,7 @@ import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
+import { SupportReportActions } from "@/next/features/SupportReportActions";
 
 interface OutputFile {
   name: string;
@@ -95,6 +96,7 @@ export function DownloadInspector({
   // answer can take a refresh to arrive, and a select that snaps back to the
   // old value in the meantime reads as a refusal.
   const [pending, setPending] = useState<{ priority?: Priority; category?: string }>({});
+  const [notice, setNotice] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
 
   const priority = pending.priority ?? jobPriority(job);
@@ -240,6 +242,14 @@ export function DownloadInspector({
       </div>
 
       <div className="flex flex-none flex-col gap-[10px] border-t border-wv-hairline px-5 py-[18px]">
+        <div className="flex gap-[10px]">
+          <SupportReportActions
+            jobId={job.id}
+            onReport={setNotice}
+            className="min-w-0 flex-1 justify-center"
+          />
+        </div>
+        {notice === null ? null : <div className="text-[12px] text-wv-muted">{notice}</div>}
         <div className="flex gap-[10px]">
           <SecondaryButton
             icon={isPaused ? "resume" : "pause"}

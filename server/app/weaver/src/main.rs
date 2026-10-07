@@ -142,6 +142,10 @@ async fn async_main() {
         std::env::var_os("NO_COLOR").is_some(),
     );
     let command = command.unwrap_or_else(Command::default_serve);
+    // Ahead of logging, so stdout carries the report alone and can be piped.
+    if let Command::Nzb { command } = command {
+        std::process::exit(commands::nzb::run(command));
+    }
 
     let log_ring_buffer =
         weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity();
@@ -471,6 +475,7 @@ async fn async_main() {
             }
         }
         Command::Par2 { .. } => unreachable!("par2 command handled before config startup"),
+        Command::Nzb { .. } => unreachable!("nzb command handled before logging starts"),
     }
 }
 

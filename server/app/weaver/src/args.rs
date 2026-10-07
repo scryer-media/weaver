@@ -141,6 +141,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: Par2Command,
     },
+
+    /// Offline NZB inspection.
+    Nzb {
+        #[command(subcommand)]
+        command: NzbCommand,
+    },
 }
 
 impl Command {
@@ -181,6 +187,21 @@ pub(crate) enum Par2Command {
     },
 }
 
+#[derive(Subcommand, Clone)]
+pub(crate) enum NzbCommand {
+    /// Print a report on an NZB that is safe to paste in public: its shape,
+    /// layout and red flags, with no names, groups, posters or message IDs.
+    Analyze {
+        /// The .nzb file, optionally gzip- or zstd-compressed.
+        #[arg(value_name = "NZB")]
+        file: PathBuf,
+
+        /// Print the report as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 pub(crate) fn upgrade_backup_required(flag: bool, env: Option<&str>) -> bool {
     flag || env.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
@@ -191,7 +212,7 @@ mod tests {
 
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Command, DEFAULT_CONFIG_FILE};
+    use super::{Cli, Command, DEFAULT_CONFIG_FILE, NzbCommand};
 
     #[test]
     fn skipping_upgrade_backup_requires_an_explicit_flag() {
@@ -366,5 +387,18 @@ mod tests {
             ),
             PathBuf::from("RoamingAppData").join("weaver"),
         );
+    }
+
+    #[test]
+    fn nzb_analyze_takes_a_file_and_an_optional_json_flag() {
+        let Some(Command::Nzb {
+            command: NzbCommand::Analyze { file, json },
+        }) = Cli::parse_from(["weaver", "nzb", "analyze", "set.nzb.gz", "--json"]).command
+        else {
+            panic!("expected nzb analyze");
+        };
+        assert_eq!(file, PathBuf::from("set.nzb.gz"));
+        assert!(json);
+        assert!(Cli::try_parse_from(["weaver", "nzb", "analyze"]).is_err());
     }
 }

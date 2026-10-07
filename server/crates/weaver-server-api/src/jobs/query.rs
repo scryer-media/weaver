@@ -230,6 +230,17 @@ fn queue_page_summary(
 
 #[Object]
 impl JobsQuery {
+    /// A report on a queued or finished job's NZB and how the job went, with
+    /// every name, path, host and password left out so it can be shared.
+    #[graphql(guard = "ReadGuard")]
+    async fn job_support_report(
+        &self,
+        ctx: &Context<'_>,
+        job_id: u64,
+    ) -> Result<crate::jobs::support_report::SupportReport> {
+        crate::jobs::support_report::resolve_job_support_report(ctx, job_id).await
+    }
+
     /// Public queue facade for active or in-flight items.
     #[graphql(guard = "ReadGuard")]
     async fn queue_items(
