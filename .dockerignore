@@ -29,3 +29,10 @@ docs
 scripts
 tasks
 tests
+
+# Bench captures and other archives dropped in the repo root are never part
+# of the image; one stray tarball inflates every build layer.
+*.tgz
+*.tar.gz
+*.tar
+*.zip
