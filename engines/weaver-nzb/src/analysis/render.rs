@@ -172,17 +172,27 @@ fn shape(out: &mut Text, report: &NzbReport) {
     }
 
     match &shape.posted {
-        Some(posted) => out.line(format!(
-            "  posted {}-{} days ago over {}{}",
-            posted.newest_age_days,
-            posted.oldest_age_days,
-            human_span(posted.span_secs),
-            if shape.invalid_dates > 0 {
+        Some(posted) => {
+            let age = if posted.newest_age_days == posted.oldest_age_days {
+                format!("{} days ago", posted.oldest_age_days)
+            } else {
+                format!(
+                    "{}-{} days ago",
+                    posted.newest_age_days, posted.oldest_age_days
+                )
+            };
+            let span = if posted.span_secs == 0 {
+                String::new()
+            } else {
+                format!(" over {}", human_span(posted.span_secs))
+            };
+            let bad = if shape.invalid_dates > 0 {
                 format!(", {} bad date(s)", shape.invalid_dates)
             } else {
                 String::new()
-            },
-        )),
+            };
+            out.line(format!("  posted {age}{span}{bad}"));
+        }
         None => out.line("  posted: no dates"),
     }
 
