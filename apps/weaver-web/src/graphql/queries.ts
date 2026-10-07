@@ -2102,3 +2102,21 @@ export const UPDATE_BACKUP_SETTINGS_MUTATION = gql`mutation UpdateBackupSettings
 export const UPDATE_AUTO_BACKUP_SETTINGS_MUTATION = gql`mutation UpdateAutoBackupSettings($input: AutoBackupSettingsInput!) { updateAutoBackupSettings(input: $input) { enabled dailyTimeLocal autoBackupKeyPresent nextRunAt } }`;
 export const DELETE_BACKUP_MUTATION = gql`mutation DeleteBackup($filename: String!) { deleteBackup(filename: $filename) }`;
 export const BACKUP_DOWNLOAD_TOKEN_MUTATION = gql`mutation BackupDownloadToken($filename: String!) { createBackupDownloadToken(filename: $filename) }`;
+
+export const JOB_SUPPORT_REPORT_QUERY = gql`
+  query JobSupportReport($jobId: Int!) {
+    jobSupportReport(jobId: $jobId) {
+      text
+      json
+    }
+  }
+`;
+
+export const ANALYZE_NZB_MUTATION = gql`
+  mutation AnalyzeNzb($input: AnalyzeNzbInput!) {
+    analyzeNzb(input: $input) {
+      text
+      json
+    }
+  }
+`;

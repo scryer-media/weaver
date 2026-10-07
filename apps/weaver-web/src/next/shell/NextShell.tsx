@@ -119,6 +119,7 @@ export function NextShell({
     { to: "/monitoring", label: t("next.nav.monitoring"), icon: "monitoring" },
     { to: "/system-info", label: t("next.nav.systemInfo"), icon: "systemInfo" },
     { to: "/logs", label: t("next.nav.logs"), icon: "logs" },
+    { to: "/tools/nzb-analyzer", label: t("next.nav.nzbAnalyzer"), icon: "inspectFile" },
     { to: "/settings", label: t("nav.settings"), icon: "settings" },
   ];
 
