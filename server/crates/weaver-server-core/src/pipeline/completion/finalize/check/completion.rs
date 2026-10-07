@@ -391,7 +391,7 @@ impl Pipeline {
             }
         }
 
-        if self.queue_script_completion_gate(job_id) {
+        if self.queue_script_completion_gate(job_id, !has_incomplete_data_files) {
             return;
         }
         self.maybe_prefetch_par3_recovery(job_id);

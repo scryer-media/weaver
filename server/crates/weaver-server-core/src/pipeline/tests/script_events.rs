@@ -373,3 +373,127 @@ async fn a_late_queue_event_leaves_a_job_that_moved_on_alone() {
     assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Verifying);
     assert!(!pipeline.queue_scripts_completed.contains(&job_id));
 }
+
+/// The live path: a job's last article is decoded by the real decode seam, and
+/// the completion check that follows must hold the job at the NZB_DOWNLOADED
+/// barrier instead of moving it to the complete folder.
+#[tokio::test]
+async fn the_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_barrier() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_queue_script(&pipeline.db, temp.path());
+    let job_id = JobId(165);
+    let payload = b"standalone payload bytes for the barrier".to_vec();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "script-barrier-live",
+            &[("payload.bin".to_string(), payload.len() as u32)],
+        ),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    park_job_on_its_final_decode(
+        &mut pipeline,
+        SegmentId {
+            file_id,
+            segment_number: 0,
+        },
+        payload.len() as u64,
+    );
+    settle_queued_decode(&mut pipeline, file_id, 0, 0, &payload, "payload.bin").await;
+    assert!(
+        pipeline.queue_script_waiters.contains(&job_id),
+        "the completion pass did not hold the barrier; status {:?}, pending download work {}",
+        pipeline.jobs[&job_id].status,
+        pipeline.job_has_pending_download_pipeline_work(job_id)
+    );
+    assert!(pipeline.inflight_moves.is_empty());
+    let TerminalPostProcessingEvent::QueueAdmitted(id) = pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    else {
+        panic!("expected queue admission");
+    };
+    assert_eq!(id, job_id);
+    pipeline.handle_queue_scripts_admitted(id);
+    assert_eq!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::AwaitingQueueScripts
+    );
+}
+
+/// The streamed shape: the job's last article was decoded on its download lane,
+/// and the completion pass runs while that article's download result is still
+/// booked as pending. The barrier must hold here all the same; this is the pass
+/// that otherwise moves the job to the complete folder.
+#[tokio::test]
+async fn the_streamed_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_barrier() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_queue_script(&pipeline.db, temp.path());
+    let job_id = JobId(166);
+    let payload = b"standalone payload bytes decoded on the lane".to_vec();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "script-barrier-streamed",
+            &[("payload.bin".to_string(), payload.len() as u32)],
+        ),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    pipeline.active_download_passes.insert(job_id);
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    // What `process_released_download_done` holds open around the decode.
+    pipeline.note_released_download_result_pending(job_id, payload.len() as u64);
+    assert!(pipeline.job_has_pending_download_pipeline_work(job_id));
+    submit_decoded_segment(&mut pipeline, file_id, 0, 0, &payload, "payload.bin", None).await;
+    pipeline.finish_released_download_result_processing(job_id, payload.len() as u64);
+    pipeline.maybe_finish_download_pass(job_id);
+    assert!(
+        pipeline.queue_script_waiters.contains(&job_id),
+        "the completion pass did not hold the barrier; status {:?}",
+        pipeline.jobs[&job_id].status
+    );
+    assert!(pipeline.inflight_moves.is_empty());
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Downloading);
+    let TerminalPostProcessingEvent::QueueAdmitted(id) = pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    else {
+        panic!("expected queue admission");
+    };
+    assert_eq!(id, job_id);
+    pipeline.handle_queue_scripts_admitted(id);
+    assert_eq!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::AwaitingQueueScripts
+    );
+    // The download pass that closes after the booking must not disturb the
+    // held job.
+    while let Some(next) = pipeline.pending_completion_checks.pop_front() {
+        pipeline.check_job_completion(next).await;
+    }
+    assert!(pipeline.inflight_moves.is_empty());
+    assert_eq!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::AwaitingQueueScripts
+    );
+}

@@ -80,8 +80,20 @@ impl Pipeline {
     }
 
     /// Returns true while the completion pass must yield to its queue scripts.
-    pub(crate) fn queue_script_completion_gate(&mut self, job_id: JobId) -> bool {
-        if self.job_has_pending_download_pipeline_work(job_id) {
+    ///
+    /// The barrier is raised once nothing more is coming off the wire, or once
+    /// every data file is complete. The second clause matters: the streamed
+    /// decode of a job's last article runs the completion pass from inside the
+    /// booking of that article's own download result, so the result still
+    /// counts as pending download work while the pass, with every file
+    /// complete, goes on to finalize the job. Deferring on pending work there
+    /// would let the final move run with the barrier never raised.
+    pub(crate) fn queue_script_completion_gate(
+        &mut self,
+        job_id: JobId,
+        data_files_complete: bool,
+    ) -> bool {
+        if !data_files_complete && self.job_has_pending_download_pipeline_work(job_id) {
             return false;
         }
         if self.queue_script_waiters.contains(&job_id) {
