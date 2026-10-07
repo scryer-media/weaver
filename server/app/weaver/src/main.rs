@@ -513,6 +513,7 @@ fn install_e2e_network_time_scale() {
         shadow_min_pin_age = ?timing.shadow_min_pin_age,
         route_cooldown = ?timing.route_cooldown,
         leg_cooldown_initial = ?timing.leg_cooldown_initial,
+        rung_cooldown = ?timing.rung_cooldown,
         replan_interval = ?timing.replan_interval,
         "e2e network time scale installed"
     );

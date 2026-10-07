@@ -548,7 +548,10 @@ impl NetworkRuntime {
                 if *direct_fallback {
                     stages.push(bottom.clone());
                 }
-                let fallback = Arc::new(Fallback::new(stages));
+                let fallback = Arc::new(Fallback::with_rung_cooldown(
+                    stages,
+                    weaver_nntp::plan_timing::timing().rung_cooldown,
+                ));
                 ladder = Some(fallback.clone());
                 fallback
             }

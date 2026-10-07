@@ -758,6 +758,10 @@ struct RungState {
 pub struct Fallback {
     rungs: Vec<Arc<dyn Dialer>>,
     states: Arc<Mutex<Vec<RungState>>>,
+    /// How long a rung whose path failed is left alone before it is tried
+    /// again. Flat: a rung is a whole path, and the ladder below it carries
+    /// the work meanwhile.
+    rung_cooldown: Duration,
 }
 impl Fallback {
     pub fn rung_states(&self) -> Vec<&'static str> {
@@ -798,14 +802,19 @@ impl Fallback {
             let now = tokio::time::Instant::now();
             if error.is_path_evidence() && state.until.is_none_or(|until| until <= now) {
                 state.failures = state.failures.saturating_add(1);
-                state.until = Some(now + Duration::from_secs(30));
+                state.until = Some(now + self.rung_cooldown);
             }
         } else {
             state.failures = 0;
             state.until = None;
         }
     }
+    /// A ladder that leaves a failed rung alone for thirty seconds.
     pub fn new(rungs: Vec<Arc<dyn Dialer>>) -> Self {
+        Self::with_rung_cooldown(rungs, Duration::from_secs(30))
+    }
+    /// A ladder that leaves a failed rung alone for `rung_cooldown`.
+    pub fn with_rung_cooldown(rungs: Vec<Arc<dyn Dialer>>, rung_cooldown: Duration) -> Self {
         let states = (0..rungs.len())
             .map(|_| RungState {
                 until: None,
@@ -815,6 +824,7 @@ impl Fallback {
         Self {
             rungs,
             states: Arc::new(Mutex::new(states)),
+            rung_cooldown,
         }
     }
 }

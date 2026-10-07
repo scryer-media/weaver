@@ -7,7 +7,12 @@
 //! [`PlanTiming::scaled`] copy once, at process start, before any plan or pool
 //! exists. Counts (samples, connects, retries) and per-dial timeouts are not
 //! part of this: they bound work, not waiting, and stay the same under any
-//! scale.
+//! scale. Nor are the two timers that bound delivery evidence: how old a pin
+//! may get before the next connect races again, and how long booked delivery
+//! stays evidence. A race discards every candidate's delivery, and gathering
+//! the samples a verdict needs is paced by the wire, not the clock, so
+//! shortening those two would leave a slow or churning pin unjudged for good
+//! rather than judged sooner.
 
 use std::num::NonZeroU32;
 use std::sync::OnceLock;
@@ -50,6 +55,8 @@ pub struct PlanTiming {
     /// First cooldown of a weighted egress leg that went down. It doubles per
     /// failed probe, up to ten times this.
     pub leg_cooldown_initial: Duration,
+    /// How long a fallback ladder leaves a rung alone after its path failed.
+    pub rung_cooldown: Duration,
 }
 
 impl PlanTiming {
@@ -66,25 +73,29 @@ impl PlanTiming {
         over_limit_probe_window: OVER_LIMIT_PROBE_WINDOW,
         route_cooldown: Duration::from_secs(30),
         leg_cooldown_initial: Duration::from_secs(30),
+        rung_cooldown: Duration::from_secs(30),
     };
 
-    /// [`Self::PRODUCTION`] with every duration divided by `scale`, none
-    /// shorter than a millisecond.
+    /// [`Self::PRODUCTION`] with every waiting duration divided by `scale`,
+    /// none shorter than a millisecond. `replan_interval` and
+    /// `delivery_evidence_age` stay at production: they bound evidence, not
+    /// waiting (see the module notes).
     pub fn scaled(scale: NonZeroU32) -> PlanTiming {
         let s = |d: Duration| (d / scale.get()).max(SCALED_FLOOR);
         let p = Self::PRODUCTION;
         PlanTiming {
-            replan_interval: s(p.replan_interval),
+            replan_interval: p.replan_interval,
             failed_race_holdoff: s(p.failed_race_holdoff),
             delivery_min_wire: s(p.delivery_min_wire),
             delivery_verdict_interval: s(p.delivery_verdict_interval),
-            delivery_evidence_age: s(p.delivery_evidence_age),
+            delivery_evidence_age: p.delivery_evidence_age,
             shadow_min_pin_age: s(p.shadow_min_pin_age),
             shadow_interval: s(p.shadow_interval),
             over_limit_holdoff_initial: s(p.over_limit_holdoff_initial),
             over_limit_probe_window: s(p.over_limit_probe_window),
             route_cooldown: s(p.route_cooldown),
             leg_cooldown_initial: s(p.leg_cooldown_initial),
+            rung_cooldown: s(p.rung_cooldown),
         }
     }
 }
@@ -113,19 +124,19 @@ mod tests {
     use super::*;
     use crate::address_plan::{DELIVERY_MIN_SAMPLES, SHADOW_EVERY_CONNECTS, SHADOW_RETRIES};
 
-    fn fields(t: &PlanTiming) -> [Duration; 11] {
+    /// The durations scaling divides: everything but the two evidence bounds.
+    fn waiting_fields(t: &PlanTiming) -> [Duration; 10] {
         [
-            t.replan_interval,
             t.failed_race_holdoff,
             t.delivery_min_wire,
             t.delivery_verdict_interval,
-            t.delivery_evidence_age,
             t.shadow_min_pin_age,
             t.shadow_interval,
             t.over_limit_holdoff_initial,
             t.over_limit_probe_window,
             t.route_cooldown,
             t.leg_cooldown_initial,
+            t.rung_cooldown,
         ]
     }
 
@@ -135,23 +146,40 @@ mod tests {
     }
 
     #[test]
-    fn scaled_divides_every_duration() {
+    fn scaled_divides_every_waiting_duration() {
         let scaled = PlanTiming::scaled(NonZeroU32::new(10).unwrap());
-        for (production, scaled) in fields(&PlanTiming::PRODUCTION)
+        for (production, scaled) in waiting_fields(&PlanTiming::PRODUCTION)
             .into_iter()
-            .zip(fields(&scaled))
+            .zip(waiting_fields(&scaled))
         {
             assert_eq!(scaled, production / 10);
         }
         assert_eq!(scaled.delivery_verdict_interval, Duration::from_secs(6));
         assert_eq!(scaled.shadow_interval, Duration::from_secs(3));
-        assert_eq!(scaled.replan_interval, Duration::from_secs(60));
+        assert_eq!(scaled.rung_cooldown, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn scaling_leaves_the_evidence_bounds_alone() {
+        // A race wipes delivery and the samples a verdict needs come at the
+        // wire's pace, so a pin that must be judged in production must still
+        // get its full ten minutes under any scale.
+        let scaled = PlanTiming::scaled(NonZeroU32::new(10).unwrap());
+        assert_eq!(
+            scaled.replan_interval,
+            PlanTiming::PRODUCTION.replan_interval
+        );
+        assert_eq!(
+            scaled.delivery_evidence_age,
+            PlanTiming::PRODUCTION.delivery_evidence_age
+        );
+        assert_eq!(scaled.replan_interval, Duration::from_secs(600));
     }
 
     #[test]
     fn scaled_floors_at_one_millisecond() {
         let scaled = PlanTiming::scaled(NonZeroU32::MAX);
-        for field in fields(&scaled) {
+        for field in waiting_fields(&scaled) {
             assert_eq!(field, SCALED_FLOOR);
         }
     }
