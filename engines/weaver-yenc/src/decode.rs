@@ -265,6 +265,8 @@ fn finalize_decode(
 
 /// Decode a complete yEnc article with custom options.
 ///
+/// Rule: weaver never fails an article another tool would accept; where readings differ it decodes as rapidyenc and sabctools do.
+///
 /// `output` is subject to the same [`max_decoded_len`] contract as [`decode`].
 pub fn decode_with_options(
     input: &[u8],
@@ -301,7 +303,17 @@ fn decode_with_line_scan(
 ) -> Result<DecodeResult, YencError> {
     let parsed = header::parse_headers_with_options(input, options)?;
 
-    let data_end = parsed.data_end.max(parsed.data_start);
+    let mut data_end = parsed.data_end.max(parsed.data_start);
+    // A body whose last line ends in a lone `=` before the control line: the
+    // `=` escapes the line's `\r` (0xA3) and the `\r` still breaks the line,
+    // as the kernel, rapidyenc and sabctools read it. Decoding through that
+    // `\r` keeps the escaped byte instead of failing on a dangling escape.
+    if data_end < input.len()
+        && input[data_end] == b'\r'
+        && ends_in_open_escape(&input[parsed.data_start..data_end])
+    {
+        data_end += 1;
+    }
     let data = &input[parsed.data_start..data_end];
 
     let mut crc = Crc32::new();
@@ -355,8 +367,8 @@ fn whole_buffer_segments(
 /// Returns `None` where the two readings of the body boundary could differ, and
 /// the caller falls back to the line-scanning path for an identical result: an
 /// NNTP terminator (`\r\n.\r\n`) inside the article, which the line scan
-/// decodes past, and a body that ends inside an escape, which the line scan
-/// fails.
+/// decodes past, and an input that ends inside an escape with no control line
+/// after it, which the line scan fails.
 fn decode_raw_single_pass(
     input: &[u8],
     output: &mut [u8],
@@ -373,13 +385,11 @@ fn decode_raw_single_pass(
         RapidyencDecodeEnd::Article => return Ok(None),
         RapidyencDecodeEnd::Control => {
             // The kernel consumes the `=y` it stopped at.
+            // A final `=` before the control line escapes the line's `\r`
+            // (0xA3), and the article ends at the trailer with its CRC
+            // mismatch, exactly as the line scan, rapidyenc and sabctools read
+            // it.
             let keyword_start = data_start + outcome.consumed - 2;
-            if ends_in_open_escape(&input[data_start..body_end(input, data_start, keyword_start)]) {
-                // The kernel decodes a final `=` as the escape of the line's
-                // `\r`; the line scan cuts the body before that `\r` and fails
-                // the article on the dangling escape. Keep that verdict.
-                return Ok(None);
-            }
             Some(header::parse_trailer_at(input, keyword_start)?)
         }
         // At the end of the input the kernel holds a line-start `=` open as a
@@ -406,18 +416,6 @@ fn decode_raw_single_pass(
         None,
     )
     .map(Some)
-}
-
-/// First byte after the body for a control line whose `=y` begins at
-/// `keyword_start`: the `\r` of the line break before it, before the stuffed
-/// `.` if there is one. A control line at the very start of the body leaves it
-/// empty.
-fn body_end(input: &[u8], data_start: usize, keyword_start: usize) -> usize {
-    if keyword_start < data_start + 2 {
-        return data_start;
-    }
-    let dot = usize::from(input[keyword_start - 1] == b'.');
-    keyword_start - 2 - dot
 }
 
 /// True when `body` ends inside an escape: an odd run of trailing `=`, since
@@ -2933,16 +2931,19 @@ mod tests {
         assert!(matches!(err, YencError::InvalidHeader { ref field, .. } if field == "=yend"));
     }
 
-    /// A body whose last line ends in a lone `=` fails on the dangling escape,
-    /// with or without a trailer after it.
+    /// A lone `=` ending the last line before the trailer escapes the line's
+    /// `\r` (0xA3) and the trailer still counts, as rapidyenc and sabctools
+    /// read it; an input that ends inside an escape with no control line after
+    /// it still fails on the dangling escape.
     #[test]
-    fn raw_article_dangling_escape_before_trailer_fails() {
-        for tail in [
-            &b"kl=\r\n=yend size=2\r\n"[..],
-            b"kl=\r\n.=yend size=2\r\n",
-            b"\r\n=",
-            b".=",
-        ] {
+    fn raw_article_dangling_escape_before_trailer_decodes_the_cr() {
+        for tail in [&b"kl=\r\n=yend size=2\r\n"[..], b"kl=\r\n.=yend size=2\r\n"] {
+            let (result, data) = nntp(&[ONE_PART, tail].concat()).unwrap();
+            assert!(result.has_trailer, "{tail:?}");
+            assert!(result.defects.yend_size_mismatch, "{tail:?}");
+            assert_eq!(data, [b'A', b'B', 0xa3], "{tail:?}");
+        }
+        for tail in [&b"\r\n="[..], b".="] {
             let err = nntp(&[ONE_PART, tail].concat()).unwrap_err();
             assert!(
                 matches!(err, YencError::MalformedEscape(_)),
