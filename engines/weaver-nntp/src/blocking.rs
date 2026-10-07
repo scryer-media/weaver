@@ -1125,10 +1125,8 @@ impl BlockingNntpConnection {
                 initial_group,
                 Some(dialed.outcome),
                 None,
+                dialed.setup,
             );
-            if let Some(setup) = dialed.setup {
-                setup.complete(result.is_ok());
-            }
             if let Ok(connection) = &mut result {
                 connection.egress_control = Some(
                     dialer
@@ -1148,6 +1146,7 @@ impl BlockingNntpConnection {
                 backend_override,
                 initial_group,
                 Some(outcome),
+                None,
                 None,
             );
         }
@@ -1173,6 +1172,7 @@ impl BlockingNntpConnection {
             initial_group,
             None,
             setup,
+            None,
         )
     }
 
@@ -1241,6 +1241,7 @@ impl BlockingNntpConnection {
         initial_group: Option<&str>,
         route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
         mut setup: Option<crate::address_plan::SetupWatch>,
+        mut pipe_setup: Option<weaver_tunnel::pipe::SetupHandle>,
     ) -> Result<Self> {
         let tcp = tcp.into();
         let route_socket = config
@@ -1289,7 +1290,23 @@ impl BlockingNntpConnection {
             group_probe_armed: false,
         };
 
-        let greeting = conn.read_response()?;
+        // The route's setup evidence is whether the server answered over this
+        // connection, as on the asynchronous path: a greeting that arrived is
+        // a reached server, whatever the session makes of it afterwards. A
+        // session that the server drops after greeting it is not an address,
+        // proxy, or pool member that fails to answer.
+        let greeting = match conn.read_response() {
+            Ok(greeting) => greeting,
+            Err(error) => {
+                if let Some(setup) = pipe_setup.take() {
+                    setup.complete(false);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(setup) = pipe_setup.take() {
+            setup.complete(true);
+        }
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received blocking NNTP greeting");
         let upgrades = config.starttls && matches!(conn.transport, BlockingTransport::Plain(_));
         if (!upgrades || !matches!(greeting.code.raw(), 200 | 201))

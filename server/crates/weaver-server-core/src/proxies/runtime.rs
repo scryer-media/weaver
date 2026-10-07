@@ -106,6 +106,15 @@ struct Cooldown {
     until: Instant,
     probing: bool,
 }
+/// Whether a policy change touches what a legacy route is built from. Its
+/// legs and failover live in the network runtime, which applies them to the
+/// live route in place: a reweight moves connections between legs, a changed
+/// path revokes that leg alone. Rebuilding the legacy route for them would
+/// revoke every socket it tracks for a change that was meant to keep them.
+fn legacy_policy_changed(current: &RoutingPolicy, next: &RoutingPolicy) -> bool {
+    current.proxy_ids != next.proxy_ids || current.allow_direct != next.allow_direct
+}
+
 pub struct ConsumerRoute {
     pub policy: RoutingPolicy,
     pub hops: Vec<Option<Arc<ProxyHop>>>,
@@ -610,7 +619,10 @@ impl ProxyRuntime {
                         .iter()
                         .filter(|(key, route)| {
                             !consumers.contains(*key)
-                                || route.policy != policies.get(*key).cloned().unwrap_or_default()
+                                || legacy_policy_changed(
+                                    &route.policy,
+                                    &policies.get(*key).cloned().unwrap_or_default(),
+                                )
                                 || route.policy.proxy_ids.iter().zip(&route.hops).any(
                                     |(id, prior)| match (prior, profiles.get(id)) {
                                         (Some(a), Some(b)) => !Arc::ptr_eq(a, b),

@@ -47,6 +47,7 @@ fn target() -> Target {
         host: "news.invalid".into(),
         port: 119,
         purpose: Purpose::Nntp { server: 1, leg: 0 },
+        addresses: Vec::new(),
     }
 }
 fn create(cap: u16) -> (Arc<Weighted>, Vec<Arc<Scripted>>) {
@@ -153,6 +154,53 @@ async fn two_failures_redistribute_then_offer_one_probe_and_restore() {
             .collect::<Vec<_>>(),
         vec![3, 2]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_dial_in_flight_during_one_outage_cools_the_leg_once() {
+    let (route, stages) = create(5);
+    for stage in &stages {
+        stage.mode.store(3, Ordering::SeqCst);
+    }
+    // Four lanes open at once and hang against the same outage, so their
+    // connects time out in the same instant. The first two verdicts take
+    // the leg down; the rest land while it is cooling and must not stretch
+    // that cooldown.
+    let dials: Vec<_> = (0..4)
+        .map(|_| {
+            let route = route.clone();
+            tokio::spawn(async move { route.dial(&target()).await.is_err() })
+        })
+        .collect();
+    tokio::task::yield_now().await;
+    assert!(route.allocations()[0].opening >= 2);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for dial in dials {
+        assert!(dial.await.unwrap());
+    }
+    assert!(matches!(
+        route.allocations()[0].health,
+        LegHealthState::Down(_)
+    ));
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_eq!(route.allocations()[0].health, LegHealthState::Probing);
+    assert!(route.needs_probe());
+    // A probe that fails after the cooldown lapsed is the next verdict and
+    // does lengthen it.
+    stages[0].mode.store(1, Ordering::SeqCst);
+    let probe = route.dial(&target()).await;
+    assert!(probe.is_err());
+    assert!(matches!(
+        route.allocations()[0].health,
+        LegHealthState::Down(_)
+    ));
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert!(matches!(
+        route.allocations()[0].health,
+        LegHealthState::Down(_)
+    ));
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_eq!(route.allocations()[0].health, LegHealthState::Probing);
 }
 
 #[tokio::test(start_paused = true)]

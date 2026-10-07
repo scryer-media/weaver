@@ -228,8 +228,10 @@ fn a_refused_pin_falls_over_to_the_candidate_that_connects_fastest() {
 
     assert_eq!(connected, faster);
     assert_eq!(dialer.take_dialled(), vec![pinned, faster]);
-    // One refusal is not yet a reason to move the pin.
-    assert_eq!(plan.snapshot().pinned, Some(pinned));
+    // The connect fell through the refused pin, so the pin moves to where
+    // the connections now are, as it does after a lease, instead of waiting
+    // for a race that no further connect may run while every lane is open.
+    assert_eq!(plan.snapshot().pinned, Some(faster));
 }
 
 #[test]
@@ -240,9 +242,10 @@ fn two_refusals_on_the_pin_race_again_even_while_the_server_is_busy() {
     pin(&plan, &dialer, pinned, &[other]);
     dialer.answer(pinned, Answer::Refuse);
 
+    // While no address connects, nothing moves the pin, but its refusals count.
     for _ in 0..SUSPECT_AFTER_FAILURES {
-        let (_, connected) = plan.connect(&dialer).unwrap();
-        assert_eq!(connected, other);
+        dialer.answer(other, Answer::Fail(io::ErrorKind::ConnectionRefused));
+        assert!(plan.connect(&dialer).is_err());
     }
     assert_eq!(plan.snapshot().pinned, Some(pinned));
 

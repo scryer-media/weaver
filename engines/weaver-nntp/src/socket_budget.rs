@@ -351,16 +351,17 @@ impl SocketSlot {
         if self.retiring() {
             return false;
         }
-        let state = self.budget.state.lock().expect("socket budget poisoned");
+        let mut state = self.budget.state.lock().expect("socket budget poisoned");
         let Some(targets) = &state.leg_targets else {
             return true;
         };
-        let Some(leg) = state
-            .entries
-            .get(&self.id)
-            .and_then(|entry| entry.path.as_ref())
-            .and_then(|path| path.leg)
-        else {
+        let Some(entry) = state.entries.get(&self.id) else {
+            return true;
+        };
+        if entry.phase == SocketPhase::Closing {
+            return false;
+        }
+        let Some(leg) = entry.path.as_ref().and_then(|path| path.leg) else {
             return true;
         };
         let target = usize::from(targets.get(leg).copied().unwrap_or(0));
@@ -372,7 +373,21 @@ impl SocketSlot {
                     && entry.path.as_ref().and_then(|path| path.leg) == Some(leg)
             })
             .count();
-        count <= target && target > 0
+        if target == 0 {
+            return false;
+        }
+        if count > target {
+            // This socket is the excess and goes: claim that here, under the
+            // lock, so every other lane on the leg that asks in the same
+            // instant counts it as gone and keeps its own.
+            state
+                .entries
+                .get_mut(&self.id)
+                .expect("live socket slot")
+                .phase = SocketPhase::Closing;
+            return false;
+        }
+        true
     }
 
     pub(crate) fn idle(&self, phase: SocketPhase, recall: Recall) {

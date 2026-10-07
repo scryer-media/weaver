@@ -86,6 +86,7 @@ impl TunnelProvider for ProbeProvider {
                 host: host.into(),
                 port,
                 purpose: Purpose::Probe,
+                addresses: Vec::new(),
             })
             .await
             .map_err(|e| match e {

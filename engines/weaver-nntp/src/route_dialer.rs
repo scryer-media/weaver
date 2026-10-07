@@ -106,6 +106,7 @@ impl RouteDialer {
         let target = Target {
             host: config.host.clone(),
             port: config.port,
+            addresses: Vec::new(),
             purpose: Purpose::Nntp {
                 server: self.server,
                 leg: 0,

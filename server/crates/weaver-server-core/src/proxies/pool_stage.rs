@@ -205,19 +205,21 @@ impl PoolState {
         });
         let state = self.clone();
         let upstream = dialed.setup.take();
-        let setup_member = member.clone();
         dialed.setup = Some(SetupHandle::new(move |reached| {
             if let Some(setup) = upstream {
                 setup.complete(reached);
             }
-            state.record(&setup_member, |plan| {
+            state.record(&member, |plan| {
                 plan.setup(id, reached, Instant::now().into_std())
             });
         }));
-        let state = self.clone();
-        dialed.outcome.on_failure(move || {
-            state.record(&member, |plan| plan.failed(id, Instant::now().into_std()));
-        });
+        // A connection that fails after it was set up says nothing about
+        // whether its member can be connected, so it is not a connect failure
+        // of the pin: a server that drops sessions mid-transfer would otherwise
+        // race the pool on every pair of drops, and every race starts the
+        // pin's age and its delivery evidence over, so no challenger could
+        // ever be measured against a throttled pin. Addresses are judged the
+        // same way: only connects and setups count against them.
         dialed
     }
     fn pool_error(&self, error: DialError) -> DialError {
@@ -279,7 +281,14 @@ impl PoolState {
                         .send(Err(self.pool_error(DialError::Skipped(message))));
                     return;
                 }
-                Attempt::Dial(order) => {
+                Attempt::Dial {
+                    order,
+                    shadow,
+                    announce,
+                } => {
+                    if let Some(announce) = announce {
+                        announce.log(&format!("pool {}", self.id));
+                    }
                     let mut last = DialError::Skipped("no enabled pool member".into());
                     for id in order {
                         let member = self.members.read().expect("pool members").get(&id).cloned();
@@ -293,10 +302,30 @@ impl PoolState {
                                 }) {
                                     continue;
                                 }
-                                let _ = reply
-                                    .take()
-                                    .unwrap()
-                                    .send(Ok(self.decorate(member, dialed)));
+                                let dialed = self.decorate(member.clone(), dialed);
+                                if shadow == Some(id) {
+                                    // The plan judges a challenger by what its
+                                    // shadow connection delivers; one that ends
+                                    // first is owed another, and the plan hears
+                                    // whether this one answered at all.
+                                    let responses = Arc::new(AtomicU64::new(0));
+                                    let answered = responses.clone();
+                                    dialed.outcome.on_body_latency(move |_| {
+                                        answered.fetch_add(1, Ordering::Relaxed);
+                                    });
+                                    let state = self.clone();
+                                    dialed.outcome.on_close(move || {
+                                        let responses = responses.load(Ordering::Relaxed);
+                                        state.record(&member, |plan| {
+                                            plan.shadow_ended(
+                                                id,
+                                                responses,
+                                                Instant::now().into_std(),
+                                            )
+                                        });
+                                    });
+                                }
+                                let _ = reply.take().unwrap().send(Ok(dialed));
                                 return;
                             }
                             Err(error) => {

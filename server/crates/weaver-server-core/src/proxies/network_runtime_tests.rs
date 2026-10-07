@@ -283,7 +283,11 @@ async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_faile
     assert_eq!(attempts.len(), 3, "two rungs and the direct fallback");
     attempts[0].report(Some(&refused(1)));
     attempts[1].report(Some(&refused(2)));
-    assert_eq!(health(), LegHealthState::Up, "two failed rungs must not take the leg down before its fallback runs");
+    assert_eq!(
+        health(),
+        LegHealthState::Up,
+        "two failed rungs must not take the leg down before its fallback runs"
+    );
     // The fallback fails too: that is the leg's one failure for this sync.
     attempts[2].report(Some(&unreachable()));
     assert_eq!(health(), LegHealthState::Up);
@@ -297,6 +301,10 @@ async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_faile
     attempts[1].report(Some(&refused(2)));
     assert_eq!(health(), LegHealthState::Up);
     attempts[2].report(Some(&unreachable()));
-    assert!(matches!(health(), LegHealthState::Down(_)), "{:?}", health());
+    assert!(
+        matches!(health(), LegHealthState::Down(_)),
+        "{:?}",
+        health()
+    );
     runtime.shutdown().await;
 }

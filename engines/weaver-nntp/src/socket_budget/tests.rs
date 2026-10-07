@@ -235,6 +235,35 @@ fn member_retirement_recalls_idle_and_drains_busy_at_boundary() {
 }
 
 #[test]
+fn a_leg_over_its_share_gives_up_exactly_the_excess_sockets() {
+    let budget = SocketBudget::new(4);
+    let slots: Vec<_> = (0..4).map(|_| budget.try_acquire().unwrap()).collect();
+    for (slot, leg) in slots.iter().zip([0, 0, 1, 1]) {
+        slot.set_path(Some(&weaver_tunnel::pipe::DialPath {
+            leg: Some(leg),
+            ..Default::default()
+        }));
+        slot.active();
+    }
+    budget.configure_legs(&[2, 2]);
+    assert!(slots.iter().all(|slot| slot.reusable()));
+    // 2/2 becomes 1/3: the two lanes on leg 0 ask in the same instant and
+    // only the first is the excess; the second keeps its socket.
+    budget.configure_legs(&[1, 3]);
+    assert!(!slots[0].reusable());
+    assert!(slots[1].reusable());
+    assert!(
+        !slots[0].reusable(),
+        "the claim holds until the socket goes"
+    );
+    assert_eq!(budget.snapshot().closing, 1);
+    assert!(slots[2].reusable());
+    assert!(slots[3].reusable());
+    drop(slots);
+    assert_eq!(budget.snapshot().physical, 0);
+}
+
+#[test]
 fn retirement_before_socket_registration_is_not_lost() {
     let budget = SocketBudget::new(1);
     let slot = budget.try_acquire().unwrap();

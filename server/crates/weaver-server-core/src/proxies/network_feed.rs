@@ -25,8 +25,15 @@ pub struct FeedAttempt {
     /// The leg's final attempt this sync: no later rung, and no direct
     /// fallback, remains after it.
     last_attempt: bool,
+    /// The addresses the fetch checked for its host, so a direct dial uses
+    /// exactly those instead of resolving again.
+    addresses: Mutex<Option<(String, Vec<IpAddr>)>>,
 }
 impl FeedAttempt {
+    /// Pins the checked addresses a direct dial of `host` uses.
+    pub fn pin_addresses(&self, host: &str, addresses: Vec<IpAddr>) {
+        *self.addresses.lock().expect("feed addresses") = Some((host.to_owned(), addresses));
+    }
     pub async fn cancelled(&self) {
         self.guard.cancelled().await;
     }
@@ -106,10 +113,20 @@ impl TunnelProvider for FeedAttempt {
         port: u16,
         observed: Arc<ConnectionOutcome>,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        let host = host.trim_matches(['[', ']']);
+        let addresses = self
+            .addresses
+            .lock()
+            .expect("feed addresses")
+            .as_ref()
+            .filter(|(pinned, _)| pinned == host)
+            .map(|(_, addresses)| addresses.clone())
+            .unwrap_or_default();
         let target = Target {
             host: host.into(),
             port,
             purpose: Purpose::Feed { feed: self.feed },
+            addresses,
         };
         let mut dialed = self
             .guard
@@ -326,6 +343,7 @@ impl NetworkRuntime {
                         setups: Mutex::new(Vec::new()),
                         last_member: member_index + 1 == count,
                         last_attempt: false,
+                        addresses: Mutex::new(None),
                     });
                 }
             }
@@ -355,6 +373,7 @@ impl NetworkRuntime {
                     setups: Mutex::new(Vec::new()),
                     last_member: true,
                     last_attempt: false,
+                    addresses: Mutex::new(None),
                 });
             }
             if let Some(last) = leg_attempts.last_mut() {

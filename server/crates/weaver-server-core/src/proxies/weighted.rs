@@ -95,10 +95,18 @@ impl LegState {
             self.blocked = Some(self.reason.clone());
             return;
         }
+        // One outage is one cooldown. Every dial in flight when the leg
+        // went down fails against the same outage, so a failure that lands
+        // while the leg is already cooling neither counts nor lengthens the
+        // cooldown; only a probe that fails after it lapses does.
+        let now = Instant::now();
+        if self.until.is_some_and(|until| until > now) {
+            return;
+        }
         self.failures = self.failures.saturating_add(1);
         if self.failures >= 2 || self.until.is_some() {
             self.cooldowns = self.cooldowns.saturating_add(1);
-            self.until = Some(Instant::now() + cooldown(self.cooldowns));
+            self.until = Some(now + cooldown(self.cooldowns));
         }
     }
     fn succeeded(&mut self) {

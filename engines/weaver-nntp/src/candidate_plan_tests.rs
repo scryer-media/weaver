@@ -30,7 +30,7 @@ fn deliver<C: Candidate>(
 }
 fn dial<C: Candidate>(plan: &mut CandidatePlan<C>, now: Instant) -> Vec<C> {
     match plan.next_attempt(now) {
-        Attempt::Dial(order) => order,
+        Attempt::Dial { order, .. } => order,
         _ => panic!("expected sequential dial"),
     }
 }
@@ -139,7 +139,13 @@ fn scenarios<C: Candidate>([a, b, c, d]: [C; 4]) {
             let expected = if verdict == 2 && repins { b } else { a };
             assert_eq!(dial(&mut plan, at)[0], expected);
             assert_eq!(plan.stats(a).delivery.samples, 0);
-            assert_eq!(plan.stats(b).delivery.samples, 0);
+            // A challenger the verdict pinned keeps the measure it was pinned on.
+            let kept = if expected == b {
+                DELIVERY_MIN_SAMPLES
+            } else {
+                0
+            };
+            assert_eq!(plan.stats(b).delivery.samples, kept);
             assert_eq!(plan.races_won, 1);
         }
         assert_eq!(plan.repins[RaceReason::Delivery.index()], u64::from(repins));
@@ -204,6 +210,250 @@ fn socket_address_scenarios() {
 #[test]
 fn pool_member_scenarios() {
     scenarios([1_u32, 2, 3, 4]);
+}
+
+// A dial that fell through a failing pin to another candidate moves the pin
+// there, as a lease does, instead of waiting for a race no further dial runs.
+fn pin_failover<C: Candidate>([a, b]: [C; 2]) {
+    let now = Instant::now();
+    let mut plan = pinned(&[a, b], now);
+    assert_eq!(dial(&mut plan, now), [a, b]);
+    plan.failed(a, now);
+    plan.connected(b, Duration::from_millis(5), now);
+    assert_eq!(plan.pinned, Some(b));
+    assert_eq!(dial(&mut plan, now), [b, a]);
+    // A connect to the pin itself, or to another candidate while the pin is
+    // healthy, moves nothing.
+    plan.connected(b, Duration::from_millis(5), now);
+    plan.connected(a, Duration::from_millis(1), now);
+    assert_eq!(plan.pinned, Some(b));
+    // The suspect race the failures had queued is answered by the move.
+    plan.failed(b, now);
+    plan.failed(b, now);
+    assert_eq!(plan.pending, Some(RaceReason::Suspect));
+    plan.connected(a, Duration::from_millis(1), now);
+    assert_eq!(plan.pinned, Some(a));
+    assert_eq!(plan.pending, None);
+    assert_eq!(dial(&mut plan, now), [a, b]);
+    // During a race the race decides.
+    plan.failed(a, now);
+    plan.failed(a, now);
+    assert!(matches!(
+        plan.next_attempt(now),
+        Attempt::Race {
+            reason: RaceReason::Suspect,
+            ..
+        }
+    ));
+    plan.connected(b, Duration::from_millis(5), now);
+    assert_eq!(plan.pinned, Some(a));
+    plan.race_finished(Ok(b), RaceReason::Suspect, now);
+    assert_eq!(plan.pinned, Some(b));
+}
+#[test]
+fn socket_pin_failover() {
+    pin_failover([1, 2].map(|last| SocketAddr::from(([192, 0, 2, last], 563))));
+}
+#[test]
+fn member_pin_failover() {
+    pin_failover([1_u32, 2]);
+}
+
+// A shadow connection that ends before its challenger is measured earns the
+// challenger the next reconnect ahead of the pacing, for as long as its
+// connections answer and a bounded number of times when they do not; one that
+// ends measured hands the challenger to the verdict.
+fn shadow_retry<C: Candidate>([a, b, c]: [C; 3]) {
+    let now = Instant::now();
+    let mut plan = pinned(&[a, b, c], now);
+    deliver(
+        &mut plan,
+        a,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_secs(1),
+        now,
+    );
+    let at = now + SHADOW_MIN_PIN_AGE;
+    plan.connects_since_shadow = SHADOW_EVERY_CONNECTS;
+    let attempt = plan.next_attempt(at);
+    let Attempt::Dial { order, shadow, .. } = attempt else {
+        panic!("expected a shadow dial");
+    };
+    assert_eq!(order[0], b);
+    assert_eq!(shadow, Some(b));
+    // The next reconnect goes to the pin, and says so.
+    assert!(matches!(
+        plan.next_attempt(at),
+        Attempt::Dial { ref order, shadow: None, .. } if order[0] == a
+    ));
+
+    // The shadow connection ends after one answer and no sample booked: `b`
+    // is owed the very next reconnect, inside the interval and without the
+    // connects count.
+    plan.shadow_ended(b, 1, at);
+    assert!(matches!(
+        plan.next_attempt(at),
+        Attempt::Dial { ref order, shadow: Some(owed), .. } if order[0] == b && owed == b
+    ));
+    // Owed once per ended connection, not more.
+    assert!(matches!(
+        plan.next_attempt(at),
+        Attempt::Dial { ref order, shadow: None, .. } if order[0] == a
+    ));
+    // Connections that keep answering keep earning reconnects, past any bound.
+    for _ in 0..SHADOW_RETRIES * 2 {
+        plan.shadow_ended(b, 2, at);
+        assert!(matches!(
+            plan.next_attempt(at),
+            Attempt::Dial { shadow: Some(owed), .. } if owed == b
+        ));
+    }
+    assert_eq!(plan.idle_shadows, 0);
+    // Connections that never answer earn one each until the bound, after
+    // which the challenger waits its usual turn.
+    for _ in 1..SHADOW_RETRIES {
+        plan.shadow_ended(b, 0, at);
+        assert!(matches!(
+            plan.next_attempt(at),
+            Attempt::Dial { shadow: Some(owed), .. } if owed == b
+        ));
+    }
+    plan.shadow_ended(b, 0, at);
+    assert_eq!(plan.idle_shadows, SHADOW_RETRIES);
+    assert!(matches!(
+        plan.next_attempt(at),
+        Attempt::Dial { ref order, shadow: None, .. } if order[0] == a
+    ));
+    // An answer booked after its connection was counted idle still counts:
+    // it ends the streak and restores the owed reconnect.
+    plan.body_latency(b, Duration::from_millis(40), at);
+    assert_eq!(plan.idle_shadows, 0);
+    assert!(matches!(
+        plan.next_attempt(at),
+        Attempt::Dial { shadow: Some(owed), .. } if owed == b
+    ));
+    // The pin's own answers change nothing.
+    plan.body_latency(a, Duration::from_millis(40), at);
+    assert_eq!(plan.shadow_owed, None);
+    for _ in 0..SHADOW_RETRIES {
+        plan.shadow_ended(b, 0, at);
+    }
+    assert_eq!(plan.shadow_owed, None);
+    // The usual pacing still runs, and a shadow it issues starts the bound
+    // over; an answer does too.
+    plan.connects_since_shadow = SHADOW_EVERY_CONNECTS;
+    let later = at + SHADOW_INTERVAL;
+    assert!(matches!(
+        plan.next_attempt(later),
+        Attempt::Dial { shadow: Some(owed), .. } if owed == b
+    ));
+    assert_eq!(plan.idle_shadows, 0);
+    plan.shadow_ended(b, 0, later);
+    assert!(matches!(
+        plan.next_attempt(later),
+        Attempt::Dial { shadow: Some(owed), .. } if owed == b
+    ));
+    plan.shadow_ended(b, 3, later);
+    assert_eq!(plan.idle_shadows, 0);
+    assert!(matches!(
+        plan.next_attempt(later),
+        Attempt::Dial { shadow: Some(owed), .. } if owed == b
+    ));
+
+    // A challenger that ended measured is not owed anything: the verdict has it.
+    deliver(
+        &mut plan,
+        b,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_secs(1),
+        later,
+    );
+    plan.shadow_ended(b, 1, later);
+    assert_eq!(plan.shadow_owed, None);
+    assert!(matches!(
+        plan.next_attempt(later),
+        Attempt::Dial { ref order, shadow: None, .. } if order[0] == a
+    ));
+
+    // That verdict reset the pin and `b`, which it judged, but not `c`: a
+    // challenger short of a measure keeps what it has booked across
+    // verdicts on others. The next shadow goes to the challenger closest to
+    // a measure, so `c` with its few samples is preferred to `b` with none.
+    assert_eq!(plan.stats(a).delivery.samples, 0);
+    assert_eq!(plan.stats(b).delivery.samples, 0);
+    deliver(&mut plan, c, 3, Duration::from_secs(1), later);
+    plan.connects_since_shadow = SHADOW_EVERY_CONNECTS;
+    let after = later + SHADOW_INTERVAL;
+    deliver(
+        &mut plan,
+        a,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_secs(1),
+        after,
+    );
+    assert!(matches!(
+        plan.next_attempt(after),
+        Attempt::Dial { shadow: Some(owed), .. } if owed == c
+    ));
+    assert_eq!(plan.stats(c).delivery.samples, 3);
+    // Nor does a later verdict on `b` take them from `c`.
+    deliver(
+        &mut plan,
+        b,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_secs(1),
+        after,
+    );
+    let judged = after + DELIVERY_VERDICT_INTERVAL;
+    deliver(
+        &mut plan,
+        a,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_secs(1),
+        judged,
+    );
+    plan.shadow_ended(c, 1, judged);
+    // The verdict leaves the pin unmeasured until it books again, so the
+    // owed reconnect waits for that rather than lapsing.
+    assert!(matches!(
+        plan.next_attempt(judged),
+        Attempt::Dial { ref order, shadow: None, .. } if order[0] == a
+    ));
+    assert_eq!(plan.last_verdict_at, Some(judged));
+    assert_eq!(plan.stats(a).delivery.samples, 0);
+    assert_eq!(plan.stats(b).delivery.samples, 0);
+    assert_eq!(plan.stats(c).delivery.samples, 3);
+    assert_eq!(plan.shadow_owed, Some(c));
+    deliver(
+        &mut plan,
+        a,
+        DELIVERY_MIN_SAMPLES,
+        Duration::from_secs(1),
+        judged,
+    );
+    assert!(matches!(
+        plan.next_attempt(judged),
+        Attempt::Dial { shadow: Some(owed), .. } if owed == c
+    ));
+
+    // A challenger that is failing, or no longer a candidate, is not owed.
+    plan.shadow_ended(c, 1, judged);
+    plan.failed(c, judged);
+    assert!(matches!(
+        plan.next_attempt(judged),
+        Attempt::Dial { ref order, shadow: None, .. } if order[0] == a
+    ));
+    plan.set_candidates(vec![a, b], judged);
+    plan.shadow_ended(c, 1, judged);
+    assert_eq!(plan.shadow_owed, None);
+}
+#[test]
+fn socket_shadow_retry() {
+    shadow_retry([1, 2, 3].map(|last| SocketAddr::from(([192, 0, 2, last], 563))));
+}
+#[test]
+fn member_shadow_retry() {
+    shadow_retry([1_u32, 2, 3]);
 }
 
 // Selection cases from the address driver also run directly against both candidate keys.

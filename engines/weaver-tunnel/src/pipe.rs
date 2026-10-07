@@ -42,6 +42,22 @@ pub struct Target {
     pub host: String,
     pub port: u16,
     pub purpose: Purpose,
+    /// The addresses `host` resolved to when the caller checked them, so a
+    /// dial connects exactly those instead of resolving `host` again; empty
+    /// when the dial, or the proxy it goes through, resolves for itself.
+    pub addresses: Vec<IpAddr>,
+}
+impl Target {
+    /// The destinations a hop asks its proxy for, in order: each checked
+    /// address when the caller pinned them, so the proxy never resolves
+    /// `host` itself, else `host`.
+    fn hop_destinations(&self) -> Vec<String> {
+        if self.addresses.is_empty() {
+            vec![self.host.clone()]
+        } else {
+            self.addresses.iter().map(|ip| ip.to_string()).collect()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,12 +163,7 @@ pub struct Dialed {
 impl Dialed {
     /// Preserve outcome ownership when adapting a pipe to a tunnel consumer.
     pub fn into_observed_stream(self) -> Box<dyn TunnelStream> {
-        Box::new(OutcomeStream {
-            stream: self.stream,
-            outcome: self.outcome,
-            _session: None,
-            _capacity: None,
-        })
+        Box::new(OutcomeStream::new(self.stream, self.outcome, None, None))
     }
 }
 
@@ -219,7 +230,8 @@ impl DialError {
     fn hop(proxy: u32, source: TunnelError) -> Self {
         if matches!(source, TunnelError::HostKeyMismatch { .. }) {
             Self::Fatal(source)
-        } else if matches!(&source, TunnelError::Dial { detail, .. } if is_forwarding_refusal(detail)) {
+        } else if matches!(&source, TunnelError::Dial { detail, .. } if is_forwarding_refusal(detail))
+        {
             // The proxy answered and refused to forward at all. That is the
             // proxy's policy, not the destination, so it is evidence against
             // the path, as an HTTP proxy refusing CONNECT is.
@@ -336,10 +348,19 @@ impl Dialer for Egress {
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let started = tokio::time::Instant::now();
         let attempt = async {
-            let peers: Vec<_> = tokio::net::lookup_host((target.host.as_str(), target.port))
-                .await
-                .map_err(DialError::Destination)?
-                .filter(|peer| self.binding.supports_address(peer.ip()))
+            let peers: Vec<_> = if target.addresses.is_empty() {
+                tokio::net::lookup_host((target.host.as_str(), target.port))
+                    .await
+                    .map_err(DialError::Destination)?
+                    .map(|peer| peer.ip())
+                    .collect()
+            } else {
+                target.addresses.clone()
+            };
+            let peers: Vec<_> = peers
+                .into_iter()
+                .filter(|ip| self.binding.supports_address(*ip))
+                .map(|ip| SocketAddr::new(ip, target.port))
                 .collect();
             let mut last = DialError::Skipped("no compatible destination address".into());
             for (index, peer) in peers.iter().enumerate() {
@@ -417,22 +438,37 @@ impl Dialer for TransportHop {
             host: self.spec.host.clone(),
             port: self.spec.port,
             purpose: Purpose::ProxyEndpoint { proxy: self.id },
+            addresses: Vec::new(),
         };
-        let mut dialed = self.inner.dial(&endpoint).await?;
-        tokio::time::timeout(
-            self.timeout,
-            self.spec
-                .negotiate(&mut dialed.stream, &target.host, target.port),
-        )
-        .await
-        .map_err(|_| DialError::Timeout {
-            stage: self.describe(),
-        })?
-        .map_err(|error| DialError::hop(self.id, error))?;
-        // A negotiated socket carries proxy framing and cannot use NNTP's raw TCP fast path.
-        dialed.stream = DialedStream::Tunnel(dialed.stream.into_tunnel());
-        dialed.path.proxies.push(self.id);
-        Ok(dialed)
+        let destinations = target.hop_destinations();
+        let started = tokio::time::Instant::now();
+        let mut last = None;
+        for (index, destination) in destinations.iter().enumerate() {
+            let mut dialed = self.inner.dial(&endpoint).await?;
+            // Reserve part of the remaining budget for every other address.
+            let remaining = self.timeout.saturating_sub(started.elapsed());
+            let negotiated = tokio::time::timeout(
+                remaining / (destinations.len() - index) as u32,
+                self.spec
+                    .negotiate(&mut dialed.stream, destination, target.port),
+            )
+            .await
+            .map_err(|_| DialError::Timeout {
+                stage: self.describe(),
+            })
+            .and_then(|result| result.map_err(|error| DialError::hop(self.id, error)));
+            match negotiated {
+                Ok(()) => {
+                    // A negotiated socket carries proxy framing and cannot use NNTP's raw TCP fast path.
+                    dialed.stream = DialedStream::Tunnel(dialed.stream.into_tunnel());
+                    dialed.path.proxies.push(self.id);
+                    return Ok(dialed);
+                }
+                Err(error @ DialError::Fatal(_)) => return Err(error),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.expect("a hop dials at least one destination"))
     }
     fn budget(&self) -> Duration {
         self.inner.budget().saturating_add(self.timeout)
@@ -461,6 +497,7 @@ impl EndpointTransport for InnerTransport {
             host: host.into(),
             port,
             purpose: Purpose::ProxyEndpoint { proxy: self.proxy },
+            addresses: Vec::new(),
         };
         let dialed = self
             .inner
@@ -474,24 +511,48 @@ impl EndpointTransport for InnerTransport {
             Some((dialed.path, dialed.peer, dialed.source));
         Ok(EndpointStream {
             source: dialed.source,
-            stream: Box::new(OutcomeStream {
-                stream: dialed.stream,
-                outcome: dialed.outcome,
-                _session: None,
-                _capacity: None,
-            }),
+            stream: Box::new(OutcomeStream::new(
+                dialed.stream,
+                dialed.outcome,
+                None,
+                None,
+            )),
         })
     }
 }
 
 struct OutcomeStream {
-    stream: DialedStream,
+    stream: std::mem::ManuallyDrop<DialedStream>,
     outcome: Arc<ConnectionOutcome>,
+    /// The runtime the stream was dialed on. A tunnel stream closes itself
+    /// from a task it spawns when dropped, so it is dropped inside that
+    /// runtime wherever the drop happens, a blocking lane thread included.
+    runtime: Option<tokio::runtime::Handle>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
+impl OutcomeStream {
+    fn new(
+        stream: DialedStream,
+        outcome: Arc<ConnectionOutcome>,
+        session: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Self {
+        Self {
+            stream: std::mem::ManuallyDrop::new(stream),
+            outcome,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            _session: session,
+            _capacity: capacity,
+        }
+    }
+}
 impl Drop for OutcomeStream {
     fn drop(&mut self) {
+        let _runtime = self.runtime.as_ref().map(tokio::runtime::Handle::enter);
+        // SAFETY: the stream is dropped exactly once, here, and never used
+        // again; the guard above holds the runtime for the drop.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.stream) };
         self.outcome.closed();
     }
 }
@@ -501,7 +562,7 @@ impl AsyncRead for OutcomeStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let result = Pin::new(&mut self.stream).poll_read(cx, buf);
+        let result = Pin::new(&mut *self.stream).poll_read(cx, buf);
         if matches!(result, Poll::Ready(Err(_))) {
             self.outcome.failed();
         }
@@ -514,17 +575,17 @@ impl AsyncWrite for OutcomeStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let result = Pin::new(&mut self.stream).poll_write(cx, buf);
+        let result = Pin::new(&mut *self.stream).poll_write(cx, buf);
         if matches!(result, Poll::Ready(Err(_))) {
             self.outcome.failed();
         }
         result
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
+        Pin::new(&mut *self.stream).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        Pin::new(&mut *self.stream).poll_shutdown(cx)
     }
 }
 
@@ -606,16 +667,26 @@ impl Dialer for SessionHop {
         let activity = self.activity.clone().read_owned().await;
         let capacity = self.capacity.acquire()?;
         let outcome = Arc::new(ConnectionOutcome::default());
-        let connected = tokio::time::timeout(
-            self.budget(),
-            self.provider
-                .dial_observed(&target.host, target.port, outcome.clone()),
-        )
-        .await
-        .map_err(|_| DialError::Timeout {
-            stage: self.describe(),
-        })
-        .and_then(|result| result.map_err(|error| DialError::hop(self.id, error)));
+        let destinations = target.hop_destinations();
+        let started = tokio::time::Instant::now();
+        let mut connected = Err(DialError::Skipped("no destination".into()));
+        for (index, destination) in destinations.iter().enumerate() {
+            // Reserve part of the remaining budget for every other address.
+            let remaining = self.budget().saturating_sub(started.elapsed());
+            connected = tokio::time::timeout(
+                remaining / (destinations.len() - index) as u32,
+                self.provider
+                    .dial_observed(destination, target.port, outcome.clone()),
+            )
+            .await
+            .map_err(|_| DialError::Timeout {
+                stage: self.describe(),
+            })
+            .and_then(|result| result.map_err(|error| DialError::hop(self.id, error)));
+            if matches!(connected, Ok(_) | Err(DialError::Fatal(_))) {
+                break;
+            }
+        }
         let stream = match connected {
             Ok(stream) => stream,
             Err(error) => {
@@ -641,12 +712,12 @@ impl Dialer for SessionHop {
         });
         path.proxies.push(self.id);
         Ok(Dialed {
-            stream: DialedStream::Tunnel(Box::new(OutcomeStream {
-                stream: DialedStream::Tunnel(stream),
-                outcome: outcome.clone(),
-                _session: Some(activity),
-                _capacity: capacity,
-            })),
+            stream: DialedStream::Tunnel(Box::new(OutcomeStream::new(
+                DialedStream::Tunnel(stream),
+                outcome.clone(),
+                Some(activity),
+                capacity,
+            ))),
             outcome,
             path,
             peer,

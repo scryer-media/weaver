@@ -147,6 +147,7 @@ impl RssService {
                     "RSS destination address is not allowed".into(),
                 ));
             }
+            attempt.pin_addresses(host.trim_matches(['[', ']']), addresses.clone());
             ResolvedFetchTarget {
                 url: url.clone(),
                 host: host.to_owned(),
@@ -173,9 +174,11 @@ impl RssService {
             .map_err(|_| AttemptError::Route)?;
         if let Some(bridge) = &bridge {
             let addr = bridge.addr().map_err(|_| AttemptError::Route)?;
-            // socks5 (not socks5h) uses exactly the checked addresses below.
+            // socks5h hands the bridge the hostname: a proxy hop forwards it
+            // as NNTP does, and a direct dial uses exactly the checked
+            // addresses pinned on the attempt, trying each in turn.
             builder = builder.proxy(
-                reqwest::Proxy::all(format!("socks5://{addr}"))
+                reqwest::Proxy::all(format!("socks5h://{addr}"))
                     .map_err(|_| AttemptError::Route)?
                     .basic_auth(bridge.credentials().0, bridge.credentials().1),
             );

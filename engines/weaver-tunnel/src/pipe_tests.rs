@@ -13,6 +13,7 @@ fn target(address: SocketAddr) -> Target {
         host: address.ip().to_string(),
         port: address.port(),
         purpose: Purpose::Probe,
+        addresses: Vec::new(),
     }
 }
 
@@ -44,6 +45,86 @@ async fn direct_stage_keeps_a_real_socket_and_revokes_only_its_leg() {
         first.dial(&target(listener.local_addr().unwrap())).await,
         Err(DialError::Skipped(_))
     ));
+}
+
+#[tokio::test]
+async fn a_direct_dial_uses_the_pinned_addresses_instead_of_resolving() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let egress = bottom();
+    let pinned = Target {
+        host: "feed.invalid".into(),
+        port,
+        purpose: Purpose::Probe,
+        addresses: vec!["127.0.0.1".parse().unwrap()],
+    };
+    let mut dialed = egress.dial(&pinned).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    dialed.stream.write_all(b"x").await.unwrap();
+    let mut byte = [0];
+    peer.read_exact(&mut byte).await.unwrap();
+    assert_eq!(byte, *b"x");
+    let unpinned = Target {
+        host: "feed.invalid".into(),
+        port,
+        purpose: Purpose::Probe,
+        addresses: Vec::new(),
+    };
+    assert!(egress.dial(&unpinned).await.is_err());
+}
+
+/// A stream that, like an SSH channel, closes itself from a task it spawns
+/// when dropped.
+struct ClosesFromATask(tokio::io::DuplexStream);
+impl Drop for ClosesFromATask {
+    fn drop(&mut self) {
+        tokio::spawn(async {});
+    }
+}
+impl AsyncRead for ClosesFromATask {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for ClosesFromATask {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn a_dialed_tunnel_stream_dropped_off_the_runtime_closes_inside_it() {
+    let (stream, _peer) = tokio::io::duplex(16);
+    let outcome = Arc::new(ConnectionOutcome::default());
+    let dialed = Dialed {
+        stream: DialedStream::Tunnel(Box::new(ClosesFromATask(stream))),
+        outcome: outcome.clone(),
+        path: DialPath::default(),
+        peer: None,
+        source: None,
+        setup: None,
+    };
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = closed.clone();
+    outcome.on_close(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+    let observed = dialed.into_observed_stream();
+    // A blocking lane thread has no runtime of its own.
+    std::thread::spawn(move || drop(observed)).join().unwrap();
+    assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 async fn connect_proxy(
@@ -102,6 +183,7 @@ async fn chained_connect_hops_preserve_source_path_and_destination_name() {
             host: "news.invalid".into(),
             port: 119,
             purpose: Purpose::Probe,
+            addresses: Vec::new(),
         })
         .await
         .unwrap();
@@ -405,9 +487,15 @@ fn an_ssh_forwarding_refusal_is_hop_evidence_and_an_unreachable_destination_is_n
         detail: detail.into(),
     };
     let refused = DialError::hop(3, dial("AdministrativelyProhibited"));
-    assert!(matches!(&refused, DialError::Hop { proxy: 3, .. }), "{refused:?}");
+    assert!(
+        matches!(&refused, DialError::Hop { proxy: 3, .. }),
+        "{refused:?}"
+    );
     assert!(refused.is_path_evidence());
     let unreachable = DialError::hop(3, dial("ConnectFailed"));
-    assert!(matches!(&unreachable, DialError::Destination(_)), "{unreachable:?}");
+    assert!(
+        matches!(&unreachable, DialError::Destination(_)),
+        "{unreachable:?}"
+    );
     assert!(!unreachable.is_path_evidence());
 }

@@ -870,6 +870,7 @@ impl NetworkRuntime {
                             host: host.into(),
                             port,
                             purpose: weaver_tunnel::pipe::Purpose::Probe,
+                            addresses: Vec::new(),
                         })
                         .await
                         .map_err(|e| e.to_string())?;

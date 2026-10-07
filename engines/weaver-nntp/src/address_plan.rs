@@ -133,6 +133,14 @@ pub const SHADOW_INTERVAL: Duration = Duration::from_secs(30);
 /// at any time.
 pub const SHADOW_EVERY_CONNECTS: u32 = 8;
 
+/// How many shadow connections in a row may end without one response from
+/// their challenger and still earn it the next reconnect ahead of the pacing
+/// above. Past this the challenger waits its usual turn: one that connects
+/// but never answers must not keep a busy pool's reconnects off the pin. A
+/// connection that answered, however briefly, starts the count over, so a
+/// server that drops connections early is still measured.
+pub const SHADOW_RETRIES: u32 = 8;
+
 /// How long booked delivery stays evidence. A server idle for longer than
 /// this has samples from a different time, and possibly the pin's from one
 /// time and a challenger's from another, so they are not judged.
@@ -372,7 +380,9 @@ impl AddressPlan {
             let now = self.now();
             let next = self.state().next(now);
             match next {
-                Next::Dial(order, announce) => {
+                Next::Dial {
+                    order, announce, ..
+                } => {
                     if let Some(announce) = announce {
                         announce.log(&self.label);
                     }

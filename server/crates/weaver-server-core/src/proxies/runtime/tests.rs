@@ -1,4 +1,5 @@
 use super::*;
+use crate::proxies::{LegPath, RouteLeg, Rung};
 mod credentials;
 mod http3;
 mod review_regressions;
@@ -311,6 +312,58 @@ async fn reload_preserves_unaffected_sessions_and_revokes_changed_profile() {
             .route(Consumer::Server(2), Duration::from_secs(1))
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn reweighting_legs_keeps_the_legacy_route_and_its_sockets() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&server(1)).unwrap();
+    let legs = |weight| RoutingPolicy {
+        legs: vec![
+            RouteLeg {
+                egress_id: 0,
+                weight,
+                path: LegPath::Direct,
+            },
+            RouteLeg {
+                egress_id: 0,
+                weight: 100 - weight,
+                path: LegPath::Direct,
+            },
+        ],
+        ..Default::default()
+    };
+    db.save_proxy_routing_policy(Consumer::Server(1), &legs(50))
+        .unwrap();
+    let runtime = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let route = runtime
+        .route(Consumer::Server(1), Duration::from_secs(1))
+        .unwrap();
+    // A reweight is the network runtime's to apply in place; it must not
+    // rebuild the legacy route, which would close every socket it tracks.
+    db.save_proxy_routing_policy(Consumer::Server(1), &legs(80))
+        .unwrap();
+    runtime.reload().await.unwrap();
+    assert!(!route.is_revoked());
+    assert!(Arc::ptr_eq(
+        &route,
+        &runtime
+            .route(Consumer::Server(1), Duration::from_secs(1))
+            .unwrap()
+    ));
+    // Putting a proxy in front of the first leg changes the legacy
+    // projection, and that does rebuild the route.
+    db.save_proxy_profile(&profile(1)).unwrap();
+    let mut proxied = legs(80);
+    proxied.legs[0].path = LegPath::Ladder {
+        rungs: vec![Rung::Proxy { id: 1 }],
+        direct_fallback: false,
+    };
+    db.save_proxy_routing_policy(Consumer::Server(1), &proxied)
+        .unwrap();
+    runtime.reload().await.unwrap();
+    assert!(route.is_revoked());
+    runtime.stop_all().await;
 }
 
 #[tokio::test]

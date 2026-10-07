@@ -73,6 +73,7 @@ fn target() -> Target {
         host: "news.invalid".into(),
         port: 119,
         purpose: Purpose::Nntp { server: 1, leg: 0 },
+        addresses: Vec::new(),
     }
 }
 
@@ -380,4 +381,47 @@ async fn hung_preparation_is_bounded_and_other_member_can_win() {
             .failures,
         1
     );
+}
+
+#[tokio::test]
+async fn connections_that_fail_after_setup_do_not_make_the_pin_suspect() {
+    let (pool, members, mut started) = fixtures();
+    let caller = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dial(&target()).await }
+    });
+    started.recv().await.unwrap();
+    started.recv().await.unwrap();
+    let finished = pool.state.changed.notified();
+    tokio::pin!(finished);
+    finished.as_mut().enable();
+    for member in &members {
+        member.gate.add_permits(1);
+    }
+    let first = caller.await.unwrap().unwrap();
+    finished.await;
+    let pin = pool.snapshot().0.pinned.unwrap();
+    assert_eq!(first.path.member, Some(pin));
+    // The pinned connection dies twice over, as a server dropping sessions
+    // mid-transfer would have it; the pool must not treat that as the pin
+    // refusing connects and race again.
+    first.outcome.failed();
+    first.outcome.failed();
+    let (plan, _) = pool.snapshot();
+    assert_eq!(plan.pinned, Some(pin));
+    assert!(
+        plan.candidates.iter().all(|c| c.failures == 0),
+        "{:?}",
+        plan.candidates
+    );
+    members[pin as usize - 1].gate.add_permits(1);
+    let next = pool.dial(&target()).await.unwrap();
+    assert_eq!(
+        next.path.member,
+        Some(pin),
+        "the reconnect dials the pin, not a race"
+    );
+    assert_eq!(started.recv().await.unwrap(), pin);
+    assert!(started.try_recv().is_err(), "no other member was dialled");
+    assert_eq!(pool.snapshot().0.races_won, 1);
 }
