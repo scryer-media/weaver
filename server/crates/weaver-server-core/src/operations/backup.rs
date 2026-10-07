@@ -31,6 +31,7 @@ mod restore;
 mod service;
 mod stored;
 mod upgrade;
+pub(crate) use upgrade::LAST_VERSION;
 pub use upgrade::{
     prepare_upgrade_backup, record_started_version, reset_automatic_backup_settings,
     skip_upgrade_backup,

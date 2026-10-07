@@ -11,7 +11,10 @@ use super::stored::{
 };
 use crate::persistence::database_target::DatabaseTarget;
 
-const LAST_VERSION: &str = "last_started_version";
+/// Settings key holding the version that last started against this database.
+/// It is written as soon as the database opens, before first-run configuration
+/// is imported, so it does not make the database hold settings of its own.
+pub(crate) const LAST_VERSION: &str = "last_started_version";
 const PENDING_VERSION: &str = "pending_auto_backup_version";
 
 /// Record the version after the database has opened and restore recovery has completed.
