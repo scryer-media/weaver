@@ -44,9 +44,20 @@ impl Pipeline {
     }
 
     pub(crate) fn persist_active_runtime(&self, job_id: JobId) {
+        self.persist_active_runtime_at(job_id, None);
+    }
+
+    /// [`Self::persist_active_runtime`] that also records `output_dir` as the
+    /// job's output location in the same ordered write.
+    pub(crate) fn persist_active_runtime_at(
+        &self,
+        job_id: JobId,
+        output_dir: Option<std::path::PathBuf>,
+    ) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
+        let output_dir = output_dir.map(|dir| dir.to_string_lossy().into_owned());
         let status = Self::persist_active_status_for(&state.status).to_string();
         let error = match &state.status {
             JobStatus::Failed { error } => Some(error.clone()),
@@ -94,8 +105,9 @@ impl Pipeline {
         if let Err(error) =
             self.db
                 .try_queue_job_write(job_id, "set_active_job_runtime", move |db| {
-                    db.set_active_job_runtime(
+                    db.set_active_job_runtime_at(
                         job_id,
+                        output_dir.as_deref(),
                         &status,
                         Some(&download_state),
                         Some(&post_state),

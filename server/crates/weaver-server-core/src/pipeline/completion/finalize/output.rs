@@ -1395,11 +1395,24 @@ impl Pipeline {
                 final_directory_override: None,
             },
         };
+        let delivered_dir = primary_failure
+            .is_none()
+            .then(|| context.working_directory.clone());
         self.transition_postprocessing_status(
             job_id,
             JobStatus::QueuedPostProcessing,
             Some("queued for post-processing scripts"),
         );
+        // A delivered job's output now lives only at its final location, and
+        // the scripts may wait on queue events before the executor records
+        // that they started. Make that fact durable first, in the job's
+        // ordered write lane, so a restart in that window resumes the scripts
+        // against the delivered output instead of re-finalizing a working
+        // directory the move already emptied. A failed job is not recorded
+        // here: restored, it would run its scripts as a success.
+        if let Some(delivered_dir) = delivered_dir {
+            self.persist_active_runtime_at(job_id, Some(delivered_dir));
+        }
         self.publish_snapshot();
         let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
         self.terminal_post_processing_cancellations

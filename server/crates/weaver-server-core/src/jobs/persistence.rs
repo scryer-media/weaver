@@ -1020,8 +1020,48 @@ impl Database {
         paused_resume_download_state: Option<&str>,
         paused_resume_post_state: Option<&str>,
     ) -> Result<(), StateError> {
+        self.set_active_job_runtime_at(
+            job_id,
+            None,
+            status,
+            download_state,
+            post_state,
+            run_state,
+            error,
+            queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms,
+            paused_resume_status,
+            paused_resume_download_state,
+            paused_resume_post_state,
+        )
+    }
+
+    /// [`Self::set_active_job_runtime`] that also moves the job's recorded
+    /// output directory in the same statement, so a restart can never read the
+    /// new runtime against the old location or the other way round. `None`
+    /// keeps the directory already recorded.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "active job runtime is persisted as one atomic SQL update"
+    )]
+    pub fn set_active_job_runtime_at(
+        &self,
+        job_id: JobId,
+        output_dir: Option<&str>,
+        status: &str,
+        download_state: Option<&str>,
+        post_state: Option<&str>,
+        run_state: Option<&str>,
+        error: Option<&str>,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<&str>,
+        paused_resume_download_state: Option<&str>,
+        paused_resume_post_state: Option<&str>,
+    ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = vec![
+            SqlArg::OptText(output_dir.map(str::to_string)),
             SqlArg::Text(status.to_string()),
             SqlArg::OptText(download_state.map(str::to_string)),
             SqlArg::OptText(post_state.map(str::to_string)),
@@ -1042,7 +1082,8 @@ impl Database {
                         Box::pin(async move {
                             tx.execute(
                                 "UPDATE active_jobs
-                                 SET status = {},
+                                 SET output_dir = COALESCE({}, output_dir),
+                                     status = {},
                                      download_state = {},
                                      post_state = {},
                                      run_state = {},
@@ -1065,7 +1106,8 @@ impl Database {
                     SqlRuntime::execute(
                         datastore.read_exec(),
                         "UPDATE active_jobs
-                         SET status = {},
+                         SET output_dir = COALESCE({}, output_dir),
+                             status = {},
                              download_state = {},
                              post_state = {},
                              run_state = {},
