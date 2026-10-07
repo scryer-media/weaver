@@ -1,12 +1,12 @@
 import { expect, graphql, test } from "./helpers";
 import { waitTerminal } from "./support/downloads";
 import {
-  type NetworkFlow, type ProxyProfile, type ProxyProfileInput, directLeg, flowAfter, flowMark, ladderLeg, legOn,
+  type NetworkFlow, type ProxyProfile, type ProxyProfileInput, directLeg, flowAfter, flowMark, graphqlErrors, hostAddress, ladderLeg, legOn,
   proxyProfiles, resetProxyHostKey, rung, saveProxyProfile, serverKey,
 } from "./support/network-flow";
 import { NetworkWorld, PROXIED_HOST, saveEvidence } from "./support/network-scenario";
 import { fixtureEvents, fixtureMark } from "./support/proxy-fixture";
-import { controlTunnel, tunnelMark, tunnelState, waitTunnelEvents } from "./support/tunnel-fixture";
+import { TUNNEL_PORTS, controlTunnel, tunnelMark, tunnelState, waitTunnelEvents } from "./support/tunnel-fixture";
 
 /** Sessions: SSH, WireGuard, HTTP/3. */
 let world: NetworkWorld;
@@ -36,19 +36,28 @@ async function sshServer(profile: ProxyProfile) {
   return { a, server, leg };
 }
 
-test("S01 SSH password auth forwards to the NNTP server", async ({ request }) => {
+test("S01 a password-only SSH profile is refused; key auth forwards to the NNTP server", async ({ request }) => {
   test.setTimeout(10 * 60_000);
+  // Weaver's SSH tunnels take an Ed25519 key only; password authentication is not offered.
+  const client = (await tunnelState(request)).sshClient;
+  const before = (await proxyProfiles(request)).length;
+  const refused = await graphqlErrors(request,
+    "mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }",
+    { input: { name: `s01-password-${Date.now()}`, kind: "SSH", enabled: true, host: hostAddress("tunnel-fixture", "a"), port: TUNNEL_PORTS.ssh1,
+      username: client.username, password: client.password, timeoutSeconds: 5 } });
+  expect(refused.join("\n")).toContain("SSH requires an Ed25519 private key");
+  expect(await proxyProfiles(request)).toHaveLength(before);
   const ssh1 = await world.ssh("ssh1");
   const seen = (await tunnelState(request)).ssh.ssh1!.acceptedAuth.length;
   await sshServer(ssh1);
-  const download = await world.download("s01-password");
+  const download = await world.download("s01-key");
   expect(await waitTerminal(request, download.jobId)).toBe("COMPLETED");
   const state = (await tunnelState(request)).ssh.ssh1!;
-  expect(authSince(state.acceptedAuth, seen)).toEqual(["password"]);
+  expect(authSince(state.acceptedAuth, seen)).toEqual(["publickey"]);
   expect(state.forwarded).toContainEqual(["nntp", 119]);
 });
 
-test("S02 SSH key and passphrase-protected key auth; a wrong passphrase takes the leg Down", async ({ request }) => {
+test("S02 SSH key and passphrase-protected key auth; a wrong passphrase is refused at save", async ({ request }) => {
   test.setTimeout(10 * 60_000);
   for (const [endpoint, auth] of [["ssh2", "key"], ["ssh3", "passphrase"]] as const) {
     const profile = await world.ssh(endpoint, { auth });
@@ -59,17 +68,16 @@ test("S02 SSH key and passphrase-protected key auth; a wrong passphrase takes th
     expect(authSince((await tunnelState(request)).ssh[endpoint]!.acceptedAuth, seen), endpoint).toEqual(["publickey"]);
     await world.updateServer(server, { active: false });
   }
-  const wrong = await world.ssh("ssh3", { auth: "wrong-passphrase" });
-  const { leg } = await sshServer(wrong);
-  const mark = await flowMark(request);
-  const download = await world.download("s02-wrong-passphrase");
-  try {
-    const flow = await flowAfter(request, mark, sample => leg(sample)?.state === "DOWN" || leg(sample)?.state === "BLOCKED", "leg Down on the key error");
-    expect(leg(flow)?.reason?.trim()).toBeTruthy();
-  } finally {
-    // The job can never download through a leg that cannot authenticate.
-    await graphql(request, "mutation($id: Int!) { cancelJob(id: $id) }", { id: download.jobId });
-  }
+  // Saving decrypts the key with its passphrase, so a wrong passphrase is
+  // refused before any profile exists and no leg can ever dial with it.
+  const client = (await tunnelState(request)).sshClient;
+  const before = await proxyProfiles(request);
+  const refused = await graphqlErrors(request,
+    "mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }",
+    { input: { name: `s02-wrong-passphrase-${Date.now()}`, kind: "SSH", enabled: true, host: hostAddress("tunnel-fixture", "a"), port: TUNNEL_PORTS.ssh3,
+      username: client.username, privateKey: client.privateKeyWithPassphrase, passphrase: `${client.passphrase}-wrong`, timeoutSeconds: 5 } });
+  expect(refused.join("\n")).toContain("the private key could not be read");
+  expect(await proxyProfiles(request)).toEqual(before);
 });
 
 test("S03 a host key that changes after first use blocks the leg until reset", async ({ request }) => {
@@ -116,9 +124,9 @@ test("S05 two servers on one SSH profile share a session that closes when both r
   // Both jobs are in flight together, so the session is busy throughout and
   // one connect is the only correct count.
   const paced = await world.pacedDownload("s05-one", { parts: 64, slowMs: 500 });
-  const second = await world.download("s05-two");
+  const unpaced = await world.download("s05-two");
   expect(await paced.release()).toBe("COMPLETED");
-  expect(await waitTerminal(request, second.jobId)).toBe("COMPLETED");
+  expect(await waitTerminal(request, unpaced.jobId)).toBe("COMPLETED");
   const flow = await flowAfter(request, await flowMark(request), sample => [first, second].every(id => legOn(sample, serverKey(id), a.id) !== undefined), "both legs present");
   const connects = (await waitTunnelEvents(request, mark, events => events.some(event => event.kind === "connect" && event.endpoint === "ssh1"), "an SSH session on ssh1"))
     .filter(event => event.kind === "connect" && event.endpoint === "ssh1");
@@ -156,12 +164,24 @@ test("S07 WireGuard carries NNTP and RSS through the tunnel; a wrong preshared k
   await world.server({ host: "nntp.proxy.test", route: { legs: [ladderLeg(a.id, [rung.proxy(wg2.id)], 100)] } });
   const download = await world.download("s07-wireguard");
   expect(await waitTerminal(request, download.jobId)).toBe("COMPLETED");
+  // Each fixture peer answers only its own names and forwards to one service:
+  // wg2 carries NNTP, wg-rss carries the feed host.
+  const wgRss = await world.wireguard("wg-rss");
   const url = await world.armFeed(`s07-${Date.now()}`, "rss.proxy.test");
-  const feed = await world.feed({ url, route: { legs: [ladderLeg(a.id, [rung.proxy(wg2.id)], 100)] } });
-  expect((await world.sync(feed)).errors).toEqual([]);
-  const peer = (await tunnelState(request)).wireguard.wg2!;
-  expect(peer.dnsQueries).toEqual(expect.arrayContaining(["nntp.proxy.test", "rss.proxy.test"]));
-  expect(peer.requests.length).toBeGreaterThan(0);
+  const feed = await world.feed({ url, route: { legs: [ladderLeg(a.id, [rung.proxy(wgRss.id)], 100)] } });
+  // A forwarding peer records no request lines; the bytes it received from the
+  // client show the feed request crossed the tunnel.
+  const rxBefore = (await tunnelState(request)).wireguard["wg-rss"]!.clientRxBytes;
+  const report = await world.sync(feed);
+  expect(report.errors).toEqual([]);
+  expect(report.itemsFetched).toBeGreaterThan(0);
+  const peers = (await tunnelState(request)).wireguard;
+  expect(peers.wg2!.dnsQueries).toContain("nntp.proxy.test");
+  expect(peers["wg-rss"]!.dnsQueries).toContain("rss.proxy.test");
+  expect(peers["wg-rss"]!.clientRxBytes).toBeGreaterThan(rxBefore);
+  // Every WireGuard profile on a route is its own instance; a host's budget
+  // can be as small as two, so the feed gives its instance back before a third is routed.
+  await world.route("RSS", feed, { legs: [directLeg(a.id, 100)] });
   const wrong = await world.wireguard("wg2", { wrongPresharedKey: true });
   const b = await world.egress("b");
   const server = await world.server({ host: "nntp.proxy.test", route: { legs: [ladderLeg(b.id, [rung.proxy(wrong.id)], 100)] } });

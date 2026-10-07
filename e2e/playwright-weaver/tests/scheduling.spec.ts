@@ -8,7 +8,7 @@ import {
 import { literal, setting, waitRows } from "./support/datastore";
 import { jobState, startDownload, waitTerminal } from "./support/downloads";
 import { readClock, setClock } from "./support/e2e-clock";
-import { stage } from "./support/network-flow";
+import { graphqlErrors, stage } from "./support/network-flow";
 import { loadStageState, nzbDocument, nzbgetRpc, saveStageState, withControlKey } from "./support/script-settings";
 
 /**
@@ -579,7 +579,8 @@ test("T08 a server is out of rotation for its scheduled window", async ({ reques
 
       setClock(at(day, 10, 0));
       await expect.poll(() => serverActive(request, backup.id), { message: "T08 nntp2 off at 10:00", timeout: 0 }).toBe(false);
-      await expect.poll(async () => (await nntpConnectionMetrics("nntp2")).active,
+      // The provider counts the session that reads its metrics, so one active connection is the probe itself.
+      await expect.poll(async () => (await nntpConnectionMetrics("nntp2")).active - 1,
         { message: "T08 no Weaver sessions on nntp2", timeout: 0 }).toBe(0);
       const during = `t08-off-${token}`;
       const held = await startDownload(request, during, { count: 2, partBytes: 16 * 1024, nntpHost: "nntp2" });
@@ -764,37 +765,42 @@ test("T12 time, times, hourly and weekday rules fire on their occurrences", asyn
   });
 });
 
-test("T14 a rule that cannot be applied holds new downloads until it can", async ({ request }) => {
+test("T14 a server rule is refused for a missing server and removed with its server", async ({ request }) => {
   initialOnly();
-  note("observed", "Built with a server rule: a rule for a server id that does not exist yet fails to apply and holds admission; adding that server lets it apply.");
+  note("observed", "The \"could not be applied\" hold for a server missing from the runtime configuration is reachable only when the database and the runtime disagree: saving refuses a missing server and removing a server removes its rules.");
   const servers = (await graphql<{ servers: Array<{ id: number }> }>(request, "query { servers { id } }")).servers;
   const missingId = Math.max(...servers.map(server => server.id)) + 1;
-  let addedId: number | undefined;
-  await withRules(request, "t14", async rules => {
-    try {
-      const rule = await rules.create({ actionType: "set_server_active", time: hhmm(readClock()), serverId: missingId, serverActive: false });
-      const held = await waitQueue(request, state => state.downloadBlock.scheduleHoldReason !== null, "T14 hold appears");
-      expect(held.downloadBlock.scheduleHoldReason).toContain(`schedule rule "${rule.label}" could not be applied`);
-      expect(held.downloadBlock.scheduleHoldReason).toContain(`server ${missingId} is missing from the runtime configuration`);
-      expect(held.downloadBlock.kind).toBe("SCHEDULED");
+  const before = await schedules(request);
+  const label = `t14-missing-${token}`;
+  const refused = await graphqlErrors(request,
+    `mutation($input: ScheduleInput!) { createSchedule(input: $input) { ${SCHEDULE_FIELDS} } }`,
+    { input: { enabled: true, days: [], label, actionType: "set_server_active", time: hhmm(readClock()), serverId: missingId, serverActive: false } });
+  expect(refused.join("\n"), "a rule for a missing server is refused").toContain(`server ${missingId} not found`);
+  expect(await schedules(request), "the refused rule left the schedules unchanged").toEqual(before);
 
-      const name = `t14-${token}`;
-      const id = await startDownload(request, name, { count: 2, partBytes: 16 * 1024 });
-      await witnessTick(request);
-      expect((await queueItem(request, id))?.downloadedBytes ?? -1, "nothing downloaded while held").toBe(0);
-      expect(await bodyCount(name)).toBe(0);
+  // A disabled throwaway server whose rule never comes into force; removing the
+  // server removes the rule with it.
+  const serverId = (await graphql<{ addServer: { id: number } }>(request,
+    "mutation($input: ServerInput!) { addServer(input: $input) { id } }",
+    { input: { host: "nntp", port: 119, tls: false, username: "e2e-user", password: "e2e-pass", connections: 1, active: false, priority: 0, backfill: false, retentionDays: 0 } })).addServer.id;
+  let removed = false;
+  try {
+    const ruleLabel = `t14-server-${token}`;
+    const created = (await graphql<{ createSchedule: ScheduleRow[] }>(request,
+      `mutation($input: ScheduleInput!) { createSchedule(input: $input) { ${SCHEDULE_FIELDS} } }`,
+      { input: { enabled: false, days: [], label: ruleLabel, actionType: "set_server_active", time: hhmm(readClock()), serverId, serverActive: false } })).createSchedule
+      .filter(row => row.label === ruleLabel);
+    expect(created, "the rule for the throwaway server").toHaveLength(1);
+    expect(created[0]).toMatchObject({ serverId, serverActive: false });
 
-      addedId = (await graphql<{ addServer: { id: number } }>(request,
-        "mutation($input: ServerInput!) { addServer(input: $input) { id } }",
-        { input: { host: "nntp", port: 119, tls: false, username: "e2e-user", password: "e2e-pass", connections: 1, active: false, priority: 0, backfill: false, retentionDays: 0 } })).addServer.id;
-      expect(addedId).toBe(missingId);
-      await waitQueue(request, state => state.downloadBlock.scheduleHoldReason === null, "T14 hold clears once the rule applies");
-      expect(await waitTerminal(request, id)).toBe("COMPLETED");
-    } finally {
-      await rules.clear();
-      if (addedId !== undefined) await graphql(request, "mutation($id: Int!) { removeServer(id: $id) { id } }", { id: addedId });
-    }
-  });
+    await graphql(request, "mutation($id: Int!) { removeServer(id: $id) { id } }", { id: serverId });
+    removed = true;
+    const after = await schedules(request);
+    expect(after.find(row => row.id === created[0]!.id), "the server's rule went with it").toBeUndefined();
+    expect(after, "no other rule changed").toEqual(before);
+  } finally {
+    if (!removed) await graphql(request, "mutation($id: Int!) { removeServer(id: $id) { id } }", { id: serverId });
+  }
 });
 
 test("T15 an armed NZBGet resume timer defers the scheduled resume", async ({ request }) => {

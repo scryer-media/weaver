@@ -133,7 +133,11 @@ test("L05 Hold parks a dead leg's share instead of moving it", async ({ request 
 test("L06 a dead leg goes Down, probes with one connection, and returns Up once its proxy does", async ({ request }, info) => {
   test.setTimeout(15 * 60_000);
   const { a, b, server } = await proxiedSecondLeg("REDISTRIBUTE");
-  const download = await world.pacedDownload("l06-probing", { parts: 240, slowMs: 5000 });
+  // The fixture paces every body line, so 10 ms lets a 64 KiB article finish in
+  // about five seconds, inside the per-article soft timeout: a recovery probe can
+  // succeed while the job is still paced. 480 parts outlast the leg cooldowns
+  // and the 60 s cap on server recovery backoff several times over.
+  const download = await world.pacedDownload("l06-probing", { parts: 480, slowMs: 10 });
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
   const subscription = await FlowSubscription.open();
   try {
@@ -190,7 +194,10 @@ test("L08 refused connections are not path evidence: the leg never goes Down", a
   const a = await world.egress("a");
   const b = await world.egress("b");
   const server = await world.server({ host: "toxiproxy", port: 3119, connections: 4, route: { legs: [directLeg(a.id, 50), directLeg(b.id, 50)] } });
-  const download = await world.pacedDownload("l08-refused", { slowMs: 500 });
+  // Paced so each article still finishes inside the per-article soft timeout:
+  // the refusals quarantine the server, and its recovery probe must be able to
+  // complete an article before the pacing is lifted.
+  const download = await world.pacedDownload("l08-refused", { parts: 320, slowMs: 10 });
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
   const before = (await serverHealth(request, "toxiproxy"))[0]!;
   const subscription = await FlowSubscription.open();
@@ -256,7 +263,10 @@ test("L10 an RSS route uses one connection on its first leg", async ({ request }
 test("L11 reweighting a running route moves connections without revoking them", async ({ request }, info) => {
   test.setTimeout(10 * 60_000);
   const { a, b, server } = await twoLegServer();
-  const download = await world.pacedDownload("l11-reweight");
+  // Paced so each article finishes inside the per-article soft timeout; a body
+  // that never finishes times out and its lane reconnects, which this test
+  // would count as a new connection.
+  const download = await world.pacedDownload("l11-reweight", { parts: 320, slowMs: 10 });
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
   const acceptedBefore = (await nntpConnectionMetrics()).accepted;
   await world.route("SERVER", server, { legs: [directLeg(a.id, 25), directLeg(b.id, 75)] });

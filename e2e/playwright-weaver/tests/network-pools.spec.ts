@@ -62,11 +62,10 @@ test("P02 a throttled pin loses to a faster member once that member has delivery
   const first = await world.pacedDownload("p02-warm", { parts: 32, slowMs: 200 });
   await pinned(request, view, connect1.id, "connect1 pinned");
   expect(await first.release()).toBe("COMPLETED");
-  // 200 MiB with connection churn, so the pool keeps re-dialling and racing.
-  await world.setChaos("drop_conn=30");
   const mark = await fixtureMark(request);
   const flowStart = await flowMark(request);
-  const download = await world.download("p02-throttled", { parts: 3200, partBytes: 64 * 1024 });
+  // 200 MiB with connection churn, so the pool keeps re-dialling and racing.
+  const download = await world.download("p02-throttled", { parts: 3200, partBytes: 64 * 1024, beforeSubmit: () => world.setChaos("drop_conn=30") });
   await addBandwidth(request, "connect1", 64);
   const switched = await pinned(request, view, connect2.id, "connect2 pinned", flowStart);
   expect(member(view(switched), connect2.id)!.samples).toBeGreaterThanOrEqual(16);
@@ -142,9 +141,9 @@ test("P06 an SSH member with a changed host key is blocked and the pool pins ano
   const pool = await world.pool("SSH", [ssh1.id, mismatch.id, ssh3.id]);
   const server = await world.server({ host: "nntp", route: { legs: [ladderLeg(a.id, [rung.pool(pool)], 100)] } });
   const view = (flow: NetworkFlow) => poolOn(flow, pool, a.id);
-  const first = await world.download("p06-pin");
-  expect(await waitTerminal(request, first.jobId)).toBe("COMPLETED");
   // Prewarming connects every member, which pins ssh-switch's primary key.
+  // The key changes before any job runs: once a job has pinned a healthy
+  // member the pool never redials the others, so the mismatch would go unseen.
   await expect.poll(async () => (await proxyProfiles(request)).find(profile => profile.id === mismatch.id)?.hostKeyFingerprint ?? null,
     { timeout: 0, message: "ssh-switch pinned on first use" }).not.toBeNull();
   await controlTunnel(request, { endpoint: "ssh-switch", hostKey: "other", cut: true });
@@ -216,10 +215,13 @@ test("P11 changing a pool's members prewarms the newcomer and drops the leaver",
   await pinned(request, view, connect1.id, "connect1 pinned");
   const mark = await flowMark(request);
   await updatePool(request, pool, { name: `pool-p11-${Date.now()}`, kind: "HTTP_CONNECT", memberIds: [connect2.id, connect3.id, connect4.id] });
+  // Dropping the pinned member clears the pin until the next dial races the
+  // remaining members, so the pin is awaited with the membership change.
   const flow = await flowAfter(request, mark, sample => {
     const current = view(sample);
-    return !!current && member(current, connect1.id) === undefined && member(current, connect4.id)?.warmed === true;
-  }, "connect1 gone, connect4 warmed");
+    return !!current && member(current, connect1.id) === undefined && member(current, connect4.id)?.warmed === true
+      && current.pinnedMember !== null;
+  }, "connect1 gone, connect4 warmed, a member pinned");
   expect([connect2.id, connect3.id, connect4.id]).toContain(view(flow)!.pinnedMember);
   expect(await download.release()).toBe("COMPLETED");
 });

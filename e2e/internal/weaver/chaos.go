@@ -308,11 +308,26 @@ func dockerComposeUp(services ...string) error {
 		if err == nil || !isDockerHostPortBindCollision(err) || attempt == maxPortBindRetries {
 			return err
 		}
+		// The failed attempt may have created some services already. A retry
+		// with new ports must recreate them, and the engine refuses to recreate
+		// a container another one shares a network namespace with (capture
+		// runs in weaver's), so remove what this attempt started first.
+		rm := containerengine.Command(dockerComposeRetryCleanupArgs(services...)...)
+		rm.Dir = e2eDir()
+		if rmErr := runExternalCommand(rm, "docker compose rm"); rmErr != nil {
+			return fmt.Errorf("%w; remove services before retry: %v", err, rmErr)
+		}
 		if retryErr := reallocateRuntimePortsForDockerRetry(); retryErr != nil {
 			return fmt.Errorf("%w; reallocate runtime ports for retry: %v", err, retryErr)
 		}
 		log.Printf("docker host-port collision; retrying compose with fresh runtime ports (attempt %d/%d)", attempt+1, maxPortBindRetries)
 	}
+}
+
+// dockerComposeRetryCleanupArgs stops and removes the given services'
+// containers, and only those, so a port-collision retry starts them afresh.
+func dockerComposeRetryCleanupArgs(services ...string) []string {
+	return append(dockerComposeArgs("rm", "--force", "--stop"), services...)
 }
 
 func requiresWeaverService(services []string) bool {

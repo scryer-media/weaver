@@ -1,4 +1,4 @@
-import { expect, test } from "./helpers";
+import { expect, metricValue, metrics, test } from "./helpers";
 import { waitTerminal } from "./support/downloads";
 import {
   FlowSubscription, type LegFlow, type NetworkFlow, type RouteInput, extended, flowAfter, flowMark, graphqlErrors,
@@ -209,14 +209,17 @@ test("F10 an egress test through a cooling rung's proxy bypasses the cooldown", 
 
 test("F11 server over-limit refusals never fail the leg or its rung", async ({ request }) => {
   test.setTimeout(10 * 60_000);
-  const { leg } = await twoRungLadder();
+  const { leg, server } = await twoRungLadder();
   // The held control session takes one of max_conns=3, leaving Weaver two.
   await world.holdChaosSession();
   const download = await world.pacedDownload("f11-over-limit", { chaos: "max_conns=3" });
   const subscription = await FlowSubscription.open();
   try {
     const start = (await subscription.next(0, () => true, "first sample")).sampledAt;
-    await expect.poll(async () => (await serverHealth(request, PROXIED_HOST))[0]?.failureCount ?? 0, { timeout: 0, message: "over-limit refusals recorded" }).toBeGreaterThan(0);
+    // A provider's over-limit refusal holds off new connects without counting as a server failure;
+    // Weaver counts it in its own provider-refusal counter.
+    await expect.poll(async () => metricValue(await metrics(request), "weaver_server_provider_refusals_total", { server_id: String(server) }) ?? 0,
+      { timeout: 0, message: "over-limit refusals recorded" }).toBeGreaterThan(0);
     const window = subscription.since(start);
     expect(window.map(leg).filter(flow => flow && (flow.state === "DOWN" || flow.rungStates.includes("COOLDOWN")))).toEqual([]);
     expect(Math.max(...window.map(flow => leg(flow)?.open ?? 0))).toBeLessThanOrEqual(2);
@@ -236,8 +239,7 @@ test("F12 server greeting failures never fail the leg or its rung", async ({ req
   try {
     const start = (await subscription.next(0, () => true, "first sample")).sampledAt;
     const before = (await serverHealth(request, PROXIED_HOST))[0]?.failureCount ?? 0;
-    await world.setChaos("greet_400=100");
-    const download = await world.download("f12-greet-400");
+    const download = await world.download("f12-greet-400", { beforeSubmit: () => world.setChaos("greet_400=100") });
     await expect.poll(async () => (await serverHealth(request, PROXIED_HOST))[0]?.failureCount ?? 0, { timeout: 0, message: "greeting failures recorded" }).toBeGreaterThan(before);
     const window = subscription.since(start);
     expect(window.map(leg).filter(flow => flow && (flow.state === "DOWN" || flow.rungStates.includes("COOLDOWN")))).toEqual([]);
@@ -308,10 +310,11 @@ test("F15 a pool whose members are all blocked blocks the leg until its path cha
   const blockedJob = await world.download("f15-blocked");
   const blocked = await flowAfter(request, mark, flow => legOn(flow, serverKey(server), a.id)?.state === "BLOCKED", "leg Blocked");
   expect(legOn(blocked, serverKey(server), a.id)?.reason).toContain("all pool members are blocked");
-  // A changed path (pool then connect3) rebuilds the leg.
-  await world.updateServer(server, { host: PROXIED_HOST });
+  // A changed path rebuilds the leg. A blocked pool is fatal to every rung after
+  // it, so the new path leaves the pool out. The host and route change in one
+  // save because an edited endpoint is probed over the route it is saved with.
   const changed = await flowMark(request);
-  await world.route("SERVER", server, { legs: [ladderLeg(a.id, [rung.pool(pool), rung.proxy(connect3.id)], 100)] });
+  await world.updateServer(server, { host: PROXIED_HOST, route: { legs: [ladderLeg(a.id, [rung.proxy(connect3.id)], 100)] } });
   await flowAfter(request, changed, flow => legOn(flow, serverKey(server), a.id)?.state === "UP", "leg Up on the changed path");
   expect(await waitTerminal(request, blockedJob.jobId)).toBe("COMPLETED");
 });

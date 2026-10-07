@@ -15,10 +15,16 @@ export type DownloadOptions = {
   extraInput?: Record<string, unknown>;
 };
 
+// The NNTP fixture keeps every article for the stack's life and refuses a
+// repeated message id, and a staged flow runs these specs again against the
+// same server after restarting Weaver, so each Playwright run posts under its
+// own ids.
+const runToken = `${Date.now().toString(36)}${process.pid.toString(36)}`;
+
 export async function postProbeFile(name: string, options: DownloadOptions = {}): Promise<Array<{ messageId: string; bytes: number }>> {
   const count = options.count ?? 32;
   const size = options.partBytes ?? 64 * 1024;
-  const articles = Array.from({ length: count }, (_, index) => ({ messageId: `${name}-${index}@e2e.invalid`, bytes: size }));
+  const articles = Array.from({ length: count }, (_, index) => ({ messageId: `${name}-${runToken}-${index}@e2e.invalid`, bytes: size }));
   for (const [index, article] of articles.entries()) {
     await postMultipartProbeArticle(article.messageId, size, {
       filename: `${name}.bin`, number: index + 1, total: count,

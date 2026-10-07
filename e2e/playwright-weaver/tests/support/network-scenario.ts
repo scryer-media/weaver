@@ -34,6 +34,8 @@ export type Network = "a" | "b";
 
 export class NetworkWorld {
   readonly servers: number[] = [];
+  /** Jobs this test submitted; cleanup cancels any still queued so none runs into the next test. */
+  readonly jobs: number[] = [];
   readonly feeds: number[] = [];
   readonly pools: number[] = [];
   readonly profiles: number[] = [];
@@ -137,7 +139,8 @@ export class NetworkWorld {
   async ssh(endpoint: TunnelEndpoint, options: { network?: Network; auth?: "password" | "key" | "passphrase" | "wrong-passphrase"; viaToxiproxy?: boolean } = {}): Promise<ProxyProfile> {
     const network = options.network ?? "a";
     const client = (await tunnelState(this.request)).sshClient;
-    const auth = options.auth ?? "password";
+    // Weaver's SSH tunnels authenticate with an Ed25519 key only.
+    const auth = options.auth ?? "key";
     const credentials =
       auth === "password" ? { password: client.password } :
       auth === "key" ? { privateKey: client.privateKey } :
@@ -184,17 +187,24 @@ export class NetworkWorld {
     await this.holdChaosSession();
     await this.setChaos([`slow_body=${options.slowMs ?? 1500}`, options.chaos].filter(Boolean).join(","));
     const jobId = await submit(this.request, name, articles);
+    this.jobs.push(jobId);
     return {
       jobId, bytes: parts * partBytes,
       release: async () => { await this.setChaos("off"); return waitTerminal(this.request, jobId); },
     };
   }
 
-  async download(name: string, options: { parts?: number; partBytes?: number } = {}) {
+  /**
+   * Post a probe file and submit it. `beforeSubmit` runs between the two, so
+   * chaos that drops or refuses NNTP sessions cannot reach the posting itself.
+   */
+  async download(name: string, options: { parts?: number; partBytes?: number; beforeSubmit?: () => Promise<void> } = {}) {
     const parts = options.parts ?? 32;
     const partBytes = options.partBytes ?? 64 * 1024;
     const articles = await postProbeFile(name, { count: parts, partBytes });
+    await options.beforeSubmit?.();
     const jobId = await submit(this.request, name, articles);
+    this.jobs.push(jobId);
     return { jobId, bytes: parts * partBytes };
   }
 
@@ -239,6 +249,12 @@ export class NetworkWorld {
     const attempt = async (label: string, action: () => Promise<unknown>) => {
       try { await action(); } catch (error) { failures.push(`${label}: ${String(error)}`); }
     };
+    for (const id of this.jobs.splice(0)) {
+      await attempt(`job ${id}`, async () => {
+        const queued = (await graphql<{ queueItem: { id: number } | null }>(this.request, "query($id: Int!) { queueItem(id: $id) { id } }", { id })).queueItem;
+        if (queued) await graphql(this.request, "mutation($id: Int!) { cancelJob(id: $id) }", { id });
+      });
+    }
     if (this.chaos) await attempt("chaos off", () => this.held ? this.held.chaos("off") : setNntpChaos("off"));
     this.held?.close();
     this.held = undefined;

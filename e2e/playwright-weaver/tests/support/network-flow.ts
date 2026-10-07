@@ -293,8 +293,10 @@ export class FlowSubscription {
   private acked = false;
   private closed = false;
 
-  private constructor(url: string) {
-    this.socket = new WebSocket(url, "graphql-transport-ws");
+  private constructor(url: string, cookie: string) {
+    // A loginless browser session rides on the entry page's session cookie,
+    // exactly as the HTTP helpers do; without it the server refuses connection_init.
+    this.socket = new WebSocket(url, { protocols: ["graphql-transport-ws"], headers: { cookie } } as unknown as string[]);
     this.socket.addEventListener("open", () => this.socket.send(JSON.stringify({ type: "connection_init", payload: {} })));
     this.socket.addEventListener("message", event => {
       const message = JSON.parse(String(event.data)) as { type: string; payload?: { data?: { networkFlow: NetworkFlow }; message?: string } };
@@ -314,9 +316,13 @@ export class FlowSubscription {
 
   static async open(): Promise<FlowSubscription> {
     const base = new URL(process.env.PLAYWRIGHT_BASE_URL || "http://weaver:9090/");
+    const entry = await fetch(base);
+    expect(entry.ok, `entry page ${entry.status}`).toBe(true);
+    const cookie = entry.headers.getSetCookie().map(value => value.split(";")[0]).join("; ");
+    expect(cookie, "entry page sets a session cookie").not.toBe("");
     base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
     base.pathname = `${base.pathname.replace(/\/+$/, "")}/graphql/ws`;
-    const subscription = new FlowSubscription(base.toString());
+    const subscription = new FlowSubscription(base.toString(), cookie);
     await expect.poll(() => subscription.acked || subscription.closed, { timeout: 0 }).toBe(true);
     expect(subscription.closed, "flow subscription closed before connection_ack").toBe(false);
     return subscription;

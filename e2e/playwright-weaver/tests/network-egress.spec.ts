@@ -29,7 +29,9 @@ test("E01 System egress is built in, Up, and carries every usable address", asyn
     .toContain("only egress 0 may use the System binding");
   const system = (await egressInterfaces(request)).find(egress => egress.id === 0);
   expect(system).toMatchObject({ name: "System", bindingKind: "SYSTEM", health: "UP", reason: null, enabled: true });
-  const discovered = (await discoverInterfaces(request)).filter(entry => entry.up).flatMap(entry => entry.addresses);
+  // Loopback can never source an outbound connection, so System leaves it out (E12).
+  const discovered = (await discoverInterfaces(request)).filter(entry => entry.up).flatMap(entry => entry.addresses)
+    .filter(address => !address.startsWith("127.") && address !== "::1");
   expect([...system!.addresses].sort()).toEqual([...discovered].sort());
   expect(system!.addresses).toEqual(expect.arrayContaining([egressAddress("a"), egressAddress("b")]));
 });

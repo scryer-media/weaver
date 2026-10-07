@@ -725,3 +725,14 @@ func TestWeaverBrowserCrashIgnoresATestTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestPortCollisionRetryRemovesOnlyTheStartedServices(t *testing.T) {
+	t.Setenv("E2E_PROJECT", "weaver-release-flow-a")
+	got := dockerComposeRetryCleanupArgs("weaver", "capture")
+	if !slices.Equal(got[:3], []string{"compose", "-p", "weaver-release-flow-a"}) {
+		t.Fatalf("retry cleanup args = %q, want the flow's own project", got)
+	}
+	if !slices.Equal(got[len(got)-5:], []string{"rm", "--force", "--stop", "weaver", "capture"}) {
+		t.Fatalf("retry cleanup args = %q, want rm of exactly the started services", got)
+	}
+}

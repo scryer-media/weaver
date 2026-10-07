@@ -148,6 +148,14 @@ export const test = base.extend<WeaverFixtures>({
   },
 });
 
+// Local iteration only (see playwright.config.ts): when set, a test cannot
+// raise its own timeout past E2E_WEAVER_PLAYWRIGHT_TEST_TIMEOUT_MS.
+const iterationTestTimeoutMs = Number(process.env.E2E_WEAVER_PLAYWRIGHT_TEST_TIMEOUT_MS) || 0;
+if (iterationTestTimeoutMs > 0) {
+  const setTimeout = test.setTimeout.bind(test);
+  test.setTimeout = (timeout: number) => setTimeout(timeout > 0 ? Math.min(timeout, iterationTestTimeoutMs) : iterationTestTimeoutMs);
+}
+
 export { expect };
 
 const initializedApiSessions = new WeakSet<APIRequestContext>();
