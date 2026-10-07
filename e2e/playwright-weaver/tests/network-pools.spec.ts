@@ -59,7 +59,7 @@ test("P02 a throttled pin loses to a faster member once that member has delivery
   test.setTimeout(30 * 60_000);
   const { view, connect1, connect2 } = await latencyPool(request);
   await world.holdChaosSession();
-  const first = await world.pacedDownload("p02-warm", { parts: 32, slowMs: 200 });
+  const first = await world.pacedDownload("p02-warm", { parts: 32, slowMs: 10 });
   await pinned(request, view, connect1.id, "connect1 pinned");
   expect(await first.release()).toBe("COMPLETED");
   const mark = await fixtureMark(request);
@@ -78,7 +78,9 @@ test("P02 a throttled pin loses to a faster member once that member has delivery
 test("P03 a black-holed pin fails over to the next fastest member", async ({ request }) => {
   test.setTimeout(10 * 60_000);
   const { view, connect1, connect2 } = await latencyPool(request);
-  const download = await world.pacedDownload("p03-suspect");
+  // Paced so each article still finishes inside the per-article soft timeout:
+  // only the black hole may fail fetches, or the server itself starts recovering.
+  const download = await world.pacedDownload("p03-suspect", { slowMs: 10 });
   await pinned(request, view, connect1.id, "connect1 pinned");
   const flowStart = await flowMark(request);
   await addToxic(request, "connect1", { name: "p03-blackhole", type: "timeout", attributes: { timeout: 0 } });

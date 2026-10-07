@@ -1,4 +1,4 @@
-import { expect, graphql, nntpConnectionMetrics, resetNntpMetrics, test } from "./helpers";
+import { expect, graphql, resetNntpMetrics, test } from "./helpers";
 import { ifaceFor, packetCount, startCapture, stopCapture } from "./support/capture";
 import { waitTerminal } from "./support/downloads";
 import {
@@ -260,6 +260,13 @@ test("L10 an RSS route uses one connection on its first leg", async ({ request }
   }
 });
 
+/**
+ * A news server accepting a connection: its SYN-ACK. A reload also races each
+ * leg's addresses, and a SYN to an address the leg's network cannot reach is
+ * retried without ever being accepted, so SYNs alone overcount.
+ */
+const NNTP_ACCEPTED = "tcp src port 119 and (tcp[tcpflags] & tcp-syn) != 0 and (tcp[tcpflags] & tcp-ack) != 0";
+
 test("L11 reweighting a running route moves connections without revoking them", async ({ request }, info) => {
   test.setTimeout(10 * 60_000);
   const { a, b, server } = await twoLegServer();
@@ -268,13 +275,29 @@ test("L11 reweighting a running route moves connections without revoking them", 
   // would count as a new connection.
   const download = await world.pacedDownload("l11-reweight", { parts: 320, slowMs: 10 });
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
-  const acceptedBefore = (await nntpConnectionMetrics()).accepted;
-  await world.route("SERVER", server, { legs: [directLeg(a.id, 25), directLeg(b.id, 75)] });
-  const flow = await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 1], [b.id, 3]]), "legs 1/3 open");
-  // One more connection on leg B, plus this probe's own session.
-  const accepted = (await nntpConnectionMetrics()).accepted - acceptedBefore;
+  // Connections the news server accepted from Weaver, counted in Weaver's
+  // namespace: the server's own accept counter also sees its container
+  // health check and this test's probes.
+  const ifaceA = await ifaceFor(request, egressAddress("a"));
+  const ifaceB = await ifaceFor(request, egressAddress("b"));
+  await startCapture(request, "l11");
+  let flow: NetworkFlow;
+  try {
+    await world.route("SERVER", server, { legs: [directLeg(a.id, 25), directLeg(b.id, 75)] });
+    flow = await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 1], [b.id, 3]]), "legs 1/3 open");
+    // The flow counts a lane while it is still connecting, so the capture
+    // runs until leg B's new connection has been accepted.
+    await expect.poll(() => packetCount(request, "l11", ifaceB, NNTP_ACCEPTED), { message: "leg B's new connection accepted", timeout: 0 }).toBeGreaterThanOrEqual(1);
+  } finally {
+    await stopCapture(request);
+  }
+  const accepted = {
+    a: await packetCount(request, "l11", ifaceA, NNTP_ACCEPTED),
+    b: await packetCount(request, "l11", ifaceB, NNTP_ACCEPTED),
+  };
   await saveEvidence(info, "L11", { flow, accepted });
-  expect(accepted).toBeLessThanOrEqual(2);
+  // One more connection on leg B, and none to replace a revoked one.
+  expect(accepted.a + accepted.b).toBeLessThanOrEqual(1);
   expect(await download.release()).toBe("COMPLETED");
 });
 

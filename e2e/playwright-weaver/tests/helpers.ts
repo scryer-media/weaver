@@ -339,15 +339,20 @@ export type NntpConnectionMetrics = {
 /// asynchronously — so a greeting of `502 Too many connections` means the
 /// drain is still in flight, not that the product misbehaved. The last failure
 /// is rethrown, so a server that never frees a slot still fails the test.
+/// Only a refused greeting is retried: once the server has greeted the probe it
+/// counts the session as accepted, and a second probe would add a session the
+/// caller did not make.
 export async function nntpConnectionMetrics(
   host = "nntp",
   port = 119,
 ): Promise<NntpConnectionMetrics> {
   const deadline = Date.now() + 30_000;
   for (let attempt = 0; ; attempt += 1) {
+    let greeted = false;
     try {
       let metrics: NntpConnectionMetrics | undefined;
       await withNntpConnection(host, port, async (session) => {
+        greeted = true;
         expect(await session.command("AUTHINFO USER e2e-user")).toMatch(/^381 /);
         expect(await session.command("AUTHINFO PASS e2e-pass")).toMatch(/^281 /);
         const response = await session.command("METRICS CONNECTIONS");
@@ -356,7 +361,7 @@ export async function nntpConnectionMetrics(
       });
       return metrics!;
     } catch (error) {
-      if (Date.now() >= deadline) {
+      if (greeted || Date.now() >= deadline) {
         throw error;
       }
       await new Promise((resolve) =>

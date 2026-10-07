@@ -95,7 +95,7 @@ func advancedNetworkingReleaseFlow() weaverReleaseFlowSpec {
 		Services:         advancedNetworkingServices(),
 		Datastores:       releaseDatastoreMatrix(),
 		Artifacts:        advancedNetworkingArtifacts(),
-		Timeout:          45 * time.Minute,
+		Timeout:          90 * time.Minute, // both stages; the initial stage alone takes ~30 min
 		ComposeFiles:     []string{advancedNetworkingComposeFile},
 		NetworkLayout:    weaverNetworkLayoutEgress,
 		Stages:           []string{"initial", "restarted"},

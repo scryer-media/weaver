@@ -73,10 +73,22 @@ function gateKeys(script: string): string[] {
   return waitingGates().filter(name => name.startsWith(`${script}-`)).map(name => name.slice(script.length + 1));
 }
 
-/** Release a live run and wait until it has consumed its gate, so a gate is never written twice. */
+/** The gate key a fixture run blocks on, as its gate script derives it. */
+const gateKeyOf = (record: ScriptRecord) => record.env.NZBNA_NZBID || record.env.NZBPP_NZBID || record.env.NZBNP_NZBNAME || "none";
+
+/**
+ * Release a live run and wait until it has consumed its gate, so a gate is
+ * never written twice. The gate's path is keyed by script and job, not by run:
+ * the job's next queue run can recreate it the moment this one removes it, so
+ * a later run's record on the same key also proves this run passed (every run
+ * writes its record before it creates its gate).
+ */
 async function openGate(script: string, key: string | number): Promise<void> {
+  const sameKey = (record: ScriptRecord) => gateKeyOf(record) === String(key);
+  const before = recordsOf(script, sameKey).length;
   await releaseGate(script, key);
-  await expect.poll(() => gateWaiting(script, key), { message: `${script} run ${key} passed its gate`, timeout: 0 }).toBe(false);
+  await expect.poll(() => !gateWaiting(script, key) || recordsOf(script, sameKey).length > before,
+    { message: `${script} run ${key} passed its gate`, timeout: 0 }).toBe(true);
 }
 
 /** Release every gate `script` blocks on until `done` holds. */

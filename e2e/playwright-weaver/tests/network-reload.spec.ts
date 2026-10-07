@@ -23,7 +23,13 @@ test("R01 saving an unrelated profile leaves running legs and their connections 
   const b = await world.egress("b");
   const server = await world.server({ route: { legs: [directLeg(a.id, 50), directLeg(b.id, 50)] } });
   const download = await world.pacedDownload("r01-unrelated");
-  await flowAfter(request, await flowMark(request), flow => carrying(flow, server, [a.id, b.id]), "legs 2/2 open");
+  // The baseline waits for both legs to have pinned an address with nothing
+  // left opening, so the dials that settle each leg's address race are counted
+  // before it rather than after the save.
+  await flowAfter(request, await flowMark(request), flow => carrying(flow, server, [a.id, b.id]) && [a.id, b.id].every(id => {
+    const leg = legOn(flow, serverKey(server), id);
+    return !!leg?.pinnedAddress && leg.opening === 0;
+  }), "legs 2/2 open on a pinned address");
   const before = (await nntpConnectionMetrics()).accepted;
   const saved = await flowMark(request);
   await world.profile({ name: `r01-unrelated-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: PROXIED_HOST, port: 8101, username: "fixture", password: "fixture" });

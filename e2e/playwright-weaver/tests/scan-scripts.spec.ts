@@ -35,12 +35,23 @@ const base64 = (text: string) => Buffer.from(text).toString("base64");
 const document = (name: string) => nzbDocument(name, [{ messageId: `${name}@e2e.invalid`, bytes: 4096 }]);
 const attribute = (result: SubmissionResult | null, key: string) => result?.item?.attributes.find(entry => entry.key === key)?.value;
 
-/** Submit `name` through GraphQL with no scan script involved. */
+/**
+ * Submit `name` through GraphQL with no script involved. The lists are
+ * emptied for the submission: a queue script another spec left listed (Q12
+ * leaves one gated across the restart) would otherwise take this job's
+ * NZB_ADDED run, block at its gate with downloads paused, and hold the slot
+ * the next scan script waits on.
+ */
 async function plain(request: APIRequestContext, name: string): Promise<number> {
-  const { result } = await submitNzb(request, { nzbBase64: base64(document(name)), filename: `${name}.nzb` });
-  expect(result?.accepted, `submit ${name}`).toBe(true);
-  created.push(result!.jobId!);
-  return result!.jobId!;
+  const restore = await useScripts(request, { global: [] });
+  try {
+    const { result } = await submitNzb(request, { nzbBase64: base64(document(name)), filename: `${name}.nzb` });
+    expect(result?.accepted, `submit ${name}`).toBe(true);
+    created.push(result!.jobId!);
+    return result!.jobId!;
+  } finally {
+    await restore();
+  }
 }
 
 type Scanned = { script: string; name: string; result: SubmissionResult | null; errors: string[] };

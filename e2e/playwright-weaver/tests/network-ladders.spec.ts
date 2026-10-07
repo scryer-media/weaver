@@ -37,12 +37,18 @@ async function onRung(request: Parameters<typeof flowMark>[0], leg: (flow: Netwo
 }
 
 /**
- * Wait for rung 0's cooldown to lapse (it reads Failing until a dial succeeds
- * on it), then cut the rung-1 connections so the leg redials: the next dial
- * is allowed on rung 0 again and must carry the leg there.
+ * Wait for rung 0's cooldown to lapse, then cut the rung-1 connections so the
+ * leg redials: the next dial is allowed on rung 0 again and must carry the leg
+ * there. A lapsed rung reads Failing only until a dial succeeds on it, and a
+ * leg with traffic can redial within one flow sample, so the lapse is any
+ * state but Cooldown: Failing, or Standby once rung 0 has already taken a
+ * connection back.
  */
 async function rungZeroReturns(request: Parameters<typeof flowMark>[0], leg: (flow: NetworkFlow) => LegFlow | undefined, after: number) {
-  const lapsed = await flowAfter(request, after, flow => leg(flow)?.rungStates[0] === "FAILING", "rung 0 cooldown lapsed");
+  const lapsed = await flowAfter(request, after, flow => {
+    const state = leg(flow)?.rungStates[0];
+    return state !== undefined && state !== "COOLDOWN";
+  }, "rung 0 cooldown lapsed");
   await controlRoute(request, { route: "connect2", cut: true });
   return onRung(request, leg, 0, "leg back on rung 0", lapsed.sampledAt);
 }

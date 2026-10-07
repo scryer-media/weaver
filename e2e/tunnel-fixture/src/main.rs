@@ -35,6 +35,7 @@ use proxy_tunnels::test_support::{
     SshServerDouble, SshServerOptions, TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, WireGuardTestPeer,
     WireGuardTestPeerOptions, test_client_private_key, test_preshared_key,
 };
+use proxy_tunnels::{NoopTunnelObserver, TunnelProvider, WireGuardTunnelProvider};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -398,6 +399,36 @@ const SSH_ENDPOINTS: &[(&str, u16)] = &[
 ];
 const WIREGUARD_ENDPOINTS: &[(&str, u16)] = &[("wg1", 51821), ("wg2", 51822), ("wg-rss", 51823)];
 
+/// A name every WireGuard peer answers and no test asks for. The fixture
+/// resolves it through a real tunnel before it publishes the peer, so a
+/// client can never reach a peer whose resolver is not yet serving, and the
+/// query it leaves in the peer's evidence cannot satisfy a test's assertion.
+const READY_NAME: &str = "ready.tunnel-fixture.test";
+
+/// Resolve [`READY_NAME`] through a tunnel to `peer` until its DNS server
+/// answers with the peer's own address. Each attempt is bounded by the
+/// client's request timeout; the wait ends on the answer, never on time, and
+/// a peer that never answers keeps the fixture from reporting ready.
+async fn dns_serving(peer: &WireGuardTestPeer, name: &str) -> u32 {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let client = WireGuardTunnelProvider::new(
+            peer.client_spec(&format!("tunnel-fixture-ready-{name}")),
+            Arc::new(NoopTunnelObserver),
+        );
+        let answer = client.resolve_host(READY_NAME).await;
+        client.shutdown().await;
+        match answer {
+            Ok(addresses) if addresses.contains(&IpAddr::V4(TEST_PEER_ADDRESS)) => return attempts,
+            Ok(addresses) => {
+                eprintln!("{name}: readiness lookup answered {addresses:?}, not the peer address")
+            }
+            Err(error) => eprintln!("{name}: readiness lookup attempt {attempts} failed: {error}"),
+        }
+    }
+}
+
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name)
         .ok()
@@ -500,6 +531,7 @@ async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: Share
         let options = WireGuardTestPeerOptions {
             names: names
                 .into_iter()
+                .chain([READY_NAME])
                 .map(|host| (host.to_string(), tunnel_peer.clone()))
                 .collect(),
             http_port: http_port_inside,
@@ -513,6 +545,12 @@ async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: Share
             false,
         )
         .await;
+        let attempts = dns_serving(&peer, name).await;
+        record(
+            &log,
+            "wireguard-dns-ready",
+            json!({ "endpoint": name, "attempts": attempts }),
+        );
         let endpoint = Endpoint::new(
             name,
             Transport::Udp,
@@ -850,6 +888,25 @@ mod tests {
             .count();
         assert_eq!(connects, 2);
         assert_eq!(endpoint.active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_peer_is_published_only_once_its_resolver_answers_through_a_tunnel() {
+        let peer = WireGuardTestPeer::start_for_downloads(
+            WireGuardTestPeerOptions {
+                names: [(READY_NAME.to_string(), vec![IpAddr::V4(TEST_PEER_ADDRESS)])]
+                    .into_iter()
+                    .collect(),
+                preshared_key: Some(test_preshared_key()),
+                ..WireGuardTestPeerOptions::default()
+            },
+            None,
+            Duration::ZERO,
+            false,
+        )
+        .await;
+        assert!(dns_serving(&peer, "wg-test").await >= 1);
+        assert_eq!(peer.dns_queries(), vec![READY_NAME.to_string()]);
     }
 
     #[tokio::test]
