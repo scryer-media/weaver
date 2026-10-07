@@ -177,12 +177,23 @@ pub fn apply_core_seed(
 ) -> Result<usize, StateError> {
     let mut seeded = 0;
 
-    if config.data_dir.trim().is_empty()
-        && let Some(value) = &seed.core.data_dir
-    {
-        db.set_setting("data_dir", value)?;
-        config.data_dir = value.clone();
-        seeded += 1;
+    // The data folder is the one setting the process may already have resolved
+    // before this runs: a config with nothing stored is given a folder derived
+    // from the config path, in memory only. Every reader that loads the
+    // settings afresh would still see an empty data_dir, so the stored row is
+    // the test here, not the in-memory value, and whatever the process resolved
+    // is written back when the store has none.
+    let stored_data_dir = db
+        .get_setting("data_dir")?
+        .filter(|value| !value.trim().is_empty());
+    if stored_data_dir.is_none() {
+        if let Some(value) = &seed.core.data_dir {
+            db.set_setting("data_dir", value)?;
+            config.data_dir = value.clone();
+            seeded += 1;
+        } else if !config.data_dir.trim().is_empty() {
+            db.set_setting("data_dir", &config.data_dir)?;
+        }
     }
 
     if config
@@ -867,6 +878,40 @@ mod tests {
             db.get_setting("max_download_speed").unwrap().as_deref(),
             Some("1000")
         );
+    }
+
+    #[test]
+    fn an_unstored_data_dir_default_yields_to_the_environment() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = db.load_config().unwrap();
+        // What startup leaves behind when nothing is stored: a folder derived
+        // from the config path, held in memory only.
+        config.data_dir = "/config".to_string();
+        let seed = parse(&[("WEAVER_DATA_DIR", "/env")]).unwrap();
+
+        let seeded = apply_core_seed(&db, &mut config, &seed).unwrap();
+
+        assert_eq!(seeded, 1);
+        assert_eq!(config.data_dir, "/env");
+        assert_eq!(db.get_setting("data_dir").unwrap().as_deref(), Some("/env"));
+    }
+
+    #[test]
+    fn an_unstored_data_dir_default_is_stored_when_the_environment_names_none() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = db.load_config().unwrap();
+        config.data_dir = "/config".to_string();
+        let seed = parse(&[("WEAVER_COMPLETE_DIR", "/downloads/complete")]).unwrap();
+
+        let seeded = apply_core_seed(&db, &mut config, &seed).unwrap();
+
+        assert_eq!(seeded, 1);
+        assert_eq!(config.data_dir, "/config");
+        assert_eq!(
+            db.get_setting("data_dir").unwrap().as_deref(),
+            Some("/config")
+        );
+        assert_eq!(db.load_config().unwrap().data_dir, "/config");
     }
 
     #[test]
