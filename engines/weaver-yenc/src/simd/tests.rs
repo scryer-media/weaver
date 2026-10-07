@@ -2680,3 +2680,67 @@ fn forced_tier_end_search_matches_scalar_at_every_alignment() {
         }
     }
 }
+
+/// One raw end-searching decode of `body` in `stretch`-byte bounded calls:
+/// the outcome or error, the bytes written, and the folded CRC.
+fn raw_stretched(body: &[u8], stretch: usize) -> (Result<KernelOutcome, String>, Vec<u8>, u32) {
+    let mut output = vec![0u8; body.len() + 64];
+    let mut crc = crate::crc::Crc32::new();
+    let outcome = decode_raw_body_until_end_crc_in(body, &mut output, Some(128), &mut crc, stretch)
+        .map_err(|err| format!("{err:?}"));
+    let written = outcome.as_ref().map_or(0, |outcome| outcome.written);
+    output.truncate(written);
+    // A failed decode discards whatever the CRC had folded.
+    let crc = if outcome.is_ok() { crc.finalize() } else { 0 };
+    (outcome, output, crc)
+}
+
+/// Folding the CRC behind bounded stretches decodes exactly what one
+/// whole-body call does, for stretches ending at every kind of byte: inside
+/// escapes, line breaks, stuffed dots, and `=y` or terminator candidates
+/// straddling the limit, at every input alignment.
+#[test]
+fn raw_stretches_match_one_whole_call() {
+    const ALPHABET: &[u8] = b"\r\n.=yea";
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut below = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    for case in 0..30_000 {
+        let lead = below(64);
+        let mut buffer = vec![b'A'; lead];
+        let len = 200 + below(3_000);
+        let spacing = 1 + below(if case % 3 == 0 { 2 } else { 40 });
+        for _ in 0..len {
+            if below(spacing) == 0 {
+                buffer.push(ALPHABET[below(ALPHABET.len())]);
+            } else {
+                buffer.push(b'*' + below(80) as u8);
+            }
+        }
+        // End markers placed anywhere, so many straddle a stretch limit.
+        if case % 2 == 0 {
+            let at = lead + below(len);
+            let marker: &[u8] = match below(4) {
+                0 => b"\r\n=yend size=1\r\n",
+                1 => b"\r\n.\r\n",
+                2 => b"=\r\n=yend size=1\r\n",
+                _ => b"\r\n.=yend size=1\r\n",
+            };
+            buffer.splice(at..at, marker.iter().copied());
+        }
+        let body = &buffer[lead..];
+        let whole = raw_stretched(body, usize::MAX);
+        for stretch in [64, 128, 192, 320, 1_024] {
+            assert_eq!(
+                raw_stretched(body, stretch),
+                whole,
+                "stretch {stretch} lead {lead} body {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+}

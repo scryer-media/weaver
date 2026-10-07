@@ -362,10 +362,12 @@ fn decode_raw_single_pass(
     output: &mut [u8],
 ) -> Result<Option<DecodeResult>, YencError> {
     let (metadata, data_start) = header::parse_leading_headers(input)?;
-    let outcome = crate::simd::decode_raw_body_until_end_with_line_length(
+    let mut crc = Crc32::new();
+    let outcome = crate::simd::decode_raw_body_until_end_crc(
         &input[data_start..],
         output,
         Some(metadata.line_length),
+        &mut crc,
     )?;
     let yend = match outcome.end {
         RapidyencDecodeEnd::Article => return Ok(None),
@@ -390,10 +392,6 @@ fn decode_raw_single_pass(
     };
 
     let bytes_written = outcome.written;
-    let mut crc = Crc32::new();
-    if bytes_written > 0 {
-        crc.update(&output[..bytes_written]);
-    }
     let part_crc = crc.finalize();
 
     let segments = whole_buffer_segments(&metadata, bytes_written, part_crc);

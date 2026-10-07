@@ -35,7 +35,7 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     // measurement host — see avx2_raw_kernel_oracle); the body below is the
     // `WEAVER_YENC_RAW_ASM=0` build's kernel.
     if cfg!(weaver_yenc_raw_asm) {
-        return avx2_raw_kernel_oracle::<SEARCH_END>(input, output, state, mode);
+        return avx2_raw_kernel_oracle::<SEARCH_END>(input, output, state, mode, input.len());
     }
 
     let mut src = 0usize;
@@ -797,6 +797,73 @@ pub(super) unsafe fn decode_kernel_avx2(
     })
 }
 
+/// Raw end-searching decode of `input` that stops at `limit` instead of the
+/// end of `input`, for a caller that folds the CRC behind each stretch while
+/// the output is still in cache.
+///
+/// The bytes after `limit` stay visible: the SIMD span keeps its lookahead
+/// reserve inside `input`, so an end probe in the last window sees exactly
+/// what an unbounded call would, and the span ends on `limit` itself when
+/// `limit` is 64-byte aligned with the reserve still ahead of it. That skips
+/// the scalar tail an unbounded call on the stretch alone would pay. The
+/// decode can run past `limit` only to finish an escape or reach an end
+/// marker. `None` when the asm kernel is not built in.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub(super) unsafe fn decode_raw_bounded_avx2(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    limit: usize,
+) -> Option<Result<KernelOutcome, YencError>> {
+    if !cfg!(weaver_yenc_raw_asm) {
+        return None;
+    }
+    let mode = DecodeStepMode {
+        dot_unstuffing: true,
+        preserve_pending: true,
+        search_end: true,
+    };
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    // The oracle enters in None/Eq/Cr/CrLf only; a stretch that ended inside
+    // a dot or line-start escape sequence finishes it with the scalar machine.
+    let head = (|| {
+        while !matches!(
+            state.state,
+            DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
+        ) {
+            if src >= limit
+                || x86_search_end_head(input, output, state, mode, &mut src, &mut dst)?
+                || !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(src >= limit)
+    })();
+    Some(match head {
+        Err(err) => Err(err),
+        Ok(true) => Ok(KernelOutcome {
+            consumed: src,
+            written: dst,
+            end: state.end.into(),
+        }),
+        Ok(false) => x86_fold_head(
+            avx2_raw_kernel_oracle::<true>(
+                &input[src..],
+                &mut output[dst..],
+                state,
+                mode,
+                limit - src,
+            ),
+            src,
+            dst,
+        ),
+    })
+}
+
 /// 2×2-lane LUT compaction + store for one 64-byte window, in the oracle's
 /// exact addressing shape (rapidyenc `decoder_avx2_base.h:556-600`, the
 /// `PLATFORM_AMD64` arm). Byte-for-byte identical output to the previous
@@ -964,6 +1031,7 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
     output: &mut [u8],
     state: &mut KernelState,
     mode: DecodeStepMode,
+    limit: usize,
 ) -> Result<KernelOutcome, YencError> {
     use std::arch::x86_64::*;
     const WIDTH: usize = 64;
@@ -983,7 +1051,7 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
                 end: state.end.into(),
             });
         }
-        if src >= input.len() || (input.as_ptr() as usize + src) & (WIDTH - 1) == 0 {
+        if src >= limit || (input.as_ptr() as usize + src) & (WIDTH - 1) == 0 {
             break;
         }
         if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
@@ -996,7 +1064,10 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
     }
 
     let tail = WIDTH - 1 + 4;
-    let simd_limit = input.len().saturating_sub(tail);
+    // The span keeps its lookahead reserve inside `input` even when `limit`
+    // stops it early, so a bounded call probes the bytes past `limit` exactly
+    // as an unbounded one does.
+    let simd_limit = input.len().saturating_sub(tail).min(limit);
     let span = (simd_limit.saturating_sub(src) / WIDTH) * WIDTH;
 
     if span > 0 {
@@ -1512,7 +1583,7 @@ unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
         };
     }
 
-    while src < input.len() {
+    while src < limit {
         if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }
