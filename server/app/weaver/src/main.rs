@@ -144,7 +144,7 @@ async fn async_main() {
     let command = command.unwrap_or_else(Command::default_serve);
     // Ahead of logging, so stdout carries the report alone and can be piped.
     if let Command::Nzb { command } = command {
-        std::process::exit(commands::nzb::run(command));
+        std::process::exit(commands::nzb::run(command).await);
     }
 
     let log_ring_buffer =
