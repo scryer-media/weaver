@@ -50,6 +50,12 @@ func (layout weaverReleaseNetworkLayout) egressNetworks() int {
 
 const advancedNetworkingComposeFile = "docker-compose.networking.yml"
 
+// How many times faster than production Weaver runs its connection-plan
+// timers (delivery verdicts, challenger dials, pin age, route cooldowns) in
+// the advanced-networking flows, so a stage does not wait them out in real
+// time. Takes effect only because the gate also runs Weaver in e2e mode.
+const advancedNetworkingTimeScale = "10"
+
 // advancedNetworkHosts are the fixed host octets on every network a layout
 // attaches. The proxy fixture also owns .250 on the default network, where
 // Weaver's resolver points.
@@ -99,8 +105,12 @@ func advancedNetworkingReleaseFlow() weaverReleaseFlowSpec {
 		ComposeFiles:     []string{advancedNetworkingComposeFile},
 		NetworkLayout:    weaverNetworkLayoutEgress,
 		Stages:           []string{"initial", "restarted"},
+		// After the restart only the @restart specs run: the rest build and
+		// tear down their own state, so a second pass proves nothing new.
+		StageScripts: map[string]string{"restarted": "advanced-networking-restarted"},
 		Env: map[string]string{
-			"E2E_TOXIPROXY_CONFIG": "./services/toxiproxy/networking.json",
+			"E2E_TOXIPROXY_CONFIG":          "./services/toxiproxy/networking.json",
+			"E2E_WEAVER_NETWORK_TIME_SCALE": advancedNetworkingTimeScale,
 		},
 	}
 }
@@ -117,6 +127,7 @@ func advancedNetworkingNoNetRawReleaseFlow() weaverReleaseFlowSpec {
 	spec.NetworkLayout = weaverNetworkLayoutSingle
 	spec.DropNetRaw = true
 	spec.Stages = []string{"initial"}
+	spec.StageScripts = nil
 	return spec
 }
 
@@ -129,8 +140,11 @@ func advancedNetworkingExtendedReleaseFlow() weaverReleaseFlowSpec {
 	spec.Datastores = []weaverDatastore{weaverDatastoreSQLite}
 	spec.Timeout = 90 * time.Minute
 	spec.Stages = []string{"initial"}
+	spec.StageScripts = nil
 	spec.ExtendedOnly = true
 	spec.Env["E2E_WEAVER_EXTENDED"] = "1"
+	// These scenarios exist to wait out the real product timers.
+	spec.Env["E2E_WEAVER_NETWORK_TIME_SCALE"] = "1"
 	return spec
 }
 
@@ -423,7 +437,11 @@ func runWeaverStagedReleaseFlow(
 		}
 		setEnv("E2E_WEAVER_STAGE", stage)
 		setEnv("E2E_WEAVER_ARTIFACT_STAGE", stage)
-		if err := runWeaverReleasePlaywright(ctx, spec.PlaywrightScript); err != nil {
+		script := spec.PlaywrightScript
+		if stageScript, ok := spec.StageScripts[stage]; ok {
+			script = stageScript
+		}
+		if err := runWeaverReleasePlaywright(ctx, script); err != nil {
 			return fmt.Errorf("%s stage %s: %w", spec.Name, stage, err)
 		}
 		if err := captureWeaverReleaseStageDiagnostics(stage); err != nil {

@@ -90,7 +90,7 @@ test("R04 the legacy routing policy still saves as a one-leg route", async ({ re
 type R05Saved = { egresses: number[]; doomed: number; profiles: number[]; pool: number; server: number; route: unknown };
 const r05File = () => path.join(process.env.PLAYWRIGHT_ARTIFACTS_DIR || "artifacts", `r05-${datastoreKind()}.json`);
 
-test("R05 routes, pools and ladders survive a restart; a vanished egress is reported at boot", async ({ request }) => {
+test("R05 routes, pools and ladders survive a restart; a vanished egress is reported at boot @restart", async ({ request }) => {
   test.setTimeout(10 * 60_000);
   if (stage() === "initial") {
     // Built outside the per-test world: this configuration must outlive the test.
@@ -134,7 +134,7 @@ test("R05 routes, pools and ladders survive a restart; a vanished egress is repo
   }
 });
 
-test("R06 the phase's datastore is the one Weaver persists networking to", async ({ request }) => {
+test("R06 the phase's datastore is the one Weaver persists networking to @restart", async ({ request }) => {
   // The datastore matrix runs every network spec (E01, P01, F01, R05 included)
   // once on SQLite and once on Postgres; this pins which store the phase used.
   const egress = await world.egress("a");

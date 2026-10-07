@@ -37,12 +37,23 @@ const weaverImageBootstrapBase = "rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc
 // there is genuinely no pin to honour.
 const weaverImageFallbackToolchain = "stable"
 
-const weaverLocalImageTag = "weaver-e2e-weaver:local"
+const weaverLocalImageRepository = "weaver-e2e-weaver"
 
 // The local image is reusable only when this label matches the complete set of
-// inputs used by buildLocalWeaverImage. A fixed tag by itself says nothing
-// about which working tree produced it.
+// inputs used by buildLocalWeaverImage. The tag carries the same fingerprint,
+// so two checkouts building at once never move each other's tag.
 const weaverImageFingerprintLabel = "org.scryer-media.weaver-e2e.source-fingerprint"
+
+// weaverLocalImageTag names the image a given source fingerprint builds.
+func weaverLocalImageTag(fingerprint string) string {
+	return weaverLocalImageRepository + ":" + shortFingerprint(fingerprint)
+}
+
+// The builder's cargo target cache is keyed per checkout. Cargo decides
+// freshness by file mtimes, and a build context copied from another checkout
+// keeps that checkout's mtimes, so a shared cache would hand one tree the
+// other's compiled artifacts whenever its files are older than the last build.
+const weaverImageCargoTargetCache = "weaver-e2e-cargo-target"
 
 const weaverImageFingerprintSchema = "weaver-e2e-image-v1"
 
@@ -51,6 +62,28 @@ const weaverImageFingerprintSchema = "weaver-e2e-image-v1"
 type weaverImagePlan struct {
 	// Toolchain is the channel from weaver's rust-toolchain.toml.
 	Toolchain string
+	// CacheScope separates the builder's cargo target cache per checkout. Empty
+	// means the unscoped cache.
+	CacheScope string
+}
+
+// cargoTargetCacheID is the buildkit cache mount id for this plan's cargo
+// target directory.
+func (plan weaverImagePlan) cargoTargetCacheID() string {
+	if plan.CacheScope == "" {
+		return weaverImageCargoTargetCache
+	}
+	return weaverImageCargoTargetCache + "-" + plan.CacheScope
+}
+
+// cacheScopeForRoot derives a stable cache scope from the checkout's path.
+func cacheScopeForRoot(weaverRoot string) string {
+	root := filepath.Clean(weaverRoot)
+	if absolute, err := filepath.Abs(root); err == nil {
+		root = absolute
+	}
+	sum := sha256.Sum256([]byte(root))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // newWeaverImagePlan reads the weaver working tree and decides how the image has
@@ -67,7 +100,10 @@ func newWeaverImagePlan(weaverRoot string) (weaverImagePlan, error) {
 	if err := rejectOutOfTreePatches(weaverRoot, string(manifest)); err != nil {
 		return weaverImagePlan{}, err
 	}
-	return weaverImagePlan{Toolchain: weaverPinnedRustToolchain(weaverRoot)}, nil
+	return weaverImagePlan{
+		Toolchain:  weaverPinnedRustToolchain(weaverRoot),
+		CacheScope: cacheScopeForRoot(weaverRoot),
+	}, nil
 }
 
 // weaverPinnedRustToolchain returns the channel weaver's rust-toolchain.toml
@@ -282,7 +318,7 @@ RUN --mount=type=cache,id=weaver-e2e-npm,target=/root/.npm,sharing=locked \
 # runtime stage below is the same Debian release, so the glibc build runs there.
 RUN --mount=type=cache,id=weaver-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=weaver-e2e-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=weaver-e2e-cargo-target,target=/app/target,sharing=locked \
+    --mount=type=cache,id=%s,target=/app/target,sharing=locked \
     CARGO_PROFILE_DEV_DEBUG=line-tables-only \
     cargo build --locked -p weaver && \
     cp target/debug/weaver /tmp/weaver-debug
@@ -309,6 +345,7 @@ CMD ["--config", "/config", "serve", "--port", "9090"]
 		weaverImageBuilderWorkdir,
 		plan.Toolchain,
 		plan.Toolchain,
+		plan.cargoTargetCacheID(),
 		weaverImageBuilderWorkdir,
 		weaverImageBuilderWorkdir,
 		weaverImageBuilderWorkdir,
@@ -457,7 +494,6 @@ func ensureLocalWeaverImage() error {
 	}
 
 	weaverImageOnce.Do(func() {
-		image := weaverLocalImageTag
 		weaverRoot := weaverRepoPath()
 		plan, err := newWeaverImagePlan(weaverRoot)
 		if err != nil {
@@ -469,6 +505,7 @@ func ensureLocalWeaverImage() error {
 			weaverImageErr = err
 			return
 		}
+		image := weaverLocalImageTag(fingerprint)
 		if !envBool("E2E_FORCE_REBUILD_WEAVER_IMAGE", false) && dockerImageLabel(image, weaverImageFingerprintLabel) == fingerprint {
 			log.Printf(
 				"reusing current local weaver image: %s (source fingerprint %s, built %s)",

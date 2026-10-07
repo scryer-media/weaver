@@ -21,7 +21,7 @@ test.afterEach(async ({}, info) => { await world.cleanup(info); });
 
 const SAVE_ROUTE = `mutation($id: Int!, $input: RouteInput!) { saveNetworkRoute(kind: SERVER, id: $id, input: $input) { consumer } }`;
 
-test("E01 System egress is built in, Up, and carries every usable address", async ({ request }) => {
+test("E01 System egress is built in, Up, and carries every usable address @restart", async ({ request }) => {
   // The product reserves the System binding for the built-in egress 0, so a
   // second SYSTEM egress is refused; egress 0 is the one under test.
   expect((await graphqlErrors(request,
@@ -172,7 +172,7 @@ test("E09 egress tests report the source address, go through a proxy, and fail w
   expect(failed.message.trim()).not.toBe("");
 });
 
-test("E10 platform networking on a two-network container", async ({ request }) => {
+test("E10 platform networking on a two-network container @restart", async ({ request }) => {
   const platform = await platformNetworking(request);
   expect(platform).toMatchObject({ platform: "linux", container: true, bridgeNetworkSuspected: false });
   expect(platform.notes.some(note => note.includes("CAP_NET_RAW"))).toBe(true);

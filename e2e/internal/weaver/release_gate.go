@@ -63,6 +63,9 @@ type weaverReleaseFlowSpec struct {
 	// Stages run the Playwright script once per stage, restarting Weaver
 	// between stages.
 	Stages []string
+	// StageScripts runs a different npm script in the named stage instead of
+	// PlaywrightScript, for stages that only need a subset of the specs.
+	StageScripts map[string]string
 	// ExtendedOnly keeps a flow out of "all" and "datastore-matrix"; it runs
 	// only when named.
 	ExtendedOnly bool
@@ -224,6 +227,13 @@ func cloneWeaverReleaseFlowSpec(spec weaverReleaseFlowSpec) weaverReleaseFlowSpe
 	spec.SpecFiles = append([]string(nil), spec.SpecFiles...)
 	spec.ComposeFiles = append([]string(nil), spec.ComposeFiles...)
 	spec.Stages = append([]string(nil), spec.Stages...)
+	if spec.StageScripts != nil {
+		scripts := make(map[string]string, len(spec.StageScripts))
+		for stage, script := range spec.StageScripts {
+			scripts[stage] = script
+		}
+		spec.StageScripts = scripts
+	}
 	if spec.Env != nil {
 		env := make(map[string]string, len(spec.Env))
 		for key, value := range spec.Env {
@@ -867,6 +877,7 @@ func (phase *weaverReleasePhase) env() map[string]string {
 		"E2E_WEAVER_DATABASE_URL":                   "",
 		"E2E_WEAVER_MODE":                           "1",
 		"E2E_WEAVER_CLOCK_FILE":                     "/e2e-clock/now",
+		"E2E_WEAVER_NETWORK_TIME_SCALE":             "1",
 		"E2E_WEAVER_BACKUP_SOURCE_DATASTORE":        phase.Spec.Env["E2E_WEAVER_BACKUP_SOURCE_DATASTORE"],
 		"E2E_WEAVER_BACKUP_TARGET_DATASTORE":        phase.Spec.Env["E2E_WEAVER_BACKUP_TARGET_DATASTORE"],
 		"E2E_WEAVER_RELEASE_FLOW":                   phase.Flow,
@@ -2260,7 +2271,7 @@ func inspectDockerVolume(name string) error {
 }
 
 const (
-	weaverReleasePlaywrightDefaultImage    = "weaver-e2e-playwright:local"
+	weaverReleasePlaywrightRepository      = "weaver-e2e-playwright"
 	weaverPlaywrightImageFingerprintLabel  = "org.weaver-e2e.playwright-source-fingerprint"
 	weaverPlaywrightImageFingerprintSchema = "weaver-e2e-playwright-image-v1"
 )
@@ -2281,14 +2292,16 @@ func ensureLocalWeaverPlaywrightImage() error {
 	weaverPlaywrightImageMu.Lock()
 	defer weaverPlaywrightImageMu.Unlock()
 
-	image := strings.TrimSpace(os.Getenv("E2E_WEAVER_PLAYWRIGHT_IMAGE"))
-	if image == "" {
-		image = weaverReleasePlaywrightDefaultImage
-		setEnv("E2E_WEAVER_PLAYWRIGHT_IMAGE", image)
-	}
 	fingerprint, err := weaverPlaywrightImageFingerprint(filepath.Join(e2eDir(), "playwright-weaver"))
 	if err != nil {
 		return err
+	}
+	image := strings.TrimSpace(os.Getenv("E2E_WEAVER_PLAYWRIGHT_IMAGE"))
+	if image == "" {
+		// The tag carries the fingerprint so checkouts with different specs
+		// never move each other's tag mid-run.
+		image = weaverReleasePlaywrightRepository + ":" + shortFingerprint(fingerprint)
+		setEnv("E2E_WEAVER_PLAYWRIGHT_IMAGE", image)
 	}
 	setEnv("E2E_WEAVER_PLAYWRIGHT_SOURCE_FINGERPRINT", fingerprint)
 	if !envBool("E2E_FORCE_REBUILD_WEAVER_PLAYWRIGHT_IMAGE", false) &&

@@ -17,6 +17,7 @@
     "test:encryption-key-lifecycle": "playwright test tests/encryption-key-lifecycle.spec.ts",
     "test:duplicate-and-queue-policy": "playwright test tests/duplicate-and-queue-policy.spec.ts",
     "test:advanced-networking": "playwright test tests/network- --grep-invert \"@no-net-raw|@extended\"",
+    "test:advanced-networking-restarted": "playwright test tests/network- --grep @restart --grep-invert \"@no-net-raw|@extended\"",
     "test:advanced-networking-no-net-raw": "playwright test tests/network-egress.spec.ts --grep @no-net-raw --grep-invert @extended",
     "test:advanced-networking-extended": "playwright test tests/network- --grep @extended",
     "test:event-scripts": "playwright test tests/event-scripts.spec.ts tests/scan-scripts.spec.ts tests/script-restart.spec.ts --grep-invert @extended",

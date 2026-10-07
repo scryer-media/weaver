@@ -206,6 +206,14 @@ func TestReleaseFlowPlaywrightScriptsExist(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s has no npm script test:%s", spec.Name, spec.PlaywrightScript)
 		}
+		for stage, stageScript := range spec.StageScripts {
+			if !slices.Contains(spec.Stages, stage) {
+				t.Fatalf("%s maps a script to stage %s, which it never runs", spec.Name, stage)
+			}
+			if _, ok := manifest.Scripts["test:"+stageScript]; !ok {
+				t.Fatalf("%s stage %s has no npm script test:%s", spec.Name, stage, stageScript)
+			}
+		}
 		if len(spec.SpecFiles) > 0 {
 			for _, file := range spec.SpecFiles {
 				if !strings.Contains(script, "tests/"+file) && !strings.Contains(script, "tests/network-") {
@@ -304,5 +312,24 @@ func TestFetchableNetworkCandidatesAreOutsideTheBlockedRanges(t *testing.T) {
 	}
 	if !weaverNetworkLayoutFixtureAddress.servesNzbUrls() || weaverNetworkLayoutEgress.servesNzbUrls() {
 		t.Fatal("only the fixture-address layout serves NZB URLs")
+	}
+}
+
+func TestAdvancedNetworkingTimeScaleReachesOnlyItsFlows(t *testing.T) {
+	scaled := map[string]bool{
+		"advanced-networking":            true,
+		"advanced-networking-no-net-raw": true,
+	}
+	t.Setenv("E2E_WEAVER_NETWORK_TIME_SCALE", "99")
+	for _, spec := range weaverReleaseFlowSpecs {
+		phase := &weaverReleasePhase{Flow: spec.Name, Spec: spec}
+		got := phase.env()["E2E_WEAVER_NETWORK_TIME_SCALE"]
+		want := "1"
+		if scaled[spec.Name] {
+			want = advancedNetworkingTimeScale
+		}
+		if got != want {
+			t.Errorf("%s: E2E_WEAVER_NETWORK_TIME_SCALE = %q, want %q", spec.Name, got, want)
+		}
 	}
 }
