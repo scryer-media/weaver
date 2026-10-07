@@ -68,7 +68,14 @@ async fn spawn_capacity_limited_body_server(
     let server = tokio::spawn(async move {
         loop {
             let (socket, _) = listener.accept().await.unwrap();
-            let active = active_for_server.fetch_add(1, Ordering::SeqCst) + 1;
+            // Claim a provider slot only when one is free, so a refused
+            // attempt never counts as a held session, even while its 502 is
+            // still being written.
+            let admitted = active_for_server
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                    (active < connection_limit).then_some(active + 1)
+                })
+                .is_ok();
             let active_for_connection = Arc::clone(&active_for_server);
             let mut final_body_released = final_body_released.clone();
             let encoded_body = Arc::clone(&encoded_body);
@@ -76,9 +83,8 @@ async fn spawn_capacity_limited_body_server(
             let body_commands = Arc::clone(&body_commands_for_server);
             tokio::spawn(async move {
                 let (reader, mut writer) = socket.into_split();
-                if active > connection_limit {
+                if !admitted {
                     let _ = writer.write_all(b"502 Too Many Connections\r\n").await;
-                    active_for_connection.fetch_sub(1, Ordering::SeqCst);
                     return;
                 }
 
