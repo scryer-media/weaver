@@ -308,3 +308,67 @@ async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_faile
     );
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn configured_legs_of_a_dormant_consumer_report_a_missing_egress() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let consumer = Consumer::Server(3);
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.consumers.insert(consumer.key());
+    config
+        .consumer_labels
+        .push((consumer, "news.invalid".into(), 3));
+    config.policies.insert(
+        consumer.key(),
+        RoutingPolicy {
+            legs: vec![
+                RouteLeg {
+                    egress_id: 0,
+                    weight: 50,
+                    path: LegPath::Direct,
+                },
+                RouteLeg {
+                    egress_id: 99,
+                    weight: 50,
+                    path: LegPath::Direct,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let warning =
+        "Restored egress 99 is missing; this leg is Down until its egress is repaired.".to_string();
+    config.warnings.insert((consumer.key(), 1), warning.clone());
+    runtime.apply_configuration(config).unwrap();
+
+    // The consumer never dialed, yet its configured legs and their egress
+    // health are reported.
+    let dormant = runtime.dormant_legs();
+    let legs: Vec<_> = dormant
+        .iter()
+        .filter(|leg| leg.consumer == consumer)
+        .collect();
+    assert_eq!(legs.len(), 2);
+    assert_eq!((legs[0].position, legs[0].definition.egress_id), (0, 0));
+    assert_eq!(legs[0].health, LegHealthState::Up);
+    assert_eq!((legs[1].position, legs[1].definition.egress_id), (1, 99));
+    assert_eq!(legs[1].health, LegHealthState::Down(warning.clone()));
+
+    // Once it dials, the live route takes over with the same reason.
+    let route = runtime.route(consumer, 3, Duration::from_secs(1)).unwrap();
+    assert!(
+        runtime
+            .dormant_legs()
+            .iter()
+            .all(|leg| leg.consumer != consumer)
+    );
+    assert_eq!(
+        route.weighted.allocations()[1].health,
+        LegHealthState::Down(warning)
+    );
+    runtime.shutdown().await;
+}

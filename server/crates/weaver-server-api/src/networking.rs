@@ -542,6 +542,34 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
             });
         }
     }
+    // Routes configured for consumers that have not dialed yet, such as an
+    // inactive server, are part of the picture too: the operator configured
+    // them, and an egress they depend on may already be missing.
+    for leg in runtime.network.dormant_legs() {
+        let (state, reason) = match leg.health {
+            core::LegHealthState::Up | core::LegHealthState::Probing => ("IDLE", None),
+            core::LegHealthState::Down(reason) => ("DOWN", Some(reason)),
+            core::LegHealthState::Blocked(reason) => ("BLOCKED", Some(reason)),
+        };
+        legs.push(NetworkLegFlow {
+            consumer: leg.consumer.key(),
+            position: leg.position as i32,
+            egress_id: leg.definition.egress_id,
+            weight: leg.definition.weight,
+            target: 0,
+            open: 0,
+            opening: 0,
+            state: state.into(),
+            reason,
+            path: RouteLegGql::from(leg.definition).path,
+            pinned_address: None,
+            source_address: None,
+            bytes_per_second: 0,
+            selected_rung: None,
+            selected_proxy_id: None,
+            rung_states: Vec::new(),
+        });
+    }
     let mut pools: Vec<_> = runtime
         .network
         .pool_status()

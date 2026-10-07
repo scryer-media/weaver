@@ -87,6 +87,42 @@ impl Configuration {
         }
         Ok(configuration)
     }
+    /// The health a leg's egress contributes before any dial evidence. A
+    /// missing egress is Down under the warning recorded for that leg, so
+    /// the flow names which egress vanished instead of a generic removal.
+    fn egress_health(
+        &self,
+        consumer: &str,
+        position: usize,
+        egress_id: u32,
+        snapshot: &InterfaceSnapshot,
+    ) -> EgressHealth {
+        match self.egresses.get(&egress_id) {
+            Some(egress) => snapshot.health(egress, None),
+            None => EgressHealth::Down(self.missing_egress_warning(consumer, position, egress_id)),
+        }
+    }
+    fn missing_egress_warning(&self, consumer: &str, position: usize, egress_id: u32) -> String {
+        self.warnings
+            .get(&(consumer.to_owned(), position))
+            .cloned()
+            .unwrap_or_else(|| {
+                format!(
+                    "Egress {egress_id} is missing; this leg is Down until its egress is repaired."
+                )
+            })
+    }
+}
+
+/// A leg of a configured route whose consumer has not asked for a dialer,
+/// such as an inactive server. It carries no connections, but the route the
+/// operator configured and the health of its egress are still facts the
+/// flow reports.
+pub struct DormantLeg {
+    pub consumer: Consumer,
+    pub position: usize,
+    pub definition: RouteLeg,
+    pub health: LegHealthState,
 }
 
 pub struct LiveLeg {
@@ -226,6 +262,40 @@ impl NetworkRuntime {
             .cloned()
             .collect()
     }
+    /// Legs of every configured route without a live counterpart.
+    pub fn dormant_legs(&self) -> Vec<DormantLeg> {
+        let snapshot = self.interfaces();
+        let config = self.configuration.read().expect("network configuration");
+        let routes = self.routes.lock().expect("network routes");
+        let mut legs = Vec::new();
+        for (consumer, _, _) in &config.consumer_labels {
+            let key = consumer.key();
+            if routes.contains_key(&key) {
+                continue;
+            }
+            let definition = config
+                .policies
+                .get(&key)
+                .cloned()
+                .unwrap_or_default()
+                .route();
+            for (position, leg) in definition.legs.into_iter().enumerate() {
+                let health = LegHealthState::of_egress(config.egress_health(
+                    &key,
+                    position,
+                    leg.egress_id,
+                    &snapshot,
+                ));
+                legs.push(DormantLeg {
+                    consumer: *consumer,
+                    position,
+                    definition: leg,
+                    health,
+                });
+            }
+        }
+        legs
+    }
     pub fn pool_status(
         &self,
     ) -> Vec<(
@@ -249,11 +319,12 @@ impl NetworkRuntime {
         let config = self.configuration.read().expect("network configuration");
         for route in self.routes.lock().expect("network routes").values() {
             for (position, leg) in route.legs.read().expect("route legs").iter().enumerate() {
-                let health = config
-                    .egresses
-                    .get(&leg.definition.egress_id)
-                    .map(|e| snapshot.health(e, None))
-                    .unwrap_or_else(|| EgressHealth::Down("Egress was removed".into()));
+                let health = config.egress_health(
+                    &route.consumer.key(),
+                    position,
+                    leg.definition.egress_id,
+                    &snapshot,
+                );
                 route.weighted.set_egress_health(position, health);
             }
         }
@@ -481,10 +552,7 @@ impl NetworkRuntime {
         timeout: Duration,
     ) -> Result<LiveLeg, String> {
         if !config.egresses.contains_key(&leg.egress_id) {
-            let warning = format!(
-                "Egress {} is missing; this leg is Down until repaired",
-                leg.egress_id
-            );
+            let warning = config.missing_egress_warning(&consumer.key(), position, leg.egress_id);
             return Ok(LiveLeg {
                 definition: leg.clone(),
                 warning: Some(warning.clone()),
@@ -617,9 +685,11 @@ impl NetworkRuntime {
         for (position, leg) in legs.iter().enumerate() {
             weighted.set_egress_health(
                 position,
-                config.egresses.get(&leg.definition.egress_id).map_or_else(
-                    || EgressHealth::Down("Egress is missing".into()),
-                    |egress| snapshot.health(egress, None),
+                config.egress_health(
+                    &consumer.key(),
+                    position,
+                    leg.definition.egress_id,
+                    &snapshot,
                 ),
             );
         }
@@ -751,9 +821,11 @@ impl NetworkRuntime {
             for (position, leg) in fresh.iter().enumerate() {
                 route.weighted.set_egress_health(
                     position,
-                    next.egresses.get(&leg.definition.egress_id).map_or_else(
-                        || EgressHealth::Down("Egress is missing".into()),
-                        |egress| snapshot.health(egress, None),
+                    next.egress_health(
+                        &route.consumer.key(),
+                        position,
+                        leg.definition.egress_id,
+                        &snapshot,
                     ),
                 );
             }

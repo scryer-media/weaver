@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -19,6 +20,62 @@ pub enum LegHealthState {
     Probing,
     Blocked(String),
 }
+impl LegHealthState {
+    /// The health a leg has from its egress alone, before any dial evidence.
+    pub fn of_egress(health: EgressHealth) -> Self {
+        match health {
+            EgressHealth::Up => Self::Up,
+            EgressHealth::Down(reason) => Self::Down(reason),
+            EgressHealth::Unknown => Self::Down("Egress health is unknown".into()),
+        }
+    }
+}
+
+/// How many one-second windows a leg's reported rate spans.
+const THROUGHPUT_WINDOWS: usize = 4;
+
+/// The bytes a leg carried over its most recent one-second windows.
+///
+/// A single second is a noisy reading: bytes are counted as reads land while
+/// the egress limiter paces them afterwards in short bursts, so one second
+/// can land well over the limit and the next well under it even though the
+/// limiter holds the rate exactly. The rate over the last few windows is
+/// what the leg sustains, and that is what the flow reports.
+struct Throughput {
+    windows: VecDeque<(u64, f64)>,
+    sampled_at: Instant,
+}
+impl Throughput {
+    fn new(now: Instant) -> Self {
+        Self {
+            windows: VecDeque::with_capacity(THROUGHPUT_WINDOWS),
+            sampled_at: now,
+        }
+    }
+    /// Whether a full second has passed since the last window closed.
+    fn due(&self, now: Instant) -> bool {
+        now.duration_since(self.sampled_at).as_secs_f64() >= 1.0
+    }
+    fn record(&mut self, bytes: u64, now: Instant) {
+        let elapsed = now.duration_since(self.sampled_at).as_secs_f64();
+        if self.windows.len() == THROUGHPUT_WINDOWS {
+            self.windows.pop_front();
+        }
+        self.windows.push_back((bytes, elapsed));
+        self.sampled_at = now;
+    }
+    fn bytes_per_second(&self) -> u64 {
+        let (bytes, seconds) = self
+            .windows
+            .iter()
+            .fold((0u64, 0f64), |(b, s), (bytes, secs)| (b + bytes, s + secs));
+        if seconds <= 0.0 {
+            0
+        } else {
+            (bytes as f64 / seconds) as u64
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct LegAllocation {
@@ -36,8 +93,7 @@ struct LegState {
     path: Option<weaver_tunnel::pipe::DialPath>,
     source: Option<std::net::SocketAddr>,
     reads: Arc<AtomicU64>,
-    bytes_per_second: u64,
-    sampled_at: Instant,
+    throughput: Throughput,
     generation: u64,
     open: u16,
     opening: u16,
@@ -54,8 +110,7 @@ impl Default for LegState {
             path: None,
             source: None,
             reads: Default::default(),
-            bytes_per_second: 0,
-            sampled_at: Instant::now(),
+            throughput: Throughput::new(Instant::now()),
             generation: 0,
             open: 0,
             opening: 0,
@@ -73,12 +128,8 @@ impl LegState {
         if let Some(reason) = &self.blocked {
             return LegHealthState::Blocked(reason.clone());
         }
-        match &self.egress {
-            EgressHealth::Down(reason) => return LegHealthState::Down(reason.clone()),
-            EgressHealth::Unknown => {
-                return LegHealthState::Down("Egress health is unknown".into());
-            }
-            EgressHealth::Up => {}
+        if let down @ LegHealthState::Down(_) = LegHealthState::of_egress(self.egress.clone()) {
+            return down;
         }
         match self.until {
             Some(until) if until > now => LegHealthState::Down(self.reason.clone()),
@@ -161,7 +212,7 @@ impl AllocationState {
                 health: health[position].clone(),
                 path: state.path.clone(),
                 source: state.source,
-                bytes_per_second: state.bytes_per_second,
+                bytes_per_second: state.throughput.bytes_per_second(),
             })
             .collect()
     }
@@ -245,11 +296,9 @@ impl Weighted {
                 let mut state = route.shared.state.lock().expect("leg allocation");
                 let now = Instant::now();
                 for leg in &mut state.legs {
-                    let elapsed = now.duration_since(leg.sampled_at).as_secs_f64();
-                    if elapsed >= 1.0 {
-                        leg.bytes_per_second =
-                            (leg.reads.swap(0, Ordering::Relaxed) as f64 / elapsed) as u64;
-                        leg.sampled_at = now;
+                    if leg.throughput.due(now) {
+                        let bytes = leg.reads.swap(0, Ordering::Relaxed);
+                        leg.throughput.record(bytes, now);
                     }
                 }
                 let next = state.snapshot();

@@ -325,3 +325,38 @@ async fn throughput_publish_does_not_wake_capacity_waiters() {
     drop(dialed);
     waiting.await;
 }
+
+async fn settle_rate(updates: &mut watch::Receiver<Vec<LegAllocation>>, expected: u64) {
+    loop {
+        let rate = updates
+            .borrow_and_update()
+            .iter()
+            .map(|leg| leg.bytes_per_second)
+            .max()
+            .unwrap_or(0);
+        if rate == expected {
+            return;
+        }
+        updates.changed().await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn leg_rate_is_the_sustained_rate_over_recent_windows() {
+    let (weighted, _) = create(5);
+    let dialed = weighted.dial(&target()).await.unwrap();
+    let mut updates = weighted.subscribe();
+    dialed.outcome.read(1024);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_rate(&mut updates, 1024).await;
+    // A burst twice the size lands in the next second: the rate averages
+    // both windows instead of jumping to the burst.
+    dialed.outcome.read(3072);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_rate(&mut updates, 2048).await;
+    // Idle seconds age the carried bytes out of the window set one at a time.
+    for expected in [1365, 1024, 768, 0] {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle_rate(&mut updates, expected).await;
+    }
+}
