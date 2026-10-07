@@ -80,6 +80,30 @@ async fn routes(tx: &mut SqlTx<'_>) -> Result<Vec<Route>, StateError> {
         .collect()
 }
 
+/// The next free egress id. An id a route still names stays reserved even
+/// when its row is gone, as after restoring an older backup: a route must
+/// never rebind to an egress created later under a reused id.
+async fn next_egress_id(tx: &mut SqlTx<'_>) -> Result<u32, StateError> {
+    let row = tx
+        .fetch_optional(
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM egress_interfaces",
+            &[],
+        )
+        .await?
+        .ok_or_else(|| error("cannot allocate egress id"))?;
+    let stored = u32::try_from(row.i64("max_id")?).map_err(error)?;
+    let referenced = routes(tx)
+        .await?
+        .iter()
+        .flat_map(|route| route.legs.iter().map(|leg| leg.egress_id))
+        .max()
+        .unwrap_or(0);
+    stored
+        .max(referenced)
+        .checked_add(1)
+        .ok_or_else(|| error("egress ids are exhausted"))
+}
+
 /// Serialize networking resource edits on a row that cannot be removed.
 pub(super) async fn lock_network(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
     tx.execute("UPDATE egress_interfaces SET id = id WHERE id = 0", &[])
@@ -246,8 +270,7 @@ impl Database {
                 Box::pin(async move {
                     lock_network(tx).await?;
                     if create {
-                        let row = tx.fetch_optional("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM egress_interfaces", &[]).await?.ok_or_else(|| error("cannot allocate egress id"))?;
-                        egress.id = u32::try_from(row.i64("next_id")?).map_err(error)?;
+                        egress.id = next_egress_id(tx).await?;
                     } else if tx.fetch_optional("SELECT id FROM egress_interfaces WHERE id = {}", &[SqlArg::I64(i64::from(egress.id))]).await?.is_none() {
                         return Err(error("egress no longer exists"));
                     }

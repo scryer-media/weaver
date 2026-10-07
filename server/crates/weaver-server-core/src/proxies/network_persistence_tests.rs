@@ -347,3 +347,63 @@ fn logical_backup_before_egress_catalog_restores_system_defaults() {
     assert!(target.list_proxy_pools().unwrap().is_empty());
     assert_eq!(target.list_proxy_profiles().unwrap().len(), 1);
 }
+
+/// Remove a row the way a restore of an older backup or a hand edit does:
+/// behind the store's reference checks.
+fn delete_row_behind_the_store(db: &Database, sql: &'static str, id: u32) {
+    let store = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&store, "row_fixture", |tx| {
+            Box::pin(async move {
+                tx.execute(sql, &[SqlArg::I64(i64::from(id))]).await?;
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+#[test]
+fn an_egress_id_a_route_still_names_is_not_reused_after_its_row_vanishes() {
+    let db = Database::open_in_memory().unwrap();
+    let kept = db.create_egress_interface(&egress()).unwrap();
+    let doomed = db.create_egress_interface(&egress()).unwrap();
+    assert_eq!((kept.id, doomed.id), (1, 2));
+    insert_route(
+        &db,
+        Route {
+            legs: vec![
+                RouteLeg {
+                    egress_id: kept.id,
+                    weight: 50,
+                    path: LegPath::Direct,
+                },
+                RouteLeg {
+                    egress_id: doomed.id,
+                    weight: 50,
+                    path: LegPath::Direct,
+                },
+            ],
+            failover: Failover::Hold,
+        },
+    );
+    delete_row_behind_the_store(
+        &db,
+        "DELETE FROM egress_interfaces WHERE id = {}",
+        doomed.id,
+    );
+
+    // The vanished row held the highest id and the route still names it, so
+    // the next egress must not take it over and rebind that leg.
+    let next = db.create_egress_interface(&egress()).unwrap();
+    assert_eq!(next.id, doomed.id + 1);
+    assert_eq!(
+        db.list_egress_interfaces()
+            .unwrap()
+            .iter()
+            .map(|egress| egress.id)
+            .collect::<Vec<_>>(),
+        [0, kept.id, next.id]
+    );
+}
