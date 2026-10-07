@@ -396,3 +396,18 @@ fn both_unique_local_ipv6_prefixes_are_filtered_consistently() {
         "2001:db8::1".parse().unwrap()
     ));
 }
+
+#[test]
+fn an_ssh_forwarding_refusal_is_hop_evidence_and_an_unreachable_destination_is_not() {
+    let dial = |detail: &str| TunnelError::Dial {
+        host: "news.example.test".into(),
+        port: 563,
+        detail: detail.into(),
+    };
+    let refused = DialError::hop(3, dial("AdministrativelyProhibited"));
+    assert!(matches!(&refused, DialError::Hop { proxy: 3, .. }), "{refused:?}");
+    assert!(refused.is_path_evidence());
+    let unreachable = DialError::hop(3, dial("ConnectFailed"));
+    assert!(matches!(&unreachable, DialError::Destination(_)), "{unreachable:?}");
+    assert!(!unreachable.is_path_evidence());
+}

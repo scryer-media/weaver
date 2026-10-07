@@ -219,12 +219,23 @@ impl DialError {
     fn hop(proxy: u32, source: TunnelError) -> Self {
         if matches!(source, TunnelError::HostKeyMismatch { .. }) {
             Self::Fatal(source)
+        } else if matches!(&source, TunnelError::Dial { detail, .. } if is_forwarding_refusal(detail)) {
+            // The proxy answered and refused to forward at all. That is the
+            // proxy's policy, not the destination, so it is evidence against
+            // the path, as an HTTP proxy refusing CONNECT is.
+            Self::Hop { proxy, source }
         } else if matches!(source, TunnelError::Dial { .. }) {
             Self::Destination(io::Error::other(source))
         } else {
             Self::Hop { proxy, source }
         }
     }
+}
+
+/// An SSH server refuses a forwarding request it will not serve with
+/// `administratively prohibited`; the destination was never tried.
+fn is_forwarding_refusal(detail: &str) -> bool {
+    detail.contains("AdministrativelyProhibited")
 }
 
 #[async_trait::async_trait]
