@@ -17,6 +17,7 @@ use crate::history::JobEvent;
 use crate::ingest::decode_persisted_nzb_bytes;
 use crate::jobs::model::TerminalDiscardKind;
 use crate::jobs::server_attribution::{JobServerContribution, contributions_from_storage};
+use crate::jobs::support_facts::JobSupportFacts;
 use crate::persistence::Database;
 use crate::{JobHistoryRow, JobId, JobInfo, SchedulerHandle, StateError};
 
@@ -114,6 +115,7 @@ pub fn build_job_support_report(
     };
     let mut job = job;
     job.apply_events(&db.get_job_events(job_id)?);
+    job.apply_support_facts(&db.load_job_support_facts(JobId(job_id))?, now_epoch_secs);
 
     let (path, compressed) = stored.ok_or(SupportReportError::NzbUnavailable(job_id))?;
     let raw = match compressed {
@@ -278,6 +280,103 @@ pub struct ProviderOutcome {
     pub wire_bytes: u64,
 }
 
+/// The job's first direct-store demotion.
+///
+/// `reason` is the demotion's stable label. A stored label that is not made
+/// of lowercase letters, digits and underscores is read back as `unknown`, so
+/// the row cannot carry text into the report.
+#[derive(Debug, Clone, Serialize)]
+pub struct DemotionOutcome {
+    pub reason: String,
+    pub stage: &'static str,
+    pub at_epoch_secs: u64,
+    pub age_secs: u64,
+    pub sets: u32,
+}
+
+/// A gap's position: the NZB report's file token and the segment's place in
+/// that file's segment list, counted from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapToken {
+    file: u32,
+    segment: u32,
+}
+
+impl std::fmt::Display for GapToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "f{:02}#{}", self.file, self.segment)
+    }
+}
+
+impl Serialize for GapToken {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerGapOutcome {
+    pub server: ServerToken,
+    pub refused: u32,
+}
+
+/// The job's articles that never arrived.
+#[derive(Debug, Clone, Serialize)]
+pub struct GapOutcome {
+    /// Articles no server had.
+    pub missing: u32,
+    /// Segments whose retries or decodes ran out.
+    pub failed: u32,
+    /// Per server, how many of those it was asked for and refused.
+    pub servers: Vec<ServerGapOutcome>,
+    /// The first gaps booked, in position order.
+    pub sample: Vec<GapToken>,
+}
+
+impl DemotionOutcome {
+    fn of(facts: &JobSupportFacts, now_epoch_secs: u64) -> Option<Self> {
+        let demotion = facts.demotion.as_ref()?;
+        Some(Self {
+            reason: demotion.reason.clone(),
+            stage: known_status(&demotion.stage),
+            at_epoch_secs: demotion.at_epoch_secs,
+            age_secs: now_epoch_secs.saturating_sub(demotion.at_epoch_secs),
+            sets: demotion.sets,
+        })
+    }
+}
+
+impl GapOutcome {
+    fn of(facts: &JobSupportFacts) -> Option<Self> {
+        let gaps = &facts.gaps;
+        if gaps.is_empty() {
+            return None;
+        }
+        let mut servers: Vec<ServerGapOutcome> = gaps
+            .servers
+            .iter()
+            .map(|entry| ServerGapOutcome {
+                server: ServerToken(entry.0),
+                refused: entry.1,
+            })
+            .collect();
+        servers.sort_by_key(|server| std::cmp::Reverse(server.refused));
+        Some(Self {
+            missing: gaps.missing,
+            failed: gaps.failed,
+            servers,
+            sample: gaps
+                .sorted_sample()
+                .into_iter()
+                .map(|position| GapToken {
+                    file: position.0.saturating_add(1),
+                    segment: position.1.saturating_add(1),
+                })
+                .collect(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StageOutcome {
@@ -383,6 +482,8 @@ pub struct JobSection {
     pub remaining_par_files: Option<u32>,
     pub discards: Vec<DiscardCount>,
     pub providers: Vec<ProviderOutcome>,
+    pub demotion: Option<DemotionOutcome>,
+    pub gaps: Option<GapOutcome>,
     pub verification_runs: u32,
     pub repair: StageOutcome,
     pub extraction: StageOutcome,
@@ -455,6 +556,8 @@ impl JobSection {
             remaining_par_files: None,
             discards: Vec::new(),
             providers: Vec::new(),
+            demotion: None,
+            gaps: None,
             verification_runs: 0,
             repair: StageOutcome::NotRun,
             extraction: StageOutcome::NotRun,
@@ -560,6 +663,12 @@ impl JobSection {
         }
     }
 
+    /// The job's stored demotion and article-gap summary.
+    pub fn apply_support_facts(&mut self, facts: &JobSupportFacts, now_epoch_secs: u64) {
+        self.demotion = DemotionOutcome::of(facts, now_epoch_secs);
+        self.gaps = GapOutcome::of(facts);
+    }
+
     fn render(&self, text: &mut String) {
         let source = match self.source {
             JobSource::Queue => "queue",
@@ -629,6 +738,51 @@ impl JobSection {
             }
             let _ = writeln!(text, "{}", clip(&servers));
         }
+        if let Some(demotion) = &self.demotion {
+            let _ = writeln!(
+                text,
+                "{}",
+                clip(&format!(
+                    "  demoted {}  in {}  sets {}  {} ago",
+                    demotion.reason,
+                    demotion.stage,
+                    demotion.sets,
+                    human_age(demotion.age_secs)
+                ))
+            );
+        }
+        if let Some(gaps) = &self.gaps {
+            let mut line = format!("  gaps missing {}  failed {}", gaps.missing, gaps.failed);
+            if !gaps.servers.is_empty() {
+                line.push_str("  refused");
+                for server in gaps.servers.iter().take(MAX_SERVERS) {
+                    let _ = write!(line, " {} {}", server.server, server.refused);
+                }
+                if gaps.servers.len() > MAX_SERVERS {
+                    let _ = write!(line, " +{}", gaps.servers.len() - MAX_SERVERS);
+                }
+            }
+            let _ = writeln!(text, "{}", clip(&line));
+            if !gaps.sample.is_empty() {
+                // Wrapped rather than clipped: the sample is the part a
+                // reader looks at to see where the gaps cluster.
+                let mut words: Vec<String> = gaps.sample.iter().map(ToString::to_string).collect();
+                let total = u64::from(gaps.missing) + u64::from(gaps.failed);
+                if total > gaps.sample.len() as u64 {
+                    words.push(format!("(first {} of {total})", gaps.sample.len()));
+                }
+                let mut line = String::from("  gap at");
+                for word in words {
+                    if line.len() + 1 + word.len() > MAX_COLUMNS {
+                        let _ = writeln!(text, "{line}");
+                        line = String::from("        ");
+                    }
+                    line.push(' ');
+                    line.push_str(&word);
+                }
+                let _ = writeln!(text, "{line}");
+            }
+        }
         let _ = writeln!(
             text,
             "  verify {}  repair {}  extract {}  member fails {}  missing {}",
@@ -684,4 +838,13 @@ fn human_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+fn human_age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3_600 => format!("{}m", secs / 60),
+        3_600..86_400 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }

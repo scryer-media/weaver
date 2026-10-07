@@ -38,6 +38,10 @@ fn assert_redacted(report: &serde_json::Value) {
 }
 
 fn seed_history_job(h: &TestHarness, job_id: u64) {
+    seed_history_job_with_facts(h, job_id, None);
+}
+
+fn seed_history_job_with_facts(h: &TestHarness, job_id: u64, facts: Option<String>) {
     h.db.create_active_job(&ActiveJob {
         job_id: JobId(job_id),
         nzb_hash: [0x22; 32],
@@ -58,6 +62,10 @@ fn seed_history_job(h: &TestHarness, job_id: u64) {
         password_override: None,
     })
     .unwrap();
+    if facts.is_some() {
+        h.db.save_active_support_facts(vec![(JobId(job_id), facts)])
+            .unwrap();
+    }
     h.db.archive_job(
         JobId(job_id),
         &JobHistoryRow {
@@ -103,6 +111,42 @@ async fn read_scope_can_read_a_job_support_report() {
     assert_eq!(json["job"]["status"], "complete");
     assert_eq!(json["nzb"]["shape"]["file_count"], 1);
     assert!(json["environment"]["weaver_version"].is_string());
+}
+
+#[tokio::test]
+async fn a_job_support_report_carries_the_demotion_and_article_gaps() {
+    use weaver_server_core::jobs::support_facts::{GapKind, GapPosition, JobSupportFacts};
+
+    let h = TestHarness::new().await;
+    let mut facts = JobSupportFacts::default();
+    facts.note_demotion("par2_damaged", "downloading", 1_767_000_005);
+    facts.note_gap(GapKind::Missing, GapPosition(0, 1));
+    facts.note_gap_servers([3]);
+    seed_history_job_with_facts(&h, 42, facts.to_storage_json());
+    let response = h
+        .execute_as(
+            "{ jobSupportReport(jobId: 42) { text json } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let report = &data["jobSupportReport"];
+    assert_redacted(report);
+    let text = report["text"].as_str().unwrap();
+    assert!(
+        text.contains("  demoted par2_damaged  in downloading  sets 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  gaps missing 1  failed 0  refused s3 1"),
+        "{text}"
+    );
+    assert!(text.contains("  gap at f01#2"), "{text}");
+    let json: serde_json::Value = serde_json::from_str(report["json"].as_str().unwrap()).unwrap();
+    assert_eq!(json["job"]["demotion"]["reason"], "par2_damaged");
+    assert_eq!(json["job"]["gaps"]["missing"], 1);
+    assert_eq!(json["job"]["gaps"]["sample"][0], "f01#2");
 }
 
 #[tokio::test]

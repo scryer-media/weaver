@@ -163,21 +163,9 @@ fn history_report_carries_the_outcome_and_no_names() {
     assert!(report.text.contains("env weaver 9.9.9  db sqlite"));
 }
 
-#[test]
-fn live_report_reads_queue_state() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&active_job(3)).unwrap();
-    record_events(
-        &db,
-        3,
-        &[
-            "ExtractionReady",
-            "ExtractionMemberFailed",
-            "ExtractionComplete",
-        ],
-    );
-    let info = JobInfo {
-        job_id: JobId(3),
+fn live_info(id: u64) -> JobInfo {
+    JobInfo {
+        job_id: JobId(id),
         job_hash: None,
         name: SENTINEL.to_string(),
         status: JobStatus::Extracting,
@@ -212,7 +200,23 @@ fn live_report_reads_queue_state() {
         download_retry_at_epoch_ms: None,
         server_attribution: Vec::new(),
         created_at_epoch_ms: 0.0,
-    };
+    }
+}
+
+#[test]
+fn live_report_reads_queue_state() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&active_job(3)).unwrap();
+    record_events(
+        &db,
+        3,
+        &[
+            "ExtractionReady",
+            "ExtractionMemberFailed",
+            "ExtractionComplete",
+        ],
+    );
+    let info = live_info(3);
 
     let report = build_job_support_report(&db, Some(info), 3, &ENVIRONMENT, NOW).unwrap();
     assert_redacted(&report);
@@ -270,4 +274,121 @@ fn failure_messages_reduce_to_a_cause() {
     ] {
         assert_eq!(FailureVerdict::classify(message), verdict, "{message}");
     }
+}
+
+fn history_row(id: u64, status: &str) -> JobHistoryRow {
+    JobHistoryRow {
+        job_id: id,
+        job_hash: None,
+        name: SENTINEL.to_string(),
+        status: status.to_string(),
+        error_message: None,
+        total_bytes: 2_100,
+        downloaded_bytes: 2_100,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_767_000_000,
+        completed_at: 1_767_000_090,
+        metadata: None,
+        server_attribution: None,
+    }
+}
+
+#[test]
+fn demotion_and_gaps_reach_the_report_and_survive_the_archive() {
+    use crate::jobs::support_facts::{GapKind, GapPosition, JobSupportFacts};
+
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&active_job(11)).unwrap();
+    let mut facts = JobSupportFacts::default();
+    facts.note_demotion("member_checksum_mismatch", "downloading", NOW - 7_200);
+    facts.note_demotion("par2_damaged", "repairing", NOW - 60);
+    facts.note_gap(GapKind::Failed, GapPosition(0, 0));
+    facts.note_gap_servers([7]);
+    for segment in 0..20 {
+        facts.note_gap(GapKind::Missing, GapPosition(2, 40 - segment));
+        facts.note_gap_servers([4, 7]);
+    }
+    db.save_active_support_facts(vec![(JobId(11), facts.to_storage_json())])
+        .unwrap();
+
+    // Live: read from the active row.
+    let live = build_job_support_report(&db, Some(live_info(11)), 11, &ENVIRONMENT, NOW).unwrap();
+    assert_redacted(&live);
+    assert!(
+        live.text
+            .contains("demoted member_checksum_mismatch  in downloading  sets 2  2h ago"),
+        "{}",
+        live.text
+    );
+
+    // Finished: the archive copies the column onto the history row.
+    db.archive_job(JobId(11), &history_row(11, "failed"))
+        .unwrap();
+    let report = build_job_support_report(&db, None, 11, &ENVIRONMENT, NOW).unwrap();
+    assert_redacted(&report);
+    let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
+    let job = &json["job"];
+    assert_eq!(job["source"], "history");
+    assert_eq!(job["demotion"]["reason"], "member_checksum_mismatch");
+    assert_eq!(job["demotion"]["stage"], "downloading");
+    assert_eq!(job["demotion"]["sets"], 2);
+    assert_eq!(job["demotion"]["age_secs"], 7_200);
+    assert_eq!(job["gaps"]["missing"], 20);
+    assert_eq!(job["gaps"]["failed"], 1);
+    assert_eq!(job["gaps"]["servers"][0]["server"], "s7");
+    assert_eq!(job["gaps"]["servers"][0]["refused"], 21);
+    assert_eq!(job["gaps"]["servers"][1]["server"], "s4");
+    let sample = job["gaps"]["sample"].as_array().unwrap();
+    assert_eq!(sample.len(), 16);
+    assert_eq!(sample[0], "f01#1");
+    assert_eq!(sample[1], "f03#27");
+    assert!(
+        report
+            .text
+            .contains("  gaps missing 20  failed 1  refused s7 21 s4 20"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains("  gap at f01#1 f03#27"),
+        "{}",
+        report.text
+    );
+    assert!(report.text.contains("(first 16 of 21)"), "{}", report.text);
+}
+
+#[test]
+fn a_job_without_facts_reports_no_demotion_or_gap_lines() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&active_job(12)).unwrap();
+    db.archive_job(JobId(12), &history_row(12, "completed"))
+        .unwrap();
+    let report = build_job_support_report(&db, None, 12, &ENVIRONMENT, NOW).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
+    assert!(json["job"]["demotion"].is_null());
+    assert!(json["job"]["gaps"].is_null());
+    assert!(!report.text.contains("demoted"));
+    assert!(!report.text.contains("gap"));
+}
+
+#[test]
+fn a_hand_edited_row_cannot_carry_names_into_the_report() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&active_job(13)).unwrap();
+    let raw = format!(r#"{{"d":{{"r":"{SENTINEL}.part01.rar","s":"{SENTINEL}","t":1}}}}"#);
+    db.save_active_support_facts(vec![(JobId(13), Some(raw))])
+        .unwrap();
+    let report = build_job_support_report(&db, Some(live_info(13)), 13, &ENVIRONMENT, NOW).unwrap();
+    assert_redacted(&report);
+    assert!(
+        report.text.contains("demoted unknown  in other"),
+        "{}",
+        report.text
+    );
 }
