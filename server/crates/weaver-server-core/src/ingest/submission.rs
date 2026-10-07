@@ -164,16 +164,11 @@ pub fn nzb_to_submission_spec(
     category: Option<String>,
     metadata: Vec<(String, String)>,
 ) -> JobSpec {
-    let metadata = append_original_title_metadata(
-        metadata,
-        filename.and_then(|value| strip_nzb_source_suffix(value)),
-        nzb.meta.title.as_deref(),
-    );
+    // A name chosen by a scan script or a client carries no source suffix.
+    let title = filename.map(|value| strip_nzb_source_suffix(value).unwrap_or(value));
+    let metadata = append_original_title_metadata(metadata, title, nzb.meta.title.as_deref());
 
-    let name = derive_release_name(
-        filename.and_then(|value| strip_nzb_source_suffix(value)),
-        nzb.meta.title.as_deref(),
-    );
+    let name = derive_release_name(title, nzb.meta.title.as_deref());
 
     let password_path = filename
         .map(PathBuf::from)

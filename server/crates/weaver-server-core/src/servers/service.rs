@@ -97,10 +97,7 @@ impl Database {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE servers SET active = {} WHERE id = {}",
-                &[
-                    SqlArg::I64(i64::from(active)),
-                    SqlArg::I64(i64::from(server_id)),
-                ],
+                &[SqlArg::Bool(active), SqlArg::I64(i64::from(server_id))],
             )
             .await?;
             if changed == 0 {

@@ -171,7 +171,8 @@ impl AsyncWrite for RouteStream {
 pub(crate) enum BlockingSocket {
     Tcp(std::net::TcpStream),
     Tunnel {
-        stream: DirectStream,
+        /// Dropped by hand inside the runtime; see the `Drop` impl.
+        stream: std::mem::ManuallyDrop<DirectStream>,
         runtime: tokio::runtime::Handle,
         read_timeout: std::cell::Cell<Option<Duration>>,
         write_timeout: std::cell::Cell<Option<Duration>>,
@@ -196,7 +197,7 @@ impl BlockingSocket {
         timeout: Duration,
     ) -> Self {
         Self::Tunnel {
-            stream: DirectStream::from_stream(stream),
+            stream: std::mem::ManuallyDrop::new(DirectStream::from_stream(stream)),
             runtime,
             read_timeout: std::cell::Cell::new(Some(timeout)),
             write_timeout: std::cell::Cell::new(Some(timeout)),
@@ -231,6 +232,22 @@ impl BlockingSocket {
             Self::Tcp(tcp) => tcp.set_nonblocking(enabled),
             Self::Tunnel { .. } if !enabled => Ok(()),
             _ => Err(io::Error::other("tunnel adapter requires blocking calls")),
+        }
+    }
+}
+impl Drop for BlockingSocket {
+    fn drop(&mut self) {
+        if let Self::Tunnel {
+            stream, runtime, ..
+        } = self
+        {
+            // The blocking socket lives on a lane thread with no reactor, but
+            // dropping the tunnel stream closes its SSH channel from a Tokio
+            // task, which panics outside a runtime context.
+            let _guard = runtime.enter();
+            // SAFETY: the stream is dropped exactly once, here, and nothing
+            // reads it after this point.
+            unsafe { std::mem::ManuallyDrop::drop(stream) };
         }
     }
 }

@@ -141,14 +141,15 @@ test("SC09 a Paused directive adds the job paused", async ({ request }) => {
 
 test("SC10 a DupeKey directive sets the duplicate key", async ({ request }) => {
   const key = `sc10-key-${token()}`;
-  const { result } = await scanned(request, "SC10", directive("DUPEKEY", key));
+  // Weaver arbitrates semantic duplicates only in SCORE mode; a native submission defaults to ENFORCE.
+  const { result } = await scanned(request, "SC10", directive("DUPEKEY", key), { dupeMode: "SCORE" });
   expect(attribute(result, "nzbget.dupe_key")).toBe(key);
   const semantic = (await queueItem(request, result!.jobId!))?.duplicateSummary?.semantic;
   expect(semantic?.normalizedKey, "semantic duplicate candidate from the key").toBeTruthy();
 });
 
 test("SC11 a DupeScore directive sets the duplicate score", async ({ request }) => {
-  const { result } = await scanned(request, "SC11", `${directive("DUPEKEY", `sc11-key-${token()}`)}${directive("DUPESCORE", "42")}`);
+  const { result } = await scanned(request, "SC11", `${directive("DUPEKEY", `sc11-key-${token()}`)}${directive("DUPESCORE", "42")}`, { dupeMode: "SCORE" });
   expect(attribute(result, "nzbget.dupe_score")).toBe("42");
   expect((await queueItem(request, result!.jobId!))?.duplicateSummary?.semantic?.score).toBe(42);
 });
