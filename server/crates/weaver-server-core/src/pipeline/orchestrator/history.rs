@@ -551,6 +551,7 @@ impl Pipeline {
             self.semantic_terminal_causes.remove(&job_id)
         };
 
+        self.persist_support_facts_before_archive(job_id);
         let archive_started = Instant::now();
         let archived = match self.db.try_queue_archive_job_with_terminal_cause(
             job_id,

@@ -67,6 +67,7 @@ mod script_events;
 mod sequential_unpack;
 mod server_attribution;
 mod sfv_completion;
+mod support_facts;
 mod terminal_settlement;
 mod yenc_compatibility;
 mod zip64;
@@ -272,6 +273,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         early_recovery_requested_blocks: 0,
         last_health_probe_failed_bytes: 0,
         next_health_probe_failed_bytes: 1,
+        support_facts: Default::default(),
         detected_archives: HashMap::new(),
         file_identities: HashMap::new(),
         held_segments: Vec::new(),
@@ -1987,6 +1989,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             early_recovery_requested_blocks: 0,
             last_health_probe_failed_bytes: 0,
             next_health_probe_failed_bytes: 1,
+            support_facts: Default::default(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             held_segments: Vec::new(),

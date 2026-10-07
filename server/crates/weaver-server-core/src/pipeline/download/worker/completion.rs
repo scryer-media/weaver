@@ -881,7 +881,9 @@ impl Pipeline {
                         self.send_segment_event(|| PipelineEvent::ArticleNotFound {
                             segment_id: result.segment_id,
                         });
-                        self.book_failed_segment(result.segment_id);
+                        if self.book_failed_segment(result.segment_id) {
+                            self.note_gap_servers_support_fact(job_id, &excluded_servers);
+                        }
                         self.maybe_finish_download_pass(job_id);
                         return;
                     }
@@ -1125,7 +1127,9 @@ impl Pipeline {
                     self.send_segment_event(|| PipelineEvent::ArticleNotFound {
                         segment_id: result.segment_id,
                     });
-                    self.book_failed_segment(result.segment_id);
+                    if self.book_failed_segment(result.segment_id) {
+                        self.note_gap_servers_support_fact(job_id, &retry_exclude_servers);
+                    }
                 } else {
                     let seg_id = result.segment_id;
                     let completion_critical = self.segment_is_completion_critical(seg_id);
@@ -1163,7 +1167,14 @@ impl Pipeline {
                         // article: without this, health stays optimistic and
                         // recovery promotion waits for post-download verify.
                         self.transport_failure_streaks.remove(&seg_id);
-                        self.book_terminal_segment(seg_id, SegmentTerminalState::RetriesExhausted);
+                        if self
+                            .book_terminal_segment(seg_id, SegmentTerminalState::RetriesExhausted)
+                        {
+                            self.note_gap_servers_support_fact(
+                                job_id,
+                                source_server_idx.as_slice(),
+                            );
+                        }
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
                         if let Some(file_spec) = state.spec.files.get(file_idx)

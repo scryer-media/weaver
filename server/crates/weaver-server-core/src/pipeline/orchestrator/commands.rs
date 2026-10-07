@@ -159,9 +159,20 @@ impl Pipeline {
                         // row is the only place left to say so.
                         server_attribution: state.server_attribution.to_storage_json(),
                     };
+                    let support_facts = state.support_facts.to_storage_json();
                     let archive_result = self
                         .db_blocking({
                             move |db| {
+                                // Ahead of the archive, which copies them from the
+                                // active row.
+                                if let Some(json) = support_facts {
+                                    db.save_active_support_facts(vec![(job_id, Some(json))])
+                                        .map_err(|e| {
+                                            format!(
+                                                "failed to save cancelled job support facts: {e}"
+                                            )
+                                        })?;
+                                }
                                 db.archive_job(job_id, &row)
                                     .map_err(|e| format!("failed to archive cancelled job: {e}"))?;
                                 Ok::<(), String>(())

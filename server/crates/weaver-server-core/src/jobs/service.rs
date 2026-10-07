@@ -853,6 +853,7 @@ impl Pipeline {
             early_recovery_requested_blocks: 0,
             last_health_probe_failed_bytes: 0,
             next_health_probe_failed_bytes: 1,
+            support_facts: Default::default(),
             detected_archives: HashMap::new(),
             file_identities,
             held_segments: Vec::new(),
@@ -1251,6 +1252,7 @@ impl Pipeline {
                 early_recovery_requested_blocks: 0,
                 last_health_probe_failed_bytes: 0,
                 next_health_probe_failed_bytes: 1,
+                support_facts: Default::default(),
                 detected_archives: HashMap::new(),
                 file_identities,
                 held_segments: Vec::new(),
@@ -1583,6 +1585,13 @@ impl Pipeline {
                 tracing::warn!(%error, job_id = job_id.0, "could not load blocked job attribution");
                 Default::default()
             });
+        let support_facts = self
+            .db_blocking(move |db| db.load_job_support_facts(job_id))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, job_id = job_id.0, "could not load blocked job support facts");
+                Default::default()
+            });
         let resume = request.paused_resume_status.clone().unwrap_or_else(|| {
             if matches!(request.status, JobStatus::Paused) {
                 JobStatus::Downloading
@@ -1656,6 +1665,7 @@ impl Pipeline {
             early_recovery_requested_blocks: 0,
             last_health_probe_failed_bytes: 0,
             next_health_probe_failed_bytes: 1,
+            support_facts,
             detected_archives: request.detected_archives.clone(),
             file_identities: identities,
             held_segments: Vec::new(),
@@ -1944,6 +1954,9 @@ impl Pipeline {
         let server_attribution = self
             .db_blocking(move |db| db.load_active_server_attribution(job_id))
             .await?;
+        let support_facts = self
+            .db_blocking(move |db| db.load_job_support_facts(job_id))
+            .await?;
         // One read and parse of the persisted NZB per restored job, off the
         // pipeline thread, instead of one per archive file. Anything short of
         // a parsed NZB leaves the harvest to read the row itself, as before.
@@ -2064,6 +2077,7 @@ impl Pipeline {
             early_recovery_requested_blocks: 0,
             last_health_probe_failed_bytes: 0,
             next_health_probe_failed_bytes: 1,
+            support_facts,
             detected_archives: HashMap::new(),
             file_identities,
             held_segments: Vec::new(),

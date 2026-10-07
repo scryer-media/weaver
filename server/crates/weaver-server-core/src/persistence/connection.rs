@@ -800,9 +800,10 @@ enum WriteLane {
     Job(u64),
     /// Job event batches, applied in submission order.
     Events,
-    /// Server attribution checkpoints, applied in submission order. They only
-    /// set `active_jobs.server_attribution`, which a job's other writes never
-    /// touch and its archive reads.
+    /// Server attribution and support facts checkpoints, applied in submission
+    /// order. They only set `active_jobs.server_attribution` and
+    /// `active_jobs.support_facts`, which a job's other writes never touch and
+    /// its archive reads.
     ServerAttribution,
 }
 
@@ -1496,7 +1497,7 @@ impl Database {
         self.try_send_with_retry(command, label)
     }
 
-    /// Queue a server attribution checkpoint. Checkpoints keep their order
+    /// Queue a server attribution or support facts checkpoint. Checkpoints keep their order
     /// against each other, and a job's archive waits for the ones queued
     /// before it; on Postgres they otherwise run alongside other writes
     /// instead of holding every lane back.

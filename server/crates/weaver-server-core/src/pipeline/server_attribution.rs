@@ -6,6 +6,7 @@ impl Pipeline {
         // that cadence into ten database transactions per second.
         if self.server_attribution_checkpoint_at.elapsed() >= std::time::Duration::from_secs(5) {
             self.flush_server_attribution();
+            self.flush_support_facts();
             self.server_attribution_checkpoint_at = Instant::now();
         }
     }

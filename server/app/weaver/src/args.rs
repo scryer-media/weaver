@@ -142,7 +142,7 @@ pub(crate) enum Command {
         command: Par2Command,
     },
 
-    /// Offline NZB inspection.
+    /// NZB inspection: offline, or a running server's job report.
     Nzb {
         #[command(subcommand)]
         command: NzbCommand,
@@ -200,7 +200,30 @@ pub(crate) enum NzbCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Print a running server's support report for one of its jobs: the NZB
+    /// report plus how the job went, with the same redaction.
+    ///
+    /// The API key is read from WEAVER_API_KEY, or from the file named by
+    /// WEAVER_API_KEY_FILE, so it never appears in the process list.
+    Report {
+        /// The job's ID, as shown in the web UI.
+        #[arg(value_name = "JOB_ID")]
+        job_id: u32,
+
+        /// The server's address, including any base URL path. Defaults to
+        /// WEAVER_URL, then to the local server on its default port.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+
+        /// Print the report as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
+
+/// Where `weaver nzb report` looks when neither --url nor WEAVER_URL says.
+pub(crate) const DEFAULT_REPORT_URL: &str = "http://127.0.0.1:9090";
 
 pub(crate) fn upgrade_backup_required(flag: bool, env: Option<&str>) -> bool {
     flag || env.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -400,5 +423,37 @@ mod tests {
         assert_eq!(file, PathBuf::from("set.nzb.gz"));
         assert!(json);
         assert!(Cli::try_parse_from(["weaver", "nzb", "analyze"]).is_err());
+    }
+
+    #[test]
+    fn nzb_report_takes_a_job_id_and_an_optional_url() {
+        let Some(Command::Nzb {
+            command: NzbCommand::Report { job_id, url, json },
+        }) = Cli::parse_from(["weaver", "nzb", "report", "42"]).command
+        else {
+            panic!("expected nzb report");
+        };
+        assert_eq!(job_id, 42);
+        assert_eq!(url, None);
+        assert!(!json);
+        let Some(Command::Nzb {
+            command: NzbCommand::Report { url, json, .. },
+        }) = Cli::parse_from([
+            "weaver",
+            "nzb",
+            "report",
+            "7",
+            "--url",
+            "http://192.0.2.10:9090/weaver",
+            "--json",
+        ])
+        .command
+        else {
+            panic!("expected nzb report");
+        };
+        assert_eq!(url.as_deref(), Some("http://192.0.2.10:9090/weaver"));
+        assert!(json);
+        assert!(Cli::try_parse_from(["weaver", "nzb", "report"]).is_err());
+        assert!(Cli::try_parse_from(["weaver", "nzb", "report", "not-a-job"]).is_err());
     }
 }
