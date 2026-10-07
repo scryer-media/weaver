@@ -656,6 +656,9 @@ pub struct JobState {
     /// An article whose server cannot be named is left uncounted, so this
     /// understates rather than misattributes.
     pub server_attribution: JobServerAttribution,
+    /// The job's first direct-store demotion and its article gaps, kept for
+    /// the support report. Reporting only, and fixed in size.
+    pub support_facts: crate::jobs::support_facts::JobSupportFacts,
     /// Conservative restored progress floor from persisted file-write checkpoints.
     /// This is only used for reporting after restart and must not affect scheduling.
     pub restored_download_floor_bytes: u64,

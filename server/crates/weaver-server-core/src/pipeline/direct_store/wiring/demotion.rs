@@ -276,6 +276,7 @@ impl Pipeline {
             live_sets,
             "direct-store set demoted"
         );
+        self.note_demotion_support_fact(job_id, reason.metric());
 
         match self.prepare_demoted_set_sweep(job_id, set_index, &set_name, reason) {
             Ok(prepared) => {

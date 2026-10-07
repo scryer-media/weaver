@@ -14,6 +14,8 @@ pub mod repository;
 pub mod server_attribution;
 mod server_attribution_persistence;
 pub mod service;
+pub mod support_facts;
+mod support_facts_persistence;
 pub mod working_dir;
 
 pub use duplicate::{

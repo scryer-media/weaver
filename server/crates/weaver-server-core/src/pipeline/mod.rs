@@ -17,6 +17,7 @@ mod orchestrator;
 mod progress;
 mod repair;
 mod server_attribution;
+mod support_facts;
 
 pub(crate) use orchestrator::{
     close_cached_write_handles_under, release_cached_write_handle,
@@ -2509,6 +2510,8 @@ pub struct Pipeline {
     pub(super) pending_file_progress: HashMap<NzbFileId, u64>,
     /// Jobs whose provider shares have moved since the last checkpoint.
     pub(super) dirty_server_attribution: HashSet<JobId>,
+    /// Jobs whose support facts changed since the last checkpoint.
+    pub(super) dirty_support_facts: HashSet<JobId>,
     pub(super) server_attribution_checkpoint_at: Instant,
     /// Last queued/persisted contiguous write floor per file.
     pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,

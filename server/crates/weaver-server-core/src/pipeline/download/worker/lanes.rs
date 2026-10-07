@@ -82,8 +82,8 @@ impl Pipeline {
 
     /// A wire outcome retired this segment: no server has it, or the budget
     /// for asking ran out.
-    pub(in crate::pipeline) fn book_failed_segment(&mut self, seg_id: SegmentId) {
-        self.book_terminal_segment(seg_id, SegmentTerminalState::Missing);
+    pub(in crate::pipeline) fn book_failed_segment(&mut self, seg_id: SegmentId) -> bool {
+        self.book_terminal_segment(seg_id, SegmentTerminalState::Missing)
     }
 
     /// Move a segment into its one terminal state.
@@ -137,6 +137,7 @@ impl Pipeline {
         }
         // A container set whose map this article closed cannot read it now.
         self.note_direct_article_terminal(seg_id);
+        self.note_gap_support_fact(seg_id, terminal_state);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
             // The failing-file set follows the same rule as the bytes: a lost
@@ -206,9 +207,10 @@ impl Pipeline {
 
     /// A verified late replacement settles a previously damaged ordinal once.
     pub(in crate::pipeline) fn clear_replaced_damage_failure(&mut self, segment_id: SegmentId) {
-        if self.segment_terminal_states.remove(&segment_id).is_none() {
+        let Some(terminal_state) = self.segment_terminal_states.remove(&segment_id) else {
             return;
-        }
+        };
+        self.forget_gap_support_fact(segment_id, terminal_state);
         let bytes = self.health_counted_segment_bytes(segment_id);
         let file_has_failures = self.file_terminal_failed_bytes(segment_id.file_id) > 0;
         if let Some(state) = self.jobs.get_mut(&segment_id.file_id.job_id) {
@@ -312,6 +314,7 @@ impl Pipeline {
     /// same segment — a restarted job re-fetches every one of them — would add
     /// those bytes a second time.
     pub(crate) fn clear_terminal_segment_failures(&mut self, job_id: JobId) {
+        self.clear_gap_support_facts(job_id);
         self.segment_terminal_states
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         if let Some(state) = self.jobs.get_mut(&job_id) {

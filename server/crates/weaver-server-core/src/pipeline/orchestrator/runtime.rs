@@ -290,6 +290,7 @@ impl Pipeline {
             uu_spool_available_bytes_for_test: None,
             pending_file_progress: HashMap::new(),
             dirty_server_attribution: HashSet::new(),
+            dirty_support_facts: HashSet::new(),
             server_attribution_checkpoint_at: Instant::now(),
             persisted_file_progress: HashMap::new(),
             file_hash_states: HashMap::new(),
@@ -809,6 +810,7 @@ impl Pipeline {
 
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
         self.dirty_server_attribution.remove(&job_id);
+        self.dirty_support_facts.remove(&job_id);
         self.blocked_restores.remove(&job_id);
         self.pending_file_progress
             .retain(|file_id, _| file_id.job_id != job_id);
@@ -1636,6 +1638,7 @@ impl Pipeline {
             warn!(error = %error, "failed to flush file progress floors during drain");
         }
         self.flush_server_attribution();
+        self.flush_support_facts();
         if let Err(error) = self.flush_download_bandwidth_usage() {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }

@@ -237,7 +237,9 @@ impl Pipeline {
             .fetch_add(1, Ordering::Relaxed);
         let segment_id = work.segment_id;
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
-        self.book_failed_segment(segment_id);
+        if self.book_failed_segment(segment_id) {
+            self.note_gap_servers_support_fact(segment_id.file_id.job_id, &work.exclude_servers);
+        }
     }
 
     /// Book as missing every queued article of `job_id` that no server may
