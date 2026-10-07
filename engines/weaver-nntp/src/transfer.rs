@@ -13,7 +13,11 @@ use tokio::sync::watch;
 
 use crate::error::NntpError;
 
-const RATE_BURST_MICROS: u64 = 1_000_000;
+/// Credit an idle or starved schedule may spend at once before pacing
+/// resumes. It is small on purpose: a configured limit is a promise about
+/// every second, not just the long-run average, so a stall must not be
+/// followed by a second that reads far above the limit.
+const RATE_BURST_MICROS: u64 = 50_000;
 const RATE_SCHEDULE_EPOCH_SHIFT: u32 = 48;
 const RATE_SCHEDULE_TARGET_MASK: u64 = (1_u64 << RATE_SCHEDULE_EPOCH_SHIFT) - 1;
 
@@ -1362,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_rate_tickets_share_one_second_of_burst_credit() {
+    fn aggregate_rate_tickets_share_the_burst_credit() {
         let registry = ServerTransferRegistry::new();
         let control = registry.configure(
             StableServerId(30),
@@ -1372,7 +1376,8 @@ mod tests {
             },
         );
 
-        let warmup = control.reserve_rate(100).unwrap();
+        // Exactly the burst credit's worth of bytes schedules without a wait.
+        let warmup = control.reserve_rate(5).unwrap();
         assert!(warmup.target_micros <= control.rate_now_micros());
         let first = control.reserve_rate(50).expect("burst credit is exhausted");
         let second = control.reserve_rate(50).expect("aggregate debt is shared");
@@ -1451,8 +1456,9 @@ mod tests {
                 quota: None,
             },
         );
+        // Spend exactly the burst credit so both waiters below are paced.
         let mut warmup = control.try_reserve(0).unwrap();
-        assert_eq!(warmup.record_async(20_000).await, Duration::ZERO);
+        assert_eq!(warmup.record_async(1_000).await, Duration::ZERO);
         let scheduled_before = control.rate_schedule_target_micros();
 
         // Each waiter reports the schedule clock it saw on return, so the
@@ -1553,14 +1559,14 @@ mod tests {
             },
         );
 
-        // Only one second of credit at the new rate survives: 100 of the 150
-        // bytes, so the ticket lands half a second past the clock reading
-        // taken before it was reserved.
+        // Only the burst credit at the new rate survives: 5 of the 150 bytes,
+        // so the ticket lands 1.45 s past the clock reading taken before it
+        // was reserved.
         let before = control.rate_now_micros();
         let ticket = control.reserve_rate(150).expect("a rate is configured");
         assert!(
-            ticket.target_micros >= before + 500_000,
-            "target {} is less than half a second past {before}",
+            ticket.target_micros >= before + 1_450_000,
+            "target {} is less than 1.45 s past {before}",
             ticket.target_micros
         );
     }
