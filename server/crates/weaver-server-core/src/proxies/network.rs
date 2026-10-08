@@ -56,11 +56,20 @@ pub fn validate_instance_budget(
                             .filter(|pool| pool.enabled)
                             .map_or(&[][..], |pool| pool.member_ids.as_slice()),
                     };
-                    for id in ids {
+                    // A WireGuard hop stacked on another is its own
+                    // instance, apart from the same proxy on the egress, so
+                    // an instance is named by the hops up to and including it.
+                    let chained = matches!(rung, Rung::Chain { .. });
+                    for (position, id) in ids.iter().enumerate() {
                         if profiles.get(id).is_some_and(|profile| {
                             profile.enabled && profile.kind == ProxyKind::WireGuard
                         }) {
-                            instances.insert((leg.egress_id, *id));
+                            let path = if chained {
+                                ids[..=position].to_vec()
+                            } else {
+                                vec![*id]
+                            };
+                            instances.insert((leg.egress_id, path));
                         }
                     }
                 }
@@ -328,11 +337,19 @@ impl Route {
                                 .into(),
                         );
                     }
+                    // Only a WireGuard hop carries the UDP that WireGuard
+                    // and HTTP/3 travel over, and only WireGuard can use it.
+                    let carried = position > 0
+                        && profile.kind == ProxyKind::WireGuard
+                        && profiles
+                            .get(&ids[position - 1])
+                            .is_some_and(|beneath| beneath.kind == ProxyKind::WireGuard);
                     if matches!(rung, Rung::Chain { .. })
                         && position > 0
                         && matches!(profile.kind, ProxyKind::WireGuard | ProxyKind::Http3Connect)
+                        && !carried
                     {
-                        return Err("WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress".into());
+                        return Err("WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress; WireGuard may also sit directly on another WireGuard proxy".into());
                     }
                     if require_dns && profile.dns_servers.is_empty() {
                         return Err("every RSS proxy and pool member requires DNS servers".into());

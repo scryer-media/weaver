@@ -247,6 +247,81 @@ fn reference_validation_catches_overlap_udp_chains_and_rss_dns() {
 }
 
 #[test]
+fn a_wireguard_hop_may_sit_only_on_the_egress_or_another_wireguard_hop() {
+    let egresses = HashMap::from([(0, EgressInterface::system())]);
+    let profiles = HashMap::from([
+        (1, profile(1, ProxyKind::WireGuard)),
+        (2, profile(2, ProxyKind::WireGuard)),
+        (3, profile(3, ProxyKind::Ssh)),
+        (4, profile(4, ProxyKind::HttpConnect)),
+        (5, profile(5, ProxyKind::Http3Connect)),
+        (6, profile(6, ProxyKind::WireGuard)),
+    ]);
+    let pools = HashMap::new();
+    let check = |ids: &[u32]| {
+        let mut route = route(&[100], Failover::Redistribute);
+        route.legs[0].path = LegPath::Ladder {
+            rungs: vec![Rung::Chain { ids: ids.to_vec() }],
+            direct_fallback: false,
+        };
+        route.validate_references(&egresses, &profiles, &pools, false)
+    };
+    for accepted in [
+        &[1, 2][..],
+        &[1, 2, 3],
+        &[1, 2, 4],
+        &[1, 2, 6],
+        &[5, 3],
+        &[1, 3, 4],
+    ] {
+        assert!(check(accepted).is_ok(), "{accepted:?}");
+    }
+    // WireGuard never rides a stream proxy, and HTTP/3 rides nothing.
+    for refused in [
+        &[4, 1][..],
+        &[3, 1],
+        &[1, 3, 2],
+        &[1, 5],
+        &[2, 1, 5],
+        &[5, 1],
+    ] {
+        let error = check(refused).unwrap_err();
+        assert!(
+            error.contains("WireGuard and HTTP/3 must be the first proxy in a chain"),
+            "{refused:?}: {error}"
+        );
+    }
+    assert!(check(&[1, 2, 1]).unwrap_err().contains("twice"));
+}
+
+#[test]
+fn a_stacked_wireguard_hop_is_its_own_instance() {
+    let profiles = HashMap::from([
+        (1, profile(1, ProxyKind::WireGuard)),
+        (2, profile(2, ProxyKind::WireGuard)),
+    ]);
+    let ladder = |rung: Rung| {
+        let mut route = route(&[100], Failover::Redistribute);
+        route.legs[0].path = LegPath::Ladder {
+            rungs: vec![rung],
+            direct_fallback: false,
+        };
+        route
+    };
+    // The chain's lower hop is the same tunnel as the first route's; its
+    // upper hop rides on it and is a second tunnel apart from the third's.
+    let routes = [
+        ladder(Rung::Proxy { id: 1 }),
+        ladder(Rung::Chain { ids: vec![1, 2] }),
+        ladder(Rung::Proxy { id: 2 }),
+    ];
+    let pools = HashMap::new();
+    assert!(validate_instance_budget(&routes, &profiles, &pools, 3).is_ok());
+    let error = validate_instance_budget(&routes, &profiles, &pools, 2).unwrap_err();
+    assert!(error.contains("require 3 WireGuard instances"), "{error}");
+}
+
+#[test]
 fn system_egress_is_unique_and_immutable() {
     let mut egress = EgressInterface::system();
     assert!(egress.validate().is_ok());

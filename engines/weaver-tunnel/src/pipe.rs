@@ -2,6 +2,8 @@
 #[path = "pipe_revocable.rs"]
 mod revocable;
 pub use revocable::Revocable;
+#[path = "pipe_datagram.rs"]
+mod datagram;
 
 #[cfg(test)]
 #[path = "pipe_tests.rs"]
@@ -24,7 +26,7 @@ use crate::{
     TunnelError, TunnelProvider, TunnelStream,
     bridge::ConnectionOutcome,
     egress::SocketEgress,
-    endpoint::{EndpointStream, EndpointTransport, UdpSocketFactory},
+    endpoint::{DatagramTransport, EndpointStream, EndpointTransport, UdpSocketFactory},
     transport::TransportProxy,
 };
 
@@ -280,6 +282,11 @@ pub trait Dialer: Send + Sync {
     }
     fn offers(&self) -> Transports {
         Transports::Tcp
+    }
+    /// Datagrams through this stage, for a WireGuard tunnel stacked on it.
+    /// Only a WireGuard stage carries them.
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        None
     }
     fn budget(&self) -> Duration;
     async fn shutdown(&self) {}
@@ -736,6 +743,11 @@ impl Dialer for SessionHop {
                 .map_err(|error| DialError::hop(self.id, error)),
             None => Ok(Resolution::Unresolved),
         }
+    }
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        self.resolver
+            .is_some()
+            .then(|| Arc::new(datagram::SessionDatagrams::new(self)) as Arc<dyn DatagramTransport>)
     }
     fn budget(&self) -> Duration {
         self.inner.budget().saturating_add(self.timeout)

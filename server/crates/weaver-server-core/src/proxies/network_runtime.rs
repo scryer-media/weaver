@@ -418,16 +418,30 @@ impl NetworkRuntime {
                         )
                     }
                     ProxyKind::WireGuard => {
-                        if !prefix.is_empty() {
-                            return Err("WireGuard must be the first hop on an egress".into());
-                        }
-                        let provider = Arc::new(
-                            WireGuardTunnelProvider::new(
-                                profile.wireguard_spec().map_err(|e| e.to_string())?,
-                                observer,
-                            )
-                            .with_udp_factory(bottom.clone()),
+                        let provider = WireGuardTunnelProvider::new(
+                            profile.wireguard_spec().map_err(|e| e.to_string())?,
+                            observer,
                         );
+                        let provider = match prefix.last() {
+                            None => provider.with_udp_factory(bottom.clone()),
+                            // A WireGuard tunnel rides only on another
+                            // WireGuard tunnel: nothing else carries UDP.
+                            Some(beneath) => {
+                                if config.profiles.get(beneath).map(|p| p.kind)
+                                    != Some(ProxyKind::WireGuard)
+                                {
+                                    return Err("WireGuard must be the first hop on an egress or sit directly on another WireGuard hop".into());
+                                }
+                                let Some(carrier) = inner.clone().datagrams() else {
+                                    return Ok(Arc::new(Unavailable(format!(
+                                        "proxy {beneath} cannot carry proxy {id}: {}",
+                                        inner.describe()
+                                    ))));
+                                };
+                                provider.with_datagram_transport(carrier)
+                            }
+                        };
+                        let provider = Arc::new(provider);
                         resolver = Some(provider.clone());
                         provider
                     }

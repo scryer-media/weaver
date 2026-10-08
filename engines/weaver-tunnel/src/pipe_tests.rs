@@ -513,3 +513,125 @@ fn cooldown_from_scales_the_whole_ladder() {
         assert_eq!(cooldown_from(initial, failures), cooldown(failures) / 10);
     }
 }
+
+/// One WireGuard session carrying another: the carried session reaches the
+/// peer behind the first, the session beneath stays up while anything rides
+/// on it, and each session holds its own budget permit.
+#[tokio::test]
+async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
+    use crate::test_support::{
+        TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT, WireGuardTestPeer,
+        WireGuardTestPeerOptions, test_key,
+    };
+    const CARRIED_PORT: u16 = 51820;
+    let far = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        private_key: test_key(31),
+        body: "carried through two tunnels".into(),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+    let near = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        udp_forward: Some((CARRIED_PORT, far.endpoint())),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+    let budget = Arc::new(tokio::sync::Semaphore::new(2));
+    let session = |id: u32,
+                   provider: Arc<crate::WireGuardTunnelProvider>,
+                   inner: Arc<dyn Dialer>,
+                   proxies: Vec<u32>,
+                   endpoint: SocketAddr| {
+        Arc::new(SessionHop {
+            capacity: SessionCapacity::new(budget.clone()),
+            activity: Default::default(),
+            id,
+            provider: provider.clone(),
+            inner,
+            transport: None,
+            path: DialPath {
+                egress: 4,
+                proxies,
+                ..Default::default()
+            },
+            endpoint: Some(endpoint),
+            timeout: Duration::from_secs(30),
+            resolver: Some(provider),
+        })
+    };
+
+    let lower_provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let lower = session(1, lower_provider, bottom(), vec![], near.endpoint());
+    let carrier = lower
+        .clone()
+        .datagrams()
+        .expect("a WireGuard session carries datagrams");
+    let carried_endpoint = SocketAddr::new(IpAddr::V4(TEST_PEER_ADDRESS), CARRIED_PORT);
+    let upper_provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            crate::WireGuardSpec {
+                endpoint_host: TEST_PEER_ADDRESS.to_string(),
+                endpoint_port: CARRIED_PORT,
+                ..far.client_spec("2")
+            },
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_datagram_transport(carrier),
+    );
+    let upper = session(2, upper_provider, lower.clone(), vec![1], carried_endpoint);
+
+    // Names beyond the top tunnel resolve on its far side.
+    let Resolution::Addresses(addresses) = upper.resolve("origin.tunnel.test").await.unwrap()
+    else {
+        panic!("the top tunnel resolves names");
+    };
+    assert!(!addresses.is_empty());
+    assert_eq!(far.dns_queries(), vec!["origin.tunnel.test"]);
+    assert!(near.dns_queries().is_empty());
+
+    let mut dialed = upper
+        .dial(&Target {
+            host: TEST_PEER_ADDRESS.to_string(),
+            port: TEST_PEER_HTTP_PORT,
+            purpose: Purpose::Probe,
+            addresses: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(dialed.path.proxies, vec![1, 2]);
+    assert_eq!(dialed.path.egress, 4);
+    assert_eq!(dialed.peer, Some(carried_endpoint));
+    dialed
+        .stream
+        .write_all(b"GET /carried HTTP/1.1\r\nHost: origin\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    dialed.stream.read_to_end(&mut answer).await.unwrap();
+    assert!(String::from_utf8_lossy(&answer).ends_with("carried through two tunnels"));
+    assert_eq!(far.requests(), vec!["GET /carried HTTP/1.1"]);
+    assert!(near.requests().is_empty());
+    assert_eq!(budget.available_permits(), 0, "one permit per tunnel");
+
+    // The near peer relayed only WireGuard, from the lower tunnel's address.
+    let forwarded = near.udp_forwarded();
+    assert!(!forwarded.is_empty());
+    for (source, seen) in &forwarded {
+        assert_eq!(source.ip(), IpAddr::V4(TEST_CLIENT_ADDRESS));
+        assert_eq!(seen.wireguard_datagrams, seen.datagrams, "{source}");
+    }
+
+    drop(dialed);
+    // The lower session is busy for as long as the upper tunnel rides on it.
+    assert!(!lower.retire_idle().await);
+    assert!(upper.retire_idle().await);
+    assert!(lower.retire_idle().await);
+    assert_eq!(budget.available_permits(), 2);
+
+    upper.shutdown().await;
+}
