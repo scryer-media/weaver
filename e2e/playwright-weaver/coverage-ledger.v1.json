@@ -27,6 +27,11 @@
       "oracle": "browser"
     },
     {
+      "path": "/tools/nzb-analyzer",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
       "path": "/system-info",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
@@ -42,7 +47,7 @@
       "oracle": "browser"
     },
     {
-      "path": "/settings/bandwidth",
+      "path": "/settings/networking/bandwidth",
       "owner": "ui-settings-crud",
       "oracle": "browser"
     },
@@ -57,7 +62,22 @@
       "oracle": "browser"
     },
     {
-      "path": "/settings/proxies",
+      "path": "/settings/networking/proxies",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/networking/overview",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/networking/egress",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/networking/routes",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
     },
@@ -93,6 +113,31 @@
     }
   ],
   "mutations": [
+    {
+      "name": "analyzeNzb",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "createBackupDownloadToken",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "deleteBackup",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "updateBackupSettings",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "previewRssFeed",
+      "owner": "event-scripts",
+      "oracle": "api-metrics"
+    },
     {
       "name": "saveProxyProfile",
       "owner": "proxy-routing",

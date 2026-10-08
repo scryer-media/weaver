@@ -179,7 +179,11 @@ test("post-processing settings, the live script list, and real script execution 
     timeout: 30_000,
   });
   await expect(page.getByText(POST_PROCESSING_SECRET)).toHaveCount(0);
-  await expect(eventLog.getByText("[REDACTED]")).not.toHaveCount(0);
+  // Captured stdout is displayed with each script run, separately from events.
+  const nzbgetRun = page.getByRole("group").filter({
+    has: page.getByText("post_processing (3)", { exact: true }),
+  });
+  await expect(nzbgetRun.getByText("[REDACTED]")).not.toHaveCount(0);
 
   // 7. Re-running executes the list again against the retained output.
   await page.getByRole("button", { name: "Re-run scripts", exact: true }).click();
@@ -235,10 +239,12 @@ test("queue barrier, marked-bad history and event result groups are visible", as
   seedEventScript();
   await page.goto("/settings/post-processing");
   const executionToggle = page.getByRole("switch", { name: "Run scripts", exact: true });
+  await expect(executionToggle).toBeVisible();
   if (!(await executionToggle.isChecked())) {
     await executionToggle.click();
     await saveSettings(page);
   }
+  await expect(executionToggle).toBeChecked();
   const runList = page.getByRole("region", { name: "Run list", exact: true });
   for (const script of [POST_PROCESSING_NOTIFY_SCRIPT, POST_PROCESSING_FAILING_SCRIPT, POST_PROCESSING_NZBGET_PACKAGE]) {
     const entry = runList.getByRole("switch", { name: `Run ${script}`, exact: true });
@@ -254,12 +260,23 @@ test("queue barrier, marked-bad history and event result groups are visible", as
 
   const jobId = await submitPostProcessingJob(request, "event-barrier");
   await expect.poll(() => eventScriptWaiting(jobId)).toBe(true);
-  await page.goto(`/jobs/${jobId}`);
-  await expect(page.getByRole("main")).toContainText("Waiting for queue scripts");
-  await releaseEventScript(jobId);
+  try {
+    await page.goto(`/jobs/${jobId}`);
+    await expect(page.getByRole("heading", { name: "event-barrier", exact: true })).toBeVisible();
+    // Queue-event scripts hold finalisation; the new timeline shows that stage.
+    const pipeline = page.getByRole("region", { name: "Pipeline", exact: true });
+    await expect(pipeline).toContainText("Finalising");
+    await expect(pipeline).toContainText("still running");
+    await expect(page.getByText("No script runs recorded.", { exact: true })).toBeVisible();
+  } finally {
+    await releaseEventScript(jobId);
+  }
   expect((await waitForTerminalJob(request, jobId)).state).toBe("FAILED");
   await page.reload();
   await expect(page.getByText("queue:NZB_DOWNLOADED (1)", { exact: true })).toBeVisible();
   await expect(page.getByText("post_processing (1)", { exact: true })).toBeVisible();
-  await expect(page.getByText("terminal status=FAILURE/BAD parameter=queue-event", { exact: false })).toBeVisible();
+  const terminalRun = page.getByRole("group").filter({
+    has: page.getByText("post_processing (1)", { exact: true }),
+  });
+  await expect(terminalRun.getByText("terminal status=FAILURE/BAD parameter=queue-event", { exact: true })).toBeVisible();
 });
