@@ -7,7 +7,7 @@ import {
 import { NetworkWorld, PROXIED_HOST, expectNoFailureEvents, jobEvents, saveEvidence, serverHealth, verifyOutput } from "./support/network-scenario";
 import { type FixtureEvent, attemptsOn, controlRoute, directEvents, fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-fixture";
 import { setEnabled } from "./support/toxiproxy";
-import { controlTunnel, tunnelEvents, tunnelMark, tunnelState } from "./support/tunnel-fixture";
+import { type TunnelState, controlTunnel, tunnelEvents, tunnelMark, tunnelState } from "./support/tunnel-fixture";
 
 /** Ladders and live hop kills. */
 let world: NetworkWorld;
@@ -354,13 +354,23 @@ test("F16 @extended an eight-rung ladder walks every rung as each dies", async (
 
 test("F17 a chain carries WireGuard inside WireGuard", async ({ request }) => {
   test.setTimeout(10 * 60_000);
-  // Each WireGuard hop in the chain is its own instance.
-  test.skip((await platformNetworking(request)).maxWireguardInstances < 2, "a WireGuard-in-WireGuard chain needs two WireGuard instances");
+  // Each WireGuard hop in the chain is its own instance. The limit follows
+  // the memory Weaver can see and no setting raises it, so a host that
+  // grants fewer than two cannot run this test and must say so.
+  const instances = (await platformNetworking(request)).maxWireguardInstances;
+  expect(instances, `F17 needs two WireGuard instances, and Weaver grants ${instances} from the memory it can see; give the weaver container more memory`).toBeGreaterThanOrEqual(2);
   const a = await world.egress("a");
   const wg1 = await world.wireguard("wg1");
   // wg2 addressed where wg1 relays to it, inside wg1's tunnel.
   const wg2 = await world.wireguard("wg2", { carried: true });
   const mark = await tunnelMark(request);
+  // The peers' lookup and relay records last for the fixture's lifetime;
+  // this test reads only what lands after these counts.
+  const relayed = (peers: TunnelState["wireguard"]) =>
+    Object.values(peers.wg1!.udpForwarded).reduce((total, seen) => total + seen.datagrams, 0);
+  const before = (await tunnelState(request)).wireguard;
+  const queriesBefore = { wg1: before.wg1!.dnsQueries.length, wg2: before.wg2!.dnsQueries.length };
+  const relayedBefore = relayed(before);
   const server = await world.server({ host: "nntp.proxy.test", route: { legs: [ladderLeg(a.id, [rung.chain([wg1.id, wg2.id])], 100)] } });
   const download = await world.download("f17-wireguard-chain");
   const flow = await flowAfter(request, await flowMark(request), sample => (legOn(sample, serverKey(server), a.id)?.open ?? 0) > 0, "chain leg open");
@@ -368,8 +378,8 @@ test("F17 a chain carries WireGuard inside WireGuard", async ({ request }) => {
   expect(await waitTerminal(request, download.jobId)).toBe("COMPLETED");
   const peers = (await tunnelState(request)).wireguard;
   // wg2's endpoint name resolved inside wg1, the server's name inside wg2.
-  expect(peers.wg1!.dnsQueries).toContain(peers.wg2!.carriedBy!.host);
-  expect(peers.wg2!.dnsQueries).toContain("nntp.proxy.test");
+  expect(peers.wg1!.dnsQueries.slice(queriesBefore.wg1)).toContain(peers.wg2!.carriedBy!.host);
+  expect(peers.wg2!.dnsQueries.slice(queriesBefore.wg2)).toContain("nntp.proxy.test");
   // wg1 relayed to wg2 nothing but WireGuard, all of it from wg1's own
   // client address: wg2 saw only the tunnel riding inside wg1.
   const clientAddress = peers.wg1!.clientAddress.split("/")[0];
@@ -380,9 +390,11 @@ test("F17 a chain carries WireGuard inside WireGuard", async ({ request }) => {
     expect(seen.datagrams, source).toBeGreaterThan(0);
     expect(seen.wireguardDatagrams, source).toBe(seen.datagrams);
   }
-  // Weaver reached wg1's published endpoint and never wg2's.
+  // This download's traffic rode wg1's relay. A wg1 flow opened before the
+  // mark may carry it, so the proof is the relay count, not a new connect;
+  // Weaver never opened a flow to wg2's published endpoint.
+  expect(relayed(peers)).toBeGreaterThan(relayedBefore);
   const connects = (await tunnelEvents(request, mark)).filter(event => event.kind === "connect");
-  expect(connects.some(event => event.endpoint === "wg1")).toBe(true);
   expect(connects.filter(event => event.endpoint === "wg2")).toEqual([]);
   test.info().annotations.push({ type: "deviation", description: "F17: the chain [wg1, wg2, ssh1] is not run; wg2 forwards only to the NNTP relay, so no SSH endpoint is reachable inside wg2." });
 });

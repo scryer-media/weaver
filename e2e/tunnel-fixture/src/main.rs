@@ -447,7 +447,15 @@ fn env_or(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: SharedLog) -> Fixture {
+/// `listen` maps each published port to the one actually bound; the binary
+/// keeps them, and a test binds ephemeral ports instead.
+async fn build_fixture(
+    public_ip: IpAddr,
+    listen: fn(u16) -> u16,
+    nntp: String,
+    http: String,
+    log: SharedLog,
+) -> Fixture {
     let mut ssh = Vec::new();
     for name in ["ssh1", "ssh2", "ssh3"] {
         ssh.push(SshDouble {
@@ -500,7 +508,7 @@ async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: Share
         let endpoint = Endpoint::new(
             name,
             Transport::Tcp,
-            SocketAddr::new(public_ip, *port),
+            SocketAddr::new(public_ip, listen(*port)),
             upstream,
         );
         start_endpoint(&endpoint, &log).await;
@@ -572,7 +580,7 @@ async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: Share
         let endpoint = Endpoint::new(
             name,
             Transport::Udp,
-            SocketAddr::new(public_ip, *port),
+            SocketAddr::new(public_ip, listen(*port)),
             peer.endpoint().to_string(),
         );
         start_endpoint(&endpoint, &log).await;
@@ -740,7 +748,7 @@ async fn main() {
         .parse()
         .expect("control port");
     let log: SharedLog = Arc::default();
-    let fixture = Arc::new(build_fixture(public_ip, nntp, http, log).await);
+    let fixture = Arc::new(build_fixture(public_ip, |port| port, nntp, http, log).await);
     let listener = TcpListener::bind((public_ip, control_port))
         .await
         .expect("bind control");
@@ -938,27 +946,27 @@ mod tests {
         assert_eq!(peer.dns_queries(), vec![READY_NAME.to_string()]);
     }
 
-    /// The relay wg1 runs is enough for a tunnel to wg2 to ride inside a
-    /// tunnel to wg1, named the way the fixture names it.
+    /// The fixture's own wiring lets a tunnel to wg2 ride inside a tunnel to
+    /// wg1: wg1 names wg2 and relays to it. Dropping either breaks this test.
     #[tokio::test]
     async fn wg2_is_reachable_inside_wg1() {
-        let wg2 = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
-            body: "wg2 answered".into(),
-            preshared_key: Some(test_preshared_key()),
-            ..WireGuardTestPeerOptions::default()
-        })
+        let fixture = build_fixture(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            |_| 0,
+            tcp_echo().await.to_string(),
+            tcp_echo().await.to_string(),
+            Arc::default(),
+        )
         .await;
-        let wg1 = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
-            names: [(
-                CARRIED_NAME.to_string(),
-                vec![IpAddr::V4(TEST_PEER_ADDRESS)],
-            )]
-            .into_iter()
-            .collect(),
-            udp_forward: Some((CARRIED_PORT, wg2.endpoint())),
-            ..WireGuardTestPeerOptions::default()
-        })
-        .await;
+        let peer = |name: &str| {
+            &fixture
+                .wireguard
+                .iter()
+                .find(|double| double.name == name)
+                .expect("the fixture runs this peer")
+                .peer
+        };
+        let (wg1, wg2) = (peer("wg1"), peer("wg2"));
         let outer = Arc::new(WireGuardTunnelProvider::new(
             wg1.client_spec("wg1"),
             Arc::new(NoopTunnelObserver),
@@ -976,20 +984,17 @@ mod tests {
             .dial(&TEST_PEER_ADDRESS.to_string(), wg2.http_port())
             .await
             .expect("a dial through wg1 to wg2");
-        stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: wg2\r\n\r\n")
-            .await
-            .expect("request");
-        let mut answer = Vec::new();
-        stream.read_to_end(&mut answer).await.expect("response");
-        assert!(String::from_utf8_lossy(&answer).ends_with("wg2 answered"));
-        assert!(wg1.requests().is_empty());
+        stream.write_all(b"carried").await.expect("request");
+        let mut answer = [0u8; 7];
+        stream.read_exact(&mut answer).await.expect("echo");
+        assert_eq!(&answer, b"carried");
         let forwarded = wg1.udp_forwarded();
         assert!(!forwarded.is_empty());
         for (source, seen) in forwarded {
             assert_eq!(source.ip(), IpAddr::V4(TEST_CLIENT_ADDRESS));
             assert_eq!(seen.wireguard_datagrams, seen.datagrams);
         }
+        drop(stream);
         inner.shutdown().await;
         outer.shutdown().await;
     }
