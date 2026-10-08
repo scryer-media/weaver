@@ -1,3 +1,6 @@
+import type { Translate } from "@/lib/context/translate-context";
+import type { SettingsBlock } from "@/next/pages/settings/framework";
+
 export const eventScriptDefaults = {
   eventScriptConcurrency: 1,
   eventScriptTimeoutSeconds: 300,
@@ -16,27 +19,47 @@ export function eventScriptOptions(source: Partial<EventScriptOptions>): EventSc
   )) as EventScriptOptions;
 }
 
-const fields: [keyof EventScriptOptions, string, number, number][] = [
-  ["eventScriptConcurrency", "Concurrent scan, feed and scheduler scripts", 1, 8],
-  ["eventScriptTimeoutSeconds", "Default event timeout (seconds)", 1, 86400],
-  ["fileDownloadedEventInterval", "File event interval (seconds; -1 disables, 0 unthrottled)", -1, 86400],
-  ["scriptOutputCeilingBytes", "Captured output per run (bytes)", 65536, 8388608],
-  ["scriptOutputRunsPerJob", "Retained runs per job", 1, 128],
-  ["scriptOutputRingBytes", "Compressed output budget (bytes)", 1048576, 1073741824],
-  ["scriptOutputRunCapBytes", "Compressed output cap per run (bytes)", 65536, 8388608],
+/** Each limit with the range the daemon accepts and the unit it is counted in. */
+const FIELDS: {
+  key: keyof EventScriptOptions;
+  label: string;
+  help: string;
+  min: number;
+  max: number;
+  unit?: string;
+}[] = [
+  { key: "eventScriptConcurrency", label: "next.postProcessing.eventConcurrency", help: "next.postProcessing.eventConcurrencyHelp", min: 1, max: 8 },
+  { key: "eventScriptTimeoutSeconds", label: "next.postProcessing.eventTimeout", help: "next.postProcessing.eventTimeoutHelp", min: 1, max: 86400, unit: "next.general.seconds" },
+  { key: "fileDownloadedEventInterval", label: "next.postProcessing.fileEventInterval", help: "next.postProcessing.fileEventIntervalHelp", min: -1, max: 86400, unit: "next.general.seconds" },
+  { key: "scriptOutputCeilingBytes", label: "next.postProcessing.outputCeiling", help: "next.postProcessing.outputCeilingHelp", min: 65536, max: 8388608, unit: "next.postProcessing.bytes" },
+  { key: "scriptOutputRunsPerJob", label: "next.postProcessing.outputRuns", help: "next.postProcessing.outputRunsHelp", min: 1, max: 128 },
+  { key: "scriptOutputRingBytes", label: "next.postProcessing.outputBudget", help: "next.postProcessing.outputBudgetHelp", min: 1048576, max: 1073741824, unit: "next.postProcessing.bytes" },
+  { key: "scriptOutputRunCapBytes", label: "next.postProcessing.outputRunCap", help: "next.postProcessing.outputRunCapHelp", min: 65536, max: 8388608, unit: "next.postProcessing.bytes" },
 ];
 
-export function EventScriptSettings({ value, onChange }: {
-  value: EventScriptOptions;
-  onChange: (patch: Partial<EventScriptOptions>) => void;
-}) {
-  return <fieldset className="my-4 grid gap-4 sm:grid-cols-2">
-    <legend className="mb-3 font-semibold">Event scripts and output retention</legend>
-    {fields.map(([key, label, min, max]) => <label key={key} className="flex flex-col gap-1 text-sm">
-      {label}
-      <input className="border border-wv-control bg-wv-input px-3 py-2" type="number" min={min} max={max}
-        value={value[key]} onChange={(event) => onChange({ [key]: Number(event.target.value) })} />
-    </label>)}
-    <p className="text-sm sm:col-span-2">Queue events run one at a time. Native direct-store downloads may have no archive file for scripts to inspect. Startup schedules require explicit opt-in.</p>
-  </fieldset>;
+/** The limits event scripts run under, and how much of what they print is kept. */
+export function eventScriptSection(
+  t: Translate,
+  value: EventScriptOptions,
+  onChange: (patch: Partial<EventScriptOptions>) => void,
+): SettingsBlock {
+  return {
+    kind: "section",
+    id: "event-scripts",
+    title: t("next.postProcessing.events"),
+    note: t("next.postProcessing.eventsNote"),
+    fields: FIELDS.map(({ key, label, help, min, max, unit }) => ({
+      id: key,
+      label: t(label),
+      help: t(help),
+      control: {
+        kind: "number",
+        value: value[key],
+        min,
+        max,
+        suffix: unit === undefined ? undefined : t(unit),
+        onChange: (next: number) => onChange({ [key]: next }),
+      },
+    })),
+  };
 }

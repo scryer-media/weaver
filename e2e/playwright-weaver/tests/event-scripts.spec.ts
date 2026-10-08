@@ -841,7 +841,7 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
   try {
     await page.goto("/settings/post-processing");
     await expect(page.getByRole("textbox", { name: "Scripts directory", exact: true })).toHaveValue(WEAVER_SCRIPTS_DIR);
-    await expect(page.getByRole("group", { name: "Event scripts and output retention", exact: true })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Event scripts and output retention", exact: true })).toBeVisible();
     // A discovered script's row; its name cell carries the script's file name.
     const entry = (name: string) =>
       page.getByRole("region", { name: "Discovered scripts", exact: true })

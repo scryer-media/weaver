@@ -11,8 +11,10 @@ import { SettingsShellProvider } from "@/next/pages/settings/framework";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
+// A rule a script's manifest declares, as the daemon lists it.
+const manifestRule = { id: "manifest", time: "04:00", days: [], times: [], everyHourAtMinute: null, actionType: "run_script", script: "nightly.py", runAtStartup: false, implicit: true, enabled: true, label: null, track: "ONE_SHOT" };
 const state = {
-  schedules: [] as Record<string, unknown>[],
+  schedules: (location.search.includes("manifest") ? [manifestRule] : []) as Record<string, unknown>[],
   backups: [] as Record<string, unknown>[],
   backupSettings: { customBackupPath: null as string | null, backupPath: "/fixture/backups" },
   autoBackupSettings: { enabled: location.search.includes("automatic"), dailyTimeLocal: "03:00", autoBackupKeyPresent: location.search.includes("automatic"), nextRunAt: (location.search.includes("automatic") ? "2026-01-03T03:00:00Z" : null) as string | null },
@@ -22,7 +24,7 @@ let passwordVerified = !location.search.includes("expired");
 let verificationRequests = 0;
 let acceptedBackupMutations = 0;
 let acceptedBackupCreates = 0;
-const track = (action: string) => ({ pause_all: "DOWNLOADS", pause_post_processing: "POST_PROCESSING", resume_post_processing: "POST_PROCESSING", set_server_active: "SERVER", set_quota_metering: "QUOTA", scan_watch_folder: "ONE_SHOT", fetch_rss: "ONE_SHOT", prune_history: "ONE_SHOT" })[action] ?? "DOWNLOADS";
+const track = (action: string) => ({ pause_all: "DOWNLOADS", pause_post_processing: "POST_PROCESSING", resume_post_processing: "POST_PROCESSING", set_server_active: "SERVER", set_quota_metering: "QUOTA", scan_watch_folder: "ONE_SHOT", fetch_rss: "ONE_SHOT", prune_history: "ONE_SHOT", run_script: "ONE_SHOT", speed_limit: "SPEED", configured_speed_limit: "SPEED", hardware_profile: "PROFILE", pause_watch_folder_scanning: "WATCH_FOLDER", resume_watch_folder_scanning: "WATCH_FOLDER" })[action] ?? "DOWNLOADS";
 function graphql(name: string, variables: Record<string, any>) {
   let mutation = {};
   if (["UpdateBackupSettings", "UpdateAutoBackupSettings", "DeleteBackup", "BackupDownloadToken"].includes(name)) {
@@ -104,5 +106,6 @@ window.fetch = async (request, init) => {
   return originalFetch(request, init);
 };
 const dictionary = { ...en, ...nextEn };
-const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls") };
+const status = document.getElementById("status")!;
+const shell = { search: "", actionsRef: { current: null }, setFlags: (flags: { status: string | null }) => { status.textContent = flags.status ?? ""; }, controlsHost: document.getElementById("controls") };
 createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto max-w-[1400px] p-8">{location.search.includes("schedules") ? <SchedulesPanel /> : <BackupPanel />}</main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

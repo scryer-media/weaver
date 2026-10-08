@@ -1,3 +1,6 @@
+import { useTranslate } from "@/lib/context/translate-context";
+import { Tag } from "./chrome";
+
 export type ScriptKind = "POST_PROCESSING" | "QUEUE" | "SCAN" | "SCHEDULER" | "FEED";
 
 export interface ScriptDeclarations {
@@ -6,26 +9,40 @@ export interface ScriptDeclarations {
   taskTimes: string[];
 }
 
-const labels: Record<ScriptKind, string> = {
-  POST_PROCESSING: "Post-processing",
-  QUEUE: "Queue",
-  SCAN: "Scan",
-  SCHEDULER: "Scheduler",
-  FEED: "Feed",
+const LABELS: Record<ScriptKind, string> = {
+  POST_PROCESSING: "next.postProcessing.kindPostProcessing",
+  QUEUE: "next.postProcessing.kindQueue",
+  SCAN: "next.postProcessing.kindScan",
+  SCHEDULER: "next.postProcessing.kindScheduler",
+  FEED: "next.postProcessing.kindFeed",
 };
 
+const DETAIL = "font-wv-mono text-[11px] leading-[1.45] break-words whitespace-normal text-wv-muted";
+
+/** What a script declares it runs for: its kinds, then the events and times it names. */
 export function ScriptKinds({ script }: { script: ScriptDeclarations }) {
+  const t = useTranslate();
   return (
-    <div className="flex min-w-0 flex-col gap-1 whitespace-normal text-xs">
-      <div className="flex flex-wrap gap-1">
-        {script.kinds.map((kind) => (
-          <span key={kind} className="border px-1.5 py-0.5">{labels[kind]}</span>
-        ))}
-      </div>
-      {script.kinds.includes("QUEUE") && (
-        <span className="break-words">Declared events: {script.queueEvents.join(", ") || "None recognised"}</span>
-      )}
-      {script.taskTimes.length > 0 && <span>Task times: {script.taskTimes.join(", ")}</span>}
+    <div className="flex min-w-0 flex-col gap-[6px]">
+      {script.kinds.length > 0 ? (
+        <div className="flex flex-wrap gap-1.5">
+          {script.kinds.map((kind) => (
+            <Tag key={kind}>{t(LABELS[kind])}</Tag>
+          ))}
+        </div>
+      ) : null}
+      {script.kinds.includes("QUEUE") ? (
+        <span className={DETAIL}>
+          {t("next.postProcessing.declaredEvents", {
+            events: script.queueEvents.join(", ") || t("next.postProcessing.noEvents"),
+          })}
+        </span>
+      ) : null}
+      {script.taskTimes.length > 0 ? (
+        <span className={DETAIL}>
+          {t("next.postProcessing.taskTimes", { times: script.taskTimes.join(", ") })}
+        </span>
+      ) : null}
     </div>
   );
 }

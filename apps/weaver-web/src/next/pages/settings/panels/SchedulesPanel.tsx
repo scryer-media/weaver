@@ -11,6 +11,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
+import { Tag } from "../../../components/chrome";
 import { PrimaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatRate } from "../../../data/format";
@@ -20,9 +21,9 @@ import {
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
-import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
-import { ScheduleOptionsFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleTimeLabel, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
+import { scheduleActionFields, scheduleActionHelp, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
+import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleTimeLabel, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -57,13 +58,16 @@ interface ScheduleForm {
   days: string[];
   time: string;
   actionType: string;
-  speedMib: string;
+  speedMib: number;
   speedUnlimited: boolean;
   /** Null until one is picked; the editor then offers the recommendation. */
   hardwareProfile: HardwareProfileName | null;
 }
 
 const MIB = 1024 * 1024;
+
+/** A stored limit as the editor shows it: mebibytes, to the two places its field keeps. */
+const toMib = (bytes: number) => Math.round((bytes / MIB) * 100) / 100;
 
 /** Labels are translation keys, resolved when the panel renders. */
 const DAYS = [
@@ -78,7 +82,7 @@ const DAYS = [
 
 const ACTIONS: { value: string; label: string }[] = [
   ...ADDITIONAL_SCHEDULE_ACTIONS,
-  { value: "run_script", label: "Run script" },
+  { value: "run_script", label: "next.schedules.runScript" },
   { value: "pause", label: "next.schedules.pause" },
   { value: "resume", label: "next.schedules.resume" },
   { value: "speed_limit", label: "next.schedules.setLimit" },
@@ -97,13 +101,13 @@ const NEW_SCHEDULE: ScheduleForm = {
   days: [],
   time: "08:00",
   actionType: "pause",
-  speedMib: "5",
+  speedMib: 5,
   speedUnlimited: false,
   hardwareProfile: null,
 };
 
 function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets): string {
-  if (schedule.actionType === "run_script") return `Run ${schedule.script}${schedule.implicit ? " (manifest)" : ""}`;
+  if (schedule.actionType === "run_script") return t("next.schedules.runScriptNamed", { script: schedule.script ?? "" });
   const details = scheduleActionDetails(t, schedule, targets);
   if (details) return details;
   if (schedule.actionType === "speed_limit") {
@@ -142,11 +146,14 @@ export function SchedulesPanel() {
   const [editingId, setEditingId] = useState<string | "new" | null>(null);
   const [form, setForm] = useState<ScheduleForm>(NEW_SCHEDULE);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<Schedule | null>(null);
 
   const schedules = data?.schedules ?? [];
   const editing = schedules.find((entry) => entry.id === editingId) ?? null;
+
+  usePanelStatus(error ?? status, error !== null);
 
   // A rule may only name a profile this machine can honour.
   const offeredProfiles = profileData?.hardwareProfile.available ?? [];
@@ -157,9 +164,11 @@ export function SchedulesPanel() {
         offeredProfiles[0] ??
         null;
 
-  const open = (schedule: Schedule | null) => {
-    if (schedule?.implicit) return;
+  const open = (schedule: Schedule | null, actionType = NEW_SCHEDULE.actionType) => {
     setError(null);
+    // A script's own task times are the script's to change, not the panel's.
+    setStatus(schedule?.implicit ? t("next.schedules.manifestReadOnly") : null);
+    if (schedule?.implicit) return;
     setForm(
       schedule
         ? {
@@ -172,11 +181,11 @@ export function SchedulesPanel() {
             actionType: schedule.actionType,
             speedUnlimited:
               schedule.actionType === "speed_limit" && !schedule.speedLimitBytes,
-            speedMib: schedule.speedLimitBytes ? String(schedule.speedLimitBytes / MIB) : "5",
+            speedMib: schedule.speedLimitBytes ? toMib(schedule.speedLimitBytes) : NEW_SCHEDULE.speedMib,
             hardwareProfile: schedule.hardwareProfile,
             options: optionsFromSchedule(schedule),
           }
-        : NEW_SCHEDULE,
+        : { ...NEW_SCHEDULE, actionType },
     );
     setEditingId(schedule ? schedule.id : "new");
   };
@@ -192,9 +201,13 @@ export function SchedulesPanel() {
       ...optionsInput(form.options, form.actionType),
     };
     if (form.actionType === "speed_limit") {
+      // A limit the field only rounded for display goes back exactly as it was stored.
+      const stored = editing?.speedLimitBytes ?? 0;
       input.speedLimitBytes = form.speedUnlimited
         ? 0
-        : Math.round(Number.parseFloat(form.speedMib || "0") * MIB);
+        : stored > 0 && toMib(stored) === form.speedMib
+          ? stored
+          : Math.round(form.speedMib * MIB);
     }
     if (form.actionType === "hardware_profile") {
       input.hardwareProfile = formProfile;
@@ -209,6 +222,7 @@ export function SchedulesPanel() {
       setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
       return;
     }
+    setError(null);
     setEditingId(null);
     void reexecute({ requestPolicy: "network-only" });
   };
@@ -218,10 +232,22 @@ export function SchedulesPanel() {
       return;
     }
     setBusy(true);
-    await deleteSchedule({ id: confirmRemove.id });
+    const result = await deleteSchedule({ id: confirmRemove.id });
     setBusy(false);
     setConfirmRemove(null);
+    if (result.error) {
+      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      return;
+    }
+    setError(null);
     setEditingId(null);
+    void reexecute({ requestPolicy: "network-only" });
+  };
+
+  const toggle = async (schedule: Schedule, enabled: boolean) => {
+    setStatus(null);
+    const result = await toggleSchedule({ id: schedule.id, enabled });
+    setError(result.error ? (result.error.graphQLErrors[0]?.message ?? result.error.message) : null);
     void reexecute({ requestPolicy: "network-only" });
   };
 
@@ -229,8 +255,8 @@ export function SchedulesPanel() {
       kind: "table",
       id: `schedules-${track.value}`,
       title: t(track.label),
-      note: t(track.value === "ONE_SHOT" ? "next.schedules.oneShotHelp" : "next.schedules.trackHelp"),
-      columns: "84px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr) 44px",
+      note: t(track.value === "ONE_SHOT" ? "next.schedules.oneShotNote" : "next.schedules.trackNote"),
+      columns: "96px minmax(0, 0.8fr) minmax(0, 1.6fr) minmax(0, 1fr) 44px",
       headers: [
         t("next.schedules.time"),
         t("next.schedules.days"),
@@ -239,7 +265,7 @@ export function SchedulesPanel() {
         "",
       ],
       empty: t("next.schedules.trackEmpty"),
-      emptyAction: { label: t("next.schedules.add"), onClick: () => open(null) },
+      emptyAction: { label: t("next.schedules.add"), onClick: () => open(null, track.action) },
       onRowClick: (id) => {
         const schedule = schedules.find((entry) => entry.id === id);
         if (schedule) {
@@ -248,33 +274,43 @@ export function SchedulesPanel() {
       },
       rows: schedules.filter((schedule) => schedule.track === track.value).map((schedule) => ({
         id: schedule.id,
-        searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""}`,
+        searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.implicit ? t("next.schedules.manifest") : ""} ${schedule.label ?? ""}`,
         cells: [
-          <Cell key="time" mono className="text-wv-fg">
+          <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
             {scheduleTimeLabel(schedule)}
           </Cell>,
           <Cell key="days" mono className="text-wv-secondary">
             {daysLabel(t, schedule.days)}
           </Cell>,
-          <Cell key="action" title={actionLabel(t, schedule, targets)}>{actionLabel(t, schedule, targets)}</Cell>,
+          <div key="action" className="flex min-w-0 items-center gap-[10px]">
+            <Cell title={actionLabel(t, schedule, targets)}>{actionLabel(t, schedule, targets)}</Cell>
+            {/* A rule a script's manifest declares: listed here, changed in the script. */}
+            {schedule.implicit ? <Tag>{t("next.schedules.manifest")}</Tag> : null}
+          </div>,
           <Cell key="label" className="text-wv-muted">
             {schedule.label || "—"}
           </Cell>,
           <span key="enabled" onClick={(event) => event.stopPropagation()}>
-            {schedule.implicit ? <span className="text-xs">Manifest</span> : <Toggle
+            <Toggle
               size="table"
               checked={schedule.enabled}
+              disabled={schedule.implicit}
               label={t("next.schedules.enabledAria", { time: schedule.time })}
-              onChange={(next) => {
-                void toggleSchedule({ id: schedule.id, enabled: next }).then(() =>
-                  reexecute({ requestPolicy: "network-only" }),
-                );
-              }}
-            />}
+              onChange={(next) => void toggle(schedule, next)}
+            />
           </span>,
         ],
       })),
   }));
+
+  const optionFields = {
+    t,
+    action: form.actionType,
+    value: form.options,
+    onChange: (options: ScheduleOptionsForm) => setForm((current) => ({ ...current, options })),
+  };
+  // The editor says how long a rule lasts in the words its group uses in the list.
+  const runsOnce = form.actionType === "run_script" || isOneShot(form.actionType);
 
   return (
     <>
@@ -302,17 +338,20 @@ export function SchedulesPanel() {
           {
             id: "when",
             title: t("next.schedules.when"),
+            note: t(runsOnce ? "next.schedules.oneShotNote" : "next.schedules.trackNote"),
             fields: [
               {
                 id: "time",
                 label: t("next.schedules.time"),
-                help: t("next.schedules.timeHelp"),
+                // A script rule's time field takes the script evaluator's own notation.
+                help: form.actionType === "run_script" ? t("next.schedules.scriptTimeHelp") : undefined,
                 control: {
                   kind: form.actionType === "run_script" ? "text" : "time",
                   value: form.time,
                   onChange: (next) => setForm((current) => ({ ...current, time: next })),
                 },
               },
+              ...scheduleTimingFields(optionFields),
               {
                 id: "days",
                 label: t("next.schedules.days"),
@@ -320,7 +359,7 @@ export function SchedulesPanel() {
                 control: {
                   kind: "custom",
                   control: (
-                    <div className="flex flex-wrap justify-end gap-1.5">
+                    <div role="group" aria-label={t("next.schedules.days")} className="flex flex-wrap justify-end gap-1.5">
                       {DAYS.map((day) => {
                         const active = form.days.includes(day.key);
                         return (
@@ -359,18 +398,19 @@ export function SchedulesPanel() {
               {
                 id: "actionType",
                 label: t("next.schedules.action"),
+                help: scheduleActionHelp(t, form.actionType),
                 control: {
                   kind: "select",
                   value: form.actionType,
-                  options: ACTIONS.map((option) => ({ ...option, label: option.value === "run_script" ? option.label : t(option.label) })),
+                  options: ACTIONS.map((option) => ({ ...option, label: t(option.label) })),
                   onChange: (next) => setForm((current) => ({ ...current, actionType: next })),
                 },
               },
               ...(form.actionType === "run_script" ? [
-                { id: "script", label: "Script name", help: "Use a Scheduler script. Time accepts HH:MM, *:MM, or * for startup only.", control: {
+                { id: "script", label: t("next.schedules.script"), help: t("next.schedules.scriptHelp"), control: {
                   kind: "text" as const, value: form.script, onChange: (script: string) => setForm((current) => ({ ...current, script })),
                 } },
-                { id: "runAtStartup", label: "Also run at startup", control: {
+                { id: "runAtStartup", label: t("next.schedules.runAtStartup"), help: t("next.schedules.runAtStartupHelp"), control: {
                   kind: "toggle" as const, value: form.runAtStartup, onChange: (runAtStartup: boolean) => setForm((current) => ({ ...current, runAtStartup })),
                 } },
               ] : []),
@@ -394,22 +434,22 @@ export function SchedulesPanel() {
                             id: "speedMib",
                             label: t("next.schedules.speedLimit"),
                             help: t("next.schedules.speedLimitHelp"),
+                            // The same field as the bandwidth panel's ceiling, with
+                            // the fractions a rule could already be saved with.
                             control: {
-                              kind: "text" as const,
+                              kind: "number" as const,
                               value: form.speedMib,
-                              className: "w-[110px]",
-                              onChange: (next: string) =>
+                              min: 0,
+                              precision: 2,
+                              suffix: "MB/s",
+                              onChange: (next: number) =>
                                 setForm((current) => ({ ...current, speedMib: next })),
                             },
                           },
                         ]),
                   ]
                 : []),
-              {
-                id: "scheduleOptions",
-                label: t("next.schedules.options"),
-                control: { kind: "custom", control: <ScheduleOptionsFields action={form.actionType} value={form.options} onChange={(options) => setForm((current) => ({ ...current, options }))} /> },
-              },
+              ...scheduleActionFields({ ...optionFields, targets }),
               ...(form.actionType === "hardware_profile"
                 ? [
                     {

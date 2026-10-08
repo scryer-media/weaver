@@ -759,6 +759,8 @@ function JobDetailContent() {
           )}
         </DetailBlock>
 
+        <JobScriptResults key={`${job.id}-${job.status}`} jobId={job.id} />
+
         <PanelGrid>
           <DetailBlock id="release" title={t("next.completed.release")} tone="panel" bodyClassName="gap-[13px]">
             <div
@@ -910,7 +912,6 @@ function JobDetailContent() {
             />
           </DetailBlock>
         </PanelGrid>
-        <JobScriptResults key={`${job.id}-${job.status}`} jobId={job.id} />
       </div>
 
       {(["delete", "deleteAll"] as const).map((kind) => {

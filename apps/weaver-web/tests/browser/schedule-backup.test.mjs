@@ -10,6 +10,12 @@ before(async () => {
   browser = await chromium.launch({ headless: true });
 });
 after(async () => { await browser?.close(); await server?.close(); });
+// The shared controls: a select is a button that opens a menu, and a toggle is a switch.
+async function choose(page, scope, name, option) {
+  await scope.getByRole("button", { name, exact: true }).click();
+  await page.getByRole("menuitemradio", { name: option, exact: true }).click();
+}
+const toggle = (scope, name) => scope.getByRole("switch", { name, exact: true });
 async function open(query = "") {
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   if (query.includes("automatic")) {
@@ -65,9 +71,15 @@ test("all new schedule actions support disabled create, edit, draft and list tog
       await form.getByRole("switch", { name: "Enabled", exact: true }).click();
       await form.getByRole("button", { name: "Action", exact: true }).click();
       await page.getByRole("menuitemradio", { name: action, exact: true }).click();
-      if (action === "Set server availability") await form.getByLabel("Server", { exact: true }).selectOption("1");
-      if (action === "Prune history") await form.getByLabel("Completed", { exact: true }).check();
-      if (action === "Fetch RSS") { await form.getByLabel("Every hour", { exact: true }).check(); await form.getByLabel("Minute of the hour", { exact: true }).fill("15"); }
+      if (action === "Set server availability") await choose(page, form, "Server", "fixture-provider");
+      if (action === "Prune history") await toggle(form, "Completed").check();
+      if (action === "Fetch RSS") {
+        await toggle(form, "Every hour").click();
+        // A number field commits what was typed when focus leaves it.
+        const minute = form.getByRole("spinbutton", { name: "Minute of the hour", exact: true });
+        await minute.fill("15");
+        await minute.blur();
+      }
       await form.getByRole("button", { name: "Save", exact: true }).click();
       await form.waitFor({ state: "hidden" });
       const row = page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(`fixture ${action}`, { exact: true }) });
@@ -89,12 +101,9 @@ test("all new schedule actions support disabled create, edit, draft and list tog
       if (description) await row.getByText(description, { exact: true }).waitFor();
       await row.click();
       const edit = page.getByRole("dialog", { name: `fixture ${action}`, exact: true });
-      if (action === "Set server availability") {
-        await edit.getByRole("option", { name: "fixture-provider", exact: true }).waitFor({ state: "attached" });
-        assert.equal(await edit.getByLabel("Server", { exact: true }).inputValue(), "1");
-      }
-      if (action === "Fetch RSS") assert.equal(await edit.getByLabel("Minute of the hour", { exact: true }).inputValue(), "15");
-      if (action === "Prune history") assert.equal(await edit.getByLabel("Completed", { exact: true }).isChecked(), true);
+      if (action === "Set server availability") await edit.getByRole("button", { name: "Server", exact: true }).getByText("fixture-provider", { exact: true }).waitFor();
+      if (action === "Fetch RSS") assert.equal(await edit.getByRole("spinbutton", { name: "Minute of the hour", exact: true }).inputValue(), "15");
+      if (action === "Prune history") assert.equal(await toggle(edit, "Completed").isChecked(), true);
       await edit.getByLabel("Label", { exact: true }).fill(`edited ${action}`);
       await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
       await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
@@ -114,7 +123,7 @@ test("all new schedule actions support disabled create, edit, draft and list tog
 test("editing another action into server and quota rules saves the displayed boolean defaults", async () => {
   const page = await open("?schedules");
   try {
-    for (const [action, group, checkbox] of [
+    for (const [action, group, option] of [
       ["Set server availability", "Servers", "Server active"],
       ["Set quota metering", "Quota metering", "Count traffic toward the quota"],
     ]) {
@@ -129,20 +138,43 @@ test("editing another action into server and quota rules saves the displayed boo
       const edit = page.getByRole("dialog", { name: label, exact: true });
       await edit.getByRole("button", { name: "Action", exact: true }).click();
       await page.getByRole("menuitemradio", { name: action, exact: true }).click();
-      if (group === "Servers") await edit.getByLabel("Server", { exact: true }).selectOption("1");
-      assert.equal(await edit.getByLabel(checkbox, { exact: true }).isChecked(), true);
+      if (group === "Servers") await choose(page, edit, "Server", "fixture-provider");
+      assert.equal(await toggle(edit, option).isChecked(), true);
       await edit.getByRole("button", { name: "Save", exact: true }).click();
       await edit.waitFor({ state: "hidden" });
       await page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(label, { exact: true }) }).click();
-      assert.equal(await edit.getByLabel(checkbox, { exact: true }).isChecked(), true);
-      await edit.getByLabel(checkbox, { exact: true }).uncheck();
+      assert.equal(await toggle(edit, option).isChecked(), true);
+      await toggle(edit, option).uncheck();
       await edit.getByRole("button", { name: "Save", exact: true }).click();
       await edit.waitFor({ state: "hidden" });
       await page.getByRole("region", { name: group, exact: true }).getByText(group === "Servers" ? "Set server availability: fixture-provider (Off)" : "Set quota metering: Off", { exact: true }).waitFor();
       await page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(label, { exact: true }) }).click();
-      assert.equal(await edit.getByLabel(checkbox, { exact: true }).isChecked(), false);
+      assert.equal(await toggle(edit, option).isChecked(), false);
       await edit.getByRole("button", { name: "Cancel", exact: true }).click();
     }
+  } finally { await page.close(); }
+});
+
+test("a group adds a rule of its own kind, and a rule a script declares is listed read-only", async () => {
+  const page = await open("?schedules&manifest");
+  try {
+    for (const [group, action, note] of [
+      ["Speed limit", "Set a speed limit", "local time · holds until the next rule in the group"],
+      ["Servers", "Set server availability", "local time · holds until the next rule in the group"],
+    ]) {
+      await page.getByRole("region", { name: group, exact: true }).getByRole("button", { name: "Add schedule", exact: true }).click();
+      const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+      await form.getByRole("button", { name: "Action", exact: true }).getByText(action, { exact: true }).waitFor();
+      await form.getByText(note, { exact: true }).waitFor();
+      await form.getByRole("button", { name: "Cancel", exact: true }).click();
+      await form.waitFor({ state: "hidden" });
+    }
+    const declared = page.getByRole("region", { name: "One-shot actions", exact: true }).getByRole("button").filter({ has: page.getByText("Run nightly.py", { exact: true }) });
+    await declared.getByText("Manifest", { exact: true }).waitFor();
+    assert.equal(await declared.getByRole("switch").isDisabled(), true);
+    await declared.click();
+    await page.getByRole("contentinfo").getByText("A script declares this rule itself, so it is read-only here.", { exact: true }).waitFor();
+    assert.equal(await page.getByRole("dialog").count(), 0);
   } finally { await page.close(); }
 });
 
