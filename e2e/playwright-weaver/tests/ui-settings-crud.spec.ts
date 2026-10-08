@@ -252,8 +252,11 @@ test("new schedule actions stay disabled and appear on their own tracks", async 
     await form.getByRole("switch", { name: "Enabled", exact: true }).click();
     await form.getByRole("button", { name: "Action", exact: true }).click();
     await page.getByRole("menuitemradio", { name: action, exact: true }).click();
-    if (action === "Set server availability") await form.getByRole("combobox", { name: "Server", exact: true }).selectOption({ label: "nntp" });
-    if (action === "Prune history") await form.getByRole("checkbox", { name: "Completed", exact: true }).check();
+    if (action === "Set server availability") {
+      await form.getByRole("button", { name: "Server", exact: true }).click();
+      await page.getByRole("menuitemradio", { name: "nntp", exact: true }).click();
+    }
+    if (action === "Prune history") await form.getByRole("switch", { name: "Completed", exact: true }).check();
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await expect(form).toBeHidden();
     let row = tableRow(page, track, label);

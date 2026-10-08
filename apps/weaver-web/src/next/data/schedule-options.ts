@@ -80,8 +80,10 @@ export function optionsFromSchedule(schedule: ScheduleOptions): ScheduleOptionsF
 
 export function optionsInput(form: ScheduleOptionsForm, action: string) {
   const hourly = isOneShot(action) ? form.everyHourAtMinute : null;
+  // A script rule lists its times in the time field, and the editor offers it no second list.
+  const listed = hourly === null && action !== "run_script";
   return {
-    times: hourly === null ? form.timesText.split(",").map((time) => time.trim()).filter(Boolean) : [],
+    times: listed ? form.timesText.split(",").map((time) => time.trim()).filter(Boolean) : [],
     everyHourAtMinute: hourly,
     serverId: action === "set_server_active" ? form.serverId : null,
     serverActive: action === "set_server_active" ? form.serverActive : null,

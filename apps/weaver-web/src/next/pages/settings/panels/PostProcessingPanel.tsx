@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { ScriptKinds, type ScriptDeclarations } from "@/next/components/ScriptKinds";
-import { EventScriptSettings, eventScriptDefaults, eventScriptOptions, type EventScriptOptions } from "@/next/components/EventScriptSettings";
+import { eventScriptDefaults, eventScriptOptions, eventScriptSection, type EventScriptOptions } from "@/next/components/EventScriptSettings";
 import {
   POST_PROCESSING_SETTINGS_QUERY,
   SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION,
@@ -476,6 +476,7 @@ export function PostProcessingPanel() {
         },
       ],
     },
+    eventScriptSection(t, values, patch),
     {
       kind: "section",
       id: "interpreters",
@@ -559,7 +560,7 @@ export function PostProcessingPanel() {
       id: "run-list",
       title: t("next.postProcessing.runList"),
       note: scopeNote,
-      columns: "44px minmax(0, 1fr) 120px 92px 150px",
+      columns: "64px minmax(0, 1fr) 176px 76px 104px",
       headers: [
         t("next.postProcessing.order"),
         t("next.postProcessing.script"),
@@ -614,7 +615,8 @@ export function PostProcessingPanel() {
               value={entry.timeoutSeconds ?? 0}
               min={0}
               max={86400}
-              className="h-7 w-[92px]"
+              suffix={t("next.general.seconds")}
+              className="h-7"
               onChange={(next) => {
                 const updated = [...entries];
                 updated[index] = { ...entry, timeoutSeconds: next > 0 ? next : null };
@@ -632,7 +634,7 @@ export function PostProcessingPanel() {
                 patchEntries(updated);
               }}
             />,
-            <span key="order-controls" className="flex items-center gap-[6px]">
+            <span key="order-controls" className="flex items-center gap-1">
               <SecondaryButton
                 className="h-7 px-2"
                 title={t("next.postProcessing.moveUp")}
@@ -650,13 +652,13 @@ export function PostProcessingPanel() {
                 <Icon name="moveDown" size={13} />
               </SecondaryButton>
               <SecondaryButton
-                icon="remove"
                 className="h-7 px-2"
+                title={t("next.common.remove")}
                 onClick={() =>
                   patchEntries(entries.filter((candidate) => candidate.script !== entry.script))
                 }
               >
-                {t("next.common.remove")}
+                <Icon name="remove" size={13} />
               </SecondaryButton>
             </span>,
           ],
@@ -686,12 +688,12 @@ export function PostProcessingPanel() {
         id: script.name,
         searchText: `${script.name} ${script.displayName} ${script.adapter}`,
         cells: [
-          <Cell key="name" className="text-wv-fg" title={script.name}>
-            <div className="flex min-w-0 flex-col gap-1">
-              <span>{script.displayName}</span>
-              <ScriptKinds script={script} />
-            </div>
-          </Cell>,
+          <div key="name" className="flex min-w-0 flex-col gap-[6px]">
+            <span className="truncate text-[13px] text-wv-fg" title={script.name}>
+              {script.displayName}
+            </span>
+            <ScriptKinds script={script} />
+          </div>,
           <Cell key="adapter" mono className="text-wv-secondary">
             {script.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet"}
           </Cell>,
@@ -746,7 +748,6 @@ export function PostProcessingPanel() {
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
-      <EventScriptSettings value={values} onChange={patch} />
 
       <ConfirmDialog
         open={confirmDirectory}
