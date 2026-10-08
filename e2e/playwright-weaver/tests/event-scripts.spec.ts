@@ -805,6 +805,13 @@ test("FS02 a FEED script rewrites item titles, and a rewritten feed over the cei
     const url = `http://${fixture.ip}:${fixture.ports.http}/feed.xml`;
     const feed = await addFeed(request, tag, url, [rewrite]);
     feeds.push(feed);
+    const preview = (await graphql<{ previewRssFeed: Array<{ itemTitle: string; decision: string; jobId: number | null }> }>(
+      request, "mutation($id: Int!) { previewRssFeed(id: $id) { itemTitle decision jobId } }", { id: feed },
+    )).previewRssFeed;
+    expect(preview).toEqual([expect.objectContaining({
+      itemTitle: `fs02-proxy-${tag}`, decision: "accepted", jobId: null,
+    })]);
+    expect(await seenItems(request, feed), "preview must not record seen items").toEqual([]);
     const report = await syncFeed(request, feed);
     expect(report.errors).toEqual([]);
     const items = await seenItems(request, feed);
@@ -833,11 +840,12 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
   const restore = await useScripts(request, { global: [queue, scheduler, scan, feed].map(script => ({ script })) });
   try {
     await page.goto("/settings/post-processing");
-    await expect(page.getByLabel("Scripts directory", { exact: true })).toHaveValue(WEAVER_SCRIPTS_DIR);
-    await expect(page.getByRole("group", { name: "Event scripts and output retention" })).toBeVisible();
+    await expect(page.getByRole("textbox", { name: "Scripts directory", exact: true })).toHaveValue(WEAVER_SCRIPTS_DIR);
+    await expect(page.getByRole("group", { name: "Event scripts and output retention", exact: true })).toBeVisible();
     // A discovered script's row; its name cell carries the script's file name.
     const entry = (name: string) =>
-      page.getByRole("button").filter({ has: page.locator(`[title="${name}"]`) }).first();
+      page.getByRole("region", { name: "Discovered scripts", exact: true })
+        .getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
     await expect(entry(queue)).toContainText("Post-processing");
     await expect(entry(queue)).toContainText("Queue");
     await expect(entry(queue)).toContainText("Declared events:");
@@ -872,4 +880,3 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
     removeFixtureScripts([queue, scheduler, scan, feed]);
   }
 });
-
