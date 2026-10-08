@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { Link, useNavigate } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
-import type { Egress, LegFlow, NetworkFlow as Flow, NetworkRoute, ProxyPool, Rung } from "@/lib/networking";
+import type {
+  Egress,
+  FailingHop,
+  LegFlow,
+  NetworkFlow as Flow,
+  NetworkRoute,
+  PoolMemberFlow,
+  ProxyPool,
+  Rung,
+} from "@/lib/networking";
 import { proxyLabels, type ProxyProfile } from "@/lib/proxies";
 import { EmptyState, Field } from "../../components/chrome";
 import { SecondaryButton, Select } from "../../components/controls";
@@ -34,18 +43,122 @@ const INK = {
 const FONT = '"Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace';
 const TITLE_FONT = '"Sora Variable", ui-sans-serif, system-ui, sans-serif';
 
+/** The four lanes, left to right. Ribbons cross the gaps between them. */
+const EGRESS = { x: 16, width: 214, end: 230 } as const;
+const LEGS = { x: 286, width: 300, end: 586 } as const;
+const PROXY = { x: 642, width: 440, end: 1082 } as const;
+const PROVIDERS = { x: 1138, width: 214, end: 1352 } as const;
+const WIDTH = PROVIDERS.end + 16;
+const LEG_HEIGHT = 64;
+const BOX_HEIGHT = 44;
+const PROXIES_PAGE = "/settings/networking/proxies";
+
+type Point = [number, number];
+type Member = { id: number; state: string; live: PoolMemberFlow | undefined; measured: boolean };
+/** One ladder rung as the proxy lane draws it. */
+type Block = {
+  rung: Rung;
+  rungIndex: number;
+  top: number;
+  height: number;
+  failing: FailingHop | undefined;
+  pinned: number | null;
+  members: Member[];
+};
+
 const legKey = (leg: LegFlow) => `${leg.consumer}:${leg.position}`;
 
+/** Monospaced text cut to the width it has, ending in an ellipsis when it was cut. */
+function fit(text: string, width: number, size: number) {
+  const room = Math.max(1, Math.floor(width / (size * 0.6)));
+  return text.length > room ? `${text.slice(0, room - 1)}…` : text;
+}
+
+/** The steps from each waypoint to the next: level stretches run straight, the rest ease between heights. */
+function steps(points: Point[], shift: number) {
+  return points
+    .slice(1)
+    .map(([x, y], index) => {
+      const [fromX, fromY] = points[index]!;
+      const mid = (fromX + x) / 2;
+      return fromY === y
+        ? `L ${x} ${y + shift}`
+        : `C ${mid} ${fromY + shift},${mid} ${y + shift},${x} ${y + shift}`;
+    })
+    .join(" ");
+}
+
+/** The line a path with nothing open is drawn as. */
+function thread(points: Point[]) {
+  const [x, y] = points[0]!;
+  return `M ${x} ${y} ${steps(points, 0)}`;
+}
+
 /** A ribbon whose thickness is the open connections it carries. */
-function band(x: number, y: number, endX: number, endY: number, width: number) {
-  const mid = (x + endX) / 2;
+function band(points: Point[], width: number) {
   const half = width / 2;
-  return `M ${x} ${y - half} C ${mid} ${y - half},${mid} ${endY - half},${endX} ${endY - half} L ${endX} ${endY + half} C ${mid} ${endY + half},${mid} ${y + half},${x} ${y + half} Z`;
+  const back = [...points].reverse();
+  const [x, y] = points[0]!;
+  const [endX, endY] = back[0]!;
+  return `M ${x} ${y - half} ${steps(points, -half)} L ${endX} ${endY + half} ${steps(back, half)} Z`;
 }
 
 /** A linear map from [0, domain] onto [0, range], clamped at both ends. */
 function scale(domain: number, range: number) {
   return (value: number) => Math.max(0, Math.min(range, (value / Math.max(1, domain)) * range));
+}
+
+/** What a rung is doing for its leg. `direct` is the rung with no tunnel. */
+function rungStatus(leg: LegFlow, rungIndex: number, direct: boolean): string {
+  if (leg.open > 0 && (direct ? leg.selectedRung == null : leg.selectedRung === rungIndex)) {
+    return "ACTIVE";
+  }
+  if (leg.state === "PROBING") {
+    return "PROBING";
+  }
+  const state = leg.rungStates?.[rungIndex];
+  if (state === "COOLDOWN") {
+    return "COOLDOWN";
+  }
+  return leg.state === "DOWN" || state === "FAILING" ? "FAILING" : "STANDBY";
+}
+
+/** What a pool member is doing, in the one word the diagram shows for it. */
+function memberState(member: PoolMemberFlow | undefined, pinned: boolean, enabled: boolean): string {
+  if (!enabled || member?.state === "DISABLED") {
+    return "DISABLED";
+  }
+  if (member?.blocked) {
+    return "BLOCKED";
+  }
+  if (pinned) {
+    return "PINNED";
+  }
+  if (member?.state === "SUSPECT" || member?.state === "CHALLENGER" || member?.state === "PROBING") {
+    return member.state;
+  }
+  if (member?.failures) {
+    return "FAILING";
+  }
+  return member?.warmed ? "READY" : "UNMEASURED";
+}
+
+/**
+ * A chain hop's state. Only the first failing hop can be known: the hops
+ * before it carried the attempt that far, and the hops after it were never
+ * reached.
+ */
+function hopState(position: number, failingAt: number, status: string, enabled: boolean): string {
+  if (!enabled) {
+    return "DISABLED";
+  }
+  if (position === failingAt) {
+    return "FAILING";
+  }
+  if (failingAt < 0 || status === "ACTIVE") {
+    return status;
+  }
+  return position < failingAt ? "UP" : "UNREACHED";
 }
 
 /** Animate measurements only: configuration and card positions change once per sample. */
@@ -89,11 +202,46 @@ function StateText({ x, y, state, label, size = 10.5 }: { x: number; y: number; 
   );
 }
 
+/** A proxy in the lane: its name, then its state, behind a bar in the state's colour. */
+function HopBox({
+  x,
+  y,
+  width,
+  title,
+  state,
+  label,
+  active,
+}: {
+  x: number;
+  y: number;
+  width: number;
+  title: string;
+  state: string;
+  label: string;
+  active: boolean;
+}) {
+  return (
+    <g opacity={state === "DISABLED" ? 0.6 : 1}>
+      <rect x={x} y={y} width={width} height={BOX_HEIGHT} fill={active ? INK.rowActive : INK.card} stroke={INK.line} />
+      <rect x={x} y={y} width="3" height={BOX_HEIGHT} fill={stateColor(state)} />
+      <text x={x + 14} y={y + 18} fill={INK.fg} fontSize="11">
+        {fit(title, width - 26, 11)}
+      </text>
+      <StateText x={x + 14} y={y + 35} size={9.5} state={state} label={fit(label, width - 39, 9.5)} />
+    </g>
+  );
+}
+
 /**
- * Where every connection leaves, which route leg carries it, and which
- * server or feed it serves: egress cards on the left, the legs and their
- * ladders in the middle, consumers on the right, joined by ribbons as thick
- * as the connections they carry. A leg with nothing open is a dashed line.
+ * Where every connection leaves, which route leg carries it, what it tunnels
+ * through, and which provider it serves: egress cards on the left, then the
+ * route legs, then each leg's proxies, then the providers, joined by ribbons
+ * as thick as the connections they carry. A path with nothing open is a
+ * dashed line.
+ *
+ * The proxy lane draws a leg's ladder top to bottom. A proxy is one box, a
+ * chain is its hops in order with a `>` between them, and a pool lists its
+ * members. Going direct has no box: the line crosses the lane untouched.
  */
 export function NetworkFlow({
   flow,
@@ -112,7 +260,6 @@ export function NetworkFlow({
   const navigate = useNavigate();
   const svg = useRef<SVGSVGElement>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<string[]>([]);
   const [filter, setFilter] = useState("");
   const [group, setGroup] = useState<number | null>(null);
   const counts = useMeasurements(flow.legs);
@@ -124,46 +271,59 @@ export function NetworkFlow({
       .sort((a, b) => a.egressId - b.egressId || a.consumer.localeCompare(b.consumer) || a.position - b.position);
     let offset = 58;
     const rows = legs.map((leg) => {
-      const rungs: (Rung | null)[] =
-        leg.path.kind === "DIRECT" ? [null] : [...leg.path.rungs, ...(leg.path.directFallback ? [null] : [])];
-      let rowY = 48;
-      const details = rungs.map((rung, rungIndex) => {
-        const pool = rung?.kind === "POOL" ? pools.find((candidate) => candidate.id === rung.poolId) : null;
-        const members = pool && expanded.includes(`${legKey(leg)}:${rungIndex}`) ? pool.memberIds : [];
-        const y = rowY;
-        rowY += 36 + members.length * 32;
-        return { rung, rungIndex, members, y };
+      let bottom = 0;
+      const blocks: Block[] = (leg.path.kind === "DIRECT" ? [] : leg.path.rungs).map((rung, rungIndex) => {
+        const live =
+          rung.kind === "POOL"
+            ? flow.pools.find((candidate) => candidate.poolId === rung.poolId && candidate.egressId === leg.egressId)
+            : undefined;
+        const configured = rung.kind === "POOL" ? pools.find((candidate) => candidate.id === rung.poolId) : undefined;
+        const members: Member[] = (configured?.memberIds ?? live?.members.map((member) => member.id) ?? []).map((id) => {
+          const member = live?.members.find((candidate) => candidate.id === id);
+          return {
+            id,
+            live: member,
+            state: memberState(
+              member,
+              live?.pinnedMember === id,
+              profiles.find((profile) => profile.id === id)?.enabled !== false,
+            ),
+            measured: member != null && (member.handshakeMs != null || member.connectMs != null || member.bytesPerSecond != null),
+          };
+        });
+        const failing = leg.failingHops?.find((hop) => hop.rung === rungIndex);
+        const height =
+          rung.kind === "POOL"
+            ? BOX_HEIGHT + members.reduce((sum, member) => sum + (member.measured ? 32 : 20), 0) + (members.length ? 8 : 0)
+            : BOX_HEIGHT + (failing ? 18 : 0);
+        const top = bottom;
+        bottom = top + height + 8;
+        return { rung, rungIndex, top, height, failing, pinned: live?.pinnedMember ?? null, members };
       });
+      // Direct has no box: its line crosses level with the leg, or beneath the ladder it backs up.
+      const bypass = leg.path.kind === "DIRECT" ? LEG_HEIGHT / 2 : leg.path.directFallback ? bottom + 26 : null;
       const y = offset;
-      const height = rowY + 12;
+      const height = Math.max(LEG_HEIGHT, bypass == null ? bottom - 8 : bypass + 16);
       offset += height + 18;
-      return { leg, y, height, details };
+      return { leg, y, height, blocks, bypass };
     });
     return {
       rows,
       height: Math.max(offset + 36, egresses.length * 128 + 90, consumers.length * 144 + 90, 260),
     };
-  }, [flow.legs, filter, grouped, group, pools, expanded, egresses.length, consumers.length]);
+  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, egresses.length, consumers.length]);
 
   const width = scale(Math.max(1, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
-  const name = (id: number) => profiles.find((profile) => profile.id === id)?.name ?? t("next.networking.proxyNumber", { id });
+  const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
+  const name = (id: number) => profile(id)?.name ?? t("next.networking.proxyNumber", { id });
   const poolName = (id: number | null) =>
     pools.find((pool) => pool.id === id)?.name ?? t("next.networking.flow.pool");
-  const rungName = (rung: Rung | null) => {
-    if (!rung) {
-      return t("next.networking.flow.direct");
-    }
-    if (rung.kind === "POOL") {
-      return t("next.networking.flow.poolRung", { name: poolName(rung.poolId) });
-    }
-    if (rung.kind === "CHAIN") {
-      return rung.chainIds.map(name).join(" → ");
-    }
-    const profile = profiles.find((candidate) => candidate.id === rung.proxyId);
-    return `${name(rung.proxyId ?? 0)} · ${profile ? proxyLabels[profile.kind] : t("next.networking.flow.proxy")}`;
-  };
   const active = flow.legs.find((leg) => legKey(leg) === selected);
   const consumerName = (leg: LegFlow) => consumers.find((consumer) => consumer.key === leg.consumer)?.name ?? leg.consumer;
+  const holds = (leg: LegFlow) => consumers.find((consumer) => consumer.key === leg.consumer)?.route?.failover === "HOLD";
+  /** Whether the leg is on, or planned onto, the line with no tunnel. */
+  const goesDirect = (leg: LegFlow) =>
+    leg.path.kind === "DIRECT" || (leg.path.directFallback && leg.open > 0 && leg.selectedRung == null);
 
   function download() {
     if (!svg.current) {
@@ -180,15 +340,128 @@ export function NetworkFlow({
     URL.revokeObjectURL(url);
   }
 
-  function toggle(key: string) {
-    setExpanded((values) => (values.includes(key) ? values.filter((value) => value !== key) : [...values, key]));
-  }
-
   /** Cards are real links, so the exported file keeps them; on screen they route in place. */
   const follow = (href: string) => (event: MouseEvent) => {
     event.preventDefault();
     navigate(href);
   };
+
+  /** One rung of a leg's ladder, drawn in the proxy lane. */
+  function rungBlock(leg: LegFlow, rowY: number, block: Block) {
+    const { rung, rungIndex, failing, members } = block;
+    const y = rowY + block.top;
+    const status = rungStatus(leg, rungIndex, false);
+    const isActive = status === "ACTIVE";
+    const reason = failing ? (
+      <text x={PROXY.x + 14} y={y + BOX_HEIGHT + 13} fill={INK.muted} fontSize="9.5">
+        {fit(failing.reason, PROXY.width - 28, 9.5)}
+      </text>
+    ) : null;
+
+    if (rung.kind === "CHAIN") {
+      const gap = 26;
+      const hopWidth = (PROXY.width - (rung.chainIds.length - 1) * gap) / rung.chainIds.length;
+      const failingAt = failing ? rung.chainIds.indexOf(failing.proxyId) : -1;
+      return (
+        <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)}>
+          <title>{[rung.chainIds.map(name).join(" > "), ...(failing ? [failing.reason] : [])].join(" · ")}</title>
+          {rung.chainIds.map((id, position) => {
+            const x = PROXY.x + position * (hopWidth + gap);
+            const state = hopState(position, failingAt, status, profile(id)?.enabled !== false);
+            return (
+              <g key={id}>
+                <HopBox x={x} y={y} width={hopWidth} title={name(id)} state={state} label={stateLabel(t, state)} active={isActive} />
+                {position + 1 < rung.chainIds.length ? (
+                  <text x={x + hopWidth + gap / 2} y={y + 27} fill={INK.muted} fontSize="15" textAnchor="middle">
+                    {">"}
+                  </text>
+                ) : null}
+              </g>
+            );
+          })}
+          {reason}
+        </a>
+      );
+    }
+
+    if (rung.kind === "POOL") {
+      const configured = pools.find((pool) => pool.id === rung.poolId);
+      const state = configured?.enabled === false ? "DISABLED" : status;
+      let memberY = y + BOX_HEIGHT;
+      return (
+        <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)}>
+          <rect x={PROXY.x} y={y} width={PROXY.width} height={block.height} fill={INK.card} stroke={INK.line} />
+          <HopBox
+            x={PROXY.x}
+            y={y}
+            width={PROXY.width}
+            title={t("next.networking.flow.poolRung", { name: poolName(rung.poolId) })}
+            state={state}
+            label={`${stateLabel(t, state)}${block.pinned != null ? ` · ${t("next.networking.flow.pinnedTo", { name: name(block.pinned) })}` : ""}`}
+            active={isActive}
+          />
+          <g role="group" aria-label={t("next.networking.flow.poolMembers", { name: poolName(rung.poolId) })}>
+            {members.map((member) => {
+              const top = memberY;
+              memberY += member.measured ? 32 : 20;
+              const held = member.live?.open ?? 0;
+              return (
+                <g key={member.id} opacity={member.state === "DISABLED" ? 0.6 : 1}>
+                  {member.live?.blocked ? <title>{member.live.blocked}</title> : null}
+                  <rect
+                    x={PROXY.x + 8}
+                    y={top}
+                    width={PROXY.width - 16}
+                    height={member.measured ? 30 : 18}
+                    fill={held > 0 ? INK.rowActive : INK.row}
+                  />
+                  <rect x={PROXY.x + 16} y={top + 6} width="7" height="7" fill={stateColor(member.state)} />
+                  <text x={PROXY.x + 29} y={top + 13} fill={INK.secondary} fontSize="10">
+                    {`${fit(name(member.id), 160, 10)} · ${stateLabel(t, member.state)}`}
+                  </text>
+                  {held > 0 ? (
+                    <text x={PROXY.end - 16} y={top + 13} fill={INK.fg} fontSize="10" textAnchor="end">
+                      {countLabel(t, "next.networking.flow.memberHolding", held)}
+                    </text>
+                  ) : null}
+                  {member.measured ? (
+                    <text x={PROXY.x + 29} y={top + 25} fill={INK.muted} fontSize="9.5">
+                      {t("next.networking.flow.memberTiming", {
+                        session: member.live?.handshakeMs?.toFixed(0) ?? "—",
+                        open: member.live?.connectMs?.toFixed(0) ?? "—",
+                        rate:
+                          member.live?.bytesPerSecond == null
+                            ? t("next.networking.flow.noEvidence")
+                            : formatRate(member.live.bytesPerSecond),
+                      })}
+                    </text>
+                  ) : null}
+                </g>
+              );
+            })}
+          </g>
+        </a>
+      );
+    }
+
+    const hop = profile(rung.proxyId);
+    const state = hop?.enabled === false ? "DISABLED" : failing && status !== "COOLDOWN" ? "FAILING" : status;
+    return (
+      <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)}>
+        {failing ? <title>{failing.reason}</title> : null}
+        <HopBox
+          x={PROXY.x}
+          y={y}
+          width={PROXY.width}
+          title={`${name(rung.proxyId ?? 0)} · ${hop ? proxyLabels[hop.kind] : t("next.networking.flow.proxy")}`}
+          state={state}
+          label={stateLabel(t, state)}
+          active={isActive}
+        />
+        {reason}
+      </a>
+    );
+  }
 
   if (consumers.length === 0 && egresses.length === 0) {
     return <EmptyState title={t("next.networking.flow.emptyTitle")} body={t("next.networking.flow.emptyBody")} />;
@@ -233,26 +506,27 @@ export function NetworkFlow({
         <svg
           ref={svg}
           xmlns="http://www.w3.org/2000/svg"
-          viewBox={`0 0 1040 ${layout.height}`}
+          viewBox={`0 0 ${WIDTH} ${layout.height}`}
           role="group"
           aria-label={t("next.networking.flow.diagram")}
-          className="block w-full min-w-[820px]"
+          className="block w-full min-w-[1160px]"
           style={{ background: INK.ground, fontFamily: FONT }}
         >
           {[
-            [20, t("next.networking.flow.egressColumn")],
-            [310, t("next.networking.flow.legsColumn")],
-            [810, t("next.networking.flow.consumersColumn")],
+            [EGRESS.x, t("next.networking.flow.egressColumn")],
+            [LEGS.x, t("next.networking.flow.legsColumn")],
+            [PROXY.x, t("next.networking.flow.proxyColumn")],
+            [PROVIDERS.x, t("next.networking.flow.consumersColumn")],
           ].map(([x, label]) => (
-            <text key={String(x)} x={x} y="30" fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
+            <text key={String(x)} x={Number(x) + 4} y="30" fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
               {String(label).toUpperCase()}
             </text>
           ))}
 
-          {layout.rows.map(({ leg, y, height }) => {
+          {layout.rows.map(({ leg, y, blocks, bypass }) => {
             const egressY = 112 + Math.max(0, egresses.findIndex((egress) => egress.id === leg.egressId)) * 128;
             const consumerY = 120 + Math.max(0, consumers.findIndex((consumer) => consumer.key === leg.consumer)) * 144;
-            const legY = y + height / 2;
+            const legY = y + LEG_HEIGHT / 2;
             const count = counts[legKey(leg)] ?? leg.open;
             const color = stateColor(leg.state);
             const tip = [
@@ -261,35 +535,43 @@ export function NetworkFlow({
               leg.sourceAddress ?? t("next.networking.flow.noSource"),
               ...(leg.reason ? [leg.reason] : []),
             ].join(" · ");
-            const holding = consumers.find((consumer) => consumer.key === leg.consumer)?.route?.failover === "HOLD";
+            // The ribbon stops at the box it tunnels through and resumes past it; with no box it runs on.
+            const via = goesDirect(leg) ? undefined : (blocks[leg.selectedRung ?? 0] ?? blocks[0]);
+            const cross = y + (via ? via.top + BOX_HEIGHT / 2 : (bypass ?? LEG_HEIGHT / 2));
+            const paths: Point[][] = [
+              [
+                [EGRESS.end, egressY],
+                [LEGS.x, legY],
+              ],
+              ...(via
+                ? [
+                    [
+                      [LEGS.end, legY],
+                      [PROXY.x, cross],
+                    ] as Point[],
+                    [
+                      [PROXY.end, cross],
+                      [PROVIDERS.x, consumerY],
+                    ] as Point[],
+                  ]
+                : [
+                    [
+                      [LEGS.end, legY],
+                      [PROXY.x, cross],
+                      [PROXY.end, cross],
+                      [PROVIDERS.x, consumerY],
+                    ] as Point[],
+                  ]),
+            ];
             return (
               <g key={`ribbon:${legKey(leg)}`}>
                 <title>{tip}</title>
-                {[
-                  [230, egressY, 310, legY],
-                  [730, legY, 810, consumerY],
-                ].map(([x, startY, endX, endY], index) =>
+                {paths.map((points, index) =>
                   count > 0 ? (
-                    <path key={index} d={band(x!, startY!, endX!, endY!, width(count))} fill={color} opacity="0.28" />
+                    <path key={index} d={band(points, Math.max(2, width(count)))} fill={color} opacity="0.28" />
                   ) : (
-                    <path
-                      key={index}
-                      d={`M ${x} ${startY} C ${(x! + endX!) / 2} ${startY},${(x! + endX!) / 2} ${endY},${endX} ${endY}`}
-                      fill="none"
-                      stroke={color}
-                      strokeWidth="1.4"
-                      strokeDasharray="4 5"
-                    />
+                    <path key={index} d={thread(points)} fill="none" stroke={color} strokeWidth="1.4" strokeDasharray="4 5" />
                   ),
-                )}
-                {leg.open ? null : (
-                  <text x="736" y={legY - 7} fill={holding ? INK.warn : INK.muted} fontSize="9.5">
-                    {holding && leg.state === "DOWN"
-                      ? t("next.networking.flow.parkedHold")
-                      : leg.state === "DOWN"
-                        ? t("next.networking.flow.shareMoved")
-                        : t("next.networking.flow.planned", { count: leg.target })}
-                  </text>
                 )}
               </g>
             );
@@ -304,16 +586,16 @@ export function NetworkFlow({
               <g key={egress.id}>
                 <title>{egress.reason ?? egress.name}</title>
                 <a href="/settings/networking/egress" onClick={follow("/settings/networking/egress")}>
-                  <rect x="16" y={y} width="214" height="108" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} strokeDasharray={down ? "4 4" : undefined} />
-                  <rect x="16" y={y} width="3" height="108" fill={stateColor(egress.health)} />
-                  <text x="30" y={y + 24} fill={INK.fg} fontSize="13" fontFamily={TITLE_FONT} fontWeight="600">
+                  <rect x={EGRESS.x} y={y} width={EGRESS.width} height="108" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} strokeDasharray={down ? "4 4" : undefined} />
+                  <rect x={EGRESS.x} y={y} width="3" height="108" fill={stateColor(egress.health)} />
+                  <text x={EGRESS.x + 14} y={y + 24} fill={INK.fg} fontSize="13" fontFamily={TITLE_FONT} fontWeight="600">
                     {egress.name.slice(0, 24)}
                   </text>
-                  <StateText x={30} y={y + 46} state={egress.health} label={stateLabel(t, egress.health)} />
-                  <text x="30" y={y + 66} fill={INK.muted} fontSize="10">
+                  <StateText x={EGRESS.x + 14} y={y + 46} state={egress.health} label={stateLabel(t, egress.health)} />
+                  <text x={EGRESS.x + 14} y={y + 66} fill={INK.muted} fontSize="10">
                     {(egress.addresses?.join(", ") || egress.sourceAddress || egress.interfaceName || t("next.networking.binding.system")).slice(0, 30)}
                   </text>
-                  <text x="30" y={y + 86} fill={INK.muted} fontSize="10">
+                  <text x={EGRESS.x + 14} y={y + 86} fill={INK.muted} fontSize="10">
                     {down
                       ? t("next.networking.flow.carryingNothing")
                       : t("next.networking.flow.egressLoad", {
@@ -326,13 +608,12 @@ export function NetworkFlow({
             );
           })}
 
-          {layout.rows.map(({ leg, y, height, details }) => {
+          {layout.rows.map(({ leg, y }) => {
             const key = legKey(leg);
-            const isSelected = selected === key;
             const open = Math.round(counts[key] ?? leg.open);
             return (
               <g key={key}>
-                <rect x="310" y={y} width="420" height={height} fill={INK.card} stroke={isSelected ? INK.accent : INK.line} />
+                <rect x={LEGS.x} y={y} width={LEGS.width} height={LEG_HEIGHT} fill={INK.card} stroke={selected === key ? INK.accent : INK.line} />
                 <g
                   role="button"
                   tabIndex={0}
@@ -346,111 +627,57 @@ export function NetworkFlow({
                     }
                   }}
                 >
-                  <rect x="320" y={y + 6} width="400" height="35" fill="transparent" />
-                  <text x="324" y={y + 21} fill={INK.fg} fontSize="12">
+                  <rect x={LEGS.x} y={y} width={LEGS.width} height={LEG_HEIGHT} fill="transparent" />
+                  <text x={LEGS.x + 14} y={y + 21} fill={INK.fg} fontSize="12">
                     {t("next.networking.flow.legTitle", {
-                      name: consumerName(leg).slice(0, 27),
+                      name: fit(consumerName(leg), 130, 12),
                       position: leg.position + 1,
                       weight: leg.weight,
                     })}
                   </text>
                   <StateText
-                    x={324}
+                    x={LEGS.x + 14}
                     y={y + 38}
                     state={leg.state}
                     label={`${stateLabel(t, leg.state)} · ${t("next.networking.flow.connections", { open, target: leg.target })} · ${formatRate(leg.bytesPerSecond)}`}
                   />
+                  {leg.open ? (
+                    <text x={LEGS.x + 14} y={y + 54} fill={INK.muted} fontSize="9.5">
+                      {leg.sourceAddress ?? t("next.networking.flow.noSource")}
+                    </text>
+                  ) : (
+                    <text x={LEGS.x + 14} y={y + 54} fill={holds(leg) ? INK.warn : INK.muted} fontSize="9.5">
+                      {holds(leg) && leg.state === "DOWN"
+                        ? t("next.networking.flow.parkedHold")
+                        : leg.state === "DOWN"
+                          ? t("next.networking.flow.shareMoved")
+                          : t("next.networking.flow.planned", { count: leg.target })}
+                    </text>
+                  )}
                 </g>
-                {details.map(({ rung, rungIndex, members, y: rowY }) => {
-                  const isActive = leg.open > 0 && (rung ? leg.selectedRung === rungIndex : leg.selectedRung == null);
-                  const pool = flow.pools.find((candidate) => candidate.poolId === rung?.poolId && candidate.egressId === leg.egressId);
-                  const rowKey = `${key}:${rungIndex}`;
-                  const rungState = leg.rungStates?.[rungIndex];
-                  const status = isActive
-                    ? "ACTIVE"
-                    : leg.state === "PROBING"
-                      ? "PROBING"
-                      : rungState === "COOLDOWN"
-                        ? "COOLDOWN"
-                        : leg.state === "DOWN" || rungState === "FAILING"
-                          ? "FAILING"
-                          : "STANDBY";
-                  const isPool = rung?.kind === "POOL";
-                  const unfolded = expanded.includes(rowKey);
-                  return (
-                    <g key={rungIndex}>
-                      <rect x="320" y={y + rowY - 1} width="400" height="31" fill={isActive ? INK.rowActive : INK.row} />
-                      <g
-                        {...(isPool
-                          ? {
-                              role: "button",
-                              tabIndex: 0,
-                              "aria-expanded": unfolded,
-                              "aria-label": t("next.networking.flow.poolMembers", { name: poolName(rung.poolId) }),
-                              style: { cursor: "pointer" },
-                              onClick: () => toggle(rowKey),
-                              onKeyDown: (event: React.KeyboardEvent) => {
-                                if (event.key === "Enter" || event.key === " ") {
-                                  event.preventDefault();
-                                  toggle(rowKey);
-                                }
-                              },
-                            }
-                          : {})}
-                      >
-                        <rect x="320" y={y + rowY - 1} width="400" height="31" fill="transparent" />
-                        <text x="329" y={y + rowY + 12} fill={INK.secondary} fontSize="10">
-                          {rungName(rung).slice(0, 52)}
-                          {isPool ? (unfolded ? " ▾" : " ▸") : ""}
-                        </text>
-                        <StateText
-                          x={329}
-                          y={y + rowY + 25}
-                          size={9.5}
-                          state={status}
-                          label={`${stateLabel(t, status)}${pool?.pinnedMember != null ? ` · ${t("next.networking.flow.pinnedTo", { name: name(pool.pinnedMember) })}` : ""}`}
-                        />
-                      </g>
-                      {members.map((id, index) => {
-                        const member = pool?.members.find((candidate) => candidate.id === id);
-                        const memberState = member?.blocked
-                          ? "BLOCKED"
-                          : pool?.pinnedMember === id
-                            ? "PINNED"
-                            : member?.state === "SUSPECT"
-                              ? "SUSPECT"
-                              : member?.state === "CHALLENGER"
-                                ? "CHALLENGER"
-                                : member?.state === "PROBING"
-                                  ? "PROBING"
-                                  : member?.failures
-                                    ? "FAILING"
-                                    : member?.warmed
-                                      ? "READY"
-                                      : "UNMEASURED";
-                        const memberY = y + rowY + 44 + index * 32;
-                        return (
-                          <g key={id}>
-                            <rect x="337" y={memberY - 7} width="7" height="7" fill={stateColor(memberState)} />
-                            <text x="350" y={memberY} fill={INK.secondary} fontSize="10">
-                              {`${name(id).slice(0, 26)} · ${stateLabel(t, memberState)}`}
-                            </text>
-                            <text x="350" y={memberY + 13} fill={INK.muted} fontSize="9.5">
-                              {t("next.networking.flow.memberTiming", {
-                                session: member?.handshakeMs?.toFixed(0) ?? "—",
-                                open: member?.connectMs?.toFixed(0) ?? "—",
-                                rate:
-                                  member?.bytesPerSecond == null
-                                    ? t("next.networking.flow.noEvidence")
-                                    : formatRate(member.bytesPerSecond),
-                              })}
-                            </text>
-                          </g>
-                        );
-                      })}
-                    </g>
-                  );
-                })}
+              </g>
+            );
+          })}
+
+          {layout.rows.map(({ leg, y, blocks, bypass }) => {
+            const status = rungStatus(leg, blocks.length, true);
+            return (
+              <g key={`proxies:${legKey(leg)}`}>
+                {blocks.map((block) => rungBlock(leg, y, block))}
+                {bypass == null ? null : (
+                  <g>
+                    {blocks.length && !goesDirect(leg) ? (
+                      <line x1={PROXY.x} y1={y + bypass} x2={PROXY.end} y2={y + bypass} stroke={INK.track} strokeDasharray="2 5" />
+                    ) : null}
+                    <StateText
+                      x={PROXY.x + 14}
+                      y={y + bypass - 18}
+                      size={9.5}
+                      state={status}
+                      label={`${t("next.networking.flow.direct")} · ${stateLabel(t, status)}`}
+                    />
+                  </g>
+                )}
               </g>
             );
           })}
@@ -467,14 +694,15 @@ export function NetworkFlow({
             const cellX = scale(Math.max(1, cells), 188);
             const href = `/settings/networking/routes?consumer=${encodeURIComponent(consumer.key)}`;
             const rss = consumer.key.startsWith("rss:");
+            const x = PROVIDERS.x + 14;
             return (
               <g key={consumer.key} opacity={down ? 0.65 : 1}>
                 <a href={href} onClick={follow(href)}>
-                  <rect x="810" y={y} width="214" height="124" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
-                  <text x="824" y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
+                  <rect x={PROVIDERS.x} y={y} width={PROVIDERS.width} height="124" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
+                  <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
                     {consumer.name.slice(0, 24)}
                   </text>
-                  <text x="824" y={y + 41} fill={INK.muted} fontSize="9.5">
+                  <text x={x} y={y + 41} fill={INK.muted} fontSize="9.5">
                     {rss
                       ? t("next.networking.flow.rssKind")
                       : t("next.networking.flow.serverKind", {
@@ -484,10 +712,10 @@ export function NetworkFlow({
                               : t("next.networking.failover.redistribute"),
                         })}
                   </text>
-                  <text x="824" y={y + 67} fill={INK.fg} fontSize="20">
+                  <text x={x} y={y + 67} fill={INK.fg} fontSize="20">
                     {`${Math.round(open)} / ${cap}`}
                   </text>
-                  <text x="824" y={y + 85} fill={INK.muted} fontSize="10">
+                  <text x={x} y={y + 85} fill={INK.muted} fontSize="10">
                     {formatRate(legs.reduce((sum, leg) => sum + (leg.bytesPerSecond ?? 0), 0))}
                     {parked ? ` · ${t("next.networking.flow.parked", { count: parked })}` : ""}
                   </text>
@@ -497,7 +725,7 @@ export function NetworkFlow({
                     return (
                       <rect
                         key={cell}
-                        x={824 + cellX(cell)}
+                        x={x + cellX(cell)}
                         y={y + 98}
                         width={Math.max(1, cellX(1) - 2)}
                         height="10"
@@ -513,7 +741,7 @@ export function NetworkFlow({
           })}
 
           {layout.rows.length ? null : (
-            <text x="310" y="85" fill={INK.muted} fontSize="12">
+            <text x={LEGS.x} y="85" fill={INK.muted} fontSize="12">
               {grouped ? t("next.networking.flow.expandGroup") : t("next.networking.flow.noLegs")}
             </text>
           )}
