@@ -47,8 +47,8 @@ const TITLE_FONT = '"Sora Variable", ui-sans-serif, system-ui, sans-serif';
 const EGRESS = { x: 16, width: 214, end: 230 } as const;
 const LEGS = { x: 286, width: 300, end: 586 } as const;
 const PROXY = { x: 642, width: 440, end: 1082 } as const;
-const PROVIDERS = { x: 1138, width: 214, end: 1352 } as const;
-const WIDTH = PROVIDERS.end + 16;
+const ENDPOINTS = { x: 1138, width: 214, end: 1352 } as const;
+const WIDTH = ENDPOINTS.end + 16;
 const LEG_HEIGHT = 64;
 const BOX_HEIGHT = 44;
 const PROXIES_PAGE = "/settings/networking/proxies";
@@ -72,7 +72,7 @@ type Block = {
  */
 type Focus =
   | { kind: "egress"; id: number }
-  | { kind: "provider"; key: string }
+  | { kind: "endpoint"; key: string }
   | { kind: "leg"; key: string }
   | { kind: "way"; key: string; index: number };
 /** How far everything off the pointed-at routes fades. */
@@ -246,19 +246,19 @@ function HopBox({
 
 /**
  * Where every connection leaves, which route leg carries it, what it tunnels
- * through, and which provider it serves: egress cards on the left, then the
- * route legs, then each leg's proxies, then the providers, joined by ribbons
+ * through, and which endpoint it serves: egress cards on the left, then the
+ * route legs, then each leg's proxies, then the endpoints, joined by ribbons
  * as thick as the connections they carry. A path with nothing open is a
  * dashed line. Only what a route uses is drawn: an egress with no leg on it
  * has no card.
  *
  * The proxy lane draws a leg's ladder top to bottom. A proxy is one box, a
  * chain is its hops in order with a `>` between them, and a pool lists its
- * members. Every rung has a line in from its leg and out to the provider,
+ * members. Every rung has a line in from its leg and out to the endpoint,
  * whether or not it is the one carrying the leg. Going direct has no box:
  * the line crosses the lane untouched.
  *
- * Pointing at a box lights the routes through it, from egress to provider,
+ * Pointing at a box lights the routes through it, from egress to endpoint,
  * and fades the rest. Inspecting a leg holds its route lit the same way.
  */
 export function NetworkFlow({
@@ -354,7 +354,7 @@ export function NetworkFlow({
     !focus ||
     (focus.kind === "egress"
       ? leg.egressId === focus.id
-      : focus.kind === "provider"
+      : focus.kind === "endpoint"
         ? leg.consumer === focus.key
         : legKey(leg) === focus.key);
   /** A leg's ways are its rungs in order, then the one with no tunnel. */
@@ -362,8 +362,8 @@ export function NetworkFlow({
   const lit = layout.rows.filter(({ leg }) => onRoute(leg));
   const egressLit = (id: number) =>
     !focus || (focus.kind === "egress" ? focus.id === id : lit.some(({ leg }) => leg.egressId === id));
-  const providerLit = (key: string) =>
-    !focus || (focus.kind === "provider" ? focus.key === key : lit.some(({ leg }) => leg.consumer === key));
+  const endpointLit = (key: string) =>
+    !focus || (focus.kind === "endpoint" ? focus.key === key : lit.some(({ leg }) => leg.consumer === key));
   const point = (target: Focus) => ({
     onPointerEnter: () => setHover(target),
     onPointerLeave: () => setHover(null),
@@ -569,7 +569,7 @@ export function NetworkFlow({
             [EGRESS.x, t("next.networking.flow.egressColumn")],
             [LEGS.x, t("next.networking.flow.legsColumn")],
             [PROXY.x, t("next.networking.flow.proxyColumn")],
-            [PROVIDERS.x, t("next.networking.flow.consumersColumn")],
+            [ENDPOINTS.x, t("next.networking.flow.consumersColumn")],
           ].map(([x, label]) => (
             <text key={String(x)} x={Number(x) + 4} y="30" fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
               {String(label).toUpperCase()}
@@ -621,7 +621,7 @@ export function NetworkFlow({
                 ];
                 const leave: Point[] = [
                   [PROXY.end, way.at],
-                  [PROVIDERS.x, consumerY],
+                  [ENDPOINTS.x, consumerY],
                 ];
                 return way.boxed
                   ? [
@@ -775,15 +775,15 @@ export function NetworkFlow({
             const cellX = scale(Math.max(1, cells), 188);
             const href = `/settings/networking/routes?consumer=${encodeURIComponent(consumer.key)}`;
             const rss = consumer.key.startsWith("rss:");
-            const x = PROVIDERS.x + 14;
+            const x = ENDPOINTS.x + 14;
             return (
               <g
                 key={consumer.key}
-                opacity={(down ? 0.65 : 1) * (providerLit(consumer.key) ? 1 : FADE)}
-                {...point({ kind: "provider", key: consumer.key })}
+                opacity={(down ? 0.65 : 1) * (endpointLit(consumer.key) ? 1 : FADE)}
+                {...point({ kind: "endpoint", key: consumer.key })}
               >
                 <a href={href} onClick={follow(href)}>
-                  <rect x={PROVIDERS.x} y={y} width={PROVIDERS.width} height="124" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
+                  <rect x={ENDPOINTS.x} y={y} width={ENDPOINTS.width} height="124" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
                   <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
                     {consumer.name.slice(0, 24)}
                   </text>
