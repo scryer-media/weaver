@@ -237,11 +237,14 @@ function HopBox({
  * through, and which provider it serves: egress cards on the left, then the
  * route legs, then each leg's proxies, then the providers, joined by ribbons
  * as thick as the connections they carry. A path with nothing open is a
- * dashed line.
+ * dashed line. Only what a route uses is drawn: an egress with no leg on it
+ * has no card.
  *
  * The proxy lane draws a leg's ladder top to bottom. A proxy is one box, a
  * chain is its hops in order with a `>` between them, and a pool lists its
- * members. Going direct has no box: the line crosses the lane untouched.
+ * members. Every rung has a line in from its leg and out to the provider,
+ * whether or not it is the one carrying the leg. Going direct has no box:
+ * the line crosses the lane untouched.
  */
 export function NetworkFlow({
   flow,
@@ -263,7 +266,12 @@ export function NetworkFlow({
   const [filter, setFilter] = useState("");
   const [group, setGroup] = useState<number | null>(null);
   const counts = useMeasurements(flow.legs);
-  const grouped = egresses.length > 6 || flow.legs.length > 40;
+  // An egress no route leaves through is not part of the flow, so it has no card.
+  const used = useMemo(
+    () => egresses.filter((egress) => flow.legs.some((leg) => leg.egressId === egress.id)),
+    [egresses, flow.legs],
+  );
+  const grouped = used.length > 6 || flow.legs.length > 40;
 
   const layout = useMemo(() => {
     const legs = flow.legs
@@ -309,9 +317,9 @@ export function NetworkFlow({
     });
     return {
       rows,
-      height: Math.max(offset + 36, egresses.length * 128 + 90, consumers.length * 144 + 90, 260),
+      height: Math.max(offset + 36, used.length * 128 + 90, consumers.length * 144 + 90, 260),
     };
-  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, egresses.length, consumers.length]);
+  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, used.length, consumers.length]);
 
   const width = scale(Math.max(1, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
@@ -321,10 +329,6 @@ export function NetworkFlow({
   const active = flow.legs.find((leg) => legKey(leg) === selected);
   const consumerName = (leg: LegFlow) => consumers.find((consumer) => consumer.key === leg.consumer)?.name ?? leg.consumer;
   const holds = (leg: LegFlow) => consumers.find((consumer) => consumer.key === leg.consumer)?.route?.failover === "HOLD";
-  /** Whether the leg is on, or planned onto, the line with no tunnel. */
-  const goesDirect = (leg: LegFlow) =>
-    leg.path.kind === "DIRECT" || (leg.path.directFallback && leg.open > 0 && leg.selectedRung == null);
-
   function download() {
     if (!svg.current) {
       return;
@@ -489,7 +493,7 @@ export function NetworkFlow({
           aria-label={t("next.networking.flow.groups")}
           className="flex flex-wrap gap-2 border-b border-wv-hairline px-4 py-3 sm:px-6"
         >
-          {egresses.map((egress) => (
+          {used.map((egress) => (
             <SecondaryButton
               key={egress.id}
               size="compact"
@@ -524,7 +528,7 @@ export function NetworkFlow({
           ))}
 
           {layout.rows.map(({ leg, y, blocks, bypass }) => {
-            const egressY = 112 + Math.max(0, egresses.findIndex((egress) => egress.id === leg.egressId)) * 128;
+            const egressY = 112 + Math.max(0, used.findIndex((egress) => egress.id === leg.egressId)) * 128;
             const consumerY = 120 + Math.max(0, consumers.findIndex((consumer) => consumer.key === leg.consumer)) * 144;
             const legY = y + LEG_HEIGHT / 2;
             const count = counts[legKey(leg)] ?? leg.open;
@@ -535,49 +539,59 @@ export function NetworkFlow({
               leg.sourceAddress ?? t("next.networking.flow.noSource"),
               ...(leg.reason ? [leg.reason] : []),
             ].join(" · ");
-            // The ribbon stops at the box it tunnels through and resumes past it; with no box it runs on.
-            const via = goesDirect(leg) ? undefined : (blocks[leg.selectedRung ?? 0] ?? blocks[0]);
-            const cross = y + (via ? via.top + BOX_HEIGHT / 2 : (bypass ?? LEG_HEIGHT / 2));
-            const paths: Point[][] = [
-              [
-                [EGRESS.end, egressY],
-                [LEGS.x, legY],
-              ],
-              ...(via
-                ? [
-                    [
-                      [LEGS.end, legY],
-                      [PROXY.x, cross],
-                    ] as Point[],
-                    [
-                      [PROXY.end, cross],
-                      [PROVIDERS.x, consumerY],
-                    ] as Point[],
-                  ]
-                : [
-                    [
-                      [LEGS.end, legY],
-                      [PROXY.x, cross],
-                      [PROXY.end, cross],
-                      [PROVIDERS.x, consumerY],
-                    ] as Point[],
-                  ]),
+            // Every way the leg can take is drawn: a line stops at a rung's box and resumes past it, and
+            // the way with no tunnel runs straight across. The one carrying the leg is the ribbon.
+            const ways = [
+              ...blocks.map((block) => ({
+                at: y + block.top + BOX_HEIGHT / 2,
+                boxed: true,
+                status: rungStatus(leg, block.rungIndex, false),
+              })),
+              ...(bypass == null ? [] : [{ at: y + bypass, boxed: false, status: rungStatus(leg, blocks.length, true) }]),
+            ];
+            const taken = ways.find((way) => way.status === "ACTIVE") ?? ways[leg.selectedRung ?? 0] ?? ways[0];
+            const lines: { points: Point[]; carries: boolean; color: string }[] = [
+              {
+                points: [
+                  [EGRESS.end, egressY],
+                  [LEGS.x, legY],
+                ],
+                carries: true,
+                color,
+              },
+              ...ways.flatMap((way) => {
+                const line = { carries: way === taken, color: way === taken ? color : stateColor(way.status) };
+                const enter: Point[] = [
+                  [LEGS.end, legY],
+                  [PROXY.x, way.at],
+                ];
+                const leave: Point[] = [
+                  [PROXY.end, way.at],
+                  [PROVIDERS.x, consumerY],
+                ];
+                return way.boxed
+                  ? [
+                      { ...line, points: enter },
+                      { ...line, points: leave },
+                    ]
+                  : [{ ...line, points: [...enter, ...leave] }];
+              }),
             ];
             return (
               <g key={`ribbon:${legKey(leg)}`}>
                 <title>{tip}</title>
-                {paths.map((points, index) =>
-                  count > 0 ? (
-                    <path key={index} d={band(points, Math.max(2, width(count)))} fill={color} opacity="0.28" />
+                {lines.map((line, index) =>
+                  line.carries && count > 0 ? (
+                    <path key={index} d={band(line.points, Math.max(2, width(count)))} fill={line.color} opacity="0.28" />
                   ) : (
-                    <path key={index} d={thread(points)} fill="none" stroke={color} strokeWidth="1.4" strokeDasharray="4 5" />
+                    <path key={index} d={thread(line.points)} fill="none" stroke={line.color} strokeWidth="1.4" strokeDasharray="4 5" />
                   ),
                 )}
               </g>
             );
           })}
 
-          {egresses.map((egress, index) => {
+          {used.map((egress, index) => {
             const legs = flow.legs.filter((leg) => leg.egressId === egress.id);
             const y = 58 + index * 128;
             const down = egress.health === "DOWN";
@@ -665,18 +679,13 @@ export function NetworkFlow({
               <g key={`proxies:${legKey(leg)}`}>
                 {blocks.map((block) => rungBlock(leg, y, block))}
                 {bypass == null ? null : (
-                  <g>
-                    {blocks.length && !goesDirect(leg) ? (
-                      <line x1={PROXY.x} y1={y + bypass} x2={PROXY.end} y2={y + bypass} stroke={INK.track} strokeDasharray="2 5" />
-                    ) : null}
-                    <StateText
-                      x={PROXY.x + 14}
-                      y={y + bypass - 18}
-                      size={9.5}
-                      state={status}
-                      label={`${t("next.networking.flow.direct")} · ${stateLabel(t, status)}`}
-                    />
-                  </g>
+                  <StateText
+                    x={PROXY.x + 14}
+                    y={y + bypass - 18}
+                    size={9.5}
+                    state={status}
+                    label={`${t("next.networking.flow.direct")} · ${stateLabel(t, status)}`}
+                  />
                 )}
               </g>
             );

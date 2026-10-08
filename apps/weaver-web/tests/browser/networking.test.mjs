@@ -54,6 +54,8 @@ test("flow displays route evidence, exports a frozen SVG, and edits weights with
  assert.deepEqual(laneX,[...laneX].sort((a,b)=>a-b));
  assert.equal(await diagram.getByText(/consumer/i).count(),0);
  await page.getByRole("button",{name:"Provider",exact:true}).waitFor();
+ assert.equal(await diagram.locator("a[href='/settings/networking/egress']").count(),3);
+ assert.equal(await diagram.getByText("Spare uplink",{exact:true}).count(),0);
  const members=diagram.getByRole("group",{name:"Europe pool members",exact:true});
  await members.getByText("Amsterdam · Pinned",{exact:true}).waitFor();
  assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Pinned","24 connections","Session 30 ms · open 20 ms · 0.95 MiB/s","Frankfurt · Ready","Session 40 ms · open 25 ms · 0.76 MiB/s","Lisbon · Disabled"]);
@@ -63,8 +65,8 @@ test("flow displays route evidence, exports a frozen SVG, and edits weights with
  const proxy=diagram.locator("a").filter({hasText:"Frankfurt · WireGuard"});
  assert.deepEqual(await proxy.locator("text").allTextContents(),["Frankfurt · WireGuard","Failing","handshake did not complete"]);
  assert.equal(await diagram.locator("a[href='/settings/networking/proxies']").count(),3);
- await diagram.locator("path[stroke-dasharray]").nth(1).waitFor({state:"attached"});
- assert.equal(await diagram.locator("path[stroke-dasharray]").count(),2);
+ await diagram.locator("path[stroke-dasharray]").nth(5).waitFor({state:"attached"});
+ assert.equal(await diagram.locator("path[stroke-dasharray]").count(),6);
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-live.png"),fullPage:true});
  const [download]=await Promise.all([page.waitForEvent("download"),page.getByRole("button",{name:"Download SVG"}).click()]);
  const stream=await download.createReadStream();let exported="";for await(const chunk of stream)exported+=chunk;
@@ -73,8 +75,8 @@ test("flow displays route evidence, exports a frozen SVG, and edits weights with
  await page.getByLabel("Route weights").filter({hasText:"61,29,10"}).waitFor();
  await page.getByRole("button",{name:"Toggle all down"}).click();
  await page.getByText("0 / 50",{exact:true}).first().waitFor();
- await diagram.locator("path[stroke-dasharray]").nth(6).waitFor({state:"attached"});
- assert.equal(await diagram.locator("path[stroke-dasharray]").count(),7);
+ await diagram.locator("path[stroke-dasharray]").nth(10).waitFor({state:"attached"});
+ assert.equal(await diagram.locator("path[stroke-dasharray]").count(),11);
  assert.equal(errors.length,0,errors.join("\n"));
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT,fullPage:true});
  await page.close();
