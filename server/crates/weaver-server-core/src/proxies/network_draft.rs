@@ -156,13 +156,8 @@ impl NetworkRuntime {
         timeout: Duration,
     ) -> Result<Arc<DraftNetworkRoute>, String> {
         self.validate_policy(consumer, &policy)?;
-        // The draft is planned against the saved routes, not with itself
-        // among them, so its WireGuard sessions are sized, keyed and shared
-        // exactly as the live ones. A draft that stacks WireGuard on a
-        // session nothing saved stacks on yet therefore rides a carrier still
-        // at its own MTU, and the tunnel on top runs below 1280 for the test.
-        // That is a limit of testing a draft, not a defect of the route:
-        // once saved, the carrier is raised to fit.
+        // Drafts share unchanged live carriers. Carried tunnels are sized
+        // by the provider in the same way before and after saving the route.
         let isolated = self.isolated_probe_runtime();
         let config = isolated
             .configuration

@@ -636,6 +636,200 @@ async fn ending_a_draft_that_stacked_on_a_live_session_leaves_that_session_runni
     runtime.shutdown().await;
 }
 
+/// Bulk replies must fit a 1280-byte carrier, including when four download
+/// streams are active and the carried endpoint is resolved inside it.
+#[tokio::test]
+async fn a_wireguard_chain_downloads_four_concurrent_bulk_streams() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use weaver_tunnel::test_support::{
+        TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, WireGuardTestPeer, WireGuardTestPeerOptions,
+        test_key, test_preshared_key,
+    };
+    const STREAMS: usize = 4;
+    const BYTES: usize = 512 * 1024;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forward = listener.local_addr().unwrap();
+    let ready = Arc::new(tokio::sync::Barrier::new(STREAMS));
+    let upstream = tokio::spawn(async move {
+        let mut replies = tokio::task::JoinSet::new();
+        for _ in 0..STREAMS {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let ready = ready.clone();
+            replies.spawn(async move {
+                let mut request = [0u8; 1];
+                socket.read_exact(&mut request).await.unwrap();
+                assert!(usize::from(request[0]) < STREAMS);
+                let body: Vec<_> = (0..BYTES)
+                    .map(|offset| (offset % 251) as u8 ^ request[0])
+                    .collect();
+                ready.wait().await;
+                socket.write_all(&body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+        while let Some(reply) = replies.join_next().await {
+            reply.unwrap();
+        }
+    });
+    let far = WireGuardTestPeer::start_for_downloads(
+        WireGuardTestPeerOptions {
+            private_key: test_key(31),
+            preshared_key: Some(test_preshared_key()),
+            ..Default::default()
+        },
+        Some(forward),
+        Duration::ZERO,
+        false,
+    )
+    .await;
+    let near = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        names: HashMap::from([("far.vpn.test".into(), vec![TEST_PEER_ADDRESS.into()])]),
+        udp_forward: Some((FAR_PORT, far.endpoint())),
+        ..Default::default()
+    })
+    .await;
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let consumer = Consumer::Server(1);
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.consumers.insert(consumer.key());
+    config.profiles.insert(
+        1,
+        wireguard_profile(1, &near, "127.0.0.1".into(), near.endpoint().port()),
+    );
+    config.profiles.insert(
+        2,
+        wireguard_profile(2, &far, "far.vpn.test".into(), FAR_PORT),
+    );
+    assert_eq!(config.profiles[&1].mtu, 1280);
+    assert_eq!(config.profiles[&2].mtu, 1280);
+    config.policies.insert(
+        consumer.key(),
+        wireguard_ladder(Rung::Chain { ids: vec![1, 2] }),
+    );
+    runtime.apply_configuration(config).unwrap();
+    let route = runtime
+        .route(consumer, STREAMS as u16, Duration::from_secs(300))
+        .unwrap();
+    assert!(route.legs.read().unwrap()[0].warning.is_none());
+    let stage = route.legs.read().unwrap()[0].stage.clone();
+    let mut downloads = tokio::task::JoinSet::new();
+    for index in 0..STREAMS {
+        let stage = stage.clone();
+        let port = far.http_port();
+        downloads.spawn(async move {
+            let mut dialed = stage
+                .dial(&Target {
+                    host: TEST_PEER_ADDRESS.to_string(),
+                    port,
+                    purpose: weaver_tunnel::pipe::Purpose::Nntp { server: 1, leg: 0 },
+                    addresses: Vec::new(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(dialed.path.proxies, vec![1, 2]);
+            assert_eq!(dialed.path.egress, SYSTEM_EGRESS_ID);
+            dialed.stream.write_all(&[index as u8]).await.unwrap();
+            let mut answer = vec![0; BYTES];
+            dialed.stream.read_exact(&mut answer).await.unwrap();
+            let expected: Vec<_> = (0..BYTES)
+                .map(|offset| (offset % 251) as u8 ^ index as u8)
+                .collect();
+            assert_eq!(answer, expected, "stream {index}");
+        });
+    }
+    while let Some(download) = downloads.join_next().await {
+        download.unwrap();
+    }
+    upstream.await.unwrap();
+    assert_eq!(near.dns_queries(), vec!["far.vpn.test"]);
+    assert!(near.requests().is_empty());
+    let forwarded = near.udp_forwarded();
+    assert!(!forwarded.is_empty());
+    for (source, seen) in &forwarded {
+        assert_eq!(source.ip(), std::net::IpAddr::V4(TEST_CLIENT_ADDRESS));
+        assert_eq!(seen.wireguard_datagrams, seen.datagrams, "{source}");
+    }
+    assert_eq!(runtime.sessions.lock().unwrap().len(), 2);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_three_hop_wireguard_chain_sizes_each_tunnel_from_its_carrier() {
+    use weaver_tunnel::test_support::{
+        TEST_PEER_ADDRESS, WireGuardTestPeer, WireGuardTestPeerOptions, test_key,
+    };
+    let body = "third tunnel payload".repeat(4096);
+    let far = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        private_key: test_key(31),
+        body: body.clone(),
+        ..Default::default()
+    })
+    .await;
+    let middle = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        private_key: test_key(33),
+        names: HashMap::from([("far.vpn.test".into(), vec![TEST_PEER_ADDRESS.into()])]),
+        udp_forward: Some((FAR_PORT, far.endpoint())),
+        ..Default::default()
+    })
+    .await;
+    let near = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        names: HashMap::from([("middle.vpn.test".into(), vec![TEST_PEER_ADDRESS.into()])]),
+        udp_forward: Some((FAR_PORT, middle.endpoint())),
+        ..Default::default()
+    })
+    .await;
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let consumer = Consumer::Server(1);
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.consumers.insert(consumer.key());
+    config.profiles.insert(
+        1,
+        wireguard_profile(1, &near, "127.0.0.1".into(), near.endpoint().port()),
+    );
+    config.profiles.insert(
+        2,
+        wireguard_profile(2, &middle, "middle.vpn.test".into(), FAR_PORT),
+    );
+    config.profiles.insert(
+        3,
+        wireguard_profile(3, &far, "far.vpn.test".into(), FAR_PORT),
+    );
+    config.policies.insert(
+        consumer.key(),
+        wireguard_ladder(Rung::Chain { ids: vec![1, 2, 3] }),
+    );
+    runtime.apply_configuration(config.clone()).unwrap();
+    let route = runtime
+        .route(consumer, 1, Duration::from_secs(300))
+        .unwrap();
+    assert!(route.legs.read().unwrap()[0].warning.is_none());
+    let stage: Arc<dyn Dialer> = route.legs.read().unwrap()[0].stage.clone();
+    let answer = fetch_through(&stage).await.unwrap();
+    assert_eq!(answer.split_once("\r\n\r\n").unwrap().1, body);
+    assert_eq!(near.dns_queries(), vec!["middle.vpn.test"]);
+    assert_eq!(middle.dns_queries(), vec!["far.vpn.test"]);
+    let bottom =
+        NetworkRuntime::bottom(&config, SYSTEM_EGRESS_ID, Duration::from_secs(300)).unwrap();
+    let ids = [1, 2, 3];
+    let mut carrier: Arc<dyn Dialer> = bottom.clone();
+    for (index, expected) in [1280, 1216, 1152].into_iter().enumerate() {
+        assert_eq!(config.profiles[&ids[index]].mtu, 1280);
+        carrier = runtime
+            .hop(&config, ids[index], carrier, bottom.clone(), &ids[..index])
+            .unwrap();
+        assert_eq!(tunnel_mtu(carrier.clone()).await, Some(expected));
+    }
+    runtime.shutdown().await;
+}
+
 /// The MTU of the WireGuard tunnel `session` runs, as seen by a socket bound
 /// inside it.
 async fn tunnel_mtu(session: Arc<dyn Dialer>) -> Option<u16> {
@@ -648,15 +842,16 @@ async fn tunnel_mtu(session: Arc<dyn Dialer>) -> Option<u16> {
         .link_mtu()
 }
 
-/// Saving a route that stacks WireGuard on a WireGuard session already in
-/// use rebuilds that session at the MTU the tunnel on top needs to get its
-/// full 1280, and removing the route rebuilds it at its own MTU again.
+/// Saving and removing a stacked route preserves its live carrier. The
+/// carried tunnel fits the carrier after resolving its endpoint.
 #[tokio::test]
-async fn stacking_on_a_wireguard_session_resizes_it_for_the_tunnel_on_top() {
+async fn stacking_on_a_wireguard_session_preserves_its_capacity_and_identity() {
     use weaver_tunnel::test_support::TEST_PEER_ADDRESS;
-    for (upper_host, lower_mtu) in [
-        ("far.vpn.test".to_string(), 1360),
-        (TEST_PEER_ADDRESS.to_string(), 1340),
+    for (upper_host, lower_mtu, upper_mtu, effective_upper_mtu) in [
+        ("far.vpn.test".to_string(), 1280, 1280, 1216),
+        (TEST_PEER_ADDRESS.to_string(), 1280, 1280, 1216),
+        ("far.vpn.test".to_string(), 1420, 1280, 1280),
+        (TEST_PEER_ADDRESS.to_string(), 1420, 1420, 1360),
     ] {
         let (near, far) = stacked_peers().await;
         let runtime = NetworkRuntime::new(
@@ -676,6 +871,8 @@ async fn stacking_on_a_wireguard_session_resizes_it_for_the_tunnel_on_top() {
             .profiles
             .insert(2, wireguard_profile(2, &far, upper_host.clone(), FAR_PORT));
         assert_eq!(config.profiles[&1].mtu, 1280);
+        config.profiles.get_mut(&1).unwrap().mtu = lower_mtu;
+        config.profiles.get_mut(&2).unwrap().mtu = upper_mtu;
         config
             .policies
             .insert(direct.key(), wireguard_ladder(Rung::Proxy { id: 1 }));
@@ -699,7 +896,7 @@ async fn stacking_on_a_wireguard_session_resizes_it_for_the_tunnel_on_top() {
                 .unwrap()
         };
         let alone = session(&runtime, &[1], None);
-        assert_eq!(tunnel_mtu(alone.clone()).await, Some(1280));
+        assert_eq!(tunnel_mtu(alone.clone()).await, Some(lower_mtu));
         let first_stage = route.legs.read().unwrap()[0].stage.clone();
 
         config.consumers.insert(stacked.key());
@@ -709,11 +906,11 @@ async fn stacking_on_a_wireguard_session_resizes_it_for_the_tunnel_on_top() {
         );
         runtime.apply_configuration(config.clone()).unwrap();
         runtime.retire_unused_sessions().await;
-        runtime.route(stacked, 1, Duration::from_secs(300)).unwrap();
+        let stacked_route = runtime.route(stacked, 1, Duration::from_secs(300)).unwrap();
+        assert!(stacked_route.legs.read().unwrap()[0].warning.is_none());
         let carrier = session(&runtime, &[1], None);
-        assert!(!Arc::ptr_eq(&alone, &carrier), "{upper_host}");
-        // The direct route moved to the resized session too.
-        assert!(!Arc::ptr_eq(
+        assert!(Arc::ptr_eq(&alone, &carrier), "{upper_host}");
+        assert!(Arc::ptr_eq(
             &first_stage,
             &route.legs.read().unwrap()[0].stage
         ));
@@ -723,15 +920,33 @@ async fn stacking_on_a_wireguard_session_resizes_it_for_the_tunnel_on_top() {
             "{upper_host}"
         );
         let carried = session(&runtime, &[1, 2], Some(carrier.clone()));
-        assert_eq!(tunnel_mtu(carried).await, Some(1280), "{upper_host}");
+        assert_eq!(
+            tunnel_mtu(carried).await,
+            Some(effective_upper_mtu),
+            "{upper_host}"
+        );
 
         config.policies.remove(&stacked.key());
         config.consumers.remove(&stacked.key());
-        runtime.apply_configuration(config).unwrap();
+        runtime.apply_configuration(config.clone()).unwrap();
         runtime.retire_unused_sessions().await;
         let again = session(&runtime, &[1], None);
-        assert!(!Arc::ptr_eq(&carrier, &again), "{upper_host}");
-        assert_eq!(tunnel_mtu(again).await, Some(1280), "{upper_host}");
+        assert!(Arc::ptr_eq(&carrier, &again), "{upper_host}");
+        assert_eq!(
+            tunnel_mtu(again.clone()).await,
+            Some(lower_mtu),
+            "{upper_host}"
+        );
+
+        // Editing the carrier itself still rebuilds the session, including
+        // an explicit MTU change carried by the profile revision.
+        let edited = config.profiles.get_mut(&1).unwrap();
+        edited.mtu += 16;
+        edited.revision += 1;
+        runtime.apply_configuration(config).unwrap();
+        let changed = session(&runtime, &[1], None);
+        assert!(!Arc::ptr_eq(&again, &changed));
+        assert_eq!(tunnel_mtu(changed).await, Some(lower_mtu + 16));
         runtime.shutdown().await;
     }
 }
