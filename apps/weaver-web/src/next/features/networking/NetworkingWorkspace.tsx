@@ -15,7 +15,8 @@ import {
   type NetworkingPage,
 } from "./data";
 import { EgressPage } from "./EgressPage";
-import { NetworkFlow } from "./NetworkFlow";
+import { FlowEditor } from "./FlowEditor";
+import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
 import { PoolsPage } from "./PoolsPage";
 import { RoutesPage } from "./RoutesPage";
 import { formatRate, Hint, MIB, NoticeBand } from "./presentation";
@@ -35,11 +36,21 @@ function ActionStatus({ message, failed }: { message: string | null; failed: boo
  * The settings rail already lists the five pages and the top bar names the
  * one that is open, so this draws only the page itself.
  */
-export function NetworkingWorkspace({ proxies, bandwidth }: { proxies: ReactNode; bandwidth: ReactNode }) {
+export function NetworkingWorkspace({
+  proxies,
+  bandwidth,
+  proxyEditor,
+}: {
+  proxies: ReactNode;
+  bandwidth: ReactNode;
+  /** One stored proxy's editor, for a proxy picked in the flow. */
+  proxyEditor: (id: number, onClose: () => void, onChanged: () => void) => ReactNode;
+}) {
   const t = useTranslate();
   const location = useLocation();
   const page = location.pathname.split("/networking/")[1] ?? "overview";
   const workspace = useNetworkingWorkspace(page);
+  const [editing, setEditing] = useState<FlowTarget | null>(null);
   const { data, error, fetching, flow, consumers, egresses, measured, action, busy, message, failed } = workspace;
 
   if (!NETWORKING_PAGES.includes(page as NetworkingPage)) {
@@ -121,10 +132,22 @@ export function NetworkingWorkspace({ proxies, bandwidth }: { proxies: ReactNode
                         profiles={measured.proxies ?? data.proxyProfiles}
                         pools={measured.proxyPools ?? data.proxyPools}
                         consumers={consumers}
+                        onEdit={setEditing}
                       />
                     ),
                   },
                 ]}
+              />
+              <FlowEditor
+                target={editing}
+                onClose={() => setEditing(null)}
+                data={data}
+                egresses={egresses}
+                consumers={consumers}
+                flow={flow}
+                action={action}
+                busy={busy}
+                proxyEditor={(id, onClose) => proxyEditor(id, onClose, workspace.retry)}
               />
             </>
           ) : null}

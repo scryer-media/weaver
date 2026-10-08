@@ -13,12 +13,13 @@ import {
   UPDATE_RSS_RULE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { directRouting, policyInput, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import type { RoutingPolicy, RoutingStatus } from "@/lib/proxies";
 import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { PrimaryButton, SecondaryButton } from "../../../components/controls";
-import { RoutingEditor, RoutingState } from "../../../components/RoutingEditor";
+import { RoutingState } from "../../../components/RoutingState";
+import { RouteView } from "../../../features/networking/RouteView";
 import { Cell } from "../../../components/rows";
 import { formatDate, formatSize } from "../../../data/format";
 import { WV } from "../../../data/palette";
@@ -112,7 +113,6 @@ interface RssData {
 
 interface FeedForm {
   scripts: string;
-  routing: RoutingPolicy;
   name: string;
   url: string;
   enabled: boolean;
@@ -141,7 +141,6 @@ const NO_CATEGORY = "";
 
 const NEW_FEED: FeedForm = {
   scripts: "",
-  routing: directRouting,
   name: "",
   url: "",
   enabled: true,
@@ -328,7 +327,6 @@ export function RssPanel() {
     setFeedForm(
       feed
         ? {
-            routing: feed.routing ?? directRouting,
             name: feed.name,
             url: feed.url,
             enabled: feed.enabled,
@@ -382,8 +380,8 @@ export function RssPanel() {
       setError(t("next.rss.urlRequired"));
       return;
     }
+    // The route is left out: it is set under Networking, and saving a feed keeps the one it has.
     const input = {
-      route: policyInput(feedForm.routing),
       name: feedForm.name.trim(),
       url: feedForm.url.trim(),
       enabled: feedForm.enabled,
@@ -731,24 +729,8 @@ export function RssPanel() {
       id: "routing",
       title: t("next.providers.networkRoute"),
       tag: <BetaTag />,
-      fields: [
-        {
-          id: "routing",
-          label: t("next.providers.proxyRoute"),
-          help: t("next.rss.proxyRouteHelp"),
-          control: {
-            kind: "custom",
-            control: (
-              <RoutingEditor
-                consumer={editingFeed ? `rss:${editingFeed.id}` : undefined}
-                rss
-                value={feedForm.routing}
-                onChange={(next) => patchFeed({ routing: next })}
-              />
-            ),
-          },
-        },
-      ],
+      fields: [],
+      body: <RouteView consumer={editingFeed ? `rss:${editingFeed.id}` : undefined} />,
     },
   ];
 

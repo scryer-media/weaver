@@ -47,18 +47,76 @@ export type NetworkingPage = (typeof NETWORKING_PAGES)[number];
 /** Run a mutation; resolves to the failure message, or null once it has landed. */
 export type NetworkingAction = (document: DocumentNode, variables: Record<string, unknown>) => Promise<string | null>;
 
-const EMPTY_FLOW: NetworkFlow = { legs: [], pools: [] };
+export const EMPTY_FLOW: NetworkFlow = { legs: [], pools: [] };
 
 export const defaultRoute = (): NetworkRoute => ({ legs: [directLeg()], failover: "REDISTRIBUTE" });
 
 /**
+ * Everything that owns a route. The flow names them once the daemon has
+ * sampled one; before that they are the servers and feeds as configured.
+ */
+export function flowConsumers(measured: NetworkFlow, data: NetworkingData | undefined): Consumer[] {
+  return (
+    measured.consumers ??
+    (data
+      ? [
+          ...data.servers.map((server) => ({
+            key: `server:${server.id}`,
+            id: server.id,
+            name: server.host,
+            kind: "SERVER" as const,
+            cap: server.connections,
+            route: server.routing,
+          })),
+          ...data.rssFeeds.map((feed) => ({
+            key: `rss:${feed.id}`,
+            id: feed.id,
+            name: feed.name,
+            kind: "RSS" as const,
+            cap: 1,
+            route: feed.routing,
+          })),
+        ]
+      : [])
+  );
+}
+
+/**
+ * The flow with a leg for every leg these consumers' routes have. One the
+ * daemon has not sampled stands idle at the share its weight would give it,
+ * so a route that has never carried traffic still shows where it would go.
+ */
+export function plannedFlow(measured: NetworkFlow, consumers: Consumer[]): NetworkFlow {
+  return {
+    ...measured,
+    legs: consumers.flatMap((consumer) => {
+      const route = consumer.route ?? defaultRoute();
+      const targets = allocation(
+        route.legs.map((leg) => leg.weight),
+        consumer.cap,
+      );
+      return route.legs.map(
+        (leg, position) =>
+          measured.legs.find((sample) => sample.consumer === consumer.key && sample.position === position) ?? {
+            ...leg,
+            consumer: consumer.key,
+            position,
+            target: targets[position] ?? 0,
+            open: 0,
+            opening: 0,
+            state: "IDLE",
+            reason: null,
+            pinnedAddress: null,
+          },
+      );
+    }),
+  };
+}
+
+/**
  * Everything the networking pages read, and the one way they write.
  *
- * The live flow is only subscribed to on the pages that draw it. Consumers
- * come from the flow when the daemon has sampled one; before that they are
- * built from the servers and feeds, and their legs are filled in as idle
- * placeholders at the share their weights would give them, so a route that
- * has never carried traffic still shows where it would go.
+ * The live flow is only subscribed to on the pages that draw it.
  */
 export function useNetworkingWorkspace(page: string) {
   const t = useTranslate();
@@ -105,52 +163,8 @@ export function useNetworkingWorkspace(page: string) {
   };
 
   const measured = subscription.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
-  const consumers: Consumer[] =
-    measured.consumers ??
-    (data
-      ? [
-          ...data.servers.map((server) => ({
-            key: `server:${server.id}`,
-            id: server.id,
-            name: server.host,
-            kind: "SERVER" as const,
-            cap: server.connections,
-            route: server.routing,
-          })),
-          ...data.rssFeeds.map((feed) => ({
-            key: `rss:${feed.id}`,
-            id: feed.id,
-            name: feed.name,
-            kind: "RSS" as const,
-            cap: 1,
-            route: feed.routing,
-          })),
-        ]
-      : []);
-  const flow: NetworkFlow = {
-    ...measured,
-    legs: consumers.flatMap((consumer) => {
-      const route = consumer.route ?? defaultRoute();
-      const targets = allocation(
-        route.legs.map((leg) => leg.weight),
-        consumer.cap,
-      );
-      return route.legs.map(
-        (leg, position) =>
-          measured.legs.find((sample) => sample.consumer === consumer.key && sample.position === position) ?? {
-            ...leg,
-            consumer: consumer.key,
-            position,
-            target: targets[position] ?? 0,
-            open: 0,
-            opening: 0,
-            state: "IDLE",
-            reason: null,
-            pinnedAddress: null,
-          },
-      );
-    }),
-  };
+  const consumers = flowConsumers(measured, data);
+  const flow = plannedFlow(measured, consumers);
   const egresses = measured.egresses ?? data?.egressInterfaces ?? [];
 
   return {
