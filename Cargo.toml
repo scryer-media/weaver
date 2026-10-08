@@ -176,3 +176,8 @@ incremental = false
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a
 # rarpar change is needed, publish it and bump the requirement here instead.
+
+[patch."https://github.com/scryer-media/proxy-tunnels.git"]
+proxy-tunnels = { path = "../proxy-tunnels/.worktrees/wg-over-wg" }
+h3 = { path = "../proxy-tunnels/.worktrees/wg-over-wg/vendor/h3" }
+h3-quinn = { path = "../proxy-tunnels/.worktrees/wg-over-wg/vendor/h3-quinn" }
