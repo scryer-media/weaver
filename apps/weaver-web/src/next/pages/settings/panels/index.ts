@@ -14,8 +14,7 @@ import { WatchFolderPanel } from "./WatchFolderPanel";
 /**
  * The settings panels, in rail order.
  *
- * Both interfaces share these routes. The former proxies and bandwidth
- * slugs redirect into Networking so existing bookmarks keep working.
+ * The former proxies and bandwidth slugs redirect into Networking so existing bookmarks keep working.
  */
 
 export interface PanelDefinition {

@@ -6,7 +6,7 @@ import {
   upgradesInApp,
   type ApplicationUpgradeRun,
   type ApplicationUpgradeStatus,
-} from "../src/features/updates/application-upgrade.ts";
+} from "../src/next/features/updates/application-upgrade.ts";
 
 function run(overrides: Partial<ApplicationUpgradeRun> = {}): ApplicationUpgradeRun {
   return {

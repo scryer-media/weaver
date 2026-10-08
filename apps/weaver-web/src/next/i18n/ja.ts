@@ -624,7 +624,6 @@ export const nextJa: LocaleDictionary = {
   "next.general.duplicate.normalizedNameHelp": "大文字小文字、空白、タグを除くと名前が一致するリリース。",
   "next.general.language": "言語",
   "next.general.languageHelp": "Weaver インターフェースの表示言語。このブラウザーにのみ適用されます。",
-  "next.general.newInterface": "新しいインターフェース",
   "next.general.interface": "インターフェース",
   "next.general.updates": "アップデート",
   "next.general.checkForUpdates": "アップデートを確認",

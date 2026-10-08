@@ -20,7 +20,7 @@ import {
   UPDATE_STATUS_SUBSCRIPTION,
   VERSION_QUERY,
 } from "@/graphql/queries";
-import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
+import { releaseNotification, type UpdateStatus } from "@/next/features/updates/update-notification";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { useTranslate } from "@/lib/context/translate-context";
 import {

@@ -110,9 +110,10 @@ const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_WINDOW_WIDTH: i32 = 1280;
 const APP_WINDOW_HEIGHT: i32 = 800;
 
-/// Caption colors mirror the web UI's `--background`/`--foreground` tokens
-/// (apps/weaver-web/src/globals.css) so the title bar reads as part of the
-/// page. COLORREF byte order is 0x00BBGGRR.
+/// Caption colors for the app window's title bar, one pair per system
+/// appearance. They predate the web UI's current palette (apps/weaver-web/src/next/theme.css,
+/// whose ground is #1a1b1e in both appearances). COLORREF byte order is
+/// 0x00BBGGRR.
 const CAPTION_DARK_BACKGROUND: u32 = 0x0014_0905; // #050914
 const CAPTION_DARK_TEXT: u32 = 0x00FF_E5DB; // #dbe5ff
 const CAPTION_LIGHT_BACKGROUND: u32 = 0x00FC_F9F8; // #f8f9fc

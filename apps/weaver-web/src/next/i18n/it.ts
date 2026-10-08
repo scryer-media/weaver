@@ -624,7 +624,6 @@ export const nextIt: LocaleDictionary = {
   "next.general.duplicate.normalizedNameHelp": "Una release il cui nome coincide una volta rimossi maiuscole, spazi e tag.",
   "next.general.language": "Lingua",
   "next.general.languageHelp": "Lingua dell'interfaccia di Weaver. Vale solo per questo browser.",
-  "next.general.newInterface": "Nuova interfaccia",
   "next.general.interface": "Interfaccia",
   "next.general.updates": "Aggiornamenti",
   "next.general.checkForUpdates": "Cerca aggiornamenti",

@@ -1,50 +1,28 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
-import { SecurityUpgradeWizard, SetupWizardPage } from "@/pages/SetupWizardPage";
 import type { SetupEnvironment } from "@/lib/setup-flow";
 import type { SecurityUpgradeState } from "@/lib/security-upgrade";
 import { Provider, useQuery } from "urql";
-import { RouterProvider } from "react-router/dom";
-import { ThemeProvider } from "next-themes";
 import { SECURITY_SETUP_STATE_QUERY } from "@/graphql/queries";
 import { requestGraphqlClientRestart, useGraphqlClient } from "./graphql/client";
-import { router } from "./router";
 import { useLanguage } from "@/lib/hooks/use-language";
 import { TranslateContext, type TranslateContextValue } from "@/lib/context/translate-context";
 import { PwaProvider } from "@/lib/context/pwa-context";
-import { Toaster } from "@/components/ui/sonner";
-import { applyUiVariant, readUiVariant } from "@/lib/ui-variant";
 import { LoadingMark } from "@/lib/loading-mark";
 import { noteAuthStatus, useLoginRequired, type AuthStatus } from "@/lib/login-required";
-import { LoginPage } from "@/pages/LoginPage";
+import { AppRoot } from "./next/AppRoot";
 
-/// The Next interface is a second, self-contained UI tree (`src/next`).
-/// Loading it lazily keeps its chunk out of a classic browser's bundle; the
-/// variant only changes on a full reload (see `setUiVariant`), so reading it
-/// once per mount is enough and no component below ever re-renders on a switch.
-const NextApp = lazy(() => import("./next/NextApp"));
-const NextLoginPage = lazy(() => import("./next/pages/LoginPage"));
-const NextSetupPage = lazy(() => import("./next/pages/SetupPage"));
-const NextSecurityUpgradePage = lazy(() => import("./next/pages/SecurityUpgradePage"));
+/// The pages a browser sees before the app itself are loaded on their own, so
+/// a signed-out or not-yet-set-up browser downloads nothing it cannot use yet.
+const LoginPage = lazy(() => import("./next/pages/LoginPage"));
+const SetupPage = lazy(() => import("./next/pages/SetupPage"));
+const SecurityUpgradePage = lazy(() => import("./next/pages/SecurityUpgradePage"));
 
-const uiVariant = readUiVariant();
-
-/// `index.html` already stamps `data-ui` before first paint, which is what
-/// stops the two backgrounds flashing over each other. Stamping it again here
-/// is what makes the two reads agree: a browser that exposes storage to the
-/// app but not to a document-start script would otherwise mount this tree
-/// with none of its scoped CSS applied.
-applyUiVariant(uiVariant);
-
-/// Gates render this while they decide. It has to match the interface that is
-/// about to paint, or the window flashes the other UI's background first. The
-/// loading mark waits before it appears, so a gate that decides at once shows a
-/// plain background rather than a flicker.
-const GATE_PLACEHOLDER_CLASS =
-  uiVariant === "next" ? "h-dvh bg-wv-app" : "min-h-screen bg-background";
-
+/// Gates render this while they decide, on the app's own background. The
+/// loading mark waits before it appears, so a gate that decides at once shows
+/// a plain background rather than a flicker.
 function GatePlaceholder() {
   return (
-    <div className={`${GATE_PLACEHOLDER_CLASS} flex items-center justify-center`} aria-hidden="true">
+    <div className="flex h-dvh items-center justify-center bg-wv-app" aria-hidden="true">
       <LoadingMark className="h-10" reveal />
     </div>
   );
@@ -106,13 +84,9 @@ function AppProviders() {
   if (loginRequired) {
     return (
       <TranslateContext.Provider value={contextValue}>
-        {uiVariant === "next" ? (
-          <Suspense fallback={<GatePlaceholder />}>
-            <NextLoginPage />
-          </Suspense>
-        ) : (
+        <Suspense fallback={<GatePlaceholder />}>
           <LoginPage />
-        )}
+        </Suspense>
       </TranslateContext.Provider>
     );
   }
@@ -121,15 +95,8 @@ function AppProviders() {
     <TranslateContext.Provider value={contextValue}>
       <Provider value={client}>
         <SecurityUpgradeGate>
-          {uiVariant === "next" ? (
-            <Suspense fallback={<GatePlaceholder />}>
-              <NextApp />
-            </Suspense>
-          ) : (
-            <RouterProvider router={router} useTransitions={false} />
-          )}
+          <AppRoot />
         </SecurityUpgradeGate>
-        <Toaster />
       </Provider>
     </TranslateContext.Provider>
   );
@@ -203,12 +170,10 @@ function SecurityUpgradeGate({ children }: { children: React.ReactNode }) {
       deployment: (data.serverRestart?.deployment ?? "").toLowerCase(),
     };
     const onDone = () => setDecision("app");
-    return uiVariant === "next" ? (
+    return (
       <Suspense fallback={<GatePlaceholder />}>
-        <NextSecurityUpgradePage state={state} onDone={onDone} />
+        <SecurityUpgradePage state={state} onDone={onDone} />
       </Suspense>
-    ) : (
-      <SecurityUpgradeWizard state={state} onDone={onDone} />
     );
   }
   return <>{children}</>;
@@ -263,12 +228,10 @@ function SetupGate({ children }: { children: React.ReactNode }) {
     return <GatePlaceholder />;
   }
   if (setupRequired) {
-    return uiVariant === "next" ? (
+    return (
       <Suspense fallback={<GatePlaceholder />}>
-        <NextSetupPage environment={setupEnvironment} />
+        <SetupPage environment={setupEnvironment} />
       </Suspense>
-    ) : (
-      <SetupWizardPage environment={setupEnvironment} />
     );
   }
   return <>{children}</>;
@@ -276,20 +239,10 @@ function SetupGate({ children }: { children: React.ReactNode }) {
 
 export function App() {
   return (
-    // The Next interface ships a single dark palette and paints its own
-    // background, so the theme is pinned there; the classic tree keeps the
-    // user's light/dark/system choice.
-    <ThemeProvider
-      attribute="class"
-      defaultTheme="dark"
-      enableSystem
-      forcedTheme={uiVariant === "next" ? "dark" : undefined}
-    >
-      <PwaProvider>
-        <SetupGate>
-          <AppProviders />
-        </SetupGate>
-      </PwaProvider>
-    </ThemeProvider>
+    <PwaProvider>
+      <SetupGate>
+        <AppProviders />
+      </SetupGate>
+    </PwaProvider>
   );
 }

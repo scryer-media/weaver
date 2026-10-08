@@ -624,7 +624,6 @@ export const nextKo: LocaleDictionary = {
   "next.general.duplicate.normalizedNameHelp": "대소문자, 공백, 태그를 제거하면 이름이 일치하는 릴리스.",
   "next.general.language": "언어",
   "next.general.languageHelp": "Weaver 인터페이스의 표시 언어입니다. 이 브라우저에만 적용됩니다.",
-  "next.general.newInterface": "새 인터페이스",
   "next.general.interface": "인터페이스",
   "next.general.updates": "업데이트",
   "next.general.checkForUpdates": "업데이트 확인",

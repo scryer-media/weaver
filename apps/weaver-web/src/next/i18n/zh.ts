@@ -624,7 +624,6 @@ export const nextZh: LocaleDictionary = {
   "next.general.duplicate.normalizedNameHelp": "去除大小写、空格和标签后名称一致的发布。",
   "next.general.language": "语言",
   "next.general.languageHelp": "Weaver 界面的显示语言。仅对此浏览器生效。",
-  "next.general.newInterface": "新界面",
   "next.general.interface": "界面",
   "next.general.updates": "更新",
   "next.general.checkForUpdates": "检查更新",

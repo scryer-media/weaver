@@ -624,7 +624,6 @@ export const nextFr: LocaleDictionary = {
   "next.general.duplicate.normalizedNameHelp": "Une publication dont le nom correspond une fois la casse, les espaces et les étiquettes retirés.",
   "next.general.language": "Langue",
   "next.general.languageHelp": "Langue d'affichage de l'interface Weaver. S'applique à ce navigateur uniquement.",
-  "next.general.newInterface": "Nouvelle interface",
   "next.general.interface": "Interface",
   "next.general.updates": "Mises à jour",
   "next.general.checkForUpdates": "Rechercher des mises à jour",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { shouldCloseAfterSubmit } from "../src/features/upload/close-decision.ts";
+import { shouldCloseAfterSubmit } from "../src/next/features/upload/close-decision.ts";
 
 test("closes when every entry submitted (incl. a duplicate accepted-with-warning)", () => {
   // The regression: a queue-duplicate that is accepted lands as "submitted" and

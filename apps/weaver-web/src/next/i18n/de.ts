@@ -624,7 +624,6 @@ export const nextDe: LocaleDictionary = {
   "next.general.duplicate.normalizedNameHelp": "Ein Release, dessen Name übereinstimmt, sobald Groß-/Kleinschreibung, Leerzeichen und Tags entfernt sind.",
   "next.general.language": "Sprache",
   "next.general.languageHelp": "Anzeigesprache der Weaver-Oberfläche. Gilt nur für diesen Browser.",
-  "next.general.newInterface": "Neue Oberfläche",
   "next.general.interface": "Oberfläche",
   "next.general.updates": "Updates",
   "next.general.checkForUpdates": "Nach Updates suchen",

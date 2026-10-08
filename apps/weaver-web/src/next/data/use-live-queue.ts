@@ -6,9 +6,9 @@ import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 
 /**
- * The live queue, as the Next UI needs it.
+ * The live queue, as the interface needs it.
  *
- * The redesign shows one grouped, unpaginated list and composes category, tab
+ * The interface shows one grouped, unpaginated list and composes category, tab
  * and search filters client-side, so this fetches the whole queue and lets the
  * screen slice it. The first page is the live query; a queue longer than one
  * page reads the remaining pages behind it after every refetch. `queuePage` computes `summary` and
@@ -16,7 +16,7 @@ import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-t
  * makes the rail counts and tab counts correct on screens that are showing a
  * filtered list — and correct on screens that never render the list at all.
  *
- * Live updates follow the same contract as the classic queue table: apply the
+ * Live updates follow one contract: apply the
  * per-item payload from `queueEvents` immediately so a row's progress moves at
  * event rate, and refetch the page on a throttle so membership and ordering
  * settle. Both are needed — the event stream never says where a new row sorts.

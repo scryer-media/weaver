@@ -624,7 +624,6 @@ export const nextEs: LocaleDictionary = {
   "next.general.duplicate.normalizedNameHelp": "Una publicación cuyo nombre coincide al quitar mayúsculas, espacios y etiquetas.",
   "next.general.language": "Idioma",
   "next.general.languageHelp": "Idioma de la interfaz de Weaver. Solo se aplica a este navegador.",
-  "next.general.newInterface": "Nueva interfaz",
   "next.general.interface": "Interfaz",
   "next.general.updates": "Actualizaciones",
   "next.general.checkForUpdates": "Buscar actualizaciones",

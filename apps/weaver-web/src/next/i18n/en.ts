@@ -1,10 +1,11 @@
 import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /**
- * The Next interface's own strings.
+ * The interface's strings.
  *
- * Wording the classic interface already translates is looked up under its
- * classic key instead of being repeated here. Every locale beside this one
+ * Some shared wording (status names, metric labels, the in-app upgrade) lives
+ * in the base dictionaries under `src/lib/i18n` and is looked up there instead
+ * of being repeated here. Every locale beside this one
  * carries exactly these keys; `tests/next-i18n.test.ts` holds them to it.
  */
 export const nextEn: LocaleDictionary = {
@@ -630,7 +631,6 @@ export const nextEn: LocaleDictionary = {
   "next.general.duplicate.normalizedNameHelp": "A release whose name matches once casing, spacing and tags are stripped.",
   "next.general.language": "Language",
   "next.general.languageHelp": "Display language for the Weaver interface. Applies to this browser only.",
-  "next.general.newInterface": "New interface",
   "next.general.interface": "Interface",
   "next.general.updates": "Updates",
   "next.general.checkForUpdates": "Check for updates",

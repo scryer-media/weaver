@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   DEFAULT_DUPLICATE_POLICY,
   normalizeDuplicatePolicy,
-} from "../src/features/duplicates/duplicate-policy.ts";
+} from "../src/next/features/duplicates/duplicate-policy.ts";
 import {
   duplicateActionI18nKey,
   duplicateFingerprintKindI18nKey,
@@ -11,8 +11,8 @@ import {
   submissionOutcomeI18nKey,
   submissionStatusCanForceRetry,
   submissionStatusIsDurable,
-} from "../src/features/duplicates/duplicate-presentation.ts";
-import { duplicateSubmissionInput } from "../src/features/upload/duplicate-submission.ts";
+} from "../src/next/features/duplicates/duplicate-presentation.ts";
+import { duplicateSubmissionInput } from "../src/next/features/upload/duplicate-submission.ts";
 
 test("SCORE keeps a normalized candidate key and integer score", () => {
   assert.deepEqual(

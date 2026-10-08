@@ -4,8 +4,8 @@
  * Scryer, and anything else that needs a key from a person looking at their
  * own Weaver, links to `settings/security?createApiKey=1&name=…&scope=…`
  * rather than asking them to find the panel and match a scope. The longer
- * spellings (`apiKeyGenerate`, `apiKeyName`, `apiKeyScope`) are the ones the
- * classic interface accepted first, so links written against it keep working.
+ * spellings (`apiKeyGenerate`, `apiKeyName`, `apiKeyScope`) are the ones Weaver
+ * accepted first, so links written against them keep working.
  *
  * Reading a link consumes it: the caller puts the returned query string back
  * in the address bar, so a reload cannot quietly mint a second key.

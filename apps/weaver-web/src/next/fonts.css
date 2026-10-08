@@ -1,11 +1,10 @@
 /*
- * Typefaces for the Next UI. Two families, two jobs: Sora names things —
+ * The interface's typefaces. Two families, two jobs: Sora names things —
  * screens, dialogs, sections — and Fira Code carries everything else, the
  * words a person wrote and the values a machine produced alike.
  *
  * Both are the variable weight-axis build, latin subset only, so one file per
- * family covers every weight the interface sets. A face nothing is set in is
- * never fetched, so neither costs the classic UI anything.
+ * family covers every weight the interface sets.
  */
 
 @font-face {

@@ -65,7 +65,7 @@ export function useBackupAdminAction(onSuccess?: () => void) {
       pendingAction.current = null; setAccountPassword(""); setReauthenticating(false); setVerificationError(null);
     }} body={<>
       <p>{t("next.backup.verifyAccountPassword")}</p>
-      <label className="mt-3 block">{t("next.security.currentPassword")}<input className="mt-1 w-full rounded border border-border bg-background p-2" type="password" autoComplete="current-password" value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} /></label>
+      <label className="mt-3 block">{t("next.security.currentPassword")}<input className="mt-1 w-full border border-wv-control bg-wv-input p-2" type="password" autoComplete="current-password" value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} /></label>
       {verificationError ? <p role="alert" className="mt-2 text-wv-error-text">{verificationError}</p> : null}
     </>} />
   );
