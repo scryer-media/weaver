@@ -12,7 +12,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
-import { directRouting, policyInput, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import { blockedRouting, directRouting, routeFields, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
@@ -109,6 +109,11 @@ interface ServerForm {
   quotaResetTime: string;
   /** The server's route as stored. It is set under Networking; here it only decides how a test leaves. */
   routing: RoutingPolicy;
+  /**
+   * A new server only: save it switched off behind a route nothing can take,
+   * untested, so it cannot dial before its route is set under Networking.
+   */
+  killSwitch: boolean;
   certificateDerBase64: string | null;
   certificateFingerprint: string | null;
 }
@@ -151,6 +156,7 @@ const NEW_SERVER: ServerForm = {
   quotaUnit: "GB",
   quotaResetTime: "00:00",
   routing: directRouting,
+  killSwitch: false,
   certificateDerBase64: null,
   certificateFingerprint: null,
 };
@@ -244,6 +250,7 @@ function formToState(server: ServerDetails | Server, username: string): ServerFo
     quotaUnit: unit,
     quotaResetTime: minutesToTime(quota.resetTimeMinutesLocal),
     routing: server.routing ?? directRouting,
+    killSwitch: false,
     certificateDerBase64:
       "tlsNameMismatchCertificateDerBase64" in server
         ? server.tlsNameMismatchCertificateDerBase64
@@ -415,7 +422,8 @@ export function ProvidersPanel() {
     const session = editorSession.current;
     const result =
       editingId === "new"
-        ? await addServer({ input })
+        ? // Behind a kill switch there is no way out to test, so the server is kept off.
+          await addServer({ input: values.killSwitch ? { ...input, active: false, routing: blockedRouting } : input })
         : await updateServer({ id: editingId, input });
     if (session !== editorSession.current) {
       void reexecute({ requestPolicy: "network-only" });
@@ -445,7 +453,7 @@ export function ProvidersPanel() {
     setError(null);
     const session = editorSession.current;
     // A test saves nothing, so it is told the route to leave by.
-    const result = await testConnection({ input: { ...serverInput(provider), route: policyInput(provider.routing) } });
+    const result = await testConnection({ input: { ...serverInput(provider), ...routeFields(provider.routing) } });
     if (session !== editorSession.current) return;
     setTesting(false);
     setTestResult(result.data?.testConnection ? { ...(result.data.testConnection as TestResult), values: provider } : null);
@@ -627,7 +635,12 @@ export function ProvidersPanel() {
               id: "active",
               label: t("next.providers.enabled"),
               help: t("next.providers.enabledHelp"),
-              control: { kind: "toggle", value: values.active, onChange: (next) => patch({ active: next }) },
+              control: {
+                kind: "toggle",
+                value: values.active && !values.killSwitch,
+                disabled: values.killSwitch,
+                onChange: (next) => patch({ active: next }),
+              },
             },
             {
               id: "priority",
@@ -711,8 +724,27 @@ export function ProvidersPanel() {
           id: "routing",
           title: t("next.providers.networkRoute"),
           tag: <BetaTag />,
-          fields: [],
-          body: <RouteView consumer={typeof editingId === "number" ? `server:${editingId}` : undefined} />,
+          fields:
+            editingId === "new"
+              ? [
+                  {
+                    id: "killSwitch",
+                    label: t("next.networking.killSwitch"),
+                    help: t("next.providers.killSwitchHelp"),
+                    control: {
+                      kind: "toggle",
+                      value: values.killSwitch,
+                      onChange: (next) => patch({ killSwitch: next }),
+                    },
+                  },
+                ]
+              : [],
+          body: (
+            <RouteView
+              consumer={typeof editingId === "number" ? `server:${editingId}` : undefined}
+              killSwitch={values.killSwitch}
+            />
+          ),
         },
       ]
     : [];
@@ -766,7 +798,7 @@ export function ProvidersPanel() {
                 {t("next.providers.resetUsage")}
               </SecondaryButton>
             ) : null}
-            <SecondaryButton icon="test" onClick={() => void runTest()} disabled={testing}>
+            <SecondaryButton icon="test" onClick={() => void runTest()} disabled={testing || values?.killSwitch}>
               {testing ? t("next.providers.testing") : t("next.providers.test")}
             </SecondaryButton>
           </>

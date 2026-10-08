@@ -285,3 +285,105 @@ async fn route_save_rejects_missing_consumers_without_persisting() {
     assert!(h.db.list_proxy_routes().unwrap().is_empty());
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
+
+/// A server or a feed made behind a kill switch is kept switched off behind a
+/// route nothing can take, and a route saved for it under Networking opens it.
+#[tokio::test]
+async fn kill_switch_keeps_a_new_consumer_blocked_until_it_is_given_a_route() {
+    let h = harness().await;
+    let shape = "id routing{proxyIds allowDirect} routingStatus{state} route{legs{egressId weight path{kind directFallback rungs{kind}}}}";
+    // The interface recognises a kill switch by this leg: a ladder with no rung and no direct fallback.
+    let closed = serde_json::json!([{
+        "egressId": 0,
+        "weight": 100,
+        "path": {"kind": "LADDER", "directFallback": false, "rungs": []}
+    }]);
+    let response = h
+        .execute(&format!(
+            r#"mutation {{addServer(input:{{host:"news.fixture.invalid",port:563,tls:true,connections:20,active:false,routing:{{proxyIds:[],allowDirect:false}}}}){{active {shape}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    let server = response_data(&response)["addServer"].clone();
+    let response = h
+        .execute(&format!(
+            r#"mutation {{addRssFeed(input:{{name:"Held feed",url:"https://feed.invalid/rss",enabled:false,routing:{{proxyIds:[],allowDirect:false}}}}){{enabled {shape}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    let feed = response_data(&response)["addRssFeed"].clone();
+    assert_eq!(server["active"], false);
+    assert_eq!(feed["enabled"], false);
+    for consumer in [&server, &feed] {
+        assert_eq!(
+            consumer["routing"],
+            serde_json::json!({"proxyIds": [], "allowDirect": false})
+        );
+        assert_eq!(consumer["routingStatus"]["state"], "BLOCKED");
+        assert_eq!(consumer["route"]["legs"], closed);
+    }
+
+    // The flow draws both, switched off as they are, by the same leg.
+    let response = h
+        .execute("{networkFlow{legs{consumer egressId weight open path{kind directFallback rungs{kind}}}}}")
+        .await;
+    assert_no_errors(&response);
+    let legs = response_data(&response)["networkFlow"]["legs"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for key in [
+        format!("server:{}", server["id"]),
+        format!("rss:{}", feed["id"]),
+    ] {
+        let leg = legs.iter().find(|leg| leg["consumer"] == key.as_str());
+        assert_eq!(
+            leg,
+            Some(&serde_json::json!({
+                "consumer": key,
+                "egressId": 0,
+                "weight": 100,
+                "open": 0,
+                "path": {"kind": "LADDER", "directFallback": false, "rungs": []}
+            }))
+        );
+    }
+
+    // A connection test told of the kill switch finds no way out, where one told nothing goes direct.
+    let response = h
+        .execute(
+            r#"mutation {testConnection(input:{host:"news.fixture.invalid",port:563,tls:true,connections:20,active:false,routing:{proxyIds:[],allowDirect:false}}){success message}}"#,
+        )
+        .await;
+    assert_no_errors(&response);
+    let test = &response_data(&response)["testConnection"];
+    assert_eq!(test["success"], false);
+    assert!(
+        test["message"]
+            .as_str()
+            .unwrap()
+            .contains("all rungs are unavailable"),
+        "{test}"
+    );
+
+    for (kind, id) in [("SERVER", &server["id"]), ("RSS", &feed["id"])] {
+        let response = h
+            .execute(&format!(
+                "mutation {{saveNetworkRoute(kind:{kind},id:{id},input:{{legs:[{{egressId:0,weight:100,path:{{direct:true}}}}]}}){{legs{{path{{kind}}}}}}}}"
+            ))
+            .await;
+        assert_no_errors(&response);
+        assert_eq!(
+            response_data(&response)["saveNetworkRoute"]["legs"][0]["path"]["kind"],
+            "DIRECT"
+        );
+    }
+    let response = h
+        .execute("{servers{routing{allowDirect}} rssFeeds{routing{allowDirect}}}")
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    assert_eq!(data["servers"][0]["routing"]["allowDirect"], true);
+    assert_eq!(data["rssFeeds"][0]["routing"]["allowDirect"], true);
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}

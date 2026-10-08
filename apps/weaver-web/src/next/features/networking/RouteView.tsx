@@ -12,16 +12,19 @@ import { NetworkFlow } from "./NetworkFlow";
  * Routes are made and changed under Networking, so this only shows the one
  * this consumer has: the egress each leg leaves through and the proxies it
  * tunnels through, with what each is doing now. A consumer that has not been
- * saved has no route to show; it starts on the default one.
+ * saved has no route to show; it starts on the default one, or behind a kill
+ * switch if it is being made with one.
  */
-export function RouteView({ consumer }: { consumer?: string }) {
+export function RouteView({ consumer, killSwitch = false }: { consumer?: string; killSwitch?: boolean }) {
   const t = useTranslate();
   const [{ data, error }] = useQuery<NetworkingData>({ query: NETWORKING_QUERY, pause: !consumer });
   const [initial] = useQuery<{ networkFlow: Flow }>({ query: NETWORK_FLOW_QUERY, pause: !consumer });
   const [live] = useSubscription<{ networkFlow: Flow }>({ query: NETWORK_FLOW_SUBSCRIPTION, pause: !consumer });
   if (!consumer) {
     return (
-      <p className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-muted sm:px-6">{t("next.networking.policy.unsaved")}</p>
+      <p className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-muted sm:px-6">
+        {t(killSwitch ? "next.networking.policy.unsavedBlocked" : "next.networking.policy.unsaved")}
+      </p>
     );
   }
 
