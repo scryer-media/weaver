@@ -3,7 +3,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { isOneShot, type ScheduleOptionsForm, type ScheduleTargets } from "../data/schedule-options";
 
 const TARGETS = gql`query ScheduleTargets { servers { id host } rssFeeds { id name } }`;
-const controlClass = "w-full rounded border border-border bg-background px-2 py-1.5 text-sm";
+const controlClass = "w-full border border-wv-control bg-wv-input px-2 py-1.5 text-sm";
 
 export function useScheduleTargets() {
   const [{ data }] = useQuery<ScheduleTargets>({ query: TARGETS });
@@ -24,7 +24,7 @@ export function ScheduleOptionsFields({ action, value, onChange }: {
     {isOneShot(action) && value.everyHourAtMinute !== null
       ? <label className="block">{t("next.schedules.minute")}<input className={controlClass} type="number" min={0} max={59} value={value.everyHourAtMinute} onChange={(event) => set({ everyHourAtMinute: Number(event.target.value) })} /></label>
       : <label className="block">{t("next.schedules.multipleTimes")}<input className={controlClass} placeholder="08:00, 18:00" value={value.timesText} onChange={(event) => set({ timesText: event.target.value })} /></label>}
-    <p className="text-muted-foreground">{t(isOneShot(action) ? "next.schedules.oneShotHelp" : "next.schedules.multipleTimesHelp")}</p>
+    <p className="text-wv-muted">{t(isOneShot(action) ? "next.schedules.oneShotHelp" : "next.schedules.multipleTimesHelp")}</p>
     {action === "pause_all" && <p>{t("next.schedules.pauseAllHelp")}</p>}
     {(action === "pause_post_processing" || action === "resume_post_processing") && <p>{t("next.schedules.postHelp")}</p>}
     {action === "set_server_active" && <>
@@ -33,11 +33,11 @@ export function ScheduleOptionsFields({ action, value, onChange }: {
         {data?.servers.map((server) => <option key={server.id} value={server.id}>{server.host}</option>)}
       </select></label>
       <label className="flex items-center gap-2"><input type="checkbox" checked={value.serverActive ?? true} onChange={(event) => set({ serverActive: event.target.checked })} />{t("next.schedules.serverEnabled")}</label>
-      <p className="text-muted-foreground">{t("next.schedules.serverHelp")}</p>
+      <p className="text-wv-muted">{t("next.schedules.serverHelp")}</p>
     </>}
     {action === "set_quota_metering" && <>
       <label className="flex items-center gap-2"><input type="checkbox" checked={value.quotaMeteringEnabled ?? true} onChange={(event) => set({ quotaMeteringEnabled: event.target.checked })} />{t("next.schedules.meterBytes")}</label>
-      <p className="text-muted-foreground">{t("next.schedules.quotaHelp")}</p>
+      <p className="text-wv-muted">{t("next.schedules.quotaHelp")}</p>
     </>}
     {action === "fetch_rss" && <label className="block">{t("next.schedules.feed")}<select aria-label={t("next.schedules.feed")} className={controlClass} value={value.feedId ?? ""} onChange={(event) => set({ feedId: event.target.value ? Number(event.target.value) : null })}>
       <option value="">{t("next.schedules.allFeeds")}</option>
@@ -48,7 +48,7 @@ export function ScheduleOptionsFields({ action, value, onChange }: {
         <label className="flex items-center gap-2"><input type="checkbox" checked={value[key] !== null} onChange={(event) => set({ [key]: event.target.checked ? { deleteFiles: key !== "pruneCompleted" } : null })} />{t(`next.schedules.${key}`)}</label>
         {value[key] && <label className="flex items-center gap-2 pl-5"><input type="checkbox" checked={value[key].deleteFiles} onChange={(event) => set({ [key]: { deleteFiles: event.target.checked } })} />{t("next.schedules.deleteFiles")}</label>}
       </div>)}
-      <p className="text-muted-foreground">{t("next.schedules.pruneWarning")}</p>
+      <p className="text-wv-muted">{t("next.schedules.pruneWarning")}</p>
     </>}
   </div>;
 }

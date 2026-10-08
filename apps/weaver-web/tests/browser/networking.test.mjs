@@ -3,7 +3,7 @@ import { after, before, test } from "node:test";
 import { createServer } from "vite";
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright");
 let server, browser, baseUrl;
-before(async()=>{server=await createServer({server:{host:"127.0.0.1",port:0,...(process.env.NETWORKING_FIXTURE_API?{proxy:{"/graphql":{target:process.env.NETWORKING_FIXTURE_API,ws:true}}}:{})}});await server.listen();baseUrl=`http://127.0.0.1:${server.httpServer.address().port}`;browser=await chromium.launch({headless:true});});
+before(async()=>{server=await createServer({cacheDir:"node_modules/.vite/browser-networking",server:{host:"127.0.0.1",port:0,...(process.env.NETWORKING_FIXTURE_API?{proxy:{"/graphql":{target:process.env.NETWORKING_FIXTURE_API,ws:true}}}:{})}});await server.listen();baseUrl=`http://127.0.0.1:${server.httpServer.address().port}`;browser=await chromium.launch({headless:true});});
 after(async()=>{await browser?.close();await server?.close();});
 test("create an egress and two-leg route, then disable the egress through GraphQL",{skip:!process.env.NETWORKING_FIXTURE_API},async()=>{
  const page=await browser.newPage({viewport:{width:1440,height:1100}});page.setDefaultTimeout(0);
@@ -12,15 +12,17 @@ test("create an egress and two-leg route, then disable the egress through GraphQ
  console.log("Networking fixture loaded");
  await page.getByRole("button",{name:"Add egress",exact:true}).click();
  await page.getByLabel("Name",{exact:true}).fill("Fixture WAN");
- await page.getByLabel("Binding",{exact:false}).selectOption("SOURCE_ADDRESS");
+ await page.getByRole("button",{name:"Binding",exact:true}).click();
+ await page.getByRole("menuitemradio",{name:"Source address",exact:true}).click();
  await page.getByRole("combobox",{name:"Source address",exact:true}).fill("127.0.0.1");
  await page.getByRole("button",{name:"Save egress",exact:true}).click();
- await page.getByRole("cell",{name:"Fixture WAN",exact:true}).waitFor();
+ await page.getByRole("button",{name:/^Fixture WAN/}).waitFor();
  console.log("Created egress through the editor");
  await page.getByRole("link",{name:"Routes",exact:true}).click();
  await page.getByRole("button",{name:"Edit route",exact:true}).click();
  await page.getByRole("button",{name:"Add leg",exact:true}).click();
- await page.getByRole("group",{name:"Leg 2",exact:true}).getByLabel("Egress",{exact:false}).selectOption({label:"Fixture WAN"});
+ await page.getByRole("group",{name:"Leg 2",exact:true}).getByRole("button",{name:"Egress",exact:true}).click();
+ await page.getByRole("menuitemradio",{name:"Fixture WAN",exact:true}).click();
  await page.getByRole("button",{name:"Save route",exact:true}).click();
  await page.getByText("20 NNTP connections · 2 legs",{exact:true}).waitFor();
  console.log("Saved two-leg route");
@@ -37,7 +39,7 @@ test("create an egress and two-leg route, then disable the egress through GraphQ
  const after=await gql("{networkFlow{legs{position target state}}}");
  assert.deepEqual(after.networkFlow.legs.map(l=>l.target),[20,0]);
  assert.equal(after.networkFlow.legs[1].state,"DOWN");
- await page.locator("svg a").filter({hasText:"Fixture WAN"}).getByText("× Down",{exact:true}).waitFor();
+ await page.locator("svg a").filter({hasText:"Fixture WAN"}).getByText("Down",{exact:true}).waitFor();
  assert.equal(errors.length,0,errors.join("\n"));
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-api.png"),fullPage:true});
  await page.close();
@@ -45,8 +47,8 @@ test("create an egress and two-leg route, then disable the egress through GraphQ
 test("flow displays route evidence, exports a frozen SVG, and edits weights without losing capacity",async()=>{
  const page=await browser.newPage({viewport:{width:1440,height:1100}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
  await page.goto(`${baseUrl}/tests/browser/networking.html`);
- await page.getByRole("button",{name:"Toggle Europe · pool members"}).click();
- await page.getByText("Amsterdam · ◆ PINNED",{exact:true}).waitFor();
+ await page.getByRole("button",{name:"Europe pool members",exact:true}).click();
+ await page.getByText("Amsterdam · Pinned",{exact:true}).waitFor();
  assert.ok(await page.getByText("Session 30 ms · open 20 ms · 0.95 MiB/s",{exact:true}).count());
  const [download]=await Promise.all([page.waitForEvent("download"),page.getByRole("button",{name:"Download SVG"}).click()]);
  const stream=await download.createReadStream();let exported="";for await(const chunk of stream)exported+=chunk;

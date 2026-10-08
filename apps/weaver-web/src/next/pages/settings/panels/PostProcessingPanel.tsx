@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
-import { ScriptKinds, type ScriptDeclarations } from "@/components/ScriptKinds";
-import { EventScriptSettings, eventScriptDefaults, eventScriptOptions, type EventScriptOptions } from "@/components/EventScriptSettings";
+import { ScriptKinds, type ScriptDeclarations } from "@/next/components/ScriptKinds";
+import { EventScriptSettings, eventScriptDefaults, eventScriptOptions, type EventScriptOptions } from "@/next/components/EventScriptSettings";
 import {
   POST_PROCESSING_SETTINGS_QUERY,
   SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION,

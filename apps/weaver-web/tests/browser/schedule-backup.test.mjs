@@ -4,7 +4,7 @@ import { createServer } from "vite";
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright");
 let server, browser, baseUrl;
 before(async () => {
-  server = await createServer({ server: { host: "127.0.0.1", port: 0 } });
+  server = await createServer({ cacheDir: "node_modules/.vite/browser-schedule-backup", server: { host: "127.0.0.1", port: 0 } });
   await server.listen();
   baseUrl = `http://127.0.0.1:${server.httpServer.address().port}`;
   browser = await chromium.launch({ headless: true });
@@ -162,98 +162,58 @@ test("an automatic backup and next run update while the backup panel stays open"
   } finally { await page.close(); }
 });
 
-test("classic backup page exposes automatic settings and creates a retained backup", async () => {
-  const page = await open("?classic");
+test("an export downloads without creating a stored backup", async () => {
+  const page = await open("");
   try {
-    const automatic = page.getByRole("region", { name: "Automatic backups", exact: true });
-    await automatic.getByLabel("Automatic backup key", { exact: true }).fill("classic fixture archive key");
-    await automatic.getByRole("switch", { name: "Enable automatic backups", exact: true }).click();
-    await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
-    await automatic.getByText("A key is stored. Enter a new key to replace it.", { exact: true }).waitFor();
-    await page.locator("#backup-export-password").fill("classic manual archive key");
-    await page.locator("#backup-export-password-confirm").fill("classic manual archive key");
-    await page.getByRole("button", { name: "Create without downloading", exact: true }).click();
-    const stored = page.getByRole("region", { name: "Stored backups", exact: true });
-    await stored.getByText("Ready", { exact: true }).waitFor();
+    const manual = page.getByRole("region", { name: "Backup", exact: true });
+    await manual.getByLabel("Password", { exact: true }).fill("fixture archive key");
+    await manual.getByLabel("Confirm password", { exact: true }).fill("fixture archive key");
     const download = page.waitForEvent("download");
-    await stored.getByRole("button", { name: "Download", exact: true }).click();
+    await page.getByRole("button", { name: "Download backup", exact: true }).click();
     assert.match((await download).suggestedFilename(), /^weaver_backup_fixture_/);
-    await page.getByRole("region", { name: "Backup storage", exact: true }).waitFor();
-    await automatic.getByRole("switch", { name: "Enable automatic backups", exact: true }).click();
-    await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
-    await automatic.getByText("Not scheduled", { exact: true }).waitFor();
+    const payload = await page.evaluate(() => fetch("/graphql", {
+      method: "POST", body: JSON.stringify({ operationName: "Backups", variables: {} }),
+    }).then((response) => response.json()));
+    assert.deepEqual(payload.data.backups, []);
+    await page.getByRole("region", { name: "Stored backups", exact: true }).getByText("Nothing configured yet.", { exact: true }).waitFor();
   } finally { await page.close(); }
 });
 
-test("both UIs export a download without creating a stored backup", async () => {
-  for (const query of ["", "?classic"]) {
-    const page = await open(query);
-    try {
-      if (query.includes("classic")) {
-        await page.locator("#backup-export-password").fill("fixture archive key");
-        await page.locator("#backup-export-password-confirm").fill("fixture archive key");
-      } else {
-        const manual = page.getByRole("region", { name: "Backup", exact: true });
-        await manual.getByLabel("Password", { exact: true }).fill("fixture archive key");
-        await manual.getByLabel("Confirm password", { exact: true }).fill("fixture archive key");
-      }
-      const download = page.waitForEvent("download");
-      await page.getByRole("button", { name: query.includes("classic") ? "Download Backup" : "Download backup", exact: true }).click();
-      assert.match((await download).suggestedFilename(), /^weaver_backup_fixture_/);
-      const payload = await page.evaluate(() => fetch("/graphql", {
-        method: "POST", body: JSON.stringify({ operationName: "Backups", variables: {} }),
-      }).then((response) => response.json()));
-      assert.deepEqual(payload.data.backups, []);
-      await page.getByRole("region", { name: "Stored backups", exact: true }).getByText("Nothing configured yet.", { exact: true }).waitFor();
-    } finally { await page.close(); }
-  }
+test("expired backup administration verifies the account password before replaying the mutation", async () => {
+  const page = await open("?expired");
+  try {
+    const automatic = page.getByRole("region", { name: "Automatic backups", exact: true });
+    await automatic.getByLabel("Automatic backup key", { exact: true }).fill("fixture archive key");
+    await automatic.getByRole("switch", { name: "Enable automatic backups", exact: true }).click();
+    await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
+    const verification = page.getByRole("dialog", { name: "Current password", exact: true });
+    await verification.getByLabel("Current password", { exact: true }).fill("wrong password");
+    await verification.getByRole("button", { name: "Continue", exact: true }).click();
+    await verification.getByRole("alert").filter({ hasText: "invalid password" }).waitFor();
+    assert.equal((await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json()))).acceptedBackupMutations, 0);
+    await verification.getByLabel("Current password", { exact: true }).fill("fixture account password");
+    await verification.getByRole("button", { name: "Continue", exact: true }).click();
+    await verification.waitFor({ state: "hidden" });
+    await automatic.getByText("A key is stored. Enter a new key to replace it.", { exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json())), { verificationRequests: 2, acceptedBackupMutations: 1, acceptedBackupCreates: 0 });
+    assert.equal(await automatic.getByLabel("Automatic backup key", { exact: true }).inputValue(), "");
+  } finally { await page.close(); }
 });
 
-test("expired backup administration verifies the account password before replaying the mutation in both UIs", async () => {
-  for (const query of ["?expired", "?classic&expired"]) {
-    const page = await open(query);
-    try {
-      const automatic = page.getByRole("region", { name: "Automatic backups", exact: true });
-      await automatic.getByLabel("Automatic backup key", { exact: true }).fill("fixture archive key");
-      await automatic.getByRole("switch", { name: "Enable automatic backups", exact: true }).click();
-      await automatic.getByRole("button", { name: "Save changes", exact: true }).click();
-      const verification = page.getByRole("dialog", { name: "Current password", exact: true });
-      await verification.getByLabel("Current password", { exact: true }).fill("wrong password");
-      await verification.getByRole("button", { name: "Continue", exact: true }).click();
-      await verification.getByRole("alert").filter({ hasText: "invalid password" }).waitFor();
-      assert.equal((await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json()))).acceptedBackupMutations, 0);
-      await verification.getByLabel("Current password", { exact: true }).fill("fixture account password");
-      await verification.getByRole("button", { name: "Continue", exact: true }).click();
-      await verification.waitFor({ state: "hidden" });
-      await automatic.getByText("A key is stored. Enter a new key to replace it.", { exact: true }).waitFor();
-      assert.deepEqual(await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json())), { verificationRequests: 2, acceptedBackupMutations: 1, acceptedBackupCreates: 0 });
-      assert.equal(await automatic.getByLabel("Automatic backup key", { exact: true }).inputValue(), "");
-    } finally { await page.close(); }
-  }
-});
-
-
-test("expired REST backup creation verifies the account password and retries once in both UIs", async () => {
-  for (const query of ["?expired", "?classic&expired"]) {
-    const page = await open(query);
-    try {
-      if (query.includes("classic")) {
-        await page.locator("#backup-export-password").fill("fixture archive key");
-        await page.locator("#backup-export-password-confirm").fill("fixture archive key");
-      } else {
-        const manual = page.getByRole("region", { name: "Backup", exact: true });
-        await manual.getByLabel("Password", { exact: true }).fill("fixture archive key");
-        await manual.getByLabel("Confirm password", { exact: true }).fill("fixture archive key");
-      }
-      await page.getByRole("button", { name: "Create without downloading", exact: true }).click();
-      const verification = page.getByRole("dialog", { name: "Current password", exact: true });
-      await verification.waitFor();
-      assert.equal((await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json()))).acceptedBackupCreates, 0);
-      await verification.getByLabel("Current password", { exact: true }).fill("fixture account password");
-      await verification.getByRole("button", { name: "Continue", exact: true }).click();
-      await verification.waitFor({ state: "hidden" });
-      await page.getByRole("region", { name: "Stored backups", exact: true }).getByText("Ready", { exact: true }).waitFor();
-      assert.deepEqual(await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json())), { verificationRequests: 1, acceptedBackupMutations: 0, acceptedBackupCreates: 1 });
-    } finally { await page.close(); }
-  }
+test("expired REST backup creation verifies the account password and retries once", async () => {
+  const page = await open("?expired");
+  try {
+    const manual = page.getByRole("region", { name: "Backup", exact: true });
+    await manual.getByLabel("Password", { exact: true }).fill("fixture archive key");
+    await manual.getByLabel("Confirm password", { exact: true }).fill("fixture archive key");
+    await page.getByRole("button", { name: "Create without downloading", exact: true }).click();
+    const verification = page.getByRole("dialog", { name: "Current password", exact: true });
+    await verification.waitFor();
+    assert.equal((await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json()))).acceptedBackupCreates, 0);
+    await verification.getByLabel("Current password", { exact: true }).fill("fixture account password");
+    await verification.getByRole("button", { name: "Continue", exact: true }).click();
+    await verification.waitFor({ state: "hidden" });
+    await page.getByRole("region", { name: "Stored backups", exact: true }).getByText("Ready", { exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => fetch("/fixture/auth-state").then((response) => response.json())), { verificationRequests: 1, acceptedBackupMutations: 0, acceptedBackupCreates: 1 });
+  } finally { await page.close(); }
 });

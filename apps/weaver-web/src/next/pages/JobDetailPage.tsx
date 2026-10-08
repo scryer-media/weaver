@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { JobScriptResults } from "@/components/JobScriptResults";
+import { JobScriptResults } from "@/next/components/JobScriptResults";
 import { Link, useNavigate, useParams } from "react-router";
 import { useMutation, useQuery, useSubscription } from "urql";
 import {

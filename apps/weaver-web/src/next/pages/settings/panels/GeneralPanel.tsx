@@ -13,8 +13,8 @@ import {
   normalizeDuplicatePolicy,
   type DuplicateAction,
   type DuplicatePolicy,
-} from "@/features/duplicates/duplicate-policy";
-import { useUpdateCheck } from "@/features/updates/use-update-check";
+} from "@/next/features/duplicates/duplicate-policy";
+import { useUpdateCheck } from "@/next/features/updates/use-update-check";
 import { Leaf, Rocket, Scale } from "lucide-react";
 import {
   initialProfile,

@@ -35,7 +35,7 @@ import {
  * RSS: the feeds weaver polls, the rules that decide what it takes from them,
  * and what it has already seen.
  *
- * Three tables rather than the classic page's nested cards: a rule belongs to
+ * Three tables rather than nested cards: a rule belongs to
  * a feed, but it reads as one flat list of decisions, and the feed it belongs
  * to is just its first column.
  */

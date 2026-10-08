@@ -832,13 +832,12 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
   const feed = writeFixtureScript(`${tag}-feed`, { kinds: ["FEED"], exitCode: 93 });
   const restore = await useScripts(request, { global: [queue, scheduler, scan, feed].map(script => ({ script })) });
   try {
-    // These selectors are the classic interface's; a browser that never chose
-    // gets the new one.
-    await page.addInitScript(() => window.localStorage.setItem("weaver.ui-variant", "classic"));
     await page.goto("/settings/post-processing");
-    await expect(page.locator("#pp-script-directory")).toHaveValue(WEAVER_SCRIPTS_DIR);
+    await expect(page.getByLabel("Scripts directory", { exact: true })).toHaveValue(WEAVER_SCRIPTS_DIR);
     await expect(page.getByRole("group", { name: "Event scripts and output retention" })).toBeVisible();
-    const entry = (name: string) => page.getByRole("listitem", { name: `Script ${name}`, exact: true }).first();
+    // A discovered script's row; its name cell carries the script's file name.
+    const entry = (name: string) =>
+      page.getByRole("button").filter({ has: page.locator(`[title="${name}"]`) }).first();
     await expect(entry(queue)).toContainText("Post-processing");
     await expect(entry(queue)).toContainText("Queue");
     await expect(entry(queue)).toContainText("Declared events:");

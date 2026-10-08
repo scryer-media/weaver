@@ -5,14 +5,12 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { useLoginEnabled } from "@/lib/login-required";
 import { authHeaders } from "@/graphql/client";
 import { signOut } from "@/lib/logout";
-import { setUiVariant } from "@/lib/ui-variant";
 import { cn } from "@/lib/utils";
-import { upgradesInApp } from "@/features/updates/application-upgrade";
-import { useApplicationUpgradeStatus } from "@/features/updates/application-upgrade-card";
+import { upgradesInApp } from "@/next/features/updates/application-upgrade";
+import { useApplicationUpgradeStatus } from "@/next/features/updates/use-application-upgrade";
 import { useNextData } from "../data/next-data";
 import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
-import { Toggle } from "../components/controls";
 import { Icon, type IconName } from "../components/icons";
 import { useSpeedLimitDialog, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 
@@ -191,7 +189,7 @@ export function NextShell({
         />
       )}
       <ThroughputBlock />
-      <InterfaceBlock />
+      <SponsorBlock />
     </>
   );
 
@@ -473,13 +471,9 @@ function ThroughputBlock() {
   );
 }
 
-/**
- * The rail's last block: the sponsor link, then the switch back to the classic
- * interface. Switching reloads the page, so the toggle only ever reads ON here.
- */
-function InterfaceBlock() {
+/** The rail's last block: the sponsor link. */
+function SponsorBlock() {
   const t = useTranslate();
-  const label = t("next.general.newInterface");
   return (
     <div className="flex flex-none flex-col gap-[10px] border-t border-wv-line-strong px-5 py-[12px]">
       <a
@@ -491,19 +485,6 @@ function InterfaceBlock() {
         <Icon name="sponsor" size={14} className="flex-none text-wv-error" />
         {t("nav.sponsor")}
       </a>
-      <div className="flex items-center justify-between gap-3">
-        <span className="truncate text-[12.5px] text-wv-muted">{label}</span>
-        <Toggle
-          size="table"
-          checked
-          label={label}
-          onChange={(next) => {
-            if (!next) {
-              setUiVariant("classic");
-            }
-          }}
-        />
-      </div>
     </div>
   );
 }

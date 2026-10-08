@@ -3,9 +3,8 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { AppErrorBoundary } from "./lib/error-page";
 import { watchForSignOut } from "./lib/login-required";
-import "./fonts.css";
 import "./next/fonts.css";
-import "./globals.css";
+import "./next/theme.css";
 
 if (import.meta.env.DEV) {
   // React 19's dev builds emit a `performance.measure` per component per

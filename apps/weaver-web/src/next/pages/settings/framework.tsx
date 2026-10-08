@@ -92,6 +92,8 @@ export type FieldControl =
       max?: number;
       step?: number;
       suffix?: string;
+      /** Decimal places the value keeps; whole numbers when omitted. */
+      precision?: number;
     }
   | {
       kind: "textarea";
@@ -195,6 +197,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           max={control.max}
           step={control.step}
           suffix={control.suffix}
+          precision={control.precision}
         />
       );
     case "textarea":

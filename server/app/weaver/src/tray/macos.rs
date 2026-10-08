@@ -1357,9 +1357,10 @@ fn pin_width(view: &NSView, width: f64) {
         .setActive(true);
 }
 
-/// Weaver's `--background` token for the current system appearance
-/// (apps/weaver-web/src/globals.css): #050914 in dark mode, #f8f9fc in light.
-/// The web UI follows the same switch through `prefers-color-scheme`.
+/// The window background for the current system appearance: #050914 in dark
+/// mode, #f8f9fc in light. These predate the web UI's current palette
+/// (apps/weaver-web/src/next/theme.css), whose ground is #1a1b1e in both
+/// appearances.
 fn theme_background_color(mtm: MainThreadMarker) -> Retained<NSColor> {
     let app = NSApplication::sharedApplication(mtm);
     let dark = appearance_is_dark(&app.effectiveAppearance());

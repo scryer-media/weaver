@@ -4,9 +4,7 @@ import type { ParsedReleaseData } from "@/lib/job-types";
 /**
  * What weaver understood about a release name.
  *
- * The vocabulary is the classic UI's, deliberately: the redesign is a new
- * interface, not a new opinion about what a parsed release is called. Empty
- * fields are dropped rather than dashed — a parse grid full of em dashes says
+ * Empty fields are dropped rather than dashed — a parse grid full of em dashes says
  * nothing except that the grid was fixed-size.
  */
 

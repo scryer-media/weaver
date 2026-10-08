@@ -5,18 +5,14 @@ import { Client, Provider, type OperationResult } from "urql";
 import { fromValue, make, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
-import { Servers } from "@/pages/Servers";
 import { ProvidersPanel } from "@/next/pages/settings/panels/ProvidersPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
-import { JobDetail } from "@/pages/JobDetail";
 import { JobDetailPage } from "@/next/pages/JobDetailPage";
-import { DirectoryBrowserDialog as LegacyFolders } from "@/components/DirectoryBrowserDialog";
-import { DirectoryBrowserDialog as NextFolders } from "@/next/features/DirectoryBrowserDialog";
-import "@/fonts.css";
-import "@/globals.css";
+import { DirectoryBrowserDialog } from "@/next/features/DirectoryBrowserDialog";
+import "@/next/fonts.css";
+import "@/next/theme.css";
 
 const params = new URLSearchParams(location.search);
-const variant = params.get("variant");
 const screen = params.get("screen") ?? "providers";
 const quota = { enabled: false, period: "MONTHLY", limitBytes: 1000, resetTimeMinutesLocal: 0,
   weeklyResetWeekday: "MON", monthlyResetDay: 1, usedBytes: 0, reservedBytes: 0,
@@ -102,12 +98,10 @@ function Fixture() {
   }, [navigate]);
   if (screen === "folders") {
     const choose = (path: string) => { fixture.chosen = path; setFolder(null); };
-    return variant === "next"
-      ? <NextFolders open={folder !== null} initialPath={folder} onClose={() => setFolder(null)} onChoose={choose} />
-      : <LegacyFolders open={folder !== null} path={folder} onPathChange={() => {}} onClose={() => setFolder(null)} onChoose={choose} />;
+    return <DirectoryBrowserDialog open={folder !== null} initialPath={folder} onClose={() => setFolder(null)} onChoose={choose} />;
   }
-  if (screen === "jobs") return <Routes><Route path="/jobs/:id" element={variant === "next" ? <JobDetailPage /> : <JobDetail />} /></Routes>;
-  return variant === "next" ? <SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} controlsHost={document.getElementById("controls")}><ProvidersPanel /></SettingsShellProvider> : <Servers />;
+  if (screen === "jobs") return <Routes><Route path="/jobs/:id" element={<JobDetailPage />} /></Routes>;
+  return <SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} controlsHost={document.getElementById("controls")}><ProvidersPanel /></SettingsShellProvider>;
 }
 createRoot(document.getElementById("root")!).render(
   <Provider value={client}><TranslateContext.Provider value={{

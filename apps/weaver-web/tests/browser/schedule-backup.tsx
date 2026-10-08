@@ -6,11 +6,10 @@ import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { nextEn } from "@/next/i18n/en";
 import { BackupPanel } from "@/next/pages/settings/panels/BackupPanel";
-import { BackupSettingsPage } from "@/pages/settings/BackupSettingsPage";
 import { SchedulesPanel } from "@/next/pages/settings/panels/SchedulesPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
-import "@/fonts.css";
-import "@/globals.css";
+import "@/next/fonts.css";
+import "@/next/theme.css";
 
 const state = {
   schedules: [] as Record<string, unknown>[],
@@ -106,4 +105,4 @@ window.fetch = async (request, init) => {
 };
 const dictionary = { ...en, ...nextEn };
 const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls") };
-createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto max-w-[1400px] p-8">{location.search.includes("schedules") ? <SchedulesPanel /> : location.search.includes("classic") ? <BackupSettingsPage /> : <BackupPanel />}</main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto max-w-[1400px] p-8">{location.search.includes("schedules") ? <SchedulesPanel /> : <BackupPanel />}</main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
