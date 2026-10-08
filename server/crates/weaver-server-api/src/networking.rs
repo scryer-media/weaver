@@ -455,6 +455,15 @@ pub struct NetworkLegFlow {
     pub selected_rung: Option<usize>,
     pub selected_proxy_id: Option<u32>,
     pub rung_states: Vec<String>,
+    pub failing_hops: Vec<NetworkFailingHop>,
+}
+/// The first proxy hop on one of a leg's ladder rungs known to be failing.
+/// Hops past it on a chain were not reached, so nothing is known of them.
+#[derive(SimpleObject)]
+pub struct NetworkFailingHop {
+    pub rung: usize,
+    pub proxy_id: u32,
+    pub reason: String,
 }
 #[derive(SimpleObject)]
 pub struct NetworkConsumerFlow {
@@ -539,6 +548,18 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                     .as_ref()
                     .and_then(|path| path.proxies.last().copied()),
                 rung_states: leg.rung_states().into_iter().map(str::to_owned).collect(),
+                failing_hops: leg
+                    .failing_hops()
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(rung, hop)| {
+                        hop.map(|hop| NetworkFailingHop {
+                            rung,
+                            proxy_id: hop.proxy,
+                            reason: hop.reason,
+                        })
+                    })
+                    .collect(),
             });
         }
     }
@@ -568,6 +589,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
             selected_rung: None,
             selected_proxy_id: None,
             rung_states: Vec::new(),
+            failing_hops: Vec::new(),
         });
     }
     let mut pools: Vec<_> = runtime

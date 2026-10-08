@@ -168,6 +168,7 @@ fn hop(id: u32, endpoint: SocketAddr, inner: Arc<dyn Dialer>) -> Arc<TransportHo
         },
         inner,
         timeout: Duration::from_secs(30),
+        failure: Default::default(),
     })
 }
 
@@ -204,6 +205,153 @@ async fn chained_connect_hops_preserve_source_path_and_destination_name() {
     drop(dialed);
     first_task.await.unwrap();
     second_task.await.unwrap();
+}
+
+/// A stage whose streams reach a proxy that has already sent `reply`.
+struct Answered {
+    reply: Mutex<&'static [u8]>,
+    far: Mutex<Vec<tokio::io::DuplexStream>>,
+}
+#[async_trait::async_trait]
+impl Dialer for Answered {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let reply = *self.reply.lock().unwrap();
+        far.write_all(reply).await.unwrap();
+        // The far end stays open so the hop can write its request.
+        self.far.lock().unwrap().push(far);
+        Ok(Dialed {
+            stream: DialedStream::Tunnel(Box::new(near)),
+            outcome: Default::default(),
+            path: DialPath::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "answered".into()
+    }
+}
+
+/// Each hop keeps its own last failure, so a ladder names the first hop
+/// failing on a rung even though the hop stacked on it failed as well.
+#[tokio::test]
+async fn a_chain_names_its_first_failing_hop() {
+    let endpoint: SocketAddr = "192.0.2.1:8080".parse().unwrap();
+    let unreachable = Arc::new(Failure {
+        fatal: false,
+        calls: Default::default(),
+    });
+    let chain = hop(8, endpoint, hop(7, endpoint, unreachable));
+    let ladder = Fallback::new(vec![chain.clone(), bottom()]);
+    assert_eq!(ladder.failing_hops(), [None, None]);
+    assert!(matches!(
+        chain.dial(&target("192.0.2.9:119".parse().unwrap())).await,
+        Err(DialError::Egress(_))
+    ));
+    let failing = ladder.failing_hops();
+    let first = failing[0].as_ref().expect("the chain has a failing hop");
+    assert_eq!(
+        first,
+        &FailingHop {
+            proxy: 7,
+            reason: "endpoint unreachable: fixture refusal".into(),
+        }
+    );
+    assert_eq!(failing[1], None);
+}
+
+/// A proxy that refuses to forward is failing itself, not the stage beneath
+/// it, and stops failing as soon as it carries a dial.
+#[tokio::test]
+async fn a_hop_is_failing_until_it_carries_a_dial() {
+    let stage = Arc::new(Answered {
+        reply: Mutex::new(b"HTTP/1.1 403 Forbidden\r\n\r\n"),
+        far: Default::default(),
+    });
+    let proxy = hop(8, "192.0.2.1:8080".parse().unwrap(), stage.clone());
+    let target = target("192.0.2.9:119".parse().unwrap());
+    let Err(DialError::Hop { proxy: 8, source }) = proxy.dial(&target).await else {
+        panic!("the proxy refuses to forward");
+    };
+    // The hop is named beside its reason, so the reason is the cause alone.
+    assert_eq!(
+        proxy.failing_hop(),
+        Some(FailingHop {
+            proxy: 8,
+            reason: source.to_string(),
+        })
+    );
+    *stage.reply.lock().unwrap() = b"HTTP/1.1 200 Connection established\r\n\r\n";
+    assert!(proxy.dial(&target).await.is_ok());
+    assert_eq!(proxy.failing_hop(), None);
+}
+
+/// A session hop is failing after a path failure of its own. A destination
+/// it reached for and could not connect to is not its failure, and carrying
+/// a dial clears one.
+#[tokio::test]
+async fn a_session_hop_is_failing_only_while_its_own_path_fails() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    const PATH_DOWN: u8 = 0;
+    const DESTINATION_DOWN: u8 = 1;
+    const UP: u8 = 2;
+    #[derive(Default)]
+    struct Provider(AtomicU8);
+    #[async_trait::async_trait]
+    impl TunnelProvider for Provider {
+        async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            match self.0.load(Ordering::SeqCst) {
+                PATH_DOWN => Err(TunnelError::Configuration("session lost".into())),
+                DESTINATION_DOWN => Err(TunnelError::Dial {
+                    host: host.into(),
+                    port,
+                    detail: "ConnectFailed".into(),
+                }),
+                _ => Ok(Box::new(tokio::io::duplex(64).0)),
+            }
+        }
+        fn describe(&self) -> String {
+            "scripted fixture".into()
+        }
+    }
+    let provider = Arc::new(Provider::default());
+    let hop = SessionHop {
+        capacity: Default::default(),
+        activity: Default::default(),
+        id: 3,
+        provider: provider.clone(),
+        inner: bottom(),
+        transport: None,
+        path: DialPath::default(),
+        endpoint: Some("127.0.0.1:22".parse().unwrap()),
+        timeout: Duration::from_secs(30),
+        resolver: None,
+        failure: Default::default(),
+    };
+    let target = target(hop.endpoint.unwrap());
+    assert_eq!(hop.failing_hop(), None);
+    assert!(matches!(
+        hop.dial(&target).await,
+        Err(DialError::Hop { proxy: 3, .. })
+    ));
+    assert_eq!(hop.failing_hop().map(|hop| hop.proxy), Some(3));
+    provider.0.store(DESTINATION_DOWN, Ordering::SeqCst);
+    assert!(matches!(
+        hop.dial(&target).await,
+        Err(DialError::Destination(_))
+    ));
+    assert_eq!(hop.failing_hop(), None);
+    provider.0.store(PATH_DOWN, Ordering::SeqCst);
+    assert!(hop.dial(&target).await.is_err());
+    assert_eq!(hop.failing_hop().map(|hop| hop.proxy), Some(3));
+    provider.0.store(UP, Ordering::SeqCst);
+    assert!(hop.dial(&target).await.is_ok());
+    assert_eq!(hop.failing_hop(), None);
 }
 
 struct Failure {
@@ -301,6 +449,7 @@ async fn idle_retirement_preserves_channels_shared_by_other_consumers() {
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
         resolver: None,
+        failure: Default::default(),
     };
     let first = hop.dial(&target(hop.endpoint.unwrap())).await.unwrap();
     let second = hop.dial(&target(hop.endpoint.unwrap())).await.unwrap();
@@ -360,6 +509,7 @@ async fn only_a_path_failure_retires_an_idle_session() {
         endpoint: Some("127.0.0.1:22".parse().unwrap()),
         timeout: Duration::from_secs(30),
         resolver: None,
+        failure: Default::default(),
     };
     let target = target(hop.endpoint.unwrap());
     assert!(matches!(
@@ -556,6 +706,7 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
             endpoint: Some(endpoint),
             timeout: Duration::from_secs(30),
             resolver: Some(provider),
+            failure: Default::default(),
         })
     };
 
@@ -682,6 +833,7 @@ fn wireguard_session(
         endpoint: None,
         timeout: Duration::from_secs(30),
         resolver: Some(resolver),
+        failure: Default::default(),
     })
 }
 
@@ -785,4 +937,5 @@ async fn a_failed_handshake_beneath_a_carried_hop_is_attributed_to_the_hop_benea
             "{error:?}"
         );
     }
+    assert_eq!(upper.failing_hop().map(|hop| hop.proxy), Some(1));
 }

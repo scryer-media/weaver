@@ -252,6 +252,47 @@ fn is_forwarding_refusal(detail: &str) -> bool {
     detail.contains("AdministrativelyProhibited")
 }
 
+/// A proxy hop known to be failing, and what its last attempt came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailingHop {
+    pub proxy: u32,
+    pub reason: String,
+}
+
+/// What a proxy hop's own last attempt came to. The hop keeps it itself, so
+/// a path can name its first failing hop however the failure travelled up: a
+/// hop stacked on a broken one fails too, and its error names only itself.
+#[derive(Default)]
+pub struct HopFailure(Mutex<Option<String>>);
+impl HopFailure {
+    /// Records `error` when it is evidence against the hop. A destination
+    /// the hop answered for clears the record, and an attempt that was never
+    /// made, such as one skipped for capacity, says nothing either way.
+    fn note(&self, error: &DialError) {
+        match error {
+            // The hop is named beside its reason, so the reason leaves it out.
+            DialError::Hop { source, .. } => self.record(source.to_string()),
+            error if error.is_path_evidence() => self.record(error.to_string()),
+            error if error.is_evidence() => self.clear(),
+            _ => {}
+        }
+    }
+    /// The hop's own endpoint could not be reached from the stage beneath.
+    fn unreachable(&self, source: &io::Error) {
+        self.record(format!("endpoint unreachable: {source}"));
+    }
+    fn record(&self, reason: String) {
+        *self.0.lock().expect("hop failure") = Some(reason);
+    }
+    fn clear(&self) {
+        self.0.lock().expect("hop failure").take();
+    }
+    fn of(&self, proxy: u32) -> Option<FailingHop> {
+        let reason = self.0.lock().expect("hop failure").clone()?;
+        Some(FailingHop { proxy, reason })
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Dialer: Send + Sync {
     /// Physical NNTP capacity by leg; independent of server health and work permits.
@@ -286,6 +327,11 @@ pub trait Dialer: Send + Sync {
     /// Datagrams through this stage, for a WireGuard tunnel stacked on it.
     /// Only a WireGuard stage carries them.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        None
+    }
+    /// The first proxy hop on this stage's path, counted from the egress,
+    /// whose own last attempt failed.
+    fn failing_hop(&self) -> Option<FailingHop> {
         None
     }
     fn budget(&self) -> Duration;
@@ -436,6 +482,7 @@ pub struct TransportHop {
     pub spec: TransportProxy,
     pub inner: Arc<dyn Dialer>,
     pub timeout: Duration,
+    pub failure: HopFailure,
 }
 
 #[async_trait::async_trait]
@@ -451,7 +498,17 @@ impl Dialer for TransportHop {
         let started = tokio::time::Instant::now();
         let mut last = None;
         for (index, destination) in destinations.iter().enumerate() {
-            let mut dialed = self.inner.dial(&endpoint).await?;
+            let mut dialed = self.inner.dial(&endpoint).await.inspect_err(|error| {
+                // The proxy's own endpoint was the destination of that dial,
+                // so failing to reach it is this hop's failure. Any other
+                // failure belongs to the stage beneath.
+                if let DialError::Egress(source)
+                | DialError::Destination(source)
+                | DialError::Refused(source) = error
+                {
+                    self.failure.unreachable(source);
+                }
+            })?;
             // Reserve part of the remaining budget for every other address.
             let remaining = self.timeout.saturating_sub(started.elapsed());
             let negotiated = tokio::time::timeout(
@@ -464,6 +521,10 @@ impl Dialer for TransportHop {
                 stage: self.describe(),
             })
             .and_then(|result| result.map_err(|error| DialError::hop(self.id, error)));
+            match &negotiated {
+                Ok(()) => self.failure.clear(),
+                Err(error) => self.failure.note(error),
+            }
             match negotiated {
                 Ok(()) => {
                     // A negotiated socket carries proxy framing and cannot use NNTP's raw TCP fast path.
@@ -476,6 +537,11 @@ impl Dialer for TransportHop {
             }
         }
         Err(last.expect("a hop dials at least one destination"))
+    }
+    fn failing_hop(&self) -> Option<FailingHop> {
+        self.inner
+            .failing_hop()
+            .or_else(|| self.failure.of(self.id))
     }
     fn budget(&self) -> Duration {
         self.inner.budget().saturating_add(self.timeout)
@@ -636,6 +702,7 @@ pub struct SessionHop {
     pub endpoint: Option<SocketAddr>,
     pub timeout: Duration,
     pub resolver: Option<Arc<crate::WireGuardTunnelProvider>>,
+    pub failure: HopFailure,
 }
 
 impl SessionHop {
@@ -672,6 +739,10 @@ impl Dialer for SessionHop {
             .map_err(|e| DialError::hop(self.id, e));
         drop(capacity);
         drop(activity);
+        match &result {
+            Ok(()) => self.failure.clear(),
+            Err(error) => self.failure.note(error),
+        }
         if result.is_err() {
             self.retire_idle().await;
         }
@@ -717,8 +788,12 @@ impl Dialer for SessionHop {
             }
         }
         let stream = match connected {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                self.failure.clear();
+                stream
+            }
             Err(error) => {
+                self.failure.note(&error);
                 drop(capacity);
                 drop(activity);
                 // A destination that refuses says nothing about the tunnel.
@@ -763,9 +838,15 @@ impl Dialer for SessionHop {
                 .resolve_host(host)
                 .await
                 .map(Resolution::Addresses)
-                .map_err(|error| DialError::hop(self.id, error)),
+                .map_err(|error| DialError::hop(self.id, error))
+                .inspect_err(|error| self.failure.note(error)),
             None => Ok(Resolution::Unresolved),
         }
+    }
+    fn failing_hop(&self) -> Option<FailingHop> {
+        self.inner
+            .failing_hop()
+            .or_else(|| self.failure.of(self.id))
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         self.resolver
@@ -817,6 +898,10 @@ impl Fallback {
                 }
             })
             .collect()
+    }
+    /// For each rung, the first proxy hop on it known to be failing.
+    pub fn failing_hops(&self) -> Vec<Option<FailingHop>> {
+        self.rungs.iter().map(|rung| rung.failing_hop()).collect()
     }
     pub fn allows_rung(&self, index: usize, probe: bool) -> bool {
         self.states

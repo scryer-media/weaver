@@ -186,6 +186,12 @@ impl LiveLeg {
             .as_ref()
             .map_or_else(Vec::new, |ladder| ladder.rung_states())
     }
+    /// For each rung, the first proxy hop on it known to be failing.
+    pub fn failing_hops(&self) -> Vec<Option<weaver_tunnel::pipe::FailingHop>> {
+        self.ladder
+            .as_ref()
+            .map_or_else(Vec::new, |ladder| ladder.failing_hops())
+    }
 }
 pub struct LiveNetworkRoute {
     pub consumer: Consumer,
@@ -458,6 +464,7 @@ impl NetworkRuntime {
                 },
                 inner,
                 timeout: profile.timeout(),
+                failure: Default::default(),
             }),
             _ => {
                 let provider: Arc<dyn TunnelProvider> = match profile.kind {
@@ -545,6 +552,7 @@ impl NetworkRuntime {
                         .map(|ip| std::net::SocketAddr::new(ip, profile.port)),
                     timeout: profile.timeout(),
                     resolver,
+                    failure: Default::default(),
                 })
             }
         };
