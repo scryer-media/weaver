@@ -44,6 +44,15 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
         .layer(Extension(auth_cache))
 }
 
+/// Password checks share one two-permit budget for the whole process, and a
+/// login that finds it busy is refused with 429 rather than queued. Tests that
+/// post a password take turns here so a neighbour's Argon2 work can never be
+/// the reason one of them is refused.
+async fn login_turn() -> tokio::sync::MutexGuard<'static, ()> {
+    static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    TURN.lock().await
+}
+
 /// The password these tests authenticate with, assembled at runtime instead of
 /// written as a literal.
 ///

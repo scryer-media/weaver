@@ -3051,6 +3051,7 @@ async fn resolve_scope_accepts_cached_api_key_without_db_lookup() {
 
 #[tokio::test]
 async fn login_handler_rejects_legacy_scrypt_hash() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     let legacy_hash =
         "$scrypt$ln=16,r=8,p=1$MDAwMDAwMDAwMDAwMDAwMA$MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
@@ -3082,6 +3083,7 @@ async fn login_handler_rejects_legacy_scrypt_hash() {
 
 #[tokio::test]
 async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     let argon2_hash = hash_password(&test_password()).unwrap();
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
@@ -3112,6 +3114,7 @@ async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
 
 #[tokio::test]
 async fn login_handler_wrong_username_with_valid_password_is_unauthorized() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     let argon2_hash = hash_password(&test_password()).unwrap();
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
@@ -3142,6 +3145,7 @@ async fn login_handler_wrong_username_with_valid_password_is_unauthorized() {
 
 #[tokio::test]
 async fn login_handler_rate_limits_repeated_failures() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     let argon2_hash = hash_password(&test_password()).unwrap();
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
@@ -3197,6 +3201,7 @@ async fn login_handler_rate_limits_repeated_failures() {
 
 #[tokio::test]
 async fn login_handler_malformed_hash_fails_cleanly() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     db.set_auth_credentials("admin", "not-a-phc-hash").unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
