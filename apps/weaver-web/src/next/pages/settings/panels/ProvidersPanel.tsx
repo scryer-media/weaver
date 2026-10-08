@@ -17,7 +17,7 @@ import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { RoutingEditor } from "../../../components/RoutingEditor";
+import { RouteView } from "../../../features/networking/RouteView";
 import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
@@ -107,6 +107,7 @@ interface ServerForm {
   quotaLimit: string;
   quotaUnit: "GB" | "TB";
   quotaResetTime: string;
+  /** The server's route as stored. It is set under Networking; here it only decides how a test leaves. */
   routing: RoutingPolicy;
   certificateDerBase64: string | null;
   certificateFingerprint: string | null;
@@ -251,10 +252,10 @@ function formToState(server: ServerDetails | Server, username: string): ServerFo
   };
 }
 
+/** A server as saved. Its route is left out: saving a server keeps the route it has. */
 function serverInput(form: ServerForm) {
   const quotaUnitBytes = form.quotaUnit === "TB" ? TIB : GIB;
   return {
-    route: policyInput(form.routing),
     host: normalizeHost(form.host),
     port: form.port,
     tls: form.tls,
@@ -443,7 +444,8 @@ export function ProvidersPanel() {
     setTestResult(null);
     setError(null);
     const session = editorSession.current;
-    const result = await testConnection({ input: serverInput(provider) });
+    // A test saves nothing, so it is told the route to leave by.
+    const result = await testConnection({ input: { ...serverInput(provider), route: policyInput(provider.routing) } });
     if (session !== editorSession.current) return;
     setTesting(false);
     setTestResult(result.data?.testConnection ? { ...(result.data.testConnection as TestResult), values: provider } : null);
@@ -709,24 +711,8 @@ export function ProvidersPanel() {
           id: "routing",
           title: t("next.providers.networkRoute"),
           tag: <BetaTag />,
-          fields: [
-            {
-              id: "routing",
-              label: t("next.providers.proxyRoute"),
-              help: t("next.providers.proxyRouteHelp"),
-              control: {
-                kind: "custom",
-                control: (
-                  <RoutingEditor
-                    consumer={typeof editingId === "number" ? `server:${editingId}` : undefined}
-                    cap={values.connections}
-                    value={values.routing}
-                    onChange={(next) => patch({ routing: next })}
-                  />
-                ),
-              },
-            },
-          ],
+          fields: [],
+          body: <RouteView consumer={typeof editingId === "number" ? `server:${editingId}` : undefined} />,
         },
       ]
     : [];

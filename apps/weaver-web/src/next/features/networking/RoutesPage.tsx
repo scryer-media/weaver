@@ -50,26 +50,6 @@ export function RoutesPage({
   const requested = new URLSearchParams(location.search).get("consumer");
   const preselected = consumers.find((consumer) => consumer.key === requested) ?? null;
   const [editing, setEditing] = useState<Consumer | null>(preselected);
-  const [route, setRoute] = useState<NetworkRoute>(preselected?.route ?? defaultRoute());
-  const [error, setError] = useState<string | null>(null);
-
-  const open = (consumer: Consumer) => {
-    setError(null);
-    setEditing(consumer);
-    setRoute(consumer.route ?? defaultRoute());
-  };
-
-  const save = async () => {
-    if (!editing) {
-      return;
-    }
-    const failure = await action(SAVE_ROUTE, { kind: editing.kind, id: editing.id, input: routeInput(route) });
-    if (failure) {
-      setError(failure);
-    } else {
-      setEditing(null);
-    }
-  };
 
   const blocks: SettingsBlock[] = [
     {
@@ -105,7 +85,7 @@ export function RoutesPage({
               label={stateLabel(t, state)}
               detail={consumer.kind === "SERVER" ? `${openCount} / ${consumer.cap}` : undefined}
             />,
-            <SecondaryButton key="edit" size="compact" onClick={() => open(consumer)} className="ml-auto">
+            <SecondaryButton key="edit" size="compact" onClick={() => setEditing(consumer)} className="ml-auto">
               {t("next.networking.routes.edit")}
             </SecondaryButton>,
           ],
@@ -114,46 +94,92 @@ export function RoutesPage({
     },
   ];
 
-  const problem = routeProblem(route);
-
   return (
     <>
       <SettingsBlocks blocks={blocks} />
       {editing ? (
-        <Dialog
-          open
-          title={t("next.networking.routes.editorTitle", { name: editing.name })}
-          note={consumerSummary(t, { ...editing, route })}
-          width={720}
-          onDismiss={() => setEditing(null)}
-          footer={
-            <>
-              <SecondaryButton onClick={() => setEditing(null)}>{t("action.cancel")}</SecondaryButton>
-              <PrimaryButton icon="save" disabled={busy || problem !== null} onClick={() => void save()}>
-                {busy ? t("settings.saving") : t("next.networking.routes.save")}
-              </PrimaryButton>
-            </>
-          }
-        >
-          <div className="px-4 py-5 sm:px-6">
-            <RouteEditor
-              value={route}
-              onChange={setRoute}
-              egresses={data.egressInterfaces}
-              profiles={data.proxyProfiles}
-              pools={data.proxyPools}
-              cap={editing.cap}
-              rss={editing.kind === "RSS"}
-              status={flow.legs.filter((leg) => leg.consumer === editing.key)}
-            />
-          </div>
-          {error ? (
-            <div role="alert" className="flex-none border-t border-wv-hairline px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
-              {error}
-            </div>
-          ) : null}
-        </Dialog>
+        <RouteDialog
+          key={editing.key}
+          data={data}
+          consumer={editing}
+          flow={flow}
+          action={action}
+          busy={busy}
+          onClose={() => setEditing(null)}
+        />
       ) : null}
     </>
+  );
+}
+
+/**
+ * One server's or feed's route in its editor, mounted while it is open. The
+ * routes table opens it, and so does a route leg or an endpoint picked in the
+ * network flow.
+ */
+export function RouteDialog({
+  data,
+  consumer,
+  flow,
+  action,
+  busy,
+  onClose,
+}: {
+  data: NetworkingData;
+  consumer: Consumer;
+  flow: NetworkFlow;
+  action: NetworkingAction;
+  busy: boolean;
+  onClose: () => void;
+}) {
+  const t = useTranslate();
+  const [route, setRoute] = useState<NetworkRoute>(consumer.route ?? defaultRoute());
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    const failure = await action(SAVE_ROUTE, { kind: consumer.kind, id: consumer.id, input: routeInput(route) });
+    if (failure) {
+      setError(failure);
+    } else {
+      onClose();
+    }
+  };
+
+  const problem = routeProblem(route);
+
+  return (
+    <Dialog
+      open
+      title={t("next.networking.routes.editorTitle", { name: consumer.name })}
+      note={consumerSummary(t, { ...consumer, route })}
+      width={720}
+      onDismiss={onClose}
+      footer={
+        <>
+          <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
+          <PrimaryButton icon="save" disabled={busy || problem !== null} onClick={() => void save()}>
+            {busy ? t("settings.saving") : t("next.networking.routes.save")}
+          </PrimaryButton>
+        </>
+      }
+    >
+      <div className="px-4 py-5 sm:px-6">
+        <RouteEditor
+          value={route}
+          onChange={setRoute}
+          egresses={data.egressInterfaces}
+          profiles={data.proxyProfiles}
+          pools={data.proxyPools}
+          cap={consumer.cap}
+          rss={consumer.kind === "RSS"}
+          status={flow.legs.filter((leg) => leg.consumer === consumer.key)}
+        />
+      </div>
+      {error ? (
+        <div role="alert" className="flex-none border-t border-wv-hairline px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
+          {error}
+        </div>
+      ) : null}
+    </Dialog>
   );
 }

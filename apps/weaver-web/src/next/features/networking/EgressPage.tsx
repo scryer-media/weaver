@@ -40,54 +40,12 @@ export function EgressPage({
 }) {
   const t = useTranslate();
   const [editing, setEditing] = useState<Egress | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState<Egress | null>(null);
-  const [testing, setTesting] = useState<Egress | null>(null);
   const kinds = data.platformNetworking.egressBindingKinds;
 
-  const open = (egress: Egress | null) => {
-    setError(null);
+  const open = (egress: Egress | null) =>
     setEditing(
       egress ?? { ...NEW_EGRESS, bindingKind: kinds.includes("INTERFACE") ? "INTERFACE" : "SOURCE_ADDRESS" },
     );
-  };
-  const patch = (next: Partial<Egress>) => setEditing((current) => (current ? { ...current, ...next } : current));
-
-  const save = async () => {
-    if (!editing) {
-      return;
-    }
-    const missing = !editing.name.trim()
-      ? t("next.networking.egress.nameRequired")
-      : editing.bindingKind === "INTERFACE" && !editing.interfaceName
-        ? t("next.networking.egress.interfaceRequired")
-        : editing.bindingKind === "SOURCE_ADDRESS" && !editing.sourceAddress?.trim()
-          ? t("next.networking.egress.sourceRequired")
-          : null;
-    if (missing) {
-      setError(missing);
-      return;
-    }
-    const failure = await action(editing.id < 0 ? CREATE_EGRESS : UPDATE_EGRESS, {
-      id: editing.id,
-      input: egressInput(editing),
-    });
-    if (failure) {
-      setError(failure);
-    } else {
-      setEditing(null);
-    }
-  };
-
-  const remove = async () => {
-    if (!deleting) {
-      return;
-    }
-    if (!(await action(DELETE_EGRESS, { id: deleting.id }))) {
-      setEditing(null);
-    }
-    setDeleting(null);
-  };
 
   const blocks: SettingsBlock[] = [
     {
@@ -144,120 +102,6 @@ export function EgressPage({
     },
   ];
 
-  const system = editing ? isSystem(editing) : false;
-  const discovered = data.discoverNetworkInterfaces;
-  const fields: FieldSpec[] = editing
-    ? [
-        {
-          id: "name",
-          label: t("next.networking.egress.name"),
-          control: system
-            ? { kind: "static", value: editing.name }
-            : { kind: "text", mono: false, value: editing.name, onChange: (name) => patch({ name }) },
-        },
-        {
-          id: "binding",
-          label: t("next.networking.egress.binding"),
-          help: t("next.networking.egress.bindingHelp"),
-          control: system
-            ? { kind: "static", value: bindingLabel(t, "SYSTEM") }
-            : {
-                kind: "select",
-                value: editing.bindingKind,
-                options: kinds
-                  .filter((kind) => kind !== "SYSTEM")
-                  .map((kind) => ({ value: kind, label: bindingLabel(t, kind) })),
-                onChange: (kind) => patch({ bindingKind: kind as Egress["bindingKind"] }),
-              },
-        },
-        ...(editing.bindingKind === "INTERFACE"
-          ? [
-              {
-                id: "interface",
-                label: t("next.networking.egress.interface"),
-                control: {
-                  kind: "select" as const,
-                  value: editing.interfaceName ?? "",
-                  className: "w-[268px] max-w-full",
-                  options: [
-                    { value: "", label: t("next.networking.egress.chooseInterface") },
-                    ...(editing.interfaceName && !discovered.some((candidate) => candidate.name === editing.interfaceName)
-                      ? [
-                          {
-                            value: editing.interfaceName,
-                            label: t("next.networking.egress.missingInterface", { name: editing.interfaceName }),
-                          },
-                        ]
-                      : []),
-                    ...discovered.map((candidate) => ({
-                      value: candidate.name,
-                      label: [
-                        candidate.name,
-                        candidate.up ? t("next.networking.egress.linkUp") : t("next.networking.egress.linkDown"),
-                        ...(candidate.addresses.length ? [candidate.addresses.join(", ")] : []),
-                      ].join(" · "),
-                    })),
-                  ],
-                  onChange: (interfaceName: string) => patch({ interfaceName }),
-                },
-              },
-            ]
-          : []),
-        ...(editing.bindingKind === "SOURCE_ADDRESS"
-          ? [
-              {
-                id: "source",
-                label: t("next.networking.egress.sourceAddress"),
-                help: data.platformNetworking.sourceAddressHint || undefined,
-                control: {
-                  kind: "custom" as const,
-                  control: (
-                    <>
-                      <TextField
-                        label={t("next.networking.egress.sourceAddress")}
-                        list="network-source-addresses"
-                        value={editing.sourceAddress ?? ""}
-                        onChange={(sourceAddress) => patch({ sourceAddress })}
-                        className="w-[268px] max-w-full"
-                      />
-                      <datalist id="network-source-addresses">
-                        {discovered.flatMap((candidate) =>
-                          candidate.addresses.map((address) => (
-                            <option key={`${candidate.name}:${address}`} value={address}>
-                              {candidate.name}
-                            </option>
-                          )),
-                        )}
-                      </datalist>
-                    </>
-                  ),
-                },
-              },
-            ]
-          : []),
-        {
-          id: "limit",
-          label: t("next.networking.egress.downloadLimit"),
-          help: t("next.networking.egress.limitHelp"),
-          control: {
-            kind: "number",
-            value: editing.maxDownloadSpeed / MIB,
-            min: 0,
-            step: 0.1,
-            precision: 1,
-            suffix: "MiB/s",
-            onChange: (limit) => patch({ maxDownloadSpeed: Math.round(limit * MIB) }),
-          },
-        },
-        {
-          id: "enabled",
-          label: t("next.networking.egress.enabled"),
-          help: system ? t("next.networking.egress.systemHelp") : undefined,
-          control: { kind: "toggle", value: editing.enabled, disabled: system, onChange: (enabled) => patch({ enabled }) },
-        },
-      ]
-    : [];
-
   return (
     <>
       <PanelControls>
@@ -267,20 +111,207 @@ export function EgressPage({
       </PanelControls>
       {data.platformNetworking.sourceAddressHint ? <Hint>{data.platformNetworking.sourceAddressHint}</Hint> : null}
       <SettingsBlocks blocks={blocks} />
+      {editing ? (
+        <EgressEditor
+          key={editing.id}
+          data={data}
+          egress={editing}
+          action={action}
+          busy={busy}
+          onClose={() => setEditing(null)}
+        />
+      ) : null}
+    </>
+  );
+}
 
+/**
+ * One egress in its editor, mounted while it is open. The egress table opens
+ * it, and so does an egress picked in the network flow. An id below zero is an
+ * egress that has not been saved yet.
+ */
+export function EgressEditor({
+  data,
+  egress,
+  action,
+  busy,
+  onClose,
+}: {
+  data: NetworkingData;
+  egress: Egress;
+  action: NetworkingAction;
+  busy: boolean;
+  onClose: () => void;
+}) {
+  const t = useTranslate();
+  const [editing, setEditing] = useState(egress);
+  const [error, setError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<Egress | null>(null);
+  const [testing, setTesting] = useState<Egress | null>(null);
+  const kinds = data.platformNetworking.egressBindingKinds;
+  const patch = (next: Partial<Egress>) => setEditing((current) => ({ ...current, ...next }));
+
+  const save = async () => {
+    const missing = !editing.name.trim()
+      ? t("next.networking.egress.nameRequired")
+      : editing.bindingKind === "INTERFACE" && !editing.interfaceName
+        ? t("next.networking.egress.interfaceRequired")
+        : editing.bindingKind === "SOURCE_ADDRESS" && !editing.sourceAddress?.trim()
+          ? t("next.networking.egress.sourceRequired")
+          : null;
+    if (missing) {
+      setError(missing);
+      return;
+    }
+    const failure = await action(editing.id < 0 ? CREATE_EGRESS : UPDATE_EGRESS, {
+      id: editing.id,
+      input: egressInput(editing),
+    });
+    if (failure) {
+      setError(failure);
+    } else {
+      onClose();
+    }
+  };
+
+  const remove = async () => {
+    if (!deleting) {
+      return;
+    }
+    const failure = await action(DELETE_EGRESS, { id: deleting.id });
+    setDeleting(null);
+    if (!failure) {
+      onClose();
+    }
+  };
+
+  const system = isSystem(editing);
+  const discovered = data.discoverNetworkInterfaces;
+  const fields: FieldSpec[] = [
+    {
+      id: "name",
+      label: t("next.networking.egress.name"),
+      control: system
+        ? { kind: "static", value: editing.name }
+        : { kind: "text", mono: false, value: editing.name, onChange: (name) => patch({ name }) },
+    },
+    {
+      id: "binding",
+      label: t("next.networking.egress.binding"),
+      help: t("next.networking.egress.bindingHelp"),
+      control: system
+        ? { kind: "static", value: bindingLabel(t, "SYSTEM") }
+        : {
+            kind: "select",
+            value: editing.bindingKind,
+            options: kinds
+              .filter((kind) => kind !== "SYSTEM")
+              .map((kind) => ({ value: kind, label: bindingLabel(t, kind) })),
+            onChange: (kind) => patch({ bindingKind: kind as Egress["bindingKind"] }),
+          },
+    },
+    ...(editing.bindingKind === "INTERFACE"
+      ? [
+          {
+            id: "interface",
+            label: t("next.networking.egress.interface"),
+            control: {
+              kind: "select" as const,
+              value: editing.interfaceName ?? "",
+              className: "w-[268px] max-w-full",
+              options: [
+                { value: "", label: t("next.networking.egress.chooseInterface") },
+                ...(editing.interfaceName && !discovered.some((candidate) => candidate.name === editing.interfaceName)
+                  ? [
+                      {
+                        value: editing.interfaceName,
+                        label: t("next.networking.egress.missingInterface", { name: editing.interfaceName }),
+                      },
+                    ]
+                  : []),
+                ...discovered.map((candidate) => ({
+                  value: candidate.name,
+                  label: [
+                    candidate.name,
+                    candidate.up ? t("next.networking.egress.linkUp") : t("next.networking.egress.linkDown"),
+                    ...(candidate.addresses.length ? [candidate.addresses.join(", ")] : []),
+                  ].join(" · "),
+                })),
+              ],
+              onChange: (interfaceName: string) => patch({ interfaceName }),
+            },
+          },
+        ]
+      : []),
+    ...(editing.bindingKind === "SOURCE_ADDRESS"
+      ? [
+          {
+            id: "source",
+            label: t("next.networking.egress.sourceAddress"),
+            help: data.platformNetworking.sourceAddressHint || undefined,
+            control: {
+              kind: "custom" as const,
+              control: (
+                <>
+                  <TextField
+                    label={t("next.networking.egress.sourceAddress")}
+                    list="network-source-addresses"
+                    value={editing.sourceAddress ?? ""}
+                    onChange={(sourceAddress) => patch({ sourceAddress })}
+                    className="w-[268px] max-w-full"
+                  />
+                  <datalist id="network-source-addresses">
+                    {discovered.flatMap((candidate) =>
+                      candidate.addresses.map((address) => (
+                        <option key={`${candidate.name}:${address}`} value={address}>
+                          {candidate.name}
+                        </option>
+                      )),
+                    )}
+                  </datalist>
+                </>
+              ),
+            },
+          },
+        ]
+      : []),
+    {
+      id: "limit",
+      label: t("next.networking.egress.downloadLimit"),
+      help: t("next.networking.egress.limitHelp"),
+      control: {
+        kind: "number",
+        value: editing.maxDownloadSpeed / MIB,
+        min: 0,
+        step: 0.1,
+        precision: 1,
+        suffix: "MiB/s",
+        onChange: (limit) => patch({ maxDownloadSpeed: Math.round(limit * MIB) }),
+      },
+    },
+    {
+      id: "enabled",
+      label: t("next.networking.egress.enabled"),
+      help: system ? t("next.networking.egress.systemHelp") : undefined,
+      control: { kind: "toggle", value: editing.enabled, disabled: system, onChange: (enabled) => patch({ enabled }) },
+    },
+  ];
+
+  return (
+    <>
       <RecordEditor
-        open={editing !== null}
-        title={editing && editing.id >= 0 ? editing.name : t("next.networking.egress.add")}
-        note={editing && editing.id >= 0 ? bindingLabel(t, editing.bindingKind) : t("next.networking.egress.newNote")}
+        open
+        title={editing.id >= 0 ? editing.name : t("next.networking.egress.add")}
+        note={editing.id >= 0 ? bindingLabel(t, editing.bindingKind) : t("next.networking.egress.newNote")}
         error={error}
         busy={busy}
         saveLabel={t("next.networking.egress.save")}
         onSave={() => void save()}
-        onDismiss={() => setEditing(null)}
-        onDelete={editing && editing.id > 0 ? () => setDeleting(editing) : undefined}
+        onDismiss={onClose}
+        onDelete={editing.id > 0 ? () => setDeleting(editing) : undefined}
         deleteLabel={t("next.networking.egress.delete")}
         extraActions={
-          editing && editing.id >= 0 ? (
+          editing.id >= 0 ? (
             <SecondaryButton icon="test" onClick={() => setTesting(editing)}>
               {t("next.networking.egress.test")}
             </SecondaryButton>

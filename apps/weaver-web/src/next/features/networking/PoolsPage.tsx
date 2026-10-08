@@ -39,44 +39,10 @@ export function PoolsPage({
 }) {
   const t = useTranslate();
   const [editing, setEditing] = useState<ProxyPool | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState<ProxyPool | null>(null);
-  const [testing, setTesting] = useState<ProxyPool | null>(null);
   const profileName = (id: number) =>
     data.proxyProfiles.find((profile) => profile.id === id)?.name ?? t("next.networking.proxyNumber", { id });
 
-  const open = (pool: ProxyPool | null) => {
-    setError(null);
-    setEditing(pool ?? NEW_POOL);
-  };
-  const patch = (next: Partial<ProxyPool>) => setEditing((current) => (current ? { ...current, ...next } : current));
-
-  const save = async () => {
-    if (!editing) {
-      return;
-    }
-    if (!editing.name.trim()) {
-      setError(t("next.networking.pools.nameRequired"));
-      return;
-    }
-    const { id, ...input } = editing;
-    const failure = await action(id < 0 ? CREATE_POOL : UPDATE_POOL, { id, input });
-    if (failure) {
-      setError(failure);
-    } else {
-      setEditing(null);
-    }
-  };
-
-  const remove = async () => {
-    if (!deleting) {
-      return;
-    }
-    if (!(await action(DELETE_POOL, { id: deleting.id }))) {
-      setEditing(null);
-    }
-    setDeleting(null);
-  };
+  const open = (pool: ProxyPool | null) => setEditing(pool ?? NEW_POOL);
 
   const blocks: SettingsBlock[] = [
     {
@@ -130,8 +96,6 @@ export function PoolsPage({
     },
   ];
 
-  const candidates = editing ? data.proxyProfiles.filter((profile) => profile.kind === editing.kind) : [];
-
   return (
     <>
       <Hint>
@@ -142,90 +106,153 @@ export function PoolsPage({
       </Hint>
       <SettingsBlocks blocks={blocks} />
       {proxies}
+      {editing ? (
+        <PoolEditor
+          key={editing.id}
+          data={data}
+          pool={editing}
+          action={action}
+          busy={busy}
+          onClose={() => setEditing(null)}
+        />
+      ) : null}
+    </>
+  );
+}
 
+/**
+ * One pool in its editor, mounted while it is open. The pools table opens it,
+ * and so does a pool picked in the network flow. An id below zero is a pool
+ * that has not been saved yet.
+ */
+export function PoolEditor({
+  data,
+  pool,
+  action,
+  busy,
+  onClose,
+}: {
+  data: NetworkingData;
+  pool: ProxyPool;
+  action: NetworkingAction;
+  busy: boolean;
+  onClose: () => void;
+}) {
+  const t = useTranslate();
+  const [editing, setEditing] = useState(pool);
+  const [error, setError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<ProxyPool | null>(null);
+  const [testing, setTesting] = useState<ProxyPool | null>(null);
+  const patch = (next: Partial<ProxyPool>) => setEditing((current) => ({ ...current, ...next }));
+
+  const save = async () => {
+    if (!editing.name.trim()) {
+      setError(t("next.networking.pools.nameRequired"));
+      return;
+    }
+    const { id, ...input } = editing;
+    const failure = await action(id < 0 ? CREATE_POOL : UPDATE_POOL, { id, input });
+    if (failure) {
+      setError(failure);
+    } else {
+      onClose();
+    }
+  };
+
+  const remove = async () => {
+    if (!deleting) {
+      return;
+    }
+    const failure = await action(DELETE_POOL, { id: deleting.id });
+    setDeleting(null);
+    if (!failure) {
+      onClose();
+    }
+  };
+
+  const candidates = data.proxyProfiles.filter((profile) => profile.kind === editing.kind);
+
+  return (
+    <>
       <RecordEditor
-        open={editing !== null}
-        title={editing && editing.id >= 0 ? editing.name : t("next.networking.pools.add")}
-        note={editing ? proxyLabels[editing.kind] : undefined}
+        open
+        title={editing.id >= 0 ? editing.name : t("next.networking.pools.add")}
+        note={proxyLabels[editing.kind]}
         error={error}
         busy={busy}
         saveLabel={t("next.networking.pools.save")}
-        saveDisabled={(editing?.memberIds.length ?? 0) < 2}
+        saveDisabled={editing.memberIds.length < 2}
         onSave={() => void save()}
-        onDismiss={() => setEditing(null)}
-        onDelete={editing && editing.id >= 0 ? () => setDeleting(editing) : undefined}
+        onDismiss={onClose}
+        onDelete={editing.id >= 0 ? () => setDeleting(editing) : undefined}
         deleteLabel={t("next.networking.pools.delete")}
         extraActions={
-          editing && editing.id >= 0 ? (
+          editing.id >= 0 ? (
             <SecondaryButton icon="test" onClick={() => setTesting(editing)}>
               {t("next.networking.pools.test")}
             </SecondaryButton>
           ) : null
         }
-        sections={
-          editing
-            ? [
-                {
-                  id: "pool",
-                  title: t("next.networking.pools.section"),
-                  fields: [
-                    {
-                      id: "name",
-                      label: t("next.networking.pools.name"),
-                      control: { kind: "text", mono: false, value: editing.name, onChange: (name) => patch({ name }) },
-                    },
-                    {
-                      id: "kind",
-                      label: t("next.networking.pools.type"),
-                      help: t("next.networking.pools.typeHelp"),
-                      control: {
-                        kind: "select",
-                        value: editing.kind,
-                        options: Object.entries(proxyLabels).map(([value, label]) => ({ value, label })),
-                        onChange: (kind) => patch({ kind: kind as ProxyKind, memberIds: [] }),
-                      },
-                    },
-                    {
-                      id: "members",
-                      label: t("next.networking.pools.members"),
-                      help: t("next.networking.pools.membersHelp"),
-                      control: {
-                        kind: "custom",
-                        control: candidates.length ? (
-                          <div role="group" aria-label={t("next.networking.pools.members")} className="flex w-[268px] max-w-full flex-col gap-[10px]">
-                            {candidates.map((profile) => (
-                              <CheckRow
-                                key={profile.id}
-                                label={profile.name}
-                                detail={profile.enabled ? undefined : t("next.networking.disabled")}
-                                checked={editing.memberIds.includes(profile.id)}
-                                onChange={(checked) =>
-                                  patch({
-                                    memberIds: checked
-                                      ? [...editing.memberIds, profile.id]
-                                      : editing.memberIds.filter((id) => id !== profile.id),
-                                  })
-                                }
-                              />
-                            ))}
-                          </div>
-                        ) : (
-                          <span className="w-[268px] max-w-full text-[12.5px] text-wv-muted">
-                            {t("next.networking.pools.noCandidates", { kind: proxyLabels[editing.kind] })}
-                          </span>
-                        ),
-                      },
-                    },
-                    {
-                      id: "enabled",
-                      label: t("next.networking.pools.enabled"),
-                      control: { kind: "toggle", value: editing.enabled, onChange: (enabled) => patch({ enabled }) },
-                    },
-                  ],
+        sections={[
+          {
+            id: "pool",
+            title: t("next.networking.pools.section"),
+            fields: [
+              {
+                id: "name",
+                label: t("next.networking.pools.name"),
+                control: { kind: "text", mono: false, value: editing.name, onChange: (name) => patch({ name }) },
+              },
+              {
+                id: "kind",
+                label: t("next.networking.pools.type"),
+                help: t("next.networking.pools.typeHelp"),
+                control: {
+                  kind: "select",
+                  value: editing.kind,
+                  options: Object.entries(proxyLabels).map(([value, label]) => ({ value, label })),
+                  onChange: (kind) => patch({ kind: kind as ProxyKind, memberIds: [] }),
                 },
-              ]
-            : []
-        }
+              },
+              {
+                id: "members",
+                label: t("next.networking.pools.members"),
+                help: t("next.networking.pools.membersHelp"),
+                control: {
+                  kind: "custom",
+                  control: candidates.length ? (
+                    <div role="group" aria-label={t("next.networking.pools.members")} className="flex w-[268px] max-w-full flex-col gap-[10px]">
+                      {candidates.map((profile) => (
+                        <CheckRow
+                          key={profile.id}
+                          label={profile.name}
+                          detail={profile.enabled ? undefined : t("next.networking.disabled")}
+                          checked={editing.memberIds.includes(profile.id)}
+                          onChange={(checked) =>
+                            patch({
+                              memberIds: checked
+                                ? [...editing.memberIds, profile.id]
+                                : editing.memberIds.filter((id) => id !== profile.id),
+                            })
+                          }
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="w-[268px] max-w-full text-[12.5px] text-wv-muted">
+                      {t("next.networking.pools.noCandidates", { kind: proxyLabels[editing.kind] })}
+                    </span>
+                  ),
+                },
+              },
+              {
+                id: "enabled",
+                label: t("next.networking.pools.enabled"),
+                control: { kind: "toggle", value: editing.enabled, onChange: (enabled) => patch({ enabled }) },
+              },
+            ],
+          },
+        ]}
       />
 
       <ConfirmDialog

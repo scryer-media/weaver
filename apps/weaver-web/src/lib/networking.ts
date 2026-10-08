@@ -5,7 +5,9 @@ export type Leg = { egressId: number; weight: number; path: { kind: "DIRECT" | "
 export type NetworkRoute = { legs: Leg[]; failover: "REDISTRIBUTE" | "HOLD" };
 export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; maxDownloadSpeed: number; health: string; reason: string | null };
 export type ProxyPool = { id: number; name: string; kind: ProxyKind; memberIds: number[]; enabled: boolean };
-export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: number; target: number; open: number; opening: number; state: string; reason: string | null; pinnedAddress: string | null; sourceAddress?:string|null;bytesPerSecond?:number;selectedRung?:number|null;selectedProxyId?:number|null };
+export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: number; target: number; open: number; opening: number; state: string; reason: string | null; pinnedAddress: string | null; sourceAddress?:string|null;bytesPerSecond?:number;selectedRung?:number|null;selectedProxyId?:number|null;failingHops?:FailingHop[] };
+/** The first proxy hop on a ladder rung known to be failing, and what its last attempt came to. */
+export type FailingHop = { rung: number; proxyId: number; reason: string };
 export type PoolMemberFlow = { state?:string; id: number; open: number; opening: number; warmed: boolean; blocked: string | null; handshakeMs: number | null; connectMs: number | null; bytesPerSecond: number | null; samples: number; failures: number };
 export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:"SERVER"|"RSS";cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] }[] };
 export const directLeg = (): Leg => ({ egressId: 0, weight: 100, path: { kind: "DIRECT", rungs: [], directFallback: false } });

@@ -10,11 +10,11 @@ import { WV } from "../../data/palette";
 /**
  * How the networking screens say what state something is in.
  *
- * Egresses, route legs, ladder rungs and pool members each report their own
- * vocabulary of states, but a reader only needs five answers: carrying
- * traffic, finding out, holding back, broken, or doing nothing. Every state
- * maps to one of those tones, and every tone is a square plus a word, so no
- * state is told by colour or by a glyph alone.
+ * Egresses, route legs, ladder rungs, chain hops and pool members each report
+ * their own vocabulary of states, but a reader only needs five answers:
+ * carrying traffic, finding out, holding back, broken, or doing nothing. Every
+ * state maps to one of those tones, and every tone is a square plus a word, so
+ * no state is told by colour or by a glyph alone.
  */
 export type NetworkTone = "ok" | "busy" | "warn" | "bad" | "idle";
 
@@ -86,6 +86,10 @@ export function stateLabel(t: Translate, state: string): string {
       return t("next.networking.state.ready");
     case "UNMEASURED":
       return t("next.networking.state.unmeasured");
+    case "DISABLED":
+      return t("next.networking.state.disabled");
+    case "UNREACHED":
+      return t("next.networking.state.unreached");
     default: {
       const words = state.toLowerCase().replace(/_/g, " ");
       return words.charAt(0).toUpperCase() + words.slice(1);

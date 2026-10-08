@@ -205,25 +205,158 @@ export function ProxiesPanel() {
   const [{ data, fetching }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
     query: PROXY_PROFILES_QUERY,
   });
-  const [, saveProxy] = useMutation(SAVE_PROXY_MUTATION);
-  const [, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
-  const [, resetTrust] = useMutation(RESET_PROXY_TRUST_MUTATION);
   const [, testProxy] = useMutation(TEST_PROXY_MUTATION);
 
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
-  const [form, setForm] = useState<ProxyForm>(NEW_PROXY);
-  const [configText, setConfigText] = useState("");
-  const [note, setNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   const [health, setHealth] = useState<Record<number, string>>({});
-  const [confirmRemove, setConfirmRemove] = useState<ProxyProfile | null>(null);
-  const [confirmTrust, setConfirmTrust] = useState<ProxyProfile | null>(null);
 
   const profiles = data?.proxyProfiles ?? [];
   const editing = typeof editingId === "number"
     ? (profiles.find((profile) => profile.id === editingId) ?? null)
     : null;
+
+  const runTest = async (profile: ProxyProfile) => {
+    setHealth((current) => ({ ...current, [profile.id]: t("next.proxies.testing") }));
+    const result = await testProxy({ id: profile.id });
+    const outcome = result.data?.testProxyProfile;
+    setHealth((current) => ({
+      ...current,
+      [profile.id]: outcome ? (outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")))
+        : (result.error?.message ?? t("next.proxies.failed")),
+    }));
+  };
+
+  const blocks: SettingsBlock[] = [
+    {
+      kind: "table",
+      id: "proxies",
+      title: t("next.settings.panel.proxies"),
+      tag: <BetaTag />,
+      note: t("next.proxies.tableNote"),
+      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 82px",
+      headers: [
+        t("next.proxies.name"),
+        t("next.proxies.type"),
+        t("next.proxies.endpoint"),
+        t("next.proxies.lastTest"),
+        "",
+      ],
+      empty: t("next.proxies.empty"),
+      emptyAction: { label: t("next.proxies.add"), onClick: () => setEditingId("new") },
+      onRowClick: (id) => {
+        const profile = profiles.find((entry) => String(entry.id) === id);
+        if (profile) {
+          setEditingId(profile.id);
+        }
+      },
+      rows: profiles.map((profile) => ({
+        id: String(profile.id),
+        searchText: `${profile.name} ${proxyLabels[profile.kind]} ${profile.host}`,
+        cells: [
+          <span key="name" className="flex min-w-0 items-center gap-[10px]">
+            <Square color={profile.enabled ? WV.accent : WV.inert} />
+            <span className="min-w-0 truncate">{profile.name}</span>
+          </span>,
+          <Cell key="kind" className="text-wv-secondary">
+            {proxyLabels[profile.kind]}
+          </Cell>,
+          <Cell key="host" mono className="text-wv-muted">
+            {profile.host}:{profile.port}
+          </Cell>,
+          <Cell key="health" mono className="text-wv-muted">
+            {health[profile.id] ?? "—"}
+          </Cell>,
+          <span key="test" onClick={(event) => event.stopPropagation()}>
+            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
+              {t("next.proxies.test")}
+            </SecondaryButton>
+          </span>,
+        ],
+      })),
+    },
+  ];
+
+  return (
+    <>
+      <PanelControls>
+        <PrimaryButton icon="add" onClick={() => setEditingId("new")}>{t("next.proxies.add")}</PrimaryButton>
+      </PanelControls>
+
+      <BetaNotice>{t("next.proxies.betaNotice")}</BetaNotice>
+
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
+
+      {editingId === null ? null : (
+        <ProxyEditor
+          key={editingId}
+          id={editingId}
+          profile={editing}
+          onClose={() => setEditingId(null)}
+          onChanged={() => void reexecute({ requestPolicy: "network-only" })}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * A stored proxy's editor, opened by its id from outside the proxies table:
+ * a proxy picked in the network flow. It reads the profiles itself, because
+ * an editor needs more of a profile than a diagram does.
+ */
+export function ProxyEditorFor({
+  id,
+  onClose,
+  onChanged,
+}: {
+  id: number;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [{ data }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({ query: PROXY_PROFILES_QUERY });
+  const profile = data?.proxyProfiles.find((candidate) => candidate.id === id);
+  return profile ? (
+    <ProxyEditor
+      id={id}
+      profile={profile}
+      onClose={onClose}
+      onChanged={() => {
+        void reexecute({ requestPolicy: "network-only" });
+        onChanged();
+      }}
+    />
+  ) : null;
+}
+
+/**
+ * One proxy in its editor, mounted while it is open: a stored profile's, or a
+ * new one's.
+ */
+export function ProxyEditor({
+  id: editingId,
+  profile: editing,
+  onClose,
+  onChanged,
+}: {
+  id: number | "new";
+  /** The stored profile, or null for a proxy that has not been saved yet. */
+  profile: ProxyProfile | null;
+  onClose: () => void;
+  /** A save, a removal, or a forgotten host key has landed. */
+  onChanged: () => void;
+}) {
+  const t = useTranslate();
+  const [, saveProxy] = useMutation(SAVE_PROXY_MUTATION);
+  const [, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
+  const [, resetTrust] = useMutation(RESET_PROXY_TRUST_MUTATION);
+
+  const [form, setForm] = useState<ProxyForm>(() => (editing ? formFor(editing) : NEW_PROXY));
+  const [configText, setConfigText] = useState("");
+  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState<ProxyProfile | null>(null);
+  const [confirmTrust, setConfirmTrust] = useState<ProxyProfile | null>(null);
 
   const patch = (next: Partial<ProxyForm>) => setForm((current) => ({ ...current, ...next }));
   const setSecret = (key: SecretKey, value: string) =>
@@ -290,14 +423,6 @@ export function ProxiesPanel() {
   };
   const storedHelp = (key: SecretKey) =>
     form.secrets[key] === null ? t("next.proxies.storedCleared") : t("next.proxies.storedKeep");
-
-  const open = (profile: ProxyProfile | null) => {
-    setError(null);
-    setNote(null);
-    setConfigText("");
-    setForm(profile ? formFor(profile) : NEW_PROXY);
-    setEditingId(profile ? profile.id : "new");
-  };
 
   /**
    * Fill the form from a pasted `wg-quick` file.
@@ -374,19 +499,8 @@ export function ProxiesPanel() {
       setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
       return;
     }
-    setEditingId(null);
-    void reexecute({ requestPolicy: "network-only" });
-  };
-
-  const runTest = async (profile: ProxyProfile) => {
-    setHealth((current) => ({ ...current, [profile.id]: t("next.proxies.testing") }));
-    const result = await testProxy({ id: profile.id });
-    const outcome = result.data?.testProxyProfile;
-    setHealth((current) => ({
-      ...current,
-      [profile.id]: outcome ? (outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")))
-        : (result.error?.message ?? t("next.proxies.failed")),
-    }));
+    onClose();
+    onChanged();
   };
 
   const isWireguard = form.kind === "WIRE_GUARD";
@@ -606,68 +720,10 @@ export function ProxiesPanel() {
     },
   ];
 
-  const blocks: SettingsBlock[] = [
-    {
-      kind: "table",
-      id: "proxies",
-      title: t("next.settings.panel.proxies"),
-      tag: <BetaTag />,
-      note: t("next.proxies.tableNote"),
-      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 82px",
-      headers: [
-        t("next.proxies.name"),
-        t("next.proxies.type"),
-        t("next.proxies.endpoint"),
-        t("next.proxies.lastTest"),
-        "",
-      ],
-      empty: t("next.proxies.empty"),
-      emptyAction: { label: t("next.proxies.add"), onClick: () => open(null) },
-      onRowClick: (id) => {
-        const profile = profiles.find((entry) => String(entry.id) === id);
-        if (profile) {
-          open(profile);
-        }
-      },
-      rows: profiles.map((profile) => ({
-        id: String(profile.id),
-        searchText: `${profile.name} ${proxyLabels[profile.kind]} ${profile.host}`,
-        cells: [
-          <span key="name" className="flex min-w-0 items-center gap-[10px]">
-            <Square color={profile.enabled ? WV.accent : WV.inert} />
-            <span className="min-w-0 truncate">{profile.name}</span>
-          </span>,
-          <Cell key="kind" className="text-wv-secondary">
-            {proxyLabels[profile.kind]}
-          </Cell>,
-          <Cell key="host" mono className="text-wv-muted">
-            {profile.host}:{profile.port}
-          </Cell>,
-          <Cell key="health" mono className="text-wv-muted">
-            {health[profile.id] ?? "—"}
-          </Cell>,
-          <span key="test" onClick={(event) => event.stopPropagation()}>
-            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
-              {t("next.proxies.test")}
-            </SecondaryButton>
-          </span>,
-        ],
-      })),
-    },
-  ];
-
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>{t("next.proxies.add")}</PrimaryButton>
-      </PanelControls>
-
-      <BetaNotice>{t("next.proxies.betaNotice")}</BetaNotice>
-
-      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
-
       <RecordEditor
-        open={editingId !== null}
+        open
         title={editingId === "new" ? t("next.proxies.add") : (editing?.name ?? t("next.proxies.proxy"))}
         note={
           <span className="inline-flex items-center gap-2">
@@ -680,7 +736,7 @@ export function ProxiesPanel() {
         error={error}
         busy={busy}
         onSave={() => void save()}
-        onDismiss={() => setEditingId(null)}
+        onDismiss={onClose}
         onDelete={editing ? () => setConfirmRemove(editing) : undefined}
         deleteLabel={t("next.proxies.remove")}
         extraActions={
@@ -728,8 +784,8 @@ export function ProxiesPanel() {
           if (confirmRemove) {
             void deleteProxy({ id: confirmRemove.id }).then(() => {
               setConfirmRemove(null);
-              setEditingId(null);
-              void reexecute({ requestPolicy: "network-only" });
+              onClose();
+              onChanged();
             });
           }
         }}
@@ -747,7 +803,7 @@ export function ProxiesPanel() {
           if (confirmTrust) {
             void resetTrust({ id: confirmTrust.id }).then(() => {
               setConfirmTrust(null);
-              void reexecute({ requestPolicy: "network-only" });
+              onChanged();
             });
           }
         }}
