@@ -633,5 +633,156 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
     assert!(lower.retire_idle().await);
     assert_eq!(budget.available_permits(), 2);
 
+    // Stopping the upper session leaves the one beneath it alone: that
+    // session belongs to whoever built it and may serve other routes.
     upper.shutdown().await;
+    let mut direct = lower
+        .dial(&Target {
+            host: TEST_PEER_ADDRESS.to_string(),
+            port: TEST_PEER_HTTP_PORT,
+            purpose: Purpose::Probe,
+            addresses: Vec::new(),
+        })
+        .await
+        .expect("the session beneath outlives the one it carried");
+    direct
+        .stream
+        .write_all(b"GET /near HTTP/1.1\r\nHost: origin\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    direct.stream.read_to_end(&mut answer).await.unwrap();
+    assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 200"));
+    drop(direct);
+    lower.shutdown().await;
+}
+
+/// A WireGuard session over `inner`, as the runtime builds one, with its
+/// own budget.
+fn wireguard_session(
+    id: u32,
+    provider: Arc<dyn TunnelProvider>,
+    resolver: Arc<crate::WireGuardTunnelProvider>,
+    inner: Arc<dyn Dialer>,
+    proxies: Vec<u32>,
+    budget: usize,
+) -> Arc<SessionHop> {
+    Arc::new(SessionHop {
+        capacity: SessionCapacity::new(Arc::new(tokio::sync::Semaphore::new(budget))),
+        activity: Default::default(),
+        id,
+        provider,
+        inner,
+        transport: None,
+        path: DialPath {
+            egress: 4,
+            proxies,
+            ..Default::default()
+        },
+        endpoint: None,
+        timeout: Duration::from_secs(30),
+        resolver: Some(resolver),
+    })
+}
+
+/// A WireGuard hop stacked on `lower`, aimed at an address inside it.
+fn carried_by(lower: &Arc<SessionHop>, spec: crate::WireGuardSpec) -> Arc<SessionHop> {
+    let carrier = lower
+        .clone()
+        .datagrams()
+        .expect("a WireGuard session carries datagrams");
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(spec, Arc::new(crate::NoopTunnelObserver))
+            .with_datagram_transport(carrier),
+    );
+    wireguard_session(2, provider.clone(), provider, lower.clone(), vec![1], 1)
+}
+
+fn probe_target() -> Target {
+    Target {
+        host: crate::test_support::TEST_PEER_ADDRESS.to_string(),
+        port: crate::test_support::TEST_PEER_HTTP_PORT,
+        purpose: Purpose::Probe,
+        addresses: Vec::new(),
+    }
+}
+
+/// The session beneath has no budget left: the stacked hop is skipped, as
+/// the session beneath would be, and nothing counts against the hop above.
+#[tokio::test]
+async fn an_exhausted_budget_beneath_a_carried_hop_is_a_skip_not_its_failure() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let lower_provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let lower = wireguard_session(
+        1,
+        lower_provider.clone(),
+        lower_provider,
+        bottom(),
+        vec![],
+        0,
+    );
+    let upper = carried_by(&lower, near.client_spec("2"));
+
+    let error = match upper.dial(&probe_target()).await {
+        Ok(_) => panic!("no budget beneath, no tunnel above"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, DialError::Skipped(_)), "{error:?}");
+    assert!(!error.is_path_evidence());
+    // The hop above never took a permit of its own for a tunnel it could
+    // not bring up.
+    assert_eq!(
+        upper.capacity.budget.as_ref().unwrap().available_permits(),
+        1
+    );
+}
+
+/// The session beneath fails its handshake: the failure is that hop's, and
+/// the hop stacked on it is not blamed.
+#[tokio::test]
+async fn a_failed_handshake_beneath_a_carried_hop_is_attributed_to_the_hop_beneath() {
+    struct Unreachable;
+    #[async_trait::async_trait]
+    impl TunnelProvider for Unreachable {
+        async fn prepare(&self) -> Result<(), TunnelError> {
+            Err(TunnelError::WireGuardConnect {
+                host: "vpn.example.test".into(),
+                port: 51820,
+                detail: "the peer did not complete a handshake".into(),
+            })
+        }
+        async fn dial(&self, _: &str, _: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            unreachable!("the session beneath never came up")
+        }
+        fn describe(&self) -> String {
+            "unreachable fixture".into()
+        }
+    }
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let resolver = Arc::new(crate::WireGuardTunnelProvider::new(
+        near.client_spec("1"),
+        Arc::new(crate::NoopTunnelObserver),
+    ));
+    let lower = wireguard_session(1, Arc::new(Unreachable), resolver, bottom(), vec![], 1);
+    let upper = carried_by(&lower, near.client_spec("2"));
+
+    for error in [
+        upper.dial(&probe_target()).await.err().expect("dial fails"),
+        upper.prepare().await.expect_err("prepare fails"),
+        upper
+            .resolve("origin.tunnel.test")
+            .await
+            .expect_err("resolve fails"),
+    ] {
+        assert!(
+            matches!(error, DialError::Hop { proxy: 1, .. }),
+            "{error:?}"
+        );
+    }
 }

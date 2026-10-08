@@ -469,3 +469,53 @@ fn a_route_may_stack_wireguard_only_on_wireguard() {
         "{error}"
     );
 }
+
+#[test]
+fn a_wireguard_proxy_is_saved_on_only_one_path_per_egress() {
+    use base64::Engine;
+    let key = |seed: u8| base64::engine::general_purpose::STANDARD.encode([seed; 32]);
+    let db = Database::open_in_memory().unwrap();
+    for id in 2..=3 {
+        db.save_proxy_profile(&ProxyProfile {
+            kind: ProxyKind::WireGuard,
+            host: "wg.example".into(),
+            port: 51820,
+            tunnel_addresses: vec!["10.63.0.2/32".into()],
+            peer_public_key: Some(key(id as u8 + 10)),
+            secrets: ProxySecrets {
+                private_key: Some(key(id as u8)),
+                ..Default::default()
+            },
+            ..profile(id)
+        })
+        .unwrap();
+    }
+    let ladder = |rung: Rung| RoutingPolicy {
+        legs: vec![RouteLeg {
+            egress_id: 0,
+            weight: 100,
+            path: LegPath::Ladder {
+                rungs: vec![rung],
+                direct_fallback: false,
+            },
+        }],
+        ..Default::default()
+    };
+    let first = crate::proxies::Consumer::Server(1);
+    let second = crate::proxies::Consumer::Server(2);
+    db.save_proxy_routing_policy(first, &ladder(Rung::Chain { ids: vec![2, 3] }))
+        .unwrap();
+    // The chain's lower hop used directly is the same session.
+    db.save_proxy_routing_policy(second, &ladder(Rung::Proxy { id: 2 }))
+        .unwrap();
+    // Its upper hop used directly as well would be a second session to the
+    // same server under the same key.
+    let error = db
+        .save_proxy_routing_policy(second, &ladder(Rung::Proxy { id: 3 }))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("WireGuard proxy 3 is used on egress 0 by two different paths"),
+        "{error}"
+    );
+}

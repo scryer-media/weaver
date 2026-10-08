@@ -480,9 +480,8 @@ impl Dialer for TransportHop {
     fn budget(&self) -> Duration {
         self.inner.budget().saturating_add(self.timeout)
     }
-    async fn shutdown(&self) {
-        self.inner.shutdown().await;
-    }
+    // No shutdown: a stream proxy hop holds nothing of its own, and the
+    // stage beneath belongs to whoever built it.
     fn describe(&self) -> String {
         format!("{} → proxy {}", self.inner.describe(), self.id)
     }
@@ -639,9 +638,31 @@ pub struct SessionHop {
     pub resolver: Option<Arc<crate::WireGuardTunnelProvider>>,
 }
 
+impl SessionHop {
+    /// A WireGuard hop carried by the WireGuard session beneath it.
+    fn is_carried(&self) -> bool {
+        self.resolver.is_some() && !self.path.proxies.is_empty()
+    }
+
+    /// Bring the session beneath a carried hop up first. Its exhausted budget
+    /// or failed handshake then surfaces as its own error, attributed to it,
+    /// instead of as a failure of this hop's tunnel to come up.
+    async fn prepare_carrier(&self) -> Result<(), DialError> {
+        if !self.is_carried() {
+            return Ok(());
+        }
+        tokio::time::timeout(self.inner.budget(), self.inner.prepare())
+            .await
+            .map_err(|_| DialError::Timeout {
+                stage: self.inner.describe(),
+            })?
+    }
+}
+
 #[async_trait::async_trait]
 impl Dialer for SessionHop {
     async fn prepare(&self) -> Result<(), DialError> {
+        self.prepare_carrier().await?;
         let activity = self.activity.read().await;
         let capacity = self.capacity.acquire()?;
         let result = self
@@ -671,11 +692,12 @@ impl Dialer for SessionHop {
         }
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        let started = tokio::time::Instant::now();
+        self.prepare_carrier().await?;
         let activity = self.activity.clone().read_owned().await;
         let capacity = self.capacity.acquire()?;
         let outcome = Arc::new(ConnectionOutcome::default());
         let destinations = target.hop_destinations();
-        let started = tokio::time::Instant::now();
         let mut connected = Err(DialError::Skipped("no destination".into()));
         for (index, destination) in destinations.iter().enumerate() {
             // Reserve part of the remaining budget for every other address.
@@ -733,6 +755,7 @@ impl Dialer for SessionHop {
         })
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.prepare_carrier().await?;
         let _activity = self.activity.read().await;
         let _capacity = self.capacity.acquire()?;
         match &self.resolver {
@@ -752,10 +775,12 @@ impl Dialer for SessionHop {
     fn budget(&self) -> Duration {
         self.inner.budget().saturating_add(self.timeout)
     }
+    /// Stops this hop's own session only. The stage beneath may be another
+    /// session shared with other routes, or one a probe runtime borrowed;
+    /// whoever owns it shuts it down.
     async fn shutdown(&self) {
         self.provider.shutdown().await;
         self.capacity.release();
-        self.inner.shutdown().await;
     }
     fn describe(&self) -> String {
         format!("{} → proxy {}", self.inner.describe(), self.id)

@@ -33,8 +33,53 @@ struct Configuration {
     pools: HashMap<u32, ProxyPool>,
     policies: HashMap<String, RoutingPolicy>,
     warnings: HashMap<(String, usize), String>,
+    /// The MTU each WireGuard session needs for the tunnels stacked on it,
+    /// by egress and session path. Planned from every saved route.
+    wireguard_needs: HashMap<(u32, Vec<u32>), u16>,
 }
 impl Configuration {
+    fn plan_wireguard_mtus(&mut self) {
+        let routes: Vec<_> = self
+            .policies
+            .iter()
+            .filter(|(consumer, _)| self.consumers.contains(*consumer))
+            .map(|(_, policy)| policy.route())
+            .collect();
+        self.wireguard_needs = wireguard_mtu_needs(
+            &wireguard_sessions(&routes, &self.profiles, &self.pools),
+            &self.profiles,
+        );
+    }
+    /// The MTU the WireGuard session for `path` on `egress` runs at, or
+    /// `None` when its own hop is not WireGuard.
+    fn wireguard_mtu(&self, egress: u32, path: &[u32]) -> Option<u16> {
+        let profile = self.profiles.get(path.last()?)?;
+        (profile.kind == ProxyKind::WireGuard).then(|| {
+            effective_wireguard_mtu(
+                profile,
+                self.wireguard_needs.get(&(egress, path.to_vec())).copied(),
+            )
+        })
+    }
+    /// Why the top of a stacked WireGuard chain runs below the minimum MTU,
+    /// if it does: the auto-raised MTU of the tunnels beneath is capped.
+    fn carried_mtu_warning(&self, egress: u32, ids: &[u32]) -> Option<String> {
+        let mut hops = Vec::new();
+        for (position, id) in ids.iter().enumerate() {
+            let Some(mtu) = self.wireguard_mtu(egress, &ids[..=position]) else {
+                break;
+            };
+            hops.push((mtu, &self.profiles[id]));
+        }
+        let mtu = carried_chain_mtu(&hops).filter(|_| hops.len() > 1)?;
+        (mtu < CARRIED_WIREGUARD_MTU).then(|| {
+            format!(
+                "WireGuard proxy {} runs at an MTU of {mtu}, below 1280, because the uplink cannot carry {} stacked WireGuard tunnels at full size.",
+                ids[hops.len() - 1],
+                hops.len()
+            )
+        })
+    }
     fn load(db: &Database) -> Result<Self, String> {
         let mut configuration = Self {
             warnings: HashMap::new(),
@@ -74,7 +119,9 @@ impl Configuration {
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .collect(),
+            wireguard_needs: HashMap::new(),
         };
+        configuration.plan_wireguard_mtus();
         for (consumer, policy) in &mut configuration.policies {
             for (position, leg) in policy.legs.iter_mut().enumerate() {
                 if !configuration.egresses.contains_key(&leg.egress_id) {
@@ -367,9 +414,18 @@ impl NetworkRuntime {
         };
         let mut ids = prefix.to_vec();
         ids.push(id);
+        // A session is rebuilt when any hop up to it changes, including the
+        // MTU a WireGuard hop is raised to for the tunnels stacked on it.
         let revisions: Vec<_> = ids
             .iter()
-            .map(|id| (*id, config.profiles.get(id).map(|p| p.revision)))
+            .enumerate()
+            .map(|(position, id)| {
+                (
+                    *id,
+                    config.profiles.get(id).map(|p| p.revision),
+                    config.wireguard_mtu(bottom.id, &ids[..=position]),
+                )
+            })
             .collect();
         let key = format!("{}:{:?}:{revisions:?}", bottom.id, bottom.binding);
         let mut sessions = self.sessions.lock().expect("network sessions");
@@ -418,10 +474,9 @@ impl NetworkRuntime {
                         )
                     }
                     ProxyKind::WireGuard => {
-                        let provider = WireGuardTunnelProvider::new(
-                            profile.wireguard_spec().map_err(|e| e.to_string())?,
-                            observer,
-                        );
+                        let mut spec = profile.wireguard_spec().map_err(|e| e.to_string())?;
+                        spec.mtu = config.wireguard_mtu(bottom.id, &ids).unwrap_or(spec.mtu);
+                        let provider = WireGuardTunnelProvider::new(spec, observer);
                         let provider = match prefix.last() {
                             None => provider.with_udp_factory(bottom.clone()),
                             // A WireGuard tunnel rides only on another
@@ -579,6 +634,7 @@ impl NetworkRuntime {
         let bottom = Self::bottom(config, leg.egress_id, timeout)?;
         let mut address_plan = None;
         let mut ladder = None;
+        let mut warning = None;
         let mut versions = Vec::new();
         let mut pool_versions = Vec::new();
         let stage: Arc<dyn Dialer> = match &leg.path {
@@ -602,7 +658,11 @@ impl NetworkRuntime {
                 for rung in rungs {
                     stages.push(match rung {
                         Rung::Proxy { id } => {
-                            versions.push((*id, config.profiles.get(id).map(|p| p.revision)));
+                            versions.push((
+                                *id,
+                                config.profiles.get(id).map(|p| p.revision),
+                                config.wireguard_mtu(leg.egress_id, &[*id]),
+                            ));
                             self.hop(config, *id, bottom.clone(), bottom.clone(), &[])?
                         }
                         Rung::Pool { id } => {
@@ -612,14 +672,21 @@ impl NetworkRuntime {
                                 versions.push((
                                     *member,
                                     config.profiles.get(member).map(|p| p.revision),
+                                    config.wireguard_mtu(leg.egress_id, &[*member]),
                                 ));
                             }
                             self.pool(config, *id, bottom.clone())?
                         }
                         Rung::Chain { ids } => {
+                            warning =
+                                warning.or_else(|| config.carried_mtu_warning(leg.egress_id, ids));
                             let mut stage: Arc<dyn Dialer> = bottom.clone();
                             for (index, id) in ids.iter().enumerate() {
-                                versions.push((*id, config.profiles.get(id).map(|p| p.revision)));
+                                versions.push((
+                                    *id,
+                                    config.profiles.get(id).map(|p| p.revision),
+                                    config.wireguard_mtu(leg.egress_id, &ids[..=index]),
+                                ));
                                 stage =
                                     self.hop(config, *id, stage, bottom.clone(), &ids[..index])?;
                             }
@@ -646,7 +713,11 @@ impl NetworkRuntime {
         );
         Ok(LiveLeg {
             definition: leg.clone(),
-            warning: config.warnings.get(&(consumer.key(), position)).cloned(),
+            warning: config
+                .warnings
+                .get(&(consumer.key(), position))
+                .cloned()
+                .or(warning),
             stage: Arc::new(Revocable::new(stage)),
             address_plan,
             ladder,
@@ -741,7 +812,8 @@ impl NetworkRuntime {
         self.refresh_health();
         Ok(())
     }
-    fn apply_configuration(&self, next: Configuration) -> Result<(), String> {
+    fn apply_configuration(&self, mut next: Configuration) -> Result<(), String> {
+        next.plan_wireguard_mtus();
         // Route lookups must see configuration and compiled paths from the same reload.
         let mut configuration = self.configuration.write().expect("network configuration");
         let mut staging = Self {
