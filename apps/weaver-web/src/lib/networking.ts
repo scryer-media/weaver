@@ -14,15 +14,17 @@ export function routeInput(route: NetworkRoute) {
     path: leg.path.kind === "DIRECT" ? { direct: true } : { ladder: { directFallback: leg.path.directFallback, rungs: leg.path.rungs.map(r => r.kind === "PROXY" ? { proxy: r.proxyId } : r.kind === "POOL" ? { pool: r.poolId } : { chain: r.chainIds }) } },
   })) };
 }
-export function routeProblem(route: NetworkRoute): string | null {
-  if (!route.legs.length || route.legs.length > 8) return "Use between one and eight legs.";
-  if (route.legs.some(l => !Number.isInteger(l.weight) || l.weight < 1 || l.weight > 100) || route.legs.reduce((sum,l) => sum+l.weight,0) !== 100) return "Leg weights must be whole percentages and add up to 100%.";
+/** Why a route cannot be saved, as a code the interface words for itself. */
+export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain";
+export function routeProblem(route: NetworkRoute): RouteProblem | null {
+  if (!route.legs.length || route.legs.length > 8) return "legCount";
+  if (route.legs.some(l => !Number.isInteger(l.weight) || l.weight < 1 || l.weight > 100) || route.legs.reduce((sum,l) => sum+l.weight,0) !== 100) return "weights";
   for (const leg of route.legs) {
     if (leg.path.kind === "DIRECT") continue;
-    if (!leg.path.rungs.length || leg.path.rungs.length > 8) return "A ladder needs one to eight rungs.";
+    if (!leg.path.rungs.length || leg.path.rungs.length > 8) return "rungCount";
     for (const rung of leg.path.rungs) {
-      if (rung.kind === "PROXY" && !rung.proxyId || rung.kind === "POOL" && !rung.poolId) return "Choose a proxy or pool for every rung.";
-      if (rung.kind === "CHAIN" && (rung.chainIds.length < 2 || rung.chainIds.length > 3 || new Set(rung.chainIds).size !== rung.chainIds.length)) return "A chain needs two or three distinct proxies.";
+      if (rung.kind === "PROXY" && !rung.proxyId || rung.kind === "POOL" && !rung.poolId) return "rungTarget";
+      if (rung.kind === "CHAIN" && (rung.chainIds.length < 2 || rung.chainIds.length > 3 || new Set(rung.chainIds).size !== rung.chainIds.length)) return "chain";
     }
   }
   return null;

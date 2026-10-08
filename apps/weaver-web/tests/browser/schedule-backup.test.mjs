@@ -4,7 +4,7 @@ import { createServer } from "vite";
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright");
 let server, browser, baseUrl;
 before(async () => {
-  server = await createServer({ server: { host: "127.0.0.1", port: 0 } });
+  server = await createServer({ cacheDir: "node_modules/.vite/browser-schedule-backup", server: { host: "127.0.0.1", port: 0 } });
   await server.listen();
   baseUrl = `http://127.0.0.1:${server.httpServer.address().port}`;
   browser = await chromium.launch({ headless: true });

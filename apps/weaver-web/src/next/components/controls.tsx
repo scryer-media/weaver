@@ -474,6 +474,7 @@ export function TextField({
   autoComplete,
   autoFocus,
   secret,
+  list,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -482,6 +483,8 @@ export function TextField({
   className?: string;
   mono?: boolean;
   type?: "text" | "password" | "url";
+  /** The id of a `<datalist>` of suggestions; the field then reads as a combobox. */
+  list?: string;
   /** Keep password managers out. Defaults to on for a password that is not the Weaver login. */
   secret?: boolean;
   onBlur?: () => void;
@@ -500,6 +503,7 @@ export function TextField({
       {...(ignoredByPasswordManagers({ secret, type, autoComplete }) ? PASSWORD_MANAGER_IGNORE : null)}
       autoFocus={autoFocus}
       type={type}
+      list={list}
       aria-label={label}
       placeholder={placeholder}
       value={value}
@@ -560,7 +564,7 @@ export function Slider({
 /* --------------------------------------------------------------- number box */
 
 /**
- * A whole-number box.
+ * A number box, whole unless `precision` asks for decimal places.
  *
  * Kept as text while focused so a field can be cleared and retyped — a number
  * input that snaps an empty string back to 0 is unusable — and clamped on blur.
@@ -579,6 +583,7 @@ export function NumberField({
   suffix,
   className,
   disabled,
+  precision = 0,
 }: {
   value: number;
   onChange: (next: number) => void;
@@ -589,6 +594,8 @@ export function NumberField({
   suffix?: string;
   className?: string;
   disabled?: boolean;
+  /** Decimal places the committed value keeps. */
+  precision?: number;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
 
@@ -598,7 +605,8 @@ export function NumberField({
       setDraft(null);
       return;
     }
-    let next = Math.round(parsed);
+    const scale = 10 ** precision;
+    let next = Math.round(parsed * scale) / scale;
     if (min !== undefined) next = Math.max(min, next);
     if (max !== undefined) next = Math.min(max, next);
     onChange(next);

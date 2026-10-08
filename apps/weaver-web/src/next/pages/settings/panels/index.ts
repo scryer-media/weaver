@@ -80,7 +80,7 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
   {slug:"networking/egress",group:"networking",label:"settings.networkEgress",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
   {slug:"networking/proxies",group:"networking",label:"settings.proxies",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
   {slug:"networking/routes",group:"networking",label:"settings.networkRoutes",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
-  {slug:"networking/bandwidth",group:"networking",label:"settings.bandwidth",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
+  {slug:"networking/bandwidth",group:"networking",label:"next.settings.panel.bandwidth",note:"settings.networkingDesc",icon:"proxies",Component:NetworkingPanel},
   {
     slug: "schedules",
     label: "next.settings.panel.schedules",

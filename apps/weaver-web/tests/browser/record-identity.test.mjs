@@ -9,6 +9,7 @@ let server, browser, baseUrl;
 const RUNNER_BOUND = { timeout: 10 * 60_000 };
 before(async () => {
   server = await createServer({
+    cacheDir: "node_modules/.vite/browser-record-identity",
     server: { host: "127.0.0.1", port: 0 },
     plugins: [{ name: "record-identity-fixture", enforce: "pre", load(id) {
       // Keep the actual pages and urql hooks; omit unrelated application chrome.
