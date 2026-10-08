@@ -11,6 +11,8 @@ export type FailingHop = { rung: number; proxyId: number; reason: string };
 export type PoolMemberFlow = { state?:string; id: number; open: number; opening: number; warmed: boolean; blocked: string | null; handshakeMs: number | null; connectMs: number | null; bytesPerSecond: number | null; samples: number; failures: number };
 export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:"SERVER"|"RSS";cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] }[] };
 export const directLeg = (): Leg => ({ egressId: 0, weight: 100, path: { kind: "DIRECT", rungs: [], directFallback: false } });
+/** A path nothing can take: a ladder with no rung on it and no going direct. It is how a kill switch is stored. */
+export const closedPath = (path: Leg["path"]) => path.kind === "LADDER" && !path.rungs.length && !path.directFallback;
 export function routeInput(route: NetworkRoute) {
   return { failover: route.failover, legs: route.legs.map(leg => ({ egressId: leg.egressId, weight: leg.weight,
     path: leg.path.kind === "DIRECT" ? { direct: true } : { ladder: { directFallback: leg.path.directFallback, rungs: leg.path.rungs.map(r => r.kind === "PROXY" ? { proxy: r.proxyId } : r.kind === "POOL" ? { pool: r.poolId } : { chain: r.chainIds }) } },

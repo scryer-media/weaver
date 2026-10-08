@@ -13,7 +13,7 @@ import {
   UPDATE_RSS_RULE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import type { RoutingPolicy, RoutingStatus } from "@/lib/proxies";
+import { blockedRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
@@ -122,6 +122,11 @@ interface FeedForm {
   clearPassword: boolean;
   defaultCategory: string;
   metadata: string;
+  /**
+   * A new feed only: save it switched off behind a route nothing can take, so
+   * it cannot poll before its route is set under Networking.
+   */
+  killSwitch: boolean;
 }
 
 interface RuleForm {
@@ -150,6 +155,7 @@ const NEW_FEED: FeedForm = {
   clearPassword: false,
   defaultCategory: NO_CATEGORY,
   metadata: "",
+  killSwitch: false,
 };
 
 const NEW_RULE: Omit<RuleForm, "feedId"> = {
@@ -337,6 +343,7 @@ export function RssPanel() {
             clearPassword: false,
             defaultCategory: feed.defaultCategory ?? NO_CATEGORY,
             metadata: metadataText(feed.defaultMetadata),
+            killSwitch: false,
           }
         : NEW_FEED,
     );
@@ -395,7 +402,11 @@ export function RssPanel() {
     };
     setBusy(true);
     const result =
-      feedId === "new" ? await addFeed({ input }) : await updateFeed({ id: feedId, input });
+      feedId === "new"
+        ? await addFeed({
+            input: feedForm.killSwitch ? { ...input, enabled: false, routing: blockedRouting } : input,
+          })
+        : await updateFeed({ id: feedId, input });
     setBusy(false);
     if (result.error) {
       setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
@@ -637,7 +648,8 @@ export function RssPanel() {
           help: t("next.rss.enabledHelp"),
           control: {
             kind: "toggle",
-            value: feedForm.enabled,
+            value: feedForm.enabled && !feedForm.killSwitch,
+            disabled: feedForm.killSwitch,
             onChange: (next) => patchFeed({ enabled: next }),
           },
         },
@@ -729,8 +741,24 @@ export function RssPanel() {
       id: "routing",
       title: t("next.providers.networkRoute"),
       tag: <BetaTag />,
-      fields: [],
-      body: <RouteView consumer={editingFeed ? `rss:${editingFeed.id}` : undefined} />,
+      fields:
+        feedId === "new"
+          ? [
+              {
+                id: "killSwitch",
+                label: t("next.networking.killSwitch"),
+                help: t("next.rss.killSwitchHelp"),
+                control: {
+                  kind: "toggle",
+                  value: feedForm.killSwitch,
+                  onChange: (next) => patchFeed({ killSwitch: next }),
+                },
+              },
+            ]
+          : [],
+      body: (
+        <RouteView consumer={editingFeed ? `rss:${editingFeed.id}` : undefined} killSwitch={feedForm.killSwitch} />
+      ),
     },
   ];
 

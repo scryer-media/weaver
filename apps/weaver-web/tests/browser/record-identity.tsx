@@ -6,6 +6,7 @@ import { fromValue, make, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { ProvidersPanel } from "@/next/pages/settings/panels/ProvidersPanel";
+import { RssPanel } from "@/next/pages/settings/panels/RssPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
 import { JobDetailPage } from "@/next/pages/JobDetailPage";
 import { DirectoryBrowserDialog } from "@/next/features/DirectoryBrowserDialog";
@@ -22,6 +23,9 @@ const servers = [1, 2].map((id) => ({ id, host: `provider-${id}.example`, userna
   retentionDays: 0, maxDownloadSpeed: 0, downloadQuota: quota,
   routing: { proxyIds: [], allowDirect: true },
   tlsNameMismatchCertificateDerBase64: null, tlsNameMismatchCertificateFingerprint: null }));
+// A provider saved behind a kill switch and not given a route since, as its route reads back.
+servers.push({ ...servers[0], id: 3, host: "provider-3.example", username: "account-3", active: false, priority: 1,
+  routing: { failover: "REDISTRIBUTE", legs: [{ egressId: 0, weight: 100, path: { kind: "LADDER", directFallback: false, rungs: [] } }] } as never });
 function snapshot(id: number) {
   return { queueItem: null, historyItem: { id, name: `Job-${id}`, displayTitle: `Job-${id}`,
     originalTitle: `Job-${id}`, status: "COMPLETED", progressPercent: 100, totalBytes: 100,
@@ -45,7 +49,8 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
     const id = Number(variables.id ?? variables.jobId ?? 1);
     const data = name === "Server" ? { server: servers.find((server) => server.id === id) }
       : name === "UpdateServer" ? { updateServer: { ...servers[id - 1], ...variables.input as object } }
-      : name === "AddServer" ? { addServer: { ...servers[0], ...variables.input as object, id: 3 } }
+      : name === "AddServer" ? { addServer: { ...servers[0], ...variables.input as object, id: 4 } }
+      : name === "AddRssFeed" ? { addRssFeed: { id: 1, rules: [], ...variables.input as object } }
       : name === "TestConnection" ? { testConnection: { success: false, message: "Result for provider 1", latencyMs: null,
           adoptableTlsNameMismatchCertificate: { derBase64: "old-certificate", sha256Fingerprint: "old-fingerprint", names: ["provider-1.example"] } } }
       : name === "BrowseDirectories" ? { browseDirectories: listing(String(variables.path)) }
@@ -56,7 +61,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
       : name === "DuplicateSnapshot" ? { duplicateSnapshot: null }
       : name === "Networking" ? { egressInterfaces: [{ id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, addresses: [], enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null }], proxyProfiles: [], proxyPools: [], servers: [], rssFeeds: [], discoverNetworkInterfaces: [], platformNetworking: { platform: "fixture", egressBindingKinds: ["SYSTEM"], sourceAddressHint: null, container: false, bridgeNetworkSuspected: false, maxWireguardInstances: 1, notes: [] } }
       : name === "NetworkFlow" || name === "NetworkFlowUpdates" ? { networkFlow: { legs: [], sampledAt: 1767225600, consumers: [], proxies: [], proxyPools: [], egresses: [], pools: [] } }
-      : { servers, proxies: [], categories: [], schedules: [], generalSettings: {} };
+      : { servers, proxies: [], categories: [], schedules: [], generalSettings: {}, rssFeeds: [], rssSeenItems: [] };
     // Real urql hooks receive no new result until the test explicitly delivers it.
     if (held.has(name) || (id === 2 && ["Server", "Job", "JobDetailUpdates", "JobOutputFiles", "DuplicateSnapshot"].includes(name))) {
       return make<OperationResult>((observer) => {
@@ -101,7 +106,7 @@ function Fixture() {
     return <DirectoryBrowserDialog open={folder !== null} initialPath={folder} onClose={() => setFolder(null)} onChoose={choose} />;
   }
   if (screen === "jobs") return <Routes><Route path="/jobs/:id" element={<JobDetailPage />} /></Routes>;
-  return <SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} controlsHost={document.getElementById("controls")}><ProvidersPanel /></SettingsShellProvider>;
+  return <SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} controlsHost={document.getElementById("controls")}>{screen === "feeds" ? <RssPanel /> : <ProvidersPanel />}</SettingsShellProvider>;
 }
 createRoot(document.getElementById("root")!).render(
   <Provider value={client}><TranslateContext.Provider value={{

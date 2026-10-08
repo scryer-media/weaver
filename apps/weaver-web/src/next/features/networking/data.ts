@@ -5,6 +5,7 @@ import { NETWORK_FLOW_QUERY, NETWORK_FLOW_SUBSCRIPTION, NETWORKING_QUERY } from 
 import { useTranslate } from "@/lib/context/translate-context";
 import {
   allocation,
+  closedPath,
   directLeg,
   type Egress,
   type NetworkFlow,
@@ -85,6 +86,9 @@ export function flowConsumers(measured: NetworkFlow, data: NetworkingData | unde
  * The flow with a leg for every leg these consumers' routes have. One the
  * daemon has not sampled stands idle at the share its weight would give it,
  * so a route that has never carried traffic still shows where it would go.
+ *
+ * A leg behind a kill switch is blocked whatever was sampled: until something
+ * dials through it the daemon knows only that its egress is up.
  */
 export function plannedFlow(measured: NetworkFlow, consumers: Consumer[]): NetworkFlow {
   return {
@@ -95,20 +99,22 @@ export function plannedFlow(measured: NetworkFlow, consumers: Consumer[]): Netwo
         route.legs.map((leg) => leg.weight),
         consumer.cap,
       );
-      return route.legs.map(
-        (leg, position) =>
-          measured.legs.find((sample) => sample.consumer === consumer.key && sample.position === position) ?? {
-            ...leg,
-            consumer: consumer.key,
-            position,
-            target: targets[position] ?? 0,
-            open: 0,
-            opening: 0,
-            state: "IDLE",
-            reason: null,
-            pinnedAddress: null,
-          },
-      );
+      return route.legs.map((leg, position) => {
+        const sampled = measured.legs.find(
+          (sample) => sample.consumer === consumer.key && sample.position === position,
+        ) ?? {
+          ...leg,
+          consumer: consumer.key,
+          position,
+          target: targets[position] ?? 0,
+          open: 0,
+          opening: 0,
+          state: "IDLE",
+          reason: null,
+          pinnedAddress: null,
+        };
+        return closedPath(sampled.path) ? { ...sampled, state: "BLOCKED" } : sampled;
+      });
     }),
   };
 }

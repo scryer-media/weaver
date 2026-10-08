@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
-import type {
-  Egress,
-  FailingHop,
-  LegFlow,
-  NetworkFlow as Flow,
-  NetworkRoute,
-  PoolMemberFlow,
-  ProxyPool,
-  Rung,
+import {
+  closedPath,
+  type Egress,
+  type FailingHop,
+  type LegFlow,
+  type NetworkFlow as Flow,
+  type NetworkRoute,
+  type PoolMemberFlow,
+  type ProxyPool,
+  type Rung,
 } from "@/lib/networking";
 import { proxyLabels, type ProxyProfile } from "@/lib/proxies";
 import { EmptyState } from "../../components/chrome";
@@ -67,10 +68,10 @@ const FULL: Lanes = {
  */
 const COMPACT: Lanes = {
   EGRESS: lane(8, 154),
-  LEGS: lane(186, 236),
-  PROXY: lane(446, 270),
+  LEGS: lane(186, 246),
+  PROXY: lane(456, 270),
   ENDPOINTS: null,
-  WIDTH: 724,
+  WIDTH: 734,
   HOP_GAP: 14,
 };
 const LEG_HEIGHT = 64;
@@ -343,7 +344,8 @@ function HopBox({
  * chain is its hops in order with a `>` between them, and a pool lists its
  * members. Every rung has a line in from its leg and out to the endpoint,
  * whether or not it is the one carrying the leg. Going direct has no box:
- * the line crosses the lane untouched.
+ * the line crosses the lane untouched. A leg behind a kill switch has no rung
+ * and may not go direct, so the kill switch is the box its line stops at.
  *
  * Every box wears its state as a bar down its left edge, and says what is
  * wrong with it inside itself. Pointing at a box lights the routes through
@@ -439,12 +441,14 @@ export function NetworkFlow({
       });
       // Direct has no box: its line crosses level with the leg, or beneath the ladder it backs up.
       const bypass = leg.path.kind === "DIRECT" ? LEG_HEIGHT / 2 : leg.path.directFallback ? bottom + 26 : null;
+      // A kill switch stands where the ladder's first rung would.
+      const closed = closedPath(leg.path);
       const note = leg.reason ? wrap(leg.reason, lanes.LEGS.width - 28, 9.5, 2) : [];
       const cardHeight = LEG_HEIGHT + noteHeight(note.length);
       const y = offset;
-      const height = Math.max(cardHeight, bypass == null ? bottom - 8 : bypass + 16);
+      const height = Math.max(cardHeight, closed ? BOX_HEIGHT : bypass == null ? bottom - 8 : bypass + 16);
       offset += height + 18;
-      return { leg, y, height, cardHeight, note, blocks, bypass };
+      return { leg, y, height, cardHeight, note, blocks, bypass, closed };
     });
     const bottom = Math.max(offset - 16, used.length * 128 + 38, compact ? 0 : consumers.length * 144 + 38);
     return { rows, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
@@ -735,7 +739,7 @@ export function NetworkFlow({
             </text>
           ))}
 
-          {layout.rows.map(({ leg, y, blocks, bypass }) => {
+          {layout.rows.map(({ leg, y, blocks, bypass, closed }) => {
             const egressY = 112 + Math.max(0, used.findIndex((egress) => egress.id === leg.egressId)) * 128;
             const consumerY = 120 + Math.max(0, consumers.findIndex((consumer) => consumer.key === leg.consumer)) * 144;
             const legY = y + LEG_HEIGHT / 2;
@@ -756,6 +760,7 @@ export function NetworkFlow({
                 status: rungStatus(leg, block.rungIndex, false),
               })),
               ...(bypass == null ? [] : [{ at: y + bypass, boxed: false, status: rungStatus(leg, blocks.length, true) }]),
+              ...(closed ? [{ at: y + BOX_HEIGHT / 2, boxed: true, status: "BLOCKED" }] : []),
             ];
             const taken = ways.find((way) => way.status === "ACTIVE") ?? ways[leg.selectedRung ?? 0] ?? ways[0];
             const lines: { points: Point[]; carries: boolean; color: string; lit: boolean }[] = [
@@ -929,11 +934,32 @@ export function NetworkFlow({
             );
           })}
 
-          {layout.rows.map(({ leg, y, blocks, bypass }) => {
+          {layout.rows.map(({ leg, y, blocks, bypass, closed }) => {
             const status = rungStatus(leg, blocks.length, true);
             return (
               <g key={`proxies:${legKey(leg)}`}>
                 {blocks.map((block) => rungBlock(leg, y, block))}
+                {closed ? (
+                  <g
+                    opacity={onWay(leg, 0) ? undefined : FADE}
+                    {...point({ kind: "way", key: legKey(leg), index: 0 })}
+                  >
+                    {card(
+                      { kind: "route", consumer: leg.consumer },
+                      routePage(leg.consumer),
+                      <HopBox
+                        x={PROXY.x}
+                        y={y}
+                        width={PROXY.width}
+                        title={t("next.networking.killSwitch")}
+                        state="BLOCKED"
+                        label={`${stateLabel(t, "BLOCKED")} · ${t("next.networking.flow.killSwitchNote")}`}
+                        active={false}
+                      />,
+                      t("next.networking.flow.openKillSwitch", { name: consumerName(leg) }),
+                    )}
+                  </g>
+                ) : null}
                 {bypass == null ? null : (
                   <g opacity={onWay(leg, blocks.length) ? undefined : FADE}>
                     <StateText

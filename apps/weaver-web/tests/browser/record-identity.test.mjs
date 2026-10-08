@@ -79,6 +79,131 @@ test(`add after edit starts blank`, RUNNER_BOUND, async () => {
   } finally { await page.close(); }
 });
 
+const SAVE = /^(Save|Save Changes|Save changes)$/;
+const toggle = (page, name) => page.getByRole("switch", { name, exact: true });
+/** With `RECORD_SCREENSHOT` set to a `.png` path, the editor as it stands is saved beside it. */
+async function shot(page, name) {
+  if (process.env.RECORD_SCREENSHOT) await page.screenshot({ path: process.env.RECORD_SCREENSHOT.replace(/\.png$/, `-${name}.png`) });
+}
+const sent = (page, name) => page.evaluate((n) => window.recordFixture.mutations.filter((m) => m.name === n).map((m) => m.variables), name);
+
+test("a kill switch saves a new provider switched off behind a blocked route, untested", RUNNER_BOUND, async () => {
+  const page = await open();
+  try {
+    await page.getByRole("button", { name: "Add provider", exact: true }).click();
+    await host(page).fill("held-provider.example");
+    const enabled = toggle(page, "Enabled");
+    const killSwitch = toggle(page, "Kill switch");
+    const testConnection = page.getByRole("button", { name: "Test connection", exact: true });
+    assert.equal(await enabled.getAttribute("aria-checked"), "true");
+    assert.equal(await killSwitch.getAttribute("aria-checked"), "false");
+    await page.getByText(/^Starts on the direct route/).waitFor();
+
+    await killSwitch.click();
+    await page.getByText(/^Starts with nothing allowed out/).waitFor();
+    assert.equal(await enabled.getAttribute("aria-checked"), "false");
+    assert.equal(await enabled.isDisabled(), true);
+    assert.equal(await testConnection.isDisabled(), true);
+
+    // Taking the kill switch back off gives the provider back as it was filled in.
+    await killSwitch.click();
+    await page.getByText(/^Starts on the direct route/).waitFor();
+    assert.equal(await enabled.getAttribute("aria-checked"), "true");
+    assert.equal(await enabled.isDisabled(), false);
+    assert.equal(await testConnection.isDisabled(), false);
+
+    await killSwitch.click();
+    await shot(page, "provider-kill-switch");
+    await page.getByRole("button", { name: SAVE }).click();
+    await page.waitForFunction(() => window.recordFixture.mutations.some((m) => m.name === "AddServer"));
+    const [{ input }] = await sent(page, "AddServer");
+    assert.equal(input.host, "held-provider.example");
+    assert.equal(input.active, false);
+    assert.deepEqual(input.routing, { proxyIds: [], allowDirect: false });
+    assert.equal("route" in input, false);
+    assert.deepEqual(await sent(page, "TestConnection"), []);
+  } finally { await page.close(); }
+});
+
+test("a new provider without the kill switch is saved as filled in, on the default route", RUNNER_BOUND, async () => {
+  const page = await open();
+  try {
+    await page.getByRole("button", { name: "Add provider", exact: true }).click();
+    await host(page).fill("open-provider.example");
+    await page.getByRole("button", { name: SAVE }).click();
+    await page.waitForFunction(() => window.recordFixture.mutations.some((m) => m.name === "AddServer"));
+    const [{ input }] = await sent(page, "AddServer");
+    assert.equal(input.active, true);
+    assert.equal("routing" in input, false);
+    assert.equal("route" in input, false);
+  } finally { await page.close(); }
+});
+
+test("a saved provider has no kill switch to set, and is tested by the route it has", RUNNER_BOUND, async () => {
+  const page = await open();
+  try {
+    const testConnection = page.getByRole("button", { name: "Test connection", exact: true });
+    await edit(page, 3);
+    await host(page).waitFor();
+    assert.equal(await toggle(page, "Kill switch").count(), 0);
+    assert.equal(await toggle(page, "Enabled").isDisabled(), false);
+    const tested = (count) => page.waitForFunction((n) => window.recordFixture.mutations.filter((m) => m.name === "TestConnection").length === n, count);
+    await testConnection.click();
+    await tested(1);
+    await cancel(page);
+    await edit(page, 1);
+    await host(page).waitFor();
+    await testConnection.click();
+    await tested(2);
+    const [held, direct] = await sent(page, "TestConnection");
+    // Behind a kill switch the test is told so: left unsaid, it would go direct.
+    assert.deepEqual(held.input.routing, { proxyIds: [], allowDirect: false });
+    assert.equal("route" in held.input, false);
+    assert.deepEqual(direct.input.route, { failover: "REDISTRIBUTE", legs: [{ egressId: 0, weight: 100, path: { direct: true } }] });
+    assert.equal("routing" in direct.input, false);
+  } finally { await page.close(); }
+});
+
+test("a kill switch saves a new feed switched off behind a blocked route", RUNNER_BOUND, async () => {
+  const page = await open("feeds");
+  try {
+    await page.getByRole("button", { name: "Add feed", exact: true }).first().click();
+    await page.getByLabel("Name", { exact: true }).fill("Held feed");
+    await page.getByLabel("URL", { exact: true }).fill("https://feed.example/rss");
+    const enabled = toggle(page, "Enabled");
+    const killSwitch = toggle(page, "Kill switch");
+    assert.equal(await enabled.getAttribute("aria-checked"), "true");
+    await page.getByText(/^Starts on the direct route/).waitFor();
+    await killSwitch.click();
+    await page.getByText(/^Starts with nothing allowed out/).waitFor();
+    assert.equal(await enabled.getAttribute("aria-checked"), "false");
+    assert.equal(await enabled.isDisabled(), true);
+    await shot(page, "feed-kill-switch");
+    await page.getByRole("button", { name: SAVE }).click();
+    await page.waitForFunction(() => window.recordFixture.mutations.some((m) => m.name === "AddRssFeed"));
+    const [{ input }] = await sent(page, "AddRssFeed");
+    assert.equal(input.name, "Held feed");
+    assert.equal(input.enabled, false);
+    assert.deepEqual(input.routing, { proxyIds: [], allowDirect: false });
+    assert.equal("route" in input, false);
+  } finally { await page.close(); }
+});
+
+test("a new feed without the kill switch is saved as filled in, on the default route", RUNNER_BOUND, async () => {
+  const page = await open("feeds");
+  try {
+    await page.getByRole("button", { name: "Add feed", exact: true }).first().click();
+    await page.getByLabel("Name", { exact: true }).fill("Open feed");
+    await page.getByLabel("URL", { exact: true }).fill("https://feed.example/rss");
+    await page.getByRole("button", { name: SAVE }).click();
+    await page.waitForFunction(() => window.recordFixture.mutations.some((m) => m.name === "AddRssFeed"));
+    const [{ input }] = await sent(page, "AddRssFeed");
+    assert.equal(input.enabled, true);
+    assert.equal("routing" in input, false);
+    assert.equal("route" in input, false);
+  } finally { await page.close(); }
+});
+
 test(`a late connection test cannot attach its certificate to a reopened editor`, RUNNER_BOUND, async () => {
   const page = await open();
   try {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { allocation, directLeg, routeInput, routeProblem, routeTargets, adjustWeight, appendLeg, removeLeg } from "../src/lib/networking.ts";
-import { policyAsRoute, policyInput } from "../src/lib/proxies.ts";
+import { blockedRouting, policyAsRoute, routeFields } from "../src/lib/proxies.ts";
 
 test("apportionment uses largest remainders with stable positional ties",()=>{
   assert.deepEqual(allocation([60,30,10],50),[30,15,5]);
@@ -18,9 +18,11 @@ test("full route serialization preserves pools chains egress and failover withou
 });
 test("legacy direct and blocked routes preserve their meaning",()=>{
   assert.deepEqual(policyAsRoute({proxyIds:[],allowDirect:true}).legs,[directLeg()]);
-  const blocked={proxyIds:[],allowDirect:false};
-  assert.equal(policyAsRoute(blocked).legs[0]!.path.kind,"LADDER");
-  assert.equal(policyInput(blocked),undefined);
+  assert.equal(policyAsRoute(blockedRouting).legs[0]!.path.kind,"LADDER");
+  // A route cannot say that nothing leaves, so a blocked one is named the older way, however it was read.
+  assert.deepEqual(routeFields(blockedRouting),{routing:{proxyIds:[],allowDirect:false}});
+  assert.deepEqual(routeFields({...blockedRouting,...policyAsRoute(blockedRouting)}),{routing:{proxyIds:[],allowDirect:false}});
+  assert.deepEqual(routeFields({proxyIds:[4],allowDirect:true}),{route:{failover:"REDISTRIBUTE",legs:[{egressId:0,weight:100,path:{ladder:{directFallback:true,rungs:[{proxy:4}]}}}]}});
   assert.ok(routeProblem({legs:[{...directLeg(),weight:99}],failover:"REDISTRIBUTE"}));
 });
 
