@@ -22,3 +22,6 @@ tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-th
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time", "test-util"] }
+
+[patch."https://github.com/scryer-media/proxy-tunnels.git"]
+proxy-tunnels = { path = "../../../proxy-tunnels/.worktrees/wg-over-wg" }

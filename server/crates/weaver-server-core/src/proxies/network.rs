@@ -37,13 +37,15 @@ pub(super) fn wireguard_session_budget() -> std::sync::Arc<tokio::sync::Semaphor
         .clone()
 }
 
-pub fn validate_instance_budget(
+/// Every WireGuard session `routes` need, named by its egress and the hops
+/// up to and including it. A WireGuard hop stacked on another is its own
+/// session, apart from the same proxy directly on the egress.
+pub fn wireguard_sessions(
     routes: &[Route],
     profiles: &HashMap<u32, ProxyProfile>,
     pools: &HashMap<u32, ProxyPool>,
-    limit: usize,
-) -> Result<(), String> {
-    let mut instances = HashSet::new();
+) -> HashSet<(u32, Vec<u32>)> {
+    let mut sessions = HashSet::new();
     for route in routes {
         for leg in &route.legs {
             if let LegPath::Ladder { rungs, .. } = &leg.path {
@@ -56,17 +58,33 @@ pub fn validate_instance_budget(
                             .filter(|pool| pool.enabled)
                             .map_or(&[][..], |pool| pool.member_ids.as_slice()),
                     };
-                    for id in ids {
+                    let chained = matches!(rung, Rung::Chain { .. });
+                    for (position, id) in ids.iter().enumerate() {
                         if profiles.get(id).is_some_and(|profile| {
                             profile.enabled && profile.kind == ProxyKind::WireGuard
                         }) {
-                            instances.insert((leg.egress_id, *id));
+                            let path = if chained {
+                                ids[..=position].to_vec()
+                            } else {
+                                vec![*id]
+                            };
+                            sessions.insert((leg.egress_id, path));
                         }
                     }
                 }
             }
         }
     }
+    sessions
+}
+
+pub fn validate_instance_budget(
+    routes: &[Route],
+    profiles: &HashMap<u32, ProxyProfile>,
+    pools: &HashMap<u32, ProxyPool>,
+    limit: usize,
+) -> Result<(), String> {
+    let instances = wireguard_sessions(routes, profiles, pools);
     if instances.len() > limit {
         return Err(format!(
             "routes require {} WireGuard instances × 516 MiB = {} MiB; this host permits {limit} instances (available memory / 4 / 516 MiB, clamped to 1–8). Pool members count individually.",
@@ -75,6 +93,122 @@ pub fn validate_instance_budget(
         ));
     }
     Ok(())
+}
+
+/// A WireGuard server keeps one endpoint per peer key, so one profile may
+/// run only one session per egress: used directly and also stacked on
+/// another WireGuard proxy, or stacked on two different ones, its two
+/// sessions would keep taking the endpoint from each other.
+pub fn validate_wireguard_paths(
+    routes: &[Route],
+    profiles: &HashMap<u32, ProxyProfile>,
+    pools: &HashMap<u32, ProxyPool>,
+) -> Result<(), String> {
+    let mut paths: HashMap<(u32, u32), Vec<Vec<u32>>> = HashMap::new();
+    for (egress, path) in wireguard_sessions(routes, profiles, pools) {
+        let id = *path.last().expect("a session path names its own hop");
+        paths.entry((egress, id)).or_default().push(path);
+    }
+    let mut conflicts: Vec<_> = paths
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .collect();
+    conflicts.sort();
+    if let Some(((egress, id), mut paths)) = conflicts.into_iter().next() {
+        paths.sort();
+        let paths = paths
+            .iter()
+            .map(|path| {
+                path.iter()
+                    .map(|id| format!("proxy {id}"))
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            })
+            .collect::<Vec<_>>()
+            .join(" and ");
+        return Err(format!(
+            "WireGuard proxy {id} is used on egress {egress} by two different paths ({paths}); a WireGuard server accepts one connection per key, so a WireGuard proxy may reach the egress by only one path"
+        ));
+    }
+    Ok(())
+}
+
+/// The MTU a carried WireGuard tunnel is sized to get: WireGuard's and
+/// IPv6's minimum.
+pub const CARRIED_WIREGUARD_MTU: u16 = 1280;
+/// The most a WireGuard tunnel's MTU is raised to carry the tunnels stacked
+/// on it: WireGuard's usual MTU on a 1500-byte link.
+pub const MAX_RAISED_WIREGUARD_MTU: u16 = 1420;
+
+/// What one packet of `upper`, carried inside the tunnel beneath, costs that
+/// tunnel: WireGuard's 32 bytes, UDP's 8 and the IP header to its endpoint.
+/// A name may resolve to IPv6, so only an IPv4 address counts as IPv4.
+pub fn carried_overhead(upper: &ProxyProfile) -> u16 {
+    let ipv4 = upper
+        .host
+        .trim()
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_ipv4());
+    if ipv4 { 60 } else { 80 }
+}
+
+/// The MTU each WireGuard session in `sessions` needs so that every tunnel
+/// stacked on it gets [`CARRIED_WIREGUARD_MTU`]. A carried tunnel's MTU is
+/// what the tunnel beneath leaves once its headers are added, rounded down
+/// to WireGuard's 16-byte padding block, so the tunnel beneath needs the
+/// upper need rounded up to that block plus the upper hop's overhead. A
+/// session nothing stacks on needs [`CARRIED_WIREGUARD_MTU`].
+pub fn wireguard_mtu_needs(
+    sessions: &HashSet<(u32, Vec<u32>)>,
+    profiles: &HashMap<u32, ProxyProfile>,
+) -> HashMap<(u32, Vec<u32>), u16> {
+    let mut ordered: Vec<_> = sessions.iter().cloned().collect();
+    // Longest paths first, so each upper need is final before it is used.
+    ordered.sort_by_key(|(_, path)| std::cmp::Reverse(path.len()));
+    let mut needs: HashMap<(u32, Vec<u32>), u16> = ordered
+        .iter()
+        .map(|session| (session.clone(), CARRIED_WIREGUARD_MTU))
+        .collect();
+    for (egress, path) in ordered {
+        let [beneath @ .., upper] = path.as_slice() else {
+            continue;
+        };
+        if beneath.is_empty() {
+            continue;
+        }
+        let Some(profile) = profiles.get(upper) else {
+            continue;
+        };
+        let carried = needs[&(egress, path.clone())]
+            .next_multiple_of(16)
+            .saturating_add(carried_overhead(profile));
+        let lower = needs
+            .entry((egress, beneath.to_vec()))
+            .or_insert(CARRIED_WIREGUARD_MTU);
+        *lower = (*lower).max(carried);
+    }
+    needs
+}
+
+/// The MTU a WireGuard session runs at: the profile's own, raised to what the
+/// tunnels stacked on it need, but never past [`MAX_RAISED_WIREGUARD_MTU`].
+pub fn effective_wireguard_mtu(profile: &ProxyProfile, need: Option<u16>) -> u16 {
+    profile.mtu.max(
+        need.unwrap_or(CARRIED_WIREGUARD_MTU)
+            .min(MAX_RAISED_WIREGUARD_MTU),
+    )
+}
+
+/// The MTU the top of a WireGuard chain is left with, given each hop's
+/// session MTU from the bottom up: each carried tunnel gets the smaller of
+/// its own MTU and what the one beneath leaves, rounded down to 16.
+pub fn carried_chain_mtu(hops: &[(u16, &ProxyProfile)]) -> Option<u16> {
+    let mut hops = hops.iter();
+    let mut mtu = hops.next()?.0;
+    for (own, profile) in hops {
+        mtu = (*own).min(mtu.saturating_sub(carried_overhead(profile)) & !15);
+    }
+    Some(mtu)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,11 +462,19 @@ impl Route {
                                 .into(),
                         );
                     }
+                    // Only a WireGuard hop carries the UDP that WireGuard
+                    // and HTTP/3 travel over, and only WireGuard can use it.
+                    let carried = position > 0
+                        && profile.kind == ProxyKind::WireGuard
+                        && profiles
+                            .get(&ids[position - 1])
+                            .is_some_and(|beneath| beneath.kind == ProxyKind::WireGuard);
                     if matches!(rung, Rung::Chain { .. })
                         && position > 0
                         && matches!(profile.kind, ProxyKind::WireGuard | ProxyKind::Http3Connect)
+                        && !carried
                     {
-                        return Err("WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress".into());
+                        return Err("WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress; WireGuard may also sit directly on another WireGuard proxy".into());
                     }
                     if require_dns && profile.dns_servers.is_empty() {
                         return Err("every RSS proxy and pool member requires DNS servers".into());

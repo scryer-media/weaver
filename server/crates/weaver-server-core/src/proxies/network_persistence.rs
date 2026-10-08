@@ -221,6 +221,7 @@ pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), St
         }
         routes.push(route);
     }
+    super::validate_wireguard_paths(&routes, &profiles, &pools).map_err(error)?;
     super::validate_instance_budget(&routes, &profiles, &pools, super::max_wireguard_instances())
         .map_err(error)
 }

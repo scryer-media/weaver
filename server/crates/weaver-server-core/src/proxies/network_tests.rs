@@ -247,6 +247,286 @@ fn reference_validation_catches_overlap_udp_chains_and_rss_dns() {
 }
 
 #[test]
+fn a_wireguard_hop_may_sit_only_on_the_egress_or_another_wireguard_hop() {
+    let egresses = HashMap::from([(0, EgressInterface::system())]);
+    let profiles = HashMap::from([
+        (1, profile(1, ProxyKind::WireGuard)),
+        (2, profile(2, ProxyKind::WireGuard)),
+        (3, profile(3, ProxyKind::Ssh)),
+        (4, profile(4, ProxyKind::HttpConnect)),
+        (5, profile(5, ProxyKind::Http3Connect)),
+        (6, profile(6, ProxyKind::WireGuard)),
+    ]);
+    let pools = HashMap::new();
+    let check = |ids: &[u32]| {
+        let mut route = route(&[100], Failover::Redistribute);
+        route.legs[0].path = LegPath::Ladder {
+            rungs: vec![Rung::Chain { ids: ids.to_vec() }],
+            direct_fallback: false,
+        };
+        route.validate_references(&egresses, &profiles, &pools, false)
+    };
+    for accepted in [
+        &[1, 2][..],
+        &[1, 2, 3],
+        &[1, 2, 4],
+        &[1, 2, 6],
+        &[5, 3],
+        &[1, 3, 4],
+    ] {
+        assert!(check(accepted).is_ok(), "{accepted:?}");
+    }
+    // WireGuard never rides a stream proxy, and HTTP/3 rides nothing.
+    for refused in [
+        &[4, 1][..],
+        &[3, 1],
+        &[1, 3, 2],
+        &[1, 5],
+        &[2, 1, 5],
+        &[5, 1],
+    ] {
+        let error = check(refused).unwrap_err();
+        assert!(
+            error.contains("WireGuard and HTTP/3 must be the first proxy in a chain"),
+            "{refused:?}: {error}"
+        );
+    }
+    assert!(check(&[1, 2, 1]).unwrap_err().contains("twice"));
+}
+
+#[test]
+fn a_stacked_wireguard_hop_is_its_own_instance() {
+    let profiles = HashMap::from([
+        (1, profile(1, ProxyKind::WireGuard)),
+        (2, profile(2, ProxyKind::WireGuard)),
+    ]);
+    let ladder = |rung: Rung| {
+        let mut route = route(&[100], Failover::Redistribute);
+        route.legs[0].path = LegPath::Ladder {
+            rungs: vec![rung],
+            direct_fallback: false,
+        };
+        route
+    };
+    // The chain's lower hop is the same tunnel as the first route's; its
+    // upper hop rides on it and is a second tunnel apart from the third's.
+    let routes = [
+        ladder(Rung::Proxy { id: 1 }),
+        ladder(Rung::Chain { ids: vec![1, 2] }),
+        ladder(Rung::Proxy { id: 2 }),
+    ];
+    let pools = HashMap::new();
+    assert!(validate_instance_budget(&routes, &profiles, &pools, 3).is_ok());
+    let error = validate_instance_budget(&routes, &profiles, &pools, 2).unwrap_err();
+    assert!(error.contains("require 3 WireGuard instances"), "{error}");
+}
+
+fn ladder_on(egress_id: u32, rung: Rung) -> Route {
+    let mut route = route(&[100], Failover::Redistribute);
+    route.legs[0].egress_id = egress_id;
+    route.legs[0].path = LegPath::Ladder {
+        rungs: vec![rung],
+        direct_fallback: false,
+    };
+    route
+}
+
+#[test]
+fn a_wireguard_proxy_reaches_one_egress_by_only_one_path() {
+    let profiles: HashMap<_, _> = (1..=3)
+        .map(|id| (id, profile(id, ProxyKind::WireGuard)))
+        .collect();
+    let pools = HashMap::from([(
+        7,
+        ProxyPool {
+            id: 7,
+            name: "pool".into(),
+            kind: ProxyKind::WireGuard,
+            member_ids: vec![2],
+            enabled: true,
+        },
+    )]);
+    let check = |routes: &[Route]| validate_wireguard_paths(routes, &profiles, &pools);
+    // The lower hop of a chain is the same session as the proxy used
+    // directly, so sharing it is fine, as is the same path twice.
+    assert!(
+        check(&[
+            ladder_on(0, Rung::Proxy { id: 1 }),
+            ladder_on(0, Rung::Chain { ids: vec![1, 2] }),
+            ladder_on(0, Rung::Chain { ids: vec![1, 2, 3] }),
+            ladder_on(0, Rung::Chain { ids: vec![1, 2] }),
+        ])
+        .is_ok()
+    );
+    // Another egress is another connection to the server.
+    assert!(
+        check(&[
+            ladder_on(0, Rung::Chain { ids: vec![1, 2] }),
+            ladder_on(5, Rung::Proxy { id: 2 }),
+            ladder_on(6, Rung::Chain { ids: vec![3, 2] }),
+        ])
+        .is_ok()
+    );
+    for (routes, paths) in [
+        (
+            vec![
+                ladder_on(0, Rung::Proxy { id: 2 }),
+                ladder_on(0, Rung::Chain { ids: vec![1, 2] }),
+            ],
+            "(proxy 1 → proxy 2 and proxy 2)",
+        ),
+        (
+            vec![
+                ladder_on(0, Rung::Chain { ids: vec![1, 2] }),
+                ladder_on(0, Rung::Chain { ids: vec![3, 2] }),
+            ],
+            "(proxy 1 → proxy 2 and proxy 3 → proxy 2)",
+        ),
+        (
+            vec![
+                ladder_on(0, Rung::Pool { id: 7 }),
+                ladder_on(0, Rung::Chain { ids: vec![1, 2] }),
+            ],
+            "(proxy 1 → proxy 2 and proxy 2)",
+        ),
+    ] {
+        let error = check(&routes).unwrap_err();
+        assert!(
+            error.starts_with("WireGuard proxy 2 is used on egress 0 by two different paths"),
+            "{error}"
+        );
+        assert!(error.contains(paths), "{error}");
+    }
+}
+
+fn wireguard_at(id: u32, host: &str) -> ProxyProfile {
+    ProxyProfile {
+        host: host.into(),
+        mtu: 1280,
+        ..profile(id, ProxyKind::WireGuard)
+    }
+}
+
+/// The session MTUs a set of single-chain routes plans, by session path.
+fn planned(chains: &[&[u32]], profiles: &HashMap<u32, ProxyProfile>) -> HashMap<Vec<u32>, u16> {
+    let routes: Vec<_> = chains
+        .iter()
+        .map(|ids| ladder_on(0, Rung::Chain { ids: ids.to_vec() }))
+        .collect();
+    wireguard_mtu_needs(
+        &wireguard_sessions(&routes, profiles, &HashMap::new()),
+        profiles,
+    )
+    .into_iter()
+    .map(|((_, path), need)| {
+        let mtu = effective_wireguard_mtu(&profiles[path.last().unwrap()], Some(need));
+        (path, mtu)
+    })
+    .collect()
+}
+
+/// What the tunnel engine leaves a tunnel carried over a link of `link`.
+fn carried(configured: u16, link: u16, endpoint: &ProxyProfile) -> u16 {
+    let address = endpoint
+        .host
+        .parse()
+        .unwrap_or_else(|_| "2001:db8::1".parse().unwrap());
+    weaver_tunnel::wireguard::carried_mtu(configured, link, address).unwrap()
+}
+
+#[test]
+fn a_wireguard_tunnel_is_raised_to_carry_a_full_sized_tunnel_on_top() {
+    let profiles = HashMap::from([
+        (1, wireguard_at(1, "192.0.2.1")),
+        (2, wireguard_at(2, "10.8.0.1")),
+        (3, wireguard_at(3, "fd00::1")),
+        (4, wireguard_at(4, "vpn.example.test")),
+        (5, wireguard_at(5, "10.9.0.1")),
+        (6, wireguard_at(6, "fd00::2")),
+    ]);
+    // Nothing stacked: the profile's own MTU.
+    assert_eq!(
+        planned(&[&[1]], &profiles),
+        HashMap::from([(vec![1], 1280)])
+    );
+    // An IPv4 endpoint above costs 60 bytes, an IPv6 one or a name 80.
+    let v4 = planned(&[&[1, 2]], &profiles);
+    assert_eq!(v4, HashMap::from([(vec![1], 1340), (vec![1, 2], 1280)]));
+    assert_eq!(carried(1280, 1340, &profiles[&2]), 1280);
+    assert_eq!(carried(1280, 1344, &profiles[&2]), 1280);
+    assert_eq!(carried(1280, 1339, &profiles[&2]), 1264);
+    for upper in [3, 4] {
+        let planned = planned(&[&[1, upper]], &profiles);
+        assert_eq!(planned[&vec![1]], 1360, "{upper}");
+        assert_eq!(carried(1280, 1360, &profiles[&upper]), 1280);
+        assert_eq!(carried(1280, 1359, &profiles[&upper]), 1264);
+    }
+    // Three deep: the middle tunnel's own MTU is rounded down to 16 by the
+    // one beneath, so that one leaves room for the rounded-up need.
+    let v4 = planned(&[&[1, 2, 5]], &profiles);
+    assert_eq!(v4[&vec![1]], 1404);
+    assert_eq!(v4[&vec![1, 2]], 1340);
+    let middle = carried(1340, 1404, &profiles[&2]);
+    assert_eq!(middle, 1340);
+    assert_eq!(carried(1280, middle, &profiles[&5]), 1280);
+    // Three IPv6 hops need 1440, more than the 1420 cap: the bottom stops
+    // there and the top runs short, which the route reports.
+    let v6 = planned(&[&[1, 3, 6]], &profiles);
+    assert_eq!(v6[&vec![1, 3]], 1360);
+    assert_eq!(v6[&vec![1]], MAX_RAISED_WIREGUARD_MTU);
+    let middle = carried(1360, 1420, &profiles[&3]);
+    assert_eq!(middle, 1328);
+    assert_eq!(carried(1280, middle, &profiles[&6]), 1248);
+    assert_eq!(
+        carried_chain_mtu(&[
+            (1420, &profiles[&1]),
+            (1360, &profiles[&3]),
+            (1280, &profiles[&6])
+        ]),
+        Some(1248)
+    );
+    // The need of a hop comes from everything stacked on it; the largest wins.
+    let shared = planned(&[&[1, 2], &[1, 4]], &profiles);
+    assert_eq!(shared[&vec![1]], 1360);
+    // A profile already wider than the need keeps its own MTU.
+    let wide = HashMap::from([
+        (
+            1,
+            ProxyProfile {
+                mtu: 1420,
+                ..wireguard_at(1, "192.0.2.1")
+            },
+        ),
+        (2, wireguard_at(2, "10.8.0.1")),
+    ]);
+    assert_eq!(planned(&[&[1, 2]], &wide)[&vec![1]], 1420);
+}
+
+#[test]
+fn a_chain_the_capped_uplink_cannot_carry_runs_its_top_short() {
+    let profiles = HashMap::from([
+        (1, wireguard_at(1, "192.0.2.1")),
+        (2, wireguard_at(2, "fd00::1")),
+        (3, wireguard_at(3, "fd00::2")),
+        (4, wireguard_at(4, "fd00::3")),
+    ]);
+    let planned = planned(&[&[1, 2, 3, 4]], &profiles);
+    assert_eq!(planned[&vec![1]], MAX_RAISED_WIREGUARD_MTU);
+    let hops: Vec<_> = [vec![1], vec![1, 2], vec![1, 2, 3], vec![1, 2, 3, 4]]
+        .iter()
+        .map(|path| (planned[path], &profiles[path.last().unwrap()]))
+        .collect();
+    let top = carried_chain_mtu(&hops).unwrap();
+    assert!(top < CARRIED_WIREGUARD_MTU, "{top}");
+    // The same arithmetic as the engine, hop by hop.
+    let mut link = planned[&vec![1]];
+    for path in [vec![1, 2], vec![1, 2, 3], vec![1, 2, 3, 4]] {
+        link = carried(planned[&path], link, &profiles[path.last().unwrap()]);
+    }
+    assert_eq!(link, top);
+}
+
+#[test]
 fn system_egress_is_unique_and_immutable() {
     let mut egress = EgressInterface::system();
     assert!(egress.validate().is_ok());

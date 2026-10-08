@@ -407,3 +407,115 @@ fn an_egress_id_a_route_still_names_is_not_reused_after_its_row_vanishes() {
         [0, kept.id, next.id]
     );
 }
+
+#[test]
+fn a_route_may_stack_wireguard_only_on_wireguard() {
+    use base64::Engine;
+    let key = |seed: u8| base64::engine::general_purpose::STANDARD.encode([seed; 32]);
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&profile(1)).unwrap();
+    for id in 2..=3 {
+        db.save_proxy_profile(&ProxyProfile {
+            kind: ProxyKind::WireGuard,
+            host: "wg.example".into(),
+            port: 51820,
+            tunnel_addresses: vec!["10.63.0.2/32".into()],
+            peer_public_key: Some(key(id as u8 + 10)),
+            secrets: ProxySecrets {
+                private_key: Some(key(id as u8)),
+                ..Default::default()
+            },
+            ..profile(id)
+        })
+        .unwrap();
+    }
+    let chain = |ids: Vec<u32>| RoutingPolicy {
+        legs: vec![RouteLeg {
+            egress_id: 0,
+            weight: 100,
+            path: LegPath::Ladder {
+                rungs: vec![Rung::Chain { ids }],
+                direct_fallback: false,
+            },
+        }],
+        ..Default::default()
+    };
+    let server = crate::proxies::Consumer::Server(1);
+    db.save_proxy_routing_policy(server, &chain(vec![2, 3, 1]))
+        .unwrap();
+    for refused in [vec![1, 2], vec![2, 1, 3]] {
+        let error = db
+            .save_proxy_routing_policy(server, &chain(refused.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("WireGuard may also sit directly on another WireGuard proxy"),
+            "{refused:?}: {error}"
+        );
+    }
+    // Turning the hop beneath into a stream proxy would strand the
+    // WireGuard hop above it, so the edit is refused.
+    let mut changed = db
+        .list_proxy_profiles()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == 2)
+        .unwrap();
+    changed.kind = ProxyKind::Socks5;
+    changed.revision += 1;
+    let error = db.save_proxy_profile(&changed).unwrap_err().to_string();
+    assert!(
+        error.contains("WireGuard may also sit directly on another WireGuard proxy"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_wireguard_proxy_is_saved_on_only_one_path_per_egress() {
+    use base64::Engine;
+    let key = |seed: u8| base64::engine::general_purpose::STANDARD.encode([seed; 32]);
+    let db = Database::open_in_memory().unwrap();
+    for id in 2..=3 {
+        db.save_proxy_profile(&ProxyProfile {
+            kind: ProxyKind::WireGuard,
+            host: "wg.example".into(),
+            port: 51820,
+            tunnel_addresses: vec!["10.63.0.2/32".into()],
+            peer_public_key: Some(key(id as u8 + 10)),
+            secrets: ProxySecrets {
+                private_key: Some(key(id as u8)),
+                ..Default::default()
+            },
+            ..profile(id)
+        })
+        .unwrap();
+    }
+    let ladder = |rung: Rung| RoutingPolicy {
+        legs: vec![RouteLeg {
+            egress_id: 0,
+            weight: 100,
+            path: LegPath::Ladder {
+                rungs: vec![rung],
+                direct_fallback: false,
+            },
+        }],
+        ..Default::default()
+    };
+    let first = crate::proxies::Consumer::Server(1);
+    let second = crate::proxies::Consumer::Server(2);
+    db.save_proxy_routing_policy(first, &ladder(Rung::Chain { ids: vec![2, 3] }))
+        .unwrap();
+    // The chain's lower hop used directly is the same session.
+    db.save_proxy_routing_policy(second, &ladder(Rung::Proxy { id: 2 }))
+        .unwrap();
+    // Its upper hop used directly as well would be a second session to the
+    // same server under the same key.
+    let error = db
+        .save_proxy_routing_policy(second, &ladder(Rung::Proxy { id: 3 }))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("WireGuard proxy 3 is used on egress 0 by two different paths"),
+        "{error}"
+    );
+}

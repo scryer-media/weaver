@@ -9,6 +9,14 @@ impl WireGuardTunnelProvider {
     pub fn with_udp_factory(self, factory: Arc<dyn crate::endpoint::UdpSocketFactory>) -> Self {
         Self(self.0.with_udp_factory(factory))
     }
+    /// Carry this tunnel's packets through `transport` instead of an OS
+    /// socket, such as a WireGuard session beneath it.
+    pub fn with_datagram_transport(
+        self,
+        transport: Arc<dyn crate::endpoint::DatagramTransport>,
+    ) -> Self {
+        Self(self.0.with_datagram_transport(transport))
+    }
     pub fn new(spec: WireGuardSpec, observer: Arc<dyn TunnelObserver>) -> Self {
         Self(
             proxy_tunnels::WireGuardTunnelProvider::new(spec, Arc::new(Observer(observer, None)))

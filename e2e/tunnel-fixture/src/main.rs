@@ -13,6 +13,11 @@
 //! The control API listens on 8095:
 //!
 //! - `GET /` the endpoints, SSH evidence, WireGuard evidence and credentials.
+//!
+//! wg2 is also reachable inside wg1, as [`CARRIED_NAME`] on [`CARRIED_PORT`]:
+//! wg1 relays UDP arriving there to wg2, so a WireGuard tunnel to wg2 can
+//! ride inside a tunnel to wg1. wg1's `udpForwarded` evidence records every
+//! datagram it relayed, by source inside wg1, and how many were WireGuard.
 //! - `GET /events?after=N` events with a sequence above `N`.
 //! - `POST /` `{endpoint, up}` | `{endpoint, cut: true}` |
 //!   `{endpoint: "ssh-switch", hostKey: "primary" | "other"}`.
@@ -397,7 +402,13 @@ const SSH_ENDPOINTS: &[(&str, u16)] = &[
     ("ssh-switch", 2224),
     ("ssh-refuse", 2225),
 ];
-const WIREGUARD_ENDPOINTS: &[(&str, u16)] = &[("wg1", 51821), ("wg2", 51822), ("wg-rss", 51823)];
+/// wg2 starts before wg1, because wg1 relays to it.
+const WIREGUARD_ENDPOINTS: &[(&str, u16)] = &[("wg2", 51822), ("wg1", 51821), ("wg-rss", 51823)];
+
+/// The name wg1's resolver gives wg2 inside wg1, and the port wg1 relays to
+/// wg2 there.
+const CARRIED_NAME: &str = "wg2.proxy.test";
+const CARRIED_PORT: u16 = 51822;
 
 /// A name every WireGuard peer answers and no test asks for. The fixture
 /// resolves it through a real tunnel before it publishes the peer, so a
@@ -436,7 +447,15 @@ fn env_or(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: SharedLog) -> Fixture {
+/// `listen` maps each published port to the one actually bound; the binary
+/// keeps them, and a test binds ephemeral ports instead.
+async fn build_fixture(
+    public_ip: IpAddr,
+    listen: fn(u16) -> u16,
+    nntp: String,
+    http: String,
+    log: SharedLog,
+) -> Fixture {
     let mut ssh = Vec::new();
     for name in ["ssh1", "ssh2", "ssh3"] {
         ssh.push(SshDouble {
@@ -489,7 +508,7 @@ async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: Share
         let endpoint = Endpoint::new(
             name,
             Transport::Tcp,
-            SocketAddr::new(public_ip, *port),
+            SocketAddr::new(public_ip, listen(*port)),
             upstream,
         );
         start_endpoint(&endpoint, &log).await;
@@ -515,11 +534,11 @@ async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: Share
     endpoints.insert(nntp_relay.name.clone(), nntp_relay);
     endpoints.insert(http_relay.name.clone(), http_relay);
 
-    let mut wireguard = Vec::new();
+    let mut wireguard: Vec<WireGuardDouble> = Vec::new();
     for (name, port) in WIREGUARD_ENDPOINTS {
         let tunnel_peer = vec![IpAddr::V4(TEST_PEER_ADDRESS)];
         let (names, http_port_inside, forward, preshared) = match *name {
-            "wg1" => (vec!["nntp.proxy.test"], 119, nntp_port, false),
+            "wg1" => (vec!["nntp.proxy.test", CARRIED_NAME], 119, nntp_port, false),
             "wg2" => (vec!["nntp.proxy.test"], 119, nntp_port, true),
             _ => (
                 vec!["rss.proxy.test", "download.proxy.test"],
@@ -536,6 +555,13 @@ async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: Share
                 .collect(),
             http_port: http_port_inside,
             preshared_key: preshared.then(test_preshared_key),
+            udp_forward: (*name == "wg1").then(|| {
+                let wg2 = wireguard
+                    .iter()
+                    .find(|double| double.name == "wg2")
+                    .expect("wg2 starts before wg1");
+                (CARRIED_PORT, wg2.peer.endpoint())
+            }),
             ..WireGuardTestPeerOptions::default()
         };
         let peer = WireGuardTestPeer::start_for_downloads(
@@ -554,7 +580,7 @@ async fn build_fixture(public_ip: IpAddr, nntp: String, http: String, log: Share
         let endpoint = Endpoint::new(
             name,
             Transport::Udp,
-            SocketAddr::new(public_ip, *port),
+            SocketAddr::new(public_ip, listen(*port)),
             peer.endpoint().to_string(),
         );
         start_endpoint(&endpoint, &log).await;
@@ -609,6 +635,17 @@ async fn snapshot(State(fixture): State<AppState>) -> Json<Value> {
                 "dnsQueries": double.peer.dns_queries(),
                 "requests": double.peer.requests(),
                 "clientRxBytes": double.peer.client_rx_bytes().await,
+                "carriedBy": (double.name == "wg2").then(|| json!({
+                    "endpoint": "wg1",
+                    "host": CARRIED_NAME,
+                    "port": CARRIED_PORT,
+                })),
+                "udpForwarded": double.peer.udp_forwarded().into_iter()
+                    .map(|(source, seen)| (source.to_string(), json!({
+                        "datagrams": seen.datagrams,
+                        "wireguardDatagrams": seen.wireguard_datagrams,
+                    })))
+                    .collect::<serde_json::Map<String, Value>>(),
             }),
         );
     }
@@ -711,7 +748,7 @@ async fn main() {
         .parse()
         .expect("control port");
     let log: SharedLog = Arc::default();
-    let fixture = Arc::new(build_fixture(public_ip, nntp, http, log).await);
+    let fixture = Arc::new(build_fixture(public_ip, |port| port, nntp, http, log).await);
     let listener = TcpListener::bind((public_ip, control_port))
         .await
         .expect("bind control");
@@ -907,6 +944,59 @@ mod tests {
         .await;
         assert!(dns_serving(&peer, "wg-test").await >= 1);
         assert_eq!(peer.dns_queries(), vec![READY_NAME.to_string()]);
+    }
+
+    /// The fixture's own wiring lets a tunnel to wg2 ride inside a tunnel to
+    /// wg1: wg1 names wg2 and relays to it. Dropping either breaks this test.
+    #[tokio::test]
+    async fn wg2_is_reachable_inside_wg1() {
+        let fixture = build_fixture(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            |_| 0,
+            tcp_echo().await.to_string(),
+            tcp_echo().await.to_string(),
+            Arc::default(),
+        )
+        .await;
+        let peer = |name: &str| {
+            &fixture
+                .wireguard
+                .iter()
+                .find(|double| double.name == name)
+                .expect("the fixture runs this peer")
+                .peer
+        };
+        let (wg1, wg2) = (peer("wg1"), peer("wg2"));
+        let outer = Arc::new(WireGuardTunnelProvider::new(
+            wg1.client_spec("wg1"),
+            Arc::new(NoopTunnelObserver),
+        ));
+        let inner = WireGuardTunnelProvider::new(
+            proxy_tunnels::wireguard::WireGuardSpec {
+                endpoint_host: CARRIED_NAME.into(),
+                endpoint_port: CARRIED_PORT,
+                ..wg2.client_spec("wg2")
+            },
+            Arc::new(NoopTunnelObserver),
+        )
+        .with_inner_wireguard(Arc::clone(&outer));
+        let mut stream = inner
+            .dial(&TEST_PEER_ADDRESS.to_string(), wg2.http_port())
+            .await
+            .expect("a dial through wg1 to wg2");
+        stream.write_all(b"carried").await.expect("request");
+        let mut answer = [0u8; 7];
+        stream.read_exact(&mut answer).await.expect("echo");
+        assert_eq!(&answer, b"carried");
+        let forwarded = wg1.udp_forwarded();
+        assert!(!forwarded.is_empty());
+        for (source, seen) in forwarded {
+            assert_eq!(source.ip(), IpAddr::V4(TEST_CLIENT_ADDRESS));
+            assert_eq!(seen.wireguard_datagrams, seen.datagrams);
+        }
+        drop(stream);
+        inner.shutdown().await;
+        outer.shutdown().await;
     }
 
     #[tokio::test]

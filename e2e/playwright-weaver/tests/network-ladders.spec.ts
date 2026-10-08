@@ -2,12 +2,12 @@ import { expect, metricValue, metrics, test } from "./helpers";
 import { waitTerminal } from "./support/downloads";
 import {
   FlowSubscription, type LegFlow, type NetworkFlow, type RouteInput, extended, flowAfter, flowMark, graphqlErrors,
-  ladderLeg, directLeg, legOn, networkHosts, proxyProfiles, rung, serverKey, testEgress, testProxyProfile,
+  ladderLeg, directLeg, legOn, networkHosts, platformNetworking, proxyProfiles, rung, serverKey, testEgress, testProxyProfile,
 } from "./support/network-flow";
 import { NetworkWorld, PROXIED_HOST, expectNoFailureEvents, jobEvents, saveEvidence, serverHealth, verifyOutput } from "./support/network-scenario";
 import { type FixtureEvent, attemptsOn, controlRoute, directEvents, fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-fixture";
 import { setEnabled } from "./support/toxiproxy";
-import { controlTunnel, tunnelState } from "./support/tunnel-fixture";
+import { type TunnelState, controlTunnel, tunnelEvents, tunnelMark, tunnelState } from "./support/tunnel-fixture";
 
 /** Ladders and live hop kills. */
 let world: NetworkWorld;
@@ -296,6 +296,9 @@ test("F14 reference rules reject unsound ladders", async ({ request }) => {
   const h3 = await world.profile({ name: `h3-${Date.now()}`, kind: "HTTP3_CONNECT", enabled: true, host: connect1.host, port: 8443, username: "fixture", password: "fixture", dnsServers: connect1.dnsServers });
   expect((await graphqlErrors(request, SAVE_ROUTE, { kind: "SERVER", id: server, input: { legs: [ladderLeg(a.id, [rung.chain([connect1.id, h3.id])], 100)] } })).join("\n"), "HTTP/3 above CONNECT")
     .toContain("WireGuard and HTTP/3 must be the first proxy in a chain");
+  // Only WireGuard rides on WireGuard; HTTP/3 stays directly above the egress.
+  expect((await graphqlErrors(request, SAVE_ROUTE, { kind: "SERVER", id: server, input: { legs: [ladderLeg(a.id, [rung.chain([wg1.id, h3.id])], 100)] } })).join("\n"), "HTTP/3 above WireGuard")
+    .toContain("WireGuard and HTTP/3 must be the first proxy in a chain");
 });
 
 test("F15 a pool whose members are all blocked blocks the leg until its path changes", async ({ request }) => {
@@ -347,4 +350,51 @@ test("F16 @extended an eight-rung ladder walks every rung as each dies", async (
   await saveEvidence(info, "F16", sequence);
   expect(sequence).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
   expect(await download.release()).toBe("COMPLETED");
+});
+
+test("F17 a chain carries WireGuard inside WireGuard", async ({ request }) => {
+  test.setTimeout(10 * 60_000);
+  // Each WireGuard hop in the chain is its own instance. The limit follows
+  // the memory Weaver can see and no setting raises it, so a host that
+  // grants fewer than two cannot run this test and must say so.
+  const instances = (await platformNetworking(request)).maxWireguardInstances;
+  expect(instances, `F17 needs two WireGuard instances, and Weaver grants ${instances} from the memory it can see; give the weaver container more memory`).toBeGreaterThanOrEqual(2);
+  const a = await world.egress("a");
+  const wg1 = await world.wireguard("wg1");
+  // wg2 addressed where wg1 relays to it, inside wg1's tunnel.
+  const wg2 = await world.wireguard("wg2", { carried: true });
+  const mark = await tunnelMark(request);
+  // The peers' lookup and relay records last for the fixture's lifetime;
+  // this test reads only what lands after these counts.
+  const relayed = (peers: TunnelState["wireguard"]) =>
+    Object.values(peers.wg1!.udpForwarded).reduce((total, seen) => total + seen.datagrams, 0);
+  const before = (await tunnelState(request)).wireguard;
+  const queriesBefore = { wg1: before.wg1!.dnsQueries.length, wg2: before.wg2!.dnsQueries.length };
+  const relayedBefore = relayed(before);
+  const server = await world.server({ host: "nntp.proxy.test", route: { legs: [ladderLeg(a.id, [rung.chain([wg1.id, wg2.id])], 100)] } });
+  const download = await world.download("f17-wireguard-chain");
+  const flow = await flowAfter(request, await flowMark(request), sample => (legOn(sample, serverKey(server), a.id)?.open ?? 0) > 0, "chain leg open");
+  expect(legOn(flow, serverKey(server), a.id)?.selectedProxyId).toBe(wg2.id);
+  expect(await waitTerminal(request, download.jobId)).toBe("COMPLETED");
+  const peers = (await tunnelState(request)).wireguard;
+  // wg2's endpoint name resolved inside wg1, the server's name inside wg2.
+  expect(peers.wg1!.dnsQueries.slice(queriesBefore.wg1)).toContain(peers.wg2!.carriedBy!.host);
+  expect(peers.wg2!.dnsQueries.slice(queriesBefore.wg2)).toContain("nntp.proxy.test");
+  // wg1 relayed to wg2 nothing but WireGuard, all of it from wg1's own
+  // client address: wg2 saw only the tunnel riding inside wg1.
+  const clientAddress = peers.wg1!.clientAddress.split("/")[0];
+  const forwarded = Object.entries(peers.wg1!.udpForwarded);
+  expect(forwarded.length).toBeGreaterThan(0);
+  for (const [source, seen] of forwarded) {
+    expect(source.slice(0, source.lastIndexOf(":")), source).toBe(clientAddress);
+    expect(seen.datagrams, source).toBeGreaterThan(0);
+    expect(seen.wireguardDatagrams, source).toBe(seen.datagrams);
+  }
+  // This download's traffic rode wg1's relay. A wg1 flow opened before the
+  // mark may carry it, so the proof is the relay count, not a new connect;
+  // Weaver never opened a flow to wg2's published endpoint.
+  expect(relayed(peers)).toBeGreaterThan(relayedBefore);
+  const connects = (await tunnelEvents(request, mark)).filter(event => event.kind === "connect");
+  expect(connects.filter(event => event.endpoint === "wg2")).toEqual([]);
+  test.info().annotations.push({ type: "deviation", description: "F17: the chain [wg1, wg2, ssh1] is not run; wg2 forwards only to the NNTP relay, so no SSH endpoint is reachable inside wg2." });
 });
