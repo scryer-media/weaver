@@ -66,6 +66,18 @@ type Block = {
   members: Member[];
 };
 
+/**
+ * The box the reader is pointing at. Its routes are the legs that pass
+ * through it; a rung narrows that to the one way through its own leg.
+ */
+type Focus =
+  | { kind: "egress"; id: number }
+  | { kind: "provider"; key: string }
+  | { kind: "leg"; key: string }
+  | { kind: "way"; key: string; index: number };
+/** How far everything off the pointed-at routes fades. */
+const FADE = 0.2;
+
 const legKey = (leg: LegFlow) => `${leg.consumer}:${leg.position}`;
 
 /** Monospaced text cut to the width it has, ending in an ellipsis when it was cut. */
@@ -245,6 +257,9 @@ function HopBox({
  * members. Every rung has a line in from its leg and out to the provider,
  * whether or not it is the one carrying the leg. Going direct has no box:
  * the line crosses the lane untouched.
+ *
+ * Pointing at a box lights the routes through it, from egress to provider,
+ * and fades the rest. Inspecting a leg holds its route lit the same way.
  */
 export function NetworkFlow({
   flow,
@@ -263,6 +278,7 @@ export function NetworkFlow({
   const navigate = useNavigate();
   const svg = useRef<SVGSVGElement>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [hover, setHover] = useState<Focus | null>(null);
   const [filter, setFilter] = useState("");
   const [group, setGroup] = useState<number | null>(null);
   const counts = useMeasurements(flow.legs);
@@ -329,6 +345,31 @@ export function NetworkFlow({
   const active = flow.legs.find((leg) => legKey(leg) === selected);
   const consumerName = (leg: LegFlow) => consumers.find((consumer) => consumer.key === leg.consumer)?.name ?? leg.consumer;
   const holds = (leg: LegFlow) => consumers.find((consumer) => consumer.key === leg.consumer)?.route?.failover === "HOLD";
+
+  // The box under the pointer or the keyboard, or else the leg being inspected, picks the routes
+  // to light. Everything else fades, and with nothing picked the whole flow is lit.
+  const focus: Focus | null =
+    hover ?? (selected != null && layout.rows.some(({ leg }) => legKey(leg) === selected) ? { kind: "leg", key: selected } : null);
+  const onRoute = (leg: LegFlow) =>
+    !focus ||
+    (focus.kind === "egress"
+      ? leg.egressId === focus.id
+      : focus.kind === "provider"
+        ? leg.consumer === focus.key
+        : legKey(leg) === focus.key);
+  /** A leg's ways are its rungs in order, then the one with no tunnel. */
+  const onWay = (leg: LegFlow, index: number) => onRoute(leg) && (focus?.kind !== "way" || focus.index === index);
+  const lit = layout.rows.filter(({ leg }) => onRoute(leg));
+  const egressLit = (id: number) =>
+    !focus || (focus.kind === "egress" ? focus.id === id : lit.some(({ leg }) => leg.egressId === id));
+  const providerLit = (key: string) =>
+    !focus || (focus.kind === "provider" ? focus.key === key : lit.some(({ leg }) => leg.consumer === key));
+  const point = (target: Focus) => ({
+    onPointerEnter: () => setHover(target),
+    onPointerLeave: () => setHover(null),
+    onFocus: () => setHover(target),
+    onBlur: () => setHover(null),
+  });
   function download() {
     if (!svg.current) {
       return;
@@ -356,6 +397,12 @@ export function NetworkFlow({
     const y = rowY + block.top;
     const status = rungStatus(leg, rungIndex, false);
     const isActive = status === "ACTIVE";
+    const way = {
+      opacity: onWay(leg, rungIndex) ? undefined : FADE,
+      ...point({ kind: "way", key: legKey(leg), index: rungIndex }),
+    };
+    // The whole block answers the pointer, the gaps between its boxes included.
+    const ground = <rect x={PROXY.x} y={y} width={PROXY.width} height={block.height} fill="transparent" />;
     const reason = failing ? (
       <text x={PROXY.x + 14} y={y + BOX_HEIGHT + 13} fill={INK.muted} fontSize="9.5">
         {fit(failing.reason, PROXY.width - 28, 9.5)}
@@ -367,8 +414,9 @@ export function NetworkFlow({
       const hopWidth = (PROXY.width - (rung.chainIds.length - 1) * gap) / rung.chainIds.length;
       const failingAt = failing ? rung.chainIds.indexOf(failing.proxyId) : -1;
       return (
-        <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)}>
+        <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)} {...way}>
           <title>{[rung.chainIds.map(name).join(" > "), ...(failing ? [failing.reason] : [])].join(" · ")}</title>
+          {ground}
           {rung.chainIds.map((id, position) => {
             const x = PROXY.x + position * (hopWidth + gap);
             const state = hopState(position, failingAt, status, profile(id)?.enabled !== false);
@@ -393,7 +441,7 @@ export function NetworkFlow({
       const state = configured?.enabled === false ? "DISABLED" : status;
       let memberY = y + BOX_HEIGHT;
       return (
-        <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)}>
+        <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)} {...way}>
           <rect x={PROXY.x} y={y} width={PROXY.width} height={block.height} fill={INK.card} stroke={INK.line} />
           <HopBox
             x={PROXY.x}
@@ -451,8 +499,9 @@ export function NetworkFlow({
     const hop = profile(rung.proxyId);
     const state = hop?.enabled === false ? "DISABLED" : failing && status !== "COOLDOWN" ? "FAILING" : status;
     return (
-      <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)}>
+      <a key={rungIndex} href={PROXIES_PAGE} onClick={follow(PROXIES_PAGE)} {...way}>
         {failing ? <title>{failing.reason}</title> : null}
+        {ground}
         <HopBox
           x={PROXY.x}
           y={y}
@@ -550,7 +599,7 @@ export function NetworkFlow({
               ...(bypass == null ? [] : [{ at: y + bypass, boxed: false, status: rungStatus(leg, blocks.length, true) }]),
             ];
             const taken = ways.find((way) => way.status === "ACTIVE") ?? ways[leg.selectedRung ?? 0] ?? ways[0];
-            const lines: { points: Point[]; carries: boolean; color: string }[] = [
+            const lines: { points: Point[]; carries: boolean; color: string; lit: boolean }[] = [
               {
                 points: [
                   [EGRESS.end, egressY],
@@ -558,9 +607,14 @@ export function NetworkFlow({
                 ],
                 carries: true,
                 color,
+                lit: onRoute(leg),
               },
-              ...ways.flatMap((way) => {
-                const line = { carries: way === taken, color: way === taken ? color : stateColor(way.status) };
+              ...ways.flatMap((way, index) => {
+                const line = {
+                  carries: way === taken,
+                  color: way === taken ? color : stateColor(way.status),
+                  lit: onWay(leg, index),
+                };
                 const enter: Point[] = [
                   [LEGS.end, legY],
                   [PROXY.x, way.at],
@@ -582,9 +636,22 @@ export function NetworkFlow({
                 <title>{tip}</title>
                 {lines.map((line, index) =>
                   line.carries && count > 0 ? (
-                    <path key={index} d={band(line.points, Math.max(2, width(count)))} fill={line.color} opacity="0.28" />
+                    <path
+                      key={index}
+                      d={band(line.points, Math.max(2, width(count)))}
+                      fill={line.color}
+                      opacity={line.lit ? (focus ? 0.5 : 0.28) : 0.28 * FADE}
+                    />
                   ) : (
-                    <path key={index} d={thread(line.points)} fill="none" stroke={line.color} strokeWidth="1.4" strokeDasharray="4 5" />
+                    <path
+                      key={index}
+                      d={thread(line.points)}
+                      fill="none"
+                      stroke={line.color}
+                      strokeWidth={focus && line.lit ? 2 : 1.4}
+                      strokeDasharray="4 5"
+                      opacity={line.lit ? undefined : FADE}
+                    />
                   ),
                 )}
               </g>
@@ -597,7 +664,7 @@ export function NetworkFlow({
             const down = egress.health === "DOWN";
             const open = Math.round(legs.reduce((sum, leg) => sum + (counts[legKey(leg)] ?? leg.open), 0));
             return (
-              <g key={egress.id}>
+              <g key={egress.id} opacity={egressLit(egress.id) ? undefined : FADE} {...point({ kind: "egress", id: egress.id })}>
                 <title>{egress.reason ?? egress.name}</title>
                 <a href="/settings/networking/egress" onClick={follow("/settings/networking/egress")}>
                   <rect x={EGRESS.x} y={y} width={EGRESS.width} height="108" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} strokeDasharray={down ? "4 4" : undefined} />
@@ -625,19 +692,22 @@ export function NetworkFlow({
           {layout.rows.map(({ leg, y }) => {
             const key = legKey(leg);
             const open = Math.round(counts[key] ?? leg.open);
+            // Inspecting a leg keeps its route lit, so picking it again lets go of it.
+            const inspect = () => setSelected(selected === key ? null : key);
             return (
-              <g key={key}>
+              <g key={key} opacity={onRoute(leg) ? undefined : FADE} {...point({ kind: "leg", key })}>
                 <rect x={LEGS.x} y={y} width={LEGS.width} height={LEG_HEIGHT} fill={INK.card} stroke={selected === key ? INK.accent : INK.line} />
                 <g
                   role="button"
                   tabIndex={0}
                   aria-label={t("next.networking.flow.inspect", { name: consumerName(leg), position: leg.position + 1 })}
+                  aria-pressed={selected === key}
                   style={{ cursor: "pointer" }}
-                  onClick={() => setSelected(key)}
+                  onClick={inspect}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
-                      setSelected(key);
+                      inspect();
                     }
                   }}
                 >
@@ -679,13 +749,15 @@ export function NetworkFlow({
               <g key={`proxies:${legKey(leg)}`}>
                 {blocks.map((block) => rungBlock(leg, y, block))}
                 {bypass == null ? null : (
-                  <StateText
-                    x={PROXY.x + 14}
-                    y={y + bypass - 18}
-                    size={9.5}
-                    state={status}
-                    label={`${t("next.networking.flow.direct")} · ${stateLabel(t, status)}`}
-                  />
+                  <g opacity={onWay(leg, blocks.length) ? undefined : FADE}>
+                    <StateText
+                      x={PROXY.x + 14}
+                      y={y + bypass - 18}
+                      size={9.5}
+                      state={status}
+                      label={`${t("next.networking.flow.direct")} · ${stateLabel(t, status)}`}
+                    />
+                  </g>
                 )}
               </g>
             );
@@ -705,7 +777,11 @@ export function NetworkFlow({
             const rss = consumer.key.startsWith("rss:");
             const x = PROVIDERS.x + 14;
             return (
-              <g key={consumer.key} opacity={down ? 0.65 : 1}>
+              <g
+                key={consumer.key}
+                opacity={(down ? 0.65 : 1) * (providerLit(consumer.key) ? 1 : FADE)}
+                {...point({ kind: "provider", key: consumer.key })}
+              >
                 <a href={href} onClick={follow(href)}>
                   <rect x={PROVIDERS.x} y={y} width={PROVIDERS.width} height="124" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
                   <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
