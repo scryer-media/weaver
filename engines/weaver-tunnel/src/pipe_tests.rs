@@ -275,20 +275,156 @@ async fn a_hop_is_failing_until_it_carries_a_dial() {
     });
     let proxy = hop(8, "192.0.2.1:8080".parse().unwrap(), stage.clone());
     let target = target("192.0.2.9:119".parse().unwrap());
-    let Err(DialError::Hop { proxy: 8, source }) = proxy.dial(&target).await else {
-        panic!("the proxy refuses to forward");
-    };
+    assert!(matches!(
+        proxy.dial(&target).await,
+        Err(DialError::Hop { proxy: 8, .. })
+    ));
     // The hop is named beside its reason, so the reason is the cause alone.
     assert_eq!(
         proxy.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: source.to_string(),
+            reason: "HTTP proxy rejected CONNECT".into(),
         })
     );
     *stage.reply.lock().unwrap() = b"HTTP/1.1 200 Connection established\r\n\r\n";
     assert!(proxy.dial(&target).await.is_ok());
     assert_eq!(proxy.failing_hop(), None);
+}
+
+/// A proxy that reports it cannot reach the next hop's endpoint is working;
+/// the hop it could not reach is the one failing. The same report for a final
+/// destination stays on the proxy's own path.
+#[tokio::test]
+async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
+    let stage = Arc::new(Answered {
+        reply: Mutex::new(b"HTTP/1.1 502 Bad Gateway\r\n\r\n"),
+        far: Default::default(),
+    });
+    let first = hop(7, "192.0.2.1:8080".parse().unwrap(), stage.clone());
+    let chain = hop(8, "192.0.2.2:8080".parse().unwrap(), first.clone());
+    let target = target("192.0.2.9:119".parse().unwrap());
+    assert!(matches!(
+        chain.dial(&target).await,
+        Err(DialError::Hop { proxy: 8, .. })
+    ));
+    assert_eq!(first.failing_hop(), None);
+    assert_eq!(
+        chain.failing_hop(),
+        Some(FailingHop {
+            proxy: 8,
+            reason: "endpoint unreachable: bad gateway (502)".into(),
+        })
+    );
+    assert!(matches!(
+        first.dial(&target).await,
+        Err(DialError::Hop { proxy: 7, .. })
+    ));
+    assert_eq!(
+        first.failing_hop(),
+        Some(FailingHop {
+            proxy: 7,
+            reason: "HTTP proxy could not connect to destination: bad gateway (502)".into(),
+        })
+    );
+    // A proxy that refuses to forward at all is failing itself, whichever
+    // destination it was asked for.
+    *stage.reply.lock().unwrap() = b"HTTP/1.1 403 Forbidden\r\n\r\n";
+    assert!(matches!(
+        chain.dial(&target).await,
+        Err(DialError::Hop { proxy: 7, .. })
+    ));
+    assert_eq!(
+        chain.failing_hop(),
+        Some(FailingHop {
+            proxy: 7,
+            reason: "HTTP proxy rejected CONNECT".into(),
+        })
+    );
+    // Each proxy answers its own request, and no hop is failing any longer.
+    *stage.reply.lock().unwrap() =
+        b"HTTP/1.1 200 Connection established\r\n\r\nHTTP/1.1 200 Connection established\r\n\r\n";
+    assert!(chain.dial(&target).await.is_ok());
+    assert_eq!(chain.failing_hop(), None);
+}
+
+/// A SOCKS proxy says what became of its own connection attempt, so a reply
+/// that the next hop's endpoint refused names that hop.
+#[tokio::test]
+async fn a_socks_reply_names_the_hop_that_refused() {
+    // The method is accepted, then the request comes back "connection refused".
+    let stage = Arc::new(Answered {
+        reply: Mutex::new(&[5, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0]),
+        far: Default::default(),
+    });
+    let first = Arc::new(TransportHop {
+        id: 7,
+        spec: TransportProxy {
+            kind: crate::transport::TransportKind::Socks5,
+            host: "192.0.2.1".into(),
+            port: 1080,
+            username: None,
+            password: None,
+        },
+        inner: stage,
+        timeout: Duration::from_secs(30),
+        failure: Default::default(),
+    });
+    let chain = hop(8, "192.0.2.2:8080".parse().unwrap(), first.clone());
+    let target = target("192.0.2.9:119".parse().unwrap());
+    assert!(matches!(
+        chain.dial(&target).await,
+        Err(DialError::Hop { proxy: 8, .. })
+    ));
+    assert_eq!(
+        chain.failing_hop(),
+        Some(FailingHop {
+            proxy: 8,
+            reason: "endpoint unreachable: connection refused".into(),
+        })
+    );
+    assert!(matches!(
+        first.dial(&target).await,
+        Err(DialError::Hop { proxy: 7, .. })
+    ));
+    assert_eq!(
+        first.failing_hop(),
+        Some(FailingHop {
+            proxy: 7,
+            reason: "SOCKS proxy could not connect to destination: connection refused".into(),
+        })
+    );
+}
+
+/// A proxy that takes the request for the next hop's endpoint and never
+/// answers was itself reached, so the wait is charged to the next hop. The
+/// same silence for a final destination times out this hop's own path.
+#[tokio::test(start_paused = true)]
+async fn a_silent_proxy_is_charged_to_the_hop_it_was_asked_for() {
+    let stage = Arc::new(Answered {
+        reply: Mutex::new(b""),
+        far: Default::default(),
+    });
+    let first = hop(7, "192.0.2.1:8080".parse().unwrap(), stage);
+    let chain = hop(8, "192.0.2.2:8080".parse().unwrap(), first.clone());
+    let target = target("192.0.2.9:119".parse().unwrap());
+    assert!(matches!(
+        chain.dial(&target).await,
+        Err(DialError::Hop { proxy: 8, .. })
+    ));
+    assert_eq!(first.failing_hop(), None);
+    assert_eq!(
+        chain.failing_hop(),
+        Some(FailingHop {
+            proxy: 8,
+            reason: "endpoint unreachable: no answer through the hop before it".into(),
+        })
+    );
+    assert!(matches!(
+        first.dial(&target).await,
+        Err(DialError::Timeout { .. })
+    ));
+    assert_eq!(first.failing_hop().map(|hop| hop.proxy), Some(7));
 }
 
 /// A session hop is failing after a path failure of its own. A destination

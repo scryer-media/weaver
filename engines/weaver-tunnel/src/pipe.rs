@@ -27,7 +27,7 @@ use crate::{
     bridge::ConnectionOutcome,
     egress::SocketEgress,
     endpoint::{DatagramTransport, EndpointStream, EndpointTransport, UdpSocketFactory},
-    transport::TransportProxy,
+    transport::{ConnectFailure, TransportProxy},
 };
 
 #[derive(Clone, Debug)]
@@ -271,7 +271,7 @@ impl HopFailure {
     fn note(&self, error: &DialError) {
         match error {
             // The hop is named beside its reason, so the reason leaves it out.
-            DialError::Hop { source, .. } => self.record(source.to_string()),
+            DialError::Hop { source, .. } => self.blame(source),
             error if error.is_path_evidence() => self.record(error.to_string()),
             error if error.is_evidence() => self.clear(),
             _ => {}
@@ -280,6 +280,15 @@ impl HopFailure {
     /// The hop's own endpoint could not be reached from the stage beneath.
     fn unreachable(&self, source: &io::Error) {
         self.record(format!("endpoint unreachable: {source}"));
+    }
+    /// Records what the hop's tunnel said. A stream proxy reports through
+    /// the engine variant, whose own wording is about an engine that could
+    /// not start, so what the proxy said stands alone.
+    fn blame(&self, source: &TunnelError) {
+        self.record(match source {
+            TunnelError::Engine(said) => said.clone(),
+            source => source.to_string(),
+        });
     }
     fn record(&self, reason: String) {
         *self.0.lock().expect("hop failure") = Some(reason);
@@ -485,6 +494,57 @@ pub struct TransportHop {
     pub failure: HopFailure,
 }
 
+impl TransportHop {
+    /// Asks the proxy for `destination` within `budget`.
+    ///
+    /// A proxy that was reached, and then reports that the next hop's
+    /// endpoint cannot be reached or never answers for it, has done its own
+    /// part. That failure is the next hop's, so the error names the next hop.
+    /// For any other destination it stays a failure of this hop's path.
+    async fn negotiate(
+        &self,
+        stream: &mut DialedStream,
+        destination: &str,
+        target: &Target,
+        budget: Duration,
+    ) -> Result<(), DialError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let timed_out = || DialError::Timeout {
+            stage: self.describe(),
+        };
+        tokio::time::timeout_at(deadline, self.spec.greet(stream))
+            .await
+            .map_err(|_| timed_out())?
+            .map_err(|error| DialError::hop(self.id, error))?;
+        let next = match target.purpose {
+            Purpose::ProxyEndpoint { proxy } => Some(proxy),
+            _ => None,
+        };
+        let unreachable = |proxy, reason: &str| DialError::Hop {
+            proxy,
+            source: TunnelError::Engine(format!("endpoint unreachable: {reason}")),
+        };
+        let connected = tokio::time::timeout_at(
+            deadline,
+            self.spec.connect(stream, destination, target.port),
+        )
+        .await;
+        match (connected, next) {
+            (Ok(Ok(())), _) => Ok(()),
+            (Ok(Err(ConnectFailure::Proxy(error))), _) => Err(DialError::hop(self.id, error)),
+            (Ok(Err(ConnectFailure::Unreachable(reason))), Some(proxy)) => {
+                Err(unreachable(proxy, reason))
+            }
+            (Ok(Err(ConnectFailure::Unreachable(reason))), None) => Err(DialError::hop(
+                self.id,
+                self.spec.destination_unreachable(reason),
+            )),
+            (Err(_), Some(proxy)) => Err(unreachable(proxy, "no answer through the hop before it")),
+            (Err(_), None) => Err(timed_out()),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Dialer for TransportHop {
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
@@ -498,31 +558,38 @@ impl Dialer for TransportHop {
         let started = tokio::time::Instant::now();
         let mut last = None;
         for (index, destination) in destinations.iter().enumerate() {
-            let mut dialed = self.inner.dial(&endpoint).await.inspect_err(|error| {
-                // The proxy's own endpoint was the destination of that dial,
-                // so failing to reach it is this hop's failure. Any other
-                // failure belongs to the stage beneath.
-                if let DialError::Egress(source)
-                | DialError::Destination(source)
-                | DialError::Refused(source) = error
-                {
-                    self.failure.unreachable(source);
-                }
-            })?;
+            let mut dialed = self
+                .inner
+                .dial(&endpoint)
+                .await
+                .inspect_err(|error| match error {
+                    // The proxy's own endpoint was the destination of that
+                    // dial, so failing to reach it is this hop's failure.
+                    DialError::Egress(source)
+                    | DialError::Destination(source)
+                    | DialError::Refused(source) => self.failure.unreachable(source),
+                    // The proxy hop beneath was reached and could not reach
+                    // this endpoint through its own proxy.
+                    DialError::Hop { proxy, source } if *proxy == self.id => {
+                        self.failure.blame(source)
+                    }
+                    // Any other failure belongs to the stage beneath.
+                    _ => {}
+                })?;
             // Reserve part of the remaining budget for every other address.
             let remaining = self.timeout.saturating_sub(started.elapsed());
-            let negotiated = tokio::time::timeout(
-                remaining / (destinations.len() - index) as u32,
-                self.spec
-                    .negotiate(&mut dialed.stream, destination, target.port),
-            )
-            .await
-            .map_err(|_| DialError::Timeout {
-                stage: self.describe(),
-            })
-            .and_then(|result| result.map_err(|error| DialError::hop(self.id, error)));
+            let negotiated = self
+                .negotiate(
+                    &mut dialed.stream,
+                    destination,
+                    target,
+                    remaining / (destinations.len() - index) as u32,
+                )
+                .await;
             match &negotiated {
                 Ok(()) => self.failure.clear(),
+                // The proxy answered for the next hop, so it is working.
+                Err(DialError::Hop { proxy, .. }) if *proxy != self.id => self.failure.clear(),
                 Err(error) => self.failure.note(error),
             }
             match negotiated {
@@ -577,6 +644,9 @@ impl EndpointTransport for InnerTransport {
             .await
             .map_err(|error| match error {
                 DialError::Fatal(error) => error,
+                // The hop beneath named this hop's endpoint as what it could
+                // not reach, so the reason is already this hop's own.
+                DialError::Hop { proxy, source } if proxy == self.proxy => source,
                 error => TunnelError::Engine(error.to_string()),
             })?;
         *self.connected.lock().expect("inner path") =
