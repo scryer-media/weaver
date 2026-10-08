@@ -7,7 +7,9 @@ import { expect } from "../helpers";
  * refuses forwarding), and WireGuard peers wg1, wg2 (preshared key) and
  * wg-rss on UDP 51821-51823. Inside a WireGuard tunnel `nntp.proxy.test` is
  * the NNTP server and `rss.proxy.test` / `download.proxy.test` the HTTP
- * fixture; the tunnel's DNS server answers those names.
+ * fixture; the tunnel's DNS server answers those names. wg2 is also reachable
+ * inside wg1 at its `carriedBy` host and port, and wg1's `udpForwarded`
+ * records every datagram it relayed there, by source inside wg1.
  */
 const controlUrl = () => (process.env.TUNNEL_FIXTURE_URL || "http://tunnel-fixture:8095").replace(/\/+$/, "");
 
@@ -25,6 +27,10 @@ export type TunnelEvent = {
 export type WireGuardPeer = {
   peerPublicKey: string; presharedKey: string | null; clientPrivateKey: string; clientAddress: string;
   dnsServer: string; dnsQueries: string[]; requests: unknown[]; clientRxBytes: number;
+  /** Where this peer is reachable inside another peer's tunnel, if anywhere. */
+  carriedBy: { endpoint: TunnelEndpoint; host: string; port: number } | null;
+  /** Datagrams this peer relayed to a carried peer, by `address:port` source inside its tunnel. */
+  udpForwarded: Record<string, { datagrams: number; wireguardDatagrams: number }>;
 };
 export type TunnelState = {
   sequence: number;

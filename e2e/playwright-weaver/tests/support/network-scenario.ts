@@ -155,14 +155,20 @@ export class NetworkWorld {
   }
 
   /** A WireGuard profile on wg1, wg2 (preshared key) or wg-rss (preshared key). */
-  async wireguard(endpoint: "wg1" | "wg2" | "wg-rss", options: { network?: Network; wrongPresharedKey?: boolean } = {}): Promise<ProxyProfile> {
+  /**
+   * `carried` addresses the peer where it is reachable inside another peer's
+   * tunnel (wg2 inside wg1), for a chain that stacks it on that peer.
+   */
+  async wireguard(endpoint: "wg1" | "wg2" | "wg-rss", options: { network?: Network; wrongPresharedKey?: boolean; carried?: boolean } = {}): Promise<ProxyProfile> {
     const network = options.network ?? "a";
     const peer = (await tunnelState(this.request)).wireguard[endpoint]!;
+    const carrier = options.carried ? peer.carriedBy : null;
+    if (options.carried && !carrier) throw new Error(`${endpoint} is not reachable inside another WireGuard peer`);
     const preshared = peer.presharedKey === null ? null
       : options.wrongPresharedKey ? Buffer.alloc(32, 7).toString("base64") : peer.presharedKey;
     return this.profile({
-      name: `${endpoint}-${network}-${Date.now()}`, kind: "WIRE_GUARD", enabled: true,
-      host: hostAddress("tunnel-fixture", network), port: TUNNEL_PORTS[endpoint],
+      name: `${endpoint}-${carrier ? `in-${carrier.endpoint}` : network}-${Date.now()}`, kind: "WIRE_GUARD", enabled: true,
+      host: carrier?.host ?? hostAddress("tunnel-fixture", network), port: carrier?.port ?? TUNNEL_PORTS[endpoint],
       peerPublicKey: peer.peerPublicKey, privateKey: peer.clientPrivateKey, presharedKey: preshared,
       tunnelAddresses: [peer.clientAddress], dnsServers: [peer.dnsServer], timeoutSeconds: 5,
     });
