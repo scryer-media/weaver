@@ -89,7 +89,8 @@ const state = {
     // A size set through the API need not be a whole number of the unit its field shows.
     scriptOutputRunCapBytes: has("uneven") ? 2097000 : 2097152, terminationGraceSeconds: 10,
     pythonInterpreter: null as string | null, powershellInterpreter: null as string | null,
-    batchInterpreter: null as string | null, unacceptableExtensions: ["exe", "scr"],
+    batchInterpreter: null as string | null, goInterpreter: null as string | null,
+    unacceptableExtensions: ["exe", "scr"],
     strictSecurityRefusesExecution: false,
   },
   scripts: {

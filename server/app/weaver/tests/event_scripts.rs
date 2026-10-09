@@ -204,6 +204,83 @@ async fn scan_distinguishes_supervisor_launch_failure_from_script_exit_127() {
     );
 }
 
+/// Stands in for the Go toolchain, which a machine running these tests need
+/// not have. It reports how it was called and ends the way `go run` ends when
+/// the program it built exits with `status`.
+fn stub_go(directory: &Path, status: i32) -> String {
+    let path = directory.join("stub-go");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf 'go %s\\n' \"$*\"\nprintf 'cache %s proxy %s\\n' \"$GOCACHE\" \"$GOPROXY\"\nprintf 'exit status {status}\\n' >&2\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+async fn a_go_script_runs_through_go_run_and_a_missing_toolchain_fails_the_launch() {
+    let (db, data) = setup();
+    let root = fs::canonicalize(db.post_processing_script_directory().unwrap()).unwrap();
+    // No executable bit: the extension alone makes it a script.
+    fs::write(
+        root.join("report.go"),
+        "// ### NZBGET SCAN SCRIPT ###\n\npackage main\n\nfunc main() {}\n",
+    )
+    .unwrap();
+    let report = ScriptName::new("report.go").unwrap();
+    select(&db, vec![on(InstanceTrigger::Scan, &report)]);
+    let mut event = jobless(data.path(), ScriptEventLabel::Scan, &[]);
+    event.facts.data_dir = Some(data.path().into());
+
+    let mut settings = db.post_processing_settings().unwrap();
+    settings.go_interpreter = Some(
+        data.path()
+            .join("missing-go")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    db.save_post_processing_settings(&settings).unwrap();
+    let failed = run_event(&db, &mut event, "scan-go-missing", None, supervisor())
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].status, ScriptStatus::Failed);
+    assert_eq!(failed[0].exit_code, None);
+    assert!(
+        failed[0]
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("did not confirm script launch")
+    );
+
+    settings.go_interpreter = Some(stub_go(data.path(), 93));
+    db.save_post_processing_settings(&settings).unwrap();
+    let ran = run_event(&db, &mut event, "scan-go", None, supervisor())
+        .await
+        .unwrap();
+    assert_eq!(ran.len(), 1);
+    // `go run` itself exited 1; the status it reported for the script is the
+    // one that counts.
+    assert_eq!(ran[0].status, ScriptStatus::Succeeded);
+    assert_eq!(ran[0].exit_code, Some(93));
+    let output = &ran[0].output_tail;
+    assert!(
+        output.contains(&format!("go run {}\n", root.join("report.go").display())),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "cache {} proxy off\n",
+            data.path().join(".weaver-go-cache").display()
+        )),
+        "{output}"
+    );
+}
+
 #[tokio::test]
 async fn queue_parameters_stream_to_persistence_and_the_next_script() {
     let (db, data) = setup();

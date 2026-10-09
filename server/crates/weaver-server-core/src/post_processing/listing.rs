@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use super::manifest::{
     MAX_LEGACY_METADATA_BYTES, ManifestError, NZBGET_MANIFEST_FILE, apply_bare_script_declarations,
-    bare_script_options, detect_bare_script_adapter, parse_nzbget_manifest,
+    bare_script_options, detect_bare_script_adapter, go_script_header, parse_nzbget_manifest,
 };
 use super::model::{PostProcessingValidationError, ScriptAdapter, ScriptManifest, ScriptName};
 
@@ -151,7 +151,13 @@ fn read_bare_script(
     path: &Path,
     name: &ScriptName,
 ) -> Result<DiscoveredScript, ListingError> {
-    let preamble = read_utf8_prefix(path, MAX_LEGACY_METADATA_BYTES as u64)?;
+    let mut preamble = read_utf8_prefix(path, MAX_LEGACY_METADATA_BYTES as u64)?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("go"))
+    {
+        preamble = go_script_header(&preamble);
+    }
     let adapter = detect_bare_script_adapter(&preamble);
     let compatibility_name = match adapter {
         ScriptAdapter::Nzbget => Some(super::model::NzbgetCompatibilityName::new(
@@ -176,7 +182,8 @@ fn read_bare_script(
 }
 
 /// A regular file counts as a script when it carries a known script extension or
-/// the executable bit, which is what both oracles list.
+/// the executable bit, which is what both oracles list. A Go source file is
+/// weaver's own addition to the extensions.
 fn is_bare_script_candidate(path: &Path, metadata: &fs::Metadata) -> bool {
     let known_extension = path
         .extension()
@@ -184,7 +191,7 @@ fn is_bare_script_candidate(path: &Path, metadata: &fs::Metadata) -> bool {
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "sh" | "bash" | "py" | "pl" | "rb" | "ps1" | "bat" | "cmd" | "exe"
+                "sh" | "bash" | "py" | "pl" | "rb" | "ps1" | "bat" | "cmd" | "exe" | "go"
             )
         });
     #[cfg(unix)]

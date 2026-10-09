@@ -69,6 +69,7 @@ interface PostProcessingSettings extends EventScriptOptions {
   pythonInterpreter?: string | null;
   powershellInterpreter?: string | null;
   batchInterpreter?: string | null;
+  goInterpreter?: string | null;
   unacceptableExtensions: string[];
   strictSecurityRefusesExecution: boolean;
   globalScriptsRun: GlobalScriptsRun;
@@ -82,6 +83,7 @@ interface ExecutionForm extends EventScriptOptions {
   pythonInterpreter: string;
   powershellInterpreter: string;
   batchInterpreter: string;
+  goInterpreter: string;
   unacceptableExtensions: string;
 }
 
@@ -97,6 +99,7 @@ const DEFAULTS: ExecutionForm = {
   pythonInterpreter: "",
   powershellInterpreter: "",
   batchInterpreter: "",
+  goInterpreter: "",
   unacceptableExtensions: "",
 };
 
@@ -144,6 +147,7 @@ export function ScriptConfigurationPanel() {
             pythonInterpreter: settings.pythonInterpreter ?? "",
             powershellInterpreter: settings.powershellInterpreter ?? "",
             batchInterpreter: settings.batchInterpreter ?? "",
+            goInterpreter: settings.goInterpreter ?? "",
             unacceptableExtensions: settings.unacceptableExtensions.join(", "),
           }
         : DEFAULTS,
@@ -178,6 +182,7 @@ export function ScriptConfigurationPanel() {
           pythonInterpreter: values.pythonInterpreter.trim() || null,
           powershellInterpreter: values.powershellInterpreter.trim() || null,
           batchInterpreter: values.batchInterpreter.trim() || null,
+          goInterpreter: values.goInterpreter.trim() || null,
           unacceptableExtensions: splitExtensions(values.unacceptableExtensions),
         },
       }).then((result) => {
@@ -331,6 +336,17 @@ export function ScriptConfigurationPanel() {
             value: values.batchInterpreter,
             placeholder: "cmd.exe",
             onChange: (next) => patch({ batchInterpreter: next }),
+          },
+        },
+        {
+          id: "goInterpreter",
+          label: "Go",
+          keywords: values.goInterpreter,
+          control: {
+            kind: "text",
+            value: values.goInterpreter,
+            placeholder: "/usr/local/go/bin/go",
+            onChange: (next) => patch({ goInterpreter: next }),
           },
         },
       ],

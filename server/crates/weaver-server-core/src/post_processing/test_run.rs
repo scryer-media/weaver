@@ -365,6 +365,7 @@ fn prepare(
         python: settings.python_interpreter.as_ref().map(PathBuf::from),
         powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
         batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
+        go: settings.go_interpreter.as_ref().map(PathBuf::from),
     };
     let context = match instance.trigger {
         InstanceTrigger::PostProcessing => None,

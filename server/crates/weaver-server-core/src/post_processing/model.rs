@@ -915,6 +915,9 @@ pub struct PostProcessingSettings {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    /// The `go` command that runs `.go` scripts.
+    #[serde(default)]
+    pub go_interpreter: Option<String>,
     /// Extension-token patterns that reject a job only after Weaver has a
     /// trustworthy output name. An empty list disables the policy.
     #[serde(default)]
@@ -933,6 +936,7 @@ impl Default for PostProcessingSettings {
             python_interpreter: None,
             powershell_interpreter: None,
             batch_interpreter: None,
+            go_interpreter: None,
             unacceptable_extensions: Vec::new(),
             global_scripts_run: GlobalScriptsRun::default(),
         }

@@ -1952,6 +1952,7 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     pythonInterpreter
     powershellInterpreter
     batchInterpreter
+    goInterpreter
     unacceptableExtensions
     strictSecurityRefusesExecution
     globalScriptsRun

@@ -3,7 +3,7 @@
 //! The manifest supplies a display name, the options schema (including which
 //! options are secret), and the NZBGet adapter. Anything without a manifest is a
 //! bare script and runs under the SABnzbd contract unless it carries NZBGet's
-//! legacy header comment.
+//! legacy header comment. A Go script carries that header in `//` comments.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -89,6 +89,31 @@ fn bare_script_kind_header(script: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// The legacy header of a Go script, as the `#` comments every other bare
+/// script carries it in. Go has no `#` comments, so a Go script writes the
+/// same lines inside its leading `//` comments: `// ### NZBGET SCAN SCRIPT`,
+/// `// #ApiToken=`. Each of those lines comes back without the `//` and the
+/// one space after it. A comment that is not a header line, `//go:build`
+/// among them, comes back blank, and the header ends at the first line of code.
+pub fn go_script_header(script: &str) -> String {
+    let script = script.strip_prefix('\u{feff}').unwrap_or(script);
+    let mut header = String::new();
+    for line in script.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            let Some(comment) = line.strip_prefix("//") else {
+                break;
+            };
+            let comment = comment.strip_prefix(' ').unwrap_or(comment);
+            if comment.starts_with('#') {
+                header.push_str(comment);
+            }
+        }
+        header.push('\n');
+    }
+    header
 }
 
 pub fn apply_bare_script_declarations(manifest: ScriptManifest, script: &str) -> ScriptManifest {

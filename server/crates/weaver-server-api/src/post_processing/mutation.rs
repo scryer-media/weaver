@@ -112,6 +112,7 @@ impl PostProcessingMutation {
             python_interpreter,
             powershell_interpreter,
             batch_interpreter,
+            go_interpreter,
             unacceptable_extensions,
             global_scripts_run,
         } = input;
@@ -166,6 +167,7 @@ impl PostProcessingMutation {
                 python_interpreter,
                 powershell_interpreter,
                 batch_interpreter,
+                go_interpreter,
                 unacceptable_extensions,
                 global_scripts_run: global_scripts_run
                     .map(Into::into)

@@ -356,6 +356,75 @@ async fn exit_codes_are_honoured_end_to_end() {
 }
 
 #[tokio::test]
+async fn a_go_script_is_run_by_go_run_and_keeps_the_exit_code_it_chose() {
+    let data = tempfile::tempdir().unwrap();
+    let working_directory = data.path().join("work");
+    fs::create_dir_all(&working_directory).unwrap();
+    let scripts = data.path().join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    // No executable bit: the extension alone makes it a script.
+    fs::write(
+        scripts.join("report.go"),
+        "// ### NZBGET POST-PROCESSING SCRIPT ###\n\npackage main\n\nfunc main() {}\n",
+    )
+    .unwrap();
+    let script = ScriptName::new("report.go").unwrap();
+    // Stands in for the Go toolchain, which a machine running these tests need
+    // not have. It reports how it was called and ends the way `go run` ends
+    // when the program it built exits with 95.
+    let go = write_script_in(
+        &data.path().join("toolchain"),
+        "go",
+        r#"#!/bin/sh
+printf 'ARGS='
+for argument in "$@"; do printf '[%s]' "$argument"; done
+printf '\n'
+printf 'GOCACHE=%s\n' "$GOCACHE"
+printf 'GOPROXY=%s\n' "$GOPROXY"
+printf 'NZBID=%s\n' "$NZBPP_NZBID"
+printf 'exit status 95\n' >&2
+exit 1
+"#,
+    );
+
+    let mut request = request(
+        data.path(),
+        &script,
+        working_directory.clone(),
+        Some(OUT_OF_REACH),
+    );
+    request.interpreters.go = Some(data.path().join("toolchain").join(go.as_str()));
+    request.context.compatibility.data_dir = Some(data.path().into());
+    let result = execute_script(request, None).await.unwrap();
+
+    // `go run` itself exited 1; the status it reported for the script is the
+    // one that counts.
+    assert_eq!(result.disposition, ExecutionDisposition::Skipped);
+    assert_eq!(result.exit_code, Some(95));
+    let output = String::from_utf8(result.output).unwrap();
+    // The script file follows `run`, then the arguments every script is given.
+    assert!(
+        output.contains(&format!(
+            "ARGS=[run][{}][{}][input file.nzb][Unicode job ✓][][movies][][0][]\n",
+            fs::canonicalize(scripts.join("report.go"))
+                .unwrap()
+                .display(),
+            working_directory.display()
+        )),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "GOCACHE={}\n",
+            data.path().join(".weaver-go-cache").display()
+        )),
+        "{output}"
+    );
+    assert!(output.contains("GOPROXY=off\n"), "{output}");
+    assert!(output.contains("NZBID=42\n"), "{output}");
+}
+
+#[tokio::test]
 async fn a_script_that_outlives_its_timeout_is_killed_after_the_grace_period() {
     let data = tempfile::tempdir().unwrap();
     let working_directory = data.path().join("work");
