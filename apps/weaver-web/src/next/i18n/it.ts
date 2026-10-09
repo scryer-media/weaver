@@ -1445,6 +1445,7 @@ export const nextIt: LocaleDictionary = {
   "next.schedules.chooseInstance": "Scegli un'istanza",
   "next.schedules.noInstances": "Ancora nessuna istanza di pianificazione",
   "next.schedules.instanceGone": "Non è più un'istanza di pianificazione",
+  "next.schedules.instanceProblem": "Non fa nulla: la sua istanza di script non esiste più o non viene più eseguita secondo una pianificazione",
   "next.schedules.scriptTimeHelp": "Ora locale. HH:MM, oppure *:MM per ogni ora; separa più orari con virgole.",
   "next.schedules.runAtStartup": "Esegui anche all’avvio",
   "next.schedules.runAtStartupHelp": "Uno script viene eseguito all’avvio solo se una regola lo attiva qui.",

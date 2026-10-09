@@ -1,10 +1,13 @@
 //! The API as a running script sees its own run.
 //!
-//! A script calling with the token its run was handed may use the whole API.
-//! What is here is the part that is about that run: the download it is for,
-//! and the things it may ask weaver to do with it. Those are the commands a
-//! script may also print after `[NZB]`, under the same rules for which
-//! trigger may issue which, and they are applied by the same code.
+//! A script calling with the token its run was handed may read whatever the
+//! API answers, but of everything that changes something it may only ask what
+//! is here: `Mutation.scriptRun`. Every other mutation is refused to it with
+//! `NOT_ALLOWED_FOR_SCRIPT_RUN`. What is here is the part that is about that
+//! run: the download it is for, and the things it may ask weaver to do with
+//! it. Those are the commands a script may also print after `[NZB]`, under the
+//! same rules for which trigger may issue which, and they are applied by the
+//! same code.
 
 use async_graphql::{Context, Enum, Object, Result};
 use weaver_server_core::post_processing::callbacks::{LiveScriptRun, RunAction, RunActionError};
@@ -223,7 +226,15 @@ impl ScriptRunActionsGql {
                 "setDuplicate needs a key, a score or a mode",
             ));
         }
-        for directive in directives.into_iter().flatten() {
+        let directives = directives.into_iter().flatten().collect::<Vec<_>>();
+        // All of them or none: one the run may not have stops the others
+        // before any is sent.
+        for directive in &directives {
+            RunAction::Command(directive.clone())
+                .check(&self.0.event)
+                .map_err(refusal)?;
+        }
+        for directive in directives {
             self.command(ctx, directive).await?;
         }
         Ok(true)

@@ -1445,6 +1445,7 @@ export const nextKo: LocaleDictionary = {
   "next.schedules.chooseInstance": "인스턴스 선택",
   "next.schedules.noInstances": "아직 일정 인스턴스가 없습니다",
   "next.schedules.instanceGone": "더 이상 일정 인스턴스가 아닙니다",
+  "next.schedules.instanceProblem": "아무것도 하지 않음: 스크립트 인스턴스가 삭제되었거나 더 이상 일정에 따라 실행되지 않습니다",
   "next.schedules.scriptTimeHelp": "현지 시각. HH:MM 또는 매시를 뜻하는 *:MM. 여러 개는 쉼표로 구분합니다.",
   "next.schedules.runAtStartup": "시작할 때도 실행",
   "next.schedules.runAtStartupHelp": "스크립트는 규칙에서 이것을 켠 경우에만 시작할 때 실행됩니다.",

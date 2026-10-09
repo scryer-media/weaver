@@ -316,6 +316,86 @@ async fn a_queue_script_reaches_its_own_download_only_while_it_runs() {
 }
 
 #[tokio::test]
+async fn what_a_script_sends_through_the_api_is_stored_without_its_secrets() {
+    let (db, data) = setup();
+    let context = job(&db, data.path());
+    let started = gate(data.path(), "started");
+    let release = gate(data.path(), "release");
+    let package = db
+        .post_processing_script_directory()
+        .unwrap()
+        .join("notify");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("manifest.json"),
+        serde_json::json!({
+            "main": "run.sh",
+            "name": "notify",
+            "kind": "QUEUE",
+            "displayName": "Notify",
+            "version": "1.0.0",
+            "author": "Author",
+            "homepage": "https://example.invalid",
+            "license": "GNU",
+            "about": "About",
+            "description": [],
+            "requirements": [],
+            "queueEvents": "NZB_DOWNLOADED",
+            "taskTime": "",
+            "sections": [],
+            "commands": [],
+            "options": [{
+                "name": "Token",
+                "displayName": "Token",
+                "value": "",
+                "description": [],
+                "select": [],
+                "secret": true
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        package.join("run.sh"),
+        format!(
+            "#!/bin/sh\n{}exit 0\n",
+            announce_and_wait(&started, &release)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(package.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    select(
+        &db,
+        vec![on(DOWNLOADED, &ScriptName::new("notify").unwrap()).secret_input("Token", "hunter2")],
+    );
+    let event = {
+        let db = db.clone();
+        let mut event = EventContext::from_job(&context, QueueEvent::NzbDownloaded);
+        tokio::spawn(async move {
+            run_event(&db, &mut event, "queue-secrets", None, Some(supervisor()))
+                .await
+                .unwrap()
+        })
+    };
+
+    let me = wait_at_gate(started).await;
+    db.script_run_action(&me.run_id, parameter("Secret", "key=hunter2"))
+        .await
+        .unwrap();
+    db.script_run_action(&me.run_id, parameter("Token", &format!("t={}", me.token)))
+        .await
+        .unwrap();
+    let parameters = db.job_script_effects(42).unwrap().parameters;
+    assert_eq!(parameters["Secret"], "key=[REDACTED]");
+    assert_eq!(parameters["Token"], "t=[REDACTED]");
+
+    open_gate(release).await;
+    let results = event.await.unwrap();
+    assert_eq!(results[0].status, ScriptStatus::Succeeded);
+}
+
+#[tokio::test]
 async fn a_scan_script_chooses_the_category_through_the_api_and_the_next_script_sees_it() {
     let (db, data) = setup();
     let input = data.path().join("input.nzb");
@@ -512,7 +592,8 @@ async fn a_test_run_reports_what_its_script_asks_for_and_applies_none_of_it() {
     let live = db.script_run_for_token(&me.token).unwrap();
     assert_eq!(live.run_id, test.id);
     assert_eq!(live.instance_id, instance.id);
-    assert_eq!(live.job_id, None);
+    // The made-up download the script was handed as `WEAVER_JOB_ID`.
+    assert_eq!(live.job_id, Some(2_000_000_000));
     assert!(live.test);
 
     // Wait for the script's own line, so the logged one is known to follow it.

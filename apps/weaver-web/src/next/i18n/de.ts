@@ -1445,6 +1445,7 @@ export const nextDe: LocaleDictionary = {
   "next.schedules.chooseInstance": "Instanz auswählen",
   "next.schedules.noInstances": "Noch keine Zeitplan-Instanzen",
   "next.schedules.instanceGone": "Keine Zeitplan-Instanz mehr",
+  "next.schedules.instanceProblem": "Wirkungslos: Die Skript-Instanz ist entfernt oder läuft nicht mehr nach Zeitplan",
   "next.schedules.scriptTimeHelp": "Ortszeit. HH:MM oder *:MM für jede Stunde; mehrere durch Kommas trennen.",
   "next.schedules.runAtStartup": "Auch beim Start ausführen",
   "next.schedules.runAtStartupHelp": "Ein Skript läuft beim Start nur, wenn eine Regel dies einschaltet.",

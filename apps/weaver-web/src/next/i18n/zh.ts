@@ -1445,6 +1445,7 @@ export const nextZh: LocaleDictionary = {
   "next.schedules.chooseInstance": "选择实例",
   "next.schedules.noInstances": "还没有计划实例",
   "next.schedules.instanceGone": "已不再是计划实例",
+  "next.schedules.instanceProblem": "不会执行任何操作：其脚本实例已删除或不再按计划运行",
   "next.schedules.scriptTimeHelp": "本地时间。HH:MM，或用 *:MM 表示每小时；多个时间以逗号分隔。",
   "next.schedules.runAtStartup": "启动时也运行",
   "next.schedules.runAtStartupHelp": "只有规则开启此项时，脚本才会在启动时运行。",

@@ -5,10 +5,18 @@ import { expect, graphql, weaverRoute } from "../helpers";
 import { type Row, literal, query, waitRows } from "./datastore";
 
 /**
- * Script settings, lists and results through the public API, for the script
- * specs. Every spec takes the settings it needs with `useScripts` and gives
- * them back with the returned restore, so specs never inherit each other's
- * lists or limits.
+ * Script settings, instances and results through the public API, for the
+ * script specs. Every spec takes the settings it needs with `useScripts` and
+ * gives them back with the returned restore, so specs never inherit each
+ * other's instances or limits.
+ *
+ * The specs still describe what runs as lists of script names, one for every
+ * download and one per category. Weaver runs instances, so a list is set up as
+ * the instances its scripts' headers ask for: one per declared trigger, filled
+ * from the header, with a schedule rule for each declared run time other than
+ * start-up. A category's entries become instances narrowed to it, for the
+ * triggers a download raises, and a category with instances of its own does
+ * not also run the ones for every category.
  */
 export const WEAVER_SCRIPTS_DIR = "/data/scripts";
 
@@ -25,18 +33,84 @@ export type ScriptSettings = {
   concurrency: number;
   terminationGraceSeconds: number;
   strictSecurityRefusesExecution: boolean;
+  globalScriptsRun: "ALWAYS" | "ONLY_WITHOUT_CATEGORY_SCRIPTS";
 };
 export type ListEntry = { script: string; enabled?: boolean; timeoutSeconds?: number | null };
 export type ScriptLists = { global: ListEntry[]; categories: Array<{ category: string; entries: ListEntry[] }> };
 
+export type ScriptTrigger = "POST_PROCESSING" | "QUEUE" | "SCAN" | "SCHEDULER" | "FEED";
+export type ScriptInstance = {
+  id: string; name: string; script: string; trigger: ScriptTrigger; queueEvent: string | null;
+  inputs: Array<{ name: string; value: string | null; secret: boolean }>;
+  categories: string[]; enabled: boolean; blocking: boolean; timeoutSeconds: number | null; runOrder: number;
+};
+export type ScriptInstanceInput = {
+  name?: string; script: string; trigger: ScriptTrigger; queueEvent?: string | null;
+  inputs?: Array<{ name: string; value: string | null; secret?: boolean }>;
+  categories?: string[]; enabled?: boolean; blocking?: boolean; timeoutSeconds?: number | null;
+};
+
 const SETTINGS_FIELDS = `eventScriptConcurrency eventScriptTimeoutSeconds fileDownloadedEventInterval
   scriptOutputCeilingBytes scriptOutputRunsPerJob scriptOutputRingBytes scriptOutputRunCapBytes
-  scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution`;
-const LIST_FIELDS = "global { script enabled timeoutSeconds } categories { category entries { script enabled timeoutSeconds } }";
+  scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution globalScriptsRun`;
+const INSTANCE_FIELDS = "id name script trigger queueEvent inputs { name value secret } categories enabled blocking timeoutSeconds runOrder";
+
+/** Every saved instance, in run order. */
+export async function scriptInstances(request: APIRequestContext): Promise<ScriptInstance[]> {
+  return (await graphql<{ scriptInstances: ScriptInstance[] }>(request,
+    `query { scriptInstances { ${INSTANCE_FIELDS} } }`)).scriptInstances;
+}
+
+export async function createScriptInstance(request: APIRequestContext, input: ScriptInstanceInput): Promise<ScriptInstance> {
+  return (await graphql<{ createScriptInstance: ScriptInstance }>(request,
+    `mutation($input: ScriptInstanceInput!) { createScriptInstance(input: $input) { ${INSTANCE_FIELDS} } }`, { input })).createScriptInstance;
+}
+
+/** Remove an instance; any schedule rule that ran it goes with it. */
+export async function deleteScriptInstance(request: APIRequestContext, id: string): Promise<void> {
+  await graphql(request, "mutation($id: String!) { deleteScriptInstance(id: $id) }", { id });
+}
+
+/** The ids of the instances of `script`, optionally only those `trigger` starts. */
+export async function instanceIds(request: APIRequestContext, script: string, trigger?: ScriptTrigger): Promise<string[]> {
+  return (await scriptInstances(request))
+    .filter(instance => instance.script === script && (trigger === undefined || instance.trigger === trigger))
+    .map(instance => instance.id);
+}
+
+/**
+ * An instance the lists below own: one named after its script, as an
+ * instance created without a name is. A test that creates a named instance
+ * of its own keeps it across list changes and removes it itself.
+ */
+const listed = (instance: ScriptInstance) => instance.name === instance.script;
+
+/** The listed instances read back as lists of script names. */
+function listsOf(saved: ScriptInstance[]): ScriptLists {
+  const instances = saved.filter(listed);
+  const entries = (of: ScriptInstance[]): ListEntry[] => {
+    const byScript = new Map<string, ListEntry>();
+    for (const instance of of) {
+      const entry = byScript.get(instance.script);
+      if (entry) entry.enabled = entry.enabled || instance.enabled;
+      else byScript.set(instance.script, { script: instance.script, enabled: instance.enabled, timeoutSeconds: instance.timeoutSeconds });
+    }
+    return [...byScript.values()];
+  };
+  const ordered = [...instances].sort((left, right) => left.runOrder - right.runOrder);
+  const categories = [...new Set(ordered.flatMap(instance => instance.categories))];
+  return {
+    global: entries(ordered.filter(instance => instance.categories.length === 0)),
+    categories: categories.map(category => ({
+      category, entries: entries(ordered.filter(instance => instance.categories.includes(category))),
+    })),
+  };
+}
 
 export async function scriptSettings(request: APIRequestContext): Promise<ScriptSettings & { lists: ScriptLists }> {
-  return (await graphql<{ postProcessingSettings: ScriptSettings & { lists: ScriptLists } }>(request,
-    `query { postProcessingSettings { ${SETTINGS_FIELDS} lists { ${LIST_FIELDS} } } }`)).postProcessingSettings;
+  const data = await graphql<{ postProcessingSettings: ScriptSettings; scriptInstances: ScriptInstance[] }>(request,
+    `query { postProcessingSettings { ${SETTINGS_FIELDS} } scriptInstances { ${INSTANCE_FIELDS} } }`);
+  return { ...data.postProcessingSettings, lists: listsOf(data.scriptInstances) };
 }
 
 function settingsInput(settings: ScriptSettings & { lists?: ScriptLists }): Record<string, unknown> {
@@ -53,13 +127,56 @@ export async function setScriptSettings(request: APIRequestContext, patch: Parti
     { input: settingsInput({ ...current, ...patch }) })).setPostProcessingSettings;
 }
 
+type Preset = {
+  triggers: Array<{ trigger: ScriptTrigger; queueEvent: string | null }>;
+  taskTimes: string[];
+  inputs: Array<{ name: string; value: string | null; secret: boolean }>;
+};
+
+/** What each listed script's header asks for, by script name. */
+async function presets(request: APIRequestContext): Promise<Map<string, Preset>> {
+  const listing = (await graphql<{ discoveredScripts: { scripts: Array<{ name: string; preset: Preset }> } }>(request,
+    "query { discoveredScripts { scripts { name preset { triggers { trigger queueEvent } taskTimes inputs { name value secret } } } } }",
+  )).discoveredScripts;
+  return new Map(listing.scripts.map(script => [script.name, script.preset]));
+}
+
+/** The triggers a download raises, the only ones a category can narrow. */
+const CATEGORY_TRIGGERS = new Set<ScriptTrigger>(["POST_PROCESSING", "QUEUE"]);
+
+/**
+ * Replace every listed instance with the ones `lists` describes, in list
+ * order. A script whose header declares no trigger, such as a bare SABnzbd
+ * script, runs as post-processing.
+ */
 export async function setScriptLists(request: APIRequestContext, lists: Partial<ScriptLists>): Promise<ScriptLists> {
-  const input = {
-    global: (lists.global ?? []).map(entry => ({ enabled: true, ...entry })),
-    categories: (lists.categories ?? []).map(list => ({ category: list.category, entries: list.entries.map(entry => ({ enabled: true, ...entry })) })),
+  for (const instance of (await scriptInstances(request)).filter(listed)) await deleteScriptInstance(request, instance.id);
+  const known = await presets(request);
+  const add = async (entry: ListEntry, category: string | null) => {
+    const preset = known.get(entry.script);
+    const triggers = preset?.triggers.length ? preset.triggers : [{ trigger: "POST_PROCESSING" as const, queueEvent: null }];
+    const enabled = entry.enabled ?? true;
+    for (const { trigger, queueEvent } of triggers) {
+      if (category !== null && !CATEGORY_TRIGGERS.has(trigger)) continue;
+      const instance = await createScriptInstance(request, {
+        script: entry.script, trigger, queueEvent, enabled, timeoutSeconds: entry.timeoutSeconds ?? null,
+        categories: category === null ? [] : [category],
+        inputs: (preset?.inputs ?? []).filter(input => !input.secret).map(({ name, value }) => ({ name, value: value ?? "" })),
+      });
+      if (trigger !== "SCHEDULER" || category !== null) continue;
+      // A start-up time is only run by a rule that opts into it.
+      for (const time of (preset?.taskTimes ?? []).filter(time => time !== "*")) {
+        await graphql(request, "mutation($input: ScheduleInput!) { createSchedule(input: $input) { id } }", {
+          input: { actionType: "run_script", instanceId: instance.id, time, enabled, label: `${entry.script} (${time})` },
+        });
+      }
+    }
   };
-  return (await graphql<{ setScriptLists: ScriptLists }>(request,
-    `mutation($input: ScriptListsInput!) { setScriptLists(input: $input) { ${LIST_FIELDS} } }`, { input })).setScriptLists;
+  for (const entry of lists.global ?? []) await add(entry, null);
+  for (const list of lists.categories ?? []) for (const entry of list.entries) await add(entry, list.category);
+  // A category with a list of its own runs that list instead.
+  await setScriptSettings(request, { globalScriptsRun: "ONLY_WITHOUT_CATEGORY_SCRIPTS" });
+  return listsOf(await scriptInstances(request));
 }
 
 /**

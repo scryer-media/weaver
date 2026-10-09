@@ -217,6 +217,41 @@ fn an_update_keeps_a_secret_that_was_not_sent_again() {
 }
 
 #[test]
+fn a_secret_is_not_kept_for_another_script() {
+    let db = Database::open_in_memory().unwrap();
+    let saved = db
+        .create_script_instance(
+            draft("notify.sh", InstanceTrigger::PostProcessing).secret_input("Token", "hunter2"),
+        )
+        .unwrap();
+    let sealed = stored_input(&db, &saved.id, "Token").unwrap();
+
+    // Pointed at another script with the secret left as it was.
+    let mut moved = ScriptInstanceDraft::from_instance(&saved);
+    moved.script = ScriptName::new("other.sh").unwrap();
+    assert!(moved.inputs.iter().all(|input| input.value.is_none()));
+    assert!(matches!(
+        db.update_script_instance(&saved.id, moved.clone()),
+        Err(ScriptInstanceError::Invalid(
+            "secrets must be entered again when the script changes"
+        ))
+    ));
+    let unchanged = db.script_instance(&saved.id).unwrap().unwrap();
+    assert_eq!(unchanged.script.as_str(), "notify.sh");
+    assert_eq!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
+
+    // Entered again, it goes with the instance to the other script.
+    moved.inputs[0].value = Some("hunter3".into());
+    let updated = db.update_script_instance(&saved.id, moved).unwrap();
+    assert_eq!(updated.script.as_str(), "other.sh");
+    assert_ne!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
+
+    // Kept as it is while the script stays the same.
+    db.update_script_instance(&saved.id, ScriptInstanceDraft::from_instance(&updated))
+        .unwrap();
+}
+
+#[test]
 fn an_instance_that_could_not_run_as_written_is_refused() {
     let db = Database::open_in_memory().unwrap();
     let pp = InstanceTrigger::PostProcessing;

@@ -3,7 +3,7 @@ import { waitTerminal } from "./support/downloads";
 import { stage } from "./support/network-flow";
 import { gateWaiting, removeFixtureScripts, removeStaleGate, writeFixtureScript } from "./support/script-fixtures";
 import {
-  loadStageState, queueRows, saveStageState, scriptSettings, setScriptLists, useScripts, waitQueueRows,
+  deleteScriptInstance, instanceIds, loadStageState, queueRows, saveStageState, scriptSettings, useScripts, waitQueueRows,
 } from "./support/script-settings";
 
 /**
@@ -41,8 +41,7 @@ test("Q12 a restart marks a started queue run interrupted and the job carries on
     return;
   }
   const { jobId } = loadStageState<{ jobId: number }>("q12");
-  const current = (await scriptSettings(request)).lists;
-  await setScriptLists(request, { global: current.global.filter(entry => entry.script !== script), categories: current.categories });
+  for (const id of await instanceIds(request, script)) await deleteScriptInstance(request, id);
   // The restart killed the run that read this gate.
   removeStaleGate(script, jobId);
   removeFixtureScripts([script]);

@@ -155,6 +155,10 @@ pub enum CallerScope {
     Read,
     Control,
     Admin,
+    /// A running script calling with its run's token. It may read whatever
+    /// an administrator may, and of what changes anything only ask what its
+    /// own run allows. It is neither control nor admin anywhere.
+    ScriptRun,
 }
 
 impl CallerScope {

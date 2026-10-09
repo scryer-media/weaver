@@ -3,7 +3,7 @@ import { type NetworkFlow, flowAfter, flowMark, ladderLeg, legOn, rssKey, rung }
 import { NetworkWorld, saveEvidence } from "./support/network-scenario";
 import { type FixtureEvent, controlRoute, directEvents, fixtureEvents, fixtureMark } from "./support/proxy-fixture";
 import { clearScriptRecords, removeFixtureScripts, scriptBodies, scriptRecords, writeFixtureScript } from "./support/script-fixtures";
-import { useScripts } from "./support/script-settings";
+import { createScriptInstance, deleteScriptInstance, useScripts } from "./support/script-settings";
 import { tunnelState } from "./support/tunnel-fixture";
 
 /** RSS through routes. */
@@ -80,9 +80,10 @@ test("RS04 a FEED script rewrites the routed feed and the rewritten item is queu
   const script = writeFixtureScript(`rs04-feed-${Date.now()}.sh`, { kinds: ["FEED"], body: scriptBodies.rewriteFeedTitles("rewritten-"), exitCode: 93 });
   clearScriptRecords();
   const restoreScripts = await useScripts(request, {});
+  const instance = await createScriptInstance(request, { name: `${script}-feed`, script, trigger: "FEED" });
   try {
     const token = `rs04-${Date.now()}`;
-    const feed = await world.feed({ url: await world.armFeed(token), route: { legs: [ladderLeg(a.id, [rung.proxy(connect1.id)], 100)] }, scripts: [script] });
+    const feed = await world.feed({ url: await world.armFeed(token), route: { legs: [ladderLeg(a.id, [rung.proxy(connect1.id)], 100)] }, scriptInstanceIds: [instance.id] });
     const { report, events } = await syncedEvents(request, feed);
     expect(report.errors).toEqual([]);
     expect(connectedOn(events, "connect1").length).toBeGreaterThan(0);
@@ -93,6 +94,7 @@ test("RS04 a FEED script rewrites the routed feed and the rewritten item is queu
     const jobs = (await graphql<{ jobs: Array<{ id: number; name: string; originalTitle: string }> }>(request, "query { jobs { id name originalTitle } }")).jobs;
     expect(jobs.filter(job => `${job.name} ${job.originalTitle}`.includes(`rewritten-proxy-${token}`))).toHaveLength(1);
   } finally {
+    await deleteScriptInstance(request, instance.id);
     await restoreScripts();
     removeFixtureScripts([script]);
   }

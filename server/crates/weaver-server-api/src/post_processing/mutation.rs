@@ -7,7 +7,7 @@ use weaver_server_core::bandwidth::schedule::SharedSchedules;
 use weaver_server_core::post_processing::executor::{
     PostProcessingExecutor, strict_security_enabled,
 };
-use weaver_server_core::post_processing::instances::ScriptInstance;
+use weaver_server_core::post_processing::instances::{InstanceTrigger, ScriptInstance};
 use weaver_server_core::post_processing::listing::resolve_script;
 use weaver_server_core::post_processing::model::{
     PipelineOutcome, PostProcessingSettings, ScriptName,
@@ -50,6 +50,28 @@ fn require_script(db: &Database, script: &ScriptName) -> std::result::Result<(),
 
 fn view(db: &Database, instance: ScriptInstance) -> ScriptInstanceGql {
     crate::post_processing::query::directory_view(db).instance(instance)
+}
+
+/// Take out every schedule rule that runs the instance `id`, and return the
+/// rules as they are saved afterwards.
+fn prune_schedule_rules(
+    db: &Database,
+    id: &str,
+) -> std::result::Result<
+    Vec<weaver_server_core::bandwidth::ScheduleEntry>,
+    weaver_server_core::StateError,
+> {
+    let mut rules = db.list_schedules()?;
+    let before = rules.len();
+    rules.retain(|rule| {
+        !matches!(&rule.action,
+            ScheduleAction::RunScript { instance_id, .. } if *instance_id == id)
+    });
+    if rules.len() != before {
+        db.save_schedules(&rules)?;
+        rules = db.list_schedules()?;
+    }
+    Ok(rules)
 }
 
 #[derive(Default)]
@@ -219,7 +241,9 @@ impl PostProcessingMutation {
     }
 
     /// Replace everything saved in an instance. A secret input sent without a
-    /// value keeps the one already stored.
+    /// value keeps the one already stored, unless the instance is given
+    /// another script: then its secrets must be entered again. An instance
+    /// that no longer runs on a schedule loses the schedule rules that ran it.
     #[graphql(guard = "FreshAdminGuard")]
     async fn update_script_instance(
         &self,
@@ -229,7 +253,11 @@ impl PostProcessingMutation {
     ) -> Result<ScriptInstanceGql> {
         let draft = input.into_draft().map_err(async_graphql::Error::new)?;
         let db = ctx.data::<Database>()?.clone();
-        blocking(move || {
+        let schedules_state = ctx.data::<SharedSchedules>()?.clone();
+        // Held across the whole change so the rules a running evaluator reads
+        // never name an instance that no longer runs on a schedule.
+        let mut schedules = schedules_state.write().await;
+        let (instance, rules) = blocking(move || {
             let existing = db
                 .script_instance(&id)
                 .map_err(|error| error.to_string())?
@@ -240,9 +268,18 @@ impl PostProcessingMutation {
             let instance = db
                 .update_script_instance(&id, draft)
                 .map_err(|error| error.to_string())?;
-            Ok::<_, String>(view(&db, instance))
+            let rules = if instance.trigger != InstanceTrigger::Schedule {
+                Some(prune_schedule_rules(&db, &id).map_err(|error| error.to_string())?)
+            } else {
+                None
+            };
+            Ok::<_, String>((view(&db, instance), rules))
         })
-        .await
+        .await?;
+        if let Some(rules) = rules {
+            *schedules = rules;
+        }
+        Ok(instance)
     }
 
     /// Remove an instance, along with any schedule rule that ran it. False
@@ -254,23 +291,15 @@ impl PostProcessingMutation {
         // Held across the whole change so the rules a running evaluator reads
         // never name an instance that has just gone.
         let mut schedules = schedules_state.write().await;
-        let (deleted, rules) = blocking(move || {
-            let deleted = db.delete_script_instance(&id)?;
-            let mut rules = db.list_schedules()?;
-            let before = rules.len();
-            rules.retain(|rule| {
-                !matches!(&rule.action,
-                    ScheduleAction::RunScript { instance_id, .. } if *instance_id == id)
-            });
-            if rules.len() != before {
-                db.save_schedules(&rules)?;
-                rules = db.list_schedules()?;
-            }
-            Ok::<_, weaver_server_core::StateError>((deleted, rules))
+        // The rules go first: an instance left without them is a lesser
+        // mistake than a rule left naming an instance that is gone.
+        let (rules, deleted) = blocking(move || {
+            let rules = prune_schedule_rules(&db, &id)?;
+            Ok::<_, weaver_server_core::StateError>((rules, db.delete_script_instance(&id)))
         })
         .await?;
         *schedules = rules;
-        Ok(deleted)
+        deleted.map_err(refused)
     }
 
     /// Put the instances of one trigger in the order given. They keep the

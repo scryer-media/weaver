@@ -1445,6 +1445,7 @@ export const nextPt: LocaleDictionary = {
   "next.schedules.chooseInstance": "Escolher instância",
   "next.schedules.noInstances": "Ainda não há instâncias de agendamento",
   "next.schedules.instanceGone": "Não é mais uma instância de agendamento",
+  "next.schedules.instanceProblem": "Não faz nada: a instância de script foi removida ou não é mais executada por agendamento",
   "next.schedules.scriptTimeHelp": "Horário local. HH:MM, ou *:MM para toda hora; separe vários com vírgulas.",
   "next.schedules.runAtStartup": "Executar também na inicialização",
   "next.schedules.runAtStartupHelp": "Um script só é executado na inicialização quando uma regra ativa isto.",

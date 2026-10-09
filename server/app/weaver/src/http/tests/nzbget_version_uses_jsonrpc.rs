@@ -498,6 +498,84 @@ async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
 }
 
 #[tokio::test]
+async fn nzbget_append_takes_a_script_switch_as_a_plain_parameter_and_still_runs_instances() {
+    use base64::Engine as _;
+    use weaver_server_core::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+    use weaver_server_core::post_processing::model::{ScriptEventLabel, ScriptName};
+
+    let db = Database::open_in_memory().unwrap();
+    let tidy = db
+        .create_script_instance(ScriptInstanceDraft {
+            categories: vec!["tv".into()],
+            ..ScriptInstanceDraft::new(
+                ScriptName::new("tidy.sh").unwrap(),
+                InstanceTrigger::PostProcessing,
+            )
+        })
+        .unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db.clone(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let nzb_b64 = base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Switch.Release"));
+
+    // A client that once picked scripts per download sends `<name>:=no`.
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "Switch.Release.nzb",
+                nzb_b64,
+                "tv",
+                0,
+                false,
+                false,
+                "",
+                0,
+                "all",
+                ["tidy.sh:", "no"]
+            ],
+            "id": "append"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["result"].as_u64().unwrap() >= 10_000);
+    let jobs = handle.list_jobs();
+    assert_eq!(jobs.len(), 1);
+    // Kept as the parameter it was sent as, and nothing more.
+    assert!(
+        jobs[0]
+            .metadata
+            .iter()
+            .any(|(key, value)| key == "tidy.sh:" && value == "no")
+    );
+    assert!(
+        jobs[0]
+            .metadata
+            .iter()
+            .all(|(key, _)| !key.contains("script_override")),
+        "{:?}",
+        jobs[0].metadata
+    );
+    // What runs for the download is still its category's instances.
+    assert_eq!(
+        db.script_instances_for(&ScriptEventLabel::PostProcessing, Some("tv"))
+            .unwrap()
+            .into_iter()
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>(),
+        [tidy.id]
+    );
+}
+
+#[tokio::test]
 async fn nzbget_append_accepts_base64_payload_with_embedded_whitespace() {
     use base64::Engine as _;
 

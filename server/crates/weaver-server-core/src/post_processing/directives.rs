@@ -79,6 +79,27 @@ impl Directive {
             | Self::DupeMode(_) => true,
         }
     }
+
+    /// The same command with each of its texts passed through `map`.
+    pub fn map_text(self, mut map: impl FnMut(&str) -> String) -> Self {
+        match self {
+            Self::Parameter { name, value } => Self::Parameter {
+                name: map(&name),
+                value: map(&value),
+            },
+            Self::Directory(value) => Self::Directory(map(&value)),
+            Self::FinalDirectory(value) => Self::FinalDirectory(map(&value)),
+            Self::Name(value) => Self::Name(map(&value)),
+            Self::Category(value) => Self::Category(map(&value)),
+            Self::DupeKey(value) => Self::DupeKey(map(&value)),
+            Self::MarkBad
+            | Self::Priority(_)
+            | Self::Top(_)
+            | Self::Paused(_)
+            | Self::DupeScore(_)
+            | Self::DupeMode(_) => self,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

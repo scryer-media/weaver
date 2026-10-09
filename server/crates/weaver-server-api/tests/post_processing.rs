@@ -788,6 +788,104 @@ async fn a_script_is_set_up_from_its_header_once_and_its_schedule_goes_with_it()
 }
 
 #[tokio::test]
+async fn a_rule_goes_when_its_instance_stops_running_on_a_schedule_or_is_deleted() {
+    use std::sync::Arc;
+    use weaver_server_core::bandwidth::ScheduleAction;
+    use weaver_server_core::bandwidth::schedule::SharedSchedules;
+
+    let harness = TestHarness::new().await;
+    write_script(
+        &harness,
+        "nightly.sh",
+        "#!/bin/sh\n### NZBGET SCHEDULER SCRIPT ###\nexit 93\n",
+    )
+    .await;
+    let first = id(&create_instance(&harness, r#"script: "nightly.sh", trigger: SCHEDULER"#).await);
+    let second = id(&create_instance(
+        &harness,
+        r#"name: "second", script: "nightly.sh", trigger: SCHEDULER"#,
+    )
+    .await);
+    let rule = |id: &str, instance: &str| json!({ "id": id, "time": "03:30", "action": { "type": "run_script", "instance_id": instance, "run_at_startup": false } });
+    harness
+        .db
+        .set_setting(
+            "schedules",
+            &json!([
+                rule("first", &first),
+                rule("second", &second),
+                { "id": "quiet", "time": "01:00", "action": { "type": "pause" } },
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    let schedules: SharedSchedules = Arc::new(tokio::sync::RwLock::new(
+        harness.db.list_schedules().unwrap(),
+    ));
+    let execute = |query: String| {
+        let schedules = schedules.clone();
+        let schema = harness.schema.clone();
+        async move {
+            let response = schema
+                .execute(
+                    async_graphql::Request::new(query)
+                        .data(CallerScope::Local)
+                        .data(schedules),
+                )
+                .await;
+            assert_no_errors(&response);
+            response
+        }
+    };
+    let rule_ids = || {
+        harness
+            .db
+            .list_schedules()
+            .unwrap()
+            .into_iter()
+            .map(|rule| rule.id)
+            .collect::<Vec<_>>()
+    };
+
+    // Still on a schedule, so its rule stays.
+    execute(format!(
+        r#"mutation {{ updateScriptInstance(id: "{first}", input: {{ name: "renamed", script: "nightly.sh", trigger: SCHEDULER }}) {{ id }} }}"#
+    ))
+    .await;
+    assert_eq!(rule_ids(), ["first", "second", "quiet"]);
+
+    // Given another trigger, it has no rule to run it.
+    execute(format!(
+        r#"mutation {{ updateScriptInstance(id: "{first}", input: {{ script: "nightly.sh", trigger: SCAN }}) {{ id }} }}"#
+    ))
+    .await;
+    assert_eq!(rule_ids(), ["second", "quiet"]);
+    assert_eq!(
+        *schedules.read().await,
+        harness.db.list_schedules().unwrap()
+    );
+
+    // Deleted, its rule goes with it and the rest stay.
+    let deleted = execute(format!(
+        r#"mutation {{ deleteScriptInstance(id: "{second}") }}"#
+    ))
+    .await;
+    assert_eq!(response_data(&deleted)["deleteScriptInstance"], true);
+    assert_eq!(rule_ids(), ["quiet"]);
+    let published = schedules.read().await.clone();
+    assert_eq!(published, harness.db.list_schedules().unwrap());
+    assert!(matches!(published[0].action, ScheduleAction::Pause));
+    assert_eq!(
+        ids(&instances(&harness).await),
+        std::slice::from_ref(&first),
+        "only the instance asked for is gone"
+    );
+
+    let missing = execute(r#"mutation { deleteScriptInstance(id: "missing") }"#.to_string()).await;
+    assert_eq!(response_data(&missing)["deleteScriptInstance"], false);
+}
+
+#[tokio::test]
 async fn an_instance_is_waited_for_unless_it_says_otherwise() {
     let harness = TestHarness::new().await;
     write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;

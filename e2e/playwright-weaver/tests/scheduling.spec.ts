@@ -58,13 +58,13 @@ const hhmm = (instant: Date) => instant.toISOString().slice(11, 16);
 // Rules
 
 type ScheduleRow = {
-  id: string; label: string; enabled: boolean; implicit: boolean; days: string[]; time: string; times: string[];
+  id: string; label: string; enabled: boolean; days: string[]; time: string; times: string[];
   everyHourAtMinute: number | null; actionType: string; track: string; feedId: number | null;
   serverId: number | null; serverActive: boolean | null; speedLimitBytes: number | null; hardwareProfile: string | null;
 };
 type RuleInput = Record<string, unknown> & { actionType: string; time: string };
 
-const SCHEDULE_FIELDS = "id label enabled implicit days time times everyHourAtMinute actionType track feedId serverId serverActive speedLimitBytes hardwareProfile";
+const SCHEDULE_FIELDS = "id label enabled days time times everyHourAtMinute actionType track feedId serverId serverActive speedLimitBytes hardwareProfile";
 
 async function schedules(request: APIRequestContext): Promise<ScheduleRow[]> {
   return (await graphql<{ schedules: ScheduleRow[] }>(request, `query { schedules { ${SCHEDULE_FIELDS} } }`)).schedules;
@@ -842,7 +842,7 @@ test("T16 rules are created, edited, toggled and deleted through the API", async
   await withRules(request, "t16", async rules => {
     try {
       const created = await rules.create({ actionType: "fetch_rss", time: "10:00", feedId: feeds.E });
-      expect(created).toMatchObject({ enabled: true, implicit: false, time: "10:00", actionType: "fetch_rss", track: "ONE_SHOT", feedId: feeds.E });
+      expect(created).toMatchObject({ enabled: true, time: "10:00", actionType: "fetch_rss", track: "ONE_SHOT", feedId: feeds.E });
       expect(created.id).toMatch(/^sched-[0-9a-f]+$/);
 
       const renamed = `${created.label}-edited`;

@@ -10,7 +10,8 @@ import {
   waitingGates, writeBareScript, writeFixturePackage, writeFixtureScript,
 } from "./support/script-fixtures";
 import {
-  type ListEntry, type ScriptResult, WEAVER_SCRIPTS_DIR, loadStageState, nzbDocument, nzbgetRpc, queueRows, saveStageState, scriptOutput,
+  type ListEntry, type ScriptResult, WEAVER_SCRIPTS_DIR, createScriptInstance, deleteScriptInstance, instanceIds, loadStageState,
+  nzbDocument, nzbgetRpc, queueRows, saveStageState, scriptInstances, scriptOutput,
   scriptResults, scriptSettings, setScriptLists, submitNzb, useScripts, waitJobLessResults, waitQueueRows, waitResults,
   withControlKey,
 } from "./support/script-settings";
@@ -489,7 +490,7 @@ test("Q11 cancelling a job ends its blocked NZB_ADDED run", async ({ request }) 
   }
 });
 
-test("Q13 a per-job script override replaces the global and category lists", async ({ request }) => {
+test("Q13 a `<Script>:` append parameter picks nothing; the category's own instances run", async ({ request }) => {
   const tag = `q13-${token()}`;
   const override = writeFixtureScript(`${tag}-override`, { kinds: ["POST-PROCESSING"], exitCode: 93 });
   const categoryScript = writeFixtureScript(`${tag}-category`, { kinds: ["POST-PROCESSING"], exitCode: 93 });
@@ -500,7 +501,7 @@ test("Q13 a per-job script override replaces the global and category lists", asy
     categories: [{ category: tag, entries: [{ script: categoryScript }] }],
   });
   try {
-    note("coverage", "The override is written only by the NZBGet facade, from `<Script>:` append parameters (weaver.* attributes are reserved on submitNzb).");
+    note("coverage", "NZBGet clients once picked scripts per download with `<Script>:` append parameters; Weaver keeps them as plain parameters and runs the instances it is set up with.");
     const messageId = `${tag}@e2e.invalid`;
     await postProbeArticle(messageId, 4096);
     const nzb = base64(nzbDocument(tag, [{ messageId, bytes: 4096 }]));
@@ -508,9 +509,9 @@ test("Q13 a per-job script override replaces the global and category lists", asy
       [`${tag}.nzb`, nzb, tag, 0, false, false, "", 0, "SCORE", [{ Name: `${override}:`, Value: "yes" }]])) as number;
     expect(jobId).toBeGreaterThan(0);
     expect(await waitTerminal(request, jobId)).toBe("COMPLETED");
-    const results = await waitResults(request, jobId, all => all.some(result => result.script === override), `Q13 result of ${override}`);
-    expect(results.map(result => result.script).filter(name => [override, categoryScript, globalScript].includes(name))).toEqual([override]);
-    expect(recordsOf(categoryScript)).toEqual([]);
+    const results = await waitResults(request, jobId, all => all.some(result => result.script === categoryScript), `Q13 result of ${categoryScript}`);
+    expect(results.map(result => result.script).filter(name => [override, categoryScript, globalScript].includes(name))).toEqual([categoryScript]);
+    expect(recordsOf(override)).toEqual([]);
     expect(recordsOf(globalScript)).toEqual([]);
   } finally {
     await restore();
@@ -640,7 +641,9 @@ test("Q17 rerunPostProcessing appends a second run; cancelJobPostProcessing ends
 const SS01_SUBJECT = "ss01-subject";
 const SS01_WITNESS = "ss01-witness";
 const SS01_RULE = "ss01-startup";
-const subjectRuns = (implicit: boolean) => scriptRecords(SS01_SUBJECT).filter(record => (record.env.NZBSP_TASKID === "0") === implicit);
+/** The startup rule runs an instance of its own, told apart by its `Origin` input. */
+const fromRule = (env: Record<string, string>) => (env.NZBPO_Origin ?? env.NZBPO_ORIGIN) === "rule";
+const subjectRuns = (fromHeader: boolean) => scriptRecords(SS01_SUBJECT).filter(record => fromRule(record.env) !== fromHeader);
 const witnessRuns = () => scriptRecords(SS01_WITNESS).length;
 
 /** Occurrences of the subject's `*:15` and `03:30` times in (from, to], on UTC minutes. */
@@ -654,22 +657,27 @@ function subjectOccurrences(from: Date, to: Date): number {
   return count;
 }
 
-type Schedule = { id: string; implicit: boolean; enabled: boolean; label: string; time: string; script: string | null; runAtStartup: boolean; actionType: string };
+type Schedule = { id: string; enabled: boolean; label: string; time: string; instanceId: string | null; runAtStartup: boolean; actionType: string };
 async function schedules(request: APIRequestContext): Promise<Schedule[]> {
   return (await graphql<{ schedules: Schedule[] }>(request,
-    "query { schedules { id implicit enabled label time script runAtStartup actionType } }")).schedules;
+    "query { schedules { id enabled label time instanceId runAtStartup actionType } }")).schedules;
 }
 
-test("SS01 SCHEDULER task times become implicit schedules on the e2e clock; Startup runs only by explicit rule", async ({ request }) => {
-  note("discrepancy", "The implicit Startup (`*`) entry is never run (enabled false, run_at_startup false); a startup run needs an explicit run_script rule with runAtStartup, which this test creates and checks after the restart.");
+/** The rules that run an instance of `script`. */
+async function scriptSchedules(request: APIRequestContext, script: string): Promise<Schedule[]> {
+  const ids = new Set(await instanceIds(request, script));
+  return (await schedules(request)).filter(entry => entry.instanceId !== null && ids.has(entry.instanceId));
+}
+
+test("SS01 SCHEDULER task times become schedule rules on the e2e clock; Startup runs only by explicit rule", async ({ request }) => {
+  note("discrepancy", "The header's Startup (`*`) time gets no rule; a startup run needs a run_script rule with runAtStartup, which this test creates for an instance of its own and checks after the restart.");
   if (stage() !== "initial") {
-    const saved = loadStageState<{ implicit: number; explicit: number }>("ss01");
-    await expect.poll(() => subjectRuns(false).length, { message: "the explicit startup rule ran at boot", timeout: 0 }).toBeGreaterThanOrEqual(saved.explicit + 1);
-    expect(subjectRuns(false)).toHaveLength(saved.explicit + 1);
-    expect(subjectRuns(false).at(-1)!.env.NZBSP_TASKID).not.toBe("0");
-    expect(subjectRuns(true), "the implicit Startup entry did not run").toHaveLength(saved.implicit);
-    for (const rule of (await schedules(request)).filter(entry => !entry.implicit && entry.label === SS01_RULE)) {
-      await graphql(request, "mutation($id: String!) { deleteSchedule(id: $id) { id } }", { id: rule.id });
+    const saved = loadStageState<{ header: number; rule: number }>("ss01");
+    await expect.poll(() => subjectRuns(false).length, { message: "the startup rule ran at boot", timeout: 0 }).toBeGreaterThanOrEqual(saved.rule + 1);
+    expect(subjectRuns(false)).toHaveLength(saved.rule + 1);
+    expect(subjectRuns(true), "the header's Startup time did not run").toHaveLength(saved.header);
+    for (const instance of (await scriptInstances(request)).filter(entry => entry.name === SS01_RULE)) {
+      await deleteScriptInstance(request, instance.id);
     }
     const current = (await scriptSettings(request)).lists;
     await setScriptLists(request, {
@@ -696,10 +704,9 @@ test("SS01 SCHEDULER task times become implicit schedules on the e2e clock; Star
   }, { message: "the schedule evaluator fires the witness on the e2e clock", timeout: 0 }).toBe(true);
 
   await setScriptLists(request, await withCurrentLists(request, [{ script: SS01_SUBJECT }, { script: SS01_WITNESS }]));
-  const entries = (await schedules(request)).filter(entry => entry.implicit && entry.script === SS01_SUBJECT);
-  expect(entries.map(entry => entry.time).sort()).toEqual(["*", "*:15", "03:30"].sort());
-  for (const entry of entries) expect(entry.id).toMatch(/^implicit-script:/);
-  expect(entries.find(entry => entry.time === "*")!.enabled).toBe(false);
+  const entries = await scriptSchedules(request, SS01_SUBJECT);
+  expect(entries.map(entry => entry.time).sort()).toEqual(["*:15", "03:30"].sort());
+  for (const entry of entries) expect(entry).toMatchObject({ actionType: "run_script", enabled: true, runAtStartup: false });
 
   let at = readClock();
   const end = new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate(), 3, 34));
@@ -715,45 +722,45 @@ test("SS01 SCHEDULER task times become implicit schedules on the e2e clock; Star
     expect(subjectRuns(true)).toHaveLength(expected);
     at = next;
   }
-  expect(subjectRuns(true).every(record => record.env.NZBSP_TASKID === "0")).toBe(true);
-
-  expect(await graphqlErrors(request, "mutation($input: ScheduleInput!) { createSchedule(input: $input) { id } }",
-    { input: { actionType: "run_script", script: SS01_SUBJECT, time: "*", label: `${SS01_RULE}-refused` } }))
-    .toEqual([expect.stringContaining("startup scripts require runAtStartup")]);
-  for (const rule of (await schedules(request)).filter(entry => !entry.implicit && entry.label === SS01_RULE)) {
-    await graphql(request, "mutation($id: String!) { deleteSchedule(id: $id) { id } }", { id: rule.id });
+  for (const instance of (await scriptInstances(request)).filter(entry => entry.name === SS01_RULE)) {
+    await deleteScriptInstance(request, instance.id);
   }
+  // Deliberately not restored: the restarted stage checks this rule ran at boot.
+  const startup = await createScriptInstance(request, {
+    name: SS01_RULE, script: SS01_SUBJECT, trigger: "SCHEDULER", inputs: [{ name: "Origin", value: "rule" }],
+  });
+  expect(await graphqlErrors(request, "mutation($input: ScheduleInput!) { createSchedule(input: $input) { id } }",
+    { input: { actionType: "run_script", instanceId: startup.id, time: "*", label: `${SS01_RULE}-refused` } }))
+    .toEqual([expect.stringContaining("startup scripts require runAtStartup")]);
   await graphql(request, "mutation($input: ScheduleInput!) { createSchedule(input: $input) { id } }",
-    { input: { actionType: "run_script", script: SS01_SUBJECT, time: "*", runAtStartup: true, label: SS01_RULE } });
-  saveStageState("ss01", { implicit: subjectRuns(true).length, explicit: subjectRuns(false).length });
+    { input: { actionType: "run_script", instanceId: startup.id, time: "*", runAtStartup: true, label: SS01_RULE } });
+  saveStageState("ss01", { header: subjectRuns(true).length, rule: subjectRuns(false).length });
 });
 
-test("SS02 implicit schedules are read-only", async ({ request }) => {
+test("SS02 a header's task times become ordinary rules the operator can change", async ({ request }) => {
   const script = writeFixtureScript(`ss02-${token()}`, { kinds: ["SCHEDULER"], taskTimes: ["05:00"] });
   const restore = await useScripts(request, await withCurrentLists(request, [{ script }]));
   try {
-    const entry = (await schedules(request)).find(candidate => candidate.implicit && candidate.script === script);
-    expect(entry, "implicit schedule for the task time").toBeTruthy();
-    const refused = "manifest schedules are read-only; create an explicit rule to opt into startup";
-    const variables = { id: entry!.id };
-    expect(await graphqlErrors(request, "mutation($id: String!) { toggleSchedule(id: $id, enabled: false) { id } }", variables))
-      .toEqual([expect.stringContaining(refused)]);
-    expect(await graphqlErrors(request, "mutation($id: String!, $input: ScheduleInput!) { updateSchedule(id: $id, input: $input) { id } }",
-      { ...variables, input: { actionType: "run_script", script, time: "06:00" } })).toEqual([expect.stringContaining(refused)]);
-    expect(await graphqlErrors(request, "mutation($id: String!) { deleteSchedule(id: $id) { id } }", variables))
-      .toEqual([expect.stringContaining(refused)]);
-    const after = (await schedules(request)).find(candidate => candidate.id === entry!.id);
-    expect(after).toMatchObject({ enabled: entry!.enabled, time: "05:00" });
-    note("observed", "toggle, update and delete on an implicit entry are refused; nothing persists.");
+    const [entry, ...others] = await scriptSchedules(request, script);
+    expect(others, "one rule for the one task time").toEqual([]);
+    expect(entry).toMatchObject({ actionType: "run_script", time: "05:00", enabled: true });
+    const variables = { id: entry.id };
+    await graphql(request, "mutation($id: String!) { toggleSchedule(id: $id, enabled: false) { id } }", variables);
+    await graphql(request, "mutation($id: String!, $input: ScheduleInput!) { updateSchedule(id: $id, input: $input) { id } }",
+      { ...variables, input: { actionType: "run_script", instanceId: entry.instanceId, time: "06:00", enabled: false, label: entry.label } });
+    expect((await schedules(request)).find(candidate => candidate.id === entry.id)).toMatchObject({ enabled: false, time: "06:00" });
+    await graphql(request, "mutation($id: String!) { deleteSchedule(id: $id) { id } }", variables);
+    expect((await schedules(request)).some(candidate => candidate.id === entry.id)).toBe(false);
+    note("observed", "the rule made for a header time toggles, updates and deletes like any other rule.");
   } finally {
     await restore();
     removeFixtureScripts([script]);
   }
 });
 
-async function addFeed(request: APIRequestContext, name: string, url: string, scripts: string[]): Promise<number> {
+async function addFeed(request: APIRequestContext, name: string, url: string, scriptInstanceIds: string[]): Promise<number> {
   const id = (await graphql<{ addRssFeed: { id: number } }>(request, "mutation($input: RssFeedInput!) { addRssFeed(input: $input) { id } }",
-    { input: { name, url, enabled: false, pollIntervalSecs: 86400, scripts } })).addRssFeed.id;
+    { input: { name, url, enabled: false, pollIntervalSecs: 86400, scriptInstanceIds } })).addRssFeed.id;
   await graphql(request, "mutation($id: Int!) { addRssRule(feedId: $id, input: { sortOrder: 0, action: ACCEPT }) { id } }", { id });
   return id;
 }
@@ -772,15 +779,19 @@ async function deleteFeed(request: APIRequestContext, id: number): Promise<void>
   await graphql(request, "mutation($id: Int!) { deleteRssFeed(id: $id) }", { id });
 }
 
-test("FS01 a feed refuses a script that does not handle feed events", async ({ request }) => {
+test("FS01 a feed refuses an instance that does not run on feeds", async ({ request }) => {
   const tag = `fs01-${token()}`;
   const script = writeFixtureScript(tag, { kinds: ["POST-PROCESSING"] });
   const fixture = await fixtureState(request);
+  const restore = await useScripts(request, await withCurrentLists(request, []));
+  const instance = await createScriptInstance(request, { name: `${tag}-instance`, script, trigger: "POST_PROCESSING" });
   try {
     const errors = await graphqlErrors(request, "mutation($input: RssFeedInput!) { addRssFeed(input: $input) { id } }",
-      { input: { name: tag, url: `http://${fixture.ip}:${fixture.ports.http}/feed.xml`, enabled: false, scripts: [script] } });
-    expect(errors).toEqual([expect.stringContaining(`script '${script}' does not support feed events`)]);
+      { input: { name: tag, url: `http://${fixture.ip}:${fixture.ports.http}/feed.xml`, enabled: false, scriptInstanceIds: [instance.id] } });
+    expect(errors).toEqual([expect.stringContaining(`'${instance.name}' does not run on feeds`)]);
   } finally {
+    await deleteScriptInstance(request, instance.id);
+    await restore();
     removeFixtureScripts([script]);
   }
 });
@@ -801,9 +812,15 @@ test("FS02 a FEED script rewrites item titles, and a rewritten feed over the cei
   });
   const restore = await useScripts(request, {});
   const feeds: number[] = [];
+  const instances: string[] = [];
+  const feedInstance = async (script: string) => {
+    const { id } = await createScriptInstance(request, { name: `${script}-feed`, script, trigger: "FEED" });
+    instances.push(id);
+    return id;
+  };
   try {
     const url = `http://${fixture.ip}:${fixture.ports.http}/feed.xml`;
-    const feed = await addFeed(request, tag, url, [rewrite]);
+    const feed = await addFeed(request, tag, url, [await feedInstance(rewrite)]);
     feeds.push(feed);
     const preview = (await graphql<{ previewRssFeed: Array<{ itemTitle: string; decision: string; jobId: number | null }> }>(
       request, "mutation($id: Int!) { previewRssFeed(id: $id) { itemTitle decision jobId } }", { id: feed },
@@ -819,13 +836,14 @@ test("FS02 a FEED script rewrites item titles, and a rewritten feed over the cei
     expect(items.map(item => item.itemTitle)).not.toContain(`proxy-${tag}`);
     for (const item of items) if (item.jobId !== null) await waitTerminal(request, item.jobId);
 
-    const big = await addFeed(request, `${tag}-big`, url, [oversize]);
+    const big = await addFeed(request, `${tag}-big`, url, [await feedInstance(oversize)]);
     feeds.push(big);
     const refused = await syncFeed(request, big);
     expect(refused.errors.join("\n")).toContain("rewritten RSS feed exceeds size limit");
     expect(await seenItems(request, big)).toEqual([]);
   } finally {
     for (const id of feeds) await deleteFeed(request, id);
+    for (const id of instances) await deleteScriptInstance(request, id);
     await restore();
     removeFixtureScripts([rewrite, oversize]);
   }

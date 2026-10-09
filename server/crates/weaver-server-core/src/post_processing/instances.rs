@@ -10,8 +10,8 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::model::{
-    GlobalScriptsRun, OptionName, OptionValue, QueueEvent, ResolvedOption, ScriptEventLabel,
-    ScriptKind, ScriptName, SecretOptionValue,
+    GlobalScriptsRun, OptionName, OptionValue, PostProcessingSettings, QueueEvent, ResolvedOption,
+    ScriptEventLabel, ScriptKind, ScriptName, SecretOptionValue,
 };
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
@@ -152,6 +152,18 @@ pub struct ScriptInstance {
 }
 
 impl ScriptInstance {
+    /// How long a run of this instance may last: its own limit, or else the
+    /// default of its trigger. A test run is held to the same.
+    pub fn time_limit(&self, settings: &PostProcessingSettings) -> std::time::Duration {
+        match (self.timeout_seconds, self.trigger) {
+            (Some(seconds), _) => std::time::Duration::from_secs(seconds),
+            (None, InstanceTrigger::PostProcessing) => super::runner::DEFAULT_TIMEOUT,
+            (None, _) => {
+                std::time::Duration::from_secs(settings.event_scripts.event_script_timeout_seconds)
+            }
+        }
+    }
+
     fn runs_for(&self, category: Option<&str>) -> Scope {
         if self.categories.is_empty() {
             return Scope::Global;
@@ -325,6 +337,14 @@ impl ScriptInstanceDraft {
             timeout_seconds: instance.timeout_seconds,
         }
     }
+}
+
+/// How an update of an instance came out.
+enum Updated {
+    Done,
+    NotFound,
+    /// The script changed while a secret was sent to be kept.
+    SecretsToEnterAgain,
 }
 
 /// A stored input value: what goes in the row, or a marker to keep the row's
@@ -581,6 +601,17 @@ impl Database {
                 let instance = instance.clone();
                 let id = target.clone();
                 Box::pin(async move {
+                    let Some(stored_script) = tx
+                        .fetch_optional(
+                            "SELECT script FROM script_instances WHERE id = {}",
+                            &[SqlArg::Text(id.clone())],
+                        )
+                        .await?
+                        .map(|row| row.text("script"))
+                        .transpose()?
+                    else {
+                        return Ok(Updated::NotFound);
+                    };
                     let kept = tx
                         .fetch_all(
                             "SELECT name, value FROM script_instance_inputs
@@ -591,6 +622,15 @@ impl Database {
                         .into_iter()
                         .map(|row| Ok((row.text("name")?, row.text("value")?)))
                         .collect::<Result<BTreeMap<_, _>, StateError>>()?;
+                    // A secret was entered for the script it was handed to.
+                    // Another script is not handed it without being asked.
+                    if stored_script != instance.script
+                        && instance.inputs.iter().any(|(name, value, _)| {
+                            matches!(value, StoredValue::Keep) && kept.contains_key(name)
+                        })
+                    {
+                        return Ok(Updated::SecretsToEnterAgain);
+                    }
                     let (kind, detail) = instance.trigger.stored();
                     let updated = tx
                         .execute(
@@ -613,7 +653,7 @@ impl Database {
                         )
                         .await?;
                     if updated == 0 {
-                        return Ok(false);
+                        return Ok(Updated::NotFound);
                     }
                     for table in ["script_instance_inputs", "script_instance_categories"] {
                         tx.execute(
@@ -630,14 +670,20 @@ impl Database {
                         .await?;
                     }
                     insert_instance_details_tx(tx, &id, &instance, &kept).await?;
-                    Ok(true)
+                    Ok(Updated::Done)
                 })
             })
             .await
         });
         self.invalidate_queue_script_admission();
-        if !found? {
-            return Err(ScriptInstanceError::NotFound);
+        match found? {
+            Updated::Done => {}
+            Updated::NotFound => return Err(ScriptInstanceError::NotFound),
+            Updated::SecretsToEnterAgain => {
+                return Err(ScriptInstanceError::Invalid(
+                    "secrets must be entered again when the script changes",
+                ));
+            }
         }
         self.script_instance(id)?
             .ok_or(ScriptInstanceError::NotFound)
