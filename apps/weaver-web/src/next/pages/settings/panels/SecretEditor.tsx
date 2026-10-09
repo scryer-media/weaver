@@ -40,6 +40,8 @@ export function SecretEditor({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // A refused delete is said inside the question, as an instance's is.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const patch = (next: Partial<SecretForm>) => {
     setError(null);
@@ -78,12 +80,12 @@ export function SecretEditor({
     setBusy(true);
     const result = await deleteSecret({ id: editing.id });
     setBusy(false);
-    setConfirmDelete(false);
     if (result.error) {
       // Refused while an instance links it; the message names them.
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setDeleteError(result.error.graphQLErrors[0]?.message ?? result.error.message);
       return;
     }
+    setConfirmDelete(false);
     onDeleted?.(editing);
   };
 
@@ -97,7 +99,14 @@ export function SecretEditor({
         busy={busy}
         onSave={() => void save()}
         onDismiss={onDismiss}
-        onDelete={editing && onDeleted ? () => setConfirmDelete(true) : undefined}
+        onDelete={
+          editing && onDeleted
+            ? () => {
+                setDeleteError(null);
+                setConfirmDelete(true);
+              }
+            : undefined
+        }
         sections={[
           {
             id: "secret",
@@ -137,7 +146,16 @@ export function SecretEditor({
         note={editing?.name}
         busy={busy}
         confirmLabel={t("action.delete")}
-        body={t("next.secrets.deleteBody", { name: editing?.name ?? "" })}
+        body={
+          <>
+            {t("next.secrets.deleteBody", { name: editing?.name ?? "" })}
+            {deleteError ? (
+              <span role="alert" className="mt-3 block text-[12.5px] text-wv-error-text">
+                {deleteError}
+              </span>
+            ) : null}
+          </>
+        }
         onConfirm={() => void remove()}
         onDismiss={() => setConfirmDelete(false)}
       />

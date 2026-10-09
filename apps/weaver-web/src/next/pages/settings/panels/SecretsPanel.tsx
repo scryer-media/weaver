@@ -19,7 +19,9 @@ export function SecretsPanel() {
   const [{ data, fetching, error }, reexecute] = useQuery<{ secrets: Secret[] }>({ query: SECRETS_QUERY });
   const [target, setTarget] = useState<SecretEditorTarget | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  usePanelStatus(status);
+  // A list that could not be read says why in the status bar, as the other script screens do.
+  const failure = error ? (error.graphQLErrors[0]?.message ?? error.message) : null;
+  usePanelStatus(failure ?? status, failure !== null);
 
   const secrets = useMemo(() => sortedSecrets(data?.secrets ?? []), [data?.secrets]);
   const refresh = () => reexecute({ requestPolicy: "network-only" });
@@ -32,8 +34,8 @@ export function SecretsPanel() {
       note: t("next.secrets.note"),
       columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.8fr)",
       headers: [t("next.secrets.name"), t("next.secrets.usedBy"), t("next.secrets.updated")],
-      empty: error ? (error.graphQLErrors[0]?.message ?? error.message) : t("next.secrets.empty"),
-      emptyAction: error ? undefined : { label: t("next.secrets.add"), onClick: () => setTarget({ mode: "new" }) },
+      // The top bar's Add is the list's only one.
+      empty: t("next.secrets.empty"),
       onRowClick: (id) => {
         const secret = secrets.find((entry) => entry.id === id);
         if (secret) {
@@ -44,8 +46,14 @@ export function SecretsPanel() {
         id: secret.id,
         searchText: `${secret.name} ${usedByText(secret)}`,
         cells: [
-          <Cell key="name">{secret.name}</Cell>,
-          <Cell key="usedBy" className={secret.usedBy.length > 0 ? "text-wv-secondary" : "text-wv-muted"}>
+          <Cell key="name" title={secret.name}>
+            {secret.name}
+          </Cell>,
+          <Cell
+            key="usedBy"
+            className={secret.usedBy.length > 0 ? "text-wv-secondary" : "text-wv-muted"}
+            title={usedByText(secret) || undefined}
+          >
             {usedByText(secret) || t("next.secrets.unused")}
           </Cell>,
           <Cell key="updated" mono className="text-wv-muted">

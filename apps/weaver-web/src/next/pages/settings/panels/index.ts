@@ -115,6 +115,7 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     group: "scripts",
     label: "next.settings.panel.secrets",
     note: "next.settings.panel.secretsNote",
+    tag: "beta",
     icon: "postProcessing",
     Component: SecretsPanel,
   },

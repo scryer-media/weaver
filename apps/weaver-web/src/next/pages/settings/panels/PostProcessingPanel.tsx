@@ -696,6 +696,7 @@ export function ScriptListPanel() {
           {script.version ? ` · ${script.version}` : ""}
         </span>
       </div>,
+      // The row itself opens a new instance of its script; the top bar's Create is the list's only Add.
       <span key="actions" className="ml-auto flex flex-wrap items-center justify-end gap-2" {...own}>
         {script.preset.triggers.length > 0 ? (
           <SecondaryButton
@@ -707,13 +708,6 @@ export function ScriptListPanel() {
             {t("next.postProcessing.setUpFromHeader")}
           </SecondaryButton>
         ) : null}
-        <SecondaryButton
-          size="compact"
-          icon="add"
-          onClick={() => openEditor({ mode: "new", script: script.name })}
-        >
-          {t("next.postProcessing.createInstance")}
-        </SecondaryButton>
       </span>,
     ],
   });
