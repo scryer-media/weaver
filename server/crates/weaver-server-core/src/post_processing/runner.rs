@@ -52,6 +52,7 @@ pub struct InterpreterConfig {
     pub python: Option<PathBuf>,
     pub powershell: Option<PathBuf>,
     pub batch: Option<PathBuf>,
+    pub go: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +198,8 @@ struct SupervisorRequest {
     args: Vec<OsStringWire>,
     env: BTreeMap<OsStringWire, OsStringWire>,
     cwd: PathBuf,
+    /// The program is `go run`, whose exit status is not the script's own.
+    go_run: bool,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -372,7 +375,11 @@ pub async fn execute_spec_tapped(
     }
     let (program, mut args) = resolve_program(&entrypoint, &spec.interpreters)?;
     args.extend(spec.argv);
+    let go_run = is_go_source(&entrypoint);
     let mut env = sanitized_platform_environment()?;
+    if go_run {
+        insert_go_environment(&mut env, &spec.facts)?;
+    }
     insert_nzbget_global_options(&mut env, &spec.facts)?;
     insert_compat_options(&mut env, "NZBPO", &spec.options)?;
     insert_options(&mut env, "SAB_OPTION_", &spec.options)?;
@@ -416,6 +423,7 @@ pub async fn execute_spec_tapped(
                 .collect::<Result<_, _>>()?,
             env,
             cwd: fs::canonicalize(spec.cwd)?,
+            go_run,
         },
         capture: CapturePolicy {
             secrets: Arc::new(secrets.clone()),
@@ -537,7 +545,11 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
     }
 
     let (program, mut args) = resolve_program(&entrypoint, &request.interpreters)?;
+    let go_run = is_go_source(&entrypoint);
     let mut env = sanitized_platform_environment()?;
+    if go_run {
+        insert_go_environment(&mut env, &request.context.compatibility)?;
+    }
     let adapter_args = adapter_environment_and_args(request, &mut env)?;
     args.extend(adapter_args);
 
@@ -554,21 +566,29 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
                 .collect::<Result<_, _>>()?,
             env,
             cwd: final_directory,
+            go_run,
         },
         capture: CapturePolicy::default(),
     })
+}
+
+fn script_extension(entrypoint: &Path) -> String {
+    entrypoint
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn is_go_source(entrypoint: &Path) -> bool {
+    script_extension(entrypoint) == "go"
 }
 
 fn resolve_program(
     entrypoint: &Path,
     interpreters: &InterpreterConfig,
 ) -> Result<(PathBuf, Vec<OsString>), RunnerError> {
-    let extension = entrypoint
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match extension.as_str() {
+    match script_extension(entrypoint).as_str() {
         "py" => Ok((
             interpreters
                 .python
@@ -604,6 +624,16 @@ fn resolve_program(
                 ],
             ))
         }
+        // A Go script is one source file, compiled and run by `go run`. Go
+        // reads every leading argument that ends in `.go` as another source
+        // file, so a first script argument spelled that way fails the build.
+        "go" => Ok((
+            interpreters
+                .go
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("go")),
+            vec![OsString::from("run"), entrypoint.as_os_str().to_owned()],
+        )),
         _ => {
             #[cfg(unix)]
             {
@@ -949,6 +979,27 @@ fn sanitized_platform_environment() -> Result<BTreeMap<OsStringWire, OsStringWir
         }
     }
     Ok(env)
+}
+
+/// The Go build cache, kept under weaver's data directory.
+const GO_BUILD_CACHE_DIR: &str = ".weaver-go-cache";
+
+/// What `go run` needs beyond the platform environment. Go will not build
+/// without a build cache and looks for one under a home directory the daemon
+/// may not have, so the cache is weaver's own: nothing is written beside the
+/// scripts, and a read-only scripts directory still works. `GOPROXY=off` keeps
+/// a build off the network, which is why a Go script is a single file that
+/// imports the standard library only.
+fn insert_go_environment(
+    env: &mut BTreeMap<OsStringWire, OsStringWire>,
+    facts: &CompatibilityFacts,
+) -> Result<(), RunnerError> {
+    if let Some(data_dir) = facts.data_dir.as_deref() {
+        // Go refuses a relative cache path.
+        let cache = std::path::absolute(data_dir)?.join(GO_BUILD_CACHE_DIR);
+        insert_env(env, "GOCACHE", path_text(&cache)?)?;
+    }
+    insert_env(env, "GOPROXY", "off")
 }
 
 fn insert_env(
@@ -1635,6 +1686,7 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
     let _job = WindowsJob::assign_current_process()?;
     let mut stdin = io::stdin();
     let request = read_supervisor_request(&mut stdin)?;
+    let go_run = request.go_run;
     let mut command = std::process::Command::new(request.program);
     command
         .args(request.args.into_iter().map(OsStringWire::into_os))
@@ -1695,8 +1747,31 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
         std::thread::sleep(Duration::from_millis(25));
     };
     let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
-    Ok(status.code().unwrap_or(126))
+    let stderr_tail = stderr_thread.join().unwrap_or_default();
+    let code = status.code().unwrap_or(126);
+    Ok(if go_run {
+        go_run_exit_code(code, &stderr_tail)
+    } else {
+        code
+    })
+}
+
+/// How much of the end of a relayed stream is kept for [`go_run_exit_code`].
+const RELAY_TAIL_BYTES: usize = 64;
+
+/// `go run` exits 1 when the program it built exits with anything but zero,
+/// and says which status that was in the last line it writes to stderr,
+/// `exit status N`. Read the script's own status back out of that line, so 93
+/// or 95 from a Go script means what it means from any other.
+fn go_run_exit_code(code: i32, stderr_tail: &[u8]) -> i32 {
+    if code != 1 {
+        return code;
+    }
+    String::from_utf8_lossy(stderr_tail)
+        .trim_end()
+        .rsplit_once("exit status ")
+        .and_then(|(_, status)| status.parse().ok())
+        .unwrap_or(code)
 }
 
 fn read_supervisor_request<R: Read>(reader: &mut R) -> Result<SupervisorRequest, RunnerError> {
@@ -1720,13 +1795,15 @@ fn relay_thread<R, W>(
     mut reader: R,
     mut writer: W,
     parent_pipe_lost: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()>
+) -> std::thread::JoinHandle<Vec<u8>>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 16 * 1024];
+        // The end of what was relayed, for a caller that reads the last line.
+        let mut tail = Vec::new();
         loop {
             let count = match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -1737,7 +1814,11 @@ where
                 parent_pipe_lost.store(true, Ordering::Release);
                 break;
             }
+            tail.extend_from_slice(&buffer[..count]);
+            let excess = tail.len().saturating_sub(RELAY_TAIL_BYTES);
+            tail.drain(..excess);
         }
+        tail
     })
 }
 
@@ -2254,6 +2335,109 @@ mod capture_tests {
         }
         assert!(ring.truncated);
         assert_eq!(ring.into_bytes().len(), CAP);
+    }
+}
+
+#[cfg(test)]
+mod go_run_tests {
+    use super::*;
+
+    fn text_env(env: BTreeMap<OsStringWire, OsStringWire>) -> BTreeMap<String, String> {
+        env.into_iter()
+            .map(|(key, value)| (key.0, value.0))
+            .collect()
+    }
+
+    #[test]
+    fn a_go_source_file_is_handed_to_go_run() {
+        let entrypoint = Path::new("/scripts/Report.GO");
+        assert!(is_go_source(entrypoint));
+        assert!(!is_go_source(Path::new("/scripts/go")));
+        let (program, args) = resolve_program(entrypoint, &InterpreterConfig::default()).unwrap();
+        assert_eq!(program, Path::new("go"));
+        assert_eq!(args, ["run", "/scripts/Report.GO"]);
+
+        let configured = InterpreterConfig {
+            go: Some(PathBuf::from("/opt/go/bin/go")),
+            ..InterpreterConfig::default()
+        };
+        let (program, args) = resolve_program(entrypoint, &configured).unwrap();
+        assert_eq!(program, Path::new("/opt/go/bin/go"));
+        assert_eq!(args, ["run", "/scripts/Report.GO"]);
+    }
+
+    #[test]
+    fn go_run_builds_into_a_cache_under_the_data_directory_and_stays_off_the_network() {
+        let data = tempfile::tempdir().unwrap();
+        let mut env = BTreeMap::new();
+        let facts = CompatibilityFacts {
+            data_dir: Some(data.path().into()),
+            ..CompatibilityFacts::default()
+        };
+        insert_go_environment(&mut env, &facts).unwrap();
+        let env = text_env(env);
+        assert_eq!(
+            Path::new(&env["GOCACHE"]),
+            data.path().join(".weaver-go-cache")
+        );
+        assert_eq!(env["GOPROXY"], "off");
+        assert_eq!(env.len(), 2);
+
+        // Go refuses a cache path that is not absolute.
+        let mut env = BTreeMap::new();
+        let facts = CompatibilityFacts {
+            data_dir: Some(PathBuf::from("data")),
+            ..CompatibilityFacts::default()
+        };
+        insert_go_environment(&mut env, &facts).unwrap();
+        let cache = PathBuf::from(&text_env(env)["GOCACHE"]);
+        assert!(cache.is_absolute());
+        assert!(cache.ends_with("data/.weaver-go-cache"));
+
+        // Without a data directory Go is left to find its own cache.
+        let mut env = BTreeMap::new();
+        insert_go_environment(&mut env, &CompatibilityFacts::default()).unwrap();
+        assert_eq!(
+            text_env(env),
+            BTreeMap::from([("GOPROXY".to_string(), "off".to_string())])
+        );
+    }
+
+    #[test]
+    fn the_status_go_run_reports_for_the_script_becomes_the_exit_code() {
+        assert_eq!(go_run_exit_code(1, b"exit status 93\n"), 93);
+        assert_eq!(
+            go_run_exit_code(1, b"[INFO] done\r\nexit status 95\r\n"),
+            95
+        );
+        // The script ended its own stderr without a line break.
+        assert_eq!(go_run_exit_code(1, b"no line breakexit status 2\n"), 2);
+        assert_eq!(go_run_exit_code(1, b"exit status 93\nexit status 1\n"), 1);
+        // A build that failed reports no status of the script's.
+        assert_eq!(go_run_exit_code(1, b"./x.go:3:15: undefined: nothing\n"), 1);
+        assert_eq!(go_run_exit_code(1, b"exit status 93 or so\n"), 1);
+        assert_eq!(go_run_exit_code(1, b""), 1);
+        // Only the status `go run` itself fails with is read this way.
+        assert_eq!(go_run_exit_code(0, b"exit status 93\n"), 0);
+        assert_eq!(go_run_exit_code(2, b"exit status 93\n"), 2);
+    }
+
+    #[test]
+    fn a_relay_keeps_the_end_of_what_it_passed_on() {
+        let lost = Arc::new(AtomicBool::new(false));
+        let mut input = vec![b'x'; 40 * 1024];
+        input.extend_from_slice(b"\nexit status 93\n");
+        let tail = relay_thread(io::Cursor::new(input), io::sink(), lost.clone())
+            .join()
+            .unwrap();
+        assert_eq!(tail.len(), RELAY_TAIL_BYTES);
+        assert_eq!(go_run_exit_code(1, &tail), 93);
+
+        let tail = relay_thread(io::Cursor::new(b"short".to_vec()), io::sink(), lost.clone())
+            .join()
+            .unwrap();
+        assert_eq!(tail, b"short");
+        assert!(!lost.load(Ordering::Acquire));
     }
 }
 

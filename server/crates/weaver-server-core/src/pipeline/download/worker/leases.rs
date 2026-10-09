@@ -163,7 +163,6 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         work: DownloadWork,
-        stop_on_cap_block: bool,
     ) -> Result<Option<DownloadWork>, DispatchAttempt> {
         if !self.primary_download_within_restart_durable_lead(job_id, &work) {
             self.flush_file_progress_batch("download.file_progress.flush.restart_durable_lead");
@@ -179,37 +178,7 @@ impl Pipeline {
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
 
-        let reservation_estimate = Self::bandwidth_reservation_estimate(work.byte_estimate);
-        match self.reserve_bandwidth_for_dispatch(work.segment_id, reservation_estimate) {
-            Ok(true) => Ok(Some(work)),
-            Ok(false) => {
-                if let Some(state) = self.jobs.get_mut(&job_id) {
-                    state.download_queue.push(work);
-                }
-                // reserve_bandwidth_for_dispatch marked the cap runtime parked
-                // and published the IspCap block state; the mark is sticky, so
-                // later usage flushes keep presenting the cap block instead of
-                // reverting to None while remaining allowance is nonzero.
-                self.update_queue_metrics();
-                if stop_on_cap_block {
-                    Err(DispatchAttempt::StopAll)
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(error) => {
-                error!(error = %error, "failed to reserve ISP bandwidth for dispatch");
-                if let Some(state) = self.jobs.get_mut(&job_id) {
-                    state.download_queue.push(work);
-                }
-                self.update_queue_metrics();
-                if stop_on_cap_block {
-                    Err(DispatchAttempt::StopAll)
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+        Ok(Some(work))
     }
 
     /// Hold payload work only while declared PAR2 indexes are unresolved.

@@ -116,9 +116,6 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
                     capture.speed_limits.lock().unwrap().push(bytes_per_sec);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
                 SchedulerCommand::RebuildNntp { reply, .. } => {
                     let _ = reply.send(Ok(crate::NntpRuntimeActivation {
                         generation: 1,
@@ -196,7 +193,6 @@ fn sample_config() -> Config {
         ],
         retry: None,
         max_download_speed: Some(1234),
-        isp_bandwidth_cap: None,
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -1188,7 +1184,6 @@ async fn restore_requires_category_remap_for_external_paths() {
             categories: vec![],
             retry: None,
             max_download_speed: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -1213,7 +1208,6 @@ async fn restore_requires_category_remap_for_external_paths() {
             categories: vec![],
             retry: None,
             max_download_speed: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),

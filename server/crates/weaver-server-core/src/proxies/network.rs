@@ -149,6 +149,10 @@ pub struct EgressInterface {
     pub binding: EgressBinding,
     pub enabled: bool,
     pub max_download_speed: u64,
+    /// Raw BODY bytes this egress may carry, counted across every server
+    /// routed over it.
+    #[serde(default)]
+    pub download_quota: crate::servers::ServerDownloadQuotaConfig,
 }
 
 impl EgressInterface {
@@ -159,6 +163,7 @@ impl EgressInterface {
             binding: EgressBinding::System,
             enabled: true,
             max_download_speed: 0,
+            download_quota: crate::servers::ServerDownloadQuotaConfig::default(),
         }
     }
 
@@ -166,6 +171,7 @@ impl EgressInterface {
         if self.name.trim().is_empty() || self.name.chars().count() > 128 {
             return Err("egress name must contain 1–128 characters".into());
         }
+        self.download_quota.validate_for("egress")?;
         if self.id == SYSTEM_EGRESS_ID {
             if self.binding != EgressBinding::System || self.name != "System" || !self.enabled {
                 return Err("the System egress cannot be renamed, rebound, or disabled".into());

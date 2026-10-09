@@ -36,6 +36,7 @@ pub struct PostProcessingSettingsGql {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    pub go_interpreter: Option<String>,
     pub unacceptable_extensions: Vec<String>,
     /// True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
     pub strict_security_refuses_execution: bool,
@@ -93,6 +94,7 @@ impl PostProcessingSettingsGql {
             python_interpreter: value.python_interpreter,
             powershell_interpreter: value.powershell_interpreter,
             batch_interpreter: value.batch_interpreter,
+            go_interpreter: value.go_interpreter,
             unacceptable_extensions: value.unacceptable_extensions,
             strict_security_refuses_execution: strict_security,
             global_scripts_run: value.global_scripts_run.into(),
@@ -116,6 +118,7 @@ pub struct PostProcessingSettingsInput {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    pub go_interpreter: Option<String>,
     /// Omission preserves the existing policy; a supplied empty list disables
     /// it. `null` is deliberately distinguishable and refused by the mutation.
     pub unacceptable_extensions: MaybeUndefined<Vec<String>>,

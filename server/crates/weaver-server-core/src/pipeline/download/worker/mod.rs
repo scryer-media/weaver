@@ -510,17 +510,6 @@ impl Pipeline {
         if self.nntp_handoff_draining {
             return;
         }
-        if let Err(error) = self.refresh_bandwidth_cap_window() {
-            error!(error = %error, "failed to refresh ISP bandwidth cap state");
-            return;
-        }
-        if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
-            self.update_queue_metrics();
-            if self.active_downloads == 0 {
-                debug!("dispatch blocked: bandwidth cap exhausted");
-            }
-            return;
-        }
         let pressure = self.refresh_download_pressure();
         if pressure.is_hard() {
             self.update_queue_metrics();

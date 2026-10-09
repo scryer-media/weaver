@@ -384,7 +384,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),

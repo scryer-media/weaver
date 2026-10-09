@@ -150,6 +150,7 @@ async fn connect_tls_drain_client(
         tls_cipher_preference: crate::tls::TlsCipherPreference::Auto,
         transfer_control: None,
         body_accounting: VecDeque::new(),
+        egress_accounting: VecDeque::new(),
         socket_slot: None,
         health_lease: None,
         checkpoint_plan: CheckpointPlan::None,

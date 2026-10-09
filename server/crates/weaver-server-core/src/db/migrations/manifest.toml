@@ -540,6 +540,11 @@ file = "migrations/0053_egress_interfaces/schema.sql"
 engine = "postgres"
 scope = "all"
 
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_isp_cap_to_system_egress_v53"
+scope = "upgrade_only"
+
 [[migration]]
 version = 54
 description = "per-job demotion and article gap summary"

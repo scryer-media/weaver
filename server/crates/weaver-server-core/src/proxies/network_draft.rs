@@ -122,7 +122,11 @@ impl NetworkRuntime {
             compiling: false,
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
-            egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::new()),
+            quota_watch: Mutex::new(None),
+            egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
+                weaver_nntp::transfer::TransferScope::Egress,
+            )),
+            quota_policy: None,
             #[cfg(test)]
             fixture_providers: Mutex::new(
                 self.fixture_providers

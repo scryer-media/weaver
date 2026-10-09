@@ -446,6 +446,15 @@ impl ProxyRuntime {
         }
     }
     pub fn new(db: Database, handle: tokio::runtime::Handle) -> Result<Arc<Self>, String> {
+        Self::with_quota_policy(db, handle, None)
+    }
+    /// A runtime whose egresses are metered by the long-lived download
+    /// policies, so every egress quota is enforced.
+    pub fn with_quota_policy(
+        db: Database,
+        handle: tokio::runtime::Handle,
+        quota_policy: Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>,
+    ) -> Result<Arc<Self>, String> {
         let profiles = db
             .list_proxy_profiles()
             .map_err(|e| e.to_string())?
@@ -459,7 +468,7 @@ impl ProxyRuntime {
             .collect();
         let consumers = Self::load_consumers(&db).map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {
-            network: NetworkRuntime::new(db.clone(), handle.clone())?,
+            network: NetworkRuntime::with_quota_policy(db.clone(), handle.clone(), quota_policy)?,
             db,
             handle,
             profiles: RwLock::new(profiles),

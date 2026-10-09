@@ -438,9 +438,6 @@ const GENERAL_SETTINGS_FIELDS = `
       articleSet
       normalizedName
     }
-    ispBandwidthCap {
-      ...IspBandwidthCapFields
-    }
     watchFolder {
       mode
       path
@@ -452,26 +449,14 @@ const GENERAL_SETTINGS_FIELDS = `
   }
 `;
 
-const ISP_BANDWIDTH_CAP_FIELDS = `
-  fragment IspBandwidthCapFields on IspBandwidthCapSettings {
-    enabled
-    period
-    limitBytes
-    resetTimeMinutesLocal
-    weeklyResetWeekday
-    monthlyResetDay
-  }
-`;
-
 const DOWNLOAD_BLOCK_FIELDS = `
   fragment DownloadBlockFields on DownloadBlock {
     kind
-    capEnabled
-    period
+    egressId
+    egressName
     usedBytes
     limitBytes
     remainingBytes
-    reservedBytes
     windowStartsAtEpochMs
     windowEndsAtEpochMs
     timezoneName
@@ -1356,7 +1341,6 @@ export const SETTINGS_QUERY = gql`
     }
   }
   ${GENERAL_SETTINGS_FIELDS}
-  ${ISP_BANDWIDTH_CAP_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
@@ -1367,7 +1351,6 @@ export const UPDATE_SETTINGS_MUTATION = gql`
     }
   }
   ${GENERAL_SETTINGS_FIELDS}
-  ${ISP_BANDWIDTH_CAP_FIELDS}
 `;
 
 // --- Hardware profile ---
@@ -1950,6 +1933,7 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     pythonInterpreter
     powershellInterpreter
     batchInterpreter
+    goInterpreter
     unacceptableExtensions
     strictSecurityRefusesExecution
     globalScriptsRun

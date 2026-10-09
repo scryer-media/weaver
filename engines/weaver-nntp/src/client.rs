@@ -819,7 +819,16 @@ impl BodyLaneLease {
         }
 
         if let Some(source) = stats.quota_rejection.clone() {
-            let control = self.client.pool.server_transfer_control(self.server_id);
+            // Revalidate the tail against whichever control refused the head.
+            let control = match source.scope {
+                crate::transfer::TransferScope::Server => {
+                    self.client.pool.server_transfer_control(self.server_id)
+                }
+                crate::transfer::TransferScope::Egress => self
+                    .conn
+                    .as_ref()
+                    .and_then(|conn| conn.egress_transfer_control()),
+            };
             for (tail_idx, message_id) in
                 message_ids.iter().enumerate().take(offered).skip(requested)
             {
@@ -3412,6 +3421,8 @@ impl NntpClient {
                 Err(e) => {
                     if is_connection_error(&e) {
                         self.discard_connection_error(server.0, conn).await;
+                    } else if is_egress_quota_rejection(&e) {
+                        conn.discard();
                     }
                     return Err(e);
                 }
@@ -3523,6 +3534,8 @@ impl NntpClient {
                 Err(FusedYencError::Nntp(e)) => {
                     if is_connection_error(&e) {
                         self.discard_connection_error(server.0, conn).await;
+                    } else if is_egress_quota_rejection(&e) {
+                        conn.discard();
                     }
                     return Err(DecodedBodyError::Nntp(e));
                 }
@@ -3858,6 +3871,8 @@ impl NntpClient {
                 Err(e) => {
                     if is_connection_error(&e) {
                         self.discard_connection_error(server.0, conn).await;
+                    } else if is_egress_quota_rejection(&e) {
+                        conn.discard();
                     }
                     return Err(e);
                 }
@@ -3943,6 +3958,19 @@ fn stat_cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
     cooldown_reason(err).or_else(|| {
         matches!(err, NntpError::MalformedResponse(_)).then_some(CooldownReason::Transport)
     })
+}
+
+/// Whether the egress the connection runs over refused the body for quota.
+///
+/// The socket is sound, but it is bound to a route leg with no quota left;
+/// pooling it would hand the next request the same refusal. It is dropped
+/// without a health penalty so the next dial takes whatever leg the route
+/// now offers.
+fn is_egress_quota_rejection(err: &NntpError) -> bool {
+    matches!(
+        err,
+        NntpError::QuotaBlocked(rejection) if rejection.scope == crate::transfer::TransferScope::Egress
+    )
 }
 
 /// Returns true if the error indicates the connection itself is bad

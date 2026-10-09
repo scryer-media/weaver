@@ -189,7 +189,6 @@ fn test_config() -> SharedConfig {
         retry: None,
         max_download_speed: None,
         cleanup_after_extract: None,
-        isp_bandwidth_cap: None,
         propagation_delay_secs: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -1157,12 +1156,11 @@ fn sample_server_health() -> metrics::ServerHealthInfo {
 fn manual_pause_block() -> DownloadBlockState {
     DownloadBlockState {
         kind: DownloadBlockKind::ManualPause,
-        cap_enabled: false,
-        period: None,
+        egress_id: None,
+        egress_name: None,
         used_bytes: 0,
         limit_bytes: 0,
         remaining_bytes: 0,
-        reserved_bytes: 0,
         window_starts_at_epoch_ms: None,
         window_ends_at_epoch_ms: None,
         timezone_name: "MDT".into(),
@@ -1441,6 +1439,7 @@ fn fully_populated_render() -> String {
     input.jobs = &jobs;
     input.server_health = &server_health;
     input.server_transfers = &transfers;
+    input.egress_transfers = &transfers;
     input.duplicate_admission = &duplicates;
     input.semantic_duplicate_lifecycle = &lifecycle;
     input.extraction_rejections = &rejections;

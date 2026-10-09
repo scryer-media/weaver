@@ -5,7 +5,7 @@
 //! rebuilds preserves rate-limit debt, quota reservations, and byte counters.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,15 @@ const RATE_SCHEDULE_TARGET_MASK: u64 = (1_u64 << RATE_SCHEDULE_EPOCH_SHIFT) - 1;
 /// Durable server identifier supplied by the application database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StableServerId(pub u32);
+
+/// What a transfer control meters: one server, or one egress shared by every
+/// server routed over it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TransferScope {
+    #[default]
+    Server,
+    Egress,
+}
 
 /// Runtime quota window calculated by the application calendar policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +158,9 @@ pub(crate) fn active_transfer_read_timeout_at(
 /// Admission failure for a BODY request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaRejection {
+    /// Whether a server or an egress turned the request away.
+    pub scope: TransferScope,
+    /// The server or egress id, as `scope` says.
     pub stable_server_id: StableServerId,
     pub requested_body_bytes: u64,
     pub capacity_revision: u64,
@@ -209,22 +221,48 @@ impl RegistryCapacitySignal {
 }
 
 pub struct ServerTransferRegistry {
+    scope: TransferScope,
     controls: RwLock<HashMap<StableServerId, Arc<ServerTransferControl>>>,
     capacity: Arc<RegistryCapacitySignal>,
+    /// Whether quotas count bytes; new controls start with it.
+    quota_metering: AtomicBool,
 }
 
 impl Default for ServerTransferRegistry {
     fn default() -> Self {
-        Self {
-            controls: RwLock::new(HashMap::new()),
-            capacity: Arc::new(RegistryCapacitySignal::default()),
-        }
+        Self::with_scope(TransferScope::Server)
     }
 }
 
 impl ServerTransferRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty registry whose controls meter `scope`.
+    pub fn with_scope(scope: TransferScope) -> Self {
+        Self {
+            scope,
+            controls: RwLock::new(HashMap::new()),
+            capacity: Arc::new(RegistryCapacitySignal::default()),
+            quota_metering: AtomicBool::new(true),
+        }
+    }
+
+    /// An empty registry for `scope` that shares this one's capacity signal,
+    /// so a capacity change in either is a change in both. A selection parked
+    /// on one revision then wakes for a server or an egress alike.
+    pub fn sibling(&self, scope: TransferScope) -> Self {
+        Self {
+            scope,
+            controls: RwLock::new(HashMap::new()),
+            capacity: Arc::clone(&self.capacity),
+            quota_metering: AtomicBool::new(true),
+        }
+    }
+
+    pub fn scope(&self) -> TransferScope {
+        self.scope
     }
 
     /// Monotonic revision for capacity changes in any registered server.
@@ -254,12 +292,38 @@ impl ServerTransferRegistry {
         }
 
         let capacity = Arc::clone(&self.capacity);
+        let scope = self.scope;
         let mut controls = self.controls.write().expect("transfer registry poisoned");
-        Arc::clone(
-            controls
-                .entry(id)
-                .or_insert_with(|| Arc::new(ServerTransferControl::new(id, capacity))),
-        )
+        Arc::clone(controls.entry(id).or_insert_with(|| {
+            let control = ServerTransferControl::new(id, scope, capacity);
+            control.quota_metering.store(
+                self.quota_metering.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            Arc::new(control)
+        }))
+    }
+
+    /// Start or stop quotas counting bytes on every control, present and
+    /// future. While stopped, bytes still count toward lifetime totals but
+    /// not toward any quota, and no quota turns work away. Usage already
+    /// counted in a window is kept.
+    pub fn set_quota_metering(&self, enabled: bool) {
+        self.quota_metering.store(enabled, Ordering::Release);
+        let controls = self
+            .controls
+            .read()
+            .expect("transfer registry poisoned")
+            .values()
+            .map(Arc::clone)
+            .collect::<Vec<_>>();
+        for control in controls {
+            control.set_quota_metering(enabled);
+        }
+    }
+
+    pub fn quota_metering(&self) -> bool {
+        self.quota_metering.load(Ordering::Acquire)
     }
 
     /// Apply a live policy update while preserving counters and reservations.
@@ -337,6 +401,7 @@ impl ServerTransferRegistry {
 /// Shared transfer state for one durable server.
 pub struct ServerTransferControl {
     id: StableServerId,
+    scope: TransferScope,
     pub(crate) socket_budget: Arc<crate::socket_budget::SocketBudget>,
     pub(crate) recovery: Arc<crate::recovery::RecoveryGate>,
     state: Mutex<TransferState>,
@@ -351,6 +416,8 @@ pub struct ServerTransferControl {
     rate_origin: Instant,
     rate_wait_lock: Mutex<()>,
     rate_changed: Condvar,
+    /// False while quota metering is suspended.
+    quota_metering: AtomicBool,
     #[cfg(test)]
     path_counters: TransferPathCounters,
     #[cfg(test)]
@@ -416,10 +483,15 @@ fn rate_cost_micros(bytes: u64, rate_bytes_per_sec: u64) -> u64 {
 }
 
 impl ServerTransferControl {
-    fn new(id: StableServerId, registry_capacity: Arc<RegistryCapacitySignal>) -> Self {
+    fn new(
+        id: StableServerId,
+        scope: TransferScope,
+        registry_capacity: Arc<RegistryCapacitySignal>,
+    ) -> Self {
         let (capacity_changed, _) = watch::channel(1);
         Self {
             id,
+            scope,
             socket_budget: crate::socket_budget::SocketBudget::new(0),
             recovery: Arc::default(),
             state: Mutex::new(TransferState {
@@ -442,6 +514,7 @@ impl ServerTransferControl {
             rate_origin: Instant::now(),
             rate_wait_lock: Mutex::new(()),
             rate_changed: Condvar::new(),
+            quota_metering: AtomicBool::new(true),
             #[cfg(test)]
             path_counters: TransferPathCounters::default(),
             #[cfg(test)]
@@ -453,8 +526,25 @@ impl ServerTransferControl {
         self.id
     }
 
+    pub fn scope(&self) -> TransferScope {
+        self.scope
+    }
+
     pub fn update_config(&self, config: ServerTransferConfig) {
         self.configure(config, None);
+    }
+
+    fn set_quota_metering(&self, enabled: bool) {
+        if self.quota_metering.swap(enabled, Ordering::AcqRel) == enabled {
+            return;
+        }
+        let revision = {
+            let mut state = self.state.lock().expect("server transfer state poisoned");
+            state.quota_saturated = false;
+            state.capacity_revision = state.capacity_revision.wrapping_add(1).max(1);
+            state.capacity_revision
+        };
+        self.publish_capacity_change(revision);
     }
 
     fn configure(&self, config: ServerTransferConfig, initial: Option<ServerTransferInitialState>) {
@@ -482,10 +572,17 @@ impl ServerTransferControl {
             if quota_epoch_changed {
                 state.quota_epoch = state.quota_epoch.wrapping_add(1).max(1);
             }
+            // A changed allowance in the same window keeps its usage but may
+            // fit work it turned away.
+            let limit_changed = matches!(
+                (state.config.quota, config.quota),
+                (Some(previous), Some(next)) if previous.limit_bytes != next.limit_bytes
+            );
             // A window rollover, manual reset, or quota edit all bump the
             // generation (or drop the quota); either way the refusal condition
             // no longer holds, so the server is free to take work again.
-            if quota_epoch_changed || !state.initialized || config.quota.is_none() {
+            if quota_epoch_changed || limit_changed || !state.initialized || config.quota.is_none()
+            {
                 state.quota_saturated = false;
             }
 
@@ -738,7 +835,8 @@ impl ServerTransferControl {
             } else {
                 u64::MAX
             },
-            quota_blocked: quota.is_some_and(|_| projected >= limit || state.quota_saturated),
+            quota_blocked: self.quota_metering.load(Ordering::Acquire)
+                && quota.is_some_and(|_| projected >= limit || state.quota_saturated),
             quota_generation: quota.map_or(0, |value| value.generation),
             capacity_revision: state.capacity_revision,
             retry_at: quota.and_then(|value| value.retry_at),
@@ -752,6 +850,9 @@ impl ServerTransferControl {
         requested_body_bytes: u64,
     ) -> Option<QuotaRejection> {
         let quota = state.config.quota?;
+        if !self.quota_metering.load(Ordering::Acquire) {
+            return None;
+        }
         let projected = state
             .quota_used_bytes
             .saturating_add(state.quota_reserved_bytes);
@@ -762,6 +863,7 @@ impl ServerTransferControl {
         }
         let snapshot = Box::new(self.snapshot_locked(state));
         Some(QuotaRejection {
+            scope: self.scope,
             stable_server_id: self.id,
             requested_body_bytes,
             capacity_revision: snapshot.capacity_revision,
@@ -1003,6 +1105,12 @@ impl ServerTransferControl {
             (projected_before, projected_after),
             (Some(before), Some(after)) if after < before
         ) {
+            // Nothing dispatches to an egress that reads as blocked, so freed
+            // allowance has to lift the refusal itself; the next body that
+            // still does not fit sets it again.
+            if self.scope == TransferScope::Egress {
+                state.quota_saturated = false;
+            }
             state.capacity_revision = state.capacity_revision.wrapping_add(1).max(1);
             Some(state.capacity_revision)
         } else {
@@ -1079,7 +1187,7 @@ impl BodyTransferPermit {
         self.control.record_lifetime_bytes(bytes);
         self.body_bytes = self.body_bytes.saturating_add(bytes);
         let quota_epoch = self.control.current_quota_epoch();
-        if quota_epoch == 0 {
+        if quota_epoch == 0 || !self.control.quota_metering.load(Ordering::Acquire) {
             return;
         }
         if self.quota_epoch != quota_epoch {
@@ -1313,6 +1421,40 @@ mod tests {
         // A dispatch the server can take clears the latch without a reset.
         assert!(control.quota_rejection_for_dispatch(200).is_none());
         assert!(!control.snapshot().quota_blocked);
+    }
+
+    #[test]
+    fn a_raised_quota_lifts_the_refusal_and_keeps_the_usage() {
+        let registry = ServerTransferRegistry::new();
+        let control = registry.configure(StableServerId(13), quota(1_000, 1));
+        let mut permit = control.try_reserve(800).unwrap();
+        permit.record_blocking(650);
+        drop(permit);
+        assert!(control.try_reserve(800).is_err());
+        assert!(control.snapshot().quota_blocked);
+
+        registry.configure(StableServerId(13), quota(5_000, 1));
+        let snapshot = control.snapshot();
+        assert!(!snapshot.quota_blocked);
+        assert_eq!(snapshot.quota_used_bytes, 650);
+    }
+
+    #[test]
+    fn freed_egress_quota_lifts_the_refusal_without_a_new_reservation() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let control = registry.configure(StableServerId(14), quota(1_000, 1));
+        let mut in_flight = control.try_reserve(800).unwrap();
+        // The second body does not fit beside the first one's estimate.
+        assert!(control.try_reserve(250).is_err());
+        assert!(control.snapshot().quota_blocked);
+
+        // The first body comes in well under its estimate.
+        in_flight.record_blocking(300);
+        drop(in_flight);
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.quota_used_bytes, 300);
+        assert!(!snapshot.quota_blocked);
+        assert!(control.try_reserve(250).is_ok());
     }
 
     #[test]
@@ -2034,5 +2176,33 @@ mod tests {
         wait_for_rate_waiter(&control).await;
         registry.configure(StableServerId(11), ServerTransferConfig::default());
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn suspended_metering_neither_counts_nor_refuses_and_keeps_window_usage() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let control = registry.configure(StableServerId(3), quota(1_000, 1));
+        let mut permit = control.try_reserve(600).unwrap();
+        permit.record_blocking(600);
+        drop(permit);
+        let rejection = control.try_reserve(500).err().unwrap();
+        assert_eq!(rejection.scope, TransferScope::Egress);
+        assert!(control.snapshot().quota_blocked);
+
+        registry.set_quota_metering(false);
+        assert!(!control.snapshot().quota_blocked);
+        let mut permit = control.try_reserve(500).unwrap();
+        permit.record_blocking(500);
+        drop(permit);
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.lifetime_body_bytes, 1_100);
+        assert_eq!(snapshot.quota_used_bytes, 600);
+        // A control made while metering is off starts off too.
+        let later = registry.configure(StableServerId(4), quota(1, 1));
+        assert!(later.try_reserve(10).is_ok());
+
+        registry.set_quota_metering(true);
+        assert!(control.try_reserve(500).is_err());
+        assert!(control.try_reserve(400).is_ok());
     }
 }

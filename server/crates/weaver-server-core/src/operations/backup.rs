@@ -653,10 +653,12 @@ impl Database {
                         "SELECT COUNT(*) AS count FROM {}",
                         catalog::quote_identifier(entry.table)
                     ),
-                    catalog::RestoreTargetPolicy::RequireZeroUsage => "SELECT COUNT(*) AS count
-                           FROM server_download_usage
-                          WHERE lifetime_bytes != 0 OR quota_baseline_bytes != 0"
-                        .to_string(),
+                    catalog::RestoreTargetPolicy::RequireZeroUsage => format!(
+                        "SELECT COUNT(*) AS count
+                           FROM {}
+                          WHERE lifetime_bytes != 0 OR quota_baseline_bytes != 0",
+                        catalog::quote_identifier(entry.table)
+                    ),
                 };
                 let count = SqlRuntime::fetch_optional(datastore.read_exec(), &query, &[])
                     .await?

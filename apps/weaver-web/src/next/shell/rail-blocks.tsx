@@ -11,7 +11,7 @@ import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
 import { useNextData, type ProviderHealth } from "../data/next-data";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
 import { useNow } from "../data/clock";
-import { formatClock, formatLatency, splitUptime } from "../data/format";
+import { formatClock, formatDayClock, formatLatency, splitUptime } from "../data/format";
 import { providerActivityLabel, type ProviderActivity } from "../data/provider-activity";
 import { countLabel, providerStateLabel } from "../i18n/labels";
 
@@ -223,13 +223,19 @@ export function useAttentionItems(): AttentionItem[] {
     items.push({
       id: "download-block",
       text:
-        downloadBlock.kind === "ISP_CAP"
-          ? t("next.attention.capReached")
+        downloadBlock.kind === "EGRESS_QUOTA"
+          ? t("next.attention.egressQuotaReached", { name: downloadBlock.egressName ?? "" })
           : downloadBlock.kind === "SERVER_QUOTA"
             ? t("next.attention.quotaReached")
             : t("next.attention.scheduleHold"),
       meta: downloadBlock.windowEndsAtEpochMs
-        ? t("next.attention.resumes", { time: formatClock(downloadBlock.windowEndsAtEpochMs) })
+        ? t("next.attention.resumes", {
+            // An egress quota's window can run for days, so its end names the day too.
+            time:
+              downloadBlock.kind === "EGRESS_QUOTA"
+                ? formatDayClock(downloadBlock.windowEndsAtEpochMs)
+                : formatClock(downloadBlock.windowEndsAtEpochMs),
+          })
         : t("next.attention.seeBandwidth"),
       color: WV.warn,
     });

@@ -81,8 +81,8 @@ const zh: LocaleDictionary = {
   "upload.stageExpired": "Staged upload expired. Re-add the file.",
 
   // Jobs page
-  "jobs.bandwidthCapShort": "ISP 限额",
-  "jobs.bandwidthCapEta": "直到 {{resetAt}}",
+  "jobs.egressQuotaBadge": "出口配额",
+  "jobs.egressQuotaEta": "直到 {{resetAt}}",
   "jobs.serverQuotaBadge": "服务器配额",
   "jobs.serverQuotaEta": "等待服务器配额",
 

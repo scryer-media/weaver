@@ -283,6 +283,7 @@ mod tests {
                 },
                 enabled: true,
                 max_download_speed: 0,
+                download_quota: Default::default(),
             })
             .unwrap();
         db.save_proxy_routing_policy(

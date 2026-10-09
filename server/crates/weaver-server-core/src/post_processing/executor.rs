@@ -445,6 +445,7 @@ impl PostProcessingExecutor {
             python: settings.python_interpreter.clone().map(PathBuf::from),
             powershell: settings.powershell_interpreter.clone().map(PathBuf::from),
             batch: settings.batch_interpreter.clone().map(PathBuf::from),
+            go: settings.go_interpreter.clone().map(PathBuf::from),
         };
         let termination_grace = Duration::from_secs(settings.termination_grace_seconds.max(1));
 

@@ -430,9 +430,6 @@ impl Pipeline {
         lease: DownloadBatchLease,
     ) {
         for work in lease.works {
-            if let Err(error) = self.release_bandwidth_reservation(work.segment_id) {
-                error!(error = %error, segment = %work.segment_id, "failed to roll back download bandwidth reservation");
-            }
             if let Some(state) = self.jobs.get_mut(&lease.job_id) {
                 state.download_queue.push(work);
             }
@@ -1111,9 +1108,6 @@ impl Pipeline {
                 self.active_downloads_by_file
                     .remove(&work.segment_id.file_id);
             }
-        }
-        if let Err(error) = self.release_bandwidth_reservation(work.segment_id) {
-            error!(error = %error, segment = %work.segment_id, "failed to release ISP bandwidth reservation for unrequested owned lane work");
         }
 
         if let Some(state) = self.jobs.get_mut(&job_id)

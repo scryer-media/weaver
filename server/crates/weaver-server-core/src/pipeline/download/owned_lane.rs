@@ -983,6 +983,11 @@ impl CachedOwnedLane {
                 .expect("owned download lease must contain work")
                 .byte_estimate,
         );
+        // An egress out of quota keeps refusing on this socket; a fresh dial
+        // goes out through whichever egress the route still has.
+        if self.lane.egress_quota_rejection(estimate).is_some() {
+            return false;
+        }
         let cached_rejection = nntp.server_quota_rejection(server, estimate);
         if cached_rejection.is_none() {
             return true;
@@ -1112,6 +1117,10 @@ enum LaneStop {
     /// BODY would expect it, so the ring still drains, but nothing more may be
     /// issued on it.
     PolicyBlocked,
+    /// The egress this connection leaves through is out of quota. The ring
+    /// drains as for any policy outcome, but the socket is let go: the route
+    /// dials its next connection through an egress that can still download.
+    EgressQuota,
     RecoveryYield,
     Quarantined,
     /// The result or refill channel is gone; the orchestrator is shutting down.
@@ -1127,7 +1136,19 @@ fn lane_stop_park(stop: Option<LaneStop>) -> Option<(LaneParkReason, bool)> {
             LaneParkReason::ServerQuota,
             keep_cached_lane_after_park(LaneParkReason::ServerQuota),
         ),
+        LaneStop::EgressQuota => (LaneParkReason::ServerQuota, false),
     })
+}
+
+/// Whether a result is a BODY its connection's egress refused for quota.
+fn egress_quota_refused(data: &Result<DownloadPayload, DownloadError>) -> bool {
+    matches!(
+        data,
+        Err(DownloadError::Fetch(failure))
+            if failure.quota_rejection.as_ref().is_some_and(|rejection| {
+                rejection.scope == weaver_nntp::transfer::TransferScope::Egress
+            })
+    )
 }
 
 /// How many times a worker re-asks for a connection when the shared server
@@ -1500,6 +1521,9 @@ fn run_owned_blocking_download_lane(
                 },
                 &work_context.retention_excludes,
             );
+            if matches!(stop, Some(LaneStop::PolicyBlocked)) && egress_quota_refused(&result.data) {
+                stop = Some(LaneStop::EgressQuota);
+            }
             if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
                 stop = Some(LaneStop::Error);
             }
@@ -1655,11 +1679,14 @@ fn run_owned_blocking_download_lane(
                     DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
                 )
         );
+        let egress_blocked = egress_quota_refused(&result.data);
         if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
             stop = Some(LaneStop::Error);
         }
         if !keeps_connection || meta.connection_discarded || lane.ring_is_closed() {
             stop.get_or_insert(LaneStop::ConnectionLost);
+        } else if egress_blocked {
+            stop.get_or_insert(LaneStop::EgressQuota);
         } else if policy_blocked {
             stop.get_or_insert(LaneStop::PolicyBlocked);
         }

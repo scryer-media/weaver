@@ -392,9 +392,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 | SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
                 SchedulerCommand::RebuildNntp { reply, .. } => {
                     let _ = reply.send(Ok(NntpRuntimeActivation {
                         generation: 1,
