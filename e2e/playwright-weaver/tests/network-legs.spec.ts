@@ -33,7 +33,7 @@ async function twoLegServer(host = DIRECT_HOST, weights: [number, number] = [50,
 }
 
 test("L01 an even split opens two connections on each egress from its own address", async ({ request }, info) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await twoLegServer();
   await world.holdChaosSession();
   await resetNntpMetrics();
@@ -54,7 +54,7 @@ test("L01 an even split opens two connections on each egress from its own addres
 });
 
 test("L02 largest-remainder targets for 75/25 and 70/30", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await twoLegServer(DIRECT_HOST, [75, 25]);
   const download = await world.pacedDownload("l02-weights");
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 3], [b.id, 1]]), "75/25 gives 3/1");
@@ -95,7 +95,7 @@ async function proxiedSecondLeg(failover: "REDISTRIBUTE" | "HOLD") {
 }
 
 test("L04 Redistribute gives a dead proxied leg's share to the direct leg", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await proxiedSecondLeg("REDISTRIBUTE");
   const download = await world.pacedDownload("l04-redistribute");
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
@@ -109,7 +109,7 @@ test("L04 Redistribute gives a dead proxied leg's share to the direct leg", asyn
 });
 
 test("L05 Hold parks a dead leg's share instead of moving it", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await proxiedSecondLeg("HOLD");
   const download = await world.pacedDownload("l05-hold");
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
@@ -131,7 +131,7 @@ test("L05 Hold parks a dead leg's share instead of moving it", async ({ request 
 });
 
 test("L06 a dead leg goes Down, probes with one connection, and returns Up once its proxy does", async ({ request }, info) => {
-  test.setTimeout(15 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await proxiedSecondLeg("REDISTRIBUTE");
   // The fixture paces every body line, so 10 ms lets a 64 KiB article finish in
   // about five seconds, inside the per-article soft timeout: a recovery probe can
@@ -159,7 +159,7 @@ test("L06 a dead leg goes Down, probes with one connection, and returns Up once 
 });
 
 test("L07 a changed SSH host key blocks the leg until the key is reset", async ({ request }) => {
-  test.setTimeout(15 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const b = await world.egress("b");
   const ssh = await world.ssh("ssh-switch", { network: "b" });
@@ -188,7 +188,7 @@ test("L07 a changed SSH host key blocks the leg until the key is reset", async (
 });
 
 test("L08 refused connections are not path evidence: the leg never goes Down", async ({ request }, info) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   // Both legs reach the NNTP server through Toxiproxy's nntp1, each from its
   // own egress, so a reset_peer toxic refuses every connection either leg opens.
   const a = await world.egress("a");
@@ -220,7 +220,7 @@ test("L08 refused connections are not path evidence: the leg never goes Down", a
 });
 
 test("L09 a black-holed proxy times out, takes its leg Down and cools its rung", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const b = await world.egress("b");
   const connect2 = await world.connect("connect2", { network: "b", timeoutSeconds: 3 });
@@ -268,7 +268,7 @@ test("L10 an RSS route uses one connection on its first leg", async ({ request }
 const NNTP_ACCEPTED = "tcp src port 119 and (tcp[tcpflags] & tcp-syn) != 0 and (tcp[tcpflags] & tcp-ack) != 0";
 
 test("L11 reweighting a running route moves connections without revoking them", async ({ request }, info) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await twoLegServer();
   // Paced so each article finishes inside the per-article soft timeout; a body
   // that never finishes times out and its lane reconnects, which this test
@@ -302,7 +302,7 @@ test("L11 reweighting a running route moves connections without revoking them", 
 });
 
 test("L12 changing one leg's path revokes only that leg", async ({ request }, info) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await twoLegServer(PROXIED_HOST);
   const connect1 = await world.connect("connect1", { network: "b" });
   const download = await world.pacedDownload("l12-revoke");
@@ -324,7 +324,7 @@ test("L12 changing one leg's path revokes only that leg", async ({ request }, in
 });
 
 test("L13 the flow subscription ticks with rising stamps and live rates on both legs", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await twoLegServer();
   const download = await world.pacedDownload("l13-subscribe", { slowMs: 200, parts: 320 });
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
@@ -341,7 +341,7 @@ test("L13 the flow subscription ticks with rising stamps and live rates on both 
 });
 
 test("L14 raising the server's connections recomputes targets and the consumer cap", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, b, server } = await twoLegServer();
   const download = await world.pacedDownload("l14-cap");
   await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");

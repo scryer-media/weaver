@@ -1703,7 +1703,7 @@ impl Pipeline {
     /// The progress floor answers this while the part downloads, but file
     /// completion retires the floor, so a complete part — or one completed
     /// again by a duplicate article — reads as floor zero. Its committed
-    /// first segment still answers the question.
+    /// opening segments still answer the question.
     fn direct_unpack_part_opens_with(
         &self,
         job_id: JobId,
@@ -1719,9 +1719,7 @@ impl Pipeline {
         self.jobs
             .get(&job_id)
             .and_then(|state| state.assembly.file(file_id))
-            .filter(|file| file.has_segment(0))
-            .and_then(|file| file.placement_of(0))
-            .is_some_and(|(offset, segment_len)| offset == 0 && u64::from(segment_len) >= len)
+            .is_some_and(|file| committed_opening_len(file, len) >= len)
     }
 
     /// The job file a part path belongs to, by its current name.
@@ -3833,5 +3831,78 @@ fn sanitize_set_dir_name(set_name: &str) -> String {
         "set".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+/// How many of a file's opening bytes its committed articles cover, walking
+/// ordinals from zero while each placement starts where the last one ended.
+/// An opening article can be shorter than a header the next one completes.
+/// Stops once `wanted` bytes are covered.
+fn committed_opening_len(file: &crate::jobs::assembly::FileAssembly, wanted: u64) -> u64 {
+    let mut end = 0u64;
+    for segment in 0..file.total_segments() {
+        if end >= wanted {
+            break;
+        }
+        match file.placement_of(segment) {
+            Some((offset, len)) if offset == end && file.has_segment(segment) => {
+                end = end.saturating_add(u64::from(len));
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
+#[cfg(test)]
+mod opening_tests {
+    use weaver_model::files::FileRole;
+
+    use super::committed_opening_len;
+    use crate::jobs::assembly::FileAssembly;
+    use crate::jobs::ids::{JobId, NzbFileId};
+
+    fn part(segment_sizes: Vec<u32>) -> FileAssembly {
+        FileAssembly::new(
+            NzbFileId {
+                job_id: JobId(1),
+                file_index: 0,
+            },
+            "set.part01.rar".into(),
+            FileRole::RarVolume { volume_number: 0 },
+            segment_sizes,
+        )
+    }
+
+    fn commit(file: &mut FileAssembly, segment: u32, offset: u64, len: u32) {
+        file.record_placement(segment, offset, len);
+        file.commit_segment(segment, len).unwrap();
+    }
+
+    #[test]
+    fn a_short_first_article_counts_with_the_article_after_it() {
+        let mut file = part(vec![20, 100, 100]);
+        commit(&mut file, 0, 0, 20);
+        assert_eq!(committed_opening_len(&file, 32), 20);
+
+        commit(&mut file, 1, 20, 100);
+        assert!(committed_opening_len(&file, 32) >= 32);
+
+        // Completion, which retires the progress floor, changes nothing here.
+        commit(&mut file, 2, 120, 100);
+        assert!(file.is_complete());
+        assert!(committed_opening_len(&file, 32) >= 32);
+    }
+
+    #[test]
+    fn a_gap_or_a_missing_first_article_covers_nothing_past_it() {
+        let mut file = part(vec![20, 100]);
+        commit(&mut file, 1, 20, 100);
+        assert_eq!(committed_opening_len(&file, 32), 0);
+
+        let mut file = part(vec![20, 100]);
+        commit(&mut file, 0, 0, 20);
+        commit(&mut file, 1, 24, 96);
+        assert_eq!(committed_opening_len(&file, 32), 20);
     }
 }

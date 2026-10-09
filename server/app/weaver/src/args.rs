@@ -156,6 +156,16 @@ impl Command {
             base_url: DEFAULT_SERVE_BASE_URL.to_string(),
         }
     }
+
+    /// Whether the command opens the database, and so may migrate it. Every
+    /// such command takes the pre-migration backup first: a one-shot download
+    /// on an upgraded install migrates the schema just as a server start does.
+    pub(crate) fn opens_database(&self) -> bool {
+        match self {
+            Self::Download { .. } | Self::Serve { .. } => true,
+            Self::Par2 { .. } | Self::Nzb { .. } => false,
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -261,6 +271,24 @@ mod tests {
         assert!(!super::upgrade_backup_required(false, Some("false")));
         assert!(!super::upgrade_backup_required(false, None));
         assert!(super::upgrade_backup_required(true, Some("false")));
+    }
+
+    #[test]
+    fn every_command_that_opens_the_database_takes_the_upgrade_backup() {
+        let command = |args: &[&str]| {
+            Cli::parse_from(args)
+                .command
+                .unwrap_or_else(Command::default_serve)
+        };
+        assert!(command(&["weaver"]).opens_database());
+        assert!(command(&["weaver", "serve"]).opens_database());
+        assert!(command(&["weaver", "download", "fixture.nzb"]).opens_database());
+        assert!(!command(&["weaver", "nzb", "analyze", "set.nzb"]).opens_database());
+        assert!(!command(&["weaver", "par2", "verify", "set.par2"]).opens_database());
+
+        let cli = Cli::parse_from(["weaver", "--require-upgrade-backup", "download", "a.nzb"]);
+        assert!(cli.require_upgrade_backup);
+        assert!(cli.command.expect("download command").opens_database());
     }
 
     #[test]

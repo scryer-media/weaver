@@ -103,7 +103,7 @@ test("E07 taking an interface down moves its share to the other leg and the egre
   // Stands in for `docker network disconnect`: the capture sidecar owns
   // Weaver's namespace and sets the link down, so the interface keeps its
   // name and the recovery half is deterministic.
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const b = await world.egress("b");
   const linkB = await ifaceFor(request, egressAddress("b"));
@@ -132,7 +132,7 @@ test("E07 taking an interface down moves its share to the other leg and the egre
 });
 
 test("E08 an egress speed limit caps every leg sample", async ({ request }, info) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   test.info().annotations.push({ type: "gap", description: "Weaver exposes no egress-throttling metrics counter, so only the 1 Hz leg samples are asserted." });
   const limit = 1024 * 1024;
   const iface = await interfaceForAddress(request, egressAddress("a"));

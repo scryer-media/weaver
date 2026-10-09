@@ -36,3 +36,16 @@ export type ProxyProfile = {
   mtu: number; keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
   hasUsername: boolean; hasPassword: boolean; hasPrivateKey: boolean; hasPassphrase: boolean; hasPresharedKey: boolean;
 };
+/**
+ * The proxies a chain's hop can use. WireGuard and HTTP/3 need UDP, which only
+ * the egress or a WireGuard hop beneath them carries, and only WireGuard can
+ * ride a WireGuard hop. The hop's saved choice always stays listed.
+ */
+export function chainHopProfiles<T extends Pick<ProxyProfile, "id" | "kind">>(profiles: T[], chainIds: number[], hop: number): T[] {
+  if (hop === 0) return profiles;
+  const beneath = profiles.find((profile) => profile.id === chainIds[hop - 1])?.kind;
+  return profiles.filter((profile) =>
+    profile.id === chainIds[hop]
+    || (profile.kind !== "WIRE_GUARD" && profile.kind !== "HTTP3_CONNECT")
+    || (profile.kind === "WIRE_GUARD" && beneath === "WIRE_GUARD"));
+}

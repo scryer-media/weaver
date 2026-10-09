@@ -13,7 +13,7 @@ import {
   type ProxyPool,
   type Rung,
 } from "@/lib/networking";
-import { proxyLabels, type ProxyProfile } from "@/lib/proxies";
+import { chainHopProfiles, proxyLabels, type ProxyProfile } from "@/lib/proxies";
 import { cn } from "@/lib/utils";
 import { Square } from "../../components/chrome";
 import { NumberField, SecondaryButton, Segmented, Select } from "../../components/controls";
@@ -260,8 +260,7 @@ export function RouteEditor({
                                   value: "",
                                   label: hop === 2 ? t("next.networking.route.optionalHop") : t("next.networking.route.chooseProxy"),
                                 },
-                                ...profiles
-                                  .filter((profile) => hop === 0 || !["WIRE_GUARD", "HTTP3_CONNECT"].includes(profile.kind))
+                                ...chainHopProfiles(profiles, rung.chainIds, hop)
                                   .map((profile) => ({
                                     value: String(profile.id),
                                     label: `${profile.name} · ${proxyLabels[profile.kind]}`,

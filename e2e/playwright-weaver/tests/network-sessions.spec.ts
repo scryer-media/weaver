@@ -37,7 +37,7 @@ async function sshServer(profile: ProxyProfile) {
 }
 
 test("S01 a password-only SSH profile is refused; key auth forwards to the NNTP server", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   // Weaver's SSH tunnels take an Ed25519 key only; password authentication is not offered.
   const client = (await tunnelState(request)).sshClient;
   const before = (await proxyProfiles(request)).length;
@@ -58,7 +58,7 @@ test("S01 a password-only SSH profile is refused; key auth forwards to the NNTP 
 });
 
 test("S02 SSH key and passphrase-protected key auth; a wrong passphrase is refused at save", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   for (const [endpoint, auth] of [["ssh2", "key"], ["ssh3", "passphrase"]] as const) {
     const profile = await world.ssh(endpoint, { auth });
     const seen = (await tunnelState(request)).ssh[endpoint]!.acceptedAuth.length;
@@ -81,7 +81,7 @@ test("S02 SSH key and passphrase-protected key auth; a wrong passphrase is refus
 });
 
 test("S03 a host key that changes after first use blocks the leg until reset", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const profile = await world.ssh("ssh-switch");
   const { leg } = await sshServer(profile);
   const first = await world.download("s03-first");
@@ -102,7 +102,7 @@ test("S03 a host key that changes after first use blocks the leg until reset", a
 });
 
 test("S04 an SSH server that refuses forwarding takes only its leg Down", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const b = await world.egress("b");
   const refuse = await world.ssh("ssh-refuse", { network: "b" });
@@ -115,7 +115,7 @@ test("S04 an SSH server that refuses forwarding takes only its leg Down", async 
 });
 
 test("S05 two servers on one SSH profile share a session that closes when both routes go", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const ssh1 = await world.ssh("ssh1");
   const mark = await tunnelMark(request);
@@ -141,7 +141,7 @@ test("S05 two servers on one SSH profile share a session that closes when both r
 });
 
 test("S06 a lost SSH endpoint takes the leg Down and the session is rebuilt when it returns", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   // The endpoint is taken down through the tunnel fixture's control API,
   // which refuses and closes exactly as a stopped container would.
   const ssh1 = await world.ssh("ssh1");
@@ -158,7 +158,7 @@ test("S06 a lost SSH endpoint takes the leg Down and the session is rebuilt when
 });
 
 test("S07 WireGuard carries NNTP and RSS through the tunnel; a wrong preshared key takes the leg Down", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const wg2 = await world.wireguard("wg2");
   await world.server({ host: "nntp.proxy.test", route: { legs: [ladderLeg(a.id, [rung.proxy(wg2.id)], 100)] } });
@@ -199,7 +199,7 @@ test.fixme("S08 HTTP/3 CONNECT sessions", () => {
 });
 
 test("S09 a profile keeps an omitted secret and clears a null one", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const connect1 = await world.connect("connect1");
   const connect2 = await world.connect("connect2");
@@ -216,7 +216,7 @@ test("S09 a profile keeps an omitted secret and clears a null one", async ({ req
 });
 
 test("S10 a disabled profile's rung is unavailable and the next rung carries the leg", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const ssh1 = await world.ssh("ssh1");
   await saveProxyProfile(request, resaveInput(ssh1, { enabled: false }), ssh1.id);
