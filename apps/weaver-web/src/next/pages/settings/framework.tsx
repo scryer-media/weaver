@@ -1,4 +1,5 @@
 import {
+  Fragment,
   createContext,
   useContext,
   useEffect,
@@ -297,6 +298,13 @@ export interface SettingsTableRowModel {
    * the table has columns. A cell without an entry takes one.
    */
   spans?: number[];
+  /**
+   * Set on a row that opens in place rather than into an editor: whether it
+   * is open now. The table's `onRowClick` toggles it.
+   */
+  expanded?: boolean;
+  /** What an open row shows under its columns, across the whole table. */
+  detail?: ReactNode;
 }
 
 /** The rows of one kind in a table that lists several kinds under the same columns. */
@@ -459,16 +467,26 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
   const row = (entry: SettingsTableRowModel) => {
     const onRowClick = block.onRowClick;
     const interactive = typeof onRowClick === "function";
-    return (
+    // A row that opens in place is a disclosure: it says whether it is open,
+    // names what it opens, and answers Space as a button does.
+    const disclosure = interactive && entry.expanded !== undefined;
+    const detailId = `${block.id}-detail-${entry.id}`;
+    const line = (
       <div
-        key={entry.id}
+        key={disclosure ? undefined : entry.id}
         {...(interactive
           ? {
               role: "button",
               tabIndex: 0,
+              ...(disclosure
+                ? { "aria-expanded": entry.expanded, "aria-controls": entry.expanded ? detailId : undefined }
+                : {}),
               onClick: () => onRowClick?.(entry.id),
               onKeyDown: (event: React.KeyboardEvent) => {
-                if (event.key === "Enter") {
+                if (event.target !== event.currentTarget && disclosure) {
+                  return;
+                }
+                if (event.key === "Enter" || (disclosure && event.key === " ")) {
                   event.preventDefault();
                   onRowClick?.(entry.id);
                 }
@@ -493,6 +511,19 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
           );
         })}
       </div>
+    );
+    if (!disclosure) {
+      return line;
+    }
+    return (
+      <Fragment key={entry.id}>
+        {line}
+        {entry.expanded ? (
+          <div id={detailId} className="border-b border-wv-hairline px-4 sm:px-6 pt-1 pb-4">
+            {entry.detail}
+          </div>
+        ) : null}
+      </Fragment>
     );
   };
   return (

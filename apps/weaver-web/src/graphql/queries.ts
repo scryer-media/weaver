@@ -2271,6 +2271,7 @@ export const SCRIPT_RUNS_QUERY = gql`
         finishedAtEpochMs
       }
       nextBefore
+      total
     }
   }
 `;

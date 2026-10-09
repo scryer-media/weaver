@@ -193,18 +193,18 @@ test("a rule that runs a script names a schedule instance, and is listed by that
     await addSchedule(page).click();
     const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
     await form.getByLabel("Label", { exact: true }).fill("fixture script");
-    assert.equal(await form.getByRole("button", { name: "Script instance", exact: true }).count(), 0);
+    assert.equal(await form.getByRole("button", { name: "Script job", exact: true }).count(), 0);
     await choose(page, form, "Action", "Run script");
-    const instance = form.getByRole("button", { name: "Script instance", exact: true });
-    await instance.getByText("Choose an instance", { exact: true }).waitFor();
-    await form.getByText("A rule can only run an instance whose trigger is Schedule.", { exact: true }).waitFor();
+    const instance = form.getByRole("button", { name: "Script job", exact: true });
+    await instance.getByText("Choose a job", { exact: true }).waitFor();
+    await form.getByText("A rule can only run a job whose trigger is Schedule.", { exact: true }).waitFor();
     // A rule with no instance to run is refused, and the editor stays open to say so.
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await form.getByText("a run_script schedule needs a script instance", { exact: true }).waitFor();
     assert.deepEqual(await storedSchedules(page), []);
     // Only the instances a schedule starts are offered, each by its name with its script beside it.
     await instance.click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Choose an instance", "Nightly report · nightly.py", "sweep.sh"]);
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Choose a job", "Nightly report · nightly.py", "sweep.sh"]);
     await page.getByRole("menuitemradio", { name: "Nightly report · nightly.py", exact: true }).click();
     await instance.getByText("Nightly report · nightly.py", { exact: true }).waitFor();
     // A script rule's time takes the script evaluator's own notation.
@@ -229,8 +229,8 @@ test("a rule that runs a script names a schedule instance, and is listed by that
     // Reopened, the rule shows the instance it runs, and a chosen instance cannot be unchosen.
     await row.getByText("fixture script", { exact: true }).click();
     const edit = page.getByRole("dialog", { name: "fixture script", exact: true });
-    await edit.getByRole("button", { name: "Script instance", exact: true }).getByText("Nightly report · nightly.py", { exact: true }).waitFor();
-    await edit.getByRole("button", { name: "Script instance", exact: true }).click();
+    await edit.getByRole("button", { name: "Script job", exact: true }).getByText("Nightly report · nightly.py", { exact: true }).waitFor();
+    await edit.getByRole("button", { name: "Script job", exact: true }).click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Nightly report · nightly.py", "sweep.sh"]);
     await page.getByRole("menuitemradio", { name: "sweep.sh", exact: true }).click();
     await toggle(edit, "Also run at startup").click();
@@ -251,10 +251,10 @@ test("a rule whose instance no longer runs on a schedule says so, and can be poi
     assert.equal(await row.getByRole("switch").isDisabled(), false);
     await row.getByText("fixture stranded", { exact: true }).click();
     const edit = page.getByRole("dialog", { name: "fixture stranded", exact: true });
-    const instance = edit.getByRole("button", { name: "Script instance", exact: true });
-    await instance.getByText("No longer a schedule instance", { exact: true }).waitFor();
+    const instance = edit.getByRole("button", { name: "Script job", exact: true });
+    await instance.getByText("No longer a schedule job", { exact: true }).waitFor();
     await instance.click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Nightly report · nightly.py", "sweep.sh", "No longer a schedule instance"]);
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Nightly report · nightly.py", "sweep.sh", "No longer a schedule job"]);
     await page.getByRole("menuitemradio", { name: "Nightly report · nightly.py", exact: true }).click();
     await edit.getByRole("button", { name: "Save", exact: true }).click();
     await edit.waitFor({ state: "hidden" });

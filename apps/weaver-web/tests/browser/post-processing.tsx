@@ -358,14 +358,28 @@ const runs = empty ? [] : [
 const retainedOutput: Record<string, string> = {
   "run-1": `token=${MASKED}\nresolved 1 recipient\nnotified 1 recipient`,
   "run-58": `token=${MASKED}\nresolved 2 recipients\nnotified 2 recipients`,
+  // Plain lines around one the log parser reads as a record, and one long enough to wrap.
+  "run-60": [
+    "starting nightly report",
+    "2026-01-01T03:00:00.125Z INFO nightly::report: summary written rows=42 path=/fixture/reports/nightly.txt",
+    `columns ${"wide ".repeat(60)}end`,
+    "warning: 1 feed was unreachable",
+    "done",
+  ].join("\n") + "\n",
 };
 // What each request for a page of runs asked for, oldest first.
 const scriptRunRequests: Record<string, unknown>[] = [];
+// The run whose full output each request asked for, oldest first.
+const outputRequests: string[] = [];
 function scriptRunPage(variables: Record<string, any>) {
   const matching = runs.filter((entry) => !variables.kind || entry.kind === variables.kind);
   const start = variables.before ? matching.findIndex((entry) => entry.id === variables.before) + 1 : 0;
   const page = matching.slice(start, start + (variables.limit ?? 50));
-  return { runs: page, nextBefore: start + page.length < matching.length ? page[page.length - 1].id : null };
+  return {
+    runs: page,
+    nextBefore: start + page.length < matching.length ? page[page.length - 1].id : null,
+    total: matching.length,
+  };
 }
 
 /* ---------------------------------------------------------------- graphql */
@@ -450,6 +464,8 @@ function graphql(name: string, variables: Record<string, any>) {
     return cancelTest(variables.id);
   } else if (name === "ScriptRuns") {
     scriptRunRequests.push(variables);
+  } else if (name === "ScriptRunOutput" || name === "ScriptOutput") {
+    outputRequests.push(variables.outputId);
   }
   return { data: structuredClone({ postProcessingSettings: state.settings, categories: state.categories,
     scriptInstances: state.instances.map(view), discoveredScripts: state.scripts, secrets: state.secrets.map(secretView),
@@ -460,7 +476,7 @@ function graphql(name: string, variables: Record<string, any>) {
 }
 // What the daemon holds, secrets included, and what it was asked to do, for the
 // test to read and for it to move a test run along.
-Object.assign(window, { scriptsFixture: { instances: state.instances, secrets: state.secrets, requests, tests } });
+Object.assign(window, { scriptsFixture: { instances: state.instances, secrets: state.secrets, requests, tests, outputRequests } });
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });
 const originalFetch = window.fetch.bind(window);
 window.fetch = async (request, init) => {

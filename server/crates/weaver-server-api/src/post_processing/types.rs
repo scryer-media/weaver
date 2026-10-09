@@ -725,6 +725,8 @@ pub struct ScriptRunPageGql {
     pub runs: Vec<ScriptRunGql>,
     /// Pass as `before` for the runs that follow; absent on the last page.
     pub next_before: Option<String>,
+    /// How many runs the filter matches across every page.
+    pub total: u64,
 }
 
 impl From<ScriptKindGql> for weaver_server_core::post_processing::model::ScriptKind {

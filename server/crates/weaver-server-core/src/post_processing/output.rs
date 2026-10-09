@@ -235,25 +235,7 @@ impl Database {
         limit: u32,
     ) -> Result<Vec<ScriptRun>, StateError> {
         let datastore = self.datastore();
-        let mut conditions = Vec::new();
-        let mut args = Vec::new();
-        if let Some(job_id) = filter.job_id {
-            conditions.push("o.job_id = {}");
-            args.push(SqlArg::I64(i64::try_from(job_id).map_err(error)?));
-        }
-        if let Some(script) = filter.script {
-            conditions.push("o.script = {}");
-            args.push(SqlArg::Text(script));
-        }
-        if let Some(kind) = filter.kind {
-            conditions.push(match kind {
-                ScriptKind::PostProcessing => "o.event = 'post_processing'",
-                ScriptKind::Queue => "o.event LIKE 'queue:%'",
-                ScriptKind::Scan => "o.event = 'scan'",
-                ScriptKind::Scheduler => "o.event LIKE 'scheduler:%'",
-                ScriptKind::Feed => "o.event LIKE 'feed:%'",
-            });
-        }
+        let (mut conditions, mut args) = script_run_conditions(&filter)?;
         if let Some(before) = before {
             conditions.push("o.seq < {}");
             args.push(SqlArg::I64(before));
@@ -288,6 +270,50 @@ impl Database {
                 .collect()
         })
     }
+
+    /// How many recorded runs the filter matches, across every page.
+    pub fn script_run_count(&self, filter: &ScriptRunFilter) -> Result<u64, StateError> {
+        let datastore = self.datastore();
+        let (conditions, args) = script_run_conditions(filter)?;
+        let mut sql = String::from("SELECT COUNT(*) AS total FROM script_outputs o");
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        let total = self.run_sql_blocking_read(async move {
+            match SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args).await? {
+                Some(row) => row.i64("total"),
+                None => Ok(0),
+            }
+        })?;
+        u64::try_from(total).map_err(error)
+    }
+}
+
+/// The SQL conditions, over `script_outputs o`, that select the runs a filter matches.
+fn script_run_conditions(
+    filter: &ScriptRunFilter,
+) -> Result<(Vec<&'static str>, Vec<SqlArg>), StateError> {
+    let mut conditions = Vec::new();
+    let mut args = Vec::new();
+    if let Some(job_id) = filter.job_id {
+        conditions.push("o.job_id = {}");
+        args.push(SqlArg::I64(i64::try_from(job_id).map_err(error)?));
+    }
+    if let Some(script) = &filter.script {
+        conditions.push("o.script = {}");
+        args.push(SqlArg::Text(script.clone()));
+    }
+    if let Some(kind) = filter.kind {
+        conditions.push(match kind {
+            ScriptKind::PostProcessing => "o.event = 'post_processing'",
+            ScriptKind::Queue => "o.event LIKE 'queue:%'",
+            ScriptKind::Scan => "o.event = 'scan'",
+            ScriptKind::Scheduler => "o.event LIKE 'scheduler:%'",
+            ScriptKind::Feed => "o.event LIKE 'feed:%'",
+        });
+    }
+    Ok((conditions, args))
 }
 
 /// Archive moves active rows to history, so deletion is explicit rather than an FK cascade.
@@ -817,5 +843,60 @@ mod tests {
             }),
             [(Some(1), "pass.sh".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn the_run_count_is_the_filtered_set_across_every_page() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        let limits = EventScriptSettings::default();
+        let recorded = [
+            (Some(1), ScriptEventLabel::PostProcessing, "pass.sh"),
+            (None, ScriptEventLabel::Scan, "scan.sh"),
+            (Some(1), ScriptEventLabel::PostProcessing, "tidy.sh"),
+            (None, ScriptEventLabel::Feed(9), "feed.sh"),
+            (None, ScriptEventLabel::Scan, "scan.sh"),
+        ];
+        for (job_id, event, script) in recorded {
+            retain_output(
+                db.clone(),
+                job_id,
+                named(event, script),
+                script.as_bytes().to_vec(),
+                limits.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        let kind = |kind| ScriptRunFilter {
+            kind: Some(kind),
+            ..Default::default()
+        };
+
+        assert_eq!(db.script_run_count(&Default::default()).unwrap(), 5);
+        assert_eq!(db.script_run_count(&kind(ScriptKind::Scan)).unwrap(), 2);
+        assert_eq!(
+            db.script_run_count(&kind(ScriptKind::PostProcessing))
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.script_run_count(&kind(ScriptKind::Queue)).unwrap(), 0);
+        assert_eq!(
+            db.script_run_count(&ScriptRunFilter {
+                job_id: Some(1),
+                script: Some("tidy.sh".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            1
+        );
+        // A page is smaller than the set it is drawn from; the count is not.
+        assert_eq!(
+            db.script_runs(kind(ScriptKind::Scan), None, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.script_run_count(&kind(ScriptKind::Scan)).unwrap(), 2);
     }
 }
