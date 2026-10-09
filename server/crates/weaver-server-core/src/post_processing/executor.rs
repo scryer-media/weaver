@@ -711,12 +711,7 @@ impl PostProcessingExecutor {
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
         let (execution, ()) = tokio::join!(
-            execute_script_observed(
-                request,
-                cancellation,
-                Some(sender),
-                settings.event_scripts.script_output_ceiling_bytes
-            ),
+            execute_script_observed(request, cancellation, Some(sender)),
             self.consume_script_events(context, receiver, &mut requests),
         );
         match execution {
@@ -751,6 +746,7 @@ impl PostProcessingExecutor {
                         Some(context.job_id),
                         record.clone(),
                         result.output,
+                        result.output_bytes,
                         settings.event_scripts,
                     )
                     .await

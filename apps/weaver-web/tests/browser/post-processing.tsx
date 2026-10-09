@@ -90,9 +90,7 @@ const state = {
     scriptDirectory: "/fixture/scripts", executionEnabled: true, concurrency: 2,
     globalScriptsRun: has("cascade") ? "ONLY_WITHOUT_CATEGORY_SCRIPTS" : "ALWAYS",
     eventScriptConcurrency: 1, eventScriptTimeoutSeconds: 300, fileDownloadedEventInterval: 0,
-    scriptOutputCeilingBytes: 1048576, scriptOutputRunsPerJob: 32, scriptOutputRingBytes: 67108864,
-    // A size set through the API need not be a whole number of the unit its field shows.
-    scriptOutputRunCapBytes: has("uneven") ? 2097000 : 2097152, terminationGraceSeconds: 10,
+    scriptOutputRunsPerJob: 32, scriptOutputFailedRunsPerJob: 8, terminationGraceSeconds: 10,
     pythonInterpreter: null as string | null, powershellInterpreter: null as string | null,
     batchInterpreter: null as string | null, unacceptableExtensions: ["exe", "scr"],
     strictSecurityRefusesExecution: false,
@@ -279,7 +277,8 @@ interface TestRun {
 // Every test the daemon was asked to start, oldest first. A run does nothing by
 // itself: it prints, ends or is forgotten only once the page under test says so,
 // and the screen sees that the next time it reads the run.
-const tests: { run: TestRun; printed: boolean; finished: boolean; forgotten: boolean; cancelled: boolean }[] = [];
+// `overflowed` makes it print more than the log keeps.
+const tests: { run: TestRun; printed: boolean; overflowed: boolean; finished: boolean; forgotten: boolean; cancelled: boolean }[] = [];
 
 function startTest(id: string) {
   const target = state.instances.find((entry) => entry.id === id);
@@ -300,7 +299,7 @@ function startTest(id: string) {
     ],
     arguments: [`/fixture/scratch/test-${number}`, "weaver-test-download.nzb"], commands: [], commandsTruncated: false,
   };
-  tests.push({ run, printed: false, finished: false, forgotten: false, cancelled: false });
+  tests.push({ run, printed: false, overflowed: false, finished: false, forgotten: false, cancelled: false });
   return { data: { testScriptInstance: structuredClone(run) } };
 }
 
@@ -313,6 +312,10 @@ function readTest(id: string) {
   const { run } = held;
   if (run.running && held.printed && run.log === "") {
     run.log = `token=${MASKED}\nresolved 1 recipient\n`;
+  }
+  if (run.running && held.overflowed && !run.logTruncated) {
+    // Only the newest of what it printed is kept.
+    Object.assign(run, { log: "line 4096 of 4096\n", logTruncated: true });
   }
   if (run.running && held.finished) {
     Object.assign(run, {

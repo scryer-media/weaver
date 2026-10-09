@@ -1944,10 +1944,8 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     eventScriptConcurrency
     eventScriptTimeoutSeconds
     fileDownloadedEventInterval
-    scriptOutputCeilingBytes
     scriptOutputRunsPerJob
-    scriptOutputRingBytes
-    scriptOutputRunCapBytes
+    scriptOutputFailedRunsPerJob
     terminationGraceSeconds
     pythonInterpreter
     powershellInterpreter

@@ -42,3 +42,4 @@ CREATE TABLE feed_scripts (
     PRIMARY KEY (feed_id, instance_id)
 );
 CREATE INDEX feed_scripts_instance ON feed_scripts(instance_id);
+ALTER TABLE script_output_state DROP COLUMN used_bytes;

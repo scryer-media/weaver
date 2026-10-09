@@ -102,10 +102,8 @@ impl PostProcessingMutation {
             event_script_concurrency,
             event_script_timeout_seconds,
             file_downloaded_event_interval,
-            script_output_ceiling_bytes,
             script_output_runs_per_job,
-            script_output_ring_bytes,
-            script_output_run_cap_bytes,
+            script_output_failed_runs_per_job,
             execution_enabled,
             concurrency,
             termination_grace_seconds,
@@ -146,17 +144,11 @@ impl PostProcessingMutation {
             if let Some(value) = file_downloaded_event_interval {
                 event_scripts.file_downloaded_event_interval = value;
             }
-            if let Some(value) = script_output_ceiling_bytes {
-                event_scripts.script_output_ceiling_bytes = value;
-            }
             if let Some(value) = script_output_runs_per_job {
                 event_scripts.script_output_runs_per_job = value;
             }
-            if let Some(value) = script_output_ring_bytes {
-                event_scripts.script_output_ring_bytes = value;
-            }
-            if let Some(value) = script_output_run_cap_bytes {
-                event_scripts.script_output_run_cap_bytes = value;
+            if let Some(value) = script_output_failed_runs_per_job {
+                event_scripts.script_output_failed_runs_per_job = value;
             }
             let settings = PostProcessingSettings {
                 event_scripts,

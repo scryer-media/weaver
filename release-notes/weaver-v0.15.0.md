@@ -55,8 +55,16 @@ enforced never-direct setting is planned for a later release.
   display name. The display name is unchanged. A collision still gets the
   job-id suffix.
 - Every command that opens the database takes the pre-migration backup.
-- The script-output budget now covers post-processing output as well as
-  event-script output; the oldest is evicted first.
+- Script output is kept by count, not by size. Each run keeps its last
+  32 KB of output, stdout and stderr together in the order they arrived,
+  compressed hard. A run that printed more shows a "Truncated" chip on the
+  Runs table and in the Test dialog. Each download keeps its newest runs
+  (default 32) plus its newest failed runs past that (default 8, new
+  setting "Retain failed runs"); runs that belong to no download are kept
+  the same way per scan, schedule or feed. Lowering either count deletes
+  the older runs in the background as soon as you save. The "captured
+  output per run", "compressed output budget" and "compressed output cap
+  per run" settings are gone.
 - The NZB analyzer caps its input while reading instead of after.
 - A RAR chase counts the articles after a short first one.
 - On Windows, a route leg cannot bind to an interface by name; choose a
@@ -72,6 +80,9 @@ enforced never-direct setting is planned for a later release.
   `scriptInstances` query and the `createScriptInstance`,
   `updateScriptInstance`, `deleteScriptInstance` and `testScriptInstance`
   mutations. Schedules that ran a script now name a script job.
+- GraphQL: `scriptOutputCeilingBytes`, `scriptOutputRingBytes` and
+  `scriptOutputRunCapBytes` are gone from the post-processing settings and
+  their input; `scriptOutputFailedRunsPerJob` is new.
 - Implicit schedules derived from a script's `### TASK TIME:` header are
   gone. "Set up from header" creates real schedule rows instead.
 - The NZBGet `<Script>:=no` per-download opt-out is not supported.
