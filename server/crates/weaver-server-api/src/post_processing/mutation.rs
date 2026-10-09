@@ -11,6 +11,9 @@ use weaver_server_core::post_processing::model::{
 };
 use weaver_server_core::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
 use weaver_server_core::post_processing::settings::normalize_script_directory;
+use weaver_server_core::post_processing::test_run::{
+    ScriptTestRequest, TestTrigger, start_script_test,
+};
 
 fn parse_script_name(value: String) -> Result<ScriptName> {
     ScriptName::new(value).map_err(|error| async_graphql::Error::new(error.to_string()))
@@ -209,6 +212,54 @@ impl PostProcessingMutation {
         })
         .await
         .map_err(|error| async_graphql::Error::new(error.to_string()))?
+    }
+
+    /// Run one script once against made-up inputs: a download that does not
+    /// exist, in a scratch directory that is removed afterwards. Commands the
+    /// script prints are reported and never applied. Read the run again with
+    /// `scriptTestRun`.
+    #[graphql(guard = "AdminGuard")]
+    async fn test_script(
+        &self,
+        ctx: &Context<'_>,
+        script: String,
+        kind: ScriptKindGql,
+        queue_event: Option<QueueEventGql>,
+        category: Option<String>,
+    ) -> Result<ScriptTestRunGql> {
+        let trigger = match kind {
+            ScriptKindGql::PostProcessing => TestTrigger::PostProcessing,
+            ScriptKindGql::Queue => TestTrigger::Queue(
+                queue_event
+                    .ok_or_else(|| {
+                        async_graphql::Error::new("a queue test needs the event to stand in for")
+                    })?
+                    .into(),
+            ),
+            ScriptKindGql::Scan => TestTrigger::Scan,
+            ScriptKindGql::Scheduler => TestTrigger::Scheduler,
+            ScriptKindGql::Feed => TestTrigger::Feed,
+        };
+        let request = ScriptTestRequest {
+            script: parse_script_name(script)?,
+            trigger,
+            category,
+        };
+        start_script_test(
+            ctx.data::<Database>()?,
+            ctx.data::<SharedConfig>()?,
+            request,
+            None,
+        )
+        .await
+        .map(Into::into)
+        .map_err(|error| async_graphql::Error::new(error.to_string()))
+    }
+
+    /// Stop a running test. False when there is no such run or it has ended.
+    #[graphql(guard = "AdminGuard")]
+    async fn cancel_script_test(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
+        Ok(ctx.data::<Database>()?.cancel_script_test(&id))
     }
 
     /// Execute the job's script list again against its retained output directory.

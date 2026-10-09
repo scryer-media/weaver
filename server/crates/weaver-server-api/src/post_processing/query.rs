@@ -134,6 +134,17 @@ impl PostProcessingQuery {
         })
     }
 
+    /// A test run as it stands, or null when there is no such run or it is no
+    /// longer kept. Test runs are held in memory and are not recorded runs.
+    #[graphql(guard = "AdminGuard")]
+    async fn script_test_run(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> Result<Option<ScriptTestRunGql>> {
+        Ok(ctx.data::<Database>()?.script_test(&id).map(Into::into))
+    }
+
     #[graphql(guard = "ReadGuard")]
     async fn script_output(&self, ctx: &Context<'_>, output_id: String) -> Result<Option<String>> {
         let db = ctx.data::<Database>()?.clone();

@@ -191,6 +191,18 @@ pub async fn execute_script_observed(
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
     output_ceiling: u64,
 ) -> Result<ScriptExecutionResult, RunnerError> {
+    execute_script_tapped(request, cancellation, events, output_ceiling, None).await
+}
+
+/// [`execute_script_observed`], with each captured line also handed to `tap`
+/// as it arrives.
+pub async fn execute_script_tapped(
+    request: ScriptExecutionRequest,
+    cancellation: Option<watch::Receiver<bool>>,
+    events: Option<mpsc::Sender<ScriptOutputEvent>>,
+    output_ceiling: u64,
+    tap: Option<OutputTap>,
+) -> Result<ScriptExecutionResult, RunnerError> {
     let mut secrets = request
         .options
         .iter()
@@ -234,6 +246,7 @@ pub async fn execute_script_observed(
         secrets: Arc::new(secrets.clone()),
         event: (adapter == ScriptAdapter::Nzbget).then_some(ScriptEventLabel::PostProcessing),
         events,
+        tap,
         ceiling: output_ceiling.clamp(MAX_LOGICAL_LINE_BYTES as u64, 8 * 1024 * 1024),
     };
     tracing::info!(
@@ -293,6 +306,17 @@ pub async fn execute_spec(
     cancellation: Option<watch::Receiver<bool>>,
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
 ) -> Result<ScriptExecutionResult, RunnerError> {
+    execute_spec_tapped(spec, cancellation, events, None).await
+}
+
+/// [`execute_spec`], with each captured line also handed to `tap` as it
+/// arrives.
+pub async fn execute_spec_tapped(
+    spec: ExecutionSpec,
+    cancellation: Option<watch::Receiver<bool>>,
+    events: Option<mpsc::Sender<ScriptOutputEvent>>,
+    tap: Option<OutputTap>,
+) -> Result<ScriptExecutionResult, RunnerError> {
     let root = fs::canonicalize(&spec.root)?;
     let entrypoint = fs::canonicalize(root.join(spec.manifest.entrypoint()))?;
     if !entrypoint.starts_with(&root) || !entrypoint.is_file() {
@@ -344,6 +368,7 @@ pub async fn execute_spec(
             secrets: Arc::new(secrets.clone()),
             event: Some(spec.kind.clone()),
             events,
+            tap,
             ceiling: spec
                 .output_ceiling
                 .clamp(MAX_LOGICAL_LINE_BYTES as u64, 8 * 1024 * 1024),
@@ -384,11 +409,16 @@ pub async fn execute_spec(
     Ok(result)
 }
 
+/// Receives each line of a run's captured output as it arrives: redacted, and
+/// with the commands the script issued already taken out.
+pub type OutputTap = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 #[derive(Clone)]
 struct CapturePolicy {
     secrets: Arc<Vec<Vec<u8>>>,
     event: Option<ScriptEventLabel>,
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
+    tap: Option<OutputTap>,
     ceiling: u64,
 }
 
@@ -398,6 +428,7 @@ impl Default for CapturePolicy {
             secrets: Arc::new(Vec::new()),
             event: None,
             events: None,
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         }
     }
@@ -1245,6 +1276,9 @@ async fn capture_line(line: Vec<u8>, output: &Arc<Mutex<BoundedOutput>>, policy:
         (redacted, None)
     };
     if !tail.is_empty() {
+        if let Some(tap) = &policy.tap {
+            tap(&tail);
+        }
         output.lock().expect("output collector poisoned").push(tail);
     }
     if let (Some(sender), Some(event)) = (&policy.events, event) {
@@ -1441,6 +1475,14 @@ fn terminate_on_parent_pipe_loss(_child: &mut std::process::Child) {
 pub(crate) fn adapter_contract_for_test(
     request: &ScriptExecutionRequest,
 ) -> Result<(Vec<String>, BTreeMap<String, String>), RunnerError> {
+    adapter_contract(request)
+}
+
+/// The arguments and environment the adapter hands a post-processing script,
+/// without the platform environment it inherits.
+pub(crate) fn adapter_contract(
+    request: &ScriptExecutionRequest,
+) -> Result<(Vec<String>, BTreeMap<String, String>), RunnerError> {
     let mut env = BTreeMap::new();
     let args = adapter_environment_and_args(request, &mut env)?
         .into_iter()
@@ -1508,6 +1550,7 @@ mod capture_tests {
             secrets: Arc::new(vec![b"private-value".to_vec()]),
             event: None,
             events: Some(sender),
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let input = b"ordinary private-value\r\n[INFO] private-value\n[NZB] NZBPR_Token=private-value\nunterminated private-value";
@@ -1538,6 +1581,7 @@ mod capture_tests {
             secrets: Arc::new(secrets),
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let lines = format!(
@@ -1624,6 +1668,7 @@ mod capture_tests {
             secrets: Arc::new(vec![b"secret-alpha\r\n\r\nsecret-beta".to_vec()]),
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let input = b"secret-alpha\r\n\r\nsecret-beta\n[INFO] secret-alpha\n[NZB] NZBPR_Token=secret-beta\n";
@@ -1660,6 +1705,7 @@ mod capture_tests {
             secrets: Arc::new(vec![b"sensitive-value".to_vec()]),
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let mut input = b"[NZB] NZBPR_Token=sensitive-value\n[INFO] sensitive-value\r\n".to_vec();

@@ -6,6 +6,7 @@ use weaver_server_core::post_processing::model::{
     ScriptSelectValue, SecretOptionValue,
 };
 use weaver_server_core::post_processing::output::ScriptRun;
+use weaver_server_core::post_processing::test_run::ScriptTestSnapshot;
 
 /// Placeholder shown instead of a stored secret. Secrets leave the process only
 /// as environment values for the script that declared them.
@@ -566,6 +567,89 @@ impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEvent
             QueueEvent::NzbNamed => Self::NzbNamed,
             QueueEvent::NzbDownloaded => Self::NzbDownloaded,
             QueueEvent::NzbDeleted => Self::NzbDeleted,
+        }
+    }
+}
+
+impl From<QueueEventGql> for weaver_server_core::post_processing::model::QueueEvent {
+    fn from(value: QueueEventGql) -> Self {
+        match value {
+            QueueEventGql::FileDownloaded => Self::FileDownloaded,
+            QueueEventGql::UrlCompleted => Self::UrlCompleted,
+            QueueEventGql::NzbMarked => Self::NzbMarked,
+            QueueEventGql::NzbAdded => Self::NzbAdded,
+            QueueEventGql::NzbNamed => Self::NzbNamed,
+            QueueEventGql::NzbDownloaded => Self::NzbDownloaded,
+            QueueEventGql::NzbDeleted => Self::NzbDeleted,
+        }
+    }
+}
+
+/// One variable made up for a script under test.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptTestInput")]
+pub struct ScriptTestInputGql {
+    pub name: String,
+    pub value: String,
+}
+
+/// A script run against made-up inputs, as it stands.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptTestRun")]
+pub struct ScriptTestRunGql {
+    pub id: String,
+    pub script: String,
+    pub event: String,
+    pub kind: ScriptKindGql,
+    pub adapter: ScriptAdapterGql,
+    pub started_at_epoch_ms: i64,
+    /// The run is ended after this long.
+    pub timeout_seconds: u64,
+    /// False once the script has ended, when `status` is set.
+    pub running: bool,
+    pub status: Option<ScriptStatusGql>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub error_message: Option<String>,
+    /// What the script has printed so far, or all of it once the run has ended.
+    pub log: String,
+    pub log_truncated: bool,
+    /// The variables made up for this run, in name order. The script's saved
+    /// options are left out.
+    pub inputs: Vec<ScriptTestInputGql>,
+    /// The arguments made up for this run, in order.
+    pub arguments: Vec<String>,
+    /// Commands the script issued, in order. A test run applies none of them.
+    pub commands: Vec<String>,
+    pub commands_truncated: bool,
+}
+
+impl From<ScriptTestSnapshot> for ScriptTestRunGql {
+    fn from(value: ScriptTestSnapshot) -> Self {
+        let outcome = value.outcome;
+        Self {
+            id: value.id,
+            script: value.script.as_str().to_string(),
+            kind: value.event.kind().into(),
+            event: value.event.to_string(),
+            adapter: value.adapter.into(),
+            started_at_epoch_ms: value.started_at_epoch_ms,
+            timeout_seconds: value.timeout_seconds,
+            running: outcome.is_none(),
+            status: outcome.as_ref().map(|outcome| outcome.status.into()),
+            exit_code: outcome.as_ref().and_then(|outcome| outcome.exit_code),
+            duration_ms: outcome.as_ref().map(|outcome| outcome.duration_ms),
+            error_message: outcome.and_then(|outcome| outcome.error_message),
+            log: value.log,
+            log_truncated: value.log_truncated,
+            inputs: value
+                .inputs
+                .into_iter()
+                .map(|(name, value)| ScriptTestInputGql { name, value })
+                .collect(),
+            arguments: value.arguments,
+            commands: value.commands,
+            commands_truncated: value.commands_truncated,
         }
     }
 }

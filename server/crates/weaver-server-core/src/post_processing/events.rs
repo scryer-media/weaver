@@ -25,7 +25,7 @@ type BackgroundRuns = BTreeMap<u64, (Option<u64>, watch::Sender<bool>)>;
 
 /// Fire-and-forget runs allowed at once. They are bounded apart from the
 /// scripts weaver waits for, so neither takes a turn from the other.
-const BACKGROUND_RUNS: usize = 8;
+const BACKGROUND_RUNS: usize = 32;
 
 struct BackgroundLane {
     turns: std::sync::Arc<tokio::sync::Semaphore>,
@@ -129,6 +129,7 @@ pub(crate) struct ScriptRuntime {
     admissions: std::sync::Mutex<QueueAdmissions>,
     durable_events_seen: std::sync::atomic::AtomicBool,
     background: BackgroundLane,
+    pub(super) tests: super::test_run::TestRuns,
 }
 
 #[derive(Clone, Copy)]

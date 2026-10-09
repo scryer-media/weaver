@@ -15,6 +15,7 @@ pub mod runner;
 pub mod scan;
 pub mod scheduler;
 pub mod settings;
+pub mod test_run;
 
 #[cfg(test)]
 mod executor_tests;
