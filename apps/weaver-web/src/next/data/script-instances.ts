@@ -50,12 +50,17 @@ export interface ScriptOption {
   defaultValue?: string | null;
 }
 
-/** One saved input: a value, or the named secret it links. A secret's value is never read back. */
+/**
+ * One saved input: a value, the named secret it links, or a secret of the
+ * job's own. Neither kind of secret is ever read back.
+ */
 export interface ScriptInstanceValue {
   name: string;
-  /** Empty when the input links a secret. */
+  /** Empty when the input is a secret of either kind. */
   value: string;
   secret: SecretRef | null;
+  /** The value is the job's own secret: stored encrypted, and never read back. */
+  sealed: boolean;
 }
 
 /** One input a header declares, at its default. A secret input has no value: it links a secret. */
@@ -231,14 +236,22 @@ export function unwiredTriggers(
 
 /* -------------------------------------------------------------------- form */
 
-/** One input as the editor holds it: a value, or a slot that links a named secret. */
+/**
+ * One input as the editor holds it: a value, a slot that links a named secret,
+ * or a secret of the job's own.
+ */
 export interface InstanceInputForm {
   name: string;
-  /** What is typed. Unused while the input is a secret. */
+  /** What is typed. Unused while the input links a secret. */
   value: string;
+  /** The input links a named secret. */
   secret: boolean;
   /** The secret a secret input links; null until one is chosen. */
   secretId: string | null;
+  /** The value is the job's own secret: stored encrypted, and never read back. */
+  own: boolean;
+  /** An own secret is already saved; left blank, it is kept as it is. */
+  held: boolean;
 }
 
 export interface InstanceForm {
@@ -267,6 +280,8 @@ function presetInputs(script: DiscoveredScript | undefined): InstanceInputForm[]
     value: input.secret ? "" : input.value,
     secret: input.secret,
     secretId: null,
+    own: false,
+    held: false,
   }));
 }
 
@@ -304,9 +319,11 @@ export function firstQueueEvent(script: DiscoveredScript | undefined): QueueEven
 export function formFromInstance(instance: ScriptInstance, script: DiscoveredScript | undefined): InstanceForm {
   const inputs: InstanceInputForm[] = instance.inputs.map((input) => ({
     name: input.name,
-    value: input.secret ? "" : input.value,
+    value: input.secret || input.sealed ? "" : input.value,
     secret: input.secret !== null,
     secretId: input.secret?.id ?? null,
+    own: input.sealed === true,
+    held: input.sealed === true,
   }));
   for (const declared of presetInputs(script)) {
     if (declared.secret && !inputs.some((input) => sameName(input.name, declared.name))) {
@@ -338,8 +355,15 @@ export function withScript(form: InstanceForm, script: DiscoveredScript | undefi
   return { ...fresh, name: form.name, enabled: form.enabled, blocking: form.blocking, timeoutSeconds: form.timeoutSeconds };
 }
 
-/** An input as the daemon is sent it: a plain value, or the id of the secret it links. */
-export type ScriptInstanceValueInput = { name: string; value: string } | { name: string; secretId: string };
+/**
+ * An input as the daemon is sent it: a plain value, the id of the secret it
+ * links, or a secret of the job's own. An own secret sent with no value keeps
+ * the one the job already holds.
+ */
+export type ScriptInstanceValueInput =
+  | { name: string; value: string }
+  | { name: string; secretId: string }
+  | { name: string; value?: string; secret: true };
 
 export interface ScriptInstanceInput {
   name: string;
@@ -355,10 +379,17 @@ export interface ScriptInstanceInput {
 
 /**
  * The input as it is sent. A secret input sends the secret it links; one with
- * no secret chosen is left out, as there is nothing to give the script.
+ * no secret chosen is left out, as there is nothing to give the script. An own
+ * secret sends what was typed, or nothing but its name to keep the saved one.
  */
 function sentInput(input: InstanceInputForm): ScriptInstanceValueInput[] {
   const name = input.name.trim();
+  if (input.own) {
+    if (input.value !== "") {
+      return [{ name, value: input.value, secret: true }];
+    }
+    return input.held ? [{ name, secret: true }] : [];
+  }
   if (!input.secret) {
     return [{ name, value: input.value }];
   }
@@ -380,7 +411,7 @@ export function inputFromForm(form: InstanceForm): ScriptInstanceInput {
   };
 }
 
-/** A saved instance sent back as it is, apart from `patch`. Its secret links are kept. */
+/** A saved instance sent back as it is, apart from `patch`. Its secrets, linked or its own, are kept. */
 export function inputFromInstance(
   instance: ScriptInstance,
   patch: Partial<Pick<ScriptInstanceInput, "enabled" | "blocking">> = {},
@@ -391,7 +422,11 @@ export function inputFromInstance(
     trigger: instance.trigger,
     queueEvent: instance.trigger === "QUEUE" ? instance.queueEvent : null,
     inputs: instance.inputs.map((input) =>
-      input.secret ? { name: input.name, secretId: input.secret.id } : { name: input.name, value: input.value },
+      input.sealed
+        ? { name: input.name, secret: true }
+        : input.secret
+          ? { name: input.name, secretId: input.secret.id }
+          : { name: input.name, value: input.value },
     ),
     categories: instance.categories,
     enabled: instance.enabled,
@@ -407,7 +442,7 @@ export function inputFromInstance(
  * becomes a value.
  */
 export function withSecret(input: InstanceInputForm, secret: boolean): InstanceInputForm {
-  return { ...input, secret, value: "", secretId: null };
+  return { ...input, secret, value: "", secretId: null, own: false, held: false };
 }
 
 /**
@@ -415,7 +450,7 @@ export function withSecret(input: InstanceInputForm, secret: boolean): InstanceI
  * unlinked secret input stays a secret slot and is left out of what is sent.
  */
 export function withLinkedSecret(input: InstanceInputForm, secretId: string | null): InstanceInputForm {
-  return { ...input, secret: true, value: "", secretId };
+  return { ...input, secret: true, value: "", secretId, own: false, held: false };
 }
 
 /** Letters, digits, `_` and `-`, starting with a letter; dots join such parts. */

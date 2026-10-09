@@ -9,7 +9,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { CheckBox, SecondaryButton, Segmented, Select, TextField } from "../../../components/controls";
+import { CheckBox, SecondaryButton, TextField } from "../../../components/controls";
 import { Icon } from "../../../components/icons";
 import {
   MAX_TIMEOUT_SECONDS,
@@ -52,7 +52,8 @@ import { SecretEditor } from "./SecretEditor";
  * script's header, and from then on the instance belongs to the operator;
  * nothing here reads the header back into a saved instance. A secret input
  * links a named secret, chosen from those there are or created here; its value
- * is never shown.
+ * is never shown. An input added here may instead be a secret of the job's
+ * own: typed once, stored encrypted, and never shown again.
  *
  * A new instance on the schedule is given when it runs here, starting from the
  * times the header asks for, and is saved with the schedule rule that runs it.
@@ -129,17 +130,16 @@ export function ScriptInstanceEditor({
   });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  // The input being added: a name with a value, or a name with a secret.
-  const [newKind, setNewKind] = useState<"value" | "secret">("value");
+  // The input being added: a name and its value, kept as the job's own secret when the box is ticked.
   const [newName, setNewName] = useState("");
   const [newValue, setNewValue] = useState("");
-  const [newSecretId, setNewSecretId] = useState<string | null>(null);
+  const [newSecret, setNewSecret] = useState(false);
   const [newProblem, setNewProblem] = useState<string | null>(null);
   const [{ data: secretsData }] = useQuery<{ secrets: Secret[] }>({ query: SECRETS_QUERY });
   // Secrets created from this editor, until the list is read again.
   const [created, setCreated] = useState<Secret[]>([]);
-  // The input a new secret is being created for; `new` is the one being added.
-  const [creatingFor, setCreatingFor] = useState<number | "new" | null>(null);
+  // The input a new secret is being created for.
+  const [creatingFor, setCreatingFor] = useState<number | null>(null);
   const secrets = useMemo(() => {
     const listed = secretsData?.secrets ?? [];
     return sortedSecrets([...listed, ...created.filter((entry) => !listed.some((own) => own.id === entry.id))]);
@@ -432,6 +432,7 @@ export function ScriptInstanceEditor({
         ? t("next.postProcessing.defaultValue", { value: option.defaultValue })
         : "",
       input.secret ? t("next.postProcessing.secretLinkHelp") : "",
+      input.own ? t("next.postProcessing.ownSecretHelp") : "",
       script && !option ? t("next.postProcessing.undeclaredInput") : "",
     ]
       .filter(Boolean)
@@ -444,7 +445,16 @@ export function ScriptInstanceEditor({
       label,
       help: help || undefined,
       keywords: input.name,
-      control: input.secret
+      control: input.own
+        ? {
+            kind: "text",
+            type: "password",
+            value: input.value,
+            // A saved one is not read back: left blank, it stays as it is.
+            placeholder: input.held ? t("next.postProcessing.ownSecretSaved") : undefined,
+            onChange,
+          }
+        : input.secret
         ? {
             kind: "select",
             value: input.secretId ?? "",
@@ -477,8 +487,8 @@ export function ScriptInstanceEditor({
             : { kind: "text", value: input.value, onChange },
     };
     // An input is a value or a secret, not a thing switched between the two:
-    // the header says which for one it declares, and one added here is added
-    // as either. The box is only for where the header can be wrong. It takes
+    // the header says which for one it declares, and one added here is a value
+    // or the job's own secret. The box is only for where the header can be wrong. It takes
     // an input for a secret by its name, and an input it calls plain may have
     // been saved as a secret; either can be made plain, which empties it.
     // Only an input the header does not ask for can be taken away.
@@ -529,20 +539,19 @@ export function ScriptInstanceEditor({
       return;
     }
     setError(null);
-    const secret = newKind === "secret";
     setForm((current) => ({
       ...current,
       inputs: [
         ...current.inputs,
-        { name: newName.trim(), value: secret ? "" : newValue, secret, secretId: secret ? newSecretId : null },
+        { name: newName.trim(), value: newValue, secret: false, secretId: null, own: newSecret, held: false },
       ],
     }));
     setNewName("");
     setNewValue("");
-    setNewSecretId(null);
+    setNewSecret(false);
   };
-  // A secret input with no secret chosen would give the script nothing.
-  const canAdd = newName.trim() !== "" && (newKind === "value" || newSecretId !== null);
+  // A secret with nothing typed would give the script nothing.
+  const canAdd = newName.trim() !== "" && (!newSecret || newValue !== "");
   const addOnEnter = (event: { key: string; preventDefault: () => void }) => {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -566,54 +575,34 @@ export function ScriptInstanceEditor({
       ) : null}
       <div className="flex flex-none flex-col gap-2 border-b border-wv-hairline px-4 py-[14px] sm:px-6">
         <div className="flex flex-wrap items-center gap-2">
-          <Segmented
-            label={t("next.postProcessing.newInputKind")}
-            value={newKind}
-            options={[
-              { value: "value", label: t("next.secrets.value") },
-              { value: "secret", label: t("next.postProcessing.secret") },
-            ]}
-            onChange={setNewKind}
-          />
           <TextField
             label={t("next.postProcessing.newInputName")}
             placeholder={t("next.postProcessing.newInputName")}
             value={newName}
-            className="w-[136px] max-w-full"
+            className="w-[150px] max-w-full"
             onChange={(next) => {
               setNewProblem(null);
               setNewName(next);
             }}
             onKeyDown={addOnEnter}
           />
-          {newKind === "value" ? (
-            <TextField
-              label={t("next.postProcessing.newInputValue")}
-              placeholder={t("next.secrets.value")}
-              value={newValue}
-              className="w-[150px] max-w-full"
-              onChange={setNewValue}
-              onKeyDown={addOnEnter}
+          <TextField
+            label={t("next.postProcessing.newInputValue")}
+            placeholder={t("next.secrets.value")}
+            type={newSecret ? "password" : "text"}
+            value={newValue}
+            className="w-[176px] max-w-full"
+            onChange={setNewValue}
+            onKeyDown={addOnEnter}
+          />
+          <label className="flex flex-none cursor-pointer items-center gap-2 text-[12.5px] text-wv-secondary">
+            <CheckBox
+              checked={newSecret}
+              onChange={setNewSecret}
+              label={t("next.postProcessing.newInputIsSecret")}
             />
-          ) : (
-            <Select
-              label={t("next.postProcessing.newInputSecretChoice")}
-              value={newSecretId ?? ""}
-              className="w-[150px] max-w-full"
-              options={[
-                { value: "", label: t("next.postProcessing.chooseSecret") },
-                ...secrets.map((entry) => ({ value: entry.id, label: entry.name })),
-                { value: CREATE_SECRET, label: t("next.postProcessing.createSecret") },
-              ]}
-              onChange={(next) => {
-                if (next === CREATE_SECRET) {
-                  setCreatingFor("new");
-                } else {
-                  setNewSecretId(next === "" ? null : next);
-                }
-              }}
-            />
-          )}
+            {t("next.postProcessing.secret")}
+          </label>
           <SecondaryButton icon="add" disabled={!canAdd} onClick={addInput}>
             {t("next.postProcessing.addInput")}
           </SecondaryButton>
@@ -797,11 +786,7 @@ export function ScriptInstanceEditor({
         target={{ mode: "new" }}
         onSaved={(secret) => {
           setCreated((current) => [...current, secret]);
-          if (creatingFor === "new") {
-            setNewSecretId(secret.id);
-          } else {
-            linkSecret(creatingFor, secret.id);
-          }
+          linkSecret(creatingFor, secret.id);
           setCreatingFor(null);
         }}
         onDismiss={() => setCreatingFor(null)}

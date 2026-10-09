@@ -1966,6 +1966,7 @@ const SCRIPT_INSTANCE_FIELDS = gql`
     inputs {
       name
       value
+      sealed
       secret {
         id
         name

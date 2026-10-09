@@ -170,9 +170,9 @@ test("a new instance is filled from the header, and a secret never is", () => {
   assert.equal(form.queueEvent, "NZB_ADDED");
   assert.equal(form.timeoutSeconds, 0);
   assert.deepEqual(form.inputs, [
-    { name: "Url", value: "http://127.0.0.1", secret: false, secretId: null },
-    { name: "Token", value: "", secret: true, secretId: null },
-    { name: "Verbose", value: "no", secret: false, secretId: null },
+    { name: "Url", value: "http://127.0.0.1", secret: false, secretId: null, own: false, held: false },
+    { name: "Token", value: "", secret: true, secretId: null, own: false, held: false },
+    { name: "Verbose", value: "no", secret: false, secretId: null, own: false, held: false },
   ]);
   // A secret slot with no secret chosen is not sent: there is nothing to give the script.
   assert.deepEqual(inputFromForm(form).inputs, [
@@ -214,8 +214,8 @@ test("a secret input opens on the secret it links and is sent as that link", () 
   });
   const form = formFromInstance(saved, NOTIFY);
   assert.deepEqual(form.inputs, [
-    { name: "Url", value: "http://127.0.0.1/hook", secret: false, secretId: null },
-    { name: "Token", value: "", secret: true, secretId: "s1" },
+    { name: "Url", value: "http://127.0.0.1/hook", secret: false, secretId: null, own: false, held: false },
+    { name: "Token", value: "", secret: true, secretId: "s1", own: false, held: false },
   ]);
   assert.equal(form.timeoutSeconds, 120);
 
@@ -237,7 +237,7 @@ test("clearing a secret input's link keeps the slot and leaves it out of what is
   });
   const form = formFromInstance(saved, NOTIFY);
   const cleared = { ...form, inputs: form.inputs.map((input) => (input.secret ? withLinkedSecret(input, null) : input)) };
-  assert.deepEqual(cleared.inputs[1], { name: "Token", value: "", secret: true, secretId: null });
+  assert.deepEqual(cleared.inputs[1], { name: "Token", value: "", secret: true, secretId: null, own: false, held: false });
   assert.deepEqual(inputFromForm(cleared).inputs, [{ name: "Url", value: "http://127.0.0.1/hook" }]);
   // Linking it again sends the link once more.
   const relinked = { ...cleared, inputs: cleared.inputs.map((input) => (input.secret ? withLinkedSecret(input, "s1") : input)) };
@@ -245,12 +245,41 @@ test("clearing a secret input's link keeps the slot and leaves it out of what is
 });
 
 test("ticking or clearing an input's secret box empties it either way", () => {
-  const plain = { name: "Password", value: "typed", secret: false, secretId: null };
+  const plain = { name: "Password", value: "typed", secret: false, secretId: null, own: false, held: false };
   // A value typed in clear never becomes a secret's value.
-  assert.deepEqual(withSecret(plain, true), { name: "Password", value: "", secret: true, secretId: null });
+  assert.deepEqual(withSecret(plain, true), { name: "Password", value: "", secret: true, secretId: null, own: false, held: false });
   // A header's hint is not a lock: a secret slot can be made plain again, and its link goes.
-  const linked = { name: "Password", value: "", secret: true, secretId: "s1" };
-  assert.deepEqual(withSecret(linked, false), { name: "Password", value: "", secret: false, secretId: null });
+  const linked = { name: "Password", value: "", secret: true, secretId: "s1", own: false, held: false };
+  assert.deepEqual(withSecret(linked, false), { name: "Password", value: "", secret: false, secretId: null, own: false, held: false });
+});
+
+test("a job's own secret is never read back: blank keeps it, a typed value replaces it", () => {
+  const saved = instance("one", {
+    inputs: [
+      { name: "Url", value: "http://127.0.0.1/hook", secret: null, sealed: false },
+      { name: "ApiKey", value: "", secret: null, sealed: true },
+    ],
+  });
+  const form = formFromInstance(saved, undefined);
+  assert.deepEqual(form.inputs[1], { name: "ApiKey", value: "", secret: false, secretId: null, own: true, held: true });
+  // Left as it opened, it is sent by name alone, which keeps what is saved.
+  assert.deepEqual(inputFromForm(form).inputs, [
+    { name: "Url", value: "http://127.0.0.1/hook" },
+    { name: "ApiKey", secret: true },
+  ]);
+  // The switch in a job's row sends the job back as it is, its own secret kept the same way.
+  assert.deepEqual(inputFromInstance(saved, { enabled: false }).inputs[1], { name: "ApiKey", secret: true });
+  // What is typed over it is what is sent.
+  const replaced = { ...form, inputs: form.inputs.map((input) => (input.own ? { ...input, value: "typed" } : input)) };
+  assert.deepEqual(inputFromForm(replaced).inputs[1], { name: "ApiKey", value: "typed", secret: true });
+  // One added in the editor is sent with what was typed, and one with nothing typed is not sent at all.
+  const fresh = { name: "Extra", value: "typed", secret: false, secretId: null, own: true, held: false };
+  assert.deepEqual(inputFromForm({ ...form, inputs: [fresh] }).inputs, [{ name: "Extra", value: "typed", secret: true }]);
+  assert.deepEqual(inputFromForm({ ...form, inputs: [{ ...fresh, value: "" }] }).inputs, []);
+  // Made a linked secret, it is the job's own no longer.
+  assert.deepEqual(withLinkedSecret(form.inputs[1], "s1"), {
+    name: "ApiKey", value: "", secret: true, secretId: "s1", own: false, held: false,
+  });
 });
 
 test("a secret the header declares and the instance was never given is offered", () => {
