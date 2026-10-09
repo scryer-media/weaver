@@ -1,5 +1,5 @@
 import { Fragment, type ReactNode } from "react";
-import { Link, NavLink } from "react-router";
+import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -348,59 +348,106 @@ export function CategoryListBlock({
   );
 }
 
+/** One row of the Settings rail. */
+export interface PanelListItem {
+  to: string;
+  label: string;
+  icon?: IconName;
+  tag?: ReactNode;
+  /** Panels nested under this row, which then opens the first of them. */
+  children?: readonly PanelListItem[];
+}
+
+const PANEL_ROW =
+  "-mx-[10px] flex h-[30px] items-center gap-[10px] px-[10px] text-[12.5px] hover:bg-wv-nav-hover";
+
+/** What a rail row draws inside its link: the active bar, the icon, the name, the tag. */
+function PanelRowContent({
+  item,
+  active = false,
+  open = false,
+  nested = false,
+}: {
+  item: PanelListItem;
+  /** This row's own panel is the one on screen. */
+  active?: boolean;
+  /** One of the panels nested under this row is the one on screen. */
+  open?: boolean;
+  nested?: boolean;
+}) {
+  return (
+    <>
+      <span
+        aria-hidden="true"
+        className={cn("h-[14px] w-[3px] flex-none", active && "bg-wv-accent")}
+      />
+      {/* As wide as an icon, so a nested row's icon starts under its parent's name. */}
+      {nested ? <span aria-hidden="true" className="w-[14px] flex-none" /> : null}
+      {item.icon === undefined ? null : (
+        <Icon
+          name={item.icon}
+          size={15}
+          className={cn(
+            "-ml-[1px] flex-none",
+            active ? "text-wv-accent" : open ? "text-wv-fg" : "text-wv-faint",
+          )}
+        />
+      )}
+      <span className="min-w-0 truncate">{item.label}</span>
+      {item.tag === undefined ? null : (
+        <span className="ml-auto flex-none font-wv-mono text-[10.5px] tracking-[0.1em] text-wv-faint uppercase">
+          {item.tag}
+        </span>
+      )}
+    </>
+  );
+}
+
 /**
  * The rail's contextual middle block on Settings: one row per panel, with the
- * active background bleeding to the rail's edge.
+ * active background bleeding to the rail's edge. A row with panels of its own
+ * lists them indented beneath it, and only a panel's own row is ever the
+ * active one.
  */
 export function PanelListBlock({
   eyebrow,
   items,
 }: {
   eyebrow: string;
-  items: readonly { to: string; label: string; icon?: IconName; tag?: ReactNode; group?: string }[];
+  items: readonly PanelListItem[];
 }) {
+  const { pathname } = useLocation();
+  const row = (item: PanelListItem, nested: boolean) => (
+    <NavLink
+      key={item.to}
+      to={item.to}
+      end
+      className={({ isActive }) =>
+        cn(PANEL_ROW, isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg")
+      }
+    >
+      {({ isActive }) => <PanelRowContent item={item} active={isActive} nested={nested} />}
+    </NavLink>
+  );
   return (
     <RailBlock eyebrow={eyebrow} position="middle" className="gap-0">
       <nav aria-label={eyebrow} className="flex flex-col">
-        {items.map((item,index) => (
-          <Fragment key={item.to}>
-          {item.group && items[index-1]?.group!==item.group && <div className="pt-4 pb-2 font-wv-mono text-[10px] uppercase tracking-widest text-wv-faint">{item.group}</div>}
-          <NavLink
-            key={item.to}
-            to={item.to}
-            end
-            className={({ isActive }) =>
-              cn(
-                "-mx-[10px] flex h-[30px] items-center gap-[10px] px-[10px] text-[12.5px] hover:bg-wv-nav-hover",
-                item.group && "pl-5",
-                isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
-              )
-            }
-          >
-            {({ isActive }) => (
-              <>
-                <span
-                  aria-hidden="true"
-                  className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
-                />
-                {item.icon === undefined ? null : (
-                  <Icon
-                    name={item.icon}
-                    size={15}
-                    className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
-                  />
-                )}
-                <span className="min-w-0 truncate">{item.label}</span>
-                {item.tag === undefined ? null : (
-                  <span className="ml-auto flex-none font-wv-mono text-[10.5px] tracking-[0.1em] text-wv-faint uppercase">
-                    {item.tag}
-                  </span>
-                )}
-              </>
-            )}
-          </NavLink>
-          </Fragment>
-        ))}
+        {items.map((item) => {
+          if (item.children === undefined) {
+            return row(item, false);
+          }
+          const open = item.children.some((child) => child.to === pathname);
+          return (
+            <Fragment key={`group:${item.to}`}>
+              <Link to={item.to} className={cn(PANEL_ROW, open ? "text-wv-strong" : "text-wv-fg")}>
+                <PanelRowContent item={item} open={open} />
+              </Link>
+              <div role="group" aria-label={item.label} className="flex flex-col">
+                {item.children.map((child) => row(child, true))}
+              </div>
+            </Fragment>
+          );
+        })}
       </nav>
     </RailBlock>
   );
