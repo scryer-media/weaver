@@ -29,9 +29,15 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(10);
 /// A user cancellation must not inherit an arbitrarily long script shutdown grace.
 const MAX_USER_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
-/// Per-script output retained on the job. Anything beyond this keeps the tail.
-pub const MAX_SCRIPT_OUTPUT_BYTES: u64 = 1024 * 1024;
-pub const MAX_LOGICAL_LINE_BYTES: usize = 64 * 1024;
+/// The most of a run's output that is kept: the newest bytes, stdout and
+/// stderr interleaved as they arrived.
+pub const MAX_SCRIPT_OUTPUT_BYTES: u64 = 32 * 1024;
+/// How much of a stream is read at once.
+const READ_CHUNK_BYTES: usize = 8 * 1024;
+/// The longest line that is read for directives. Past this a line is only
+/// output, and only its tail is kept.
+pub const MAX_LOGICAL_LINE_BYTES: usize = MAX_SCRIPT_OUTPUT_BYTES as usize + READ_CHUNK_BYTES;
+const REDACTED: &[u8] = b"[REDACTED]";
 
 const SUPERVISOR_ARG: &str = "__post-processing-supervisor";
 const MAX_SUPERVISOR_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
@@ -165,6 +171,8 @@ pub struct ScriptExecutionResult {
     pub exit_code: Option<i32>,
     /// Captured stdout/stderr, already truncated to the tail budget and redacted.
     pub output: Vec<u8>,
+    /// Every byte the script wrote, including what `output` no longer holds.
+    pub output_bytes: u64,
     pub output_truncated: bool,
     pub error_message: Option<String>,
 }
@@ -213,16 +221,15 @@ pub async fn execute_script(
     request: ScriptExecutionRequest,
     cancellation: Option<watch::Receiver<bool>>,
 ) -> Result<ScriptExecutionResult, RunnerError> {
-    execute_script_observed(request, cancellation, None, MAX_SCRIPT_OUTPUT_BYTES).await
+    execute_script_observed(request, cancellation, None).await
 }
 
 pub async fn execute_script_observed(
     request: ScriptExecutionRequest,
     cancellation: Option<watch::Receiver<bool>>,
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
-    output_ceiling: u64,
 ) -> Result<ScriptExecutionResult, RunnerError> {
-    execute_script_tapped(request, cancellation, events, output_ceiling, None).await
+    execute_script_tapped(request, cancellation, events, None).await
 }
 
 /// [`execute_script_observed`], with each captured line also handed to `tap`
@@ -231,7 +238,6 @@ pub async fn execute_script_tapped(
     request: ScriptExecutionRequest,
     cancellation: Option<watch::Receiver<bool>>,
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
-    output_ceiling: u64,
     tap: Option<OutputTap>,
 ) -> Result<ScriptExecutionResult, RunnerError> {
     let mut secrets = request
@@ -281,7 +287,6 @@ pub async fn execute_script_tapped(
         event: Some(ScriptEventLabel::PostProcessing),
         events,
         tap,
-        ceiling: output_ceiling.clamp(MAX_LOGICAL_LINE_BYTES as u64, 8 * 1024 * 1024),
     };
     tracing::info!(
         script = %display_name,
@@ -293,7 +298,16 @@ pub async fn execute_script_tapped(
     let started = Instant::now();
     let mut result = execute_supervised(prepared, request.timeout, grace, cancellation).await;
     if let Ok(result) = result.as_mut() {
-        result.output = redact_bytes(&result.output, &secrets);
+        // Every line was redacted as it was captured; this pass only catches a
+        // secret written across lines, and must not grow the output past the
+        // ring.
+        let redacted = redact_bytes(&result.output, &secrets);
+        if redacted != result.output {
+            let mut ring = BoundedOutput::default();
+            ring.push(redacted);
+            result.output_truncated |= ring.truncated;
+            result.output = ring.into_bytes();
+        }
         if let Some(message) = &mut result.error_message {
             *message = redact_string(message, &secrets);
         }
@@ -333,7 +347,6 @@ pub struct ExecutionSpec {
     pub facts: CompatibilityFacts,
     pub interpreters: InterpreterConfig,
     pub supervisor_executable: Option<PathBuf>,
-    pub output_ceiling: u64,
 }
 
 pub async fn execute_spec(
@@ -409,9 +422,6 @@ pub async fn execute_spec_tapped(
             event: Some(spec.kind.clone()),
             events,
             tap,
-            ceiling: spec
-                .output_ceiling
-                .clamp(MAX_LOGICAL_LINE_BYTES as u64, 8 * 1024 * 1024),
         },
     };
     tracing::info!(run_id = %spec.run_id, event = %spec.kind, "starting script");
@@ -433,25 +443,12 @@ pub async fn execute_spec_tapped(
 /// with the commands the script issued already taken out.
 pub type OutputTap = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct CapturePolicy {
     secrets: Arc<Vec<Vec<u8>>>,
     event: Option<ScriptEventLabel>,
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
     tap: Option<OutputTap>,
-    ceiling: u64,
-}
-
-impl Default for CapturePolicy {
-    fn default() -> Self {
-        Self {
-            secrets: Arc::new(Vec::new()),
-            event: None,
-            events: None,
-            tap: None,
-            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
-        }
-    }
 }
 
 struct PreparedExecution {
@@ -513,11 +510,12 @@ impl OutputInjector {
         if let Some(tap) = &target.tap {
             tap(&line);
         }
-        target
+        let mut output = target
             .output
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(line);
+            .unwrap_or_else(|error| error.into_inner());
+        output.written = output.written.saturating_add(line.len() as u64);
+        output.push(line);
         true
     }
 }
@@ -1094,6 +1092,27 @@ fn sensitive_url_query_key(key: &str) -> bool {
 }
 
 fn redact_bytes(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
+    let patterns = redaction_patterns(secrets);
+    let mut output = input.to_vec();
+    for secret in patterns {
+        let mut cursor = 0;
+        while cursor + secret.len() <= output.len() {
+            let Some(offset) = output[cursor..]
+                .windows(secret.len())
+                .position(|candidate| candidate == secret)
+            else {
+                break;
+            };
+            let start = cursor + offset;
+            output.splice(start..start + secret.len(), REDACTED.iter().copied());
+            cursor = start + REDACTED.len();
+        }
+    }
+    output
+}
+
+/// What redaction looks for, longest first.
+fn redaction_patterns(secrets: &[Vec<u8>]) -> Vec<&[u8]> {
     // Capture emits complete lines independently. Multiline credentials must
     // therefore also redact each nonempty line before logs or directives leave
     // the capture task. Prefer longer matches when secret values overlap.
@@ -1110,22 +1129,7 @@ fn redact_bytes(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
         .collect();
     patterns.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
     patterns.dedup();
-    let mut output = input.to_vec();
-    for secret in patterns {
-        let mut cursor = 0;
-        while cursor + secret.len() <= output.len() {
-            let Some(offset) = output[cursor..]
-                .windows(secret.len())
-                .position(|candidate| candidate == secret)
-            else {
-                break;
-            };
-            let start = cursor + offset;
-            output.splice(start..start + secret.len(), b"[REDACTED]".iter().copied());
-            cursor = start + b"[REDACTED]".len();
-        }
-    }
-    output
+    patterns
 }
 
 fn redact_string(input: &str, secrets: &[Vec<u8>]) -> String {
@@ -1203,10 +1207,7 @@ async fn execute_supervised(
     let mut stdin = child.stdin.take().ok_or_else(|| {
         RunnerError::SupervisorProtocol("supervisor stdin was unavailable".into())
     })?;
-    let output = Arc::new(Mutex::new(BoundedOutput {
-        ceiling: prepared.capture.ceiling,
-        ..Default::default()
-    }));
+    let output = Arc::new(Mutex::new(BoundedOutput::default()));
     // Bound before the script is launched, so that nothing it asks for can
     // arrive first, and let go of before the output is taken back below.
     let injected = prepared.injector.bind(&output, &prepared.capture);
@@ -1306,10 +1307,12 @@ async fn execute_supervised(
         );
     }
     let output_truncated = captured.truncated;
+    let output_bytes = captured.written;
     Ok(ScriptExecutionResult {
         disposition,
         exit_code,
         output: captured.into_bytes(),
+        output_bytes,
         output_truncated,
         error_message: match disposition {
             ExecutionDisposition::TimedOut => Some("post-processing script timed out".into()),
@@ -1323,37 +1326,79 @@ async fn execute_supervised(
     })
 }
 
+/// The newest [`MAX_SCRIPT_OUTPUT_BYTES`] of a run's output. Older bytes are
+/// dropped as newer ones arrive, mid-line if need be, so the ring never holds
+/// more than it hands over.
+#[derive(Default)]
 struct BoundedOutput {
-    lines: VecDeque<Vec<u8>>,
-    bytes: u64,
+    ring: VecDeque<u8>,
+    /// Every byte the script wrote, kept or not.
+    written: u64,
+    /// Set exactly when a byte of output was dropped.
     truncated: bool,
-    ceiling: u64,
-}
-
-impl Default for BoundedOutput {
-    fn default() -> Self {
-        Self {
-            lines: VecDeque::new(),
-            bytes: 0,
-            truncated: false,
-            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
-        }
-    }
+    /// Bytes the capture tasks hold as unfinished lines, which will displace
+    /// the oldest kept bytes once they arrive.
+    pending: usize,
+    /// The most the ring and the unfinished lines held at once.
+    #[cfg(test)]
+    peak: usize,
 }
 
 impl BoundedOutput {
-    fn push(&mut self, line: Vec<u8>) {
-        self.bytes = self.bytes.saturating_add(line.len() as u64);
-        self.lines.push_back(line);
-        while self.bytes > self.ceiling && self.lines.len() > 1 {
-            let removed = self.lines.pop_front().expect("non-empty");
-            self.bytes = self.bytes.saturating_sub(removed.len() as u64);
+    const CAPACITY: usize = MAX_SCRIPT_OUTPUT_BYTES as usize;
+
+    fn push(&mut self, bytes: Vec<u8>) {
+        let mut bytes = bytes.as_slice();
+        if bytes.len() > Self::CAPACITY {
+            bytes = &bytes[bytes.len() - Self::CAPACITY..];
+            self.truncated = true;
+        }
+        let over = (self.ring.len() + bytes.len()).saturating_sub(Self::CAPACITY);
+        self.drop_oldest(over);
+        self.ring.extend(bytes);
+        self.observe();
+    }
+
+    fn drop_oldest(&mut self, count: usize) {
+        let count = count.min(self.ring.len());
+        if count > 0 {
+            self.ring.drain(..count);
             self.truncated = true;
         }
     }
 
+    /// Record how much a capture task now holds as an unfinished line, and
+    /// make room for it: together they stay within the ring's capacity and
+    /// one read. Only a line longer than a read can drop kept bytes early.
+    fn hold_pending(&mut self, before: usize, now: usize) {
+        self.pending = self.pending.saturating_sub(before).saturating_add(now);
+        let over =
+            (self.ring.len() + self.pending).saturating_sub(Self::CAPACITY + READ_CHUNK_BYTES);
+        self.drop_oldest(over);
+        self.observe();
+    }
+
+    #[cfg(test)]
+    fn observe(&mut self) {
+        self.peak = self.peak.max(self.ring.len() + self.pending);
+    }
+
+    #[cfg(not(test))]
+    fn observe(&mut self) {}
+
+    /// The kept bytes. When the oldest were dropped, a character the cut went
+    /// through is dropped whole rather than handed over in part.
     fn into_bytes(self) -> Vec<u8> {
-        self.lines.into_iter().flatten().collect()
+        let mut bytes = Vec::from(self.ring);
+        if self.truncated {
+            let partial = bytes
+                .iter()
+                .take(3)
+                .take_while(|byte| **byte & 0b1100_0000 == 0b1000_0000)
+                .count();
+            bytes.drain(..partial);
+        }
+        bytes
     }
 }
 
@@ -1383,40 +1428,124 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     output: Arc<Mutex<BoundedOutput>>,
     policy: CapturePolicy,
 ) -> Result<(), io::Error> {
+    // Nothing here holds more than one unfinished line, and a line is held
+    // only up to the ring's capacity and one read: past that its oldest bytes
+    // are dropped as newer ones arrive, before the line is complete.
     let mut pending = Vec::new();
+    let mut held = 0;
     let mut oversized = false;
-    let mut buffer = [0_u8; 8192];
+    let mut head_lost = false;
+    let mut buffer = [0_u8; READ_CHUNK_BYTES];
+    let hold = |held: &mut usize, now: usize| {
+        if *held == now {
+            return;
+        }
+        output
+            .lock()
+            .expect("output collector poisoned")
+            .hold_pending(std::mem::replace(held, now), now);
+    };
     loop {
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
             break;
         }
+        {
+            let mut output = output.lock().expect("output collector poisoned");
+            output.written = output.written.saturating_add(count as u64);
+        }
         for part in buffer[..count].split_inclusive(|byte| *byte == b'\n') {
-            if !oversized {
-                if pending.len() + part.len() > MAX_LOGICAL_LINE_BYTES {
-                    // Discard a fragmented logical line in full. This also prevents
-                    // secrets spanning a chunk boundary from escaping redaction.
-                    pending.clear();
-                    oversized = true;
-                    let mut output = output.lock().expect("output collector poisoned");
-                    output.truncated = true;
-                    output.push(b"[oversized script line omitted]\n".to_vec());
-                } else {
-                    pending.extend_from_slice(part);
-                }
+            let overflow = (pending.len() + part.len()).saturating_sub(MAX_LOGICAL_LINE_BYTES);
+            if overflow > 0 {
+                // A part is never longer than a read, so it always fits.
+                pending.drain(..overflow);
+                oversized = true;
+                head_lost = true;
             }
+            pending.extend_from_slice(part);
+            hold(&mut held, pending.len());
             if part.last() == Some(&b'\n') {
-                if !oversized {
-                    capture_line(std::mem::take(&mut pending), &output, &policy).await;
+                let line = std::mem::take(&mut pending);
+                hold(&mut held, 0);
+                if std::mem::take(&mut oversized) {
+                    capture_oversized_line(&line, std::mem::take(&mut head_lost), &output, &policy);
+                } else {
+                    capture_line(line, &output, &policy).await;
                 }
-                oversized = false;
             }
         }
     }
-    if !pending.is_empty() {
+    hold(&mut held, 0);
+    if oversized {
+        capture_oversized_line(&pending, head_lost, &output, &policy);
+    } else if !pending.is_empty() {
         capture_line(pending, &output, &policy).await;
     }
     Ok(())
+}
+
+/// Keep the tail of a line too long to read for directives. Its head is gone,
+/// so it is never taken as a directive, only kept as output.
+fn capture_oversized_line(
+    line: &[u8],
+    head_lost: bool,
+    output: &Arc<Mutex<BoundedOutput>>,
+    policy: &CapturePolicy,
+) {
+    let tail = redacted_tail(line, head_lost, BoundedOutput::CAPACITY, &policy.secrets);
+    if let Some(tap) = &policy.tap {
+        tap(&tail);
+    }
+    let mut output = output.lock().expect("output collector poisoned");
+    output.truncated = true;
+    output.push(tail);
+}
+
+/// The last `keep` bytes of `line`, redacted. A secret the cut would go
+/// through is replaced whole, so no part of it is kept. When the line's head
+/// was already dropped (`head_lost`), a secret may have begun before what is
+/// held: if what is held begins with the end of a secret that reaches past the
+/// cut, that end is treated as the secret, at the cost of sometimes replacing
+/// a few bytes that only looked like one.
+fn redacted_tail(line: &[u8], head_lost: bool, keep: usize, secrets: &[Vec<u8>]) -> Vec<u8> {
+    let patterns = redaction_patterns(secrets);
+    let mut cut = line.len().saturating_sub(keep);
+    let mut straddled = false;
+    loop {
+        let begun_before = patterns.iter().filter(|_| head_lost).filter_map(|secret| {
+            (1..secret.len())
+                .map(|start| &secret[start..])
+                .find(|rest| rest.len() > cut && line.starts_with(rest))
+                .map(<[u8]>::len)
+        });
+        let reach = patterns
+            .iter()
+            .filter_map(|secret| {
+                let first = cut.saturating_sub(secret.len() - 1);
+                let last = (cut + secret.len() - 1).min(line.len());
+                line.get(first..last)?
+                    .windows(secret.len())
+                    .rposition(|candidate| candidate == *secret)
+                    .map(|offset| first + offset + secret.len())
+                    .filter(|end| *end > cut)
+            })
+            .chain(begun_before)
+            .max();
+        match reach {
+            Some(end) => {
+                cut = end;
+                straddled = true;
+            }
+            None => break,
+        }
+    }
+    let mut tail = if straddled {
+        REDACTED.to_vec()
+    } else {
+        Vec::new()
+    };
+    tail.extend(redact_bytes(&line[cut..], secrets));
+    tail
 }
 
 async fn capture_line(line: Vec<u8>, output: &Arc<Mutex<BoundedOutput>>, policy: &CapturePolicy) {
@@ -1704,7 +1833,6 @@ mod capture_tests {
             event: None,
             events: Some(sender),
             tap: None,
-            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let input = b"ordinary private-value\r\n[INFO] private-value\n[NZB] NZBPR_Token=private-value\nunterminated private-value";
         capture_stream(input.as_slice(), output.clone(), policy)
@@ -1735,7 +1863,6 @@ mod capture_tests {
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
             tap: None,
-            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let lines = format!(
             "[INFO] {url}\n[WARNING] password123 token123 awssecret123 googsecret123\n[INFO] {aws_url}\n[INFO] {google_url}\n"
@@ -1822,7 +1949,6 @@ mod capture_tests {
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
             tap: None,
-            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let input = b"secret-alpha\r\n\r\nsecret-beta\n[INFO] secret-alpha\n[NZB] NZBPR_Token=secret-beta\n";
         capture_stream(input.as_slice(), output.clone(), policy)
@@ -1851,7 +1977,7 @@ mod capture_tests {
     }
 
     #[tokio::test]
-    async fn capture_redacts_before_directives_and_omits_oversized_lines() {
+    async fn capture_redacts_before_directives_and_keeps_only_the_tail_of_oversized_lines() {
         let output = Arc::new(Mutex::new(BoundedOutput::default()));
         let (sender, mut receiver) = mpsc::channel(8);
         let policy = CapturePolicy {
@@ -1859,7 +1985,6 @@ mod capture_tests {
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
             tap: None,
-            ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let mut input = b"[NZB] NZBPR_Token=sensitive-value\n[INFO] sensitive-value\r\n".to_vec();
         input.extend_from_slice(b"[NZB] NZBPR_TooLong=");
@@ -1896,6 +2021,239 @@ mod capture_tests {
         assert!(!text.contains("sensitive-value"));
         assert!(!text.contains("[INFO]"));
         assert!(!text.contains("TooLong"));
+        assert!(
+            text.ends_with("xxxx\n"),
+            "the line's tail is kept as output"
+        );
+    }
+
+    /// Run `input` through capture without directive reading.
+    async fn capture(input: &[u8], secrets: Vec<Vec<u8>>) -> (Vec<u8>, bool, u64) {
+        let output = Arc::new(Mutex::new(BoundedOutput::default()));
+        let policy = CapturePolicy {
+            secrets: Arc::new(secrets),
+            ..Default::default()
+        };
+        capture_stream(input, output.clone(), policy).await.unwrap();
+        let captured = Arc::try_unwrap(output).ok().unwrap().into_inner().unwrap();
+        let (truncated, written) = (captured.truncated, captured.written);
+        (captured.into_bytes(), truncated, written)
+    }
+
+    const CAP: usize = MAX_SCRIPT_OUTPUT_BYTES as usize;
+
+    fn tail(input: &[u8]) -> &[u8] {
+        &input[input.len().saturating_sub(CAP)..]
+    }
+
+    #[tokio::test]
+    async fn many_short_lines_keep_exactly_the_last_32_kib() {
+        let input = (0..10_000)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect::<Vec<_>>();
+        let (kept, truncated, written) = capture(&input, Vec::new()).await;
+        assert!(truncated);
+        assert_eq!(kept.len(), CAP);
+        assert_eq!(kept, tail(&input));
+        assert_eq!(written, input.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_line_larger_than_the_ring_keeps_its_last_32_kib() {
+        // Larger than the ring but still read whole for directives.
+        let mut input = b"head-marker ".to_vec();
+        input.extend((0..36 * 1024).map(|i| b'a' + (i % 26) as u8));
+        input.push(b'\n');
+        assert!(input.len() <= MAX_LOGICAL_LINE_BYTES);
+        let (kept, truncated, written) = capture(&input, Vec::new()).await;
+        assert!(truncated);
+        assert_eq!(kept, tail(&input));
+        assert_eq!(written, input.len() as u64);
+
+        // Past the directive limit, so held only as its tail while it arrives.
+        let mut input = b"head-marker ".to_vec();
+        input.extend((0..300 * 1024).map(|i| b'a' + (i % 26) as u8));
+        input.extend_from_slice(b" end\n");
+        let (kept, truncated, written) = capture(&input, Vec::new()).await;
+        assert!(truncated);
+        assert_eq!(kept, tail(&input));
+        assert_eq!(written, input.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_a_trailing_newline_keeps_its_tail() {
+        let mut input = (0..5_000)
+            .flat_map(|i| format!("row {i}\n").into_bytes())
+            .collect::<Vec<_>>();
+        input.extend_from_slice(b"unterminated last words");
+        let (kept, truncated, _) = capture(&input, Vec::new()).await;
+        assert!(truncated);
+        assert_eq!(kept, tail(&input));
+        assert!(kept.ends_with(b"unterminated last words"));
+
+        let mut input = b"x".repeat(100 * 1024);
+        input.extend_from_slice(b"no newline at all");
+        let (kept, truncated, _) = capture(&input, Vec::new()).await;
+        assert!(truncated);
+        assert_eq!(kept, tail(&input));
+    }
+
+    #[tokio::test]
+    async fn a_character_straddling_the_cut_is_dropped_whole() {
+        // A two- and a three-byte character, each with its second byte the
+        // first of the last 32 KiB.
+        for prefix in ["\u{e9}".as_bytes().to_vec(), "\u{20ac}".as_bytes().to_vec()] {
+            let mut input = b"older\n".to_vec();
+            input.extend_from_slice(&prefix);
+            input.extend(std::iter::repeat_n(b'z', CAP - prefix.len()));
+            input.push(b'\n');
+            let (kept, truncated, _) = capture(&input, Vec::new()).await;
+            assert!(truncated);
+            let text = String::from_utf8(kept.clone()).expect("the cut is on a boundary");
+            assert!(!text.contains('\u{fffd}'));
+            assert_eq!(kept, &input[input.len() - CAP + prefix.len() - 1..]);
+            assert!(kept.len() < CAP);
+        }
+
+        // The same holds for a line held only as its tail.
+        let mut input = "\u{20ac}".repeat(40 * 1024).into_bytes();
+        input.push(b'\n');
+        let (kept, truncated, _) = capture(&input, Vec::new()).await;
+        assert!(truncated);
+        let text = String::from_utf8(kept.clone()).expect("the cut is on a boundary");
+        assert!(text.chars().all(|c| c == '\u{20ac}' || c == '\n'));
+        assert!(tail(&input).ends_with(&kept));
+    }
+
+    #[tokio::test]
+    async fn output_of_exactly_32_kib_is_kept_whole() {
+        let mut input = b"q".repeat(CAP - 1);
+        input.push(b'\n');
+        let (kept, truncated, written) = capture(&input, Vec::new()).await;
+        assert!(!truncated, "nothing was dropped");
+        assert_eq!(kept, input);
+        assert_eq!(written, CAP as u64);
+
+        input.push(b'!');
+        let (kept, truncated, _) = capture(&input, Vec::new()).await;
+        assert!(truncated, "one byte was dropped");
+        assert_eq!(kept, &input[1..]);
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_share_one_ring_in_arrival_order() {
+        let output = Arc::new(Mutex::new(BoundedOutput::default()));
+        // stdout, stderr, stdout: each stream's capture writes the one ring.
+        for text in ["first\n", "second\n", "third\n"] {
+            capture_stream(text.as_bytes(), output.clone(), CapturePolicy::default())
+                .await
+                .unwrap();
+        }
+        let captured = Arc::try_unwrap(output).ok().unwrap().into_inner().unwrap();
+        assert_eq!(captured.into_bytes(), b"first\nsecond\nthird\n");
+    }
+
+    #[tokio::test]
+    async fn a_secret_cut_by_the_tail_of_an_oversized_line_is_not_kept_in_part() {
+        let secret = b"very-secret-token-value".to_vec();
+        // Place the secret so the last 32 KiB begins in its middle.
+        let mut input = b"y".repeat(100 * 1024);
+        input.extend_from_slice(&secret);
+        input.extend(std::iter::repeat_n(b'y', CAP - 5));
+        input.push(b'\n');
+        let (kept, truncated, _) = capture(&input, vec![secret.clone()]).await;
+        assert!(truncated);
+        assert_eq!(kept.len(), CAP);
+        // Cut at the same place without redaction, the kept bytes would begin
+        // with the secret's last four.
+        assert!(tail(&input).starts_with(b"alue"));
+        let text = String::from_utf8(kept).unwrap();
+        assert!(!text.contains("alue"), "{}", &text[..16]);
+        assert!(text.ends_with("yyy\n"));
+    }
+
+    /// Feed `input` to capture through a pipe and return the most the ring
+    /// and the unfinished line ever held at once.
+    async fn peak_held(input: Vec<u8>) -> (usize, Vec<u8>) {
+        let output = Arc::new(Mutex::new(BoundedOutput::default()));
+        let (mut writer, reader) = tokio::io::duplex(READ_CHUNK_BYTES);
+        let feed = tokio::spawn(async move {
+            writer.write_all(&input).await.unwrap();
+            input
+        });
+        capture_stream(reader, output.clone(), CapturePolicy::default())
+            .await
+            .unwrap();
+        let input = feed.await.unwrap();
+        let captured = Arc::try_unwrap(output).ok().unwrap().into_inner().unwrap();
+        assert_eq!(captured.pending, 0, "nothing is left unaccounted");
+        assert_eq!(captured.written, input.len() as u64);
+        let peak = captured.peak;
+        assert_eq!(captured.into_bytes(), tail(&input));
+        (peak, input)
+    }
+
+    #[tokio::test]
+    async fn megabytes_of_output_never_hold_more_than_the_ring_and_one_read() {
+        let bound = CAP + READ_CHUNK_BYTES;
+        let lines = (0..400_000)
+            .flat_map(|i| format!("progress {i} of many\n").into_bytes())
+            .collect::<Vec<_>>();
+        assert!(lines.len() > 4 * 1024 * 1024);
+        let (peak, _) = peak_held(lines).await;
+        assert!(peak <= bound, "held {peak} bytes");
+        assert!(peak >= CAP, "the ring was full");
+
+        let unbroken = (0..6 * 1024 * 1024)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect::<Vec<_>>();
+        let (peak, _) = peak_held(unbroken).await;
+        assert!(peak <= bound, "held {peak} bytes");
+
+        // Long lines that each need more than one read, then short ones.
+        let mut mixed = Vec::new();
+        for i in 0..200 {
+            mixed.extend(std::iter::repeat_n(b'm', 20_000 + i * 97));
+            mixed.push(b'\n');
+            mixed.extend_from_slice(b"short\n");
+        }
+        let (peak, _) = peak_held(mixed).await;
+        assert!(peak <= bound, "held {peak} bytes");
+    }
+
+    #[tokio::test]
+    async fn a_secret_longer_than_a_read_cut_by_the_tail_is_not_kept_in_part() {
+        let secret = (0..12 * 1024)
+            .map(|i| b'A' + (i % 26) as u8)
+            .collect::<Vec<_>>();
+        // Its first bytes fall before what the capture still holds, and its
+        // last 100 are the first of the last 32 KiB.
+        let mut input = b"z".repeat(100 * 1024);
+        input.extend_from_slice(&secret);
+        input.extend(std::iter::repeat_n(b'z', CAP - 101));
+        input.push(b'\n');
+        assert_eq!(&tail(&input)[..100], &secret[secret.len() - 100..]);
+        let (kept, truncated, _) = capture(&input, vec![secret.clone()]).await;
+        assert!(truncated);
+        assert!(kept.len() <= CAP);
+        assert!(kept.starts_with(REDACTED));
+        assert!(
+            kept[REDACTED.len()..]
+                .iter()
+                .all(|byte| !byte.is_ascii_uppercase()),
+            "no byte of the secret is kept"
+        );
+    }
+
+    #[test]
+    fn the_ring_never_holds_more_than_it_hands_over() {
+        let mut ring = BoundedOutput::default();
+        for size in [1, CAP - 1, 7, CAP + 9, 3] {
+            ring.push(vec![b'k'; size]);
+            assert!(ring.ring.len() <= CAP);
+        }
+        assert!(ring.truncated);
+        assert_eq!(ring.into_bytes().len(), CAP);
     }
 }
 

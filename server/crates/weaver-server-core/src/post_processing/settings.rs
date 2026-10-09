@@ -182,9 +182,14 @@ impl Database {
         settings: &PostProcessingSettings,
     ) -> Result<(), StateError> {
         let settings = settings.clone().normalized().map_err(state_err)?;
+        let previous = self.post_processing_settings()?;
         let result = self.set_setting(SETTINGS_KEY, &to_json(&settings)?);
         self.invalidate_queue_script_admission();
-        result
+        result?;
+        if retention_lowered(&previous, &settings) {
+            self.request_script_output_trim();
+        }
+        Ok(())
     }
 
     /// Save a full settings update while optionally retaining the extension
@@ -229,12 +234,13 @@ impl Database {
                                 )
                             })?
                             .text("value")?;
+                        let stored = from_json::<PostProcessingSettings>(&stored)?;
                         let mut settings = settings;
                         if preserve_extensions {
-                            settings.unacceptable_extensions =
-                                from_json::<PostProcessingSettings>(&stored)?.unacceptable_extensions;
+                            settings.unacceptable_extensions = stored.unacceptable_extensions.clone();
                         }
                         let settings = settings.normalized().map_err(state_err)?;
+                        let lowered = retention_lowered(&stored, &settings);
                         tx.execute(
                             "INSERT INTO settings (key, value) VALUES ({}, {})\n                             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                             &[
@@ -243,14 +249,18 @@ impl Database {
                             ],
                         )
                         .await?;
-                        Ok(settings)
+                        Ok((settings, lowered))
                     })
                 },
             )
             .await
         });
         self.invalidate_queue_script_admission();
-        result
+        let (settings, lowered) = result?;
+        if lowered {
+            self.request_script_output_trim();
+        }
+        Ok(settings)
     }
 
     /// Stamp a job's script results and rollup summary onto whichever of its rows exist.
@@ -376,6 +386,14 @@ impl Database {
     }
 }
 
+/// Whether `next` keeps fewer runs than `previous` did. Raising a limit
+/// deletes nothing, so it needs no trim.
+fn retention_lowered(previous: &PostProcessingSettings, next: &PostProcessingSettings) -> bool {
+    let (previous, next) = (&previous.event_scripts, &next.event_scripts);
+    next.script_output_runs_per_job < previous.script_output_runs_per_job
+        || next.script_output_failed_runs_per_job < previous.script_output_failed_runs_per_job
+}
+
 fn job_id_i64(job_id: u64) -> Result<i64, StateError> {
     i64::try_from(job_id).map_err(|_| StateError::Database("job id is out of range".into()))
 }
@@ -390,4 +408,43 @@ fn from_json<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T, StateError>
 
 fn state_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_settings_from_earlier_shapes_still_load() {
+        let db = Database::open_in_memory().unwrap();
+        // As 0.14 stored it: no event-script fields at all.
+        db.set_setting(
+            SETTINGS_KEY,
+            r#"{"executionEnabled":true,"concurrency":2,"terminationGraceSeconds":10,"pythonInterpreter":null,"powershellInterpreter":null,"batchInterpreter":null,"unacceptableExtensions":["exe"]}"#,
+        )
+        .unwrap();
+        let settings = db.post_processing_settings().unwrap();
+        assert!(settings.execution_enabled);
+        assert_eq!(settings.concurrency, 2);
+        assert_eq!(settings.event_scripts.script_output_runs_per_job, 32);
+        assert_eq!(settings.event_scripts.script_output_failed_runs_per_job, 8);
+
+        // With output settings that no longer exist: they are ignored, and
+        // the next save leaves them out.
+        db.set_setting(
+            SETTINGS_KEY,
+            r#"{"eventScriptConcurrency":2,"eventScriptTimeoutSeconds":300,"fileDownloadedEventInterval":0,"scriptOutputCeilingBytes":1048576,"scriptOutputRunsPerJob":5,"scriptOutputRingBytes":67108864,"scriptOutputRunCapBytes":2097152,"executionEnabled":false,"concurrency":4,"terminationGraceSeconds":10,"pythonInterpreter":null,"powershellInterpreter":null,"batchInterpreter":null,"unacceptableExtensions":[],"globalScriptsRun":"always"}"#,
+        )
+        .unwrap();
+        let settings = db.post_processing_settings().unwrap();
+        assert_eq!(settings.event_scripts.event_script_concurrency, 2);
+        assert_eq!(settings.event_scripts.script_output_runs_per_job, 5);
+        assert_eq!(settings.event_scripts.script_output_failed_runs_per_job, 8);
+        db.save_post_processing_settings(&settings).unwrap();
+        let stored = db.get_setting(SETTINGS_KEY).unwrap().unwrap();
+        assert!(!stored.contains("scriptOutputCeilingBytes"));
+        assert!(!stored.contains("scriptOutputRingBytes"));
+        assert!(!stored.contains("scriptOutputRunCapBytes"));
+        assert!(stored.contains(r#""scriptOutputFailedRunsPerJob":8"#));
+    }
 }

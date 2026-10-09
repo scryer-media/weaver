@@ -401,6 +401,69 @@ async fn a_running_test_shows_its_output_and_ends_when_cancelled() {
     assert!(!fixture.db.cancel_script_test("no-such-run"));
 }
 
+/// A shell loop printing `lines` lines of 99 characters and a newline.
+fn printing(lines: usize) -> String {
+    format!(
+        "i=0\nwhile [ $i -lt {lines} ]; do printf '%099d\\n' $i; i=$((i + 1)); done\nprintf 'last line\\n'\n"
+    )
+}
+
+#[tokio::test]
+async fn a_test_says_whether_it_printed_more_than_the_log_keeps() {
+    let fixture = fixture(true);
+    let (over, under) = (
+        script(
+            &fixture,
+            "over.sh",
+            &format!("#!/bin/sh\n{}exit 0\n", printing(400)),
+        ),
+        script(
+            &fixture,
+            "under.sh",
+            &format!("#!/bin/sh\n{}exit 0\n", printing(100)),
+        ),
+    );
+
+    let over = test_on(&fixture, &over, InstanceTrigger::PostProcessing).await;
+    assert_eq!(status(&over), ScriptStatus::Succeeded);
+    assert!(over.log_truncated, "40,010 bytes do not fit in 32 KiB");
+    assert!(over.log.len() <= 32 * 1024);
+    assert!(over.log.ends_with("last line\n"));
+
+    let under = test_on(&fixture, &under, InstanceTrigger::PostProcessing).await;
+    assert!(!under.log_truncated, "10,010 bytes fit");
+    assert_eq!(under.log.len(), 100 * 100 + "last line\n".len());
+}
+
+#[tokio::test]
+async fn a_test_cancelled_after_printing_too_much_still_says_so() {
+    let fixture = fixture(true);
+    let gate = gate(fixture.data.path(), "gate");
+    let script = script(
+        &fixture,
+        "flood.sh",
+        &format!(
+            "#!/bin/sh\n{}read line < '{}'\nexit 0\n",
+            printing(400),
+            gate.display()
+        ),
+    );
+
+    let flood = instance(&fixture, &script, InstanceTrigger::PostProcessing);
+    let started = start(&fixture, &flood).await.unwrap();
+    fixture
+        .db
+        .script_test_when(&started.id, |run| run.log.contains("last line"))
+        .await
+        .unwrap();
+    assert!(fixture.db.cancel_script_test(&started.id));
+    let run = ended(&fixture, &started.id).await;
+
+    assert_eq!(status(&run), ScriptStatus::Cancelled);
+    assert!(run.log_truncated);
+    assert!(run.log.ends_with("last line\n"));
+}
+
 #[tokio::test]
 async fn each_trigger_is_tested_with_the_variables_a_real_one_carries() {
     let fixture = fixture(true);

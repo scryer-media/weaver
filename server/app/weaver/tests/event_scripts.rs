@@ -205,6 +205,59 @@ async fn scan_distinguishes_supervisor_launch_failure_from_script_exit_127() {
 }
 
 #[tokio::test]
+async fn a_recorded_run_says_whether_it_printed_more_than_was_kept() {
+    let (db, data) = setup();
+    // 400 or 100 lines of 99 characters and a newline, then a last line.
+    let printing = |lines: usize| {
+        format!(
+            "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\ni=0\nwhile [ $i -lt {lines} ]; do printf '%099d\\n' $i; i=$((i + 1)); done\nprintf 'last line\\n'\nexit 0\n"
+        )
+    };
+    let over = script(&db, "over.sh", &printing(400));
+    let under = script(&db, "under.sh", &printing(100));
+    select(
+        &db,
+        vec![
+            on(InstanceTrigger::Scan, &over),
+            on(InstanceTrigger::Scan, &under),
+        ],
+    );
+    let mut event = jobless(data.path(), ScriptEventLabel::Scan, &[]);
+    let results = run_event(&db, &mut event, "scan-output", None, supervisor())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].output_truncated);
+    assert!(!results[1].output_truncated);
+
+    let recorded = db.script_runs(ScriptRunFilter::default(), None, 8).unwrap();
+    let run = |script: &ScriptName| {
+        recorded
+            .iter()
+            .find(|run| &run.result.script == script)
+            .unwrap()
+    };
+    let (over, under) = (run(&over), run(&under));
+    assert!(
+        over.result.output_truncated,
+        "40,010 bytes do not fit in 32 KiB"
+    );
+    let kept = db
+        .script_output(over.result.output_id.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.len(), 32 * 1024);
+    assert!(kept.ends_with("last line\n"));
+
+    assert!(!under.result.output_truncated, "10,010 bytes fit");
+    let kept = db
+        .script_output(under.result.output_id.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.len(), 100 * 100 + "last line\n".len());
+}
+
+#[tokio::test]
 async fn queue_parameters_stream_to_persistence_and_the_next_script() {
     let (db, data) = setup();
     let context = job(&db, data.path());
@@ -318,7 +371,6 @@ async fn cancellation_keeps_redacted_directives_emitted_before_the_kill() {
         facts: context.compatibility.clone(),
         interpreters: InterpreterConfig::default(),
         supervisor_executable: supervisor(),
-        output_ceiling: 1048576,
     };
     let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
     let (cancel, cancellation) = tokio::sync::watch::channel(false);

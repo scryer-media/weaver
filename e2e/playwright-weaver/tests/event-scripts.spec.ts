@@ -527,7 +527,7 @@ test("Q14 the output store truncates, keeps a 4 KiB excerpt and evicts beyond ru
     kinds: ["POST-PROCESSING", "QUEUE"], queueEvents: ["NZB_MARKED"], body: scriptBodies.output(9 * 1024 * 1024), exitCode: 93,
   });
   const restore = await useScripts(request, { global: [{ script }] }, {
-    scriptOutputRunsPerJob: 2, scriptOutputCeilingBytes: 65_536, scriptOutputRunCapBytes: 65_536, scriptOutputRingBytes: 1024 * 1024,
+    scriptOutputRunsPerJob: 2, scriptOutputFailedRunsPerJob: 0,
   });
   try {
     const jobId = await job(request, tag);
