@@ -2538,3 +2538,209 @@ fn forced_tier_kernels_match_scalar_in_production_shape() {
         }
     }
 }
+
+/// Every tier kernel against the scalar oracle with the input placed at every
+/// offset from a 64-byte boundary and entered in every decoder state, in the
+/// end-detecting shape. The AVX2 end search head-aligns its span with scalar
+/// steps, so the bytes those steps cover (stuffed dots, escapes, `=y` and
+/// terminators straddling the alignment point) must decode exactly as the
+/// scalar machine decodes them. Each boundary sequence is spliced at every
+/// position around the alignment point, and random bodies dense in the bytes
+/// the boundary rules read cover the remaining orderings.
+#[test]
+fn forced_tier_end_search_matches_scalar_at_every_alignment() {
+    const ALPHABET: &[u8] = b"\r\n.=yAB";
+    const SEQUENCES: [&[u8]; 9] = [
+        b"\r\n=y",
+        b"\r\n.=y",
+        b"\r\n.\r\n",
+        b"\r\n..",
+        b"\r\n.",
+        b"\r\n=",
+        b"=\r\n",
+        b"==",
+        b"\r\r\n",
+    ];
+    const STATES: [DecoderState; 7] = [
+        DecoderState::None,
+        DecoderState::Eq,
+        DecoderState::Cr,
+        DecoderState::CrLf,
+        DecoderState::CrLfDot,
+        DecoderState::CrLfDotCr,
+        DecoderState::CrLfEq,
+    ];
+    let tiers = forced_tier_kernels();
+    let mut seed = 0x6a09_e667_f3bc_c909u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut bodies: Vec<(usize, Vec<u8>)> = Vec::new();
+    for offset in 0..64usize {
+        // The first byte the aligned span starts on, relative to the input.
+        let align_at = (64 - offset) % 64;
+        for seq in SEQUENCES {
+            for shift in 0..9usize {
+                let Some(at) = (align_at + shift).checked_sub(5) else {
+                    continue;
+                };
+                let mut body = production_line_body(320, 128);
+                body[at..at + seq.len()].copy_from_slice(seq);
+                bodies.push((offset, body));
+            }
+        }
+    }
+    for round in 0..600usize {
+        let len = 129 + (next() % 700) as usize;
+        let spacing = 1 + (next() % 24);
+        let body = (0..len)
+            .map(|_| {
+                if next() % spacing == 0 {
+                    ALPHABET[(next() % ALPHABET.len() as u64) as usize]
+                } else {
+                    b'A' + (next() % 20) as u8
+                }
+            })
+            .collect();
+        bodies.push((round % 64, body));
+    }
+
+    let mut backing = vec![0u8; 1024 + 128];
+    let base = backing.as_ptr().align_offset(64);
+    for (offset, body) in &bodies {
+        let len = body.len();
+        backing[base + offset..base + offset + len].copy_from_slice(body);
+        let input = &backing[base + offset..base + offset + len];
+        for entry in STATES {
+            for preserve in [true, false] {
+                let mut reference = vec![0u8; len + 64];
+                let mut reference_state = KernelState {
+                    state: entry,
+                    ..KernelState::body()
+                };
+                let reference_outcome = decode_kernel_scalar(
+                    input,
+                    &mut reference,
+                    &mut reference_state,
+                    true,
+                    preserve,
+                    true,
+                );
+                for &(name, available, kernel) in &tiers {
+                    if !available {
+                        continue;
+                    }
+                    let mut output = vec![0u8; len + 64];
+                    let mut state = KernelState {
+                        state: entry,
+                        ..KernelState::body()
+                    };
+                    let outcome =
+                        unsafe { kernel(input, &mut output, &mut state, true, preserve, true) };
+                    let context = || {
+                        format!(
+                            "tier {name} offset {offset} entry {entry:?} preserve {preserve} \
+                             body {:?}",
+                            String::from_utf8_lossy(input)
+                        )
+                    };
+                    match (&reference_outcome, outcome) {
+                        (Ok(expected), Ok(actual)) => {
+                            assert_eq!(
+                                (
+                                    &output[..actual.written],
+                                    actual.consumed,
+                                    actual.end,
+                                    state
+                                ),
+                                (
+                                    &reference[..expected.written],
+                                    expected.consumed,
+                                    expected.end,
+                                    reference_state,
+                                ),
+                                "{}",
+                                context()
+                            );
+                        }
+                        (expected, actual) => {
+                            assert_eq!(
+                                format!("{:?}", expected.as_ref().map(|_| ())),
+                                format!("{:?}", actual.map(|_| ())),
+                                "{}",
+                                context()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One raw end-searching decode of `body` in `stretch`-byte bounded calls:
+/// the outcome or error, the bytes written, and the folded CRC.
+fn raw_stretched(body: &[u8], stretch: usize) -> (Result<KernelOutcome, String>, Vec<u8>, u32) {
+    let mut output = vec![0u8; body.len() + 64];
+    let mut crc = crate::crc::Crc32::new();
+    let outcome = decode_raw_body_until_end_crc_in(body, &mut output, Some(128), &mut crc, stretch)
+        .map_err(|err| format!("{err:?}"));
+    let written = outcome.as_ref().map_or(0, |outcome| outcome.written);
+    output.truncate(written);
+    // A failed decode discards whatever the CRC had folded.
+    let crc = if outcome.is_ok() { crc.finalize() } else { 0 };
+    (outcome, output, crc)
+}
+
+/// Folding the CRC behind bounded stretches decodes exactly what one
+/// whole-body call does, for stretches ending at every kind of byte: inside
+/// escapes, line breaks, stuffed dots, and `=y` or terminator candidates
+/// straddling the limit, at every input alignment.
+#[test]
+fn raw_stretches_match_one_whole_call() {
+    const ALPHABET: &[u8] = b"\r\n.=yea";
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut below = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    for case in 0..30_000 {
+        let lead = below(64);
+        let mut buffer = vec![b'A'; lead];
+        let len = 200 + below(3_000);
+        let spacing = 1 + below(if case % 3 == 0 { 2 } else { 40 });
+        for _ in 0..len {
+            if below(spacing) == 0 {
+                buffer.push(ALPHABET[below(ALPHABET.len())]);
+            } else {
+                buffer.push(b'*' + below(80) as u8);
+            }
+        }
+        // End markers placed anywhere, so many straddle a stretch limit.
+        if case % 2 == 0 {
+            let at = lead + below(len);
+            let marker: &[u8] = match below(4) {
+                0 => b"\r\n=yend size=1\r\n",
+                1 => b"\r\n.\r\n",
+                2 => b"=\r\n=yend size=1\r\n",
+                _ => b"\r\n.=yend size=1\r\n",
+            };
+            buffer.splice(at..at, marker.iter().copied());
+        }
+        let body = &buffer[lead..];
+        let whole = raw_stretched(body, usize::MAX);
+        for stretch in [64, 128, 192, 320, 1_024] {
+            assert_eq!(
+                raw_stretched(body, stretch),
+                whole,
+                "stretch {stretch} lead {lead} body {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+}

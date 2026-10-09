@@ -1482,8 +1482,11 @@ async fn only_a_source_whose_generation_changed_is_verified_again() {
         reread != 0,
         "a source whose bytes changed must be verified again"
     );
+    // On a local disk par3-rs hashes a source whole first and, only when that
+    // hash misses, once more by block; a changed file therefore costs at most
+    // two reads of itself. Its unchanged peers must not be read at all.
     assert!(
-        reread <= changed_len,
+        reread <= 2 * changed_len,
         "only the changed source may be reread: {reread} bytes for a {changed_len}-byte file"
     );
 }

@@ -26,7 +26,16 @@ impl Pipeline {
             return;
         }
 
-        if self.has_active_rar_workers(job_id) {
+        // A full-set extraction of a set with no runtime state of its own (a
+        // name only a file classification still carries) counts no workers,
+        // so its in-flight entry is the only sign it is running. Starting
+        // another one, or finalizing the job and removing the volume it is
+        // about to open, both race that task.
+        let full_set_extraction_inflight = self
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| set_names.iter().any(|name| sets.contains(name)));
+        if full_set_extraction_inflight || self.has_active_rar_workers(job_id) {
             if self
                 .jobs
                 .get(&job_id)
@@ -147,7 +156,35 @@ impl Pipeline {
             }
 
             if has_ready_incremental_work {
+                // The batch pass offers each set to a RAR chase first, and a
+                // set it arms is no longer the batch scheduler's. Every part
+                // is already complete here, so no file completion is left to
+                // join that chase the way a set chased during the download is
+                // joined above; join it now, or the job waits on a chase
+                // nothing will ever consume.
+                let chased_before: HashSet<String> = set_names
+                    .iter()
+                    .filter(|set_name| self.rar_chase_owns_set(job_id, set_name))
+                    .cloned()
+                    .collect();
                 self.try_rar_extraction(job_id).await;
+                for set_name in &set_names {
+                    if chased_before.contains(set_name)
+                        || !self.rar_chase_owns_set(job_id, set_name)
+                    {
+                        continue;
+                    }
+                    if let Err(error) = self.extract_rar_set(job_id, set_name).await {
+                        warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            error = %error,
+                            "failed to join a RAR chase armed at completion"
+                        );
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                }
                 return;
             }
 

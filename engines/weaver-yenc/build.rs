@@ -15,7 +15,7 @@ fn main() {
     println!("cargo:rerun-if-changed=rapidyenc_shim.cc");
 
     // The oracle-model `asm!` decode kernel (`avx2_raw_kernel_oracle`) is the
-    // DEFAULT `SEARCH_END=false` path on x86_64: measured on Alder Lake and
+    // DEFAULT raw path on x86_64, with and without end detection: measured on Alder Lake and
     // Zen2/Windows it matches or beats rapidyenc on every decode fixture
     // (realshape 1.013/1.127, crlf 1.111/1.048; >1 = weaver faster), where
     // the intrinsic loop trailed on realshape. `WEAVER_YENC_RAW_ASM=0` is the

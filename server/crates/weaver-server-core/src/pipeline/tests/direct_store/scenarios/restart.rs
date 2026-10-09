@@ -1437,6 +1437,84 @@ async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_ident
     );
 }
 
+/// The prefix read-back must replace a held capture shorter than its window.
+///
+/// Content binding prefers any held prefix over a proven fingerprint and
+/// refuses one that does not cover the description's window, so an undersized
+/// capture — a duplicate offset-zero article, or a first article shorter than
+/// 16 KiB — left in place by the read-back holds the window closed and demotes
+/// a set whose placed bytes prove every volume. A live header-admitted set
+/// stands in for a restored one: the read-back runs for any live volume with
+/// nothing to bind by, and the short capture is seeded where the restart
+/// would have left nothing.
+#[tokio::test]
+async fn a_short_held_prefix_is_replaced_by_the_window_read_back_from_the_placed_bytes() {
+    let member_name = "Silver.Horizon.S01E45.mkv";
+    let payload: Vec<u8> = (0..240_000u32).map(|index| (index % 227) as u8).collect();
+    let named = single_member_store_set(member_name, &payload, 3);
+    // The descriptions carry the real names; the spec carries hex, so every
+    // volume can only bind by content.
+    let par2_bytes = par2_index_over_volumes(&named);
+    let volumes = obfuscate_volumes(&named);
+    let window = crate::pipeline::PAR2_HASH_16K_BYTES;
+    assert!(
+        volumes.iter().all(|(_, bytes)| bytes.len() > window),
+        "non-vacuity: every volume must be longer than the window"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41850);
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, &par2_bytes).await;
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_demoted()
+                && !set.is_finalized()
+                && set.volume_is_complete(0)),
+        "non-vacuity: the set must be live with its first volume placed whole, got {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let real = &volumes[0].1;
+    pipeline
+        .file_prefix_16k
+        .insert(file_id, real[..window / 4].to_vec());
+    pipeline.file_proven_par2_fingerprint.remove(&file_id);
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_none(),
+        "non-vacuity: the short capture must leave the volume unbound"
+    );
+
+    assert!(
+        !pipeline.demote_unbindable_direct_sets(job_id).await,
+        "a set whose placed bytes prove every volume must not be demoted as unbindable, got {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+    let held = pipeline.file_prefix_16k.get(&file_id).map(Vec::as_slice);
+    assert_eq!(
+        held.map(<[u8]>::len),
+        Some(window),
+        "the read-back must replace the short capture with the whole window"
+    );
+    assert_eq!(held, Some(&real[..window]));
+    assert!(
+        pipeline.resolve_par2_file_binding(file_id).is_some(),
+        "the volume must bind by the window read back"
+    );
+}
+
 /// One RAR5 archive that is not a volume, under a name that says nothing.
 fn obfuscated_standalone_archive(member_name: &str, payload: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut bytes = Vec::new();
