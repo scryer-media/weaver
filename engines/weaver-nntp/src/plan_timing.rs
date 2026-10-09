@@ -111,12 +111,12 @@ pub fn timing() -> &'static PlanTiming {
 /// Sets this process's timing. Must be called at process start, before any
 /// plan or pool exists: the first [`timing`] call fixes the timing for the
 /// life of the process, after which this returns the rejected value.
-pub fn install(timing: PlanTiming) -> Result<(), PlanTiming> {
+pub fn install(timing: PlanTiming) -> Result<(), Box<PlanTiming>> {
     install_into(&TIMING, timing)
 }
 
-fn install_into(cell: &OnceLock<PlanTiming>, timing: PlanTiming) -> Result<(), PlanTiming> {
-    cell.set(timing)
+fn install_into(cell: &OnceLock<PlanTiming>, timing: PlanTiming) -> Result<(), Box<PlanTiming>> {
+    cell.set(timing).map_err(Box::new)
 }
 
 #[cfg(test)]
@@ -202,7 +202,7 @@ mod tests {
             *cell.get_or_init(|| PlanTiming::PRODUCTION),
             PlanTiming::PRODUCTION
         );
-        assert_eq!(install_into(&cell, scaled), Err(scaled));
+        assert_eq!(install_into(&cell, scaled), Err(Box::new(scaled)));
         assert_eq!(cell.get(), Some(&PlanTiming::PRODUCTION));
     }
 
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(cell.get(), Some(&scaled));
         assert_eq!(
             install_into(&cell, PlanTiming::PRODUCTION),
-            Err(PlanTiming::PRODUCTION)
+            Err(Box::new(PlanTiming::PRODUCTION))
         );
     }
 
@@ -223,7 +223,10 @@ mod tests {
         // Production timing is the only value this can leave behind, so the
         // other tests in this process are unaffected whatever the order.
         let used = *timing();
-        assert_eq!(install(PlanTiming::PRODUCTION), Err(PlanTiming::PRODUCTION));
+        assert_eq!(
+            install(PlanTiming::PRODUCTION),
+            Err(Box::new(PlanTiming::PRODUCTION))
+        );
         assert_eq!(*timing(), used);
     }
 }

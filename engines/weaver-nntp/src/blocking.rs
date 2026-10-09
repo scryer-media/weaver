@@ -1233,6 +1233,7 @@ impl BlockingNntpConnection {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_tcp(
         config: &ServerConfig,
         tcp: impl Into<BlockingSocket>,
