@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::auth::{FreshAdminGuard, graphql_error};
+use crate::auth::{AdminGuard, FreshAdminGuard, graphql_error};
 use weaver_server_core::bandwidth::ScheduleAction;
 use weaver_server_core::bandwidth::schedule::SharedSchedules;
 use weaver_server_core::post_processing::executor::{
@@ -254,8 +254,10 @@ impl PostProcessingMutation {
     }
 
     /// Keep a value encrypted under a name, for script inputs to link. The
-    /// value can be replaced but never read back.
-    #[graphql(guard = "FreshAdminGuard")]
+    /// value can be replaced but never read back. Adding one changes nothing
+    /// already saved, so it asks for no recent password check; changing or
+    /// removing one does.
+    #[graphql(guard = "AdminGuard")]
     async fn create_secret(
         &self,
         ctx: &Context<'_>,

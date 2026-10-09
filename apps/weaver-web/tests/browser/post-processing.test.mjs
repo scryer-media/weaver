@@ -945,6 +945,78 @@ test("a secret an instance links cannot be deleted, and the refusal names the in
   } finally { await page.close(); }
 });
 
+test("signed in, a secret is added without the password, and changing or deleting one asks for it", async () => {
+  const page = await open("?secrets&signedin");
+  try {
+    const check = page.getByRole("dialog", { name: "Confirm your password", exact: true });
+
+    // Adding one is never held back.
+    await action(controls(page), "Add secret").click();
+    let editor = secretDialog(page, "Add secret");
+    await field(editor, "Name").fill("Mail token");
+    await secretField(editor, "Value").fill("fixture-token-3");
+    await action(editor, "Save").click();
+    await status(page, "Secret Mail token created").waitFor();
+    assert.equal(await check.count(), 0);
+
+    // A change the daemon holds back asks for the password over the editor, and says nothing in it.
+    await secretRow(page, "Mail token").getByText("Mail token", { exact: true }).click();
+    editor = secretDialog(page, "Mail token");
+    await field(editor, "Name").fill("Mail key");
+    await action(editor, "Save").click();
+    await check.waitFor();
+    assert.equal(await editor.getByRole("alert").count(), 0);
+    assert.equal(await page.getByText("recent password verification required").count(), 0);
+    await shot(page, "secret-password-check");
+    // A wrong password is said inside the question, and the change is not tried again.
+    await secretField(check, "Password").fill("not-it");
+    await action(check, "Continue").click();
+    await check.getByRole("alert").filter({ hasText: "That password is not correct." }).waitFor();
+    await secretField(check, "Password").fill("fixture-password");
+    await action(check, "Continue").click();
+    // The same change runs again by itself.
+    await status(page, "Secret Mail key saved").waitFor();
+    await check.waitFor({ state: "detached" });
+    await editor.waitFor({ state: "detached" });
+    await secretRow(page, "Mail key").waitFor();
+    assert.deepEqual((await daemon(page)).requests, [
+      { name: "CreateSecret", variables: { name: "Mail token", value: "fixture-token-3" } },
+      { name: "UpdateSecret", variables: { id: "s3", name: "Mail key", value: null } },
+      { name: "UpdateSecret", variables: { id: "s3", name: "Mail key", value: null } },
+    ]);
+  } finally { await page.close(); }
+});
+
+test("signed in, deleting a secret asks for the password over the question, and cancelling leaves it", async () => {
+  const page = await open("?secrets&signedin");
+  try {
+    const check = page.getByRole("dialog", { name: "Confirm your password", exact: true });
+    const confirm = page.getByRole("dialog", { name: "Delete secret", exact: true });
+    await secretRow(page, "Spare key").getByText("Spare key", { exact: true }).click();
+    const editor = secretDialog(page, "Spare key");
+    await action(editor, "Delete").click();
+    await action(confirm, "Delete").click();
+    await check.waitFor();
+    assert.equal(await confirm.getByRole("alert").count(), 0);
+    // Cancelled, the question is still there and nothing was deleted.
+    await action(check, "Cancel").click();
+    await check.waitFor({ state: "detached" });
+    assert.equal(await confirm.count(), 1);
+    assert.equal(await confirm.getByRole("alert").count(), 0);
+    // Asked again, it asks again; the password checked, the delete goes through.
+    await action(confirm, "Delete").click();
+    await secretField(check, "Password").fill("fixture-password");
+    await action(check, "Continue").click();
+    await status(page, "Secret Spare key deleted").waitFor();
+    await secretRow(page, "Spare key").waitFor({ state: "detached" });
+    assert.deepEqual((await daemon(page)).requests, [
+      { name: "DeleteSecret", variables: { id: "s2" } },
+      { name: "DeleteSecret", variables: { id: "s2" } },
+      { name: "DeleteSecret", variables: { id: "s2" } },
+    ]);
+  } finally { await page.close(); }
+});
+
 test("no secrets says so, and the top bar's Add is the only one", async () => {
   const page = await open("?secrets&empty");
   try {

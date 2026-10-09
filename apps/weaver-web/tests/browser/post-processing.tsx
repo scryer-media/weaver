@@ -221,6 +221,14 @@ function deleteSecret(id: string) {
 }
 
 const refused = (message: string) => ({ data: null, errors: [{ message }] });
+// An install that requires sign-in changes or deletes a secret only for a
+// session whose password was checked lately; adding one is never held back.
+const PASSWORD = "fixture-password";
+let passwordVerified = !has("signedin");
+const REAUTH = {
+  data: null,
+  errors: [{ message: "recent password verification required", extensions: { code: "REAUTH_REQUIRED" } }],
+};
 const inTrigger = (trigger: string) => state.instances.filter((entry) => entry.trigger === trigger).length;
 
 function saveInstance(variables: Record<string, any>): Stored | string {
@@ -457,10 +465,10 @@ function graphql(name: string, variables: Record<string, any>) {
     return createSecret(variables);
   } else if (name === "UpdateSecret") {
     requests.push({ name, variables });
-    return updateSecret(variables);
+    return passwordVerified ? updateSecret(variables) : REAUTH;
   } else if (name === "DeleteSecret") {
     requests.push({ name, variables });
-    return deleteSecret(variables.id);
+    return passwordVerified ? deleteSecret(variables.id) : REAUTH;
   } else if (name === "TestScriptInstance") {
     return startTest(variables.id);
   } else if (name === "ScriptTestRun") {
@@ -486,6 +494,12 @@ const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferG
 const originalFetch = window.fetch.bind(window);
 window.fetch = async (request, init) => {
   const url = new URL(String(request), document.baseURI);
+  if (url.pathname.endsWith("/api/auth/verify")) {
+    passwordVerified = JSON.parse(String(init?.body)).password === PASSWORD;
+    return passwordVerified
+      ? Response.json({ authenticated: true })
+      : Response.json({ error: "invalid credentials" }, { status: 401 });
+  }
   if (url.pathname !== "/graphql") return originalFetch(request, init);
   const body = JSON.parse(String(init?.body));
   return Response.json(graphql(body.operationName, body.variables));

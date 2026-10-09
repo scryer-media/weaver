@@ -908,7 +908,7 @@ async fn a_script_runs_token_may_not_create_change_or_delete_a_secret() {
 }
 
 #[tokio::test]
-async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secret() {
+async fn a_browser_session_without_a_recent_password_check_may_add_a_secret_but_not_change_one() {
     use weaver_server_core::security::{AUTHENTICATED_POLICY_REVISION, RuntimeSecurityConfig};
 
     let security = RuntimeSecurityConfig::default();
@@ -934,7 +934,8 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
         .unwrap();
     let kept = harness.db.create_secret("Kept", "hunter2").unwrap();
     let before = stored_secrets(&harness);
-    for mutation in secret_mutations(&kept.id) {
+    let [create, change, delete] = secret_mutations(&kept.id);
+    for mutation in [change, delete] {
         let response = harness
             .schema
             .execute(
@@ -948,6 +949,20 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
     }
     assert_eq!(stored_secrets(&harness), before);
 
+    // Adding one touches nothing already saved, and is not held back.
+    let added = harness
+        .schema
+        .execute(
+            async_graphql::Request::new(create.as_str())
+                .data(CallerScope::Admin)
+                .data(weaver_server_api::auth::CallerIdentity::Jwt([7; 32])),
+        )
+        .await;
+    assert_no_errors(&added);
+    let mut after = stored_secrets(&harness);
+    after.retain(|(name, _)| name != "From outside");
+    assert_eq!(after, before);
+
     // Listing names needs no fresh password check.
     let listed = harness
         .schema
@@ -958,10 +973,14 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
         )
         .await;
     assert_no_errors(&listed);
-    assert_eq!(
-        response_data(&listed)["secrets"],
-        json!([{ "name": "Kept" }])
-    );
+    let mut names: Vec<String> = response_data(&listed)["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|secret| secret["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["From outside", "Kept"]);
 }
 
 #[tokio::test]
