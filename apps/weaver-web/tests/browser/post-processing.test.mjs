@@ -340,7 +340,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
     await page.getByRole("menuitemradio", { name: "Archive · archive.py", exact: true }).click();
 
     // The first trigger the header declares, and every input it declares at its default.
-    await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Post-processing", { exact: true }).waitFor();
     assert.equal(await action(editor, "Save").isDisabled(), false);
     assert.equal(await editor.getByText("This job has no inputs.", { exact: true }).count(), 0);
     assert.equal(await field(editor, "Target").inputValue(), "/fixture/archive");
@@ -356,12 +356,12 @@ test("a new instance starts from what the chosen script's header declares", asyn
       "Choose a secret", "Notify token", "Spare key", "Create new secret…",
     ]);
     await page.getByRole("menuitemradio", { name: "Choose a secret", exact: true }).click();
-    // The triggers the header declares are marked among all there are.
+    // Every trigger is offered by its plain name, whatever the header asks for.
     await action(editor, "Trigger").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
-      "Post-processing · declared", "Queue", "Scan", "Schedule · declared", "Feed",
+      "Post-processing", "Queue", "Scan", "Schedule", "Feed",
     ]);
-    await page.getByRole("menuitemradio", { name: "Post-processing · declared", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "Post-processing", exact: true }).click();
 
     await field(editor, "Job name").fill("Archive movies");
     await pick(page, editor, "Key", "Spare key");
@@ -403,7 +403,7 @@ test("a queue instance names its event, and each input the header declares draws
     await action(editor, "Script").getByText("Archive · archive.py", { exact: true }).waitFor();
     assert.equal(await action(editor, "Queue event").count(), 0);
     await pick(page, editor, "Trigger", "Queue");
-    // The header declares no queue event, so none of them is marked.
+    // The header declares no queue event, so the first of them all is the one offered.
     await action(editor, "Queue event").getByText("NZB_ADDED", { exact: true }).waitFor();
     await action(editor, "Queue event").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
@@ -429,7 +429,7 @@ test("a queue instance names its event, and each input the header declares draws
     // Each input the header declares draws the control its header asks for.
     await action(controls(page), "Add job").click();
     await pick(page, editor, "Script", "Notify · notify.py");
-    await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Post-processing", { exact: true }).waitFor();
     assert.equal(await field(editor, "Label").inputValue(), "");
     await editor.getByText("Shown in the notification title. Required.", { exact: true }).waitFor();
     await action(editor, "Mode").getByText("quiet", { exact: true }).waitFor();
@@ -438,22 +438,22 @@ test("a queue instance names its event, and each input the header declares draws
     await field(editor, "Label").fill("downloads");
     await pick(page, editor, "Mode", "verbose");
     await editor.getByRole("switch", { name: "Attach the log", exact: true }).click();
-    // The events the header declares are marked, and the first of them is the one offered.
-    await pick(page, editor, "Trigger", "Queue · declared");
-    await action(editor, "Queue event").getByText("NZB_ADDED · declared", { exact: true }).waitFor();
+    // The first event the header declares is the one offered, among all of them by their plain names.
+    await pick(page, editor, "Trigger", "Queue");
+    await action(editor, "Queue event").getByText("NZB_ADDED", { exact: true }).waitFor();
     await action(editor, "Queue event").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
-      "FILE_DOWNLOADED", "URL_COMPLETED", "NZB_MARKED", "NZB_ADDED · declared", "NZB_NAMED", "NZB_DOWNLOADED · declared", "NZB_DELETED",
+      "FILE_DOWNLOADED", "URL_COMPLETED", "NZB_MARKED", "NZB_ADDED", "NZB_NAMED", "NZB_DOWNLOADED", "NZB_DELETED",
     ]);
-    await page.getByRole("menuitemradio", { name: "NZB_DOWNLOADED · declared", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "NZB_DOWNLOADED", exact: true }).click();
     // Only a download has a category, so only its triggers can be narrowed to one.
     const categories = editor.getByRole("group", { name: "Categories", exact: true });
     assert.equal(await categories.count(), 1);
     await pick(page, editor, "Trigger", "Schedule");
     await categories.waitFor({ state: "detached" });
     assert.equal(await action(editor, "Queue event").count(), 0);
-    await pick(page, editor, "Trigger", "Queue · declared");
-    await action(editor, "Queue event").getByText("NZB_DOWNLOADED · declared", { exact: true }).waitFor();
+    await pick(page, editor, "Trigger", "Queue");
+    await action(editor, "Queue event").getByText("NZB_DOWNLOADED", { exact: true }).waitFor();
     await action(editor, "Save").click();
     await status(page, "notify.py created").waitFor();
     await rows(group(page, "Queue · NZB_DOWNLOADED")).first().and(row(page, "notify.py")).waitFor();
@@ -497,7 +497,7 @@ test("a new job on the schedule is given when it runs, starting from the times i
     await pick(page, editor, "Script", "Notify · notify.py");
     assert.equal(await times.count(), 0);
     await pick(page, editor, "Script", "Nightly report · nightly.py");
-    await action(editor, "Trigger").getByText("Schedule · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Schedule", { exact: true }).waitFor();
     assert.equal(await times.inputValue(), "04:00, *:20");
     assert.deepEqual(await days.getByRole("button").allTextContents(), ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]);
     assert.equal(await days.locator('[aria-pressed="true"]').count(), 0);
@@ -628,9 +628,9 @@ test("a secret input shows the secret it links and never its value, and can link
   try {
     let editor = await edit(page, "Notify");
     // The instance's trigger sits beside its name, and its script and trigger are the ones saved.
-    await editor.getByText("Post-processing", { exact: true }).waitFor();
     await action(editor, "Script").getByText("Notify · notify.py", { exact: true }).waitFor();
-    await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Post-processing", { exact: true }).waitFor();
+    assert.equal(await editor.getByText("Post-processing", { exact: true }).count(), 2);
     assert.equal(await field(editor, "Job name").inputValue(), "Notify");
     assert.equal(await field(editor, "Label").inputValue(), "fixture");
     // The secret input names the secret it links; nothing can be typed into it.
@@ -752,7 +752,7 @@ test("an input the header does not declare can be added, and taken away again", 
       { exact: true },
     ).waitFor();
     assert.equal(await field(editor, "Legacy").inputValue(), "1");
-    await editor.getByText("Not declared by the script's header.", { exact: true }).waitFor();
+    await editor.getByText("Not in the script's header.", { exact: true }).waitFor();
     await shot(page, "instance-editor-drift");
     // Only what the header does not ask for can be removed.
     assert.equal(await editor.getByRole("button", { name: /^Remove / }).count(), 1);
@@ -993,7 +993,7 @@ test("set up from header creates an instance for each trigger the header declare
     await action(editor, "Script").getByText("Choose a script", { exact: true }).waitFor();
     assert.equal(await action(editor, "Set up jobs from header").count(), 0);
     await pick(page, editor, "Script", "Nightly report · nightly.py");
-    await action(editor, "Trigger").getByText("Schedule · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Schedule", { exact: true }).waitFor();
     assert.equal(await action(editor, "Set up jobs from header").count(), 0);
     await pick(page, editor, "Script", "Notify · notify.py");
     await action(editor, "Set up jobs from header").click();

@@ -224,10 +224,6 @@ export function ScriptInstanceEditor({
 
   /* ------------------------------------------------------------- the script */
 
-  const declared = script?.preset.triggers ?? [];
-  const marked = (name: string, isDeclared: boolean) =>
-    isDeclared ? t("next.postProcessing.declaredOption", { name }) : name;
-
   const scriptOptions = [
     ...(form.script === "" ? [{ value: "", label: t("next.postProcessing.chooseScript") }] : []),
     ...scripts.map((entry) => ({
@@ -271,7 +267,7 @@ export function ScriptInstanceEditor({
         value: form.trigger,
         options: SCRIPT_KINDS.map((kind) => ({
           value: kind,
-          label: marked(t(SCRIPT_KIND_LABELS[kind]), declared.some((entry) => entry.trigger === kind)),
+          label: t(SCRIPT_KIND_LABELS[kind]),
         })),
         onChange: (next) => patch({ trigger: next as ScriptKind }),
       },
@@ -285,13 +281,7 @@ export function ScriptInstanceEditor({
             control: {
               kind: "select" as const,
               value: form.queueEvent,
-              options: queueEvents.map((event) => ({
-                value: event,
-                label: marked(
-                  event,
-                  declared.some((entry) => entry.trigger === "QUEUE" && entry.queueEvent === event),
-                ),
-              })),
+              options: queueEvents.map((event) => ({ value: event, label: event })),
               onChange: (next: string) => patch({ queueEvent: next as QueueEvent }),
             },
           },
