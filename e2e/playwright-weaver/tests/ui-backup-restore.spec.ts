@@ -444,7 +444,8 @@ async function expectProductMarkers(
   if (present) await expect(categoryRow).toContainText(matrix.categoryPattern);
 
   await page.goto("/settings/schedules");
-  await expect(page.getByRole("region", { name: "Downloads", exact: true })).toBeVisible();
+  // The list heads only the groups that hold a rule, so the list itself is what loads.
+  await expect(page.getByRole("region", { name: "Schedules", exact: true })).toBeVisible();
   await expect(tableRow(page, "Downloads", matrix.scheduleName)).toHaveCount(present ? 1 : 0);
 
   await page.goto("/settings/servers");

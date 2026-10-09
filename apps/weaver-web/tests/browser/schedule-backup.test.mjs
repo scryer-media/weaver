@@ -16,6 +16,8 @@ async function choose(page, scope, name, option) {
   await page.getByRole("menuitemradio", { name: option, exact: true }).click();
 }
 const toggle = (scope, name) => scope.getByRole("switch", { name, exact: true });
+// The panel's own Add, which the settings shell puts in its top bar.
+const addSchedule = (page) => page.locator("#controls").getByRole("button", { name: "Add schedule", exact: true });
 async function open(query = "") {
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   if (query.includes("automatic")) {
@@ -65,7 +67,7 @@ test("all new schedule actions support disabled create, edit, draft and list tog
   const page = await open("?schedules");
   try {
     for (const [action, group] of [["Pause all intake", "Downloads"], ["Pause post-processing", "Post-processing"], ["Resume post-processing", "Post-processing"], ["Set server availability", "Servers"], ["Set quota metering", "Quota metering"], ["Scan watch folder", "One-shot actions"], ["Fetch RSS", "One-shot actions"], ["Prune history", "One-shot actions"]]) {
-      await page.getByRole("button", { name: "Add schedule", exact: true }).first().click();
+      await addSchedule(page).click();
       const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
       await form.getByLabel("Label", { exact: true }).fill(`fixture ${action}`);
       await form.getByRole("switch", { name: "Enabled", exact: true }).click();
@@ -128,7 +130,7 @@ test("editing another action into server and quota rules saves the displayed boo
       ["Set quota metering", "Quota metering", "Count traffic toward the quota"],
     ]) {
       const label = `converted ${group}`;
-      await page.getByRole("button", { name: "Add schedule", exact: true }).first().click();
+      await addSchedule(page).click();
       const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
       await form.getByLabel("Label", { exact: true }).fill(label);
       await form.getByRole("switch", { name: "Enabled", exact: true }).click();
@@ -155,21 +157,37 @@ test("editing another action into server and quota rules saves the displayed boo
   } finally { await page.close(); }
 });
 
-test("a group adds a rule of its own kind, and a rule a script declares is listed read-only", async () => {
+test("the schedules are one list with one Add, headed only by the groups that hold a rule", async () => {
+  const page = await open("?schedules");
+  try {
+    const list = page.getByRole("region", { name: "Schedules", exact: true });
+    await list.getByText("No schedules yet. Weaver downloads whenever there is work.", { exact: true }).waitFor();
+    assert.equal(await list.getByRole("region").count(), 0);
+    // The top bar's Add is the only one, with rules listed or without.
+    const everyAdd = page.getByRole("button", { name: "Add schedule", exact: true });
+    assert.equal(await everyAdd.count(), 1);
+    assert.equal(await list.getByRole("button").count(), 0);
+    await addSchedule(page).click();
+    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    await form.getByLabel("Label", { exact: true }).fill("fixture hold");
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await form.waitFor({ state: "hidden" });
+    await list.getByRole("region", { name: "Downloads", exact: true }).getByText("fixture hold", { exact: true }).waitFor();
+    assert.equal(await list.getByRole("region").count(), 1);
+    assert.equal(await list.getByText("Time", { exact: true }).count(), 1);
+    assert.equal(await everyAdd.count(), 1);
+    assert.equal(await addSchedule(page).count(), 1);
+  } finally { await page.close(); }
+});
+
+test("a rule a script declares is listed read-only among the one-shot actions", async () => {
   const page = await open("?schedules&manifest");
   try {
-    for (const [group, action, note] of [
-      ["Speed limit", "Set a speed limit", "local time · holds until the next rule in the group"],
-      ["Servers", "Set server availability", "local time · holds until the next rule in the group"],
-    ]) {
-      await page.getByRole("region", { name: group, exact: true }).getByRole("button", { name: "Add schedule", exact: true }).click();
-      const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
-      await form.getByRole("button", { name: "Action", exact: true }).getByText(action, { exact: true }).waitFor();
-      await form.getByText(note, { exact: true }).waitFor();
-      await form.getByRole("button", { name: "Cancel", exact: true }).click();
-      await form.waitFor({ state: "hidden" });
-    }
-    const declared = page.getByRole("region", { name: "One-shot actions", exact: true }).getByRole("button").filter({ has: page.getByText("Run nightly.py", { exact: true }) });
+    const list = page.getByRole("region", { name: "Schedules", exact: true });
+    await list.getByText("local time · holds until the next rule in the group", { exact: true }).waitFor();
+    const oneShot = list.getByRole("region", { name: "One-shot actions", exact: true });
+    await oneShot.getByText("local time · runs once each time", { exact: true }).waitFor();
+    const declared = oneShot.getByRole("button").filter({ has: page.getByText("Run nightly.py", { exact: true }) });
     await declared.getByText("Manifest", { exact: true }).waitFor();
     assert.equal(await declared.getByRole("switch").isDisabled(), true);
     await declared.click();

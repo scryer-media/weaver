@@ -847,6 +847,12 @@ pub struct ScriptListEntry {
     /// `None` runs the script under the 24-hour default timeout.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// A blocking script is run in line: the next script waits for it, and so
+    /// does whatever its trigger holds. One that is not is started and left to
+    /// finish on its own, and its result changes nothing. Scan and feed
+    /// scripts are always waited for, because what they return is used.
+    #[serde(default = "default_true")]
+    pub blocking: bool,
 }
 
 fn default_true() -> bool {
@@ -859,6 +865,7 @@ impl ScriptListEntry {
             script,
             enabled: true,
             timeout_seconds: None,
+            blocking: true,
         }
     }
 
@@ -1176,6 +1183,9 @@ pub struct ScriptResult {
     pub event: ScriptEventLabel,
     #[serde(default)]
     pub output_id: Option<String>,
+    /// The run was started without anything waiting for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
     pub adapter: ScriptAdapter,
     pub status: ScriptStatus,
     pub exit_code: Option<i32>,

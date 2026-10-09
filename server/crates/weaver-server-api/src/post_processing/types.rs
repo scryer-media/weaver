@@ -5,6 +5,7 @@ use weaver_server_core::post_processing::model::{
     ScriptListEntry, ScriptLists, ScriptName, ScriptOption, ScriptOptionType, ScriptResult,
     ScriptSelectValue, SecretOptionValue,
 };
+use weaver_server_core::post_processing::output::ScriptRun;
 
 /// Placeholder shown instead of a stored secret. Secrets leave the process only
 /// as environment values for the script that declared them.
@@ -245,6 +246,9 @@ pub struct ScriptListEntryGql {
     pub script: String,
     pub enabled: bool,
     pub timeout_seconds: Option<u64>,
+    /// Whether the script is waited for. One that is not is started and left
+    /// to finish on its own, and its result changes nothing.
+    pub blocking: bool,
 }
 
 impl From<&ScriptListEntry> for ScriptListEntryGql {
@@ -253,6 +257,7 @@ impl From<&ScriptListEntry> for ScriptListEntryGql {
             script: value.script.as_str().to_string(),
             enabled: value.enabled,
             timeout_seconds: value.timeout_seconds,
+            blocking: value.blocking,
         }
     }
 }
@@ -291,6 +296,10 @@ pub struct ScriptListEntryInput {
     #[graphql(default = true)]
     pub enabled: bool,
     pub timeout_seconds: Option<u64>,
+    /// Whether the script is waited for. One that is not is started and left
+    /// to finish on its own, and its result changes nothing.
+    #[graphql(default = true)]
+    pub blocking: bool,
 }
 
 #[derive(Debug, Clone, InputObject)]
@@ -315,6 +324,7 @@ fn script_list(entries: Vec<ScriptListEntryInput>) -> Result<ScriptList, String>
                 script: ScriptName::new(entry.script).map_err(|error| error.to_string())?,
                 enabled: entry.enabled,
                 timeout_seconds: entry.timeout_seconds,
+                blocking: entry.blocking,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -408,6 +418,8 @@ pub struct ScriptResultGql {
     pub output_retained: bool,
     pub script: String,
     pub event: String,
+    /// The run was started without anything waiting for it.
+    pub background: bool,
     pub adapter: ScriptAdapterGql,
     pub status: ScriptStatusGql,
     pub exit_code: Option<i32>,
@@ -425,6 +437,7 @@ impl From<ScriptResult> for ScriptResultGql {
             output_retained: false,
             script: value.script.as_str().to_string(),
             event: value.event.to_string(),
+            background: value.background,
             adapter: value.adapter.into(),
             status: value.status.into(),
             exit_code: value.exit_code,
@@ -445,6 +458,76 @@ pub enum ScriptKindGql {
     Scan,
     Scheduler,
     Feed,
+}
+
+/// One recorded run of a script, whatever started it.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptRun")]
+pub struct ScriptRunGql {
+    /// Names the run's kept output for `scriptOutput`, when `outputRetained`.
+    pub id: String,
+    pub job_id: Option<u64>,
+    /// Known once the job has reached history.
+    pub job_name: Option<String>,
+    pub script: String,
+    pub event: String,
+    pub kind: ScriptKindGql,
+    /// The run was started without anything waiting for it.
+    pub background: bool,
+    pub adapter: ScriptAdapterGql,
+    pub status: ScriptStatusGql,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub output_tail: String,
+    pub output_truncated: bool,
+    pub output_retained: bool,
+    pub error_message: Option<String>,
+    pub finished_at_epoch_ms: i64,
+}
+
+impl From<ScriptRun> for ScriptRunGql {
+    fn from(value: ScriptRun) -> Self {
+        let result = value.result;
+        Self {
+            id: value.id,
+            job_id: value.job_id,
+            job_name: value.job_name,
+            script: result.script.as_str().to_string(),
+            kind: result.event.kind().into(),
+            event: result.event.to_string(),
+            background: result.background,
+            adapter: result.adapter.into(),
+            status: result.status.into(),
+            exit_code: result.exit_code,
+            duration_ms: result.duration_ms,
+            output_tail: result.output_tail,
+            output_truncated: result.output_truncated,
+            output_retained: value.output_retained,
+            error_message: result.error_message,
+            finished_at_epoch_ms: result.finished_at_epoch_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptRunPage")]
+pub struct ScriptRunPageGql {
+    /// Latest first.
+    pub runs: Vec<ScriptRunGql>,
+    /// Pass as `before` for the runs that follow; absent on the last page.
+    pub next_before: Option<String>,
+}
+
+impl From<ScriptKindGql> for weaver_server_core::post_processing::model::ScriptKind {
+    fn from(value: ScriptKindGql) -> Self {
+        match value {
+            ScriptKindGql::PostProcessing => Self::PostProcessing,
+            ScriptKindGql::Queue => Self::Queue,
+            ScriptKindGql::Scan => Self::Scan,
+            ScriptKindGql::Scheduler => Self::Scheduler,
+            ScriptKindGql::Feed => Self::Feed,
+        }
+    }
 }
 
 impl From<weaver_server_core::post_processing::model::ScriptKind> for ScriptKindGql {

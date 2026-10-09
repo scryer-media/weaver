@@ -3,23 +3,26 @@ import type { IconName } from "../../../components/icons";
 import { BackupPanel } from "./BackupPanel";
 import { CategoriesPanel } from "./CategoriesPanel";
 import { GeneralPanel } from "./GeneralPanel";
-import { PostProcessingPanel } from "./PostProcessingPanel";
+import { ScriptConfigurationPanel, ScriptListPanel } from "./PostProcessingPanel";
 import { ProvidersPanel } from "./ProvidersPanel";
 import { NetworkingPanel } from "./NetworkingPanel";
 import { RssPanel } from "./RssPanel";
 import { SchedulesPanel } from "./SchedulesPanel";
+import { ScriptRunsPanel } from "./ScriptRunsPanel";
 import { SecurityPanel } from "./SecurityPanel";
 import { WatchFolderPanel } from "./WatchFolderPanel";
 
 /**
  * The settings panels, in rail order.
  *
- * The former proxies and bandwidth slugs redirect into Networking so existing bookmarks keep working.
+ * The former proxies and bandwidth slugs redirect into Networking, and the former
+ * post-processing slug into Scripts, so existing bookmarks keep working.
  */
 
 export interface PanelDefinition {
   slug: string;
-  group?: "networking";
+  /** The rail heading the panel sits under, with the others that share it. */
+  group?: "networking" | "scripts";
   /** Translation key of the panel's name. */
   label: string;
   /** Translation key of the mono subtitle beside the panel's title in the top bar. */
@@ -89,12 +92,31 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     Component: SchedulesPanel,
   },
   {
-    slug: "post-processing",
-    label: "next.settings.panel.postProcessing",
-    note: "next.settings.panel.postProcessingNote",
+    slug: "scripts/configuration",
+    group: "scripts",
+    label: "next.settings.panel.scriptsConfiguration",
+    note: "next.settings.panel.scriptsNote",
     tag: "beta",
     icon: "postProcessing",
-    Component: PostProcessingPanel,
+    Component: ScriptConfigurationPanel,
+  },
+  {
+    slug: "scripts/list",
+    group: "scripts",
+    label: "next.settings.panel.scripts",
+    note: "next.settings.panel.scriptsNote",
+    tag: "beta",
+    icon: "postProcessing",
+    Component: ScriptListPanel,
+  },
+  {
+    slug: "scripts/runs",
+    group: "scripts",
+    label: "next.settings.panel.scriptRuns",
+    note: "next.settings.panel.scriptRunsNote",
+    tag: "beta",
+    icon: "postProcessing",
+    Component: ScriptRunsPanel,
   },
   {
     slug: "watch-folder",

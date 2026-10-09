@@ -3062,6 +3062,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         duration_ms: 5,
         output_tail: "postgres-log".into(),
         output_id: None,
+        background: false,
         output_truncated: true,
         error_message: None,
         finished_at_epoch_ms: 3,

@@ -31,6 +31,7 @@ pub async fn transform_feed(
                                 .map_err(|error| error.to_string())?,
                             enabled: true,
                             timeout_seconds: None,
+                            blocking: true,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?,

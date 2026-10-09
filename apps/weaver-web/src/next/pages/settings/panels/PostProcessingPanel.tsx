@@ -28,13 +28,16 @@ import {
 } from "../framework";
 
 /**
- * Post-processing: the scripts weaver runs when a download finishes.
+ * Scripts: what weaver runs on a download and on the events around it.
  *
- * Three things live here that save in three different ways, which is the
- * daemon's own shape rather than a choice: the execution settings are a draft
- * behind the top bar's Save, the scripts directory is destructive enough to
- * ask first, and the run list writes the moment it is reordered.
+ * Two screens read the same settings. Configuration holds what applies to every
+ * script: the execution settings, a draft behind the top bar's Save, and the
+ * scripts directory, destructive enough to ask first. Scripts holds the run
+ * list, which writes the moment it is edited, and the scripts the directory
+ * holds, each opening its own options.
  */
+
+type ScriptsSection = "configuration" | "list";
 
 const GLOBAL = "__global__";
 const MASKED_SECRET = "[REDACTED]";
@@ -65,6 +68,8 @@ interface ListEntry {
   script: string;
   enabled: boolean;
   timeoutSeconds?: number | null;
+  /** Whether weaver waits for the script. Left out, it does. */
+  blocking?: boolean | null;
 }
 
 interface ScriptLists {
@@ -155,7 +160,17 @@ function splitExtensions(value: string): string[] {
     .filter(Boolean);
 }
 
-export function PostProcessingPanel() {
+/** What applies to every script: whether and how they run, and where they are read from. */
+export function ScriptConfigurationPanel() {
+  return <ScriptsPanel section="configuration" />;
+}
+
+/** The scripts that run, in order, and the ones the directory holds. */
+export function ScriptListPanel() {
+  return <ScriptsPanel section="list" />;
+}
+
+function ScriptsPanel({ section }: { section: ScriptsSection }) {
   const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<PostProcessingData>({
     query: POST_PROCESSING_SETTINGS_QUERY,
@@ -270,19 +285,17 @@ export function PostProcessingPanel() {
     setError(null);
     setLocalLists({ base: serverLists, value: next });
     setListSaves((count) => count + 1);
+    const stored = (entry: ListEntry) => ({
+      script: entry.script,
+      enabled: entry.enabled,
+      timeoutSeconds: entry.timeoutSeconds ?? null,
+      blocking: entry.blocking ?? true,
+    });
     const input = {
-      global: next.global.map((entry) => ({
-        script: entry.script,
-        enabled: entry.enabled,
-        timeoutSeconds: entry.timeoutSeconds ?? null,
-      })),
+      global: next.global.map(stored),
       categories: next.categories.map((category) => ({
         category: category.category,
-        entries: category.entries.map((entry) => ({
-          script: entry.script,
-          enabled: entry.enabled,
-          timeoutSeconds: entry.timeoutSeconds ?? null,
-        })),
+        entries: category.entries.map(stored),
       })),
     };
     listQueue.current = listQueue.current.then(async () => {
@@ -409,7 +422,7 @@ export function PostProcessingPanel() {
       ? t("next.postProcessing.runsForEvery")
       : t("next.postProcessing.runsForCategory", { name: scope });
 
-  const blocks: (SettingsBlock | null)[] = [
+  const configuration: SettingsBlock[] = [
     {
       kind: "section",
       id: "execution",
@@ -555,16 +568,20 @@ export function PostProcessingPanel() {
         },
       ],
     },
+  ];
+
+  const list: (SettingsBlock | null)[] = [
     {
       kind: "table",
       id: "run-list",
       title: t("next.postProcessing.runList"),
-      note: scopeNote,
-      columns: "64px minmax(0, 1fr) 176px 76px 104px",
+      note: `${scopeNote} · ${t("next.postProcessing.runModeNote")}`,
+      columns: "64px minmax(120px, 1fr) 176px 168px 76px 104px",
       headers: [
         t("next.postProcessing.order"),
         t("next.postProcessing.script"),
         t("next.postProcessing.timeout"),
+        t("next.postProcessing.runMode"),
         t("next.postProcessing.enabled"),
         "",
       ],
@@ -584,7 +601,10 @@ export function PostProcessingPanel() {
             ]}
             onChange={(next) => {
               if (next) {
-                patchEntries([...entries, { script: next, enabled: true, timeoutSeconds: null }]);
+                patchEntries([
+                  ...entries,
+                  { script: next, enabled: true, timeoutSeconds: null, blocking: true },
+                ]);
               }
             }}
           />
@@ -620,6 +640,21 @@ export function PostProcessingPanel() {
               onChange={(next) => {
                 const updated = [...entries];
                 updated[index] = { ...entry, timeoutSeconds: next > 0 ? next : null };
+                patchEntries(updated);
+              }}
+            />,
+            <Select
+              key="run-mode"
+              label={t("next.postProcessing.runModeFor", { name: entry.script })}
+              value={(entry.blocking ?? true) ? "blocking" : "background"}
+              className="h-7 w-[168px] min-w-0 gap-2 text-[12.5px]"
+              options={[
+                { value: "blocking", label: t("next.postProcessing.blocking") },
+                { value: "background", label: t("next.postProcessing.fireAndForget") },
+              ]}
+              onChange={(next) => {
+                const updated = [...entries];
+                updated[index] = { ...entry, blocking: next === "blocking" };
                 patchEntries(updated);
               }}
             />,
@@ -732,6 +767,25 @@ export function PostProcessingPanel() {
       : null,
   ];
 
+  if (section === "configuration") {
+    return (
+      <>
+        <SettingsBlocks blocks={configuration} loading={fetching && !data} />
+
+        <ConfirmDialog
+          open={confirmDirectory}
+          title={t("next.postProcessing.changeDirTitle")}
+          note={scriptDirectory}
+          busy={directoryState.fetching}
+          confirmLabel={t("next.postProcessing.changeDirConfirm")}
+          body={t("next.postProcessing.changeDirBody")}
+          onConfirm={applyDirectory}
+          onDismiss={() => setConfirmDirectory(false)}
+        />
+      </>
+    );
+  }
+
   return (
     <>
       <PanelControls>
@@ -747,18 +801,7 @@ export function PostProcessingPanel() {
         />
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
-
-      <ConfirmDialog
-        open={confirmDirectory}
-        title={t("next.postProcessing.changeDirTitle")}
-        note={scriptDirectory}
-        busy={directoryState.fetching}
-        confirmLabel={t("next.postProcessing.changeDirConfirm")}
-        body={t("next.postProcessing.changeDirBody")}
-        onConfirm={applyDirectory}
-        onDismiss={() => setConfirmDirectory(false)}
-      />
+      <SettingsBlocks blocks={list} loading={fetching && !data} />
 
       <RecordEditor
         open={selected !== null}

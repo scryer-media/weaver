@@ -104,6 +104,64 @@ fn set_global_list(db: &Database, entries: Vec<ScriptListEntry>) {
     .unwrap();
 }
 
+/// A pipe a test script stops at, so the test decides when the script goes on.
+fn gate(directory: &Path, name: &str) -> PathBuf {
+    let path = directory.join(name);
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    path
+}
+
+/// Lets the script stopped at `gate` go on. Returns once the script is there
+/// to be let through, however long it takes to arrive.
+async fn open_gate(gate: PathBuf) {
+    tokio::task::spawn_blocking(move || fs::write(gate, "go\n").unwrap())
+        .await
+        .unwrap();
+}
+
+/// Returns once the script has written to `gate`, which it does when it starts.
+async fn wait_at_gate(gate: PathBuf) {
+    tokio::task::spawn_blocking(move || fs::read(gate).unwrap())
+        .await
+        .unwrap();
+}
+
+fn not_waited_for(script: ScriptName) -> ScriptListEntry {
+    ScriptListEntry {
+        blocking: false,
+        ..ScriptListEntry::new(script)
+    }
+}
+
+/// A finished job for script runs to be recorded against.
+fn finished_job(db: &Database, job_id: u64, working_directory: &Path) {
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: "finished".into(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1_000,
+        category: None,
+        output_dir: Some(working_directory.to_string_lossy().into_owned()),
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata: None,
+        server_attribution: None,
+    })
+    .unwrap();
+}
+
 #[tokio::test]
 async fn event_only_scripts_are_listed_but_never_executed_as_terminal_scripts() {
     use weaver_server_core::post_processing::listing::list_scripts;
@@ -440,6 +498,7 @@ async fn a_disabled_script_is_kept_in_the_list_but_never_executed() {
         script: skipped,
         enabled: false,
         timeout_seconds: None,
+        blocking: true,
     }])
     .unwrap();
 
@@ -864,4 +923,186 @@ async fn changing_the_scripts_directory_pins_admitted_work_and_updates_future_jo
         "new-second\n",
         "a later job resolves scripts from the replacement root"
     );
+}
+
+#[tokio::test]
+async fn a_script_nothing_waits_for_has_no_part_in_the_pass() {
+    let data = tempfile::tempdir().unwrap();
+    let working_directory = data.path().join("work");
+    fs::create_dir_all(&working_directory).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    enable_execution(&db);
+    finished_job(&db, 110, &working_directory);
+    let gate = gate(&working_directory, "gate");
+
+    let detached = write_script(
+        data.path(),
+        "detached.sh",
+        "#!/bin/sh\nread line < \"$SAB_COMPLETE_DIR/gate\"\nprintf 'detached\\n'\nexit 7\n",
+    );
+    let waited = write_script(data.path(), "waited.sh", "#!/bin/sh\nprintf 'waited\\n'\n");
+    let list = ScriptList::new(vec![
+        not_waited_for(detached.clone()),
+        ScriptListEntry::new(waited.clone()),
+    ])
+    .unwrap();
+
+    // The first script cannot end until its gate opens, so a pass that
+    // returns before then did not wait for it. Its exit status would have
+    // made the pass a warning had it counted.
+    let report = executor(&db, data.path())
+        .execute_job(
+            110,
+            list,
+            context(110, working_directory.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.summary, PostProcessingSummary::Succeeded);
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].script, waited);
+    assert!(!report.results[0].background);
+    assert!(db.event_script_results(110).unwrap().is_empty());
+
+    open_gate(gate).await;
+    db.background_scripts_settled().await;
+    let recorded = db.event_script_results(110).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].script, detached);
+    assert!(recorded[0].background);
+    assert_eq!(recorded[0].status, ScriptStatus::Warning);
+    assert_eq!(recorded[0].exit_code, Some(7));
+    assert_eq!(recorded[0].output_tail, "detached\n");
+    let pass = db.job_post_processing_results(110).unwrap();
+    assert_eq!(pass.len(), 1, "the pass is as it ended");
+    assert_eq!(pass[0].script, waited);
+}
+
+#[tokio::test]
+async fn a_list_with_nothing_to_wait_for_does_not_queue_behind_another_job() {
+    let data = tempfile::tempdir().unwrap();
+    let working_directory = data.path().join("work");
+    fs::create_dir_all(&working_directory).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    enable_execution(&db);
+    finished_job(&db, 112, &working_directory);
+    let release = gate(&working_directory, "release");
+
+    // One job at a time is post-processed here, and this one stays in that
+    // place until it is released.
+    let holder = write_script(
+        data.path(),
+        "holder.sh",
+        "#!/bin/sh\nread line < \"$SAB_COMPLETE_DIR/release\"\n",
+    );
+    let quick = write_script(data.path(), "quick.sh", "#!/bin/sh\nprintf 'quick\\n'\n");
+    let executor = executor(&db, data.path());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let holding = {
+        let executor = executor.clone();
+        let list = ScriptList::new(vec![ScriptListEntry::new(holder)]).unwrap();
+        let context = context(111, working_directory.clone());
+        tokio::spawn(async move {
+            executor
+                .execute_job(111, list, context, None, Some(started_tx))
+                .await
+        })
+    };
+    started_rx.await.unwrap();
+
+    let missing = ScriptName::new("renamed.sh").unwrap();
+    let list = ScriptList::new(vec![
+        not_waited_for(missing.clone()),
+        not_waited_for(quick.clone()),
+    ])
+    .unwrap();
+    let report = executor
+        .execute_job(
+            112,
+            list,
+            context(112, working_directory.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.summary, PostProcessingSummary::NotRun);
+    assert!(report.results.is_empty());
+
+    db.background_scripts_settled().await;
+    let recorded = db.event_script_results(112).unwrap();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded.iter().all(|result| result.background));
+    let ran = recorded
+        .iter()
+        .find(|result| result.script == quick)
+        .unwrap();
+    assert_eq!(ran.status, ScriptStatus::Succeeded);
+    assert_eq!(ran.output_tail, "quick\n");
+    // A script that could not be started has nowhere else to say so.
+    let unstarted = recorded
+        .iter()
+        .find(|result| result.script == missing)
+        .unwrap();
+    assert_eq!(unstarted.status, ScriptStatus::Warning);
+    assert!(
+        unstarted
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("renamed.sh")
+    );
+
+    open_gate(release).await;
+    let held = holding.await.unwrap().unwrap();
+    assert_eq!(held.summary, PostProcessingSummary::Succeeded);
+}
+
+#[tokio::test]
+async fn cancelling_a_job_stops_a_script_nothing_waits_for() {
+    let data = tempfile::tempdir().unwrap();
+    let working_directory = data.path().join("work");
+    fs::create_dir_all(&working_directory).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    enable_execution(&db);
+    finished_job(&db, 113, &working_directory);
+    let started = gate(&working_directory, "started");
+    // Never opened: only the cancel can end the script.
+    gate(&working_directory, "never");
+
+    let detached = write_script(
+        data.path(),
+        "detached.sh",
+        "#!/bin/sh\nprintf 'up\\n' > \"$SAB_COMPLETE_DIR/started\"\nread line < \"$SAB_COMPLETE_DIR/never\"\n",
+    );
+    let executor = executor(&db, data.path());
+    let list = ScriptList::new(vec![not_waited_for(detached.clone())]).unwrap();
+    executor
+        .execute_job(
+            113,
+            list,
+            context(113, working_directory.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !db.cancel_background_scripts(999),
+        "another job's cancel finds nothing to stop"
+    );
+
+    wait_at_gate(started).await;
+    assert!(
+        !executor.cancel_job(113),
+        "the pass is over, so there is none to stop"
+    );
+    db.background_scripts_settled().await;
+    let recorded = db.event_script_results(113).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].script, detached);
+    assert!(recorded[0].background);
+    assert_eq!(recorded[0].status, ScriptStatus::Cancelled);
 }

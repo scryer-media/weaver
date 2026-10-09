@@ -203,6 +203,7 @@ async fn run_scheduled_script(
         script,
         enabled: true,
         timeout_seconds: None,
+        blocking: true,
     });
     if !implicit {
         script_entry.enabled = true;

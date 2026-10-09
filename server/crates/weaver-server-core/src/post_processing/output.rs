@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 
-use super::model::{EventScriptSettings, ScriptEventLabel, ScriptResult};
+use super::model::{EventScriptSettings, ScriptEventLabel, ScriptKind, ScriptResult};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
@@ -10,6 +10,28 @@ const EXCERPT_BYTES: usize = 4096;
 
 fn error(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
+}
+
+/// Which recorded runs to list. An unset field matches every run.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ScriptRunFilter {
+    pub job_id: Option<u64>,
+    pub script: Option<String>,
+    pub kind: Option<ScriptKind>,
+}
+
+/// One recorded run of a script, whatever started it.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ScriptRun {
+    /// Names the run's kept output, when `output_retained`.
+    pub id: String,
+    /// Position in the order runs were recorded; later runs are higher.
+    pub seq: i64,
+    pub job_id: Option<u64>,
+    /// Known once the job has reached history.
+    pub job_name: Option<String>,
+    pub output_retained: bool,
+    pub result: ScriptResult,
 }
 
 pub fn excerpt(output: &[u8]) -> String {
@@ -57,6 +79,21 @@ pub async fn retain_output(
             compressed.clear();
         }
         db.insert_script_output(job_id, result, output.len(), compressed, limits)
+    })
+    .await
+    .map_err(error)?
+}
+
+/// Record a result that has no output to keep, such as a script that could
+/// not be started.
+pub(crate) async fn retain_result(
+    db: Database,
+    job_id: Option<u64>,
+    result: ScriptResult,
+    limits: EventScriptSettings,
+) -> Result<ScriptResult, StateError> {
+    tokio::task::spawn_blocking(move || {
+        db.insert_script_output(job_id, result, 0, Vec::new(), limits)
     })
     .await
     .map_err(error)?
@@ -162,11 +199,80 @@ impl Database {
         })
     }
 
+    /// The job's runs that are not part of a post-processing pass: its event
+    /// scripts, and the post-processing scripts nothing waited for.
     pub fn event_script_results(&self, job_id: u64) -> Result<Vec<ScriptResult>, StateError> {
         let datastore = self.datastore();
         let job_id = i64::try_from(job_id).map_err(error)?;
+        let results: Vec<ScriptResult> = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(datastore.read_exec(), "SELECT result_json FROM script_outputs WHERE job_id = {} ORDER BY seq DESC LIMIT 128", &[SqlArg::I64(job_id)]).await?.into_iter().map(|row| serde_json::from_str(&row.text("result_json")?).map_err(error)).collect()
+        })?;
+        Ok(results
+            .into_iter()
+            .filter(|result| result.event != ScriptEventLabel::PostProcessing || result.background)
+            .collect())
+    }
+
+    /// Recorded runs, latest first. `before` continues a listing below the
+    /// `seq` of the last run already returned.
+    pub fn script_runs(
+        &self,
+        filter: ScriptRunFilter,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<ScriptRun>, StateError> {
+        let datastore = self.datastore();
+        let mut conditions = Vec::new();
+        let mut args = Vec::new();
+        if let Some(job_id) = filter.job_id {
+            conditions.push("o.job_id = {}");
+            args.push(SqlArg::I64(i64::try_from(job_id).map_err(error)?));
+        }
+        if let Some(script) = filter.script {
+            conditions.push("o.script = {}");
+            args.push(SqlArg::Text(script));
+        }
+        if let Some(kind) = filter.kind {
+            conditions.push(match kind {
+                ScriptKind::PostProcessing => "o.event = 'post_processing'",
+                ScriptKind::Queue => "o.event LIKE 'queue:%'",
+                ScriptKind::Scan => "o.event = 'scan'",
+                ScriptKind::Scheduler => "o.event LIKE 'scheduler:%'",
+                ScriptKind::Feed => "o.event LIKE 'feed:%'",
+            });
+        }
+        if let Some(before) = before {
+            conditions.push("o.seq < {}");
+            args.push(SqlArg::I64(before));
+        }
+        let mut sql = String::from(
+            "SELECT o.id, o.seq, o.job_id, o.stored_bytes, o.result_json, h.name AS job_name FROM script_outputs o LEFT JOIN job_history h ON h.job_id = o.job_id",
+        );
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY o.seq DESC LIMIT {}");
+        args.push(SqlArg::I64(i64::from(limit)));
         self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_all(datastore.read_exec(), "SELECT result_json FROM script_outputs WHERE job_id = {} AND event <> 'post_processing' ORDER BY seq DESC LIMIT 128", &[SqlArg::I64(job_id)]).await?.into_iter().map(|row| serde_json::from_str(&row.text("result_json")?).map_err(error)).collect()
+            SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    Ok(ScriptRun {
+                        id: row.text("id")?,
+                        seq: row.i64("seq")?,
+                        job_id: row
+                            .opt_i64("job_id")?
+                            .map(u64::try_from)
+                            .transpose()
+                            .map_err(error)?,
+                        job_name: row.opt_text("job_name")?,
+                        output_retained: row.i64("stored_bytes")? > 0,
+                        result: serde_json::from_str(&row.text("result_json")?).map_err(error)?,
+                    })
+                })
+                .collect()
         })
     }
 }
@@ -243,6 +349,7 @@ mod tests {
             script: ScriptName::new("test.sh").unwrap(),
             event,
             output_id: None,
+            background: false,
             adapter: ScriptAdapter::Nzbget,
             status: ScriptStatus::Succeeded,
             exit_code: Some(93),
@@ -446,5 +553,168 @@ mod tests {
         .unwrap();
         assert!(late.output_id.is_none());
         assert!(db.event_script_results(1).unwrap().is_empty());
+    }
+
+    fn named(event: ScriptEventLabel, script: &str) -> ScriptResult {
+        ScriptResult {
+            script: ScriptName::new(script).unwrap(),
+            ..result(event)
+        }
+    }
+
+    fn history(db: &Database, job_id: u64, name: &str) {
+        db.insert_job_history(&crate::JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: name.into(),
+            status: "complete".into(),
+            error_message: None,
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1_000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+            server_attribution: None,
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_jobs_runs_outside_its_pass_include_the_scripts_nothing_waited_for() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        let limits = EventScriptSettings::default();
+        for (script, background) in [("pass.sh", false), ("detached.sh", true)] {
+            let result = ScriptResult {
+                background,
+                ..named(ScriptEventLabel::PostProcessing, script)
+            };
+            retain_output(db.clone(), Some(1), result, b"out".to_vec(), limits.clone())
+                .await
+                .unwrap();
+        }
+        let results = db.event_script_results(1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].script.as_str(), "detached.sh");
+        assert!(results[0].background);
+    }
+
+    #[tokio::test]
+    async fn a_result_with_nothing_to_show_is_kept_without_output() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        let kept = retain_result(
+            db.clone(),
+            Some(1),
+            named(ScriptEventLabel::PostProcessing, "missing.sh"),
+            EventScriptSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert!(kept.output_id.is_none());
+        let runs = db.script_runs(Default::default(), None, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].result.script.as_str(), "missing.sh");
+        assert!(!runs[0].output_retained);
+    }
+
+    #[tokio::test]
+    async fn runs_are_listed_latest_first_whatever_started_them() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        history(&db, 2, "finished job");
+        let limits = EventScriptSettings::default();
+        let added = ScriptEventLabel::Queue(super::super::model::QueueEvent::NzbAdded);
+        let recorded = [
+            (Some(1), ScriptEventLabel::PostProcessing, "pass.sh"),
+            (Some(2), added, "queue.sh"),
+            (None, ScriptEventLabel::Scan, "scan.sh"),
+            (None, ScriptEventLabel::Scheduler(4), "nightly.sh"),
+            (None, ScriptEventLabel::Feed(9), "feed.sh"),
+            (Some(2), ScriptEventLabel::PostProcessing, "pass.sh"),
+        ];
+        for (job_id, event, script) in recorded.clone() {
+            retain_output(
+                db.clone(),
+                job_id,
+                named(event, script),
+                script.as_bytes().to_vec(),
+                limits.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        let scripts = |runs: &[ScriptRun]| {
+            runs.iter()
+                .map(|run| (run.job_id, run.result.script.to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        let all = db.script_runs(Default::default(), None, 10).unwrap();
+        assert_eq!(
+            scripts(&all),
+            recorded
+                .iter()
+                .rev()
+                .map(|(job_id, _, script)| (*job_id, script.to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert!(all.iter().all(|run| run.output_retained));
+        assert!(all.windows(2).all(|pair| pair[0].seq > pair[1].seq));
+        // A job still in the queue has no name to show; one in history does.
+        assert_eq!(all[0].job_name.as_deref(), Some("finished job"));
+        assert_eq!(all[5].job_name, None);
+        assert_eq!(
+            db.script_output(&all[2].id).unwrap().as_deref(),
+            Some("nightly.sh"),
+            "a run that belongs to no job still has its output"
+        );
+
+        // Each page continues below the last run of the one before it.
+        let first = db.script_runs(Default::default(), None, 4).unwrap();
+        assert_eq!(scripts(&first), scripts(&all[..4]));
+        let rest = db
+            .script_runs(Default::default(), Some(first[3].seq), 4)
+            .unwrap();
+        assert_eq!(scripts(&rest), scripts(&all[4..]));
+
+        let by = |filter: ScriptRunFilter| scripts(&db.script_runs(filter, None, 10).unwrap());
+        let kind = |kind| ScriptRunFilter {
+            kind: Some(kind),
+            ..Default::default()
+        };
+        assert_eq!(
+            by(kind(ScriptKind::PostProcessing)),
+            [(Some(2), "pass.sh".into()), (Some(1), "pass.sh".into())]
+        );
+        assert_eq!(by(kind(ScriptKind::Queue)), [(Some(2), "queue.sh".into())]);
+        assert_eq!(by(kind(ScriptKind::Scan)), [(None, "scan.sh".into())]);
+        assert_eq!(
+            by(kind(ScriptKind::Scheduler)),
+            [(None, "nightly.sh".into())]
+        );
+        assert_eq!(by(kind(ScriptKind::Feed)), [(None, "feed.sh".into())]);
+        assert_eq!(
+            by(ScriptRunFilter {
+                job_id: Some(2),
+                ..Default::default()
+            }),
+            [(Some(2), "pass.sh".into()), (Some(2), "queue.sh".into())]
+        );
+        assert_eq!(
+            by(ScriptRunFilter {
+                script: Some("pass.sh".into()),
+                job_id: Some(1),
+                ..Default::default()
+            }),
+            [(Some(1), "pass.sh".into())]
+        );
     }
 }

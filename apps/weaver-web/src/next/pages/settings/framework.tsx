@@ -294,6 +294,14 @@ export interface SettingsTableRowModel {
   cells: ReactNode[];
 }
 
+/** The rows of one kind in a table that lists several kinds under the same columns. */
+export interface SettingsTableGroupModel {
+  id: string;
+  title: string;
+  note?: ReactNode;
+  rows: SettingsTableRowModel[];
+}
+
 export interface SettingsTableModel {
   kind: "table";
   id: string;
@@ -305,6 +313,12 @@ export interface SettingsTableModel {
   columns: string;
   headers: ReactNode[];
   rows: SettingsTableRowModel[];
+  /**
+   * Rows that fall into kinds: each group follows `rows` under a heading of
+   * its own, and a group with no rows is not drawn. One list with headings
+   * keeps one set of columns and one "Add", where a table per kind repeats both.
+   */
+  groups?: SettingsTableGroupModel[];
   onRowClick?: (id: string) => void;
   empty?: string;
   /**
@@ -373,7 +387,15 @@ export function SettingsBlocks({
         const rows = block.rows.filter((row) =>
           matches(row.searchText, search),
         );
-        return rows.length > 0 ? { ...block, rows } : null;
+        // A group's heading answers for its rows, as a block's title does.
+        const groups = (block.groups ?? []).map((group) =>
+          matches(group.title, search)
+            ? group
+            : { ...group, rows: group.rows.filter((row) => matches(row.searchText, search)) },
+        );
+        return rows.length > 0 || groups.some((group) => group.rows.length > 0)
+          ? { ...block, rows, groups }
+          : null;
       }
       return matches(block.searchText, search) ? block : null;
     })
@@ -428,6 +450,39 @@ export function SettingsBlocks({
  */
 function SettingsTable({ block }: { block: SettingsTableModel }) {
   const t = useTranslate();
+  const groups = (block.groups ?? []).filter((group) => group.rows.length > 0);
+  const row = (entry: SettingsTableRowModel) => {
+    const onRowClick = block.onRowClick;
+    const interactive = typeof onRowClick === "function";
+    return (
+      <div
+        key={entry.id}
+        {...(interactive
+          ? {
+              role: "button",
+              tabIndex: 0,
+              onClick: () => onRowClick?.(entry.id),
+              onKeyDown: (event: React.KeyboardEvent) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  onRowClick?.(entry.id);
+                }
+              },
+            }
+          : {})}
+        className={`grid items-center gap-5 border-b border-wv-hairline px-4 sm:px-6 py-3 text-[12.5px] text-wv-fg hover:bg-wv-cell-hover${
+          interactive ? " cursor-pointer" : ""
+        }`}
+        style={{ gridTemplateColumns: block.columns }}
+      >
+        {entry.cells.map((cell, index) => (
+          <div key={index} className="flex min-w-0 items-center">
+            {cell}
+          </div>
+        ))}
+      </div>
+    );
+  };
   return (
     <div className="min-w-0 overflow-x-auto">
       <div className="min-w-[640px]">
@@ -441,7 +496,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             </Eyebrow>
           ))}
         </div>
-        {block.rows.length === 0 ? (
+        {block.rows.length === 0 && groups.length === 0 ? (
           <div className="flex flex-col items-start gap-3 px-4 sm:px-6 py-5">
             <span className="text-[13px] text-wv-muted">{block.empty ?? t("next.settings.nothingConfigured")}</span>
             {block.emptyAction === undefined ? null : (
@@ -451,38 +506,20 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             )}
           </div>
         ) : (
-          block.rows.map((row) => {
-            const onRowClick = block.onRowClick;
-            const interactive = typeof onRowClick === "function";
-            return (
-              <div
-                key={row.id}
-                {...(interactive
-                  ? {
-                      role: "button",
-                      tabIndex: 0,
-                      onClick: () => onRowClick?.(row.id),
-                      onKeyDown: (event: React.KeyboardEvent) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          onRowClick?.(row.id);
-                        }
-                      },
-                    }
-                  : {})}
-                className={`grid items-center gap-5 border-b border-wv-hairline px-4 sm:px-6 py-3 text-[12.5px] text-wv-fg hover:bg-wv-cell-hover${
-                  interactive ? " cursor-pointer" : ""
-                }`}
-                style={{ gridTemplateColumns: block.columns }}
-              >
-                {row.cells.map((cell, index) => (
-                  <div key={index} className="flex min-w-0 items-center">
-                    {cell}
-                  </div>
-                ))}
-              </div>
-            );
-          })
+          <>
+            {block.rows.map(row)}
+            {groups.map((group) => (
+              <section key={group.id} aria-label={group.title}>
+                <div className="flex items-center gap-[10px] border-b border-wv-hairline px-4 sm:px-6 pb-2 pt-4">
+                  <Eyebrow>{group.title}</Eyebrow>
+                  {group.note === undefined ? null : (
+                    <span className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">{group.note}</span>
+                  )}
+                </div>
+                {group.rows.map(row)}
+              </section>
+            ))}
+          </>
         )}
         {block.footer === undefined ? null : (
           <div className="flex flex-none items-center justify-end gap-[10px] border-b border-wv-hairline px-4 sm:px-6 py-[10px]">

@@ -53,6 +53,8 @@ export const nextRouter = createBrowserRouter(
             { path: "proxies", element: <Navigate to="/settings/networking/proxies" replace /> },
             { path: "bandwidth", element: <Navigate to="/settings/networking/bandwidth" replace /> },
             { path: "networking", element: <Navigate to="/settings/networking/overview" replace /> },
+            { path: "post-processing", element: <Navigate to="/settings/scripts/configuration" replace /> },
+            { path: "scripts", element: <Navigate to="/settings/scripts/configuration" replace /> },
             {
               path: ":panel/*",
               ...lazyRoute(() => import("./pages/settings/SettingsPage"), "SettingsPage"),
