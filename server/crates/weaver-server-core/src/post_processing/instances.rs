@@ -14,7 +14,7 @@ use super::model::{
     ScriptEventLabel, ScriptKind, ScriptName, SecretOptionValue,
 };
 use super::secrets::{SecretRef, secrets_exist_tx};
-use crate::persistence::encryption::decrypt_value;
+use crate::persistence::encryption::{decrypt_value, encrypt_value};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, is_foreign_key_violation};
 use crate::persistence::{Database, StateError};
 
@@ -121,20 +121,25 @@ impl<'de> Deserialize<'de> for InstanceTrigger {
     }
 }
 
-/// One saved input: a plain value, or a link to a named secret. A secret's
-/// value is never read back out for display.
+/// One saved input: a plain value, a link to a named secret, or a secret of
+/// the instance's own. A secret's value is never read back out for display.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceInput {
     pub name: OptionName,
-    /// Empty for a secret.
+    /// Empty for a secret of either kind.
     pub value: String,
     pub secret: Option<SecretRef>,
+    /// The input is a secret of the instance's own: its value is kept sealed
+    /// in the instance's own row, and no named secret stands behind it.
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 impl InstanceInput {
+    /// Whether the input is a secret, linked or the instance's own.
     pub fn is_secret(&self) -> bool {
-        self.secret.is_some()
+        self.secret.is_some() || self.sealed
     }
 }
 
@@ -238,19 +243,45 @@ pub fn resolve_instances(
 pub enum ScriptInstanceError {
     #[error("{0}")]
     Invalid(&'static str),
+    /// An input was sent as a secret of the instance's own with no value, and
+    /// the instance holds none under that name to keep.
+    #[error("input \"{0}\" is marked secret but was given no value, and none is saved for it")]
+    NoOwnSecret(String),
     #[error("script instance does not exist")]
     NotFound,
     #[error(transparent)]
     Storage(#[from] StateError),
 }
 
-/// One input as the operator sent it: exactly one of a plain value or the id
-/// of a secret to link.
-#[derive(Debug, Clone, Eq, PartialEq)]
+/// One input as the operator sent it: a plain value, the id of a secret to
+/// link, or a secret of the instance's own.
+///
+/// A secret of the instance's own is `sealed` with a value to seal, or, on an
+/// update, `sealed` with nothing else to keep the one the instance already
+/// holds under that name.
+#[derive(Clone, Eq, PartialEq)]
 pub struct InstanceInputDraft {
     pub name: String,
     pub value: Option<String>,
     pub secret_id: Option<String>,
+    pub sealed: bool,
+}
+
+/// A value on its way to being sealed is not printed.
+impl fmt::Debug for InstanceInputDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match &self.value {
+            Some(_) if self.sealed => Some("<sealed>"),
+            value => value.as_deref(),
+        };
+        formatter
+            .debug_struct("InstanceInputDraft")
+            .field("name", &self.name)
+            .field("value", &value)
+            .field("secret_id", &self.secret_id)
+            .field("sealed", &self.sealed)
+            .finish()
+    }
 }
 
 impl InstanceInputDraft {
@@ -259,6 +290,7 @@ impl InstanceInputDraft {
             name: name.into(),
             value: Some(value.into()),
             secret_id: None,
+            sealed: false,
         }
     }
 
@@ -267,6 +299,28 @@ impl InstanceInputDraft {
             name: name.into(),
             value: None,
             secret_id: Some(secret_id.into()),
+            sealed: false,
+        }
+    }
+
+    /// A secret of the instance's own, to be sealed from `value`.
+    pub fn sealed(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: Some(value.into()),
+            secret_id: None,
+            sealed: true,
+        }
+    }
+
+    /// The secret of its own the instance already holds under `name`, kept
+    /// as it is.
+    pub fn kept_sealed(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: None,
+            secret_id: None,
+            sealed: true,
         }
     }
 }
@@ -317,6 +371,12 @@ impl ScriptInstanceDraft {
         self
     }
 
+    /// An input that is a secret of the instance's own, sealed from `value`.
+    pub fn sealed_input(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.inputs.push(InstanceInputDraft::sealed(name, value));
+        self
+    }
+
     pub fn category(mut self, category: impl Into<String>) -> Self {
         self.categories.push(category.into());
         self
@@ -337,6 +397,8 @@ impl ScriptInstanceDraft {
         self
     }
 
+    /// `instance` as a draft that saves it back unchanged. A secret of its
+    /// own is carried as one to keep, so its value is never needed.
     pub fn from_instance(instance: &ScriptInstance) -> Self {
         Self {
             name: instance.name.clone(),
@@ -347,6 +409,7 @@ impl ScriptInstanceDraft {
                 .iter()
                 .map(|input| match &input.secret {
                     Some(secret) => InstanceInputDraft::secret(input.name.as_str(), &secret.id),
+                    None if input.sealed => InstanceInputDraft::kept_sealed(input.name.as_str()),
                     None => InstanceInputDraft::plain(input.name.as_str(), &input.value),
                 })
                 .collect(),
@@ -363,6 +426,8 @@ enum Updated {
     Done,
     NotFound,
     MissingSecret,
+    /// The named input was to keep a secret of its own that is not there.
+    NoOwnSecret(String),
 }
 
 const MISSING_SECRET: ScriptInstanceError =
@@ -380,11 +445,31 @@ fn missing_secret_race<T>(result: Result<T, StateError>) -> Result<T, ScriptInst
     })
 }
 
-/// What an input row holds.
+/// What an input row is to hold.
 #[derive(Debug, Clone)]
 enum StoredValue {
     Plain(String),
+    /// The id of the named secret it links.
     Secret(String),
+    /// A secret of the instance's own, already sealed.
+    Sealed(String),
+    /// The secret of its own the instance already holds under this name.
+    KeepSealed,
+}
+
+/// One input row as it is written.
+#[derive(Debug, Clone)]
+struct InputRow {
+    name: String,
+    value: String,
+    secret_id: Option<String>,
+    sealed_value: Option<String>,
+}
+
+/// The form an input's name is compared in: names that differ only by ASCII
+/// case are one input.
+fn input_name_key(name: &str) -> String {
+    name.to_ascii_uppercase()
 }
 
 #[derive(Debug, Clone)]
@@ -406,13 +491,57 @@ impl ValidatedInstance {
             .iter()
             .filter_map(|(_, stored)| match stored {
                 StoredValue::Secret(id) => Some(id.clone()),
-                StoredValue::Plain(_) => None,
+                StoredValue::Plain(_) | StoredValue::Sealed(_) | StoredValue::KeepSealed => None,
+            })
+            .collect()
+    }
+
+    /// Whether any input keeps a secret the instance already holds.
+    fn keeps_sealed(&self) -> bool {
+        self.inputs
+            .iter()
+            .any(|(_, stored)| matches!(stored, StoredValue::KeepSealed))
+    }
+
+    /// The input rows to write. `kept` is the sealed value the instance
+    /// already holds under each input name, by compared name. The error is
+    /// the name of an input that was to keep one that is not there.
+    fn input_rows(&self, kept: &BTreeMap<String, String>) -> Result<Vec<InputRow>, String> {
+        self.inputs
+            .iter()
+            .map(|(name, stored)| {
+                let (value, secret_id, sealed_value) = match stored {
+                    StoredValue::Plain(value) => (value.clone(), None, None),
+                    StoredValue::Secret(secret_id) => {
+                        (String::new(), Some(secret_id.clone()), None)
+                    }
+                    StoredValue::Sealed(sealed) => (String::new(), None, Some(sealed.clone())),
+                    StoredValue::KeepSealed => match kept.get(&input_name_key(name)) {
+                        Some(sealed) => (String::new(), None, Some(sealed.clone())),
+                        None => return Err(name.clone()),
+                    },
+                };
+                Ok(InputRow {
+                    name: name.clone(),
+                    value,
+                    secret_id,
+                    sealed_value,
+                })
             })
             .collect()
     }
 }
 
 impl Database {
+    /// Seal the value of a secret of an instance's own. Refused without an
+    /// encryption key, as storing a named secret is.
+    fn seal_input(&self, value: &str) -> Result<String, ScriptInstanceError> {
+        let key = self.encryption_key().ok_or(ScriptInstanceError::Invalid(
+            "an encryption key is required to store a secret",
+        ))?;
+        encrypt_value(key, value).map_err(|error| ScriptInstanceError::Storage(storage(error)))
+    }
+
     fn validate_script_instance(
         &self,
         draft: ScriptInstanceDraft,
@@ -463,17 +592,27 @@ impl Database {
         for input in draft.inputs {
             let name = OptionName::new(input.name.trim())
                 .map_err(|_| ScriptInstanceError::Invalid("input name is invalid"))?;
-            if !seen.insert(name.as_str().to_ascii_uppercase()) {
+            if !seen.insert(input_name_key(name.as_str())) {
                 return Err(ScriptInstanceError::Invalid("input names must be unique"));
             }
-            let stored = match (input.value, input.secret_id) {
-                (Some(value), None) => {
+            let stored = match (input.value, input.secret_id, input.sealed) {
+                (Some(value), None, sealed) => {
                     if value.len() > MAX_INPUT_VALUE_BYTES || value.contains('\0') {
                         return Err(ScriptInstanceError::Invalid("input value is invalid"));
                     }
-                    StoredValue::Plain(value)
+                    if sealed {
+                        StoredValue::Sealed(self.seal_input(&value)?)
+                    } else {
+                        StoredValue::Plain(value)
+                    }
                 }
-                (None, Some(secret_id)) => StoredValue::Secret(secret_id),
+                (None, Some(secret_id), false) => StoredValue::Secret(secret_id),
+                (None, None, true) => StoredValue::KeepSealed,
+                (_, Some(_), true) => {
+                    return Err(ScriptInstanceError::Invalid(
+                        "an input is a secret of its own or a link to a named secret, not both",
+                    ));
+                }
                 _ => {
                     return Err(ScriptInstanceError::Invalid(
                         "an input holds either a value or a secret",
@@ -482,7 +621,8 @@ impl Database {
             };
             inputs.push((name.as_str().to_string(), stored));
         }
-        // Linked secrets are checked inside the write's transaction.
+        // Linked secrets, and secrets of its own that are to be kept, are
+        // checked inside the write's transaction.
         Ok(ValidatedInstance {
             name,
             script: draft.script.as_str().to_string(),
@@ -535,8 +675,10 @@ impl Database {
             .await?;
             let inputs = SqlRuntime::fetch_all(
                 datastore.read_exec(),
+                // A sealed value is never read here, only whether there is one.
                 &format!(
-                    "SELECT i.instance_id, i.name, i.value, i.secret_id, s.name AS secret_name
+                    "SELECT i.instance_id, i.name, i.value, i.secret_id, s.name AS secret_name,
+                            (i.sealed_value IS NOT NULL) AS sealed
                        FROM script_instance_inputs i
                        LEFT JOIN secrets s ON s.id = i.secret_id
                       {input_filter}
@@ -567,17 +709,19 @@ impl Database {
                     }),
                     None => None,
                 };
+                let sealed = row.bool("sealed")?;
                 inputs_by_instance
                     .entry(row.text("instance_id")?)
                     .or_default()
                     .push(InstanceInput {
                         name,
-                        value: if secret.is_some() {
+                        value: if secret.is_some() || sealed {
                             String::new()
                         } else {
                             row.text("value")?
                         },
                         secret,
+                        sealed,
                     });
             }
             let mut categories_by_instance = BTreeMap::<String, Vec<String>>::new();
@@ -646,6 +790,10 @@ impl Database {
         draft: ScriptInstanceDraft,
     ) -> Result<ScriptInstance, ScriptInstanceError> {
         let instance = self.validate_script_instance(draft)?;
+        // A new instance holds no secret of its own to keep.
+        let rows = instance
+            .input_rows(&BTreeMap::new())
+            .map_err(ScriptInstanceError::NoOwnSecret)?;
         let mut entropy = [0_u8; 12];
         getrandom::fill(&mut entropy).map_err(storage)?;
         let id = hex::encode(entropy);
@@ -655,12 +803,13 @@ impl Database {
         let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_script_instance", |tx| {
                 let instance = instance.clone();
+                let rows = rows.clone();
                 let id = id.clone();
                 Box::pin(async move {
                     if !secrets_exist_tx(tx, &instance.linked_secrets()).await? {
                         return Ok(false);
                     }
-                    insert_instance_tx(tx, &id, &instance, now).await?;
+                    insert_instance_tx(tx, &id, &instance, &rows, now).await?;
                     Ok(true)
                 })
             })
@@ -691,6 +840,23 @@ impl Database {
                     if !secrets_exist_tx(tx, &instance.linked_secrets()).await? {
                         return Ok(Updated::MissingSecret);
                     }
+                    // Read before the rows are replaced: a secret of its own
+                    // that is kept is carried across sealed, as it is stored.
+                    let kept = if instance.keeps_sealed() {
+                        sealed_inputs_tx(tx, &id).await?
+                    } else {
+                        BTreeMap::new()
+                    };
+                    let rows = match instance.input_rows(&kept) {
+                        Ok(rows) => rows,
+                        Err(name) => {
+                            return Ok(if instance_exists_tx(tx, &id).await? {
+                                Updated::NoOwnSecret(name)
+                            } else {
+                                Updated::NotFound
+                            });
+                        }
+                    };
                     let (kind, detail) = instance.trigger.stored();
                     let updated = tx
                         .execute(
@@ -729,7 +895,7 @@ impl Database {
                         )
                         .await?;
                     }
-                    insert_instance_details_tx(tx, &id, &instance).await?;
+                    insert_instance_details_tx(tx, &id, &rows, &instance.categories).await?;
                     Ok(Updated::Done)
                 })
             })
@@ -740,6 +906,7 @@ impl Database {
             Updated::Done => {}
             Updated::NotFound => return Err(ScriptInstanceError::NotFound),
             Updated::MissingSecret => return Err(MISSING_SECRET),
+            Updated::NoOwnSecret(name) => return Err(ScriptInstanceError::NoOwnSecret(name)),
         }
         self.script_instance(id)?
             .ok_or(ScriptInstanceError::NotFound)
@@ -835,7 +1002,8 @@ impl Database {
         result
     }
 
-    /// An instance's inputs as a run receives them, secrets included. `None`
+    /// An instance's inputs as a run receives them, secrets included: a
+    /// secret of its own is handed over exactly as a linked one is. `None`
     /// when the instance is gone.
     pub(crate) fn script_instance_run_inputs(
         &self,
@@ -856,7 +1024,7 @@ impl Database {
             }
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT i.name, i.value, i.secret_id, s.value AS sealed
+                "SELECT i.name, i.value, i.secret_id, i.sealed_value, s.value AS linked_value
                    FROM script_instance_inputs i
                    LEFT JOIN secrets s ON s.id = i.secret_id
                   WHERE i.instance_id = {} ORDER BY i.position, i.name",
@@ -865,12 +1033,14 @@ impl Database {
             .await?
             .into_iter()
             .map(|row| {
-                let linked = row.opt_text("secret_id")?.is_some();
-                Ok((
-                    row.text("name")?,
-                    row.text("value")?,
-                    linked.then(|| row.opt_text("sealed")).transpose()?,
-                ))
+                // `Some` for a secret: the sealed value of the linked secret,
+                // or else the one the row holds itself.
+                let sealed = if row.opt_text("secret_id")?.is_some() {
+                    Some(row.opt_text("linked_value")?)
+                } else {
+                    row.opt_text("sealed_value")?.map(Some)
+                };
+                Ok((row.text("name")?, row.text("value")?, sealed))
             })
             .collect::<Result<Vec<_>, StateError>>()
             .map(Some)
@@ -1022,10 +1192,44 @@ pub(crate) async fn set_feed_scripts_tx(
     Ok(())
 }
 
+/// The sealed value of each secret of its own an instance holds, by compared
+/// input name.
+async fn sealed_inputs_tx(
+    tx: &mut SqlTx<'_>,
+    id: &str,
+) -> Result<BTreeMap<String, String>, StateError> {
+    let mut sealed = BTreeMap::new();
+    for row in tx
+        .fetch_all(
+            "SELECT name, sealed_value FROM script_instance_inputs
+              WHERE instance_id = {} AND sealed_value IS NOT NULL",
+            &[SqlArg::Text(id.into())],
+        )
+        .await?
+    {
+        sealed.insert(
+            input_name_key(&row.text("name")?),
+            row.text("sealed_value")?,
+        );
+    }
+    Ok(sealed)
+}
+
+async fn instance_exists_tx(tx: &mut SqlTx<'_>, id: &str) -> Result<bool, StateError> {
+    Ok(tx
+        .fetch_optional(
+            "SELECT id FROM script_instances WHERE id = {}",
+            &[SqlArg::Text(id.into())],
+        )
+        .await?
+        .is_some())
+}
+
 async fn insert_instance_tx(
     tx: &mut SqlTx<'_>,
     id: &str,
     instance: &ValidatedInstance,
+    rows: &[InputRow],
     now: i64,
 ) -> Result<(), StateError> {
     let next = tx
@@ -1058,33 +1262,32 @@ async fn insert_instance_tx(
         ],
     )
     .await?;
-    insert_instance_details_tx(tx, id, instance).await
+    insert_instance_details_tx(tx, id, rows, &instance.categories).await
 }
 
 async fn insert_instance_details_tx(
     tx: &mut SqlTx<'_>,
     id: &str,
-    instance: &ValidatedInstance,
+    rows: &[InputRow],
+    categories: &[String],
 ) -> Result<(), StateError> {
-    for (position, (name, stored)) in instance.inputs.iter().enumerate() {
-        let (value, secret_id) = match stored {
-            StoredValue::Plain(value) => (value.clone(), None),
-            StoredValue::Secret(secret_id) => (String::new(), Some(secret_id.clone())),
-        };
+    for (position, row) in rows.iter().enumerate() {
         tx.execute(
-            "INSERT INTO script_instance_inputs (instance_id, name, value, secret_id, position)
-             VALUES ({}, {}, {}, {}, {})",
+            "INSERT INTO script_instance_inputs
+                (instance_id, name, value, secret_id, sealed_value, position)
+             VALUES ({}, {}, {}, {}, {}, {})",
             &[
                 SqlArg::Text(id.into()),
-                SqlArg::Text(name.clone()),
-                SqlArg::Text(value),
-                SqlArg::OptText(secret_id),
+                SqlArg::Text(row.name.clone()),
+                SqlArg::Text(row.value.clone()),
+                SqlArg::OptText(row.secret_id.clone()),
+                SqlArg::OptText(row.sealed_value.clone()),
                 SqlArg::I64(position as i64),
             ],
         )
         .await?;
     }
-    for category in &instance.categories {
+    for category in categories {
         tx.execute(
             "INSERT INTO script_instance_categories (instance_id, category) VALUES ({}, {})",
             &[SqlArg::Text(id.into()), SqlArg::Text(category.clone())],

@@ -836,7 +836,7 @@ async fn an_instance_gives_its_script_the_inputs_it_holds_and_nothing_else() {
     .unwrap();
     fs::write(
         package.join("run.sh"),
-        "#!/bin/sh\nprintf 'HOST=%s TOKEN=%s PORT=%s/%s/%s\\n' \"${NZBPO_Host-unset}\" \"$NZBPO_Token\" \"$NZBPO_Port\" \"$SAB_OPTION_PORT\" \"$WEAVER_INPUT_PORT\" > \"$NZBPP_DIRECTORY/env.txt\"\nexit 93\n",
+        "#!/bin/sh\nprintf 'HOST=%s TOKEN=%s PASS=%s PORT=%s/%s/%s\\n' \"${NZBPO_Host-unset}\" \"$NZBPO_Token\" \"$NZBPO_Pass\" \"$NZBPO_Port\" \"$SAB_OPTION_PORT\" \"$WEAVER_INPUT_PORT\" > \"$NZBPP_DIRECTORY/env.txt\"\nexit 93\n",
     )
     .unwrap();
     fs::set_permissions(package.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -848,6 +848,7 @@ async fn an_instance_gives_its_script_the_inputs_it_holds_and_nothing_else() {
         .create_script_instance(
             draft(&script)
                 .secret_input("Token", &token.id)
+                .sealed_input("Pass", "hunter4")
                 .input("Port", "587"),
         )
         .unwrap();
@@ -855,8 +856,25 @@ async fn an_instance_gives_its_script_the_inputs_it_holds_and_nothing_else() {
         saved
             .inputs
             .iter()
-            .all(|input| input.secret.is_none() || input.value.is_empty())
+            .all(|input| !input.is_secret() || input.value.is_empty())
     );
+    assert_eq!(
+        saved
+            .inputs
+            .iter()
+            .map(|input| (input.name.as_str(), input.secret.is_some(), input.sealed))
+            .collect::<Vec<_>>(),
+        [
+            ("Token", true, false),
+            ("Pass", false, true),
+            ("Port", false, false)
+        ]
+    );
+    // Saved again as it was read, the instance still holds the secret of its
+    // own, which nothing ever handed back.
+    let saved = db
+        .update_script_instance(&saved.id, ScriptInstanceDraft::from_instance(&saved))
+        .unwrap();
 
     let list = vec![saved];
     let report = executor(&db, data.path())
@@ -874,9 +892,12 @@ async fn an_instance_gives_its_script_the_inputs_it_holds_and_nothing_else() {
     let env = fs::read_to_string(working_directory.join("env.txt")).unwrap();
     // What was saved is what the script is given, under every naming: a
     // default the script declares is not filled in, an input it does not
-    // declare is passed on, and the stored secret is decrypted for the
-    // process only.
-    assert_eq!(env.trim(), "HOST=unset TOKEN=hunter2 PORT=587/587/587");
+    // declare is passed on, and a stored secret, named or the instance's
+    // own, is decrypted for the process only.
+    assert_eq!(
+        env.trim(),
+        "HOST=unset TOKEN=hunter2 PASS=hunter4 PORT=587/587/587"
+    );
 }
 
 #[tokio::test]

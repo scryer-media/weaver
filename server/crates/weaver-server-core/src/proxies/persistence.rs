@@ -71,6 +71,11 @@ impl Database {
         profile: &ProxyProfile,
         reset_trust: bool,
     ) -> Result<ProxyProfile, StateError> {
+        let mut profile = profile.clone();
+        // SSH authenticates with an Ed25519 key alone, so no password is kept for it.
+        if profile.kind == super::ProxyKind::Ssh {
+            profile.secrets.password = None;
+        }
         profile.validate().map_err(error)?;
         let key = self
             .encryption_key()
@@ -80,7 +85,6 @@ impl Database {
             &serde_json::to_string(&profile.secrets).map_err(error)?,
         )
         .map_err(error)?;
-        let profile = profile.clone();
         let store = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&store, "save_proxy_profile", |tx| {

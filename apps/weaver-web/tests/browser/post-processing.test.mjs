@@ -381,10 +381,23 @@ test("a new instance starts from what the chosen script's header declares", asyn
 
     await field(editor, "Job name").fill("Archive movies");
     await pick(page, editor, "Key", "Spare key");
-    const categories = editor.getByRole("group", { name: "Categories", exact: true });
-    assert.deepEqual(await categories.getByRole("button").allTextContents(), ["movies", "tv"]);
-    await action(categories, "movies").click();
-    await categories.locator('[aria-pressed="true"]').and(action(categories, "movies")).waitFor();
+    // Categories are one dropdown: it says every category until some are ticked, then names them.
+    const categories = action(editor, "Categories");
+    await categories.getByText("Every category", { exact: true }).waitFor();
+    await categories.click();
+    const choices = page.getByRole("menuitemcheckbox");
+    assert.deepEqual(await choices.allTextContents(), ["movies", "tv"]);
+    assert.deepEqual(await choices.evaluateAll((all) => all.map((one) => one.getAttribute("aria-checked"))), ["false", "false"]);
+    // Ticking leaves the menu open, so several can be chosen in one go, and a tick comes off again.
+    await choices.nth(1).click();
+    await choices.nth(0).click();
+    await categories.getByText("movies, tv", { exact: true }).waitFor();
+    await shot(page, "instance-editor-categories", { resize: false });
+    await choices.nth(1).click();
+    await categories.getByText("movies", { exact: true }).waitFor();
+    assert.deepEqual(await choices.evaluateAll((all) => all.map((one) => one.getAttribute("aria-checked"))), ["true", "false"]);
+    await page.keyboard.press("Escape");
+    await choices.first().waitFor({ state: "detached" });
     await editor.getByRole("radio", { name: "Fire and forget", exact: true }).click();
     const timeout = editor.getByRole("spinbutton", { name: "Timeout", exact: true });
     await timeout.fill("120");
@@ -463,7 +476,7 @@ test("a queue instance names its event, and each input the header declares draws
     ]);
     await page.getByRole("menuitemradio", { name: "NZB_DOWNLOADED", exact: true }).click();
     // Only a download has a category, so only its triggers can be narrowed to one.
-    const categories = editor.getByRole("group", { name: "Categories", exact: true });
+    const categories = action(editor, "Categories");
     assert.equal(await categories.count(), 1);
     await pick(page, editor, "Trigger", "Schedule");
     await categories.waitFor({ state: "detached" });
@@ -489,14 +502,17 @@ test("a job for downloads says there are no categories when none are defined", a
   try {
     const editor = await edit(page, "Notify");
     await editor.getByText("No categories defined", { exact: true }).waitFor();
-    assert.equal(await editor.getByRole("group", { name: "Categories", exact: true }).count(), 0);
+    assert.equal(await action(editor, "Categories").count(), 0);
     assert.equal(await editor.getByText("Every category", { exact: true }).count(), 0);
     await shot(page, "instance-editor-no-categories");
     await action(editor, "Cancel").click();
     await editor.waitFor({ state: "detached" });
     // A category a job was saved with is still offered, so it can be taken off.
     const narrowed = await edit(page, "Tidy tv");
-    assert.deepEqual(await narrowed.getByRole("group", { name: "Categories", exact: true }).getByRole("button").allTextContents(), ["tv"]);
+    await action(narrowed, "Categories").getByText("tv", { exact: true }).waitFor();
+    await action(narrowed, "Categories").click();
+    assert.deepEqual(await page.getByRole("menuitemcheckbox").allTextContents(), ["tv"]);
+    assert.equal(await page.getByRole("menuitemcheckbox").getAttribute("aria-checked"), "true");
   } finally { await page.close(); }
 });
 
@@ -739,7 +755,8 @@ test("only an input the header takes for a secret has the secret box, which give
     const editor = await edit(page, "Notify");
     // The header says which inputs are secrets; one it calls plain has no box to make it one.
     for (const name of ["Label", "Mode", "Attach"]) assert.equal(await secretBox(editor, name).count(), 0, name);
-    assert.equal(await editor.getByRole("checkbox").count(), 1);
+    // The only other box is the one beside the input being added.
+    assert.equal(await editor.getByRole("checkbox").count(), 2);
     assert.equal(await secretBox(editor, "Token").isChecked(), true);
     // It takes an input for a secret by its name, so that one can be made plain, and back.
     await secretBox(editor, "Token").click();
@@ -758,7 +775,7 @@ test("only an input the header takes for a secret has the secret box, which give
   } finally { await page.close(); }
 });
 
-test("an input the header does not declare can be added, and taken away again", async () => {
+test("an input the header does not have is added as a value or as the job's own secret, which is never read back", async () => {
   const page = await open("?scripts");
   try {
     const editor = await edit(page, "Announce");
@@ -772,12 +789,13 @@ test("an input the header does not declare can be added, and taken away again", 
     await shot(page, "instance-editor-drift");
     // Only what the header does not ask for can be removed.
     assert.equal(await editor.getByRole("button", { name: /^Remove / }).count(), 1);
-    // An input is added in one step, as a name with its value or a name with its secret.
+    // An input is added in one step: its name, its value, and a box that makes the value this job's own secret.
     const name = field(editor, "New input name");
-    const value = field(editor, "New input value");
-    const kind = editor.getByRole("radiogroup", { name: "Kind of new input", exact: true });
-    assert.deepEqual(await kind.getByRole("radio").allTextContents(), ["Value", "Secret"]);
-    assert.equal(await kind.getByRole("radio", { name: "Value", exact: true }).isChecked(), true);
+    const value = secretField(editor, "New input value");
+    const own = editor.getByRole("checkbox", { name: "The new input is a secret", exact: true });
+    assert.equal(await editor.getByRole("radiogroup").count(), 1);
+    assert.equal(await own.isChecked(), false);
+    assert.equal(await value.getAttribute("type"), "text");
     assert.equal(await action(editor, "Add input").isDisabled(), true);
     await name.fill("bad name");
     await action(editor, "Add input").click();
@@ -793,43 +811,81 @@ test("an input the header does not declare can be added, and taken away again", 
     assert.equal(await field(editor, "Retries").inputValue(), "3");
     assert.equal(await name.inputValue(), "");
     assert.equal(await value.inputValue(), "");
-    // A secret input is added with the secret it links; with none chosen there is nothing to add.
-    await kind.getByRole("radio", { name: "Secret", exact: true }).click();
-    await value.waitFor({ state: "detached" });
+    // Ticked, the value is typed masked, and with nothing typed there is nothing to add.
+    await own.click();
+    assert.equal(await value.getAttribute("type"), "password");
     await name.fill("Extra.key");
-    await action(editor, "New input secret").getByText("Choose a secret", { exact: true }).waitFor();
     assert.equal(await action(editor, "Add input").isDisabled(), true);
-    await action(editor, "New input secret").click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
-      "Choose a secret", "Notify token", "Spare key", "Create new secret…",
-    ]);
-    // A secret made on the spot is the one chosen.
-    await page.getByRole("menuitemradio", { name: "Create new secret…", exact: true }).click();
-    const created = secretDialog(page, "Add secret");
-    await field(created, "Name").fill("Extra token");
-    await secretField(created, "Value").fill("fixture-token-3");
-    await action(created, "Save").click();
-    await created.waitFor({ state: "detached" });
-    await action(editor, "New input secret").getByText("Extra token", { exact: true }).waitFor();
+    await value.fill("fixture-own-secret");
     await shot(page, "instance-editor-add-input");
     await action(editor, "Add input").click();
-    await action(editor, "Extra.key").getByText("Extra token", { exact: true }).waitFor();
-    await action(editor, "New input secret").getByText("Choose a secret", { exact: true }).waitFor();
-    // What was added is a value or a secret, and stays what it was added as.
-    for (const added of ["Retries", "Extra.key"]) assert.equal(await secretBox(editor, added).count(), 0, added);
+    // It joins the inputs masked, as this job's own, and the box is clear for the next one.
+    const added = secretField(editor, "Extra.key");
+    assert.equal(await added.getAttribute("type"), "password");
+    assert.equal(await added.inputValue(), "fixture-own-secret");
+    assert.equal(await own.isChecked(), false);
+    assert.equal(await value.getAttribute("type"), "text");
+    // What was added is a value or the job's own secret, and stays what it was added as.
+    for (const each of ["Retries", "Extra.key"]) assert.equal(await secretBox(editor, each).count(), 0, each);
     assert.equal(await editor.getByRole("button", { name: /^Remove / }).count(), 3);
     await action(editor, "Remove Legacy").click();
     await field(editor, "Legacy").waitFor({ state: "detached" });
+    // Each save renames the job, so the row opened next is one the daemon has answered with since.
+    await field(editor, "Job name").fill("Announce 2");
     await action(editor, "Save").click();
-    await status(page, "Announce saved").waitFor();
-    // The secret the header declares and the instance never linked is not sent; the added ones go as a value and a link.
-    assert.deepEqual((await daemon(page)).requests.at(-1).variables.input.inputs, [
-      { name: "Label", value: "queued" }, { name: "Retries", value: "3" }, { name: "Extra.key", secretId: "s3" },
+    await status(page, "Announce 2 saved").waitFor();
+    // The secret the header declares and the instance never linked is not sent; the added ones go as a value and
+    // as the job's own secret, which is no secret of the Secrets screen.
+    let held = await daemon(page);
+    assert.deepEqual(held.requests.at(-1).variables.input.inputs, [
+      { name: "Label", value: "queued" }, { name: "Retries", value: "3" },
+      { name: "Extra.key", value: "fixture-own-secret", secret: true },
     ]);
-    assert.deepEqual((await daemon(page)).instances.find((entry) => entry.id === "4").inputs, [
+    assert.deepEqual(held.instances.find((entry) => entry.id === "4").inputs, [
       { name: "Label", value: "queued", secretId: null }, { name: "Retries", value: "3", secretId: null },
-      { name: "Extra.key", value: "", secretId: "s3" },
+      { name: "Extra.key", value: "", secretId: null, sealed: true },
     ]);
+    assert.equal(held.requests.filter((request) => request.name === "CreateSecret").length, 0);
+
+    // Opened again, the saved secret is not read back: its field is blank, and left blank it is kept.
+    let again = await edit(page, "Announce 2");
+    let kept = secretField(again, "Extra.key");
+    assert.equal(await kept.getAttribute("type"), "password");
+    assert.equal(await kept.inputValue(), "");
+    assert.equal(await kept.getAttribute("placeholder"), "Saved. Type to replace.");
+    assert.equal(await page.getByText("fixture-own-secret").count(), 0);
+    await shot(page, "instance-editor-own-secret-saved");
+    await field(again, "Job name").fill("Announce 3");
+    await action(again, "Save").click();
+    await status(page, "Announce 3 saved").waitFor();
+    held = await daemon(page);
+    assert.deepEqual(held.requests.at(-1).variables.input.inputs, [
+      { name: "Label", value: "queued" }, { name: "Retries", value: "3" }, { name: "Extra.key", secret: true },
+    ]);
+    assert.deepEqual(held.instances.find((entry) => entry.id === "4").inputs.at(-1), {
+      name: "Extra.key", value: "", secretId: null, sealed: true,
+    });
+
+    // A new value typed over it replaces it, and it can be taken away like any input added here.
+    again = await edit(page, "Announce 3");
+    kept = secretField(again, "Extra.key");
+    await kept.fill("fixture-own-secret-2");
+    await field(again, "Job name").fill("Announce 4");
+    await action(again, "Save").click();
+    await status(page, "Announce 4 saved").waitFor();
+    assert.deepEqual((await daemon(page)).requests.at(-1).variables.input.inputs.at(-1), {
+      name: "Extra.key", value: "fixture-own-secret-2", secret: true,
+    });
+    again = await edit(page, "Announce 4");
+    await action(again, "Remove Extra.key").click();
+    await secretField(again, "Extra.key").waitFor({ state: "detached" });
+    await field(again, "Job name").fill("Announce 5");
+    await action(again, "Save").click();
+    await status(page, "Announce 5 saved").waitFor();
+    assert.deepEqual((await daemon(page)).requests.at(-1).variables.input.inputs, [
+      { name: "Label", value: "queued" }, { name: "Retries", value: "3" },
+    ]);
+    assert.equal(await page.getByText("fixture-own-secret").count(), 0);
     assert.equal(await page.getByText("fixture-token").count(), 0);
   } finally { await page.close(); }
 });

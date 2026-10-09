@@ -180,7 +180,7 @@ test("L07 a changed SSH host key blocks the leg until the key is reset", async (
   const reset = await resetProxyHostKey(request, ssh.id);
   expect(reset.hostKeyFingerprint).toBeNull();
   const client = (await tunnelState(request)).sshClient;
-  await saveProxyProfile(request, { name: ssh.name, kind: "SSH", enabled: true, host: ssh.host, port: ssh.port, username: client.username, password: client.password, timeoutSeconds: 5 }, ssh.id);
+  await saveProxyProfile(request, { name: ssh.name, kind: "SSH", enabled: true, host: ssh.host, port: ssh.port, username: client.username, timeoutSeconds: 5 }, ssh.id);
   const rebuilt = await flowMark(request);
   const third = await world.download("l07-reset");
   await flowAfter(request, rebuilt, sample => legOn(sample, serverKey(server), b.id)?.state === "UP", "leg B Up after the reset");

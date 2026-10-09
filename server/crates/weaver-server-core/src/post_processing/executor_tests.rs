@@ -260,6 +260,7 @@ fn an_update_stores_the_links_it_is_sent() {
                 name: "Token".into(),
                 value: Some("x".into()),
                 secret_id: Some(token.id.clone()),
+                sealed: false,
             },
             "an input holds either a value or a secret",
         ),
@@ -268,6 +269,7 @@ fn an_update_stores_the_links_it_is_sent() {
                 name: "Token".into(),
                 value: None,
                 secret_id: None,
+                sealed: false,
             },
             "an input holds either a value or a secret",
         ),
@@ -326,6 +328,338 @@ fn a_linked_secret_stays_with_the_instance_and_a_run_resolves_its_current_value(
         [("Token", "", Some("Renamed token"))]
     );
     assert_eq!(run_value(&db, &saved.id, "Token"), "hunter3");
+}
+
+/// The sealed value of one input, exactly as the row holds it. `None` when
+/// there is no such row, `Some(None)` when the row holds no sealed value.
+fn stored_sealed(db: &Database, instance: &str, name: &str) -> Option<Option<String>> {
+    let datastore = db.datastore();
+    let (instance, name) = (instance.to_string(), name.to_string());
+    db.run_sql_blocking_read(async move {
+        SqlRuntime::fetch_optional(
+            datastore.read_exec(),
+            "SELECT sealed_value FROM script_instance_inputs
+              WHERE instance_id = {} AND name = {}",
+            &[SqlArg::Text(instance), SqlArg::Text(name)],
+        )
+        .await?
+        .map(|row| row.opt_text("sealed_value"))
+        .transpose()
+    })
+    .unwrap()
+}
+
+/// What each input of an instance shows, with whether it is a secret of the
+/// instance's own.
+fn shown_sealed(instance: &ScriptInstance) -> Vec<(&str, &str, Option<&str>, bool)> {
+    instance
+        .inputs
+        .iter()
+        .map(|input| {
+            (
+                input.name.as_str(),
+                input.value.as_str(),
+                input.secret.as_ref().map(|secret| secret.name.as_str()),
+                input.sealed,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_secret_of_the_instances_own_is_sealed_in_its_row_and_never_read_back() {
+    let db = Database::open_in_memory().unwrap();
+    assert!(!db.has_encrypted_credentials().unwrap());
+    let saved = db
+        .create_script_instance(
+            draft("notify.sh", InstanceTrigger::PostProcessing)
+                .input("Host", "mail.example.invalid")
+                .sealed_input("Token", "hunter2")
+                .sealed_input("Blank", ""),
+        )
+        .unwrap();
+
+    assert_eq!(
+        shown_sealed(&saved),
+        [
+            ("Host", "mail.example.invalid", None, false),
+            ("Token", "", None, true),
+            ("Blank", "", None, true),
+        ]
+    );
+    assert!(saved.inputs[1].is_secret());
+    assert_eq!(db.script_instance(&saved.id).unwrap(), Some(saved.clone()));
+
+    // The row holds the value sealed, beside an empty plain value.
+    assert_eq!(stored_input(&db, &saved.id, "Token").unwrap(), "");
+    let sealed = stored_sealed(&db, &saved.id, "Token").unwrap().unwrap();
+    assert!(crate::persistence::encryption::is_encrypted(&sealed));
+    assert!(!sealed.contains("hunter2"));
+    assert_eq!(stored_sealed(&db, &saved.id, "Host"), Some(None));
+    // It is the instance's alone: no named secret was made for it.
+    assert!(db.secrets().unwrap().is_empty());
+    assert!(db.secret_usages().unwrap().is_empty());
+
+    // Nothing an instance is shown as carries the value, clear or sealed,
+    // and neither does what it was sent as when that is printed.
+    for text in [
+        format!("{saved:?}"),
+        serde_json::to_string(&saved).unwrap(),
+        format!("{:?}", ScriptInstanceDraft::from_instance(&saved)),
+        format!(
+            "{:?}",
+            draft("notify.sh", InstanceTrigger::PostProcessing).sealed_input("Token", "hunter2")
+        ),
+    ] {
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains(&sealed), "{text}");
+    }
+
+    // A run is handed it exactly as it is handed a linked secret.
+    assert_eq!(run_value(&db, &saved.id, "Token"), "hunter2");
+    assert_eq!(run_value(&db, &saved.id, "Blank"), "");
+    let inputs = db.script_instance_run_inputs(&saved.id).unwrap().unwrap();
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| (input.name().as_str(), input.value().is_secret()))
+            .collect::<Vec<_>>(),
+        [("Host", false), ("Token", true), ("Blank", true)]
+    );
+    assert!(!format!("{inputs:?}").contains("hunter2"));
+
+    // It counts among the credentials the encryption key answers for.
+    assert!(db.has_encrypted_credentials().unwrap());
+    db.validate_encrypted_credentials(db.encryption_key().unwrap())
+        .unwrap();
+    let error = db
+        .validate_encrypted_credentials(&crate::persistence::encryption::EncryptionKey::generate())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "cannot decrypt secret input Token of script instance {}",
+            saved.id
+        )),
+        "{error}"
+    );
+    assert!(!error.contains(&sealed), "{error}");
+
+    // Deleting the instance takes its secrets with it.
+    assert!(db.delete_script_instance(&saved.id).unwrap());
+    assert_eq!(stored_sealed(&db, &saved.id, "Token"), None);
+    assert!(!db.has_encrypted_credentials().unwrap());
+}
+
+#[test]
+fn an_update_keeps_replaces_or_drops_a_secret_of_the_instances_own() {
+    let db = Database::open_in_memory().unwrap();
+    let saved = db
+        .create_script_instance(
+            draft("notify.sh", InstanceTrigger::PostProcessing)
+                .input("Host", "mail.example.invalid")
+                .sealed_input("Token", "hunter2"),
+        )
+        .unwrap();
+    let first = stored_sealed(&db, &saved.id, "Token").unwrap().unwrap();
+
+    // Saved back as it was read, the secret is carried across as it is
+    // stored: the draft holds no value for it, and none is needed.
+    let edit = ScriptInstanceDraft::from_instance(&saved).named("Renamed");
+    assert_eq!(edit.inputs[1], InstanceInputDraft::kept_sealed("Token"));
+    let updated = db.update_script_instance(&saved.id, edit).unwrap();
+    assert_eq!(updated.name, "Renamed");
+    assert_eq!(updated.inputs, saved.inputs);
+    assert_eq!(
+        stored_sealed(&db, &saved.id, "Token"),
+        Some(Some(first.clone()))
+    );
+
+    // So do the changes that leave an instance's inputs alone.
+    db.disable_script_instances().unwrap();
+    db.reorder_script_instances(std::slice::from_ref(&saved.id))
+        .unwrap();
+    let mut moved = ScriptInstanceDraft::from_instance(&updated);
+    moved.script = ScriptName::new("other.sh").unwrap();
+    moved.trigger = InstanceTrigger::Scan;
+    db.update_script_instance(&saved.id, moved).unwrap();
+    assert_eq!(
+        stored_sealed(&db, &saved.id, "Token"),
+        Some(Some(first.clone()))
+    );
+    assert_eq!(run_value(&db, &saved.id, "Token"), "hunter2");
+
+    // The name it is kept under is matched without regard to case, as input
+    // names are when they are checked for being unique.
+    let mut edit = ScriptInstanceDraft::from_instance(&updated);
+    edit.inputs[1] = InstanceInputDraft::kept_sealed("TOKEN");
+    let recased = db.update_script_instance(&saved.id, edit).unwrap();
+    assert_eq!(recased.inputs[1].name.as_str(), "TOKEN");
+    assert_eq!(stored_sealed(&db, &saved.id, "Token"), None);
+    assert_eq!(
+        stored_sealed(&db, &saved.id, "TOKEN"),
+        Some(Some(first.clone()))
+    );
+
+    // A new value replaces it.
+    let mut edit = ScriptInstanceDraft::from_instance(&recased);
+    edit.inputs[1] = InstanceInputDraft::sealed("Token", "hunter3");
+    let replaced = db.update_script_instance(&saved.id, edit).unwrap();
+    assert_eq!(
+        shown_sealed(&replaced),
+        [
+            ("Host", "mail.example.invalid", None, false),
+            ("Token", "", None, true),
+        ]
+    );
+    let second = stored_sealed(&db, &saved.id, "Token").unwrap().unwrap();
+    assert_ne!(second, first);
+    assert!(!second.contains("hunter3"));
+    assert_eq!(run_value(&db, &saved.id, "Token"), "hunter3");
+
+    // It can become a plain value or a link, and a secret of its own again.
+    let named = db.create_secret("Shared", "linked").unwrap();
+    let mut edit = ScriptInstanceDraft::from_instance(&replaced);
+    edit.inputs[1] = InstanceInputDraft::plain("Token", "in clear");
+    let plain = db.update_script_instance(&saved.id, edit).unwrap();
+    assert_eq!(plain.inputs[1].value, "in clear");
+    assert!(!plain.inputs[1].sealed);
+    assert_eq!(stored_sealed(&db, &saved.id, "Token"), Some(None));
+    let mut edit = ScriptInstanceDraft::from_instance(&plain);
+    edit.inputs[1] = InstanceInputDraft::secret("Token", &named.id);
+    let linked = db.update_script_instance(&saved.id, edit).unwrap();
+    assert_eq!(
+        shown_sealed(&linked)[1],
+        ("Token", "", Some("Shared"), false)
+    );
+    assert_eq!(stored_sealed(&db, &saved.id, "Token"), Some(None));
+    assert_eq!(run_value(&db, &saved.id, "Token"), "linked");
+    let mut edit = ScriptInstanceDraft::from_instance(&linked);
+    edit.inputs[1] = InstanceInputDraft::sealed("Token", "hunter4");
+    let own = db.update_script_instance(&saved.id, edit).unwrap();
+    assert_eq!(shown_sealed(&own)[1], ("Token", "", None, true));
+    assert!(db.secret(&named.id).unwrap().unwrap().used_by.is_empty());
+    assert_eq!(run_value(&db, &saved.id, "Token"), "hunter4");
+
+    // Left out of what is sent, it goes with every other input left out.
+    let mut edit = ScriptInstanceDraft::from_instance(&own);
+    edit.inputs.retain(|input| input.name != "Token");
+    let dropped = db.update_script_instance(&saved.id, edit).unwrap();
+    assert_eq!(
+        shown_sealed(&dropped),
+        [("Host", "mail.example.invalid", None, false)]
+    );
+    assert_eq!(stored_sealed(&db, &saved.id, "Token"), None);
+    // With the named secret gone as well, nothing sealed is left behind.
+    assert!(db.has_encrypted_credentials().unwrap());
+    db.delete_secret(&named.id).unwrap();
+    assert!(!db.has_encrypted_credentials().unwrap());
+}
+
+#[test]
+fn a_secret_of_the_instances_own_that_cannot_be_saved_as_asked_is_refused() {
+    let db = Database::open_in_memory().unwrap();
+    let pp = InstanceTrigger::PostProcessing;
+    let named = db.create_secret("Shared", "linked").unwrap();
+
+    // A new instance holds nothing to keep, and the refusal names the input.
+    let error = db
+        .create_script_instance(
+            draft("a.sh", pp)
+                .input("Host", "a")
+                .sealed_input("Key", "k"),
+        )
+        .map(|_| ())
+        .and_then(|()| {
+            let mut new = draft("a.sh", pp).input("Host", "a");
+            new.inputs.push(InstanceInputDraft::kept_sealed("Token"));
+            db.create_script_instance(new).map(|_| ())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&error, ScriptInstanceError::NoOwnSecret(name) if name == "Token"),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "input \"Token\" is marked secret but was given no value, and none is saved for it"
+    );
+    let saved = db.script_instances().unwrap().remove(0);
+    assert_eq!(db.script_instances().unwrap().len(), 1);
+    let sealed = stored_sealed(&db, &saved.id, "Key").unwrap().unwrap();
+
+    // Nor is there one to keep under a name the instance holds as a plain
+    // value, or does not hold at all.
+    for name in ["Host", "Other"] {
+        let mut edit = ScriptInstanceDraft::from_instance(&saved);
+        edit.inputs.retain(|input| input.name != name);
+        edit.inputs.push(InstanceInputDraft::kept_sealed(name));
+        let error = db.update_script_instance(&saved.id, edit).unwrap_err();
+        assert!(
+            matches!(&error, ScriptInstanceError::NoOwnSecret(found) if found == name),
+            "{error:?}"
+        );
+    }
+    // An instance that is not there is reported as that.
+    let mut gone = draft("a.sh", pp);
+    gone.inputs.push(InstanceInputDraft::kept_sealed("Key"));
+    assert!(matches!(
+        db.update_script_instance("missing", gone),
+        Err(ScriptInstanceError::NotFound)
+    ));
+
+    // A secret of its own is never also a link, with or without a value.
+    for value in [None, Some("x".to_string())] {
+        let mut edit = ScriptInstanceDraft::from_instance(&saved);
+        edit.inputs[1] = InstanceInputDraft {
+            name: "Key".into(),
+            value,
+            secret_id: Some(named.id.clone()),
+            sealed: true,
+        };
+        assert!(matches!(
+            db.update_script_instance(&saved.id, edit),
+            Err(ScriptInstanceError::Invalid(
+                "an input is a secret of its own or a link to a named secret, not both"
+            ))
+        ));
+    }
+    // Its value is held to the limits of a plain one.
+    for value in ["nul\0byte".to_string(), "x".repeat(64 * 1024 + 1)] {
+        assert_eq!(
+            refused(&db, draft("a.sh", pp).sealed_input("Key", value)),
+            "input value is invalid"
+        );
+    }
+    db.create_script_instance(draft("a.sh", pp).sealed_input("Key", "x".repeat(64 * 1024)))
+        .unwrap();
+
+    // Every refusal left what was saved as it was.
+    assert_eq!(db.script_instance(&saved.id).unwrap(), Some(saved.clone()));
+    assert_eq!(stored_sealed(&db, &saved.id, "Key"), Some(Some(sealed)));
+    assert_eq!(run_value(&db, &saved.id, "Key"), "k");
+}
+
+#[test]
+fn a_secret_of_the_instances_own_needs_an_encryption_key_as_a_named_secret_does() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::open(&directory.path().join("weaver.db")).unwrap();
+    let pp = InstanceTrigger::PostProcessing;
+
+    let named = match db.create_secret("Shared", "hunter2") {
+        Err(SecretError::Invalid(reason)) => reason,
+        other => panic!("expected the secret to be refused, got {other:?}"),
+    };
+    assert_eq!(named, "an encryption key is required to store a secret");
+    assert_eq!(
+        refused(&db, draft("a.sh", pp).sealed_input("Token", "hunter2")),
+        named
+    );
+    assert!(db.script_instances().unwrap().is_empty());
+
+    // Plain inputs need no key.
+    db.create_script_instance(draft("a.sh", pp).input("Host", "a"))
+        .unwrap();
 }
 
 #[test]

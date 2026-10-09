@@ -67,11 +67,13 @@ interface StoredSecret { id: string; name: string; value: string; createdAt: str
 /** An instance as the daemon stores it: a secret input holds a link to a secret, never a value. */
 interface Stored {
   id: string; name: string; script: string; trigger: string; queueEvent: string | null;
-  inputs: { name: string; value: string; secretId: string | null }[]; categories: string[];
+  inputs: { name: string; value: string; secretId: string | null; sealed?: boolean }[]; categories: string[];
   enabled: boolean; blocking: boolean; timeoutSeconds: number | null; runOrder: number;
 }
 const held = (name: string, value: string) => ({ name, value, secretId: null as string | null });
 const linked = (name: string, secretId: string) => ({ name, value: "", secretId: secretId as string | null });
+// A job's own secret: what was typed is not kept anywhere a screen could read it.
+const sealed = (name: string) => ({ name, value: "", secretId: null as string | null, sealed: true });
 const storedSecret = (id: string, name: string, value: string): StoredSecret => ({
   id, name, value, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-02T00:00:00Z",
 });
@@ -163,7 +165,7 @@ function view(entry: Stored) {
     ...entry,
     inputs: entry.inputs.map((input) => {
       const linkedTo = state.secrets.find((candidate) => candidate.id === input.secretId);
-      return { name: input.name, value: linkedTo ? "" : input.value,
+      return { name: input.name, value: linkedTo ? "" : input.value, sealed: input.sealed === true,
         secret: linkedTo ? { id: linkedTo.id, name: linkedTo.name } : null };
     }),
     scriptProblem: known ? null : (unlistable ?? "the script is no longer in the scripts directory"),
@@ -171,16 +173,28 @@ function view(entry: Stored) {
   };
 }
 
-/** The inputs to store for what was sent: each one is a value or a link to a secret, never both. */
-function storedInputs(input: Record<string, any>): Stored["inputs"] | string {
-  const sent = input.inputs as { name: string; value?: string; secretId?: string }[];
+/**
+ * The inputs to store for what was sent: each one is a value, a link to a
+ * secret, or a secret of the job's own, which sent with no value keeps the one
+ * `previous` holds.
+ */
+function storedInputs(input: Record<string, any>, previous: Stored | undefined): Stored["inputs"] | string {
+  const sent = input.inputs as { name: string; value?: string; secretId?: string; secret?: boolean }[];
   for (const entry of sent) {
+    if (entry.secret) {
+      if (entry.secretId !== undefined) return "an input takes a value or a secret, not both";
+      if (entry.value === undefined && !previous?.inputs.some((own) => own.sealed && same(own.name, entry.name))) {
+        return `input ${entry.name} has no saved secret to keep`;
+      }
+      continue;
+    }
     if ((entry.value === undefined) === (entry.secretId === undefined)) return "an input takes a value or a secret, not both";
     if (entry.secretId !== undefined && !state.secrets.some((candidate) => candidate.id === entry.secretId)) {
       return "secret does not exist";
     }
   }
-  return sent.map((entry) => entry.secretId === undefined ? held(entry.name, entry.value ?? "") : linked(entry.name, entry.secretId));
+  return sent.map((entry) => entry.secret ? sealed(entry.name)
+    : entry.secretId === undefined ? held(entry.name, entry.value ?? "") : linked(entry.name, entry.secretId));
 }
 
 /* ---------------------------------------------------------------- secrets */
@@ -250,7 +264,7 @@ function saveInstance(variables: Record<string, any>): Stored | string {
   if (variables.id !== undefined && !previous) {
     return "script instance does not exist";
   }
-  const inputs = storedInputs(input);
+  const inputs = storedInputs(input, previous);
   if (typeof inputs === "string") {
     return inputs;
   }
