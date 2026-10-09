@@ -151,6 +151,7 @@ impl PostProcessingQuery {
     /// Recorded script runs, latest first, whatever started them. Runs that
     /// belong to no job are listed here and nowhere else.
     #[graphql(guard = "ReadGuard")]
+    #[allow(clippy::too_many_arguments)]
     async fn script_runs(
         &self,
         ctx: &Context<'_>,
