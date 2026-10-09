@@ -3012,6 +3012,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
             .named("Notify")
             .input("Server", "example.test")
             .secret_input("Token", &token.id)
+            .sealed_input("Password", "hunter3")
             .category("movies")
             .fire_and_forget()
             .timeout(90),
@@ -3029,12 +3030,14 @@ async fn postgres_post_processing_roundtrip_when_configured() {
             .map(|input| (
                 input.name.as_str(),
                 input.value.as_str(),
-                input.secret.as_ref().map(|secret| secret.name.as_str())
+                input.secret.as_ref().map(|secret| secret.name.as_str()),
+                input.sealed
             ))
             .collect::<Vec<_>>(),
         [
-            ("Server", "example.test", None),
-            ("Token", "", Some("Notify token"))
+            ("Server", "example.test", None, false),
+            ("Token", "", Some("Notify token"), false),
+            ("Password", "", None, true)
         ]
     );
     assert!(matches!(
@@ -3045,8 +3048,28 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         .script_instance_run_inputs(&instance.id)
         .unwrap()
         .unwrap();
-    assert_eq!(run_inputs.len(), 2);
+    assert_eq!(run_inputs.len(), 3);
     assert!(run_inputs[1].value().is_secret());
+    assert!(matches!(
+        run_inputs[2].value(),
+        crate::post_processing::model::OptionValue::Secret(value)
+            if value.expose_for_execution() == "hunter3"
+    ));
+    // Saved back as it was read, the instance keeps its own secret sealed.
+    let kept = db
+        .update_script_instance(
+            &instance.id,
+            crate::post_processing::instances::ScriptInstanceDraft::from_instance(&instance),
+        )
+        .unwrap();
+    assert_eq!(kept.inputs, instance.inputs);
+    assert!(matches!(
+        db.script_instance_run_inputs(&instance.id).unwrap().unwrap()[2].value(),
+        crate::post_processing::model::OptionValue::Secret(value)
+            if value.expose_for_execution() == "hunter3"
+    ));
+    db.validate_encrypted_credentials(db.encryption_key().unwrap())
+        .unwrap();
     let feed_instance = db
         .create_script_instance(crate::post_processing::instances::ScriptInstanceDraft::new(
             script.clone(),

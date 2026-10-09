@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use weaver_server_api::auth::CallerScope;
 
 /// Every field of a saved instance.
-const INSTANCE: &str = "id name script trigger queueEvent inputs { name value secret { id name } } categories enabled blocking timeoutSeconds runOrder scriptProblem headerDrift";
+const INSTANCE: &str = "id name script trigger queueEvent inputs { name value secret { id name } sealed } categories enabled blocking timeoutSeconds runOrder scriptProblem headerDrift";
 
 /// Write a bare script into the harness's `data_dir/scripts`.
 async fn write_script(harness: &TestHarness, name: &str, body: &str) {
@@ -115,7 +115,7 @@ async fn scripts_directory_is_admin_owned_and_turns_every_instance_off_when_chan
     assert_eq!(saved[0]["enabled"], false);
     assert_eq!(
         saved[0]["inputs"],
-        json!([{ "name": "Host", "value": "example.invalid", "secret": null }])
+        json!([{ "name": "Host", "value": "example.invalid", "secret": null, "sealed": false }])
     );
     assert!(
         saved[0]["scriptProblem"]
@@ -543,7 +543,7 @@ async fn an_update_replaces_what_is_saved_and_may_keep_naming_a_script_that_has_
     assert_eq!(updated["runOrder"], created["runOrder"]);
     assert_eq!(
         updated["inputs"],
-        json!([{ "name": "Port", "value": "25", "secret": null }])
+        json!([{ "name": "Port", "value": "25", "secret": null, "sealed": false }])
     );
     assert_eq!(instances(&harness).await, vec![updated.clone()]);
 
@@ -657,14 +657,15 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     let linked = json!({
         "name": "Token",
         "value": "",
-        "secret": { "id": mail_id, "name": "Mail token" }
+        "secret": { "id": mail_id, "name": "Mail token" },
+        "sealed": false
     });
     assert_eq!(
         created["inputs"],
         json!([
-            { "name": "Host", "value": "smtp.example.invalid", "secret": null },
+            { "name": "Host", "value": "smtp.example.invalid", "secret": null, "sealed": false },
             linked,
-            { "name": "Extra", "value": "x", "secret": null }
+            { "name": "Extra", "value": "x", "secret": null, "sealed": false }
         ]),
     );
     assert_eq!(
@@ -693,7 +694,7 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
             r#"mutation {{ updateScriptInstance(id: "{}", input: {{ script: "email", trigger: POST_PROCESSING, inputs: [
                 {{ name: "Token", secretId: "{mail_id}" }}
                 {{ name: "Extra", value: "y" }}
-            ] }}) {{ inputs {{ name value secret {{ id name }} }} headerDrift }} }}"#,
+            ] }}) {{ inputs {{ name value secret {{ id name }} sealed }} headerDrift }} }}"#,
             id(&created)
         ))
         .await;
@@ -701,7 +702,7 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     let updated = &response_data(&updated)["updateScriptInstance"];
     assert_eq!(
         updated["inputs"],
-        json!([linked, { "name": "Extra", "value": "y", "secret": null }])
+        json!([linked, { "name": "Extra", "value": "y", "secret": null, "sealed": false }])
     );
     assert_eq!(updated["headerDrift"], true);
 
@@ -720,7 +721,7 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     assert_has_errors(&denied);
     let reapplied = harness
         .execute(&format!(
-            r#"mutation {{ reapplyScriptHeader(id: "{}") {{ inputs {{ name value secret {{ id name }} }} headerDrift }} }}"#,
+            r#"mutation {{ reapplyScriptHeader(id: "{}") {{ inputs {{ name value secret {{ id name }} sealed }} headerDrift }} }}"#,
             id(&created)
         ))
         .await;
@@ -729,7 +730,7 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     assert_eq!(
         reapplied["inputs"],
         json!([
-            { "name": "Host", "value": "mail.example.invalid", "secret": null },
+            { "name": "Host", "value": "mail.example.invalid", "secret": null, "sealed": false },
             linked
         ])
     );
@@ -739,6 +740,269 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
         .execute(r#"mutation { reapplyScriptHeader(id: "nope") { id } }"#)
         .await;
     assert_has_errors(&nothing_there);
+
+    // A secret of the instance's own is kept under a name the header
+    // declares, in the header's spelling, and dropped with any other input
+    // the header does not declare.
+    let own = harness
+        .execute(&format!(
+            r#"mutation {{ updateScriptInstance(id: "{}", input: {{ script: "email", trigger: POST_PROCESSING, inputs: [
+                {{ name: "token", value: "hunter5", secret: true }}
+                {{ name: "Extra", value: "hunter6", secret: true }}
+            ] }}) {{ inputs {{ name value secret {{ id name }} sealed }} headerDrift }} }}"#,
+            id(&created)
+        ))
+        .await;
+    assert_no_errors(&own);
+    carries_no_secret(&own);
+    let own = &response_data(&own)["updateScriptInstance"];
+    assert_eq!(
+        own["inputs"],
+        json!([own_secret("token"), own_secret("Extra")])
+    );
+    assert_eq!(own["headerDrift"], true);
+    let reapplied = harness
+        .execute(&format!(
+            r#"mutation {{ reapplyScriptHeader(id: "{}") {{ inputs {{ name value secret {{ id name }} sealed }} headerDrift }} }}"#,
+            id(&created)
+        ))
+        .await;
+    assert_no_errors(&reapplied);
+    carries_no_secret(&reapplied);
+    let reapplied = &response_data(&reapplied)["reapplyScriptHeader"];
+    assert_eq!(
+        reapplied["inputs"],
+        json!([
+            { "name": "Host", "value": "mail.example.invalid", "secret": null, "sealed": false },
+            own_secret("Token")
+        ])
+    );
+    assert_eq!(reapplied["headerDrift"], false);
+}
+
+/// What is read back for an input holding a secret of the instance's own.
+fn own_secret(name: &str) -> Value {
+    json!({ "name": name, "value": "", "secret": null, "sealed": true })
+}
+
+/// What is read back for an input holding a plain value.
+fn plain(name: &str, value: &str) -> Value {
+    json!({ "name": name, "value": value, "secret": null, "sealed": false })
+}
+
+/// Every secret value in these tests starts `hunter`, and anything sealed
+/// starts `enc:v1:`; a response carries neither.
+fn carries_no_secret(response: &async_graphql::Response) {
+    let text = format!("{response:?}");
+    assert!(
+        !text.contains("hunter") && !text.contains("enc:v1:"),
+        "a secret was read back: {text}"
+    );
+}
+
+#[tokio::test]
+async fn an_input_may_be_a_secret_of_the_instances_own_and_is_never_read_back() {
+    let harness = TestHarness::new().await;
+    write_script(&harness, "notify.sh", "#!/bin/sh\nexit 0\n").await;
+    let named = create_secret(&harness, "Notify token", "hunter2").await;
+    let named_id = named["id"].as_str().unwrap().to_string();
+    let linked = |name: &str| {
+        json!({
+            "name": name,
+            "value": "",
+            "secret": { "id": named_id, "name": "Notify token" },
+            "sealed": false
+        })
+    };
+    let kept_named =
+        |used_by: Value| json!([{ "id": named_id, "name": "Notify token", "usedBy": used_by }]);
+
+    // An input is a plain value, a link to a named secret, or a secret of the
+    // instance's own. Leaving `secret` out, or sending it as false or null,
+    // is a plain value.
+    let created = harness
+        .execute(&format!(
+            r#"mutation {{ createScriptInstance(input: {{ name: "Notify", script: "notify.sh", trigger: POST_PROCESSING, inputs: [
+                {{ name: "Host", value: "example.invalid" }}
+                {{ name: "Token", secretId: "{named_id}" }}
+                {{ name: "Password", value: "hunter7", secret: true }}
+                {{ name: "Shown", value: "a", secret: false }}
+                {{ name: "Unmarked", value: "b", secret: null }}
+            ] }}) {{ {INSTANCE} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&created);
+    carries_no_secret(&created);
+    let instance = response_data(&created)["createScriptInstance"].clone();
+    let instance_id = id(&instance);
+    assert_eq!(
+        instance["inputs"],
+        json!([
+            plain("Host", "example.invalid"),
+            linked("Token"),
+            own_secret("Password"),
+            plain("Shown", "a"),
+            plain("Unmarked", "b")
+        ])
+    );
+    let read = harness
+        .execute(&format!("{{ scriptInstances {{ {INSTANCE} }} }}"))
+        .await;
+    assert_no_errors(&read);
+    carries_no_secret(&read);
+    assert_eq!(
+        response_data(&read)["scriptInstances"],
+        json!([instance.clone()])
+    );
+
+    // It is no named secret: nothing lists it, so nothing else can link it.
+    let secrets = "{ secrets { id name usedBy { id name } } }";
+    let listing = harness.execute(secrets).await;
+    assert_no_errors(&listing);
+    carries_no_secret(&listing);
+    assert_eq!(
+        response_data(&listing)["secrets"],
+        kept_named(json!([{ "id": instance_id, "name": "Notify" }]))
+    );
+
+    // A new instance holds nothing to keep, and a secret of its own is never
+    // also a link.
+    let kept_nothing = |name: &str| {
+        format!(
+            r#"input "{name}" is marked secret but was given no value, and none is saved for it"#
+        )
+    };
+    let not_both = "an input is a secret of its own or a link to a named secret, not both";
+    for (inputs, message) in [
+        (
+            r#"{ name: "Password", secret: true }"#.to_string(),
+            kept_nothing("Password"),
+        ),
+        (
+            format!(r#"{{ name: "Password", secret: true, secretId: "{named_id}" }}"#),
+            not_both.to_string(),
+        ),
+        (
+            format!(
+                r#"{{ name: "Password", value: "hunter9", secret: true, secretId: "{named_id}" }}"#
+            ),
+            not_both.to_string(),
+        ),
+    ] {
+        let refused = harness
+            .execute(&format!(
+                r#"mutation {{ createScriptInstance(input: {{ script: "notify.sh", trigger: POST_PROCESSING, inputs: [{inputs}] }}) {{ id }} }}"#
+            ))
+            .await;
+        assert_has_errors(&refused);
+        carries_no_secret(&refused);
+        assert!(
+            refused.errors[0].message.contains(&message),
+            "{inputs} was refused with {:?}",
+            refused.errors[0].message
+        );
+    }
+    assert_eq!(ids(&instances(&harness).await), [instance_id.clone()]);
+
+    let update = |inputs: String| {
+        let harness = &harness;
+        let instance_id = instance_id.clone();
+        async move {
+            let response = harness
+                .execute(&format!(
+                    r#"mutation {{ updateScriptInstance(id: "{instance_id}", input: {{ name: "Notify", script: "notify.sh", trigger: POST_PROCESSING, inputs: [{inputs}] }}) {{ {INSTANCE} }} }}"#
+                ))
+                .await;
+            carries_no_secret(&response);
+            response
+        }
+    };
+    let saved = |response: async_graphql::Response| {
+        assert_no_errors(&response);
+        response_data(&response)["updateScriptInstance"]["inputs"].clone()
+    };
+
+    // Marked secret and sent without a value, an input keeps the secret the
+    // instance already holds under that name, however the name is spelled
+    // and wherever it now stands.
+    let kept = update(format!(
+        r#"{{ name: "PASSWORD", secret: true }} {{ name: "Token", secretId: "{named_id}" }} {{ name: "Host", value: "b" }}"#
+    ))
+    .await;
+    assert_eq!(
+        saved(kept),
+        json!([own_secret("PASSWORD"), linked("Token"), plain("Host", "b")])
+    );
+
+    // There is nothing to keep under a name that holds a plain value, a
+    // link, or nothing at all, and the refusal names the input. What is
+    // saved stays as it was.
+    let before = instances(&harness).await;
+    for name in ["Host", "Token", "Other"] {
+        let refused = update(format!(
+            r#"{{ name: "PASSWORD", secret: true }} {{ name: "{name}", secret: true }}"#
+        ))
+        .await;
+        assert_has_errors(&refused);
+        assert!(
+            refused.errors[0].message.contains(&kept_nothing(name)),
+            "{name} was refused with {:?}",
+            refused.errors[0].message
+        );
+    }
+    let both = update(format!(
+        r#"{{ name: "PASSWORD", secret: true, secretId: "{named_id}" }}"#
+    ))
+    .await;
+    assert_has_errors(&both);
+    assert!(both.errors[0].message.contains(not_both));
+    let nothing_there = harness
+        .execute(
+            r#"mutation { updateScriptInstance(id: "nope", input: { script: "notify.sh", trigger: POST_PROCESSING, inputs: [{ name: "PASSWORD", secret: true }] }) { id } }"#,
+        )
+        .await;
+    assert_has_errors(&nothing_there);
+    carries_no_secret(&nothing_there);
+    assert_eq!(instances(&harness).await, before);
+
+    // A new value replaces the one that was kept.
+    let replaced = update(r#"{ name: "Password", value: "hunter8", secret: true }"#.to_string());
+    assert_eq!(saved(replaced.await), json!([own_secret("Password")]));
+    let listing = harness.execute(secrets).await;
+    assert_eq!(response_data(&listing)["secrets"], kept_named(json!([])));
+
+    // Sent as a plain value or as a link, the input stops being a secret of
+    // the instance's own, and nothing is left to keep.
+    let keep = || update(r#"{ name: "Password", secret: true }"#.to_string());
+    let own = || update(r#"{ name: "Password", value: "hunter7", secret: true }"#.to_string());
+    let shown = update(r#"{ name: "Password", value: "shown" }"#.to_string()).await;
+    assert_eq!(saved(shown), json!([plain("Password", "shown")]));
+    assert_has_errors(&keep().await);
+    assert_eq!(saved(own().await), json!([own_secret("Password")]));
+    let relinked = update(format!(r#"{{ name: "Password", secretId: "{named_id}" }}"#)).await;
+    assert_eq!(saved(relinked), json!([linked("Password")]));
+    assert_has_errors(&keep().await);
+
+    // Left out, it is removed with every other input that was not sent.
+    assert_eq!(saved(own().await), json!([own_secret("Password")]));
+    assert_eq!(saved(keep().await), json!([own_secret("Password")]));
+    assert_eq!(saved(update(String::new()).await), json!([]));
+    assert_has_errors(&keep().await);
+
+    // It goes with its instance, and was never a named secret to be left
+    // behind.
+    assert_eq!(saved(own().await), json!([own_secret("Password")]));
+    let deleted = harness
+        .execute(&format!(
+            r#"mutation {{ deleteScriptInstance(id: "{instance_id}") }}"#
+        ))
+        .await;
+    assert_no_errors(&deleted);
+    assert_eq!(response_data(&deleted)["deleteScriptInstance"], true);
+    assert!(instances(&harness).await.is_empty());
+    let listing = harness.execute(secrets).await;
+    assert_eq!(response_data(&listing)["secrets"], kept_named(json!([])));
+    assert_eq!(harness.db.secrets().unwrap().len(), 1);
 }
 
 #[tokio::test]

@@ -1647,6 +1647,7 @@ impl Database {
                 "SELECT password FROM active_jobs WHERE password IS NOT NULL",
                 "SELECT source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
                 "SELECT value AS password FROM secrets",
+                "SELECT sealed_value AS password FROM script_instance_inputs WHERE sealed_value IS NOT NULL",
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
                 for row in rows {
@@ -1764,6 +1765,26 @@ impl Database {
                         "cannot decrypt secret {} ({}): {error}",
                         row.text("name").unwrap_or_default(),
                         row.text("id").unwrap_or_default(),
+                    ))
+                })?;
+            }
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT instance_id, name, sealed_value FROM script_instance_inputs
+                  WHERE sealed_value IS NOT NULL",
+                &[],
+            )
+            .await?;
+            for row in rows {
+                let value = row.text("sealed_value")?;
+                if !is_encrypted(&value) {
+                    continue;
+                }
+                decrypt_value(&credential_key, &value).map_err(|error| {
+                    StateError::Conflict(format!(
+                        "cannot decrypt secret input {} of script instance {}: {error}",
+                        row.text("name").unwrap_or_default(),
+                        row.text("instance_id").unwrap_or_default(),
                     ))
                 })?;
             }

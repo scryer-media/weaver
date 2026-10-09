@@ -1983,7 +1983,8 @@ mod logical_reader_tests {
                     InstanceTrigger::PostProcessing,
                 )
                 .input("Host", "mail.example.invalid")
-                .secret_input("Token", &token.id),
+                .secret_input("Token", &token.id)
+                .sealed_input("Password", "kept-with-the-instance"),
             )
             .unwrap();
         let archive = source.export_logical_backup().unwrap();
@@ -1995,6 +1996,19 @@ mod logical_reader_tests {
             rows.iter()
                 .all(|row| !serde_json::to_string(row).unwrap().contains("round-trip"))
         );
+        // So it does a secret of the instance's own, in the instance's row.
+        let rows = read_table_objects(archive.staging.path(), "script_instance_inputs").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| {
+            !serde_json::to_string(row)
+                .unwrap()
+                .contains("kept-with-the-instance")
+        }));
+        let own = rows.iter().find(|row| row["name"] == "Password").unwrap();
+        assert_eq!(own["value"], "");
+        assert!(crate::persistence::encryption::is_encrypted(
+            own["sealed_value"].as_str().unwrap()
+        ));
 
         let mut target = Database::open_in_memory().unwrap();
         target.set_encryption_key(source.encryption_key().unwrap().clone());
@@ -2020,10 +2034,32 @@ mod logical_reader_tests {
             target.script_instance(&instance.id).unwrap().unwrap(),
             instance
         );
+        let run = target
+            .script_instance_run_inputs(&instance.id)
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            target.script_instance_run_inputs(&instance.id).unwrap().unwrap()[1].value(),
+            run[1].value(),
             OptionValue::Secret(value) if value.expose_for_execution() == "round-trip"
         ));
+        // The instance's own secret came back with it, and no named secret
+        // was made of it.
+        assert!(
+            target
+                .script_instance(&instance.id)
+                .unwrap()
+                .unwrap()
+                .inputs[2]
+                .sealed
+        );
+        assert!(matches!(
+            run[2].value(),
+            OptionValue::Secret(value)
+                if value.expose_for_execution() == "kept-with-the-instance"
+        ));
+        target
+            .validate_encrypted_credentials(source.encryption_key().unwrap())
+            .unwrap();
     }
 
     #[test]

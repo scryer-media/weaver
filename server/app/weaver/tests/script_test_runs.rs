@@ -327,7 +327,8 @@ async fn saved_inputs_reach_the_script_and_stay_out_of_what_a_test_reports() {
         package.join("run.sh"),
         "#!/bin/sh\n\
          [ \"$NZBPO_Token\" = hunter2 ] && printf 'token delivered\\n'\n\
-         printf 'host=%s token=%s\\n' \"$NZBPO_Host\" \"$NZBPO_Token\"\n\
+         [ \"$NZBPO_Pass\" = hunter4 ] && printf 'own secret delivered\\n'\n\
+         printf 'host=%s token=%s pass=%s\\n' \"$NZBPO_Host\" \"$NZBPO_Token\" \"$NZBPO_Pass\"\n\
          exit 93\n",
     )
     .unwrap();
@@ -339,7 +340,8 @@ async fn saved_inputs_reach_the_script_and_stay_out_of_what_a_test_reports() {
         .create_script_instance(
             ScriptInstanceDraft::new(script, InstanceTrigger::PostProcessing)
                 .input("Host", "mail.example.invalid")
-                .secret_input("Token", &token.id),
+                .secret_input("Token", &token.id)
+                .sealed_input("Pass", "hunter4"),
         )
         .unwrap();
 
@@ -347,9 +349,10 @@ async fn saved_inputs_reach_the_script_and_stay_out_of_what_a_test_reports() {
 
     assert_eq!(status(&run), ScriptStatus::Succeeded);
     assert!(run.log.contains("token delivered"));
+    assert!(run.log.contains("own secret delivered"));
     assert!(run.log.contains("host=mail.example.invalid"));
     assert!(
-        !run.log.contains("hunter2"),
+        !run.log.contains("hunter2") && !run.log.contains("hunter4"),
         "a secret never reaches the log"
     );
     assert!(!run.inputs.is_empty());
@@ -360,7 +363,7 @@ async fn saved_inputs_reach_the_script_and_stay_out_of_what_a_test_reports() {
                 .all(|prefix| !name.starts_with(prefix)),
             "{name} was not made up for the test"
         );
-        assert!(!value.contains("hunter2"));
+        assert!(!value.contains("hunter2") && !value.contains("hunter4"));
     }
 }
 
