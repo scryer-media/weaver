@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
+use crate::bandwidth::QuotaWeekday;
 use crate::categories::CategoryConfig;
 use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, StoreDatastore};
@@ -2615,7 +2615,7 @@ async fn postgres_runtime_smoke_when_configured() {
                 limit_bytes: 20_000_000,
                 period: crate::servers::ServerDownloadQuotaPeriod::Weekly,
                 reset_time_minutes_local: 120,
-                weekly_reset_weekday: IspBandwidthCapWeekday::Thu,
+                weekly_reset_weekday: QuotaWeekday::Thu,
                 monthly_reset_day: 10,
             },
             tls_ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
@@ -2633,14 +2633,6 @@ async fn postgres_runtime_smoke_when_configured() {
         }),
         max_download_speed: Some(12_345),
         cleanup_after_extract: Some(false),
-        isp_bandwidth_cap: Some(IspBandwidthCapConfig {
-            enabled: true,
-            period: IspBandwidthCapPeriod::Weekly,
-            limit_bytes: 9_999_999,
-            reset_time_minutes_local: 6 * 60,
-            weekly_reset_weekday: IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 7,
-        }),
         propagation_delay_secs: Some(0),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -2657,13 +2649,6 @@ async fn postgres_runtime_smoke_when_configured() {
     assert_eq!(loaded_config.complete_dir, config.complete_dir);
     assert_eq!(loaded_config.max_download_speed, config.max_download_speed);
     assert_eq!(loaded_config.cleanup_after_extract, Some(false));
-    assert_eq!(
-        loaded_config
-            .isp_bandwidth_cap
-            .as_ref()
-            .map(|cap| cap.period),
-        Some(IspBandwidthCapPeriod::Weekly)
-    );
     assert_eq!(loaded_config.servers.len(), 1);
     assert_eq!(loaded_config.servers[0].host, "news.example.com");
     assert_eq!(loaded_config.servers[0].max_download_speed, 3_000_000);

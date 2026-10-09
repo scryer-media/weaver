@@ -353,6 +353,9 @@ pub struct NntpConnection {
     tls_cipher_preference: crate::tls::TlsCipherPreference,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    /// The egress's accounting for each outstanding BODY, in step with
+    /// `body_accounting`. Empty when the connection has no egress control.
+    egress_accounting: VecDeque<BodyTransferAccounting>,
     // Declared after the transport: a physical slot is refunded only after close.
     pub(crate) socket_slot: Option<crate::socket_budget::SocketSlot>,
     pub(crate) health_lease: Option<Arc<crate::recovery::ConnectionHealthLease>>,
@@ -559,6 +562,7 @@ impl NntpConnection {
             tls_cipher_preference: config.tls_cipher_preference,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            egress_accounting: VecDeque::new(),
             socket_slot: None,
             health_lease: None,
             checkpoint_plan: CheckpointPlan::None,
@@ -829,7 +833,7 @@ impl NntpConnection {
             .map_err(NntpError::quota_blocked)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
         if let Err(error) = self.write_command_frame(&cmd).await {
-            self.body_accounting.pop_back();
+            self.unreserve_last_body();
             return Err(error);
         }
         Ok(())
@@ -843,6 +847,13 @@ impl NntpConnection {
         self.transfer_control = transfer_control;
     }
 
+    /// The egress control this connection's route leaves through, if any.
+    pub(crate) fn egress_transfer_control(&self) -> Option<Arc<ServerTransferControl>> {
+        self.egress_control.clone()
+    }
+
+    /// Admit one BODY against the server, then against the egress. A refusal
+    /// from either leaves nothing reserved and names who refused.
     fn reserve_body(
         &mut self,
         estimated_body_bytes: u64,
@@ -851,16 +862,42 @@ impl NntpConnection {
             self.body_accounting
                 .push_back(control.start_body(estimated_body_bytes)?);
         }
+        if let Some(control) = &self.egress_control {
+            match control.start_body(estimated_body_bytes) {
+                Ok(accounting) => self.egress_accounting.push_back(accounting),
+                Err(rejection) => {
+                    if self.transfer_control.is_some() {
+                        self.body_accounting.pop_back();
+                    }
+                    return Err(rejection);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Undo the last `reserve_body`, for a BODY that was never sent.
+    fn unreserve_last_body(&mut self) {
+        if self.transfer_control.is_some() {
+            self.body_accounting.pop_back();
+        }
+        if self.egress_control.is_some() {
+            self.egress_accounting.pop_back();
+        }
     }
 
     async fn charge_active_body(&mut self, bytes: usize) -> Duration {
         if let Some(outcome) = &self.route_outcome {
             outcome.read(bytes);
         }
-        let egress_wait = match &self.egress_control {
-            Some(control) => control.pace_read_async(bytes).await,
-            None => Duration::ZERO,
+        let egress_wait = match (self.egress_accounting.front_mut(), &self.egress_control) {
+            (Some(BodyTransferAccounting::Tracked(permit)), _) => permit.record_async(bytes).await,
+            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
+                control.record_unlimited_body_bytes(bytes);
+                Duration::ZERO
+            }
+            (None, Some(control)) => control.pace_read_async(bytes).await,
+            (_, None) => Duration::ZERO,
         };
         let server_wait = match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
@@ -879,8 +916,15 @@ impl NntpConnection {
         if let Some(outcome) = &self.route_outcome {
             outcome.read(bytes);
         }
-        if let Some(control) = &self.egress_control {
-            control.pace_read_without_wait(bytes);
+        match (self.egress_accounting.front_mut(), &self.egress_control) {
+            (Some(BodyTransferAccounting::Tracked(permit)), _) => {
+                permit.record_without_wait(bytes);
+            }
+            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
+                control.record_unlimited_body_bytes(bytes);
+            }
+            (None, Some(control)) => control.pace_read_without_wait(bytes),
+            (_, None) => {}
         }
         match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
@@ -899,10 +943,14 @@ impl NntpConnection {
         if let Some(BodyTransferAccounting::Tracked(permit)) = self.body_accounting.pop_front() {
             permit.finish();
         }
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.egress_accounting.pop_front() {
+            permit.finish();
+        }
     }
 
     fn abort_active_body(&mut self) {
         self.body_accounting.pop_front();
+        self.egress_accounting.pop_front();
     }
 
     fn poison_on_soft_timeout(&mut self, error: &NntpError) {

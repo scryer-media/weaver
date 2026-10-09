@@ -61,17 +61,18 @@ groups:
             Every configured server is cooling down or disabled, so nothing can
             download.
 
-      - alert: WeaverDownloadsGatedByIspCap
-        expr: weaver_pipeline_download_gate{reason="isp_cap"} == 1
+      - alert: WeaverDownloadsGatedByEgressQuota
+        expr: weaver_pipeline_download_gate{reason="egress_quota"} == 1
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "Downloads blocked by the ISP bandwidth cap"
+          summary: "Downloads blocked by an egress download quota"
           description: >-
-            The configured ISP cap has been holding downloads for 15 minutes.
-            weaver_bandwidth_cap_remaining_bytes shows what is left, and
-            weaver_bandwidth_cap_window_end_seconds when the window rolls over.
+            Every egress the waiting work can use has exhausted its download
+            quota for 15 minutes. Check weaver_egress_download_quota_blocked to
+            see which, and weaver_download_quota_block_window_end_seconds for
+            when the window rolls over.
 
       - alert: WeaverDownloadsGatedByServerQuota
         expr: weaver_pipeline_download_gate{reason="server_quota"} == 1
@@ -129,22 +130,23 @@ groups:
             current window. Downloads will start spilling to lower-priority
             servers, or stop, when it runs out.
 
-      - alert: WeaverIspCapNearlyExhausted
+      - alert: WeaverEgressQuotaNearlyExhausted
         expr: >-
-          weaver_bandwidth_cap_enabled == 1
+          weaver_egress_download_quota_enabled == 1
           and
           (
-            weaver_bandwidth_cap_used_bytes
-              / clamp_min(weaver_bandwidth_cap_limit_bytes, 1)
+            weaver_egress_download_quota_used_bytes
+              / clamp_min(weaver_egress_download_quota_limit_bytes, 1)
           ) > 0.9
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "ISP bandwidth cap over 90% consumed"
+          summary: "Egress {{ $labels.egress_id }} has used over 90% of its quota"
           description: >-
-            {{ $value | humanizePercentage }} of the configured ISP cap has been
-            used in the current window.
+            {{ $value | humanizePercentage }} of egress {{ $labels.egress_id }}'s
+            download quota has been used in the current window. Routes move off
+            it when it runs out.
 
       - alert: WeaverServerArticleMissRatioHigh
         # The `and` clause is a volume floor: on a quiet server two misses out

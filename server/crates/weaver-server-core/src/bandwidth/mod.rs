@@ -8,5 +8,5 @@ pub mod repository;
 pub mod schedule;
 pub mod service;
 
-pub use caps::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
+pub use caps::QuotaWeekday;
 pub use model::{PruneFiles, ScheduleAction, ScheduleEntry, ScheduleTrack, Weekday};

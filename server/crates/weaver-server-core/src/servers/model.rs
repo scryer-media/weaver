@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::bandwidth::IspBandwidthCapWeekday;
+use crate::bandwidth::QuotaWeekday;
 
 /// Largest byte count accepted by persistence-backed per-server policies.
 pub const MAX_PERSISTED_SERVER_DOWNLOAD_BYTES: u64 = i64::MAX as u64;
@@ -47,7 +47,7 @@ pub struct ServerDownloadQuotaConfig {
     #[serde(default)]
     pub reset_time_minutes_local: u16,
     #[serde(default = "default_quota_weekday")]
-    pub weekly_reset_weekday: IspBandwidthCapWeekday,
+    pub weekly_reset_weekday: QuotaWeekday,
     #[serde(default = "default_monthly_reset_day")]
     pub monthly_reset_day: u8,
 }
@@ -67,21 +67,31 @@ impl Default for ServerDownloadQuotaConfig {
 
 impl ServerDownloadQuotaConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_for("server")
+    }
+
+    /// The same bounds for a quota held by something other than a server;
+    /// `subject` names it in the error.
+    pub fn validate_for(&self, subject: &str) -> Result<(), String> {
         if self.limit_bytes > MAX_PERSISTED_SERVER_DOWNLOAD_BYTES {
-            return Err("server download quota limit exceeds database range".to_string());
+            return Err(format!(
+                "{subject} download quota limit exceeds database range"
+            ));
         }
         if self.enabled && self.limit_bytes == 0 {
-            return Err(
-                "enabled server download quota limit must be greater than zero".to_string(),
-            );
+            return Err(format!(
+                "enabled {subject} download quota limit must be greater than zero"
+            ));
         }
         if self.reset_time_minutes_local >= 24 * 60 {
-            return Err("server download quota reset time must be between 0 and 1439".to_string());
+            return Err(format!(
+                "{subject} download quota reset time must be between 0 and 1439"
+            ));
         }
         if !(1..=31).contains(&self.monthly_reset_day) {
-            return Err(
-                "server download quota monthly reset day must be between 1 and 31".to_string(),
-            );
+            return Err(format!(
+                "{subject} download quota monthly reset day must be between 1 and 31"
+            ));
         }
         Ok(())
     }
@@ -158,8 +168,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_quota_weekday() -> IspBandwidthCapWeekday {
-    IspBandwidthCapWeekday::Mon
+fn default_quota_weekday() -> QuotaWeekday {
+    QuotaWeekday::Mon
 }
 
 fn default_monthly_reset_day() -> u8 {

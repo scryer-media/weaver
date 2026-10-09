@@ -60,13 +60,7 @@ impl Pipeline {
         let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
         let decode_backlog_budget_bytes =
             compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
-        let (
-            hardware_profile,
-            initial_bandwidth_policy,
-            direct_store_settings,
-            direct_unpack_settings,
-            propagation_delay,
-        ) = {
+        let (hardware_profile, direct_store_settings, direct_unpack_settings, propagation_delay) = {
             let cfg = config.read().await;
             // An install that never chose one — every upgraded install — runs
             // the profile this machine is recommended. A saved choice the
@@ -82,7 +76,6 @@ impl Pipeline {
                 .direct_store_resident_default_cap_bytes;
             (
                 hardware_profile,
-                cfg.isp_bandwidth_cap.clone(),
                 // Config, with `WEAVER_RAR_DIRECT_STORE`
                 // overriding it. Resolved once here and held for the life of
                 // the pipeline — a set admitted under an enabled gate must not
@@ -230,8 +223,7 @@ impl Pipeline {
         let chase_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
         );
-        let mut bandwidth_cap = BandwidthCapRuntime::default();
-        bandwidth_cap.set_policy(initial_bandwidth_policy);
+        let bandwidth_cap = BandwidthCapRuntime::default();
 
         let mut pipeline = Self {
             cmd_rx,
@@ -274,6 +266,7 @@ impl Pipeline {
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
+            egress_quota_parked: HashMap::new(),
             uu_spool_capacity: storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
             uu_spool_debits: crate::operations::CapacityDebits::default(),
@@ -398,7 +391,6 @@ impl Pipeline {
             global_paused: initial_global_paused,
             scheduled_pause: false,
             bandwidth_cap,
-            bandwidth_reservations: HashMap::new(),
             rate_limit_reservations: HashMap::new(),
             configured_rate_limit: 0,
             scheduled_rate_limit: None,
@@ -549,7 +541,7 @@ impl Pipeline {
             config,
             pp_pool,
         };
-        let _ = pipeline.refresh_bandwidth_cap_window();
+        pipeline.publish_download_block();
         pipeline.refresh_download_pressure();
         // The very first lease a lane takes must already know the depth its
         // server can run at; discovering it from the first response means the
@@ -1355,7 +1347,10 @@ impl Pipeline {
     pub(crate) fn publish_snapshot(&mut self) {
         self.snapshot_published_at = Some(Instant::now());
         self.snapshot_publish_pending = false;
-        let _ = self.refresh_bandwidth_cap_window();
+        if let Err(error) = self.bandwidth_cap.prune_if_due(&self.db) {
+            warn!(error = %error, "failed to prune the bandwidth ledger");
+        }
+        self.publish_download_block();
         let jobs = self.list_jobs();
         let holds: HashMap<_, _> = jobs
             .iter()
@@ -1518,7 +1513,8 @@ impl Pipeline {
             infrastructure_retry,
             mut work,
         } = retry;
-        if self.server_quota_parked.remove(&work.segment_id) {
+        let egress_parked = self.egress_quota_parked.remove(&work.segment_id).is_some();
+        if self.server_quota_parked.remove(&work.segment_id) || egress_parked {
             self.refresh_server_quota_block_presentation();
         }
         if scheduled_pool_generation != self.pool_generation

@@ -2181,7 +2181,6 @@ fn settings_resolve_reads_the_config_table() {
         retry: None,
         max_download_speed: None,
         cleanup_after_extract: None,
-        isp_bandwidth_cap: None,
         propagation_delay_secs: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: crate::jobs::DuplicatePolicy::default(),

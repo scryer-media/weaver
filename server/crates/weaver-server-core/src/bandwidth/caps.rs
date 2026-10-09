@@ -1,16 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// Day a weekly download quota window resets on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IspBandwidthCapPeriod {
-    Daily,
-    Weekly,
-    Monthly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IspBandwidthCapWeekday {
+pub enum QuotaWeekday {
     Mon,
     Tue,
     Wed,
@@ -18,15 +11,4 @@ pub enum IspBandwidthCapWeekday {
     Fri,
     Sat,
     Sun,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IspBandwidthCapConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    pub period: IspBandwidthCapPeriod,
-    pub limit_bytes: u64,
-    pub reset_time_minutes_local: u16,
-    pub weekly_reset_weekday: IspBandwidthCapWeekday,
-    pub monthly_reset_day: u8,
 }

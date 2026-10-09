@@ -27,6 +27,7 @@ fn egress(binding: EgressBinding) -> EgressInterface {
         binding,
         enabled: true,
         max_download_speed: 0,
+        download_quota: Default::default(),
     }
 }
 

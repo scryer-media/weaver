@@ -34,9 +34,6 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline
-        .reserve_bandwidth_for_dispatch(segment_id, 1024)
-        .unwrap();
     pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -121,9 +118,6 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline
-        .reserve_bandwidth_for_dispatch(segment_id, 1024)
-        .unwrap();
     pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -776,46 +770,66 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
 }
 
 #[tokio::test]
-async fn dispatch_downloads_blocks_when_isp_bandwidth_cap_is_hit() {
+async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
-    let job_id = JobId(20005);
-    let spec = standalone_job_spec("ISP Cap Gate", &[("queued.bin".to_string(), 512u32)]);
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let block = crate::jobs::handle::EgressQuotaBlock {
+        egress_id: 4,
+        egress_name: "Metered uplink".to_string(),
+        used_bytes: 900,
+        limit_bytes: 1_000,
+        remaining_bytes: 0,
+        window_starts_at_epoch_ms: Some(1_000.0),
+        window_ends_at_epoch_ms: Some(2_000.0),
+        timezone_name: "UTC".to_string(),
+    };
 
-    let now = chrono::Local::now();
-    let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
+    pipeline.shared_state.set_server_quota_blocked(true);
     pipeline
-        .db
-        .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 1024)
-        .unwrap();
-    pipeline
-        .apply_bandwidth_cap_policy(Some(crate::bandwidth::IspBandwidthCapConfig {
-            enabled: true,
-            period: crate::bandwidth::IspBandwidthCapPeriod::Daily,
-            limit_bytes: 512,
-            reset_time_minutes_local: reset_minutes,
-            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 1,
-        }))
-        .unwrap();
+        .shared_state
+        .set_egress_quota_block(Some(block.clone()));
+    let state = pipeline.shared_state.download_block();
+    assert_eq!(
+        state.kind,
+        crate::jobs::handle::DownloadBlockKind::EgressQuota
+    );
+    assert_eq!(state.egress_id, Some(4));
+    assert_eq!(state.egress_name.as_deref(), Some("Metered uplink"));
+    assert_eq!(state.used_bytes, 900);
+    assert_eq!(state.limit_bytes, 1_000);
+    assert_eq!(state.window_ends_at_epoch_ms, Some(2_000.0));
 
-    pipeline.dispatch_downloads();
-
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 1);
+    // A refresh from the pause state keeps the egress block laid over it.
+    pipeline.publish_download_block();
     assert_eq!(
         pipeline.shared_state.download_block().kind,
-        crate::jobs::handle::DownloadBlockKind::IspCap
+        crate::jobs::handle::DownloadBlockKind::EgressQuota
+    );
+
+    // A manual pause outranks it, and the egress details stay readable.
+    pipeline.global_paused = true;
+    pipeline.publish_download_block();
+    let state = pipeline.shared_state.download_block();
+    assert_eq!(
+        state.kind,
+        crate::jobs::handle::DownloadBlockKind::ManualPause
+    );
+    assert_eq!(state.egress_id, Some(4));
+    pipeline.global_paused = false;
+    pipeline.publish_download_block();
+
+    // Once the egress clears, the server quota underneath shows again.
+    pipeline.shared_state.set_egress_quota_block(None);
+    let state = pipeline.shared_state.download_block();
+    assert_eq!(
+        state.kind,
+        crate::jobs::handle::DownloadBlockKind::ServerQuota
+    );
+    assert_eq!(state.egress_id, None);
+    pipeline.shared_state.set_server_quota_blocked(false);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::None
     );
 }
 
@@ -865,7 +879,7 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
 }
 
 #[tokio::test]
-async fn bandwidth_cap_state_refresh_preserves_scheduled_speed_limit() {
+async fn download_block_refresh_preserves_scheduled_speed_limit() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -880,7 +894,7 @@ async fn bandwidth_cap_state_refresh_preserves_scheduled_speed_limit() {
 
     pipeline.scheduled_rate_limit = Some(131_072);
     pipeline.rate_limiter.set_rate(131_072);
-    pipeline.refresh_bandwidth_cap_window().unwrap();
+    pipeline.publish_download_block();
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
         131_072
@@ -997,44 +1011,6 @@ async fn clearing_scheduled_speed_limit_restores_latest_configured_limit() {
         pipeline.shared_state.download_block().scheduled_speed_limit,
         0
     );
-}
-
-#[tokio::test]
-async fn set_bandwidth_cap_policy_recomputes_current_window_usage_from_ledger() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
-
-    let now = chrono::Local::now();
-    let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
-    pipeline
-        .db
-        .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 4096)
-        .unwrap();
-
-    pipeline
-        .apply_bandwidth_cap_policy(Some(crate::bandwidth::IspBandwidthCapConfig {
-            enabled: false,
-            period: crate::bandwidth::IspBandwidthCapPeriod::Daily,
-            limit_bytes: 10_000,
-            reset_time_minutes_local: reset_minutes,
-            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 1,
-        }))
-        .unwrap();
-
-    let block = pipeline.shared_state.download_block();
-    assert_eq!(block.used_bytes, 4096);
-    assert_eq!(block.remaining_bytes, 10_000 - 4096);
-    assert!(!block.cap_enabled);
 }
 
 #[tokio::test]
@@ -2212,8 +2188,6 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     pipeline.active_downloads = 1;
     pipeline.active_download_passes.insert(job_id);
     pipeline.active_downloads_by_job.insert(job_id, 1);
-    pipeline.bandwidth_cap.reserve(256);
-    pipeline.bandwidth_reservations.insert(segment_id, 256);
     pipeline.rate_limit_reservations.insert(segment_id, 256);
     let lane_id = Pipeline::next_download_lane_id();
     pipeline.download_lane_owners.insert(
@@ -2262,7 +2236,6 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     assert_eq!(pipeline.active_downloads, 0);
     assert!(!pipeline.active_download_passes.contains(&job_id));
     assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
-    assert!(pipeline.bandwidth_reservations.is_empty());
     assert!(pipeline.rate_limit_reservations.is_empty());
 }
 

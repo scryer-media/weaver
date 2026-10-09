@@ -81,8 +81,8 @@ const ko: LocaleDictionary = {
   "upload.stageExpired": "Staged upload expired. Re-add the file.",
 
   // Jobs page
-  "jobs.bandwidthCapShort": "ISP 제한",
-  "jobs.bandwidthCapEta": "{{resetAt}}까지",
+  "jobs.egressQuotaBadge": "송신 할당량",
+  "jobs.egressQuotaEta": "{{resetAt}}까지",
   "jobs.serverQuotaBadge": "서버 할당량",
   "jobs.serverQuotaEta": "서버 할당량 대기 중",
 

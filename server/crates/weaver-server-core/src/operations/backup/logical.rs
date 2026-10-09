@@ -16,7 +16,7 @@ use super::catalog::{
     is_engine_internal_table, is_optional_catalog_table, quote_identifier,
 };
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
-use crate::schema_migrations::script_instances_v55;
+use crate::schema_migrations::{egress_quotas_v53, script_instances_v55};
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
 
@@ -883,6 +883,12 @@ async fn import_sqlite(
             )));
         }
         validate_sqlite_counts(&mut conn, &restored).await?;
+        move_older_bandwidth_cap(
+            &mut SqlConn::Sqlite(&mut conn),
+            source_schema_version,
+            expected,
+        )
+        .await?;
         move_older_script_wiring(
             &mut SqlConn::Sqlite(&mut conn),
             source_schema_version,
@@ -971,6 +977,12 @@ async fn import_postgres(
     }
     validate_postgres_counts(&mut tx, &restored).await?;
     repair_postgres_sequences(&mut tx).await?;
+    move_older_bandwidth_cap(
+        &mut SqlConn::Postgres(&mut tx),
+        source_schema_version,
+        expected,
+    )
+    .await?;
     move_older_script_wiring(
         &mut SqlConn::Postgres(&mut tx),
         source_schema_version,
@@ -978,6 +990,22 @@ async fn import_postgres(
     )
     .await?;
     tx.commit().await.map_err(db_err)
+}
+
+/// A bundle written before egresses kept download quotas can carry the
+/// bandwidth cap they replaced. No migration runs over a restore, so the step
+/// that moves the cap onto the System egress on an upgrade is run here instead.
+async fn move_older_bandwidth_cap(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+    expected: &BTreeMap<String, TablePartMetadata>,
+) -> Result<(), StateError> {
+    if source_schema_version >= egress_quotas_v53::SCHEMA_VERSION
+        || expected.contains_key("egress_download_usage")
+    {
+        return Ok(());
+    }
+    egress_quotas_v53::move_isp_cap_to_system_egress(conn).await
 }
 
 /// A bundle written before there were script instances carries the wiring

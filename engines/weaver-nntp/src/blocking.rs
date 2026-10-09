@@ -43,8 +43,8 @@ use crate::tls::{
     selected_blocking_tls_backend, tls_backend_for_preference,
 };
 use crate::transfer::{
-    ActiveTransferBudget, BodyTransferAccounting, ServerTransferControl, StableServerId,
-    active_transfer_read_timeout, active_transfer_timeout,
+    ActiveTransferBudget, BodyTransferAccounting, QuotaRejection, ServerTransferControl,
+    StableServerId, active_transfer_read_timeout, active_transfer_timeout,
 };
 use crate::types::{ArticleId, Capabilities, Response};
 
@@ -215,6 +215,9 @@ pub struct BlockingNntpConnection {
     poisoned: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    /// The egress's accounting for each outstanding BODY, in step with
+    /// `body_accounting`. Empty when the connection has no egress control.
+    egress_accounting: VecDeque<BodyTransferAccounting>,
     /// Immutable geometry the next decoded article's CRC pass checkpoints at.
     /// Set per fetch by the lane; never inherited from a prior job.
     checkpoint_plan: CheckpointPlan,
@@ -357,9 +360,7 @@ impl BlockingBodyLane {
         // A GROUP written behind an unread BODY response would read that
         // article's payload as its own status line; a poisoned socket cannot
         // be re-pointed at all. Either way the lane is not worth keeping.
-        if self.conn.poisoned
-            || !self.ring.outstanding.is_empty()
-            || !self.conn.body_accounting.is_empty()
+        if self.conn.poisoned || !self.ring.outstanding.is_empty() || self.conn.bodies_outstanding()
         {
             return Err(NntpError::ConnectionClosed);
         }
@@ -386,6 +387,16 @@ impl BlockingBodyLane {
 
     pub fn stable_server_id(&self) -> StableServerId {
         self.stable_server_id
+    }
+
+    /// Whether the egress this connection leaves through would turn away a
+    /// BODY of `requested_body_bytes` now. A connection on an egress that is
+    /// out of quota cannot carry work until the quota resets, while the route
+    /// may have other egresses that can.
+    pub fn egress_quota_rejection(&self, requested_body_bytes: u64) -> Option<QuotaRejection> {
+        self.conn
+            .egress_transfer_control()
+            .and_then(|control| control.quota_rejection_for(requested_body_bytes))
     }
 
     pub fn remote_ip(&self) -> Option<IpAddr> {
@@ -422,7 +433,7 @@ impl BlockingBodyLane {
     /// Inspect only between leases, through TLS where applicable. Partial
     /// records remain in the transport and inspection never waits for input.
     pub fn peer_closed(&mut self) -> bool {
-        if !self.ring.outstanding.is_empty() || !self.conn.body_accounting.is_empty() {
+        if !self.ring.outstanding.is_empty() || self.conn.bodies_outstanding() {
             return false;
         }
         if !self.accepts_new_work() {
@@ -485,9 +496,7 @@ impl BlockingBodyLane {
                 inconclusive: false,
             };
         }
-        if !self.ring.outstanding.is_empty()
-            || !self.conn.body_accounting.is_empty()
-            || self.conn.poisoned
+        if !self.ring.outstanding.is_empty() || self.conn.bodies_outstanding() || self.conn.poisoned
         {
             return ProbeBatchResult {
                 exists: vec![false; message_ids.len()],
@@ -664,15 +673,18 @@ impl BlockingBodyLane {
         }
 
         if let Some((quota_idx, source)) = quota_rejection {
+            // Revalidate the tail against whichever control refused the head.
+            let refusing_control = match source.scope {
+                crate::transfer::TransferScope::Server => self.conn.transfer_control.clone(),
+                crate::transfer::TransferScope::Egress => self.conn.egress_transfer_control(),
+            };
             for (tail_idx, message_id) in
                 message_ids.iter().enumerate().take(offered).skip(quota_idx)
             {
                 let estimate = estimated_body_bytes.get(tail_idx).copied().unwrap_or(0);
                 let error = if tail_idx == quota_idx {
                     NntpError::QuotaBlocked(source.clone())
-                } else if let Some(rejection) = self
-                    .conn
-                    .transfer_control
+                } else if let Some(rejection) = refusing_control
                     .as_ref()
                     .and_then(|control| control.quota_rejection_for(estimate))
                 {
@@ -893,7 +905,7 @@ impl BlockingBodyLane {
     pub fn park(mut self) {
         // An unread response still in the socket makes QUIT meaningless: the
         // reply read back would be the tail of an article, not the server's.
-        if self.conn.body_accounting.is_empty()
+        if !self.conn.bodies_outstanding()
             && self.ring.outstanding.is_empty()
             && !self.conn.poisoned
         {
@@ -1285,6 +1297,7 @@ impl BlockingNntpConnection {
             poisoned: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            egress_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
             group_probe_armed: false,
@@ -1593,7 +1606,7 @@ impl BlockingNntpConnection {
         self.reserve_body(estimated_body_bytes)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
         if let Err(error) = self.write_command_frame(&cmd) {
-            self.body_accounting.pop_back();
+            self.unreserve_last_body();
             return Err(error);
         }
         Ok(())
@@ -1604,6 +1617,18 @@ impl BlockingNntpConnection {
         self.transfer_control = control;
     }
 
+    /// The egress control this connection's route leaves through, if any.
+    pub(crate) fn egress_transfer_control(&self) -> Option<Arc<ServerTransferControl>> {
+        self.egress_control.clone()
+    }
+
+    /// Whether any BODY is admitted and not yet finished or aborted.
+    fn bodies_outstanding(&self) -> bool {
+        !self.body_accounting.is_empty() || !self.egress_accounting.is_empty()
+    }
+
+    /// Admit one BODY against the server, then against the egress. A refusal
+    /// from either leaves nothing reserved and names who refused.
     fn reserve_body(&mut self, estimated_body_bytes: u64) -> Result<()> {
         if let Some(control) = &self.transfer_control {
             self.body_accounting.push_back(
@@ -1612,16 +1637,42 @@ impl BlockingNntpConnection {
                     .map_err(NntpError::quota_blocked)?,
             );
         }
+        if let Some(control) = &self.egress_control {
+            match control.start_body(estimated_body_bytes) {
+                Ok(accounting) => self.egress_accounting.push_back(accounting),
+                Err(rejection) => {
+                    if self.transfer_control.is_some() {
+                        self.body_accounting.pop_back();
+                    }
+                    return Err(NntpError::quota_blocked(rejection));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Undo the last `reserve_body`, for a BODY that was never sent.
+    fn unreserve_last_body(&mut self) {
+        if self.transfer_control.is_some() {
+            self.body_accounting.pop_back();
+        }
+        if self.egress_control.is_some() {
+            self.egress_accounting.pop_back();
+        }
     }
 
     fn charge_active_body(&mut self, bytes: usize) -> Duration {
         if let Some(outcome) = &self.route_outcome {
             outcome.read(bytes);
         }
-        let egress_wait = match &self.egress_control {
-            Some(control) => control.pace_read_blocking(bytes),
-            None => Duration::ZERO,
+        let egress_wait = match (self.egress_accounting.front_mut(), &self.egress_control) {
+            (Some(BodyTransferAccounting::Tracked(permit)), _) => permit.record_blocking(bytes),
+            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
+                control.record_unlimited_body_bytes(bytes);
+                Duration::ZERO
+            }
+            (None, Some(control)) => control.pace_read_blocking(bytes),
+            (_, None) => Duration::ZERO,
         };
         let server_wait = match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
@@ -1640,8 +1691,15 @@ impl BlockingNntpConnection {
         if let Some(outcome) = &self.route_outcome {
             outcome.read(bytes);
         }
-        if let Some(control) = &self.egress_control {
-            control.pace_read_without_wait(bytes);
+        match (self.egress_accounting.front_mut(), &self.egress_control) {
+            (Some(BodyTransferAccounting::Tracked(permit)), _) => {
+                permit.record_without_wait(bytes);
+            }
+            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
+                control.record_unlimited_body_bytes(bytes);
+            }
+            (None, Some(control)) => control.pace_read_without_wait(bytes),
+            (_, None) => {}
         }
         match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
@@ -1660,14 +1718,19 @@ impl BlockingNntpConnection {
         if let Some(BodyTransferAccounting::Tracked(permit)) = self.body_accounting.pop_front() {
             permit.finish();
         }
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.egress_accounting.pop_front() {
+            permit.finish();
+        }
     }
 
     fn abort_active_body(&mut self) {
         self.body_accounting.pop_front();
+        self.egress_accounting.pop_front();
     }
 
     fn abort_all_bodies(&mut self) {
         self.body_accounting.clear();
+        self.egress_accounting.clear();
     }
 
     fn fail_body_pipeline(&mut self) {

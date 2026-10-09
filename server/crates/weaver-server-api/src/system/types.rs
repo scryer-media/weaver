@@ -10,7 +10,6 @@ use crate::history::types::{
     DOWNLOAD_FINALIZATION_MARKER, EventKind, encode_timeline_member_subject,
 };
 use crate::jobs::types::{GlobalQueueState, QueueSummary};
-use crate::settings::types::IspBandwidthCapPeriodGql;
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct DirectoryBrowseEntry {
@@ -73,7 +72,7 @@ pub enum DownloadBlockKindGql {
     None,
     ManualPause,
     Scheduled,
-    IspCap,
+    EgressQuota,
     ServerQuota,
 }
 
@@ -83,7 +82,7 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
             DownloadBlockKind::None => Self::None,
             DownloadBlockKind::ManualPause => Self::ManualPause,
             DownloadBlockKind::Scheduled => Self::Scheduled,
-            DownloadBlockKind::IspCap => Self::IspCap,
+            DownloadBlockKind::EgressQuota => Self::EgressQuota,
             DownloadBlockKind::ServerQuota => Self::ServerQuota,
         }
     }
@@ -92,12 +91,13 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SimpleObject)]
 pub struct DownloadBlock {
     pub kind: DownloadBlockKindGql,
-    pub cap_enabled: bool,
-    pub period: Option<IspBandwidthCapPeriodGql>,
+    /// The egress whose download quota is holding downloads, while one is.
+    pub egress_id: Option<u32>,
+    /// That egress's name.
+    pub egress_name: Option<String>,
     pub used_bytes: u64,
     pub limit_bytes: u64,
     pub remaining_bytes: u64,
-    pub reserved_bytes: u64,
     pub window_starts_at_epoch_ms: Option<f64>,
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
@@ -110,12 +110,11 @@ impl From<&DownloadBlockState> for DownloadBlock {
     fn from(value: &DownloadBlockState) -> Self {
         Self {
             kind: value.kind.into(),
-            cap_enabled: value.cap_enabled,
-            period: value.period.map(Into::into),
+            egress_id: value.egress_id,
+            egress_name: value.egress_name.clone(),
             used_bytes: value.used_bytes,
             limit_bytes: value.limit_bytes,
             remaining_bytes: value.remaining_bytes,
-            reserved_bytes: value.reserved_bytes,
             window_starts_at_epoch_ms: value.window_starts_at_epoch_ms,
             window_ends_at_epoch_ms: value.window_ends_at_epoch_ms,
             timezone_name: value.timezone_name.clone(),

@@ -80,8 +80,8 @@ const ja: LocaleDictionary = {
   "upload.stageExpired": "Staged upload expired. Re-add the file.",
 
   // Jobs page
-  "jobs.bandwidthCapShort": "ISP 制限",
-  "jobs.bandwidthCapEta": "{{resetAt}} まで",
+  "jobs.egressQuotaBadge": "送信容量",
+  "jobs.egressQuotaEta": "{{resetAt}} まで",
   "jobs.serverQuotaBadge": "サーバークォータ",
   "jobs.serverQuotaEta": "サーバークォータ待ち",
 

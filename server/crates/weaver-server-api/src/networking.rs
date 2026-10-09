@@ -231,9 +231,20 @@ pub struct EgressInterfaceInput {
     pub enabled: bool,
     #[graphql(default)]
     pub max_download_speed: u64,
+    /// The download allowance on this egress. Omitted on an update, the
+    /// saved quota stays as it is; omitted on a create, there is none.
+    pub download_quota: Option<crate::servers::types::ServerDownloadQuotaInput>,
 }
 impl EgressInterfaceInput {
-    fn egress(self, id: u32) -> Result<core::EgressInterface> {
+    fn egress(
+        self,
+        id: u32,
+        saved_quota: weaver_server_core::servers::ServerDownloadQuotaConfig,
+    ) -> Result<core::EgressInterface> {
+        let download_quota = match self.download_quota {
+            Some(quota) => quota.try_into().map_err(async_graphql::Error::new)?,
+            None => saved_quota,
+        };
         let binding = match self.binding_kind {
             EgressBindingKind::System => core::EgressBinding::System,
             EgressBindingKind::Interface => {
@@ -261,6 +272,7 @@ impl EgressInterfaceInput {
             binding,
             enabled: self.enabled,
             max_download_speed: self.max_download_speed,
+            download_quota,
         };
         egress.validate().map_err(async_graphql::Error::new)?;
         Ok(egress)
@@ -277,18 +289,31 @@ pub struct EgressInterfaceGql {
     pub addresses: Vec<String>,
     pub enabled: bool,
     pub max_download_speed: u64,
+    /// The download allowance and its live usage.
+    pub download_quota: crate::servers::types::ServerDownloadQuota,
+    /// The live usage of the download allowance, or null while this Weaver
+    /// is not tracking it.
+    pub download_quota_usage: Option<crate::servers::types::DownloadQuotaUsage>,
     pub health: String,
     pub reason: Option<String>,
 }
 fn egress_gql(
     e: core::EgressInterface,
     interfaces: &core::InterfaceSnapshot,
+    network: &core::NetworkRuntime,
 ) -> EgressInterfaceGql {
+    let usage = network.egress_quota_usage(e.id);
     let (health, reason) = match interfaces.health(&e, None) {
-        core::EgressHealth::Up => ("UP", None),
         core::EgressHealth::Down(reason) => ("DOWN", Some(reason)),
+        _ if usage.as_ref().is_some_and(|usage| usage.blocked) => {
+            ("DOWN", Some(core::QUOTA_REACHED.to_owned()))
+        }
+        core::EgressHealth::Up => ("UP", None),
         core::EgressHealth::Unknown => ("UNKNOWN", interfaces.error.clone()),
     };
+    let download_quota =
+        crate::servers::types::ServerDownloadQuota::from_config(&e.download_quota, usage.as_ref());
+    let download_quota_usage = usage.as_ref().map(Into::into);
     let addresses = interfaces
         .interfaces
         .iter()
@@ -327,6 +352,8 @@ fn egress_gql(
         addresses,
         enabled: e.enabled,
         max_download_speed: e.max_download_speed,
+        download_quota,
+        download_quota_usage,
         health: health.into(),
         reason,
     }
@@ -690,7 +717,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
         pools,
         egresses: egresses
             .into_iter()
-            .map(|e| egress_gql(e, &interfaces))
+            .map(|e| egress_gql(e, &interfaces, &runtime.network))
             .collect(),
         proxies: profiles.into_iter().map(Into::into).collect(),
         proxy_pools: definitions.into_iter().map(Into::into).collect(),
@@ -707,13 +734,14 @@ pub struct NetworkingQuery;
 impl NetworkingQuery {
     #[graphql(guard = "AdminGuard")]
     async fn egress_interfaces(&self, ctx: &Context<'_>) -> Result<Vec<EgressInterfaceGql>> {
-        let snapshot = runtime(ctx)?.network.interfaces();
+        let runtime = runtime(ctx)?;
+        let snapshot = runtime.network.interfaces();
         let db = ctx.data::<Database>()?.clone();
         Ok(
             spawn_blocking_db("network.egresses", move || db.list_egress_interfaces())
                 .await?
                 .into_iter()
-                .map(|e| egress_gql(e, &snapshot))
+                .map(|e| egress_gql(e, &snapshot, &runtime.network))
                 .collect(),
         )
     }
@@ -816,13 +844,17 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
-        let egress = input.egress(1)?;
+        let egress = input.egress(1, Default::default())?;
         let saved = spawn_blocking_db("network.create_egress", move || {
             db.create_egress_interface(&egress)
         })
         .await?;
         runtime.reload().await.map_err(async_graphql::Error::new)?;
-        Ok(egress_gql(saved, &runtime.network.interfaces()))
+        Ok(egress_gql(
+            saved,
+            &runtime.network.interfaces(),
+            &runtime.network,
+        ))
     }
     #[graphql(guard = "AdminGuard")]
     async fn update_egress_interface(
@@ -834,13 +866,30 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
-        let egress = input.egress(id)?;
+        let saved_quota = if input.download_quota.is_some() {
+            Default::default()
+        } else {
+            let db = db.clone();
+            spawn_blocking_db("network.update_egress.saved_quota", move || {
+                db.list_egress_interfaces()
+            })
+            .await?
+            .into_iter()
+            .find(|egress| egress.id == id)
+            .map(|egress| egress.download_quota)
+            .unwrap_or_default()
+        };
+        let egress = input.egress(id, saved_quota)?;
         let saved = spawn_blocking_db("network.update_egress", move || {
             db.update_egress_interface(&egress)
         })
         .await?;
         runtime.reload().await.map_err(async_graphql::Error::new)?;
-        Ok(egress_gql(saved, &runtime.network.interfaces()))
+        Ok(egress_gql(
+            saved,
+            &runtime.network.interfaces(),
+            &runtime.network,
+        ))
     }
     #[graphql(guard = "AdminGuard")]
     async fn delete_egress_interface(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {

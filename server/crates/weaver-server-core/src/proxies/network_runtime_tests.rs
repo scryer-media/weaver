@@ -373,6 +373,191 @@ async fn configured_legs_of_a_dormant_consumer_report_a_missing_egress() {
     runtime.shutdown().await;
 }
 
+fn metered_egress(limit_bytes: u64) -> EgressInterface {
+    EgressInterface {
+        id: 0,
+        name: "Metered link".into(),
+        binding: EgressBinding::SourceAddress {
+            address: "127.0.0.1".parse().unwrap(),
+        },
+        enabled: true,
+        max_download_speed: 0,
+        download_quota: crate::servers::ServerDownloadQuotaConfig {
+            enabled: true,
+            limit_bytes,
+            period: crate::servers::ServerDownloadQuotaPeriod::OneTime,
+            ..Default::default()
+        },
+    }
+}
+
+/// Spend `bytes` of an egress's allowance the way a finished BODY does.
+fn spend(runtime: &NetworkRuntime, egress_id: u32, bytes: usize) {
+    let mut permit = runtime
+        .egress_controls
+        .control(weaver_nntp::transfer::StableServerId(egress_id))
+        .try_reserve(bytes as u64)
+        .unwrap();
+    permit.record_blocking(bytes);
+    permit.finish();
+}
+
+#[tokio::test]
+async fn a_used_up_egress_quota_takes_its_leg_down_and_its_share_moves_to_the_other_leg() {
+    let db = Database::open_in_memory().unwrap();
+    let metered = db
+        .create_egress_interface(&metered_egress(1_000_000))
+        .unwrap();
+    let policy = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = NetworkRuntime::with_quota_policy(
+        db,
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    let consumer = Consumer::Server(3);
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.consumers.insert(consumer.key());
+    config.policies.insert(
+        consumer.key(),
+        RoutingPolicy {
+            legs: vec![
+                RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 50,
+                    path: LegPath::Direct,
+                },
+                RouteLeg {
+                    egress_id: metered.id,
+                    weight: 50,
+                    path: LegPath::Direct,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    runtime.apply_configuration(config).unwrap();
+    let route = runtime.route(consumer, 4, Duration::from_secs(1)).unwrap();
+    assert_ne!(
+        route.weighted.allocations()[1].health,
+        LegHealthState::Down(QUOTA_REACHED.into())
+    );
+
+    // The allowance is spent and the next body is turned away.
+    spend(&runtime, metered.id, 900_000);
+    assert!(
+        runtime
+            .egress_controls
+            .control(weaver_nntp::transfer::StableServerId(metered.id))
+            .try_reserve(200_000)
+            .is_err()
+    );
+    assert_eq!(
+        runtime.quota_blocked_egresses(),
+        HashSet::from([metered.id])
+    );
+    runtime.refresh_health();
+    let allocations = route.weighted.allocations();
+    assert_eq!(
+        allocations[1].health,
+        LegHealthState::Down(QUOTA_REACHED.into())
+    );
+    assert_eq!(allocations[1].target, 0);
+    assert_eq!(allocations[0].health, LegHealthState::Up);
+    assert_eq!(allocations[0].target, 4);
+    assert!(policy.egress_snapshot(metered.id).unwrap().blocked);
+
+    // A larger allowance gives the leg back.
+    let mut raised = metered.clone();
+    raised.download_quota.limit_bytes = 10_000_000;
+    policy.reconfigure_egresses(&[raised]).unwrap();
+    runtime.refresh_health();
+    assert!(runtime.quota_blocked_egresses().is_empty());
+    assert_ne!(
+        route.weighted.allocations()[1].health,
+        LegHealthState::Down(QUOTA_REACHED.into())
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn egress_quota_usage_survives_a_network_recompile_and_a_rebuilt_runtime() {
+    let db = Database::open_in_memory().unwrap();
+    let metered = db
+        .create_egress_interface(&metered_egress(5_000_000))
+        .unwrap();
+    let policy = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = NetworkRuntime::with_quota_policy(
+        db.clone(),
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    spend(&runtime, metered.id, 1_234_567);
+    assert_eq!(
+        policy.egress_snapshot(metered.id).unwrap().used_bytes,
+        1_234_567
+    );
+
+    // An edit to the egress recompiles the network mid-window.
+    let mut edited = metered.clone();
+    edited.name = "Metered link, renamed".into();
+    edited.max_download_speed = 4_096;
+    db.update_egress_interface(&edited).unwrap();
+    runtime.reload().await.unwrap();
+    let after_reload = policy.egress_snapshot(metered.id).unwrap();
+    assert_eq!(after_reload.used_bytes, 1_234_567);
+    assert_eq!(after_reload.remaining_bytes, Some(5_000_000 - 1_234_567));
+    assert_eq!(
+        runtime
+            .egress_controls
+            .snapshot(weaver_nntp::transfer::StableServerId(metered.id))
+            .rate_bytes_per_sec,
+        4_096
+    );
+
+    // A runtime built afresh over the same policies keeps counting from there.
+    runtime.shutdown().await;
+    drop(runtime);
+    let rebuilt = NetworkRuntime::with_quota_policy(
+        db.clone(),
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    spend(&rebuilt, metered.id, 1_000);
+    assert_eq!(
+        policy.egress_snapshot(metered.id).unwrap().used_bytes,
+        1_235_567
+    );
+
+    // Persisted usage restores into policies built from scratch.
+    policy.flush_usage().unwrap();
+    rebuilt.shutdown().await;
+    drop(rebuilt);
+    let restored = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = NetworkRuntime::with_quota_policy(
+        db,
+        tokio::runtime::Handle::current(),
+        Some(restored.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        restored.egress_snapshot(metered.id).unwrap().used_bytes,
+        1_235_567
+    );
+    runtime.shutdown().await;
+}
+
 /// A ladder whose chain stacks one WireGuard proxy on another, against two
 /// real peers: the second is reachable only inside the first, by a name only
 /// the first resolves.

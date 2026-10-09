@@ -8,7 +8,7 @@ import {
 import { literal, setting, waitRows } from "./support/datastore";
 import { jobState, startDownload, waitTerminal } from "./support/downloads";
 import { readClock, setClock } from "./support/e2e-clock";
-import { graphqlErrors, stage } from "./support/network-flow";
+import { graphqlErrors, setSystemEgressQuota, stage, systemEgressQuotaUsage } from "./support/network-flow";
 import { loadStageState, nzbDocument, nzbgetRpc, saveStageState, withControlKey } from "./support/script-settings";
 
 /**
@@ -601,10 +601,12 @@ test("T08 a server is out of rotation for its scheduled window", async ({ reques
   });
 });
 
-async function setIspCap(request: APIRequestContext, enabled: boolean): Promise<void> {
-  await updateSettings(request, { ispBandwidthCap: {
-    enabled, period: "DAILY", limitBytes: 2_000_000_000, resetTimeMinutesLocal: 0, weeklyResetWeekday: "MON", monthlyResetDay: 1,
-  } });
+async function setSystemQuota(request: APIRequestContext, enabled: boolean): Promise<void> {
+  await setSystemEgressQuota(request, { enabled, period: "DAILY", limitBytes: 2_000_000_000 });
+}
+
+async function systemQuotaUsed(request: APIRequestContext): Promise<number> {
+  return (await systemEgressQuotaUsage(request)).usedBytes;
 }
 
 test("T09 quota metering pauses and resumes on schedule", async ({ request }) => {
@@ -613,25 +615,24 @@ test("T09 quota metering pauses and resumes on schedule", async ({ request }) =>
   setClock(at(day, 9, 59));
   await withRules(request, "t09", async rules => {
     try {
-      await setIspCap(request, true);
+      await setSystemQuota(request, true);
       await rules.create({ actionType: "set_quota_metering", time: "10:30", quotaMeteringEnabled: true });
       const off = await rules.create({ actionType: "set_quota_metering", time: "10:00", quotaMeteringEnabled: false });
       expect(off.track).toBe("QUOTA");
 
       setClock(at(day, 10, 0));
       await witnessTick(request);
-      const before = (await queueState(request)).downloadBlock.usedBytes;
+      const before = await systemQuotaUsed(request);
       await completedJob(request, "t09-unmetered");
       await witnessTick(request);
-      expect((await queueState(request)).downloadBlock.usedBytes, "nothing metered while metering is off").toBe(before);
+      expect(await systemQuotaUsed(request), "nothing metered while metering is off").toBe(before);
 
       setClock(at(day, 10, 30));
       await witnessTick(request);
       await completedJob(request, "t09-metered");
-      await expect.poll(async () => (await queueState(request)).downloadBlock.usedBytes > before,
-        { message: "T09 metered again after 10:30", timeout: 0 }).toBe(true);
-    } finally {
-      await setIspCap(request, false);
+      await expect.poll(async () => (await systemQuotaUsed(request)) > before,
+        { message: "T09 metered again after 10:30", timeout: 0 }).toBe(true);    } finally {
+      await setSystemQuota(request, false);
     }
   });
 });

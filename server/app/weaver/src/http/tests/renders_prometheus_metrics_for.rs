@@ -173,7 +173,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"server_quota\"} 1"));
     assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"none\"} 0"));
     assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"manual_pause\"} 0"));
-    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"isp_cap\"} 0"));
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"egress_quota\"} 0"));
 
     // The gate that shipped without a label: a schedule-imposed pause used to
     // render as no gate at all.
@@ -291,12 +291,11 @@ fn renders_prometheus_download_observed_limiter_states() {
     };
     let unblocked = DownloadBlockState {
         kind: DownloadBlockKind::None,
-        cap_enabled: false,
-        period: None,
+        egress_id: None,
+        egress_name: None,
         used_bytes: 0,
         limit_bytes: 0,
         remaining_bytes: 0,
-        reserved_bytes: 0,
         window_starts_at_epoch_ms: None,
         window_ends_at_epoch_ms: None,
         timezone_name: "MDT".into(),

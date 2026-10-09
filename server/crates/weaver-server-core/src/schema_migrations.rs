@@ -14,6 +14,7 @@ use crate::migration_assets::{
 use crate::migration_hook_ids;
 use crate::persistence::sql_runtime::SqlConn;
 
+pub(crate) mod egress_quotas_v53;
 pub(crate) mod script_instances_v55;
 
 const EMBEDDED_MIGRATION_CATALOG: &[u8] =
@@ -789,6 +790,9 @@ async fn run_rust_hook(
         "upgrade_to_schema_25" => upgrade_to_schema_25(tx).await,
         "restart_active_jobs_drop_active_segments_v28" => {
             restart_active_jobs_drop_active_segments_v28(tx).await
+        }
+        egress_quotas_v53::HOOK_ID => {
+            egress_quotas_v53::move_isp_cap_to_system_egress(&mut SqlConn::Sqlite(tx)).await
         }
         script_instances_v55::HOOK_ID => {
             script_instances_v55::move_script_wiring_to_instances(&mut SqlConn::Sqlite(tx)).await

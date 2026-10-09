@@ -145,7 +145,7 @@ impl ScheduleAction {
 }
 
 /// Day of week for schedule entries. Reuses the same serialization as
-/// [`IspBandwidthCapWeekday`] but is a separate type to avoid coupling.
+/// [`QuotaWeekday`] but is a separate type to avoid coupling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Weekday {

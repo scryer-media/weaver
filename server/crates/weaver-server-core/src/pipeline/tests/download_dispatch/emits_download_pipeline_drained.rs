@@ -2279,9 +2279,6 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
     pipeline
         .active_downloads_by_file
         .insert(segment_id.file_id, 1);
-    pipeline
-        .reserve_bandwidth_for_dispatch(segment_id, 2048)
-        .unwrap();
 
     let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
     let mut pending = VecDeque::new();

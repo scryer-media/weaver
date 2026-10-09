@@ -12,6 +12,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
+import type { DownloadQuota } from "@/lib/networking";
 import { blockedRouting, directRouting, routeFields, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
@@ -22,8 +23,9 @@ import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/cont
 import { Cell } from "../../../components/rows";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
-import { formatHostnames, formatLatency, formatSize } from "../../../data/format";
-import { PanelControls, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../framework";
+import { formatHostnames, formatLatency } from "../../../data/format";
+import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
+import { quotaDraft, quotaFields, quotaInput, trimNumber, type QuotaDraft } from "../quota";
 
 /**
  * Providers: the news servers weaver downloads from.
@@ -35,19 +37,8 @@ import { PanelControls, SettingsBlocks, type FieldSpec, type SettingsBlock } fro
  */
 
 const MIB = 1024 * 1024;
-const GIB = 1024 ** 3;
-const TIB = 1024 ** 4;
 
-type QuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
-type Weekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
-
-interface ServerQuota {
-  enabled: boolean;
-  period: QuotaPeriod;
-  limitBytes: number;
-  resetTimeMinutesLocal: number;
-  weeklyResetWeekday: Weekday;
-  monthlyResetDay: number;
+interface ServerQuota extends DownloadQuota {
   usedBytes: number;
   remainingBytes: number;
   blocked: boolean;
@@ -103,10 +94,9 @@ interface ServerForm {
   retentionDays: number;
   speedUnlimited: boolean;
   speedMib: string;
-  quota: ServerQuota;
-  quotaLimit: string;
-  quotaUnit: "GB" | "TB";
-  quotaResetTime: string;
+  quota: QuotaDraft;
+  /** What the quota's current window has spent. */
+  quotaUsedBytes: number;
   /** The server's route as stored. It is set under Networking; here it only decides how a test leaves. */
   routing: RoutingPolicy;
   /**
@@ -126,18 +116,6 @@ interface ServerForm {
  */
 const CERTIFICATE_NAME_MISMATCH = "certificate belongs to a different hostname";
 
-const EMPTY_QUOTA: ServerQuota = {
-  enabled: false,
-  period: "MONTHLY",
-  limitBytes: 0,
-  resetTimeMinutesLocal: 0,
-  weeklyResetWeekday: "MON",
-  monthlyResetDay: 1,
-  usedBytes: 0,
-  remainingBytes: 0,
-  blocked: false,
-};
-
 const NEW_SERVER: ServerForm = {
   host: "",
   port: 563,
@@ -151,50 +129,13 @@ const NEW_SERVER: ServerForm = {
   retentionDays: 0,
   speedUnlimited: true,
   speedMib: "10",
-  quota: EMPTY_QUOTA,
-  quotaLimit: "",
-  quotaUnit: "GB",
-  quotaResetTime: "00:00",
+  quota: quotaDraft(null),
+  quotaUsedBytes: 0,
   routing: directRouting,
   killSwitch: false,
   certificateDerBase64: null,
   certificateFingerprint: null,
 };
-
-/** Labels are translation keys, resolved when the panel renders. */
-const QUOTA_PERIODS: { value: string; label: string }[] = [
-  { value: "ONE_TIME", label: "next.providers.oneBlock" },
-  { value: "DAILY", label: "next.bandwidth.daily" },
-  { value: "WEEKLY", label: "next.bandwidth.weekly" },
-  { value: "MONTHLY", label: "next.bandwidth.monthly" },
-];
-
-const WEEKDAYS: { value: string; label: string }[] = [
-  { value: "MON", label: "next.weekday.mon" },
-  { value: "TUE", label: "next.weekday.tue" },
-  { value: "WED", label: "next.weekday.wed" },
-  { value: "THU", label: "next.weekday.thu" },
-  { value: "FRI", label: "next.weekday.fri" },
-  { value: "SAT", label: "next.weekday.sat" },
-  { value: "SUN", label: "next.weekday.sun" },
-];
-
-function minutesToTime(minutes: number): string {
-  const clamped = Math.max(0, Math.min(23 * 60 + 59, Math.round(minutes)));
-  return `${String(Math.floor(clamped / 60)).padStart(2, "0")}:${String(clamped % 60).padStart(2, "0")}`;
-}
-
-function timeToMinutes(raw: string): number {
-  const [hours, minutes] = raw.split(":").map(Number);
-  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) {
-    return 0;
-  }
-  return Math.max(0, Math.min(23 * 60 + 59, hours * 60 + minutes));
-}
-
-function trimNumber(value: number): string {
-  return String(Number(value.toFixed(4)));
-}
 
 /** `nntps://news.example:563/` and `news.example` both mean the same host. */
 function normalizeHost(host: string): string {
@@ -230,8 +171,6 @@ function roleLabel(t: Translate, server: Server): string {
 }
 
 function formToState(server: ServerDetails | Server, username: string): ServerForm {
-  const quota = server.downloadQuota ?? EMPTY_QUOTA;
-  const unit = quota.limitBytes >= TIB ? "TB" : "GB";
   return {
     host: server.host,
     port: server.port,
@@ -245,10 +184,8 @@ function formToState(server: ServerDetails | Server, username: string): ServerFo
     retentionDays: server.retentionDays,
     speedUnlimited: server.maxDownloadSpeed === 0,
     speedMib: server.maxDownloadSpeed === 0 ? "10" : trimNumber(server.maxDownloadSpeed / MIB),
-    quota,
-    quotaLimit: quota.limitBytes === 0 ? "" : trimNumber(quota.limitBytes / (unit === "TB" ? TIB : GIB)),
-    quotaUnit: unit,
-    quotaResetTime: minutesToTime(quota.resetTimeMinutesLocal),
+    quota: quotaDraft(server.downloadQuota),
+    quotaUsedBytes: server.downloadQuota?.usedBytes ?? 0,
     routing: server.routing ?? directRouting,
     killSwitch: false,
     certificateDerBase64:
@@ -261,7 +198,6 @@ function formToState(server: ServerDetails | Server, username: string): ServerFo
 
 /** A server as saved. Its route is left out: saving a server keeps the route it has. */
 function serverInput(form: ServerForm) {
-  const quotaUnitBytes = form.quotaUnit === "TB" ? TIB : GIB;
   return {
     host: normalizeHost(form.host),
     port: form.port,
@@ -275,14 +211,7 @@ function serverInput(form: ServerForm) {
     retentionDays: form.retentionDays,
     tlsNameMismatchCertificateDerBase64: form.certificateDerBase64,
     maxDownloadSpeed: form.speedUnlimited ? 0 : Math.round(Number(form.speedMib || 0) * MIB),
-    downloadQuota: {
-      enabled: form.quota.enabled,
-      limitBytes: Math.max(0, Math.round(Number(form.quotaLimit || 0) * quotaUnitBytes)),
-      period: form.quota.period,
-      resetTimeMinutesLocal: timeToMinutes(form.quotaResetTime),
-      weeklyResetWeekday: form.quota.weeklyResetWeekday,
-      monthlyResetDay: Math.min(31, Math.max(1, Math.trunc(form.quota.monthlyResetDay))),
-    },
+    downloadQuota: quotaInput(form.quota),
   };
 }
 
@@ -707,17 +636,11 @@ export function ProvidersPanel() {
                     help: t("next.schedules.speedLimitHelp"),
                   },
                 ]),
-            {
-              id: "quotaEnabled",
+            ...quotaFields(t, values.quota, (quota) => patch({ quota }), {
               label: t("next.providers.quota"),
               help: t("next.providers.quotaHelp"),
-              control: {
-                kind: "toggle",
-                value: values.quota.enabled,
-                onChange: (next) => patch({ quota: { ...values.quota, enabled: next } }),
-              },
-            },
-            ...(values.quota.enabled ? quotaFields(t, values, patch) : []),
+              usedBytes: values.quotaUsedBytes,
+            }),
           ],
         },
         {
@@ -786,7 +709,7 @@ export function ProvidersPanel() {
         deleteLabel={t("next.providers.remove")}
         extraActions={
           <>
-            {editing && values?.quota.enabled ? (
+            {editing && values?.quota.quota.enabled ? (
               <SecondaryButton
                 icon="reset"
                 onClick={() => {
@@ -920,107 +843,4 @@ export function ProvidersPanel() {
       />
     </>
   );
-}
-
-function quotaFields(
-  t: Translate,
-  values: ServerForm,
-  patch: (next: Partial<ServerForm>) => void,
-): FieldSpec[] {
-  return [
-    {
-      id: "quotaPeriod",
-      label: t("next.providers.quotaWindow"),
-      control: {
-        kind: "select",
-        value: values.quota.period,
-        options: QUOTA_PERIODS.map((option) => ({ ...option, label: t(option.label) })),
-        onChange: (next) => patch({ quota: { ...values.quota, period: next as QuotaPeriod } }),
-      },
-    },
-    {
-      id: "quotaLimit",
-      label: t("next.bandwidth.allowance"),
-      help: t("next.providers.usedSoFar", { size: formatSize(values.quota.usedBytes) }),
-      control: {
-        kind: "custom",
-        control: (
-          <div className="flex items-center gap-[10px]">
-            <input
-              type="text"
-              inputMode="decimal"
-              aria-label={t("next.bandwidth.allowance")}
-              value={values.quotaLimit}
-              placeholder="0"
-              onChange={(event) => patch({ quotaLimit: event.target.value })}
-              className="h-[34px] w-[110px] border border-wv-control bg-wv-input px-3 font-wv-mono text-[12px] text-wv-fg outline-none focus:border-wv-control-focus"
-            />
-            <div className="flex border border-wv-control bg-wv-input">
-              {(["GB", "TB"] as const).map((unit, index) => (
-                <button
-                  key={unit}
-                  type="button"
-                  aria-pressed={values.quotaUnit === unit}
-                  onClick={() => patch({ quotaUnit: unit })}
-                  className={`flex h-8 cursor-pointer items-center px-[13px] font-wv-mono text-[12px] ${
-                    index > 0 ? "border-l border-wv-control " : ""
-                  }${
-                    values.quotaUnit === unit
-                      ? "bg-wv-segment-active font-medium text-wv-strong"
-                      : "text-wv-muted hover:text-wv-strong"
-                  }`}
-                >
-                  {unit}
-                </button>
-              ))}
-            </div>
-          </div>
-        ),
-      },
-    },
-    ...(values.quota.period === "ONE_TIME"
-      ? []
-      : [
-          {
-            id: "quotaResetTime",
-            label: t("next.bandwidth.resetAt"),
-            control: {
-              kind: "time" as const,
-              value: values.quotaResetTime,
-              onChange: (next: string) => patch({ quotaResetTime: next }),
-            },
-          },
-        ]),
-    ...(values.quota.period === "WEEKLY"
-      ? [
-          {
-            id: "quotaWeekday",
-            label: t("next.bandwidth.resetDay"),
-            control: {
-              kind: "select" as const,
-              value: values.quota.weeklyResetWeekday,
-              options: WEEKDAYS.map((option) => ({ ...option, label: t(option.label) })),
-              onChange: (next: string) =>
-                patch({ quota: { ...values.quota, weeklyResetWeekday: next as Weekday } }),
-            },
-          },
-        ]
-      : []),
-    ...(values.quota.period === "MONTHLY"
-      ? [
-          {
-            id: "quotaMonthDay",
-            label: t("next.bandwidth.resetDayOfMonth"),
-            control: {
-              kind: "number" as const,
-              value: values.quota.monthlyResetDay,
-              min: 1,
-              max: 31,
-              onChange: (next: number) =>
-                patch({ quota: { ...values.quota, monthlyResetDay: next } }),
-            },
-          },
-        ]
-      : []),
-  ];
 }

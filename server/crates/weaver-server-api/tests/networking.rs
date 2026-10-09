@@ -387,3 +387,181 @@ async fn kill_switch_keeps_a_new_consumer_blocked_until_it_is_given_a_route() {
     assert_eq!(data["rssFeeds"][0]["routing"]["allowDirect"], true);
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
+
+async fn quota_harness() -> TestHarness {
+    let h = TestHarness::new().await;
+    h.handle.set_proxy_runtime(
+        ProxyRuntime::with_quota_policy(
+            h.db.clone(),
+            tokio::runtime::Handle::current(),
+            Some(h.server_transfer_policy.clone()),
+        )
+        .unwrap(),
+    );
+    h
+}
+
+const EGRESS_QUOTA_SHAPE: &str = "id health reason downloadQuota{enabled limitBytes period resetTimeMinutesLocal weeklyResetWeekday monthlyResetDay usedBytes} downloadQuotaUsage{usedBytes remainingBytes blocked}";
+
+#[tokio::test]
+async fn egress_download_quota_is_saved_on_create_and_kept_when_an_update_omits_it() {
+    let h = quota_harness().await;
+    let response = h
+        .execute(&format!(
+            r#"mutation {{createEgressInterface(input:{{name:"Metered link",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{{enabled:true,limitBytes:5000000000,period:MONTHLY,monthlyResetDay:15,resetTimeMinutesLocal:120}}}}){{{EGRESS_QUOTA_SHAPE}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    let created = response_data(&response)["createEgressInterface"].clone();
+    let id = created["id"].as_u64().unwrap();
+    assert_eq!(
+        created["downloadQuota"],
+        serde_json::json!({
+            "enabled": true,
+            "limitBytes": 5_000_000_000u64,
+            "period": "MONTHLY",
+            "resetTimeMinutesLocal": 120,
+            "weeklyResetWeekday": "MON",
+            "monthlyResetDay": 15,
+            "usedBytes": 0,
+        })
+    );
+    assert_eq!(created["downloadQuotaUsage"]["usedBytes"], 0);
+    assert_eq!(
+        created["downloadQuotaUsage"]["remainingBytes"],
+        5_000_000_000u64
+    );
+
+    // An update that leaves the quota out keeps the saved one.
+    let response = h
+        .execute(&format!(
+            r#"mutation {{updateEgressInterface(id:{id},input:{{name:"Metered link renamed",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",maxDownloadSpeed:2048}}){{name maxDownloadSpeed {EGRESS_QUOTA_SHAPE}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    let updated = response_data(&response)["updateEgressInterface"].clone();
+    assert_eq!(updated["name"], "Metered link renamed");
+    assert_eq!(updated["maxDownloadSpeed"], 2048);
+    assert_eq!(updated["downloadQuota"], created["downloadQuota"]);
+    let saved =
+        h.db.list_egress_interfaces()
+            .unwrap()
+            .into_iter()
+            .find(|egress| u64::from(egress.id) == id)
+            .unwrap();
+    assert!(saved.download_quota.enabled);
+    assert_eq!(saved.download_quota.limit_bytes, 5_000_000_000);
+
+    // An update that carries a quota replaces it.
+    let response = h
+        .execute(&format!(
+            r#"mutation {{updateEgressInterface(id:{id},input:{{name:"Metered link renamed",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{{enabled:false}}}}){{{EGRESS_QUOTA_SHAPE}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateEgressInterface"]["downloadQuota"]["enabled"],
+        false
+    );
+
+    // A quota the server quota would refuse is refused here too.
+    assert_has_errors(
+        &h.execute(&format!(
+            r#"mutation {{updateEgressInterface(id:{id},input:{{name:"Metered link renamed",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{{enabled:true,limitBytes:0}}}}){{id}}}}"#
+        ))
+        .await,
+    );
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
+async fn egress_quota_usage_reports_recorded_bytes_and_a_used_up_quota_takes_the_egress_down() {
+    let h = quota_harness().await;
+    let response = h
+        .execute(r#"mutation {createEgressInterface(input:{name:"Small allowance",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{enabled:true,limitBytes:1048576,period:ONE_TIME}}){id}}"#)
+        .await;
+    assert_no_errors(&response);
+    let id = response_data(&response)["createEgressInterface"]["id"]
+        .as_u64()
+        .unwrap() as u32;
+    let control = h
+        .server_transfer_policy
+        .egress_transfer_registry()
+        .control(weaver_nntp::transfer::StableServerId(id));
+    let mut permit = control.try_reserve(700_000).unwrap();
+    permit.record_blocking(700_000);
+    permit.finish();
+
+    let query = format!("{{egressInterfaces{{{EGRESS_QUOTA_SHAPE}}}}}");
+    let response = h.execute(&query).await;
+    assert_no_errors(&response);
+    let egress = response_data(&response)["egressInterfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|egress| egress["id"] == id)
+        .unwrap()
+        .clone();
+    assert_eq!(egress["downloadQuota"]["usedBytes"], 700_000);
+    assert_eq!(egress["downloadQuotaUsage"]["usedBytes"], 700_000);
+    assert_eq!(egress["downloadQuotaUsage"]["remainingBytes"], 348_576);
+    assert_eq!(egress["downloadQuotaUsage"]["blocked"], false);
+    assert_ne!(egress["reason"], "Quota reached");
+
+    // A body that no longer fits is turned away, and the egress reads Down.
+    assert!(control.try_reserve(700_000).is_err());
+    let response = h.execute(&query).await;
+    assert_no_errors(&response);
+    let egress = response_data(&response)["egressInterfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|egress| egress["id"] == id)
+        .unwrap()
+        .clone();
+    assert_eq!(egress["downloadQuotaUsage"]["blocked"], true);
+    assert_eq!(egress["health"], "DOWN");
+    assert_eq!(egress["reason"], "Quota reached");
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
+async fn download_block_names_the_egress_whose_quota_holds_downloads() {
+    let h = quota_harness().await;
+    h.shared_state
+        .set_egress_quota_block(Some(weaver_server_core::EgressQuotaBlock {
+            egress_id: 0,
+            egress_name: "System".into(),
+            used_bytes: 4_000,
+            limit_bytes: 4_000,
+            remaining_bytes: 0,
+            window_starts_at_epoch_ms: Some(1_000.0),
+            window_ends_at_epoch_ms: Some(2_000.0),
+            timezone_name: "UTC".into(),
+        }));
+    // A server quota does not displace the egress that holds everything back.
+    h.shared_state.set_server_quota_blocked(true);
+    let query = "{downloadBlock{kind egressId egressName usedBytes limitBytes remainingBytes windowEndsAtEpochMs timezoneName}}";
+    let response = h.execute(query).await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["downloadBlock"],
+        serde_json::json!({
+            "kind": "EGRESS_QUOTA",
+            "egressId": 0,
+            "egressName": "System",
+            "usedBytes": 4_000,
+            "limitBytes": 4_000,
+            "remainingBytes": 0,
+            "windowEndsAtEpochMs": 2_000.0,
+            "timezoneName": "UTC",
+        })
+    );
+    h.shared_state.set_egress_quota_block(None);
+    let response = h.execute(query).await;
+    assert_no_errors(&response);
+    let block = &response_data(&response)["downloadBlock"];
+    assert_eq!(block["kind"], "SERVER_QUOTA");
+    assert_eq!(block["egressId"], serde_json::Value::Null);
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}

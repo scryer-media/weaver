@@ -203,6 +203,7 @@ impl PrometheusMetricsExporter {
             .unwrap_or(0);
         let server_health = collect_server_health(&nntp_pool).await;
         let server_transfers = self.transfer_policy.transfer_registry().snapshots();
+        let egress_transfers = self.transfer_policy.egress_transfer_registry().snapshots();
         let per_job_series = self.config.read().await.metrics.per_job_series;
 
         let extraction_rejections: Vec<(&'static str, u64)> = EXTRACTION_REJECTION_REASONS
@@ -240,6 +241,7 @@ impl PrometheusMetricsExporter {
         input.server_health = &server_health;
         input.runtime_generation = runtime_generation;
         input.server_transfers = &server_transfers;
+        input.egress_transfers = &egress_transfers;
         input.duplicate_admission = &duplicate_admission;
         input.semantic_duplicate_lifecycle = &semantic_duplicate_lifecycle;
         input.extraction_rejections = &extraction_rejections;

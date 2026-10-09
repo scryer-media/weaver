@@ -81,8 +81,8 @@ const it: LocaleDictionary = {
   "upload.stageExpired": "Staged upload expired. Re-add the file.",
 
   // Jobs page
-  "jobs.bandwidthCapShort": "Limite ISP",
-  "jobs.bandwidthCapEta": "Fino a {{resetAt}}",
+  "jobs.egressQuotaBadge": "Quota di uscita",
+  "jobs.egressQuotaEta": "Fino a {{resetAt}}",
   "jobs.serverQuotaBadge": "Quota server",
   "jobs.serverQuotaEta": "In attesa della quota server",
 

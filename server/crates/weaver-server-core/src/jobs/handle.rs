@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod};
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::ids::{JobId, NzbFileId};
@@ -107,6 +106,8 @@ pub struct SharedPipelineState {
     metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     download_block: Arc<RwLock<DownloadBlockState>>,
     server_quota_blocked: Arc<AtomicBool>,
+    /// The egress whose download quota holds work back, while one does.
+    egress_quota_block: Arc<RwLock<Option<EgressQuotaBlock>>>,
     proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
     server_transfer_policy:
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
@@ -158,6 +159,7 @@ impl SharedPipelineState {
             metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
             server_quota_blocked: Arc::new(AtomicBool::new(false)),
+            egress_quota_block: Arc::new(RwLock::new(None)),
             proxy_runtime: Arc::new(RwLock::new(None)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
@@ -289,17 +291,70 @@ impl SharedPipelineState {
 
     pub fn set_download_block(&self, mut state: DownloadBlockState) {
         let mut current = self.download_block.write().unwrap();
-        if self.server_quota_blocked.load(Ordering::Relaxed)
-            && matches!(
-                state.kind,
+        self.apply_quota_blocks(&mut state);
+        *current = state;
+    }
+
+    /// Lay the quota blocks over a pause-derived block state. A manual or
+    /// scheduled pause outranks both; an egress quota outranks a server quota,
+    /// since no server can be reached past it.
+    fn apply_quota_blocks(&self, state: &mut DownloadBlockState) {
+        let egress = self.egress_quota_block.read().unwrap().clone();
+        let quota_kind = matches!(
+            state.kind,
+            DownloadBlockKind::EgressQuota | DownloadBlockKind::ServerQuota
+        );
+        if quota_kind {
+            state.kind = if state.scheduled_speed_limit > 0 {
+                DownloadBlockKind::Scheduled
+            } else {
                 DownloadBlockKind::None
-                    | DownloadBlockKind::Scheduled
-                    | DownloadBlockKind::ServerQuota
-            )
-        {
+            };
+        }
+        let overridable = matches!(
+            state.kind,
+            DownloadBlockKind::None | DownloadBlockKind::Scheduled
+        );
+        state.egress_id = None;
+        state.egress_name = None;
+        state.used_bytes = 0;
+        state.limit_bytes = 0;
+        state.remaining_bytes = 0;
+        state.window_starts_at_epoch_ms = None;
+        state.window_ends_at_epoch_ms = None;
+        if let Some(block) = egress {
+            state.egress_id = Some(block.egress_id);
+            state.egress_name = Some(block.egress_name);
+            state.used_bytes = block.used_bytes;
+            state.limit_bytes = block.limit_bytes;
+            state.remaining_bytes = block.remaining_bytes;
+            state.window_starts_at_epoch_ms = block.window_starts_at_epoch_ms;
+            state.window_ends_at_epoch_ms = block.window_ends_at_epoch_ms;
+            state.timezone_name = block.timezone_name;
+            if overridable {
+                state.kind = DownloadBlockKind::EgressQuota;
+            }
+        } else if overridable && self.server_quota_blocked.load(Ordering::Relaxed) {
             state.kind = DownloadBlockKind::ServerQuota;
         }
-        *current = state;
+    }
+
+    pub fn egress_quota_block(&self) -> Option<EgressQuotaBlock> {
+        self.egress_quota_block.read().unwrap().clone()
+    }
+
+    /// Record which egress quota, if any, holds work back, and re-lay the
+    /// published block state over it.
+    pub fn set_egress_quota_block(&self, block: Option<EgressQuotaBlock>) {
+        let mut state = self.download_block.write().unwrap();
+        {
+            let mut current = self.egress_quota_block.write().unwrap();
+            if *current == block {
+                return;
+            }
+            *current = block;
+        }
+        self.apply_quota_blocks(&mut state);
     }
 
     /// Memory one conventional 7z extraction may hold. `u64::MAX` when no
@@ -331,26 +386,9 @@ impl SharedPipelineState {
     }
 
     pub fn set_server_quota_blocked(&self, blocked: bool) {
-        self.server_quota_blocked.store(blocked, Ordering::Relaxed);
         let mut state = self.download_block.write().unwrap();
-        if blocked {
-            if matches!(
-                state.kind,
-                DownloadBlockKind::None
-                    | DownloadBlockKind::Scheduled
-                    | DownloadBlockKind::ServerQuota
-            ) {
-                state.kind = DownloadBlockKind::ServerQuota;
-            }
-        } else if state.kind == DownloadBlockKind::ServerQuota {
-            state.kind = if state.cap_enabled && state.remaining_bytes == 0 {
-                DownloadBlockKind::IspCap
-            } else if state.scheduled_speed_limit > 0 {
-                DownloadBlockKind::Scheduled
-            } else {
-                DownloadBlockKind::None
-            };
-        }
+        self.server_quota_blocked.store(blocked, Ordering::Relaxed);
+        self.apply_quota_blocks(&mut state);
     }
 
     pub fn set_server_transfer_policy(
@@ -364,6 +402,10 @@ impl SharedPipelineState {
         &self,
     ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
         self.server_transfer_policy.read().unwrap().clone()
+    }
+
+    pub fn proxy_runtime(&self) -> Option<Arc<crate::proxies::ProxyRuntime>> {
+        self.proxy_runtime.read().expect("proxy runtime").clone()
     }
 
     pub fn set_nntp_pool(&self, pool: Arc<weaver_nntp::pool::NntpPool>) {
@@ -430,7 +472,7 @@ pub enum DownloadBlockKind {
     None,
     ManualPause,
     Scheduled,
-    IspCap,
+    EgressQuota,
     ServerQuota,
 }
 
@@ -442,7 +484,7 @@ impl DownloadBlockKind {
         Self::None,
         Self::ManualPause,
         Self::Scheduled,
-        Self::IspCap,
+        Self::EgressQuota,
         Self::ServerQuota,
     ];
 
@@ -451,7 +493,7 @@ impl DownloadBlockKind {
             Self::None => "none",
             Self::ManualPause => "manual_pause",
             Self::Scheduled => "scheduled",
-            Self::IspCap => "isp_cap",
+            Self::EgressQuota => "egress_quota",
             Self::ServerQuota => "server_quota",
         }
     }
@@ -531,12 +573,15 @@ mod splice_job_order_tests {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DownloadBlockState {
     pub kind: DownloadBlockKind,
-    pub cap_enabled: bool,
-    pub period: Option<IspBandwidthCapPeriod>,
+    /// The egress whose download quota is reached, while one is. The byte
+    /// and window fields below describe that egress's quota.
+    #[serde(default)]
+    pub egress_id: Option<u32>,
+    #[serde(default)]
+    pub egress_name: Option<String>,
     pub used_bytes: u64,
     pub limit_bytes: u64,
     pub remaining_bytes: u64,
-    pub reserved_bytes: u64,
     pub window_starts_at_epoch_ms: Option<f64>,
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
@@ -548,16 +593,29 @@ pub struct DownloadBlockState {
     pub schedule_hold_reason: Option<String>,
 }
 
+/// An egress download quota that holds work back: no leg of the route the
+/// work needs has quota left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EgressQuotaBlock {
+    pub egress_id: u32,
+    pub egress_name: String,
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    pub remaining_bytes: u64,
+    pub window_starts_at_epoch_ms: Option<f64>,
+    pub window_ends_at_epoch_ms: Option<f64>,
+    pub timezone_name: String,
+}
+
 impl Default for DownloadBlockState {
     fn default() -> Self {
         Self {
             kind: DownloadBlockKind::None,
-            cap_enabled: false,
-            period: None,
+            egress_id: None,
+            egress_name: None,
             used_bytes: 0,
             limit_bytes: 0,
             remaining_bytes: 0,
-            reserved_bytes: 0,
             window_starts_at_epoch_ms: None,
             window_ends_at_epoch_ms: None,
             timezone_name: chrono::Local::now().offset().to_string(),
@@ -733,11 +791,6 @@ pub enum SchedulerCommand {
     SetScheduledHardwareProfile {
         profile: Option<crate::runtime::HardwareProfile>,
         reply: oneshot::Sender<()>,
-    },
-    /// Set or clear the ISP bandwidth cap policy.
-    SetBandwidthCapPolicy {
-        policy: Option<IspBandwidthCapConfig>,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Replace the NNTP client at runtime (hot-reload after server config change).
     /// The client is boxed as `dyn Any` to avoid coupling weaver-scheduler to weaver-nntp.
@@ -1301,18 +1354,6 @@ impl SchedulerHandle {
         self.state.is_post_processing_paused()
     }
 
-    pub async fn set_bandwidth_cap_policy(
-        &self,
-        policy: Option<IspBandwidthCapConfig>,
-    ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::SetBandwidthCapPolicy { policy, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
-    }
-
     /// Set the global download speed limit. 0 means unlimited.
     pub async fn set_speed_limit(&self, bytes_per_sec: u64) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
@@ -1411,11 +1452,7 @@ impl SchedulerHandle {
     }
 
     pub fn proxy_runtime(&self) -> Option<Arc<crate::proxies::ProxyRuntime>> {
-        self.state
-            .proxy_runtime
-            .read()
-            .expect("proxy runtime")
-            .clone()
+        self.state.proxy_runtime()
     }
 
     pub fn set_nntp_pool(&self, pool: Arc<weaver_nntp::pool::NntpPool>) {
