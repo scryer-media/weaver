@@ -42,11 +42,17 @@ pub struct SystemInterfaceSource;
 impl InterfaceSource for SystemInterfaceSource {
     fn interfaces(&self) -> io::Result<Vec<DiscoveredInterface>> {
         let mut interfaces = BTreeMap::<String, DiscoveredInterface>::new();
-        for iface in if_addrs::get_if_addrs()? {
+        let discovered = if_addrs::get_if_addrs()?;
+        // One read of the platform's address state for every address, not
+        // one per address: this runs on every health tick.
+        let pairs: Vec<(&str, IpAddr)> = discovered
+            .iter()
+            .map(|iface| (iface.name.as_str(), iface.ip()))
+            .collect();
+        let flags = weaver_tunnel::egress::address_flags_many(&pairs);
+        for (iface, (deprecated, tentative)) in discovered.into_iter().zip(flags) {
             let address = iface.ip();
             let up = iface.is_oper_up();
-            let (deprecated, tentative) =
-                weaver_tunnel::egress::address_flags(&iface.name, address);
             let entry =
                 interfaces
                     .entry(iface.name.clone())
@@ -91,7 +97,7 @@ pub enum EgressHealth {
     Unknown,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InterfaceSnapshot {
     pub interfaces: Vec<DiscoveredInterface>,
     pub error: Option<String>,

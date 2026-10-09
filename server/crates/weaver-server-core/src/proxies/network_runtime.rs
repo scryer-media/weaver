@@ -197,6 +197,10 @@ pub struct NetworkRuntime {
     pool_updates: Mutex<StagedPoolMembers>,
     poll: Mutex<Option<tokio::task::JoinHandle<()>>>,
     quota_watch: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What the last health publish was computed from. The periodic tick
+    /// republishes only when one of these moved; an idle daemon otherwise
+    /// recomputes nothing.
+    health_inputs: Mutex<Option<(InterfaceSnapshot, HashSet<u32>)>>,
 }
 
 impl NetworkRuntime {
@@ -253,6 +257,7 @@ impl NetworkRuntime {
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
             quota_watch: Mutex::new(None),
+            health_inputs: Mutex::new(None),
         });
         let weak = Arc::downgrade(&runtime);
         *runtime.poll.lock().expect("network health task") = Some(handle.spawn(async move {
@@ -262,7 +267,7 @@ impl NetworkRuntime {
                 let Some(runtime) = weak.upgrade() else {
                     break;
                 };
-                runtime.refresh_health();
+                runtime.refresh_health_if_changed();
                 runtime.retire_unused_sessions().await;
             }
         }));
@@ -412,10 +417,33 @@ impl NetworkRuntime {
             })
             .collect()
     }
-    /// Publish every live leg's egress health, quota included.
-    pub fn refresh_health(&self) {
+    /// [`refresh_health`](Self::refresh_health) only when the interfaces or
+    /// the quota-blocked set moved since the last publish. Configuration
+    /// changes publish through the reload path, which always refreshes.
+    pub fn refresh_health_if_changed(&self) {
         let snapshot = self.interfaces();
         let quota_blocked = self.quota_blocked_egresses();
+        let unchanged = self
+            .health_inputs
+            .lock()
+            .expect("network health inputs")
+            .as_ref()
+            .is_some_and(|(last_snapshot, last_blocked)| {
+                *last_snapshot == snapshot && *last_blocked == quota_blocked
+            });
+        if !unchanged {
+            self.refresh_health_from(snapshot, quota_blocked);
+        }
+    }
+
+    /// Publish every live leg's egress health, quota included.
+    pub fn refresh_health(&self) {
+        self.refresh_health_from(self.interfaces(), self.quota_blocked_egresses());
+    }
+
+    fn refresh_health_from(&self, snapshot: InterfaceSnapshot, quota_blocked: HashSet<u32>) {
+        *self.health_inputs.lock().expect("network health inputs") =
+            Some((snapshot.clone(), quota_blocked.clone()));
         let config = self.configuration.read().expect("network configuration");
         for route in self.routes.lock().expect("network routes").values() {
             for (position, leg) in route.legs.read().expect("route legs").iter().enumerate() {
@@ -874,6 +902,7 @@ impl NetworkRuntime {
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
             quota_watch: Mutex::new(None),
+            health_inputs: Mutex::new(None),
             egress_controls: self.egress_controls.clone(),
             quota_policy: None,
             #[cfg(test)]

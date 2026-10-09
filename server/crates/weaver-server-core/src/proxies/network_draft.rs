@@ -123,6 +123,7 @@ impl NetworkRuntime {
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
             quota_watch: Mutex::new(None),
+            health_inputs: Mutex::new(None),
             egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
                 weaver_nntp::transfer::TransferScope::Egress,
             )),

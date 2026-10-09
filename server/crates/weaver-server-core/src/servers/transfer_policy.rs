@@ -95,7 +95,36 @@ pub struct ServerTransferPolicyRegistry {
     egresses: PolicyBook,
     maintenance_gate: Mutex<()>,
     last_flush: Mutex<Instant>,
+    /// The usage each control had when it was last written, so an idle
+    /// daemon's flush writes nothing.
+    flushed_usage: Mutex<HashMap<(TransferScope, u32), FlushedUsage>>,
     policy_revision: tokio::sync::watch::Sender<u64>,
+}
+
+/// The parts of a stored usage row that change between flushes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FlushedUsage {
+    lifetime_bytes: u64,
+    quota_baseline_bytes: u64,
+    window_end: Option<DateTime<Utc>>,
+}
+
+impl FlushedUsage {
+    fn of(usage: &ServerDownloadUsage) -> Self {
+        Self {
+            lifetime_bytes: usage.lifetime_bytes,
+            quota_baseline_bytes: usage.quota_baseline_bytes,
+            window_end: usage.window_end,
+        }
+    }
+}
+
+/// A quota window that rolled over in memory and still has to be written.
+struct WindowReset {
+    scope: TransferScope,
+    id: u32,
+    lifetime_bytes: u64,
+    policy: ServerPolicyState,
 }
 
 impl ServerTransferPolicyRegistry {
@@ -111,6 +140,7 @@ impl ServerTransferPolicyRegistry {
             egresses: PolicyBook::new(TransferScope::Egress, egress_transfers),
             maintenance_gate: Mutex::new(()),
             last_flush: Mutex::new(Instant::now()),
+            flushed_usage: Mutex::new(HashMap::new()),
             policy_revision,
         };
         registry.reconfigure(servers)?;
@@ -169,6 +199,10 @@ impl ServerTransferPolicyRegistry {
             .last_flush
             .lock()
             .expect("server policy registry poisoned") = Instant::now();
+        self.flushed_usage
+            .lock()
+            .expect("server policy registry poisoned")
+            .clear();
         self.notify_changed();
     }
 
@@ -443,13 +477,17 @@ impl ServerTransferPolicyRegistry {
             .maintenance_gate
             .lock()
             .expect("server policy maintenance gate poisoned");
-        self.refresh_windows_inner()
+        let resets = self.advance_windows();
+        self.persist_window_resets(resets)
     }
 
-    fn refresh_windows_inner(&self) -> Result<(), StateError> {
+    /// Roll every elapsed quota window over in memory. Cheap when nothing
+    /// elapsed, which is nearly every call; the returned resets still have to
+    /// be written with [`persist_window_resets`](Self::persist_window_resets).
+    fn advance_windows(&self) -> Vec<WindowReset> {
         let now = crate::e2e_clock::local_now();
         let now_utc = now.with_timezone(&Utc);
-        let mut changed = Vec::new();
+        let mut resets = Vec::new();
         for book in self.books() {
             let mut policies = book.policies();
             for (&id, policy) in policies.iter_mut() {
@@ -469,34 +507,83 @@ impl ServerTransferPolicyRegistry {
                     StableServerId(id),
                     transfer_config_parts(before.rate_bytes_per_sec, policy),
                 );
-                changed.push((book.scope, id, before.lifetime_body_bytes, policy.clone()));
+                resets.push(WindowReset {
+                    scope: book.scope,
+                    id,
+                    lifetime_bytes: before.lifetime_body_bytes,
+                    policy: policy.clone(),
+                });
             }
         }
-        if !changed.is_empty() {
+        if !resets.is_empty() {
             self.notify_changed();
         }
-        for (scope, id, lifetime_bytes, policy) in changed {
-            self.store_usage(
-                scope,
-                &ServerDownloadUsage {
-                    server_id: id,
-                    lifetime_bytes,
-                    quota_baseline_bytes: lifetime_bytes,
-                    window_start: policy.window.map(|value| value.start),
-                    window_end: policy.window.map(|value| value.end),
-                    updated_at: crate::e2e_clock::utc_now(),
-                },
-            )?;
-            match scope {
+        resets
+    }
+
+    fn persist_window_resets(&self, resets: Vec<WindowReset>) -> Result<(), StateError> {
+        for reset in resets {
+            let usage = ServerDownloadUsage {
+                server_id: reset.id,
+                lifetime_bytes: reset.lifetime_bytes,
+                quota_baseline_bytes: reset.lifetime_bytes,
+                window_start: reset.policy.window.map(|value| value.start),
+                window_end: reset.policy.window.map(|value| value.end),
+                updated_at: crate::e2e_clock::utc_now(),
+            };
+            self.store_usage(reset.scope, &usage)?;
+            self.record_flushed(reset.scope, &usage);
+            match reset.scope {
                 TransferScope::Server => {
-                    info!(server_id = id, "server download quota window reset")
+                    info!(server_id = reset.id, "server download quota window reset")
                 }
                 TransferScope::Egress => {
-                    info!(egress_id = id, "egress download quota window reset")
+                    info!(egress_id = reset.id, "egress download quota window reset")
                 }
             }
         }
         Ok(())
+    }
+
+    fn record_flushed(&self, scope: TransferScope, usage: &ServerDownloadUsage) {
+        self.flushed_usage
+            .lock()
+            .expect("server policy registry poisoned")
+            .insert((scope, usage.server_id), FlushedUsage::of(usage));
+    }
+
+    /// The current usage of every control, with whether it differs from what
+    /// was last written.
+    fn usage_rows(&self) -> Vec<(TransferScope, ServerDownloadUsage, bool)> {
+        let flushed = self
+            .flushed_usage
+            .lock()
+            .expect("server policy registry poisoned");
+        let mut rows = Vec::new();
+        for book in self.books() {
+            let policies = book.policies();
+            rows.extend(policies.iter().map(|(&id, policy)| {
+                let snapshot = book.transfers.snapshot(StableServerId(id));
+                let usage = ServerDownloadUsage {
+                    server_id: id,
+                    lifetime_bytes: snapshot.lifetime_body_bytes,
+                    quota_baseline_bytes: snapshot
+                        .lifetime_body_bytes
+                        .saturating_sub(snapshot.quota_used_bytes),
+                    window_start: policy.window.map(|value| value.start),
+                    window_end: policy.window.map(|value| value.end),
+                    updated_at: crate::e2e_clock::utc_now(),
+                };
+                let changed = flushed.get(&(book.scope, id)) != Some(&FlushedUsage::of(&usage));
+                (book.scope, usage, changed)
+            }));
+        }
+        rows
+    }
+
+    /// Whether a flush now would write anything.
+    fn usage_changed_since_flush(&self) -> bool {
+        self.usage_rows().iter().any(|(_, _, changed)| *changed)
     }
 
     pub fn flush_usage(&self) -> Result<(), StateError> {
@@ -504,29 +591,14 @@ impl ServerTransferPolicyRegistry {
             .maintenance_gate
             .lock()
             .expect("server policy maintenance gate poisoned");
-        self.refresh_windows_inner()?;
-        let mut usages = Vec::new();
-        for book in self.books() {
-            let policies = book.policies();
-            usages.extend(policies.iter().map(|(&id, policy)| {
-                let snapshot = book.transfers.snapshot(StableServerId(id));
-                (
-                    book.scope,
-                    ServerDownloadUsage {
-                        server_id: id,
-                        lifetime_bytes: snapshot.lifetime_body_bytes,
-                        quota_baseline_bytes: snapshot
-                            .lifetime_body_bytes
-                            .saturating_sub(snapshot.quota_used_bytes),
-                        window_start: policy.window.map(|value| value.start),
-                        window_end: policy.window.map(|value| value.end),
-                        updated_at: crate::e2e_clock::utc_now(),
-                    },
-                )
-            }));
-        }
-        for (scope, usage) in usages {
+        let resets = self.advance_windows();
+        self.persist_window_resets(resets)?;
+        for (scope, usage, changed) in self.usage_rows() {
+            if !changed {
+                continue;
+            }
             self.store_usage(scope, &usage)?;
+            self.record_flushed(scope, &usage);
         }
         Ok(())
     }
@@ -541,23 +613,45 @@ impl ServerTransferPolicyRegistry {
                 let Some(registry) = registry.upgrade() else {
                     break;
                 };
+                // The in-memory part runs here: with no elapsed window and
+                // no new bytes, an idle daemon touches neither a worker
+                // thread nor the database.
+                let resets = {
+                    let _maintenance = registry
+                        .maintenance_gate
+                        .lock()
+                        .expect("server policy maintenance gate poisoned");
+                    registry.advance_windows()
+                };
                 let should_flush = {
                     let mut last_flush = registry
                         .last_flush
                         .lock()
                         .expect("server policy registry poisoned");
-                    if last_flush.elapsed() >= Self::FLUSH_INTERVAL {
+                    if last_flush.elapsed() >= Self::FLUSH_INTERVAL
+                        && registry.usage_changed_since_flush()
+                    {
                         *last_flush = Instant::now();
                         true
                     } else {
                         false
                     }
                 };
+                if resets.is_empty() && !should_flush {
+                    continue;
+                }
                 let result = tokio::task::spawn_blocking(move || {
+                    {
+                        let _maintenance = registry
+                            .maintenance_gate
+                            .lock()
+                            .expect("server policy maintenance gate poisoned");
+                        registry.persist_window_resets(resets)?;
+                    }
                     if should_flush {
                         registry.flush_usage()
                     } else {
-                        registry.refresh_windows()
+                        Ok(())
                     }
                 })
                 .await;
