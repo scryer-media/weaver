@@ -24,7 +24,7 @@ import { Cell } from "../../../components/rows";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
 import { formatHostnames, formatLatency } from "../../../data/format";
-import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
+import { PanelControls, SettingsBlocks, useSettingsPanelActive, type SettingsBlock } from "../framework";
 import { quotaDraft, quotaFields, quotaInput, trimNumber, type QuotaDraft } from "../quota";
 
 /**
@@ -272,7 +272,9 @@ export function ProvidersPanel() {
   // when nothing is configured. Open it once, then take the ask out of the URL
   // so neither a reload nor Back opens it again.
   const [searchParams, setSearchParams] = useSearchParams();
-  const askedToAdd = searchParams.has("add");
+  const panelActive = useSettingsPanelActive();
+  // Only the open panel answers; a search mounts this one beside it.
+  const askedToAdd = searchParams.has("add") && panelActive;
   useEffect(() => {
     if (!askedToAdd) {
       return;

@@ -186,6 +186,20 @@ export function findPanel(slug: string | undefined): PanelDefinition | undefined
 }
 
 /**
+ * A panel's heading in the search results: its rail name, after its group's
+ * when it nests under one, since "Proxies" alone does not say where it lives.
+ */
+export function panelSearchTitle(
+  t: (key: string, params?: Record<string, string>) => string,
+  entry: PanelDefinition,
+): string {
+  const panel = t(entry.label);
+  return entry.group
+    ? t("next.settings.searchPanelPath", { group: t(PANEL_GROUPS[entry.group].label), panel })
+    : panel;
+}
+
+/**
  * The rail's rows: every ungrouped panel at the top level, and each group as
  * one row there with its panels nested under it.
  */
