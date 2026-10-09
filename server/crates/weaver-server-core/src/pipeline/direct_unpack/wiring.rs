@@ -506,6 +506,14 @@ impl DirectUnpackRuntime {
         self.settings().gate
     }
 
+    /// Whether a chase is armed, draining or owed a refresh: the state the
+    /// reaper polls on every pipeline turn.
+    pub(crate) fn has_work_in_flight(&self) -> bool {
+        !self.armed.is_empty()
+            || !self.draining.is_empty()
+            || !self.pending_virtual_refresh.is_empty()
+    }
+
     /// Outcome counters, as a snapshot.
     ///
     /// The exported metric surface is the per-event `direct_unpack.*` records

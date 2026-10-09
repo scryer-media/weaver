@@ -491,6 +491,10 @@ impl Pipeline {
     pub(crate) fn dispatch_downloads(&mut self) {
         let now = Instant::now();
         self.download_dispatch_wake = false;
+        // Every early return below except an operator pause is a gate that
+        // can lift with no event to announce it, so the pass is retried on
+        // the idle tick until one gets as far as the eligible jobs.
+        self.download_dispatch_retry = !self.global_paused;
         // Lanes already connected and waiting in the actor are answered
         // before any dial: an established socket outranks a new one.
         self.service_held_download_refills();
@@ -565,6 +569,10 @@ impl Pipeline {
         let tuner_max = params.max_concurrent_downloads;
         let max = self.effective_download_connection_capacity(tuner_max);
         let eligible = self.download_scheduler_eligible_jobs();
+        // Eligibility changes only through job state, which every path that
+        // changes it follows with a turn of its own; work that is eligible
+        // but could not be placed is retried on the tick.
+        self.download_dispatch_retry = !eligible.is_empty();
         if eligible.is_empty() && self.active_downloads == 0 {
             let mut drained_parked_recovery_jobs = Vec::new();
             // Collected rather than logged in place: the warning is throttled

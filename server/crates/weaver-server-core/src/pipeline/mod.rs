@@ -2871,6 +2871,34 @@ pub struct Pipeline {
     pub(super) snapshot_published_at: Option<Instant>,
     /// Whether a debounced snapshot publish is owed once the window reopens.
     pub(super) snapshot_publish_pending: bool,
+    /// Whether anything the job snapshot shows may have changed since it was
+    /// last published. A turn woken only by a periodic tick leaves it clear,
+    /// so an idle pipeline never rebuilds the snapshot.
+    pub(super) snapshot_dirty: bool,
+    /// Whether the footprint gauges were last taken before the most recent
+    /// state change, so the next tick must take them again.
+    pub(super) footprint_metrics_stale: bool,
+    /// Whether the last dispatch pass was held back by a gate that lifts with
+    /// time alone (a schedule window, the rate limiter, the bandwidth cap,
+    /// byte pressure) or found eligible work it could not place, so the idle
+    /// tick must try again. Without it nothing would wake dispatch when such
+    /// a gate lifts.
+    pub(super) download_dispatch_retry: bool,
+    /// Whether the last metrics refresh still showed a non-zero rate. The
+    /// rate windows only move when sampled, so the fast tick runs until the
+    /// gauges read zero.
+    pub(super) metrics_rates_moving: bool,
+    /// Entries in `phase_progress` for a phase other than the download,
+    /// kept so liveness is a comparison rather than a walk of every job's
+    /// phases.
+    pub(super) post_download_phases: usize,
+    /// Whether nothing has happened since the last state reconcile, so the
+    /// next one would find exactly what the last one did.
+    pub(super) reconcile_clean: bool,
+    /// What each reconcile candidate looked like when its completion check
+    /// was last scheduled by the reconcile; an unchanged job is not checked
+    /// again.
+    pub(super) reconcile_signatures: HashMap<JobId, (u64, u64, u64, usize, usize, bool)>,
     /// Per-job delay after restart-durable-lead throttling parks primary work.
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
     /// The one over-limit article reserved until its result is processed or returned.
@@ -3180,7 +3208,7 @@ pub struct Pipeline {
     /// Promoted PAR2 recovery segments that can no longer be fetched or decoded.
     pub(super) unavailable_promoted_recovery_segments: HashSet<SegmentId>,
     /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
-    pub(super) finished_jobs: Vec<JobInfo>,
+    pub(super) finished_jobs: orchestrator::FinishedJobs,
     /// Shared state for control plane reads (API handlers read without channel round-trip).
     pub(super) shared_state: SharedPipelineState,
     /// SQLite database for durable history.

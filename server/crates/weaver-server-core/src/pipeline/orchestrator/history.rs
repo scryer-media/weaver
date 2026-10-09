@@ -2,6 +2,67 @@ use std::collections::HashSet;
 
 use super::*;
 
+/// The finished jobs the pipeline keeps in memory, newest first, with the
+/// shared copy the job snapshot publishes.
+///
+/// History is most of a long-running snapshot and changes only when a job
+/// finishes or a row is deleted, so the published copy is built once per
+/// change and shared by every snapshot until the next one. Any mutable access
+/// drops it, so it can never be stale.
+#[derive(Debug, Default)]
+pub(crate) struct FinishedJobs {
+    jobs: Vec<JobInfo>,
+    shared: Option<Arc<[JobInfo]>>,
+}
+
+impl FinishedJobs {
+    /// The rows as an immutable shared slice, built on first use after a
+    /// change.
+    pub(crate) fn shared(&mut self) -> Arc<[JobInfo]> {
+        let jobs = &self.jobs;
+        Arc::clone(
+            self.shared
+                .get_or_insert_with(|| Arc::from(jobs.as_slice())),
+        )
+    }
+}
+
+impl std::ops::Deref for FinishedJobs {
+    type Target = Vec<JobInfo>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.jobs
+    }
+}
+
+impl std::ops::DerefMut for FinishedJobs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.shared = None;
+        &mut self.jobs
+    }
+}
+
+impl From<Vec<JobInfo>> for FinishedJobs {
+    fn from(jobs: Vec<JobInfo>) -> Self {
+        Self { jobs, shared: None }
+    }
+}
+
+impl FromIterator<JobInfo> for FinishedJobs {
+    fn from_iter<I: IntoIterator<Item = JobInfo>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl<'a> IntoIterator for &'a FinishedJobs {
+    type Item = &'a JobInfo;
+    type IntoIter = std::slice::Iter<'a, JobInfo>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.jobs.iter()
+    }
+}
+
 /// The working directories a history delete will remove, and the ones it will
 /// leave on disk because their ownership marker no longer matches them.
 #[derive(Debug, Default)]

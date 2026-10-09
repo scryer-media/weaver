@@ -96,7 +96,7 @@ impl JobCancellationRegistry {
 /// without going through the command channel.
 #[derive(Clone)]
 pub struct SharedPipelineState {
-    jobs: Arc<RwLock<Vec<JobInfo>>>,
+    jobs: Arc<RwLock<PublishedJobs>>,
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
     schedule_replay_paused: Arc<AtomicBool>,
@@ -136,6 +136,25 @@ pub struct SharedPipelineState {
     /// persistence, the queue replay producer) was woken for each one only to
     /// discard it. Nothing is even built here unless someone is listening.
     segment_events: broadcast::Sender<PipelineEvent>,
+    /// Metrics snapshot refreshes, counted so tests can observe the cadence of
+    /// the orchestrator's periodic tick.
+    #[cfg(test)]
+    metrics_refreshes: Arc<AtomicU64>,
+}
+
+/// The published job list: live jobs rebuilt on each publish, followed by the
+/// finished jobs, which are shared with the orchestrator and only rebuilt when
+/// history itself changes.
+#[derive(Default)]
+struct PublishedJobs {
+    live: Vec<JobInfo>,
+    history: Arc<[JobInfo]>,
+}
+
+impl PublishedJobs {
+    fn iter(&self) -> impl Iterator<Item = &JobInfo> {
+        self.live.iter().chain(self.history.iter())
+    }
 }
 
 /// Bounded like the job-level broadcast; a lagging listener drops articles,
@@ -148,7 +167,10 @@ impl SharedPipelineState {
         let (job_revision, _) = tokio::sync::watch::channel(0);
         let (segment_events, _) = broadcast::channel(SEGMENT_EVENT_CAPACITY);
         Self {
-            jobs: Arc::new(RwLock::new(initial_jobs)),
+            jobs: Arc::new(RwLock::new(PublishedJobs {
+                live: initial_jobs,
+                history: Arc::from(Vec::new()),
+            })),
             job_revision,
             paused: Arc::new(AtomicBool::new(false)),
             schedule_replay_paused: Arc::new(AtomicBool::new(false)),
@@ -168,6 +190,8 @@ impl SharedPipelineState {
             hardware_profile: Arc::new(RwLock::new(None)),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
+            #[cfg(test)]
+            metrics_refreshes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -187,7 +211,20 @@ impl SharedPipelineState {
     // --- Reader methods (called by API handlers) ---
 
     pub fn list_jobs(&self) -> Vec<JobInfo> {
-        self.jobs.read().unwrap().clone()
+        self.jobs.read().unwrap().iter().cloned().collect()
+    }
+
+    /// How many published jobs are in each status, counted under the read
+    /// lock without copying a job.
+    pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
+        crate::operations::metrics_store::JobStatusCounts::from_statuses(
+            self.jobs.read().unwrap().iter().map(|job| &job.status),
+        )
+    }
+
+    /// The revision of the published job list; it moves on every publish.
+    pub fn job_revision(&self) -> u64 {
+        *self.job_revision.borrow()
     }
 
     /// Live download rate of every transferring job, read off the published
@@ -198,7 +235,10 @@ impl SharedPipelineState {
     /// `(job id, rate)` pairs, so a metrics subscriber sampling it every
     /// 250 ms costs less than the job-list clone the queue readers make.
     pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
-        job_download_rates(&self.jobs.read().unwrap())
+        let jobs = self.jobs.read().unwrap();
+        let mut rates = job_download_rates(&jobs.live);
+        rates.extend(job_download_rates(&jobs.history));
+        rates
     }
 
     pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
@@ -270,7 +310,14 @@ impl SharedPipelineState {
     // --- Writer methods (called by pipeline loop only) ---
 
     pub fn publish_jobs(&self, jobs: Vec<JobInfo>) {
-        *self.jobs.write().unwrap() = jobs;
+        self.publish_live_jobs(jobs, Arc::from(Vec::new()));
+    }
+
+    /// Publish the live jobs together with the finished ones. The finished
+    /// list is shared, not copied: the orchestrator rebuilds it only when
+    /// history changes.
+    pub fn publish_live_jobs(&self, live: Vec<JobInfo>, history: Arc<[JobInfo]>) {
+        *self.jobs.write().unwrap() = PublishedJobs { live, history };
         self.job_revision
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
@@ -279,8 +326,24 @@ impl SharedPipelineState {
         self.job_revision.subscribe()
     }
 
-    pub fn refresh_metrics_snapshot(&self) {
-        *self.metrics_snapshot.write().unwrap() = self.metrics.snapshot();
+    /// Advance the rate windows and publish the metrics snapshot. Returns
+    /// whether any published rate is still above zero, so the caller keeps
+    /// sampling quickly until the gauges have settled.
+    pub fn refresh_metrics_snapshot(&self) -> bool {
+        let snapshot = self.metrics.snapshot();
+        let rates_moving = snapshot.current_download_speed > 0
+            || snapshot.articles_per_sec > 0.0
+            || snapshot.decode_rate_mbps > 0.0;
+        *self.metrics_snapshot.write().unwrap() = snapshot;
+        #[cfg(test)]
+        self.metrics_refreshes.fetch_add(1, Ordering::Relaxed);
+        rates_moving
+    }
+
+    /// How many times the metrics snapshot has been refreshed.
+    #[cfg(test)]
+    pub(crate) fn metrics_refresh_count(&self) -> u64 {
+        self.metrics_refreshes.load(Ordering::Relaxed)
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -1117,6 +1180,22 @@ impl SchedulerHandle {
     /// List all jobs (reads from shared state, no channel round-trip).
     pub fn list_jobs(&self) -> Vec<JobInfo> {
         self.state.list_jobs()
+    }
+
+    /// How many jobs are in each status (reads from shared state, copies no
+    /// job).
+    pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
+        self.state.job_status_counts()
+    }
+
+    /// The revision of the published job list; it moves on every publish.
+    pub fn job_revision(&self) -> u64 {
+        self.state.job_revision()
+    }
+
+    /// Wakes when the published job list changes.
+    pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.state.subscribe_job_changes()
     }
 
     /// Download rate of every transferring job (reads from shared state, no

@@ -69,6 +69,43 @@ async fn queue_snapshots_include_new_job() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn idle_queue_snapshots_client_gets_nothing_until_a_job_is_added() {
+    let h = TestHarness::new().await;
+
+    let request =
+        Request::new("subscription { queueSnapshots { items { id } } }").data(CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+
+    let initial = stream.next().await.expect("stream should stay open");
+    assert!(initial.errors.is_empty());
+    let data = initial.data.into_json().unwrap();
+    assert!(
+        data["queueSnapshots"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // The clock is paused, so this window is virtual: it lets the 2 s
+    // heartbeat fire thirty times, and none of those ticks has anything new.
+    tokio::select! {
+        biased;
+        response = stream.next() => panic!("idle client got a repeat snapshot: {response:?}"),
+        () = tokio::time::sleep(Duration::from_secs(60)) => {}
+    }
+
+    let job_id = h.submit_test_nzb("idle-then-added").await;
+    let response = stream.next().await.expect("stream should stay open");
+    assert!(response.errors.is_empty());
+    let data = response.data.into_json().unwrap();
+    let items = data["queueSnapshots"]["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|item| item["id"].as_u64() == Some(job_id)),
+        "the snapshot after an add should carry the new job"
+    );
+}
+
 #[tokio::test]
 async fn queue_snapshots_reflect_pause_state() {
     let h = TestHarness::new().await;

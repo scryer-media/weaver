@@ -400,7 +400,7 @@ pub struct Par3Slot {
 }
 
 /// A slot's phase as read by the snapshot tick.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Par3SlotSnapshot {
     pub job_id: u64,
     pub phase: Par3Phase,
@@ -842,7 +842,7 @@ impl Par3Metrics {
 
 /// Point-in-time PAR3 counters. Plain integers and fixed-size arrays only, so
 /// the enclosing snapshot stays a fixed-size struct copy with no heap fields.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Par3MetricsSnapshot {
     pub admission_refused: [u64; Par3AdmissionReason::COUNT],
     pub waiting_for_memory_active: usize,

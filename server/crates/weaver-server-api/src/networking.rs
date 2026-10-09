@@ -86,7 +86,7 @@ pub struct RouteInput {
     #[graphql(default)]
     pub failover: RouteFailover,
 }
-#[derive(SimpleObject)]
+#[derive(Clone, PartialEq, SimpleObject)]
 #[graphql(name = "Route")]
 pub struct RouteGql {
     pub legs: Vec<RouteLegGql>,
@@ -139,7 +139,7 @@ pub enum RungKind {
     Pool,
     Chain,
 }
-#[derive(Clone, Debug, SimpleObject)]
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
 #[graphql(name = "RouteRung")]
 pub struct RouteRungGql {
     pub kind: RungKind,
@@ -176,14 +176,14 @@ pub enum LegPathKind {
     Direct,
     Ladder,
 }
-#[derive(Clone, Debug, SimpleObject)]
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
 #[graphql(name = "LegPath")]
 pub struct LegPathGql {
     pub kind: LegPathKind,
     pub rungs: Vec<RouteRungGql>,
     pub direct_fallback: bool,
 }
-#[derive(Clone, Debug, SimpleObject)]
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
 #[graphql(name = "RouteLeg")]
 pub struct RouteLegGql {
     pub egress_id: u32,
@@ -266,7 +266,7 @@ impl EgressInterfaceInput {
         Ok(egress)
     }
 }
-#[derive(Clone, Debug, SimpleObject)]
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
 #[graphql(name = "EgressInterface")]
 pub struct EgressInterfaceGql {
     pub id: u32,
@@ -398,7 +398,7 @@ impl ProxyPoolInput {
         }
     }
 }
-#[derive(Clone, Debug, SimpleObject)]
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
 #[graphql(name = "ProxyPool")]
 pub struct ProxyPoolGql {
     pub id: u32,
@@ -437,7 +437,7 @@ pub struct NetworkRoute {
     pub legs: Vec<RouteLegGql>,
     pub failover: RouteFailover,
 }
-#[derive(SimpleObject)]
+#[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkLegFlow {
     pub consumer: String,
     pub position: i32,
@@ -459,13 +459,13 @@ pub struct NetworkLegFlow {
 }
 /// The first proxy hop on one of a leg's ladder rungs known to be failing.
 /// Hops past it on a chain were not reached, so nothing is known of them.
-#[derive(SimpleObject)]
+#[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkFailingHop {
     pub rung: usize,
     pub proxy_id: u32,
     pub reason: String,
 }
-#[derive(SimpleObject)]
+#[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkConsumerFlow {
     pub key: String,
     pub id: u32,
@@ -474,7 +474,7 @@ pub struct NetworkConsumerFlow {
     pub cap: u16,
     pub route: RouteGql,
 }
-#[derive(SimpleObject)]
+#[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkFlow {
     pub consumers: Vec<NetworkConsumerFlow>,
     pub legs: Vec<NetworkLegFlow>,
@@ -484,14 +484,14 @@ pub struct NetworkFlow {
     pub proxy_pools: Vec<ProxyPoolGql>,
     pub sampled_at: f64,
 }
-#[derive(SimpleObject)]
+#[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkPoolFlow {
     pub pool_id: u32,
     pub egress_id: u32,
     pub pinned_member: Option<u32>,
     pub members: Vec<NetworkPoolMemberFlow>,
 }
-#[derive(SimpleObject)]
+#[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkPoolMemberFlow {
     pub id: u32,
     pub state: String,
@@ -1009,8 +1009,37 @@ impl NetworkingSubscription {
         ctx: &Context<'_>,
     ) -> Result<impl tokio_stream::Stream<Item = NetworkFlow> + use<>> {
         let runtime = runtime(ctx)?;
-        Ok(
-            async_stream::stream! { let mut interval=tokio::time::interval(Duration::from_secs(1));interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);loop{interval.tick().await;yield flow(&runtime);} },
-        )
+        Ok(async_stream::stream! {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last: Option<(NetworkFlow, tokio::time::Instant)> = None;
+            loop {
+                interval.tick().await;
+                let next = flow(&runtime);
+                let now = tokio::time::Instant::now();
+                if let Some((previous, sent_at)) = &last
+                    && same_flow(previous, &next)
+                    && now.duration_since(*sent_at) < NETWORK_FLOW_HEARTBEAT
+                {
+                    continue;
+                }
+                last = Some((next.clone(), now));
+                yield next;
+            }
+        })
     }
+}
+
+/// The longest a `networkFlow` client waits for a frame while nothing
+/// changes; it still learns the stream is alive.
+const NETWORK_FLOW_HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// Whether two flows differ only in when they were sampled.
+fn same_flow(a: &NetworkFlow, b: &NetworkFlow) -> bool {
+    a.consumers == b.consumers
+        && a.legs == b.legs
+        && a.pools == b.pools
+        && a.egresses == b.egresses
+        && a.proxies == b.proxies
+        && a.proxy_pools == b.proxy_pools
 }

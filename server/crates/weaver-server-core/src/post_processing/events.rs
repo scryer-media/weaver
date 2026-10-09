@@ -359,12 +359,22 @@ pub fn selected_scripts(
 /// Record whether a queue event could have anything to run, and return
 /// whether script execution is refused altogether.
 pub(crate) fn refresh_admission_hint(db: &Database) -> Result<bool, StateError> {
-    let revision = db
+    let (revision, cached) = *db
         .script_runtime
         .admission_hint
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .0;
+        .unwrap_or_else(|error| error.into_inner());
+    // Every save of the settings or of an instance drops the hint, so one
+    // that is still held answers for both reads below. A refusal is always
+    // worked out again: it also follows the strict-security switch, which
+    // nothing saves, and costs one settings read with no instance scan.
+    if matches!(
+        cached,
+        Some(AdmissionHint::NoConfiguredScripts | AdmissionHint::Possible)
+    ) && !strict_security_enabled()
+    {
+        return Ok(false);
+    }
     let settings = db.post_processing_settings()?;
     let disabled = execution_refusal(&settings, strict_security_enabled()).is_some();
     let hint =

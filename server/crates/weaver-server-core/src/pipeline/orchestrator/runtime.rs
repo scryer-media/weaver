@@ -22,6 +22,11 @@ fn compute_uu_spool_max_segments(write_buf_max_pending: usize) -> usize {
 
 impl Pipeline {
     const METRICS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    /// The metrics tick while nothing is moving: often enough for the speed
+    /// gauges to decay and for a time-lifted dispatch gate to be noticed,
+    /// rare enough that an idle pipeline costs next to nothing.
+    pub(crate) const IDLE_SNAPSHOT_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(1);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const SHUTDOWN_DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     /// Bound on how long `drain` waits to join detached fire-and-forget writes.
@@ -412,6 +417,13 @@ impl Pipeline {
             download_pressure_soft_dispatch_after: None,
             snapshot_published_at: None,
             snapshot_publish_pending: false,
+            snapshot_dirty: true,
+            footprint_metrics_stale: true,
+            download_dispatch_retry: true,
+            metrics_rates_moving: false,
+            post_download_phases: 0,
+            reconcile_clean: false,
+            reconcile_signatures: HashMap::new(),
             download_restart_durable_lead_retry_after: HashMap::new(),
             checkpoint_progress_articles: HashMap::new(),
             download_lane_owners: HashMap::new(),
@@ -542,7 +554,7 @@ impl Pipeline {
             sfv_checked: HashSet::new(),
             jobs_with_verification_outcome: HashSet::new(),
             unavailable_promoted_recovery_segments: HashSet::new(),
-            finished_jobs: initial_history,
+            finished_jobs: initial_history.into(),
             shared_state,
             db,
             fire_and_forget_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
@@ -882,6 +894,71 @@ impl Pipeline {
         self.retire_stalled_download_lanes(job_id)
     }
 
+    /// The periodic safety net for a completion check that no event
+    /// scheduled.
+    ///
+    /// Only a job that could be waiting on such a check is a candidate: one
+    /// queued or downloading whose queue has drained, one with parked runs
+    /// still to release, one with container sets in flight, or one in a phase
+    /// past the download. A queued or downloading candidate that looks
+    /// exactly as it did when this last checked it is skipped, and when
+    /// nothing at all has happened since the last pass the pass is skipped,
+    /// so an idle pipeline pays nothing here however many jobs it holds.
+    pub(crate) async fn reconcile_candidate_jobs(&mut self) {
+        if self.reconcile_clean && !self.pipeline_is_live() {
+            return;
+        }
+        self.reconcile_clean = true;
+        let unanchored: HashSet<JobId> = self
+            .pending_unanchored_release
+            .iter()
+            .map(|segment_id| segment_id.file_id.job_id)
+            .collect();
+        let mut due = Vec::new();
+        let mut candidates = HashSet::new();
+        for (job_id, state) in &self.jobs {
+            let fetching = matches!(state.status, JobStatus::Queued | JobStatus::Downloading);
+            if !fetching {
+                if !matches!(state.status, JobStatus::Paused) && !is_terminal_status(&state.status)
+                {
+                    due.push(*job_id);
+                }
+                continue;
+            }
+            let candidate = state.download_queue.is_empty()
+                || unanchored.contains(job_id)
+                || self
+                    .direct_store
+                    .sets_for(*job_id)
+                    .iter()
+                    .any(|set| !set.is_demoted() && !set.is_finalized());
+            if !candidate {
+                continue;
+            }
+            candidates.insert(*job_id);
+            let signature = (
+                state.downloaded_bytes,
+                state.downloaded_wire_bytes,
+                state.failed_bytes,
+                state.download_queue.len(),
+                state.recovery_queue.len(),
+                state.health_probing,
+            );
+            if self.reconcile_signatures.get(job_id) != Some(&signature) {
+                self.reconcile_signatures.insert(*job_id, signature);
+                due.push(*job_id);
+            }
+        }
+        self.reconcile_signatures
+            .retain(|job_id, _| candidates.contains(job_id));
+        for (index, job_id) in due.into_iter().enumerate() {
+            self.reconcile_job_progress(job_id).await;
+            if index % 16 == 15 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
     pub(crate) fn auto_pause_stalled_downloads(&mut self) {
         let stalled_jobs: Vec<_> = self
             .jobs
@@ -941,9 +1018,49 @@ impl Pipeline {
         }
     }
 
+    /// Whether anything is moving: transfers, decodes, writes, phases past
+    /// the download, checks or container-set work in flight, or rate gauges
+    /// that have not yet settled to zero. Every term is a length or a flag,
+    /// so asking costs the same however many jobs and history rows exist.
+    pub(crate) fn pipeline_is_live(&self) -> bool {
+        self.active_downloads > 0
+            || !self.active_download_connections_by_job.is_empty()
+            || !self.pending_decode.is_empty()
+            || !self.active_decodes_by_job.is_empty()
+            || !self.held_download_refills.is_empty()
+            || !self.rate_limit_reservations.is_empty()
+            || !self.pending_completion_checks.is_empty()
+            || !self.pending_released_download_results_by_job.is_empty()
+            || !self.pending_unanchored_release.is_empty()
+            || self.write_buffered_bytes > 0
+            || !self.direct_barrier_flights.is_empty()
+            || !self.direct_placement_lanes.is_empty()
+            || self.direct_unpack.has_work_in_flight()
+            || !self.dirty_server_attribution.is_empty()
+            || self.metrics_rates_moving
+            || self.post_download_phases > 0
+    }
+
+    fn metrics_snapshot_period(live: bool) -> std::time::Duration {
+        if live {
+            Self::METRICS_SNAPSHOT_INTERVAL
+        } else {
+            Self::IDLE_SNAPSHOT_INTERVAL
+        }
+    }
+
+    fn metrics_snapshot_timer(live: bool) -> tokio::time::Interval {
+        let period = Self::metrics_snapshot_period(live);
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+    }
+
     pub async fn run(&mut self) {
-        let mut metrics_snapshot_interval = tokio::time::interval(Self::METRICS_SNAPSHOT_INTERVAL);
-        metrics_snapshot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut metrics_live = true;
+        let mut metrics_snapshot_interval = Self::metrics_snapshot_timer(metrics_live);
+        // Whether the previous turn did anything that dispatch must follow.
+        let mut dispatch_due = true;
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stalled_download_interval = tokio::time::interval(STALLED_DOWNLOAD_CHECK_INTERVAL);
@@ -960,6 +1077,10 @@ impl Pipeline {
         }
 
         'run_loop: loop {
+            // Whether this turn was woken by, or found, anything other than a
+            // periodic tick. Only such a turn can have changed what the job
+            // snapshot shows or what dispatch would hand out.
+            let mut turn_active = false;
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             self.pump_decode_queue();
@@ -970,16 +1091,19 @@ impl Pipeline {
             // or the job would be judged with that part neither placed nor
             // given up.
             if !self.pending_unanchored_release.is_empty() {
+                turn_active = true;
                 self.release_settled_unanchored_runs().await;
                 self.pump_decode_queue();
             }
             // A container set whose end header was ruled missing hands over
             // before it holds anything more.
             if self.has_direct_end_header_verdicts() {
+                turn_active = true;
                 self.settle_direct_end_header_verdicts().await;
             }
 
             let pending_completion_checks = self.pending_completion_checks.len();
+            turn_active |= pending_completion_checks > 0;
             for _ in 0..pending_completion_checks {
                 let Some(job_id) = self.pending_completion_checks.pop_front() else {
                     break;
@@ -989,7 +1113,18 @@ impl Pipeline {
             }
 
             self.consume_due_checkpoint_rechecks();
-            self.dispatch_downloads();
+            // A pass over the eligible jobs follows only something that could
+            // change its answer: activity, a wake, live transfers, or a gate
+            // that lifts with time. An idle turn would find what the last one
+            // found.
+            if dispatch_due
+                || turn_active
+                || self.download_dispatch_wake
+                || self.download_dispatch_retry
+                || self.pipeline_is_live()
+            {
+                self.dispatch_downloads();
+            }
             // The byte and age triggers are polled on the loop's
             // existing periodic seam rather than on a timer of their own, so an
             // idle set still checkpoints and a busy one is never checked more
@@ -1029,6 +1164,7 @@ impl Pipeline {
                         break 'run_loop;
                     }
                     Ok(cmd) => {
+                        turn_active = true;
                         if let Some(scope) = Self::pause_barrier_scope(&cmd) {
                             self.demand_direct_store_barriers_for_pause(scope).await;
                         }
@@ -1049,7 +1185,11 @@ impl Pipeline {
                     &mut metrics_snapshot_interval,
                 )
                 .await;
+            turn_active |= processed_results > 0;
             if processed_results == 0 {
+                // Set by the periodic arms that found nothing to do; every
+                // other arm is an event.
+                let mut idle_tick = false;
                 tokio::select! {
                     cmd = self.cmd_rx.recv() => {
                         match cmd {
@@ -1164,6 +1304,7 @@ impl Pipeline {
                         self.receive_retry_work(retry);
                     }
                     _ = metrics_snapshot_interval.tick() => {
+                        idle_tick = true;
                         self.refresh_periodic_snapshot();
                         // Lanes whose refill found nothing wait here for the
                         // next wake; the tick is what ends the wait when no
@@ -1179,18 +1320,26 @@ impl Pipeline {
                         self.requeue_due_infrastructure_retries();
                     }
                     _ = tune_interval.tick() => {
-                        self.flush_quiescent_write_backlog().await;
+                        idle_tick = true;
+                        // An empty write backlog has nothing to flush.
+                        if self.write_buffered_bytes > 0 {
+                            self.flush_quiescent_write_backlog().await;
+                        }
                         self.relieve_latched_write_backlog().await;
                         self.refresh_download_pressure();
                         self.publish_download_transport_health();
 
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                        let live = self.pipeline_is_live();
                         let snapshot = self.metrics.snapshot();
                         let not_found = snapshot.articles_not_found;
-                        let min_health: Option<u32> = self.jobs.values()
+                        // Folded over every job, so only while something
+                        // is moving; an idle pipeline's health is unchanged.
+                        let min_health: Option<u32> = live.then(|| self.jobs.values()
                             .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete))
                             .filter(|s| s.spec.total_bytes > 0)
                             .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
-                            .min();
+                            .min()).flatten();
                         debug!(
                             active = self.active_downloads,
                             queue = snapshot.download_queue_depth,
@@ -1209,24 +1358,38 @@ impl Pipeline {
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"
                         );
-                    }
-                    _ = stalled_download_interval.tick() => {
-                        self.auto_pause_stalled_downloads();
-                    }
-                    _ = state_reconcile_interval.tick() => {
-                        let job_ids: Vec<_> = self.jobs.keys().copied().collect();
-                        for (index, job_id) in job_ids.into_iter().enumerate() {
-                            self.reconcile_job_progress(job_id).await;
-                            if index % 16 == 15 {
-                                tokio::task::yield_now().await;
-                            }
                         }
                     }
+                    _ = stalled_download_interval.tick() => {
+                        // A stall needs a transfer in flight; with none the
+                        // walk over every job would find nothing.
+                        idle_tick = self.active_downloads_by_job.is_empty();
+                        if !idle_tick {
+                            self.auto_pause_stalled_downloads();
+                        }
+                    }
+                    _ = state_reconcile_interval.tick() => {
+                        idle_tick = true;
+                        self.reconcile_candidate_jobs().await;
+                    }
                 }
+                turn_active |= !idle_tick;
             }
 
             self.pump_decode_queue();
+            let live = self.pipeline_is_live();
+            if turn_active || live {
+                self.snapshot_dirty = true;
+            }
+            if turn_active {
+                self.reconcile_clean = false;
+            }
+            dispatch_due = turn_active;
             self.publish_snapshot_debounced();
+            if live != metrics_live {
+                metrics_live = live;
+                metrics_snapshot_interval = Self::metrics_snapshot_timer(live);
+            }
         }
 
         self.drain().await;
@@ -1271,9 +1434,20 @@ impl Pipeline {
 
     fn refresh_periodic_snapshot(&mut self) {
         self.checkpoint_server_attribution_if_due();
-        self.sample_phase_progress();
-        self.publish_download_footprint_metrics();
-        self.shared_state.refresh_metrics_snapshot();
+        let live = self.pipeline_is_live();
+        // Phase rows are sampled while anything moves, and once more after,
+        // so rates that were showing are cleared from the published rows.
+        if live || !self.phase_progress_snapshots.is_empty() || !self.phase_publish_state.is_empty()
+        {
+            self.sample_phase_progress();
+        }
+        // The footprint readings walk the job order; with nothing moving they
+        // only change when the jobs do, which marks them stale.
+        if live || self.footprint_metrics_stale {
+            self.footprint_metrics_stale = false;
+            self.publish_download_footprint_metrics();
+        }
+        self.metrics_rates_moving = self.shared_state.refresh_metrics_snapshot();
         self.flush_pending_snapshot();
     }
 
@@ -1355,8 +1529,12 @@ impl Pipeline {
     pub(crate) fn publish_snapshot(&mut self) {
         self.snapshot_published_at = Some(Instant::now());
         self.snapshot_publish_pending = false;
+        self.snapshot_dirty = false;
+        self.footprint_metrics_stale = true;
         let _ = self.refresh_bandwidth_cap_window();
-        let jobs = self.list_jobs();
+        // Live rows are rebuilt; finished rows are shared with the previous
+        // publish unless history itself changed.
+        let jobs = self.list_live_jobs();
         let holds: HashMap<_, _> = jobs
             .iter()
             .filter(|job| {
@@ -1375,7 +1553,8 @@ impl Pipeline {
             .filter(|job_id| holds.get(job_id) != self.published_propagation_holds.get(job_id))
             .collect();
         self.published_propagation_holds = holds;
-        self.shared_state.publish_jobs(jobs);
+        let history = self.finished_jobs.shared();
+        self.shared_state.publish_live_jobs(jobs, history);
         // Publish the updated payload before notifying live queue subscribers.
         for job_id in changed {
             let _ = self
@@ -1399,6 +1578,9 @@ impl Pipeline {
     /// changes never wait on the window.
     pub(crate) fn publish_snapshot_debounced(&mut self) {
         const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(100);
+        if !self.snapshot_dirty && !self.snapshot_publish_pending {
+            return;
+        }
         if self
             .snapshot_published_at
             .is_some_and(|at| at.elapsed() < SNAPSHOT_DEBOUNCE)

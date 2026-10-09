@@ -1000,3 +1000,75 @@ async fn pause_all_holds_scheduled_and_regular_rss_but_not_manual_fetch() {
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     server.abort();
 }
+
+fn scheduled_feed(id: u32, last_polled_at: Option<i64>) -> RssFeedRow {
+    RssFeedRow {
+        id,
+        name: format!("Scheduled feed {id}"),
+        // Never fetched: these tests stop before any feed is due.
+        url: "http://127.0.0.1:9/feed".into(),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+        scripts: Vec::new(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn due_sync_loop_loads_no_feed_rows_while_no_feed_is_due() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    // Polled just now on a fifteen-minute interval.
+    db.insert_rss_feed(&scheduled_feed(1, Some(unix_now_secs())))
+        .unwrap();
+    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+
+    // The loop sleeps until the feed is due, a minute at most at a time.
+    assert_eq!(service.next_due_sync_delay(), Duration::from_secs(60));
+    let poller = service.start_background_loop();
+    // Ten minutes of virtual time: ten or more wakes, none with a feed due.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    poller.abort();
+
+    assert_eq!(
+        service
+            .inner
+            .full_feed_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn due_feed_selection_loads_only_the_due_feed() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    db.insert_rss_feed(&scheduled_feed(1, Some(unix_now_secs())))
+        .unwrap();
+    db.insert_rss_feed(&scheduled_feed(2, None)).unwrap();
+    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+
+    let due = service
+        .load_target_feeds(crate::rss::poller::RssSyncTarget::AllEnabledFeeds, true)
+        .unwrap();
+
+    assert_eq!(due.iter().map(|feed| feed.id).collect::<Vec<_>>(), vec![2]);
+    assert_eq!(
+        service
+            .inner
+            .full_feed_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    // A due feed brings the next look forward to now, floored at a second.
+    assert_eq!(service.next_due_sync_delay(), Duration::from_secs(1));
+}
