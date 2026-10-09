@@ -174,16 +174,20 @@ impl PostProcessingQuery {
             kind: kind.map(Into::into),
         };
         // One more than asked for says whether another page follows.
-        let mut runs =
-            tokio::task::spawn_blocking(move || db.script_runs(filter, before, limit as u32 + 1))
-                .await
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let (mut runs, total) = tokio::task::spawn_blocking(move || {
+            let total = db.script_run_count(&filter)?;
+            db.script_runs(filter, before, limit as u32 + 1)
+                .map(|runs| (runs, total))
+        })
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         let more = runs.len() > limit;
         runs.truncate(limit);
         Ok(ScriptRunPageGql {
             next_before: runs.last().filter(|_| more).map(|run| run.seq.to_string()),
             runs: runs.into_iter().map(Into::into).collect(),
+            total,
         })
     }
 

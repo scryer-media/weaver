@@ -52,10 +52,10 @@ async function pick(page, scope, label, option) {
 test("configuration and scripts are two screens that share nothing but the settings behind them", async () => {
   const region = (page, name) => page.getByRole("region", { name, exact: true });
   const configuration = ["Execution", "Event scripts and output retention", "Interpreters", "Scripts directory"];
-  const scripts = ["Script instances", "Scripts that could not be read"];
+  const scripts = ["Jobs", "Scripts that could not be read"];
   for (const [query, shown, absent, buttons] of [
     ["", configuration, scripts, []],
-    ["?scripts", scripts, configuration, ["Refresh", "Create instance"]],
+    ["?scripts", scripts, configuration, ["Refresh", "Create job"]],
   ]) {
     const page = await open(query);
     try {
@@ -112,7 +112,7 @@ test("when instances for every category run is a setting saved with the rest of 
     const execution = page.getByRole("region", { name: "Execution", exact: true });
     const choice = action(execution, "Global scripts run");
     await execution.getByText(
-      "A global script is an instance with no category of its own, and runs ahead of a category's own. This decides whether it also runs for a download whose category has scripts.",
+      "A global script is a job with no category of its own, and runs ahead of a category's own. This decides whether it also runs for a download whose category has scripts.",
       { exact: true },
     ).waitFor();
     await choice.getByText(always, { exact: true }).waitFor();
@@ -161,13 +161,13 @@ test("the settings search reaches an event script limit", async () => {
 // The scripts screen: its one table, the heading a trigger's instances sit under,
 // the rows of either, and the row holding a given text. A row is a button that
 // opens its editor, and the controls inside it are buttons of their own.
-const table = (page) => page.getByRole("region", { name: "Script instances", exact: true });
+const table = (page) => page.getByRole("region", { name: "Jobs", exact: true });
 const group = (page, title) => table(page).getByRole("region", { name: title, exact: true });
 const rows = (scope) => scope.locator('[role="button"]');
 const row = (page, name) => rows(table(page)).filter({ has: page.getByText(name, { exact: true }) });
 const headings = (page) => table(page).getByRole("region").evaluateAll((sections) => sections.map((section) => section.getAttribute("aria-label")));
 // The scripts no instance runs, which close the table, and the row of one of them by its file.
-const unused = (page) => group(page, "Scripts with no instance");
+const unused = (page) => group(page, "Scripts with no job");
 const unusedRow = (page, file) => rows(unused(page)).filter({ has: page.getByText(file, { exact: true }) });
 /** Opens the editor of the instance called `name`, which the dialog is then titled by. */
 async function edit(page, name) {
@@ -176,7 +176,7 @@ async function edit(page, name) {
   await editor.waitFor();
   return editor;
 }
-const creator = (page) => page.getByRole("dialog", { name: "Create instance", exact: true });
+const creator = (page) => page.getByRole("dialog", { name: "Create job", exact: true });
 const field = (editor, name) => editor.getByRole("textbox", { name, exact: true });
 // A password input has no role to be found by.
 const secretField = (scope, name) => scope.getByLabel(name, { exact: true });
@@ -188,12 +188,12 @@ test("the scripts screen is one table of instances, under a heading for each thi
   try {
     await row(page, "Notify").waitFor();
     await unused(page).waitFor();
-    for (const header of ["Name", "Script", "Categories", "Run mode", "Timeout", "Enabled"]) {
+    for (const header of ["Job name", "Script", "Categories", "Run mode", "Timeout", "Enabled"]) {
       assert.equal(await table(page).getByText(header, { exact: true }).count(), 1, header);
     }
-    await table(page).getByText("instances for every category run ahead of a category's own", { exact: true }).waitFor();
+    await table(page).getByText("jobs for every category run ahead of a category's own", { exact: true }).waitFor();
     assert.deepEqual(await headings(page), [
-      "Post-processing", "Queue · NZB_ADDED", "Queue · NZB_DELETED", "Schedule", "Feed", "Scripts with no instance",
+      "Post-processing", "Queue · NZB_ADDED", "Queue · NZB_DELETED", "Schedule", "Feed", "Scripts with no job",
     ]);
     // Each row: its name, script, categories, run mode and timeout, and whether it is on.
     for (const [title, entries] of [
@@ -239,8 +239,8 @@ test("the scripts screen is one table of instances, under a heading for each thi
     // An instance alone under its heading has nowhere to go.
     for (const name of ["Move up", "Move down"]) assert.equal(await action(row(page, "Feed intake"), name).isDisabled(), true);
     // One Create for the whole list, in the top bar.
-    assert.deepEqual(await controls(page).getByRole("button").allTextContents(), ["Refresh", "Create instance"]);
-    assert.equal(await action(controls(page), "Create instance").isDisabled(), false);
+    assert.deepEqual(await controls(page).getByRole("button").allTextContents(), ["Refresh", "Create job"]);
+    assert.equal(await action(controls(page), "Create job").isDisabled(), false);
     await shot(page, "scripts-table");
   } finally { await page.close(); }
 });
@@ -254,15 +254,15 @@ test("a script nothing is wired to closes the table, with what its header declar
       "Archive", "archive.py", "NZBGet · 0.9", "Post-processing", "Queue", "Schedule",
       "Declared events: None recognised", "Task times: 03:30",
     ]) assert.equal(await unusedRow(page, "archive.py").getByText(line, { exact: true }).count(), 1, line);
-    assert.equal(await action(unusedRow(page, "archive.py"), "Set up from header").count(), 1);
+    assert.equal(await action(unusedRow(page, "archive.py"), "Set up jobs from header").count(), 1);
     // A script whose header declares nothing has nothing to be set up from.
     for (const line of ["SABnzbd", "Post-processing"]) {
       assert.equal(await unusedRow(page, "plain.sh").getByText(line, { exact: true }).count(), 1, line);
     }
     assert.equal(await unusedRow(page, "plain.sh").getByText("Declared events:").count(), 0);
-    assert.equal(await action(unusedRow(page, "plain.sh"), "Set up from header").count(), 0);
+    assert.equal(await action(unusedRow(page, "plain.sh"), "Set up jobs from header").count(), 0);
     // The row opens a new instance of its script; the top bar's Create is the list's only one.
-    assert.equal(await action(table(page), "Create instance").count(), 0);
+    assert.equal(await action(table(page), "Create job").count(), 0);
     // Neither is an instance, so neither has a switch, an order or a test.
     assert.equal(await unused(page).getByRole("switch").count(), 0);
     for (const name of ["Move up", "Test", "Delete"]) assert.equal(await action(unused(page), name).count(), 0, name);
@@ -275,8 +275,8 @@ test("a script nothing is wired to closes the table, with what its header declar
 test("the table says which way the instances for every category run", async () => {
   const page = await open("?scripts&cascade");
   try {
-    await table(page).getByText("instances for every category run only when the category has none of its own", { exact: true }).waitFor();
-    assert.equal(await table(page).getByText("instances for every category run ahead of a category's own", { exact: true }).count(), 0);
+    await table(page).getByText("jobs for every category run only when the category has none of its own", { exact: true }).waitFor();
+    assert.equal(await table(page).getByText("jobs for every category run ahead of a category's own", { exact: true }).count(), 0);
   } finally { await page.close(); }
 });
 
@@ -291,7 +291,7 @@ test("a scripts directory that cannot be listed still shows every instance, and 
     assert.equal(await unused(page).count(), 0);
     assert.equal(await page.getByRole("region", { name: "Scripts that could not be read", exact: true }).count(), 0);
     // With no script known, there is nothing a new instance could run.
-    assert.equal(await action(controls(page), "Create instance").isDisabled(), true);
+    assert.equal(await action(controls(page), "Create job").isDisabled(), true);
   } finally { await page.close(); }
 });
 
@@ -301,7 +301,7 @@ test("a directory with no scripts and no instances says so", async () => {
     await table(page).getByText("Nothing here. Put a script in the scripts directory, then reload.", { exact: true }).waitFor();
     assert.equal(await page.getByRole("region").count(), 1);
     assert.equal(await rows(table(page)).count(), 0);
-    assert.equal(await action(controls(page), "Create instance").isDisabled(), true);
+    assert.equal(await action(controls(page), "Create job").isDisabled(), true);
     // The top bar's Create is the only one, even with nothing listed.
     assert.equal(await table(page).getByRole("button").count(), 0);
     await shot(page, "scripts-empty");
@@ -324,13 +324,13 @@ test("a new instance starts from what the chosen script's header declares", asyn
   const page = await open("?scripts");
   try {
     await unused(page).waitFor();
-    await action(controls(page), "Create instance").click();
+    await action(controls(page), "Create job").click();
     const editor = creator(page);
-    await editor.getByText("new instance", { exact: true }).waitFor();
+    await editor.getByText("new job", { exact: true }).waitFor();
     // Nothing can be saved until there is a script to run.
     await action(editor, "Script").getByText("Choose a script", { exact: true }).waitFor();
     assert.equal(await action(editor, "Save").isDisabled(), true);
-    await editor.getByText("This instance has no inputs.", { exact: true }).waitFor();
+    await editor.getByText("This job has no inputs.", { exact: true }).waitFor();
     await action(editor, "Script").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
       "Choose a script", "Notify · notify.py", "Cleanup · cleanup.sh", "Nightly report · nightly.py",
@@ -341,7 +341,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
     // The first trigger the header declares, and every input it declares at its default.
     await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
     assert.equal(await action(editor, "Save").isDisabled(), false);
-    assert.equal(await editor.getByText("This instance has no inputs.", { exact: true }).count(), 0);
+    assert.equal(await editor.getByText("This job has no inputs.", { exact: true }).count(), 0);
     assert.equal(await field(editor, "Target").inputValue(), "/fixture/archive");
     await editor.getByText("Where a finished download is copied. Default /fixture/archive.", { exact: true }).waitFor();
     // A secret is never filled in from the header: it links one of the saved secrets, and none is chosen yet.
@@ -361,7 +361,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
     ]);
     await page.getByRole("menuitemradio", { name: "Post-processing · declared", exact: true }).click();
 
-    await field(editor, "Name").fill("Archive movies");
+    await field(editor, "Job name").fill("Archive movies");
     await pick(page, editor, "Key", "Spare key");
     const categories = editor.getByRole("group", { name: "Categories", exact: true });
     assert.deepEqual(await categories.getByRole("button").allTextContents(), ["movies", "tv"]);
@@ -414,7 +414,7 @@ test("an instance can be started from its script's row, and a queue instance nam
     await status(page, "archive.py created").waitFor();
     await rows(group(page, "Queue · NZB_NAMED")).first().and(row(page, "archive.py")).waitFor();
     assert.deepEqual(await headings(page), [
-      "Post-processing", "Queue · NZB_ADDED", "Queue · NZB_NAMED", "Queue · NZB_DELETED", "Schedule", "Feed", "Scripts with no instance",
+      "Post-processing", "Queue · NZB_ADDED", "Queue · NZB_NAMED", "Queue · NZB_DELETED", "Schedule", "Feed", "Scripts with no job",
     ]);
     let held = await daemon(page);
     assert.deepEqual(held.requests.at(-1), { name: "CreateScriptInstance", variables: { input: {
@@ -426,7 +426,7 @@ test("an instance can be started from its script's row, and a queue instance nam
     assert.deepEqual(held.instances.at(-1).inputs, [{ name: "Target", value: "/fixture/archive", secretId: null }]);
 
     // Each input the header declares draws the control its header asks for.
-    await action(controls(page), "Create instance").click();
+    await action(controls(page), "Create job").click();
     await pick(page, editor, "Script", "Notify · notify.py");
     await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
     assert.equal(await field(editor, "Label").inputValue(), "");
@@ -493,14 +493,14 @@ test("a secret input shows the secret it links and never its value, and can link
     await editor.getByText("Post-processing", { exact: true }).waitFor();
     await action(editor, "Script").getByText("Notify · notify.py", { exact: true }).waitFor();
     await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
-    assert.equal(await field(editor, "Name").inputValue(), "Notify");
+    assert.equal(await field(editor, "Job name").inputValue(), "Notify");
     assert.equal(await field(editor, "Label").inputValue(), "fixture");
     // The secret input names the secret it links; nothing can be typed into it.
     await action(editor, "Token").getByText("Notify token", { exact: true }).waitFor();
     await editor.getByText("The service's access token. Linked from Settings · Scripts · Secrets. The script is given its value when it runs; it is never shown here.", { exact: true }).waitFor();
     await shot(page, "instance-editor-secret-linked");
     await field(editor, "Label").fill("renamed");
-    await field(editor, "Name").fill("Notify all");
+    await field(editor, "Job name").fill("Notify all");
     await action(editor, "Save").click();
     await status(page, "Notify all saved").waitFor();
     // The row under its new name is the instance as the daemon now holds it.
@@ -605,7 +605,7 @@ test("an input the header does not declare can be added, and taken away again", 
     const editor = await edit(page, "Announce");
     await editor.getByText("Queue · NZB_ADDED", { exact: true }).waitFor();
     await editor.getByText(
-      "This instance's inputs no longer match what the script's header declares. Re-apply from header to bring them in line; saved values are kept.",
+      "This job's inputs no longer match what the script's header declares. Re-apply from header to bring them in line; saved values are kept.",
       { exact: true },
     ).waitFor();
     assert.equal(await field(editor, "Legacy").inputValue(), "1");
@@ -623,7 +623,7 @@ test("an input the header does not declare can be added, and taken away again", 
     await name.fill("label");
     await editor.getByRole("alert").waitFor({ state: "detached" });
     await name.press("Enter");
-    await editor.getByRole("alert").filter({ hasText: "This instance already has an input with that name." }).waitFor();
+    await editor.getByRole("alert").filter({ hasText: "This job already has an input with that name." }).waitFor();
     await name.fill("Extra.key");
     await secret.click();
     await action(editor, "Add input").click();
@@ -701,11 +701,11 @@ test("the switch in a row turns its instance on or off without opening it, and k
 test("deleting an instance asks first, and says what goes with it", async () => {
   const page = await open("?scripts");
   try {
-    const confirm = page.getByRole("dialog", { name: "Delete instance", exact: true });
+    const confirm = page.getByRole("dialog", { name: "Delete job", exact: true });
     await action(row(page, "Feed intake"), "Delete").click();
     await confirm.getByText("Feed intake", { exact: true }).waitFor();
     await confirm.getByText(
-      "The instance is removed, along with any schedule rule that runs it and its place on any feed. The script file is not touched.",
+      "The job is removed, along with any schedule rule that runs it and its place on any feed. The script file is not touched.",
       { exact: true },
     ).waitFor();
     await action(confirm, "Cancel").click();
@@ -740,7 +740,7 @@ test("a delete or a re-apply the daemon refuses says so inside the question", as
   const page = await open("?scripts&stale");
   try {
     for (const [name, button, title] of [
-      ["Feed intake", "Delete", "Delete instance"],
+      ["Feed intake", "Delete", "Delete job"],
       ["Announce", "Re-apply from header", "Re-apply from header"],
     ]) {
       await action(row(page, name), button).click();
@@ -795,8 +795,8 @@ test("an instance its header has moved away from is brought back in line, from i
 test("set up from header creates an instance for each trigger the header declares that has none", async () => {
   const page = await open("?scripts");
   try {
-    await action(unusedRow(page, "archive.py"), "Set up from header").click();
-    await status(page, "2 instances created for Archive").waitFor();
+    await action(unusedRow(page, "archive.py"), "Set up jobs from header").click();
+    await status(page, "2 jobs created for Archive").waitFor();
     // One under each heading the header names, last in its order and named after the file.
     for (const [title, index] of [["Post-processing", 3], ["Schedule", 1]]) {
       const created = rows(group(page, title)).nth(index);
@@ -813,16 +813,16 @@ test("set up from header creates an instance for each trigger the header declare
     ]);
 
     // The editor of a new instance offers the same, while its script has a declared trigger with no instance.
-    await action(controls(page), "Create instance").click();
+    await action(controls(page), "Create job").click();
     const editor = creator(page);
     await action(editor, "Script").getByText("Choose a script", { exact: true }).waitFor();
-    assert.equal(await action(editor, "Set up from header").count(), 0);
+    assert.equal(await action(editor, "Set up jobs from header").count(), 0);
     await pick(page, editor, "Script", "Nightly report · nightly.py");
     await action(editor, "Trigger").getByText("Schedule · declared", { exact: true }).waitFor();
-    assert.equal(await action(editor, "Set up from header").count(), 0);
+    assert.equal(await action(editor, "Set up jobs from header").count(), 0);
     await pick(page, editor, "Script", "Notify · notify.py");
-    await action(editor, "Set up from header").click();
-    await status(page, "1 instance created for Notify").waitFor();
+    await action(editor, "Set up jobs from header").click();
+    await status(page, "1 job created for Notify").waitFor();
     await editor.waitFor({ state: "detached" });
     const created = rows(group(page, "Queue · NZB_DOWNLOADED")).first();
     await created.waitFor();
@@ -911,7 +911,7 @@ test("a secret an instance links cannot be deleted, and the refusal names the in
     await secretRow(page, "Notify token").getByText("Notify token", { exact: true }).click();
     let editor = secretDialog(page, "Notify token");
     await action(editor, "Delete").click();
-    await confirm.getByText("Delete Notify token? An instance that still links it keeps it from being deleted.", { exact: true }).waitFor();
+    await confirm.getByText("Delete Notify token? A job that still links it keeps it from being deleted.", { exact: true }).waitFor();
     assert.equal(await confirm.getByRole("alert").count(), 0);
     await action(confirm, "Delete").click();
     // Said where it was asked, as an instance's refused delete is; the question stays open.
@@ -979,7 +979,7 @@ test("testing an instance runs it once against made-up inputs and applies nothin
     const section = (name) => dialog.getByRole("region", { name, exact: true });
     await dialog.getByText("Running", { exact: true }).waitFor();
     for (const text of [
-      "notify.py", "The instance as saved, run once against made-up inputs. Nothing the script asks for is applied.",
+      "notify.py", "The job as saved, run once against made-up inputs. Nothing the script asks for is applied.",
       "Post-processing", "5m", "NZBGet",
     ]) assert.equal(await dialog.getByText(text, { exact: true }).count(), 1, text);
     // It has neither an exit code nor a duration until it ends.
@@ -989,7 +989,7 @@ test("testing an instance runs it once against made-up inputs and applies nothin
     ]) {
       for (const text of [name, value]) assert.equal(await section("Simulated inputs").getByText(text, { exact: true }).count(), 1, text);
     }
-    await section("Simulated inputs").getByText("made up for this run · the instance's own inputs are left out", { exact: true }).waitFor();
+    await section("Simulated inputs").getByText("made up for this run · the job's own inputs are left out", { exact: true }).waitFor();
     for (const text of ["/fixture/scratch/test-1", "weaver-test-download.nzb"]) {
       assert.equal(await section("Arguments").getByText(text, { exact: true }).count(), 1, text);
     }
@@ -1119,15 +1119,22 @@ test("a job no script ran for says so", async () => {
 });
 
 // The runs screen: its one table, a run's row in it, and the rows holding a given text.
-// "Load more" is a button under the rows and not one of them.
+// A row is a disclosure; the pagination bar sits under the table, outside it.
 const runsTable = (page) => page.getByRole("region", { name: "Script runs", exact: true });
 const runRows = (page) => runsTable(page).locator('[role="button"]');
 const rowsHolding = (page, text) => runRows(page).filter({ has: page.getByText(text, { exact: true }) });
-const loadMore = (page) => runsTable(page).getByRole("button", { name: "Load more", exact: true });
 // The pages of runs the screen has asked the fixture's daemon for, oldest request first.
 const runRequests = (page) => page.evaluate(() => fetch("/graphql", {
   method: "POST", body: JSON.stringify({ operationName: "ScriptRunRequests", variables: {} }),
 }).then((response) => response.json()).then((payload) => payload.data.scriptRunRequests));
+// The runs whose full output the screen has asked for, oldest first.
+const outputRequests = async (page) => (await daemon(page)).outputRequests;
+// The output of the run called `name`, as the open row shows it.
+const outputOf = (page, name) => runsTable(page).getByRole("region", { name: `Output of ${name}`, exact: true });
+// The pagination bar: the page on screen, the range it covers, and its steps.
+const currentPage = (page) => page.locator('[aria-current="page"]');
+const pageButton = (page, name) => page.getByRole("button", { name, exact: true });
+const rowsPerPage = (page) => page.getByRole("radiogroup", { name: "Rows per page", exact: true });
 
 test("the runs screen is one table of every run, newest first, with no way to create one", async () => {
   const page = await open("?runs");
@@ -1135,14 +1142,14 @@ test("the runs screen is one table of every run, newest first, with no way to cr
     const rows = runRows(page);
     await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
     assert.equal(await page.getByRole("region").count(), 1);
-    for (const header of ["Finished", "Instance", "Trigger", "Job", "Status", "Exit code", "Duration"]) {
+    for (const header of ["Finished", "Script job", "Trigger", "Job", "Status", "Exit code", "Duration"]) {
       assert.equal(await runsTable(page).getByText(header, { exact: true }).count(), 1);
     }
     await runsTable(page).getByText("newest first", { exact: true }).waitFor();
-    // A run is called by its instance, with the script file beside it.
-    for (const [index, instance, script, trigger, status, exitCode, duration] of [
+    // A run is called by its script job, with the script file beside it.
+    for (const [index, job, script, trigger, status, exitCode, duration] of [
       [0, "Nightly report", "nightly.py", "Schedule", "SUCCEEDED", "0", "1m 35s"],
-      // An instance named after its file reads as the file alone, as does a run with no instance.
+      // A script job named after its file reads as the file alone, as does a run with no script job.
       [1, null, "intake.py", "Scan", "SUCCEEDED", "0", "1.5s"],
       [2, "Notify", "notify.py", "Post-processing", "SUCCEEDED", "0", "240 ms"],
       [3, null, "retired.py", "Post-processing", "FAILED", "—", "240 ms"],
@@ -1151,10 +1158,15 @@ test("the runs screen is one table of every run, newest first, with no way to cr
       [6, "Feed intake", "intake.py", "Feed", "SUCCEEDED", "0", "240 ms"],
       [7, null, "sweep.sh", "Queue · FILE_DOWNLOADED", "SUCCEEDED", "0", "240 ms"],
     ]) {
-      for (const text of [instance, script, trigger, status, exitCode, duration]) {
+      for (const text of [job, script, trigger, status, exitCode, duration]) {
         if (text !== null) assert.equal(await rows.nth(index).getByText(text, { exact: true }).count(), 1, `row ${index}: ${text}`);
       }
     }
+    // Every row starts shut, showing only its columns, and no output has been asked for.
+    assert.equal(await rows.count(), 25);
+    assert.deepEqual(new Set(await rows.evaluateAll((all) => all.map((row) => row.getAttribute("aria-expanded")))), new Set(["false"]));
+    assert.equal(await runsTable(page).getByText("nightly.py finished", { exact: true }).count(), 0);
+    assert.deepEqual(await outputRequests(page), []);
     // Only the run nothing waited for is marked.
     assert.equal(await runsTable(page).getByText("Fire and forget", { exact: true }).count(), 1);
     assert.equal(await rows.nth(5).getByText("Fire and forget", { exact: true }).count(), 1);
@@ -1165,7 +1177,11 @@ test("the runs screen is one table of every run, newest first, with no way to cr
       assert.equal(await page.locator("#controls").getByRole("button", { name, exact: true }).count(), 1);
     }
     assert.equal(await page.getByRole("button", { name: /^(Add|Create|New)\b/ }).count(), 0);
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 50, before: null, kind: null });
+    // The first page of the smallest size, and where it sits in the whole.
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: null });
+    await page.getByText("1–25 of 60", { exact: true }).waitFor();
+    assert.equal(await currentPage(page).textContent(), "1");
+    assert.equal(await rowsPerPage(page).getByRole("radio", { checked: true }).textContent(), "25");
     await shot(page, "runs");
   } finally { await page.close(); }
 });
@@ -1186,15 +1202,190 @@ test("a run links to its job, and a run no job owns links nowhere", async () => 
     assert.equal(await rows.nth(5).getByRole("link", { name: "#9", exact: true }).getAttribute("href"), "/jobs/9");
     // The link is the job's own: following it does not open the run it sits in.
     await named.click();
-    assert.equal(await page.getByRole("dialog").count(), 0);
+    assert.deepEqual(await outputRequests(page), []);
   } finally { await page.close(); }
 });
 
-test("the trigger filter asks the daemon for one kind and lists what comes back", async () => {
+test("opening a run reads its output once into the log viewer, and shutting it keeps what was read", async () => {
+  const page = await open("?runs");
+  try {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: baseUrl });
+    const rows = runRows(page);
+    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+    const nightly = rows.nth(0);
+
+    await nightly.getByText("Schedule", { exact: true }).click();
+    assert.equal(await nightly.getAttribute("aria-expanded"), "true");
+    const viewer = outputOf(page, "Nightly report");
+    await viewer.getByText("summary written ").waitFor();
+    // Every line is numbered; the line the log parser reads as a record shows its stamp,
+    // level and target, and tints its key=value pairs. The plain lines are left as they are.
+    for (const number of ["1", "2", "3", "4", "5"]) {
+      assert.equal(await viewer.getByText(number, { exact: true }).count(), 1, `line ${number}`);
+    }
+    assert.equal(await viewer.getByText("6", { exact: true }).count(), 0, "a trailing newline is not a line");
+    for (const text of ["starting nightly report", "warning: 1 feed was unreachable", "done", "03:00:00.125", "nightly::report"]) {
+      assert.equal(await viewer.getByText(text, { exact: true }).count(), 1, text);
+    }
+    assert.equal(await viewer.getByText(/^info$/i).count(), 1, "the record's level");
+    for (const pair of ["rows=42", "path=/fixture/reports/nightly.txt"]) {
+      const tinted = viewer.getByText(pair, { exact: true });
+      assert.match(await tinted.getAttribute("class"), /text-wv-info/, pair);
+    }
+    // A long line wraps inside the viewer rather than widening it.
+    const box = await viewer.boundingBox();
+    const wide = await viewer.getByText(/^columns wide/).first().boundingBox();
+    assert.ok(wide.width <= box.width, "the long line stays inside the viewer");
+    assert.ok(wide.height > 30, "the long line wraps");
+    // The detail says how the run went, and how it was started.
+    await runsTable(page).getByText("nightly.py · Blocking · NZBGet · scheduler:4", { exact: true }).waitFor();
+    assert.deepEqual(await outputRequests(page), ["run-60"]);
+    await shot(page, "runs-row-open");
+
+    // The whole output goes to the clipboard.
+    await action(runsTable(page), "Copy output").click();
+    await status(page, "Output copied to the clipboard").waitFor();
+    assert.equal(
+      await page.evaluate(() => navigator.clipboard.readText()),
+      "starting nightly report\n2026-01-01T03:00:00.125Z INFO nightly::report: summary written rows=42 path=/fixture/reports/nightly.txt\n"
+        + `columns ${"wide ".repeat(60)}end\nwarning: 1 feed was unreachable\ndone\n`,
+    );
+
+    // Shut, the row shows only its columns again; opened again, it does not ask again.
+    await nightly.getByText("Schedule", { exact: true }).click();
+    await viewer.waitFor({ state: "detached" });
+    assert.equal(await nightly.getAttribute("aria-expanded"), "false");
+    await nightly.getByText("Schedule", { exact: true }).click();
+    await viewer.getByText("starting nightly report", { exact: true }).waitFor();
+    assert.deepEqual(await outputRequests(page), ["run-60"]);
+
+    // The row answers the keyboard as a button does: Enter and Space open and shut it.
+    const notify = rows.nth(2);
+    await notify.focus();
+    await page.keyboard.press("Enter");
+    await outputOf(page, "Notify").getByText("resolved 2 recipients", { exact: true }).waitFor();
+    assert.equal(await notify.getAttribute("aria-expanded"), "true");
+    await page.keyboard.press(" ");
+    await outputOf(page, "Notify").waitFor({ state: "detached" });
+    assert.equal(await notify.getAttribute("aria-expanded"), "false");
+    // Only the rows that were opened were read, each once.
+    assert.deepEqual(await outputRequests(page), ["run-60", "run-58"]);
+  } finally { await page.close(); }
+});
+
+test("an open run says why it failed, and when its output is cut or no longer kept", async () => {
   const page = await open("?runs");
   try {
     const rows = runRows(page);
     await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+
+    // A failed run says why, and has neither output to read nor any to show.
+    await rows.nth(3).getByText("FAILED", { exact: true }).click();
+    for (const text of ["script is no longer in the scripts directory", "Full output is no longer retained."]) {
+      await runsTable(page).getByText(text, { exact: true }).waitFor();
+    }
+    assert.equal(await outputOf(page, "retired.py").count(), 0);
+    assert.equal(await action(runsTable(page), "Copy output").count(), 0);
+    await rows.nth(3).getByText("FAILED", { exact: true }).click();
+    await runsTable(page).getByText("script is no longer in the scripts directory", { exact: true }).waitFor({ state: "detached" });
+
+    // A scan's excerpt outlives the output it was cut from, and nothing is asked for.
+    await rows.nth(1).getByText("Scan", { exact: true }).click();
+    await outputOf(page, "intake.py").getByText("intake.py finished", { exact: true }).waitFor();
+    await runsTable(page).getByText("Full output is no longer retained.", { exact: true }).waitFor();
+    await rows.nth(1).getByText("Scan", { exact: true }).click();
+    await outputOf(page, "intake.py").waitFor({ state: "detached" });
+
+    // A run cut at the capture limit says so; one whose output the daemon has since let go
+    // keeps the excerpt it ended with.
+    await rows.nth(5).getByText("WARNING", { exact: true }).click();
+    await runsTable(page).getByText("Capture limit reached; output was truncated.", { exact: true }).waitFor();
+    await runsTable(page).getByText("Full output is no longer retained.", { exact: true }).waitFor();
+    await outputOf(page, "Tidy tv").getByText("cleanup.sh finished", { exact: true }).waitFor();
+    await runsTable(page).getByText("cleanup.sh · Fire and forget · SABnzbd · post_processing", { exact: true }).waitFor();
+    assert.deepEqual(await outputRequests(page), ["run-55"]);
+  } finally { await page.close(); }
+});
+
+test("the runs go a page at a time, forward and back, and a shut page leaves its rows shut", async () => {
+  const page = await open("?runs");
+  try {
+    const rows = runRows(page);
+    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+    await rows.nth(0).getByText("Schedule", { exact: true }).click();
+    await outputOf(page, "Nightly report").waitFor();
+
+    // The next page starts below the last run of this one.
+    await pageButton(page, "Next").click();
+    await rows.first().and(rowsHolding(page, "fixture.batch.35")).waitFor();
+    assert.equal(await rows.count(), 25);
+    assert.equal(await rows.last().getByRole("link", { name: "fixture.batch.11", exact: true }).count(), 1);
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-36", kind: null });
+    await page.getByText("26–50 of 60", { exact: true }).waitFor();
+    assert.equal(await currentPage(page).textContent(), "2");
+    await shot(page, "runs-page-two");
+
+    // The last page is short, and has nowhere further to go.
+    await pageButton(page, "3").click();
+    await rows.first().and(rowsHolding(page, "fixture.batch.10")).waitFor();
+    assert.equal(await rows.count(), 10);
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-11", kind: null });
+    await page.getByText("51–60 of 60", { exact: true }).waitFor();
+    assert.equal(await pageButton(page, "Next").isDisabled(), true);
+
+    // Back goes to where the page before began.
+    await pageButton(page, "Previous").click();
+    await rows.first().and(rowsHolding(page, "fixture.batch.35")).waitFor();
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-36", kind: null });
+    await pageButton(page, "1").click();
+    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: null });
+    assert.equal(await pageButton(page, "Previous").isDisabled(), true);
+    // The row opened before the first page was left is shut on the way back.
+    assert.equal(await rows.nth(0).getAttribute("aria-expanded"), "false");
+    assert.equal(await outputOf(page, "Nightly report").count(), 0);
+  } finally { await page.close(); }
+});
+
+test("a page further on than any reached yet is walked to, a page at a time", async () => {
+  const page = await open("?runs");
+  try {
+    const rows = runRows(page);
+    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+    const asked = (await runRequests(page)).length;
+    await pageButton(page, "3").click();
+    await rows.first().and(rowsHolding(page, "fixture.batch.10")).waitFor();
+    assert.deepEqual((await runRequests(page)).slice(asked), [
+      { limit: 25, before: "run-36", kind: null },
+      { limit: 25, before: "run-11", kind: null },
+    ]);
+    assert.equal(await currentPage(page).textContent(), "3");
+  } finally { await page.close(); }
+});
+
+test("a new page size starts again from the first page", async () => {
+  const page = await open("?runs");
+  try {
+    const rows = runRows(page);
+    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+    await pageButton(page, "Next").click();
+    await rows.first().and(rowsHolding(page, "fixture.batch.35")).waitFor();
+    await rowsPerPage(page).getByRole("radio", { name: "50", exact: true }).click();
+    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+    assert.equal(await rows.count(), 50);
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 50, before: null, kind: null });
+    assert.equal(await currentPage(page).textContent(), "1");
+    await page.getByText("1–50 of 60", { exact: true }).waitFor();
+  } finally { await page.close(); }
+});
+
+test("the trigger filter asks the daemon for one kind from its first page", async () => {
+  const page = await open("?runs");
+  try {
+    const rows = runRows(page);
+    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+    await pageButton(page, "Next").click();
+    await rows.first().and(rowsHolding(page, "fixture.batch.35")).waitFor();
     await page.locator("#controls").getByRole("button", { name: "Filter by trigger", exact: true }).click();
     const triggers = ["All triggers", "Post-processing", "Queue", "Scan", "Schedule", "Feed"];
     assert.equal(await page.getByRole("menuitemradio").count(), triggers.length);
@@ -1205,97 +1396,14 @@ test("the trigger filter asks the daemon for one kind and lists what comes back"
     await rows.first().and(rowsHolding(page, "Post-processing")).waitFor();
     assert.equal(await rows.count(), 3);
     assert.equal(await rowsHolding(page, "Post-processing").count(), 3);
-    assert.equal(await loadMore(page).count(), 0);
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 50, before: null, kind: "POST_PROCESSING" });
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: "POST_PROCESSING" });
+    assert.equal(await currentPage(page).textContent(), "1");
+    await page.getByText("1–3 of 3", { exact: true }).waitFor();
+    assert.equal(await pageButton(page, "Next").isDisabled(), true);
   } finally { await page.close(); }
 });
 
-test("load more appends the next page of runs and goes away at the end", async () => {
-  const page = await open("?runs");
-  try {
-    const rows = runRows(page);
-    await loadMore(page).waitFor();
-    assert.equal(await rows.count(), 50);
-    assert.equal(await rows.last().getByRole("link", { name: "fixture.batch.11", exact: true }).count(), 1);
-    await loadMore(page).click();
-    await rows.last().and(rowsHolding(page, "fixture.batch.1")).waitFor();
-    assert.equal(await rows.count(), 60);
-    // The second page follows the first; the first is not asked for again.
-    assert.equal(await rows.nth(49).getByRole("link", { name: "fixture.batch.11", exact: true }).count(), 1);
-    assert.equal(await rows.nth(50).getByRole("link", { name: "fixture.batch.10", exact: true }).count(), 1);
-    assert.equal(await loadMore(page).count(), 0);
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 50, before: "run-11", kind: null });
-  } finally { await page.close(); }
-});
-
-test("opening a run shows what it did and fetches its retained output", async () => {
-  const page = await open("?runs");
-  try {
-    const rows = runRows(page);
-    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
-    // A run's record is titled by its instance, or by its script when it has none.
-    const record = (name) => page.getByRole("dialog", { name, exact: true });
-    const shut = async (dialog) => {
-      await dialog.getByRole("button", { name: "Close", exact: true }).click();
-      await dialog.waitFor({ state: "detached" });
-    };
-    const retained = (dialog) => dialog.getByRole("button", { name: "Show retained output", exact: true });
-
-    await rows.nth(2).getByText("Post-processing", { exact: true }).click();
-    const notify = record("Notify");
-    await notify.waitFor();
-    for (const text of ["notify.py", "post_processing", "Post-processing", "Blocking", "SUCCEEDED", "0", "240 ms", "NZBGet"]) {
-      assert.equal(await notify.getByText(text, { exact: true }).count(), 1, text);
-    }
-    // The instance is named in the title and again beside the script it ran.
-    assert.equal(await notify.getByText("Notify", { exact: true }).count(), 2);
-    assert.equal(await notify.getByRole("link", { name: "fixture.release.one", exact: true }).getAttribute("href"), "/jobs/7");
-    // The excerpt stands until the retained output arrives, and comes back on request.
-    await notify.getByText("notified 2 recipients").waitFor();
-    assert.equal(await notify.getByText("resolved 2 recipients").count(), 0);
-    await retained(notify).click();
-    await notify.getByText("resolved 2 recipients").waitFor();
-    await notify.getByRole("button", { name: "Show excerpt", exact: true }).click();
-    await notify.getByText("resolved 2 recipients").waitFor({ state: "detached" });
-    await notify.getByText("notified 2 recipients").waitFor();
-    await shot(page, "run-record");
-    await shut(notify);
-
-    // A failed run says why, and has neither an exit code nor output to fetch. Its instance is gone too.
-    await rows.nth(3).getByText("FAILED", { exact: true }).click();
-    const retired = record("retired.py");
-    await retired.waitFor();
-    for (const text of ["script is no longer in the scripts directory", "FAILED", "Full output is no longer retained."]) {
-      assert.equal(await retired.getByText(text, { exact: true }).count(), 1, text);
-    }
-    assert.equal(await retired.getByText("—", { exact: true }).count(), 2);
-    assert.equal(await retained(retired).count(), 0);
-    await shut(retired);
-
-    // A scan belongs to no job; its excerpt outlives the output it was cut from.
-    await rows.nth(1).getByText("Scan", { exact: true }).click();
-    const intake = record("intake.py");
-    await intake.waitFor();
-    for (const text of ["scan", "Scan", "—", "1.5s", "intake.py finished", "Full output is no longer retained."]) {
-      assert.equal(await intake.getByText(text, { exact: true }).count(), 1, text);
-    }
-    assert.equal(await intake.getByRole("link").count(), 0);
-    assert.equal(await retained(intake).count(), 0);
-    await shut(intake);
-
-    // A run nothing waited for says so, and one cut at the capture limit says that.
-    await rows.nth(5).getByText("WARNING", { exact: true }).click();
-    const cleanup = record("Tidy tv");
-    await cleanup.waitFor();
-    for (const text of ["cleanup.sh", "Fire and forget", "WARNING", "3", "SABnzbd", "Capture limit reached; output was truncated."]) {
-      assert.equal(await cleanup.getByText(text, { exact: true }).count(), 1, text);
-    }
-    assert.equal(await cleanup.getByRole("link", { name: "#9", exact: true }).getAttribute("href"), "/jobs/9");
-    assert.equal(await retained(cleanup).count(), 1);
-  } finally { await page.close(); }
-});
-
-test("the settings search narrows the loaded runs by script or by instance", async () => {
+test("the settings search narrows the loaded runs by script or by script job", async () => {
   for (const search of ["cleanup", "tidy"]) {
     const page = await open(`?runs&search=${search}`);
     try {

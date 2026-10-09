@@ -1316,7 +1316,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
         .unwrap();
     }
 
-    let fields = "runs { id jobId jobName script instanceId instanceName event kind background adapter status exitCode durationMs outputTail outputTruncated outputRetained errorMessage finishedAtEpochMs } nextBefore";
+    let fields = "runs { id jobId jobName script instanceId instanceName event kind background adapter status exitCode durationMs outputTail outputTruncated outputRetained errorMessage finishedAtEpochMs } nextBefore total";
     let first = harness
         .execute_as(
             &format!("{{ scriptRuns(limit: 2) {{ {fields} }} }}"),
@@ -1327,6 +1327,10 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     let first = &response_data(&first)["scriptRuns"];
     let runs = first["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 2);
+    assert_eq!(
+        first["total"], 3,
+        "the total counts every page, not this one"
+    );
     assert_eq!(runs[0]["script"], "hourly.sh");
     assert_eq!(runs[0]["instanceId"], "instance-1");
     assert_eq!(runs[0]["instanceName"], "Every hour");
@@ -1369,6 +1373,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     let rest = &response_data(&rest)["scriptRuns"];
     assert_eq!(rest["runs"].as_array().unwrap().len(), 1);
     assert_eq!(rest["runs"][0]["script"], "nightly.sh");
+    assert_eq!(rest["total"], 3);
     assert!(
         rest["nextBefore"].is_null(),
         "nothing follows the last page"
@@ -1376,13 +1381,14 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
 
     let scheduled = harness
         .execute_as(
-            "{ scriptRuns(kind: SCHEDULER, script: \"nightly.sh\") { runs { script } nextBefore } }",
+            "{ scriptRuns(kind: SCHEDULER, script: \"nightly.sh\") { runs { script } nextBefore total } }",
             CallerScope::Read,
         )
         .await;
     assert_no_errors(&scheduled);
     let scheduled = &response_data(&scheduled)["scriptRuns"];
     assert_eq!(scheduled["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(scheduled["total"], 1, "the total is of the filtered runs");
     assert!(scheduled["nextBefore"].is_null());
 
     let of_a_job = harness
