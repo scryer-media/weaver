@@ -4,6 +4,8 @@ use super::{
     EgressBinding, EgressInterface, LegPath, ProxyPool, ProxyProfile, Route, RoutingPolicy, Rung,
 };
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
+use crate::servers::record::{parse_quota_weekday, quota_weekday_str};
+use crate::servers::{ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 use crate::{Database, StateError};
 
 fn error(value: impl std::fmt::Display) -> StateError {
@@ -31,9 +33,29 @@ fn egress_row(row: SqlRow) -> Result<EgressInterface, StateError> {
         binding,
         enabled: row.i64("enabled")? != 0,
         max_download_speed: u64::try_from(row.i64("max_download_speed")?).map_err(error)?,
+        download_quota: quota_row(&row)?,
     };
     egress.validate().map_err(error)?;
     Ok(egress)
+}
+
+fn quota_row(row: &SqlRow) -> Result<ServerDownloadQuotaConfig, StateError> {
+    let period = row.text("download_quota_period")?;
+    let weekday = row.text("download_quota_weekly_reset_weekday")?;
+    Ok(ServerDownloadQuotaConfig {
+        enabled: row.i64("download_quota_enabled")? != 0,
+        limit_bytes: u64::try_from(row.i64("download_quota_limit_bytes")?).map_err(error)?,
+        period: ServerDownloadQuotaPeriod::parse(&period)
+            .ok_or_else(|| error(format!("invalid egress download quota period '{period}'")))?,
+        reset_time_minutes_local: u16::try_from(
+            row.i64("download_quota_reset_time_minutes_local")?,
+        )
+        .map_err(error)?,
+        weekly_reset_weekday: parse_quota_weekday(&weekday)
+            .ok_or_else(|| error(format!("invalid egress download quota weekday '{weekday}'")))?,
+        monthly_reset_day: u8::try_from(row.i64("download_quota_monthly_reset_day")?)
+            .map_err(error)?,
+    })
 }
 
 fn pool_row(row: SqlRow) -> Result<ProxyPool, StateError> {
@@ -207,6 +229,7 @@ pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), St
                     },
                     enabled: true,
                     max_download_speed: 0,
+                    download_quota: ServerDownloadQuotaConfig::default(),
                 });
         }
         if route.legacy_policy().is_none() {
@@ -282,9 +305,14 @@ impl Database {
                         EgressBinding::SourceAddress { address } => ("sourceAddress", Some(address.to_string())),
                     };
                     let now = chrono::Utc::now().timestamp();
-                    tx.execute("INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, binding_kind = excluded.binding_kind, binding_value = excluded.binding_value, enabled = excluded.enabled, max_download_speed = excluded.max_download_speed, updated_at = excluded.updated_at", &[
+                    let quota = &egress.download_quota;
+                    tx.execute("INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, binding_kind = excluded.binding_kind, binding_value = excluded.binding_value, enabled = excluded.enabled, max_download_speed = excluded.max_download_speed, download_quota_enabled = excluded.download_quota_enabled, download_quota_limit_bytes = excluded.download_quota_limit_bytes, download_quota_period = excluded.download_quota_period, download_quota_reset_time_minutes_local = excluded.download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday = excluded.download_quota_weekly_reset_weekday, download_quota_monthly_reset_day = excluded.download_quota_monthly_reset_day, updated_at = excluded.updated_at", &[
                         SqlArg::I64(i64::from(egress.id)), SqlArg::Text(egress.name.clone()), SqlArg::Text(kind.into()), SqlArg::OptText(value),
-                        SqlArg::I64(i64::from(egress.enabled)), SqlArg::I64(speed), SqlArg::I64(now), SqlArg::I64(now),
+                        SqlArg::I64(i64::from(egress.enabled)), SqlArg::I64(speed),
+                        SqlArg::I64(i64::from(quota.enabled)), SqlArg::I64(quota.limit_bytes as i64), SqlArg::Text(quota.period.as_str().into()),
+                        SqlArg::I64(i64::from(quota.reset_time_minutes_local)), SqlArg::Text(quota_weekday_str(quota.weekly_reset_weekday).into()),
+                        SqlArg::I64(i64::from(quota.monthly_reset_day)),
+                        SqlArg::I64(now), SqlArg::I64(now),
                     ]).await?;
                     Ok(egress)
                 })

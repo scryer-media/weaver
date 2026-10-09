@@ -10,6 +10,7 @@ fn egress() -> EgressInterface {
         },
         enabled: true,
         max_download_speed: 1_000_000,
+        download_quota: Default::default(),
     }
 }
 

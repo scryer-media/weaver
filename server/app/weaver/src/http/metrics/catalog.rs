@@ -53,19 +53,21 @@ metric_families! {
     SCHEDULED_SPEED_LIMIT = ("weaver_pipeline_scheduled_speed_limit_bytes_per_second", Gauge, [],
         "Speed limit imposed by the active schedule; zero means no scheduled limit.");
 
-    // ---- ISP bandwidth cap ----------------------------------------------
-    CAP_ENABLED = ("weaver_bandwidth_cap_enabled", Gauge, [],
-        "Whether the ISP bandwidth cap policy is enabled.");
-    CAP_USED_BYTES = ("weaver_bandwidth_cap_used_bytes", Gauge, [],
-        "Current ISP bandwidth cap usage in bytes.");
-    CAP_LIMIT_BYTES = ("weaver_bandwidth_cap_limit_bytes", Gauge, [],
-        "Configured ISP bandwidth cap limit in bytes.");
-    CAP_REMAINING_BYTES = ("weaver_bandwidth_cap_remaining_bytes", Gauge, [],
-        "Remaining ISP bandwidth cap bytes in the active window.");
-    CAP_RESERVED_BYTES = ("weaver_bandwidth_cap_reserved_bytes", Gauge, [],
-        "Bytes conservatively reserved for in-flight downloads against the active cap window.");
-    CAP_WINDOW_END_SECONDS = ("weaver_bandwidth_cap_window_end_seconds", Gauge, [],
-        "Active ISP bandwidth cap window end as a unix timestamp.");
+    // ---- egress download quotas ------------------------------------------
+    EGRESS_QUOTA_ENABLED = ("weaver_egress_download_quota_enabled", Gauge, ["egress_id"],
+        "Whether an egress has a download quota.");
+    EGRESS_QUOTA_LIMIT_BYTES = ("weaver_egress_download_quota_limit_bytes", Gauge, ["egress_id"],
+        "Configured egress download quota for the current window; 0 when no quota is configured, so clamp the denominator before dividing by it.");
+    EGRESS_QUOTA_USED_BYTES = ("weaver_egress_download_quota_used_bytes", Gauge, ["egress_id"],
+        "Bytes charged in the current egress quota window.");
+    EGRESS_QUOTA_RESERVED_BYTES = ("weaver_egress_download_quota_reserved_bytes", Gauge,
+        ["egress_id"], "Bytes reserved for in-flight downloads against the egress quota.");
+    EGRESS_QUOTA_REMAINING_BYTES = ("weaver_egress_download_quota_remaining_bytes", Gauge,
+        ["egress_id"], "Remaining admissible bytes in the current egress quota window.");
+    EGRESS_QUOTA_BLOCKED = ("weaver_egress_download_quota_blocked", Gauge, ["egress_id"],
+        "Whether the egress currently turns downloads away because of its quota.");
+    DOWNLOAD_BLOCK_WINDOW_END_SECONDS = ("weaver_download_quota_block_window_end_seconds", Gauge, [],
+        "When the quota holding downloads resets, as a unix timestamp; 0 while no quota holds them.");
 
     // ---- queue mix ------------------------------------------------------
     PIPELINE_JOBS = ("weaver_pipeline_jobs", Gauge, ["status"],

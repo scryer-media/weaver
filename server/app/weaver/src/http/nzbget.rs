@@ -1330,7 +1330,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let download_block = ctx.handle.get_download_block();
     let quota_reached = matches!(
         download_block.kind,
-        weaver_server_core::DownloadBlockKind::IspCap
+        weaver_server_core::DownloadBlockKind::EgressQuota
             | weaver_server_core::DownloadBlockKind::ServerQuota
     );
     let config = ctx.config.read().await;

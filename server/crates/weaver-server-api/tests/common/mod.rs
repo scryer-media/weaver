@@ -212,7 +212,6 @@ impl TestHarness {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
@@ -699,9 +698,6 @@ fn spawn_test_scheduler(
                 SchedulerCommand::SetPropagationDelay { reply, .. }
                 | SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
-                }
-                SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
-                    let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::RebuildNntp {
                     client,

@@ -202,16 +202,6 @@ impl Pipeline {
             return;
         }
 
-        let mut park_reason = None;
-        if let Err(error) = self.refresh_bandwidth_cap_window() {
-            error!(error = %error, "failed to refresh ISP bandwidth cap state for lane refill");
-            park_reason = Some(LaneParkReason::Error);
-        }
-        if let Some(reason) = park_reason {
-            self.park_download_lane_refill(request, reason, held_since, now);
-            return;
-        }
-
         let pressure = self.refresh_download_pressure();
         let lane_mode = self.download_lane_mode_for_server(
             server_idx,
@@ -265,7 +255,6 @@ impl Pipeline {
                             .fetch_add(1, Ordering::Relaxed);
                         LaneParkReason::Pressure
                     }
-                    YieldReason::BandwidthCapExhausted => LaneParkReason::Pressure,
                     YieldReason::Paused
                     | YieldReason::RateLimited
                     | YieldReason::HandoffDraining => LaneParkReason::ProbeYield,
@@ -349,7 +338,7 @@ impl Pipeline {
         let mut reserved = Vec::with_capacity(works.len());
         let mut works = works.into_iter();
         for work in works.by_ref() {
-            match self.reserve_download_work_for_dispatch(job_id, work, false) {
+            match self.reserve_download_work_for_dispatch(job_id, work) {
                 Ok(Some(work)) => reserved.push(work),
                 // The helper has already returned the refused article; the
                 // rest of the handout follows it below so the batch keeps

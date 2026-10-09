@@ -2501,6 +2501,9 @@ pub struct Pipeline {
     pub(in crate::pipeline) files_counted_missing: HashSet<NzbFileId>,
     /// Work parked specifically on per-server quota capacity or policy changes.
     pub(super) server_quota_parked: HashSet<SegmentId>,
+    /// The egress each piece of work in `server_quota_parked` waits on, when
+    /// an egress download quota rather than a server quota parked it.
+    pub(super) egress_quota_parked: HashMap<SegmentId, u32>,
     /// Directory for active downloads (per-job subdirectories).
     pub(super) intermediate_dir: PathBuf,
     /// Directory for completed downloads (category subdirectories).
@@ -2840,11 +2843,8 @@ pub struct Pipeline {
     /// than an operator action. Only meaningful while `global_paused` is true;
     /// it selects the Scheduled vs ManualPause download-block presentation.
     pub(super) scheduled_pause: bool,
-    /// ISP bandwidth cap runtime state.
+    /// The per-minute download ledger behind the bandwidth graph.
     pub(crate) bandwidth_cap: BandwidthCapRuntime,
-    /// Conservative byte reservations for in-flight downloads used to enforce the
-    /// ISP bandwidth cap before actual payload bytes are known.
-    pub(crate) bandwidth_reservations: HashMap<SegmentId, u64>,
     /// Estimated bytes charged to the speed limiter for in-flight downloads.
     pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
     /// Persisted/general speed limit restored when no schedule speed action is active.

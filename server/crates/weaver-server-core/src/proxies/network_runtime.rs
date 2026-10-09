@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
@@ -23,6 +23,9 @@ pub use feed::FeedAttempt;
 #[path = "network_draft.rs"]
 mod draft;
 pub use draft::DraftNetworkRoute;
+
+/// The health reason of an egress whose download quota is used up.
+pub const QUOTA_REACHED: &str = "Quota reached";
 
 #[derive(Clone)]
 struct Configuration {
@@ -90,15 +93,25 @@ impl Configuration {
     /// The health a leg's egress contributes before any dial evidence. A
     /// missing egress is Down under the warning recorded for that leg, so
     /// the flow names which egress vanished instead of a generic removal.
+    ///
+    /// An egress whose download quota is used up is Down too, so routes move
+    /// their connections to the legs that can still download.
     fn egress_health(
         &self,
         consumer: &str,
         position: usize,
         egress_id: u32,
         snapshot: &InterfaceSnapshot,
+        quota_blocked: &HashSet<u32>,
     ) -> EgressHealth {
         match self.egresses.get(&egress_id) {
-            Some(egress) => snapshot.health(egress, None),
+            Some(egress) => match snapshot.health(egress, None) {
+                EgressHealth::Down(reason) => EgressHealth::Down(reason),
+                _ if quota_blocked.contains(&egress_id) => {
+                    EgressHealth::Down(QUOTA_REACHED.to_owned())
+                }
+                health => health,
+            },
             None => EgressHealth::Down(self.missing_egress_warning(consumer, position, egress_id)),
         }
     }
@@ -163,6 +176,10 @@ type StagedPoolMembers = HashMap<(u32, u32), Vec<(u32, Arc<dyn Dialer>)>>;
 
 pub struct NetworkRuntime {
     pub egress_controls: Arc<weaver_nntp::transfer::ServerTransferRegistry>,
+    /// The long-lived download policies. With one, the egress controls are
+    /// its egress registry, so counters outlive this runtime's rebuilds and
+    /// every egress quota is enforced.
+    quota_policy: Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>,
     #[cfg(test)]
     fixture_providers: Mutex<HashMap<u32, Arc<dyn TunnelProvider>>>,
     db: Database,
@@ -179,27 +196,49 @@ pub struct NetworkRuntime {
     compiling: bool,
     pool_updates: Mutex<StagedPoolMembers>,
     poll: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    quota_watch: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl NetworkRuntime {
     pub fn new(db: Database, handle: tokio::runtime::Handle) -> Result<Arc<Self>, String> {
+        Self::with_quota_policy(db, handle, None)
+    }
+    pub fn with_quota_policy(
+        db: Database,
+        handle: tokio::runtime::Handle,
+        quota_policy: Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>,
+    ) -> Result<Arc<Self>, String> {
         let configuration = Configuration::load(&db)?;
         let interfaces = Arc::new(InterfaceMonitor::start(
             Arc::new(SystemInterfaceSource),
             &handle,
         ));
-        let egress_controls = Arc::new(weaver_nntp::transfer::ServerTransferRegistry::new());
-        for egress in configuration.egresses.values() {
-            egress_controls.configure(
-                weaver_nntp::transfer::StableServerId(egress.id),
-                weaver_nntp::transfer::ServerTransferConfig {
-                    rate_bytes_per_sec: egress.max_download_speed,
-                    quota: None,
-                },
-            );
-        }
+        let egress_controls = match &quota_policy {
+            Some(policy) => {
+                policy
+                    .reconfigure_egresses(
+                        &configuration.egresses.values().cloned().collect::<Vec<_>>(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                policy.egress_transfer_registry()
+            }
+            None => {
+                let controls = Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
+                    weaver_nntp::transfer::TransferScope::Egress,
+                ));
+                configure_egress_rates(&controls, &configuration);
+                controls
+            }
+        };
+        let quota_changes = quota_policy.as_ref().map(|policy| {
+            (
+                policy.subscribe_changes(),
+                policy.subscribe_capacity_changes(),
+            )
+        });
         let runtime = Arc::new(Self {
             egress_controls,
+            quota_policy,
             #[cfg(test)]
             fixture_providers: Mutex::new(HashMap::new()),
             db,
@@ -213,6 +252,7 @@ impl NetworkRuntime {
             compiling: false,
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
+            quota_watch: Mutex::new(None),
         });
         let weak = Arc::downgrade(&runtime);
         *runtime.poll.lock().expect("network health task") = Some(handle.spawn(async move {
@@ -226,7 +266,57 @@ impl NetworkRuntime {
                 runtime.retire_unused_sessions().await;
             }
         }));
+        if let Some((policy_changes, capacity_changes)) = quota_changes {
+            let task = handle.spawn(Self::follow_quota_state(
+                Arc::downgrade(&runtime),
+                policy_changes,
+                capacity_changes,
+            ));
+            *runtime.quota_watch.lock().expect("network quota task") = Some(task);
+        }
         Ok(runtime)
+    }
+    /// Re-publish leg health whenever an egress runs out of quota or gets
+    /// quota back, so routes move off it or back onto it straight away.
+    async fn follow_quota_state(
+        runtime: std::sync::Weak<Self>,
+        mut policy_changes: tokio::sync::watch::Receiver<u64>,
+        mut capacity_changes: tokio::sync::watch::Receiver<u64>,
+    ) {
+        let mut published = HashSet::new();
+        loop {
+            {
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                let blocked = runtime.quota_blocked_egresses();
+                if blocked != published {
+                    runtime.refresh_health();
+                    published = blocked;
+                }
+            }
+            tokio::select! {
+                changed = policy_changes.changed() => if changed.is_err() { break },
+                changed = capacity_changes.changed() => if changed.is_err() { break },
+            }
+        }
+    }
+    /// Egresses whose download quota turns work away.
+    pub fn quota_blocked_egresses(&self) -> HashSet<u32> {
+        self.egress_controls
+            .snapshots()
+            .into_iter()
+            .filter(|snapshot| snapshot.quota_blocked)
+            .map(|snapshot| snapshot.stable_server_id.0)
+            .collect()
+    }
+    /// The live download-quota usage of one egress, when this runtime
+    /// enforces download policies.
+    pub fn egress_quota_usage(
+        &self,
+        egress_id: u32,
+    ) -> Option<crate::servers::transfer_policy::ServerDownloadQuotaSnapshot> {
+        self.quota_policy.as_ref()?.egress_snapshot(egress_id)
     }
     pub fn interfaces(&self) -> InterfaceSnapshot {
         self.interfaces.snapshot()
@@ -271,6 +361,7 @@ impl NetworkRuntime {
     /// Legs of every configured route without a live counterpart.
     pub fn dormant_legs(&self) -> Vec<DormantLeg> {
         let snapshot = self.interfaces();
+        let quota_blocked = self.quota_blocked_egresses();
         let config = self.configuration.read().expect("network configuration");
         let routes = self.routes.lock().expect("network routes");
         let mut legs = Vec::new();
@@ -291,6 +382,7 @@ impl NetworkRuntime {
                     position,
                     leg.egress_id,
                     &snapshot,
+                    &quota_blocked,
                 ));
                 legs.push(DormantLeg {
                     consumer: *consumer,
@@ -320,8 +412,10 @@ impl NetworkRuntime {
             })
             .collect()
     }
-    fn refresh_health(&self) {
+    /// Publish every live leg's egress health, quota included.
+    pub fn refresh_health(&self) {
         let snapshot = self.interfaces();
+        let quota_blocked = self.quota_blocked_egresses();
         let config = self.configuration.read().expect("network configuration");
         for route in self.routes.lock().expect("network routes").values() {
             for (position, leg) in route.legs.read().expect("route legs").iter().enumerate() {
@@ -330,6 +424,7 @@ impl NetworkRuntime {
                     position,
                     leg.definition.egress_id,
                     &snapshot,
+                    &quota_blocked,
                 );
                 route.weighted.set_egress_health(position, health);
             }
@@ -707,6 +802,7 @@ impl NetworkRuntime {
             &self.handle,
         )?;
         let snapshot = self.interfaces();
+        let quota_blocked = self.quota_blocked_egresses();
         for (position, leg) in legs.iter().enumerate() {
             weighted.set_egress_health(
                 position,
@@ -715,6 +811,7 @@ impl NetworkRuntime {
                     position,
                     leg.definition.egress_id,
                     &snapshot,
+                    &quota_blocked,
                 ),
             );
         }
@@ -744,9 +841,18 @@ impl NetworkRuntime {
     }
     pub async fn reload(&self) -> Result<(), String> {
         let db = self.db.clone();
-        let next = tokio::task::spawn_blocking(move || Configuration::load(&db))
-            .await
-            .map_err(|e| e.to_string())??;
+        let policy = self.quota_policy.clone();
+        let next = tokio::task::spawn_blocking(move || {
+            let next = Configuration::load(&db)?;
+            if let Some(policy) = policy {
+                policy
+                    .reconfigure_egresses(&next.egresses.values().cloned().collect::<Vec<_>>())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok::<_, String>(next)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         self.apply_configuration(next)?;
         self.retire_unused_sessions().await;
         self.refresh_health();
@@ -767,7 +873,9 @@ impl NetworkRuntime {
             compiling: true,
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
+            quota_watch: Mutex::new(None),
             egress_controls: self.egress_controls.clone(),
+            quota_policy: None,
             #[cfg(test)]
             fixture_providers: Mutex::new(
                 self.fixture_providers
@@ -840,6 +948,7 @@ impl NetworkRuntime {
             self.pools.lock().expect("network pools")[&key].set_members(members);
         }
         let snapshot = self.interfaces();
+        let quota_blocked = self.quota_blocked_egresses();
         for (route, fresh, allocation) in updates {
             let mut old = route.legs.write().expect("route legs");
             route.weighted.apply_update(allocation);
@@ -851,6 +960,7 @@ impl NetworkRuntime {
                         position,
                         leg.definition.egress_id,
                         &snapshot,
+                        &quota_blocked,
                     ),
                 );
             }
@@ -873,14 +983,9 @@ impl NetworkRuntime {
                 .expect("network routes")
                 .remove(&route.consumer.key());
         }
-        for egress in next.egresses.values() {
-            self.egress_controls.configure(
-                weaver_nntp::transfer::StableServerId(egress.id),
-                weaver_nntp::transfer::ServerTransferConfig {
-                    rate_bytes_per_sec: egress.max_download_speed,
-                    quota: None,
-                },
-            );
+        // The policy registry already applied rates and quotas on reload.
+        if self.quota_policy.is_none() {
+            configure_egress_rates(&self.egress_controls, &next);
         }
         // A pool cache owns its member sessions. Drop unused plans before
         // pruning sessions so deleted routes do not retain tunnel buffers.
@@ -996,6 +1101,9 @@ impl NetworkRuntime {
         if let Some(task) = self.poll.lock().expect("network health task").take() {
             task.abort();
         }
+        if let Some(task) = self.quota_watch.lock().expect("network quota task").take() {
+            task.abort();
+        }
         for route in self.live_routes() {
             for leg in route.legs.read().expect("route legs").iter() {
                 leg.stage.revoke();
@@ -1028,6 +1136,30 @@ impl Drop for NetworkRuntime {
         if let Some(task) = self.poll.get_mut().expect("network health task").take() {
             task.abort();
         }
+        if let Some(task) = self
+            .quota_watch
+            .get_mut()
+            .expect("network quota task")
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
+/// Speed limits alone, for a runtime without download policies.
+fn configure_egress_rates(
+    controls: &weaver_nntp::transfer::ServerTransferRegistry,
+    configuration: &Configuration,
+) {
+    for egress in configuration.egresses.values() {
+        controls.configure(
+            weaver_nntp::transfer::StableServerId(egress.id),
+            weaver_nntp::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: egress.max_download_speed,
+                quota: None,
+            },
+        );
     }
 }
 

@@ -3,7 +3,13 @@ import type { ProxyKind } from "./proxies";
 export type Rung = { kind: "PROXY" | "POOL" | "CHAIN"; proxyId: number | null; poolId: number | null; chainIds: number[] };
 export type Leg = { egressId: number; weight: number; path: { kind: "DIRECT" | "LADDER"; rungs: Rung[]; directFallback: boolean } };
 export type NetworkRoute = { legs: Leg[]; failover: "REDISTRIBUTE" | "HOLD" };
-export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; maxDownloadSpeed: number; health: string; reason: string | null };
+export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; maxDownloadSpeed: number; downloadQuota?: DownloadQuota; downloadQuotaUsage?: DownloadQuotaUsage | null; health: string; reason: string | null };
+export type QuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
+export type Weekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
+/** A download allowance as it is configured, on a server or an egress. */
+export type DownloadQuota = { enabled: boolean; period: QuotaPeriod; limitBytes: number; resetTimeMinutesLocal: number; weeklyResetWeekday: Weekday; monthlyResetDay: number };
+/** How much of an egress's allowance is spent; null `remainingBytes` means it has none. */
+export type DownloadQuotaUsage = { usedBytes: number; reservedBytes: number; remainingBytes: number | null; blocked: boolean; windowStartsAtEpochMs: number | null; windowEndsAtEpochMs: number | null; timezoneName: string };
 export type ProxyPool = { id: number; name: string; kind: ProxyKind; memberIds: number[]; enabled: boolean };
 export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: number; target: number; open: number; opening: number; state: string; reason: string | null; pinnedAddress: string | null; sourceAddress?:string|null;bytesPerSecond?:number;selectedRung?:number|null;selectedProxyId?:number|null;failingHops?:FailingHop[] };
 /** The first proxy hop on a ladder rung known to be failing, and what its last attempt came to. */

@@ -54,6 +54,7 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) server_health: &'a [ServerHealthInfo],
     pub(crate) runtime_generation: u64,
     pub(crate) server_transfers: &'a [weaver_nntp::transfer::ServerTransferSnapshot],
+    pub(crate) egress_transfers: &'a [weaver_nntp::transfer::ServerTransferSnapshot],
     pub(crate) duplicate_admission: &'a [(&'static str, &'static str, u64)],
     pub(crate) semantic_duplicate_lifecycle: &'a [(&'static str, u64)],
     pub(crate) extraction_rejections: &'a [(&'static str, u64)],
@@ -91,6 +92,7 @@ impl<'a> PrometheusRenderInput<'a> {
             server_health: &[],
             runtime_generation: 0,
             server_transfers: &[],
+            egress_transfers: &[],
             duplicate_admission: &[],
             semantic_duplicate_lifecycle: &[],
             extraction_rejections: &[],
@@ -147,6 +149,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         server_health,
         runtime_generation,
         server_transfers,
+        egress_transfers,
         duplicate_admission,
         semantic_duplicate_lifecycle,
         extraction_rejections,
@@ -221,6 +224,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     render_jobs(&mut out, jobs, per_job_series);
     render_servers(&mut out, server_health, runtime_generation);
     render_server_transfers(&mut out, server_transfers, server_health);
+    render_egress_quotas(&mut out, egress_transfers);
     render_server_articles(&mut out, server_metrics, server_health);
 
     if let Some(lifecycle) = job_lifecycle {
@@ -290,13 +294,8 @@ fn render_gate(out: &mut Encoder, pipeline_paused: bool, download_block: &Downlo
         download_block.scheduled_speed_limit,
     );
 
-    out.sample(&f::CAP_ENABLED, &[], u64::from(download_block.cap_enabled));
-    out.sample(&f::CAP_USED_BYTES, &[], download_block.used_bytes);
-    out.sample(&f::CAP_LIMIT_BYTES, &[], download_block.limit_bytes);
-    out.sample(&f::CAP_REMAINING_BYTES, &[], download_block.remaining_bytes);
-    out.sample(&f::CAP_RESERVED_BYTES, &[], download_block.reserved_bytes);
     out.sample(
-        &f::CAP_WINDOW_END_SECONDS,
+        &f::DOWNLOAD_BLOCK_WINDOW_END_SECONDS,
         &[],
         download_block
             .window_ends_at_epoch_ms
@@ -1240,6 +1239,51 @@ fn render_server_transfers(
         );
         out.sample(
             &f::SERVER_QUOTA_BLOCKED,
+            id,
+            u64::from(transfer.quota_blocked),
+        );
+    }
+}
+
+/// Each egress's download quota, keyed by egress id.
+fn render_egress_quotas(
+    out: &mut Encoder,
+    egress_transfers: &[weaver_nntp::transfer::ServerTransferSnapshot],
+) {
+    for transfer in egress_transfers {
+        let egress_id = transfer.stable_server_id.0.to_string();
+        let id: &[(&str, &str)] = &[("egress_id", egress_id.as_str())];
+        out.sample(
+            &f::EGRESS_QUOTA_ENABLED,
+            id,
+            u64::from(transfer.quota_enabled),
+        );
+        out.sample(
+            &f::EGRESS_QUOTA_LIMIT_BYTES,
+            id,
+            if transfer.quota_enabled {
+                transfer.quota_limit_bytes
+            } else {
+                0
+            },
+        );
+        out.sample(&f::EGRESS_QUOTA_USED_BYTES, id, transfer.quota_used_bytes);
+        out.sample(
+            &f::EGRESS_QUOTA_RESERVED_BYTES,
+            id,
+            transfer.quota_reserved_bytes,
+        );
+        out.sample(
+            &f::EGRESS_QUOTA_REMAINING_BYTES,
+            id,
+            if transfer.quota_enabled {
+                transfer.quota_remaining_bytes
+            } else {
+                0
+            },
+        );
+        out.sample(
+            &f::EGRESS_QUOTA_BLOCKED,
             id,
             u64::from(transfer.quota_blocked),
         );

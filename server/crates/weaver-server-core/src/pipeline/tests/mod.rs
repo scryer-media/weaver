@@ -17,7 +17,6 @@ use crate::settings::{Config, SharedConfig};
 use crate::{
     FileSpec, JobInfo, PipelineMetrics, SchedulerHandle, SegmentSpec, SharedPipelineState,
 };
-use chrono::Timelike;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
 use tokio::sync::{RwLock, oneshot};
@@ -111,7 +110,6 @@ impl TestHarness {
             categories: vec![],
             retry: None,
             max_download_speed: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -531,7 +529,6 @@ async fn new_direct_pipeline_on_machine(
         categories: vec![],
         retry: None,
         max_download_speed: None,
-        isp_bandwidth_cap: None,
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

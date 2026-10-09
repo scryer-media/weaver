@@ -4,7 +4,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::bandwidth::IspBandwidthCapConfig;
 use crate::categories::CategoryConfig;
 use crate::jobs::DuplicatePolicy;
 use crate::runtime::hardware_profile::HardwareProfile;
@@ -41,9 +40,6 @@ pub struct Config {
     /// after successful extraction. Defaults to true.
     #[serde(default)]
     pub cleanup_after_extract: Option<bool>,
-    /// Optional ISP bandwidth cap policy.
-    #[serde(default)]
-    pub isp_bandwidth_cap: Option<IspBandwidthCapConfig>,
     /// Watched-folder NZB intake settings.
     #[serde(default)]
     pub watch_folder: WatchFolderConfig,
@@ -378,7 +374,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),

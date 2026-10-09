@@ -9,7 +9,9 @@ import { RecordEditor } from "../../components/RecordEditor";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
 import { Cell } from "../../components/rows";
 import { FieldRows, PanelControls, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../../pages/settings/framework";
+import { quotaDraft, quotaFields, quotaInput, quotaProblem } from "../../pages/settings/quota";
 import { egressInput, liveAddresses, type NetworkingAction, type NetworkingData } from "./data";
+import { metered, quotaSummary } from "./egress-quota";
 import { bindingLabel, formatLimit, Hint, MIB, stateLabel, StatusMark } from "./presentation";
 
 const NEW_EGRESS: Egress = {
@@ -52,12 +54,13 @@ export function EgressPage({
       kind: "table",
       id: "egress",
       title: t("next.networking.egress.title"),
-      columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.9fr) 104px",
+      columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.9fr) 104px minmax(0, 1fr)",
       headers: [
         t("next.networking.egress.name"),
         t("next.networking.egress.bindingColumn"),
         t("next.networking.egress.health"),
         t("next.networking.egress.limit"),
+        t("next.networking.egress.quota"),
       ],
       empty: t("next.networking.egress.empty"),
       emptyAction: { label: t("next.networking.egress.add"), onClick: () => open(null) },
@@ -95,6 +98,15 @@ export function EgressPage({
             </span>,
             <Cell key="limit" mono className={egress.maxDownloadSpeed ? undefined : "text-wv-muted"}>
               {formatLimit(t, egress.maxDownloadSpeed)}
+            </Cell>,
+            <Cell
+              key="quota"
+              mono
+              className={
+                egress.downloadQuotaUsage?.blocked ? "text-wv-warn" : metered(egress) ? undefined : "text-wv-muted"
+              }
+            >
+              {quotaSummary(egress)}
             </Cell>,
           ],
         };
@@ -145,6 +157,7 @@ export function EgressEditor({
 }) {
   const t = useTranslate();
   const [editing, setEditing] = useState(egress);
+  const [quota, setQuota] = useState(() => quotaDraft(egress.downloadQuota));
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Egress | null>(null);
   const [testing, setTesting] = useState<Egress | null>(null);
@@ -158,14 +171,14 @@ export function EgressEditor({
         ? t("next.networking.egress.interfaceRequired")
         : editing.bindingKind === "SOURCE_ADDRESS" && !editing.sourceAddress?.trim()
           ? t("next.networking.egress.sourceRequired")
-          : null;
+          : quotaProblem(t, quota);
     if (missing) {
       setError(missing);
       return;
     }
     const failure = await action(editing.id < 0 ? CREATE_EGRESS : UPDATE_EGRESS, {
       id: editing.id,
-      input: egressInput(editing),
+      input: { ...egressInput(editing), downloadQuota: quotaInput(quota) },
     });
     if (failure) {
       setError(failure);
@@ -317,7 +330,18 @@ export function EgressEditor({
             </SecondaryButton>
           ) : null
         }
-        sections={[{ id: "egress", title: t("next.networking.egress.section"), fields }]}
+        sections={[
+          { id: "egress", title: t("next.networking.egress.section"), fields },
+          {
+            id: "quota",
+            title: t("next.networking.egress.quotaSection"),
+            fields: quotaFields(t, quota, setQuota, {
+              label: t("next.networking.egress.quotaEnabled"),
+              help: t("next.networking.egress.quotaHelp"),
+              usedBytes: egress.downloadQuotaUsage?.usedBytes,
+            }),
+          },
+        ]}
       />
 
       <ConfirmDialog

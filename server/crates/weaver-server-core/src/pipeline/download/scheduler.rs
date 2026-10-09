@@ -130,7 +130,6 @@ pub(in crate::pipeline) struct LaneShare {
 pub(in crate::pipeline) enum YieldReason {
     Paused,
     HardPressure,
-    BandwidthCapExhausted,
     RateLimited,
     HandoffDraining,
 }
@@ -245,16 +244,6 @@ impl Pipeline {
         }
         if self.nntp_handoff_draining {
             return Some(YieldReason::HandoffDraining);
-        }
-        if let Err(error) = self.refresh_bandwidth_cap_window() {
-            // The cap window could not be read, so the allowance is unknown.
-            // Treating unknown as spent is the only safe direction: it costs a
-            // pass, where fetching past a real cap costs the user money.
-            error!(error = %error, "failed to refresh ISP bandwidth cap state");
-            return Some(YieldReason::BandwidthCapExhausted);
-        }
-        if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
-            return Some(YieldReason::BandwidthCapExhausted);
         }
         if pressure.state == DownloadPressureState::Hard {
             return Some(YieldReason::HardPressure);

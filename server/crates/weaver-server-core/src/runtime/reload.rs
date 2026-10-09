@@ -164,10 +164,6 @@ pub async fn reload_runtime_from_db(
         .set_speed_limit(loaded.max_download_speed.unwrap_or(0))
         .await
         .map_err(|error| error.to_string())?;
-    handle
-        .set_bandwidth_cap_policy(loaded.isp_bandwidth_cap.clone())
-        .await
-        .map_err(|error| error.to_string())?;
     if load_global_pause_from_db(db).await? {
         handle
             .pause_all()
@@ -252,7 +248,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
@@ -288,7 +283,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),

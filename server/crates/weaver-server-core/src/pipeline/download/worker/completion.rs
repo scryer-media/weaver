@@ -155,6 +155,55 @@ impl Pipeline {
         let blocked = !self.server_quota_parked.is_empty()
             && self.nntp.all_normal_fill_servers_quota_blocked();
         self.shared_state.set_server_quota_blocked(blocked);
+        self.shared_state
+            .set_egress_quota_block(self.parked_egress_quota_block());
+    }
+
+    /// The egress quota holding parked work back, if one still is. Work parks
+    /// on an egress only when no server could be reached over any other leg,
+    /// so a parked entry whose egress is still out of quota is a real block.
+    fn parked_egress_quota_block(&self) -> Option<crate::jobs::handle::EgressQuotaBlock> {
+        if self.egress_quota_parked.is_empty() {
+            return None;
+        }
+        let policy = self.shared_state.server_transfer_policy()?;
+        let mut egress_ids = self
+            .egress_quota_parked
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        egress_ids.sort_unstable();
+        egress_ids.dedup();
+        let snapshot = egress_ids
+            .into_iter()
+            .filter_map(|egress_id| policy.egress_snapshot(egress_id))
+            .find(|snapshot| snapshot.blocked)?;
+        let egress = self.shared_state.proxy_runtime().and_then(|runtime| {
+            runtime
+                .network
+                .configuration_snapshot()
+                .0
+                .into_iter()
+                .find(|egress| egress.id == snapshot.server_id)
+        });
+        let limit_bytes = egress
+            .as_ref()
+            .map_or(0, |egress| egress.download_quota.limit_bytes);
+        let egress_name = egress
+            .map(|egress| egress.name)
+            .unwrap_or_else(|| format!("Egress {}", snapshot.server_id));
+        Some(crate::jobs::handle::EgressQuotaBlock {
+            egress_id: snapshot.server_id,
+            egress_name,
+            used_bytes: snapshot.used_bytes,
+            limit_bytes,
+            remaining_bytes: snapshot.remaining_bytes.unwrap_or(0),
+            window_starts_at_epoch_ms: snapshot
+                .window_start
+                .map(|start| start.timestamp_millis() as f64),
+            window_ends_at_epoch_ms: snapshot.window_end.map(|end| end.timestamp_millis() as f64),
+            timezone_name: snapshot.timezone,
+        })
     }
 
     fn download_retry_work(
@@ -401,9 +450,6 @@ impl Pipeline {
             }
         }
         self.publish_active_stage_metrics();
-        if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {
-            error!(error = %error, segment = %result.segment_id, "failed to release ISP bandwidth reservation");
-        }
         let actual_raw_bytes = match &result.data {
             Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
             Ok(DownloadPayload::Decoded(decoded)) => Some(decoded.raw_size),
@@ -419,7 +465,7 @@ impl Pipeline {
             error!(
                 error = %error,
                 segment = %result.segment_id,
-                "failed to record ISP bandwidth usage"
+                "failed to record download bandwidth usage"
             );
         }
         true
@@ -787,8 +833,24 @@ impl Pipeline {
                 if failure.kind == DownloadFailureKind::ServerQuota {
                     let mut retry_after = failure.retry_after;
                     let mut quota_rejection = failure.quota_rejection;
-                    let mut park_for_quota = source_server_idx.is_none();
-                    if source_server_idx.is_some()
+                    let egress_rejection = quota_rejection
+                        .as_ref()
+                        .filter(|rejection| {
+                            rejection.scope == weaver_nntp::transfer::TransferScope::Egress
+                        })
+                        .cloned();
+                    if egress_rejection.is_some()
+                        && let Some(runtime) = self.shared_state.proxy_runtime()
+                    {
+                        // Take the exhausted egress out of every route now, so
+                        // the selection below sees only legs with quota left,
+                        // the same way a dead link drops out.
+                        runtime.network.refresh_health();
+                    }
+                    let mut park_for_quota =
+                        source_server_idx.is_none() && egress_rejection.is_none();
+                    let mut parked_egress = None;
+                    if (source_server_idx.is_some() || egress_rejection.is_some())
                         && let Some(rejection) = quota_rejection.as_ref()
                     {
                         let effective_excludes =
@@ -800,18 +862,32 @@ impl Pipeline {
                                 rejection.requested_body_bytes,
                             )
                             .await;
-                        if selection.eligible.is_empty()
-                            && let Some(current) = selection.quota_blocked
-                        {
-                            retry_after = current
-                                .retry_at
-                                .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-                            quota_rejection = Some(current);
-                            park_for_quota = true;
+                        if selection.eligible.is_empty() {
+                            if let Some(current) = selection.quota_blocked {
+                                retry_after = current.retry_at.map(|deadline| {
+                                    deadline.saturating_duration_since(Instant::now())
+                                });
+                                quota_rejection = Some(current);
+                                park_for_quota = true;
+                            } else if let Some(egress) = egress_rejection.as_ref() {
+                                // No server is reachable over any leg with
+                                // quota left: the egress quota holds the work.
+                                retry_after = egress.retry_at.map(|deadline| {
+                                    deadline.saturating_duration_since(Instant::now())
+                                });
+                                parked_egress = Some(egress.stable_server_id.0);
+                                park_for_quota = true;
+                            }
                         }
                     }
 
                     if park_for_quota {
+                        if let Some(egress_id) = parked_egress {
+                            self.egress_quota_parked
+                                .insert(result.segment_id, egress_id);
+                        } else {
+                            self.egress_quota_parked.remove(&result.segment_id);
+                        }
                         if self.schedule_download_work_without_retry_budget(
                             result.segment_id,
                             result.retry_count,
@@ -822,10 +898,27 @@ impl Pipeline {
                         ) {
                             debug!(
                                 segment = %result.segment_id,
+                                egress = ?parked_egress,
                                 retry_after_ms = ?retry_after.map(|value| value.as_millis()),
-                                "server quota blocked this work's eligible servers; parked without consuming retry budget"
+                                "download quota blocked this work's eligible servers; parked without consuming retry budget"
                             );
+                        } else {
+                            self.egress_quota_parked.remove(&result.segment_id);
                         }
+                    } else if egress_rejection.is_some()
+                        && self.schedule_download_work_without_retry_budget(
+                            result.segment_id,
+                            result.retry_count,
+                            excluded_servers.clone(),
+                            Some(Duration::ZERO),
+                            false,
+                            None,
+                        )
+                    {
+                        debug!(
+                            segment = %result.segment_id,
+                            "egress quota refused BODY admission; retrying over the legs still in quota"
+                        );
                     } else if let Some(source_server_idx) = source_server_idx
                         && self.schedule_download_work_without_retry_budget(
                             result.segment_id,

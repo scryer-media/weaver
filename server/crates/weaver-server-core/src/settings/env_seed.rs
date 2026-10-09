@@ -6,7 +6,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use crate::StateError;
-use crate::bandwidth::IspBandwidthCapWeekday;
+use crate::bandwidth::QuotaWeekday;
 use crate::persistence::Database;
 use crate::servers::{
     ServerConfig, ServerConnectivityResult, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod,
@@ -140,7 +140,7 @@ struct PartialServerSeed {
     download_quota_limit_bytes: Option<u64>,
     download_quota_period: Option<ServerDownloadQuotaPeriod>,
     download_quota_reset_time_minutes_local: Option<u16>,
-    download_quota_weekly_reset_weekday: Option<IspBandwidthCapWeekday>,
+    download_quota_weekly_reset_weekday: Option<QuotaWeekday>,
     download_quota_monthly_reset_day: Option<u8>,
     tls_ca_cert: Option<PathBuf>,
     pipelining: Option<bool>,
@@ -482,7 +482,7 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<EnvSeedServer>, E
             reset_time_minutes_local: partial.download_quota_reset_time_minutes_local.unwrap_or(0),
             weekly_reset_weekday: partial
                 .download_quota_weekly_reset_weekday
-                .unwrap_or(IspBandwidthCapWeekday::Mon),
+                .unwrap_or(QuotaWeekday::Mon),
             monthly_reset_day: partial.download_quota_monthly_reset_day.unwrap_or(1),
         };
         let server = ServerConfig {
@@ -608,10 +608,7 @@ fn parse_quota_period_value(
     })
 }
 
-fn parse_quota_weekday_value(
-    name: &str,
-    value: &str,
-) -> Result<IspBandwidthCapWeekday, EnvSeedError> {
+fn parse_quota_weekday_value(name: &str, value: &str) -> Result<QuotaWeekday, EnvSeedError> {
     let value = value.trim().to_ascii_lowercase();
     crate::servers::record::parse_quota_weekday(&value).ok_or_else(|| {
         EnvSeedError::new(format!(
@@ -702,7 +699,7 @@ mod tests {
         assert_eq!(server.download_quota.reset_time_minutes_local, 375);
         assert_eq!(
             server.download_quota.weekly_reset_weekday,
-            IspBandwidthCapWeekday::Thu
+            QuotaWeekday::Thu
         );
         assert_eq!(server.download_quota.monthly_reset_day, 31);
     }
@@ -1149,7 +1146,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),

@@ -150,8 +150,13 @@ pub(crate) async fn run(
     let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
     let proxy_db = db.clone();
     let runtime_handle = tokio::runtime::Handle::current();
+    let proxy_policy = Arc::clone(&server_transfer_policy);
     let proxies = tokio::task::spawn_blocking(move || {
-        weaver_server_core::proxies::ProxyRuntime::new(proxy_db, runtime_handle)
+        weaver_server_core::proxies::ProxyRuntime::with_quota_policy(
+            proxy_db,
+            runtime_handle,
+            Some(proxy_policy),
+        )
     })
     .await??;
     let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy, &proxies)?;

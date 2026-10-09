@@ -148,7 +148,6 @@ impl SettingsMutation {
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
         let enable_srrdb_lookup = input.enable_srrdb_lookup;
-        let isp_bandwidth_cap = input.isp_bandwidth_cap.clone();
         let duplicate_policy_update = input.duplicate_policy.clone();
         let watch_folder_update = input
             .watch_folder
@@ -173,7 +172,6 @@ impl SettingsMutation {
             cleanup_after_extract,
             max_download_speed,
             max_retries,
-            isp_bandwidth_cap.clone(),
             watch_folder_update.clone(),
             duplicate_policy_update.clone(),
             enable_srrdb_lookup,
@@ -204,48 +202,7 @@ impl SettingsMutation {
                         if let Some(v) = persist_input.4 {
                             db.set_setting("retry.max_retries", &v.to_string())?;
                         }
-                        if let Some(ref cap) = persist_input.5 {
-                            db.set_setting("bandwidth_cap.enabled", &cap.enabled.to_string())?;
-                            db.set_setting(
-                                "bandwidth_cap.period",
-                                match cap.period {
-                                    crate::settings::types::IspBandwidthCapPeriodGql::Daily => {
-                                        "daily"
-                                    }
-                                    crate::settings::types::IspBandwidthCapPeriodGql::Weekly => {
-                                        "weekly"
-                                    }
-                                    crate::settings::types::IspBandwidthCapPeriodGql::Monthly => {
-                                        "monthly"
-                                    }
-                                },
-                            )?;
-                            db.set_setting(
-                                "bandwidth_cap.limit_bytes",
-                                &cap.limit_bytes.to_string(),
-                            )?;
-                            db.set_setting(
-                                "bandwidth_cap.reset_time_minutes_local",
-                                &cap.reset_time_minutes_local.to_string(),
-                            )?;
-                            db.set_setting(
-                                "bandwidth_cap.weekly_reset_weekday",
-                                match cap.weekly_reset_weekday {
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Mon => "mon",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Tue => "tue",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Wed => "wed",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Thu => "thu",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Fri => "fri",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Sat => "sat",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Sun => "sun",
-                                },
-                            )?;
-                            db.set_setting(
-                                "bandwidth_cap.monthly_reset_day",
-                                &cap.monthly_reset_day.to_string(),
-                            )?;
-                        }
-                        if let Some(ref watch) = persist_input.6 {
+                        if let Some(ref watch) = persist_input.5 {
                             if let Some(mode) = watch.mode {
                                 db.set_setting("watch_folder.mode", mode.as_str())?;
                             }
@@ -275,7 +232,7 @@ impl SettingsMutation {
                                 db.set_setting("watch_folder.scanning_paused", &value.to_string())?;
                             }
                         }
-                        if let Some(ref duplicate_policy) = persist_input.7 {
+                        if let Some(ref duplicate_policy) = persist_input.6 {
                             if let Some(value) = duplicate_policy.strict_active_or_success {
                                 db.set_setting(
                                     "duplicate_policy.strict_active_or_success",
@@ -314,10 +271,10 @@ impl SettingsMutation {
                                 )?;
                             }
                         }
-                        if let Some(seconds) = persist_input.9 {
+                        if let Some(seconds) = persist_input.8 {
                             db.set_setting("propagation_delay_secs", &seconds.to_string())?;
                         }
-                        if let Some(enabled) = persist_input.8 {
+                        if let Some(enabled) = persist_input.7 {
                             db.set_setting(
                                 "delivery_naming.enable_srrdb_lookup",
                                 &enabled.to_string(),
@@ -368,9 +325,6 @@ impl SettingsMutation {
                             });
                     retry.max_retries = Some(retries);
                 }
-                if let Some(cap) = isp_bandwidth_cap {
-                    cfg.isp_bandwidth_cap = Some(cap.into());
-                }
                 if let Some(enabled) = enable_srrdb_lookup {
                     cfg.delivery_naming
                         .get_or_insert_with(Default::default)
@@ -399,7 +353,6 @@ impl SettingsMutation {
                     propagation_delay_secs: cfg.propagation_delay_secs(),
                     max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
                     enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
-                    isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
                     watch_folder: (&cfg.watch_folder).into(),
                     duplicate_policy: cfg.duplicate_policy.into(),
                 };
@@ -414,9 +367,6 @@ impl SettingsMutation {
         // Apply speed limit immediately.
         if let Some(speed) = max_download_speed {
             let _ = handle.set_speed_limit(speed).await;
-        }
-        if let Some(cap) = input.isp_bandwidth_cap {
-            let _ = handle.set_bandwidth_cap_policy(Some(cap.into())).await;
         }
 
         // Apply directory changes immediately so new jobs use them without restart.
@@ -723,7 +673,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),

@@ -426,7 +426,7 @@ impl Pipeline {
                 self.global_paused = false;
                 self.scheduled_pause = false;
                 self.shared_state.set_paused(false);
-                let _ = self.refresh_bandwidth_cap_window();
+                self.publish_download_block();
                 if let Err(e) = self
                     .db_blocking(move |db| db.set_setting("global_paused", "false"))
                     .await
@@ -530,10 +530,6 @@ impl Pipeline {
                 }
                 let _ = reply.send(());
             }
-            SchedulerCommand::SetBandwidthCapPolicy { policy, reply } => {
-                let result = self.apply_bandwidth_cap_policy(policy);
-                let _ = reply.send(result);
-            }
             // Profile commands use the profile activation path.
             SchedulerCommand::ApplyScheduleAction {
                 action: crate::bandwidth::ScheduleAction::HardwareProfile { profile },
@@ -552,14 +548,14 @@ impl Pipeline {
                         // The Scheduled kind now falls out of global_pause(), so
                         // any later block-state refresh keeps reporting it
                         // instead of reclassifying the pause as manual.
-                        let _ = self.refresh_bandwidth_cap_window();
+                        self.publish_download_block();
                         info!("schedule: paused downloads");
                     }
                     ScheduleAction::Resume => {
                         self.global_paused = false;
                         self.scheduled_pause = false;
                         self.shared_state.set_paused(false);
-                        let _ = self.refresh_bandwidth_cap_window();
+                        self.publish_download_block();
                         info!("schedule: resumed downloads");
                     }
                     ScheduleAction::SpeedLimit { bytes_per_sec } => {
@@ -575,12 +571,18 @@ impl Pipeline {
                     ScheduleAction::ConfiguredSpeedLimit => {
                         self.scheduled_rate_limit = None;
                         self.rate_limiter.set_rate(self.configured_rate_limit);
-                        let _ = self.refresh_bandwidth_cap_window();
+                        self.publish_download_block();
                         info!("schedule: restored configured speed limit");
                     }
                     ScheduleAction::SetQuotaMetering { enabled } => {
+                        // Metering off suspends every egress download quota:
+                        // bytes still reach the ledger, tagged unmetered, but
+                        // no egress counts them or refuses work.
                         self.bandwidth_cap.set_metering_enabled(enabled);
-                        let _ = self.refresh_bandwidth_cap_window();
+                        if let Some(policy) = self.shared_state.server_transfer_policy() {
+                            policy.set_egress_quota_metering(enabled);
+                        }
+                        self.publish_download_block();
                     }
                     ScheduleAction::PauseWatchFolderScanning
                     | ScheduleAction::ResumeWatchFolderScanning
@@ -589,7 +591,7 @@ impl Pipeline {
                     | ScheduleAction::FetchRss { .. }
                     | ScheduleAction::PruneHistory { .. }
                     | ScheduleAction::RunScript { .. } => {
-                        let _ = self.refresh_bandwidth_cap_window();
+                        self.publish_download_block();
                         warn!(
                             action = ?action,
                             "service schedule action reached download pipeline"
@@ -610,7 +612,7 @@ impl Pipeline {
                 self.scheduled_pause = false;
                 self.scheduled_rate_limit = None;
                 self.rate_limiter.set_rate(self.configured_rate_limit);
-                let _ = self.refresh_bandwidth_cap_window();
+                self.publish_download_block();
                 info!("schedule: cleared scheduled action");
                 let _ = reply.send(());
             }

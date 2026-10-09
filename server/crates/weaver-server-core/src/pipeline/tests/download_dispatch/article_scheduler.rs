@@ -571,28 +571,6 @@ async fn every_whole_link_gate_yields_under_its_own_name() {
         .write_buffered_bytes
         .store(0, Ordering::Relaxed);
 
-    let now = chrono::Local::now();
-    let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
-    pipeline
-        .db
-        .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 4096)
-        .unwrap();
-    pipeline
-        .apply_bandwidth_cap_policy(Some(crate::bandwidth::IspBandwidthCapConfig {
-            enabled: true,
-            period: crate::bandwidth::IspBandwidthCapPeriod::Daily,
-            limit_bytes: 512,
-            reset_time_minutes_local: reset_minutes,
-            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 1,
-        }))
-        .unwrap();
-    assert!(matches!(
-        ask(&mut pipeline, SERVER_A, 8, None),
-        Handout::Yield(YieldReason::BandwidthCapExhausted)
-    ));
-    pipeline.apply_bandwidth_cap_policy(None).unwrap();
-
     // Nothing was taken from the queue while the gates were shut.
     assert_eq!(queued(&pipeline, hot), 200);
     assert_eq!(handouts_hot(&pipeline), 0);

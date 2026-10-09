@@ -20,7 +20,6 @@ impl SettingsQuery {
                 propagation_delay_secs: cfg.propagation_delay_secs(),
                 max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
                 enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
-                isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
                 watch_folder: (&cfg.watch_folder).into(),
                 duplicate_policy: cfg.duplicate_policy.into(),
             })

@@ -169,7 +169,7 @@ export async function platformNetworking(request: APIRequestContext): Promise<Pl
 
 export type EgressInput = {
   name: string; bindingKind: BindingKind; interfaceName?: string | null; sourceAddress?: string | null;
-  enabled?: boolean; maxDownloadSpeed?: number;
+  enabled?: boolean; maxDownloadSpeed?: number; downloadQuota?: DownloadQuotaInput;
 };
 export async function createEgress(request: APIRequestContext, input: EgressInput): Promise<Egress> {
   return (await graphql<{ createEgressInterface: Egress }>(request,
@@ -182,6 +182,63 @@ export async function updateEgress(request: APIRequestContext, id: number, input
 export async function deleteEgress(request: APIRequestContext, id: number): Promise<boolean> {
   return (await graphql<{ deleteEgressInterface: boolean }>(request,
     "mutation($id: Int!) { deleteEgressInterface(id: $id) }", { id })).deleteEgressInterface;
+}
+
+// ---------------------------------------------------------- download quotas
+
+export type QuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
+export type QuotaWeekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
+export type DownloadQuotaInput = {
+  enabled: boolean; period: QuotaPeriod; limitBytes: number; resetTimeMinutesLocal?: number;
+  weeklyResetWeekday?: QuotaWeekday; monthlyResetDay?: number;
+};
+/** Live accounting of one egress's download allowance in its current window. */
+export type DownloadQuotaUsage = {
+  lifetimeBytes: number; usedBytes: number; reservedBytes: number; remainingBytes: number | null;
+  blocked: boolean; windowStartsAtEpochMs: number | null; windowEndsAtEpochMs: number | null; timezoneName: string;
+};
+export type EgressQuota = {
+  id: number; name: string; health: string; reason: string | null;
+  downloadQuota: { enabled: boolean; period: QuotaPeriod; limitBytes: number };
+  downloadQuotaUsage: DownloadQuotaUsage | null;
+};
+
+/** The always-present System egress: id 0, bound to the host's default route. */
+export const SYSTEM_EGRESS_ID = 0;
+export const SYSTEM_EGRESS_NAME = "System";
+
+const EGRESS_QUOTA = `id name health reason downloadQuota { enabled period limitBytes }
+  downloadQuotaUsage {
+    lifetimeBytes usedBytes reservedBytes remainingBytes blocked
+    windowStartsAtEpochMs windowEndsAtEpochMs timezoneName
+  }`;
+
+export async function egressQuota(request: APIRequestContext, id: number): Promise<EgressQuota> {
+  const found = (await graphql<{ egressInterfaces: EgressQuota[] }>(request,
+    `query { egressInterfaces { ${EGRESS_QUOTA} } }`)).egressInterfaces.find(egress => egress.id === id);
+  expect(found, `egress ${id} is configured`).toBeTruthy();
+  return found!;
+}
+
+/** Usage of the System egress's allowance; it is tracked while Weaver runs. */
+export async function systemEgressQuotaUsage(request: APIRequestContext): Promise<DownloadQuotaUsage> {
+  const usage = (await egressQuota(request, SYSTEM_EGRESS_ID)).downloadQuotaUsage;
+  expect(usage, "the System egress reports its download quota usage").not.toBeNull();
+  return usage!;
+}
+
+/** Replaces the System egress's download quota, keeping it enabled and unthrottled. */
+export async function setSystemEgressQuota(request: APIRequestContext, downloadQuota: DownloadQuotaInput): Promise<EgressQuota> {
+  await updateEgress(request, SYSTEM_EGRESS_ID, {
+    name: SYSTEM_EGRESS_NAME, bindingKind: "SYSTEM", enabled: true, downloadQuota: {
+      resetTimeMinutesLocal: 0, weeklyResetWeekday: "MON", monthlyResetDay: 1, ...downloadQuota,
+    },
+  });
+  const saved = await egressQuota(request, SYSTEM_EGRESS_ID);
+  expect(saved.downloadQuota).toEqual({
+    enabled: downloadQuota.enabled, period: downloadQuota.period, limitBytes: downloadQuota.limitBytes,
+  });
+  return saved;
 }
 
 /** Interface-bound egress on Weaver's egress-a or egress-b address. */

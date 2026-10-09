@@ -8,9 +8,17 @@ Everything below is new since 0.14.7. This is a pre-release.
   route: a ladder of legs that can be the system egress, a chosen interface
   or source address, a SOCKS5, HTTP or SSH proxy, a userspace WireGuard hop,
   a chain of proxies, or a pool. Legs carry weights and health; a leg that
-  is unknown or down takes no traffic. Each egress can cap the traffic that
-  leaves through it. The Networking screen shows the live flow from every
-  consumer through its legs to the network.
+  is unknown or down takes no traffic. The Networking screen shows the live
+  flow from every consumer through its legs to the network.
+- Download quotas per egress. Each egress, the System egress included, can
+  carry a download quota with the same periods and reset settings a server
+  quota has. A download that would go past it is refused at that egress,
+  the leg goes down with "Quota reached" and its share moves to the other
+  legs of the route; a job with no leg left parks as blocked by the egress
+  quota until the window resets. Raising the limit lifts the block at once.
+  The egress editor, the egress table, the Bandwidth panel, Monitoring and
+  the jobs list show usage against the quota. This replaces the
+  instance-wide ISP bandwidth cap.
 - Scripts are wired as jobs. A script job is one script on one trigger
   (post-processing, a queue event, scan, schedule or feed) with its own
   inputs, categories, blocking flag and time limit. The script header is a
@@ -86,6 +94,20 @@ enforced never-direct setting is planned for a later release.
 - Implicit schedules derived from a script's `### TASK TIME:` header are
   gone. "Set up from header" creates real schedule rows instead.
 - The NZBGet `<Script>:=no` per-download opt-out is not supported.
+- The ISP bandwidth cap is gone, replaced by the System egress's download
+  quota. GraphQL: `GeneralSettings.ispBandwidthCap`,
+  `GeneralSettingsInput.ispBandwidthCap`, the `IspBandwidthCapSettings`,
+  `IspBandwidthCapSettingsInput`, `IspBandwidthCapPeriod` and `QuotaWeekday`
+  types, `DownloadBlockKind.ISP_CAP` and `DownloadBlock.capEnabled`,
+  `period` and `reservedBytes` are removed. New: `EgressInterface.downloadQuota`
+  and `downloadQuotaUsage`, `EgressInterfaceInput.downloadQuota`, the
+  `DownloadQuotaUsage` type, `DownloadBlockKind.EGRESS_QUOTA` and
+  `DownloadBlock.egressId` and `egressName`. Prometheus: the
+  `weaver_bandwidth_cap_*` gauges and the ISP cap alerts are replaced by
+  `weaver_egress_download_quota_*{egress_id}`,
+  `weaver_download_quota_block_window_end_seconds` and the
+  `WeaverDownloadsGatedByEgressQuota` and `WeaverEgressQuotaNearlyExhausted`
+  alerts.
 
 ## Upgrade notes
 
@@ -102,3 +124,6 @@ enforced never-direct setting is planned for a later release.
   such category on upgrade.
 - Routes default to the direct route through the system egress for every
   existing server and feed.
+- An enabled ISP bandwidth cap becomes the System egress's download quota,
+  and the bytes already counted in its current window carry over, so the
+  quota resumes where the cap left off. A cap that was turned off is dropped.
