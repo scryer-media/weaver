@@ -80,6 +80,18 @@ enforced never-direct setting is planned for a later release.
   it. That adapter needs its own default gateway, as Windows picks the way
   out by the source address alone. Proxies, WireGuard, chains, pools and
   the kill switch work the same on every platform.
+- An idle daemon does almost nothing. With no download moving, the job
+  snapshot is published only when something changes, gauges are sampled
+  once a second instead of ten times, finished jobs are shared between
+  publishes instead of rebuilt, completion checks run only for jobs that
+  could have changed, egress health is recomputed only when an interface
+  or a quota moved, and quota usage is written only when bytes moved.
+  Feeds, schedules and script instances are no longer reloaded in full
+  just to decide whether anything is due.
+- The settings search box searches every settings panel, not only the open
+  one. Matches show under a heading per panel; the open panel stays
+  editable and another panel's result opens that panel with the query
+  kept. Every word of the query must match, in any order.
 
 ## Removed
 
