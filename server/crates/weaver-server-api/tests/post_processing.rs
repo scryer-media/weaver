@@ -1280,16 +1280,29 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
 
     let harness = TestHarness::new().await;
     let recorded = [
-        (ScriptEventLabel::Scheduler(1), "nightly.sh", false, None),
-        (ScriptEventLabel::Scan, "scan.sh", false, None),
+        (
+            ScriptEventLabel::Scheduler(1),
+            "nightly.sh",
+            false,
+            None,
+            ScriptStatus::Succeeded,
+        ),
+        (
+            ScriptEventLabel::Scan,
+            "scan.sh",
+            false,
+            None,
+            ScriptStatus::Failed,
+        ),
         (
             ScriptEventLabel::Scheduler(2),
             "hourly.sh",
             true,
             Some(("instance-1", "Every hour")),
+            ScriptStatus::Succeeded,
         ),
     ];
-    for (event, script, background, instance) in recorded {
+    for (event, script, background, instance, status) in recorded {
         retain_output(
             harness.db.clone(),
             None,
@@ -1301,7 +1314,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
                 output_id: None,
                 background,
                 adapter: ScriptAdapter::Nzbget,
-                status: ScriptStatus::Succeeded,
+                status,
                 exit_code: Some(93),
                 duration_ms: 5,
                 output_tail: String::new(),
@@ -1390,6 +1403,36 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     assert_eq!(scheduled["runs"].as_array().unwrap().len(), 1);
     assert_eq!(scheduled["total"], 1, "the total is of the filtered runs");
     assert!(scheduled["nextBefore"].is_null());
+
+    let failed = harness
+        .execute_as(
+            "{ scriptRuns(status: FAILED) { runs { script status } total statusCounts { status count } } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&failed);
+    let failed = &response_data(&failed)["scriptRuns"];
+    assert_eq!(failed["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(failed["runs"][0]["script"], "scan.sh");
+    assert_eq!(failed["runs"][0]["status"], "FAILED");
+    assert_eq!(failed["total"], 1);
+    // The counts cover every status, so each quick filter can show its own.
+    let mut counts = failed["statusCounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["status"].as_str().unwrap().to_string(),
+                entry["count"].as_u64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    counts.sort();
+    assert_eq!(
+        counts,
+        [("FAILED".to_string(), 1), ("SUCCEEDED".to_string(), 2)]
+    );
 
     let of_a_job = harness
         .execute_as(

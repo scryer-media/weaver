@@ -1090,6 +1090,18 @@ impl ScriptStatus {
         }
     }
 
+    pub fn from_persisted(value: &str) -> Option<Self> {
+        match value {
+            "succeeded" => Some(Self::Succeeded),
+            "skipped" => Some(Self::Skipped),
+            "warning" => Some(Self::Warning),
+            "failed" => Some(Self::Failed),
+            "timed_out" => Some(Self::TimedOut),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
     pub fn summary(self) -> PostProcessingSummary {
         match self {
             Self::Succeeded | Self::Skipped => PostProcessingSummary::Succeeded,

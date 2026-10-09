@@ -1178,7 +1178,7 @@ test("the runs screen is one table of every run, newest first, with no way to cr
     }
     assert.equal(await page.getByRole("button", { name: /^(Add|Create|New)\b/ }).count(), 0);
     // The first page of the smallest size, and where it sits in the whole.
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: null });
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: null, status: null });
     await page.getByText("1–25 of 60", { exact: true }).waitFor();
     assert.equal(await currentPage(page).textContent(), "1");
     assert.equal(await rowsPerPage(page).getByRole("radio", { checked: true }).textContent(), "25");
@@ -1320,7 +1320,7 @@ test("the runs go a page at a time, forward and back, and a shut page leaves its
     await rows.first().and(rowsHolding(page, "fixture.batch.35")).waitFor();
     assert.equal(await rows.count(), 25);
     assert.equal(await rows.last().getByRole("link", { name: "fixture.batch.11", exact: true }).count(), 1);
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-36", kind: null });
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-36", kind: null, status: null });
     await page.getByText("26–50 of 60", { exact: true }).waitFor();
     assert.equal(await currentPage(page).textContent(), "2");
     await shot(page, "runs-page-two");
@@ -1329,17 +1329,17 @@ test("the runs go a page at a time, forward and back, and a shut page leaves its
     await pageButton(page, "3").click();
     await rows.first().and(rowsHolding(page, "fixture.batch.10")).waitFor();
     assert.equal(await rows.count(), 10);
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-11", kind: null });
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-11", kind: null, status: null });
     await page.getByText("51–60 of 60", { exact: true }).waitFor();
     assert.equal(await pageButton(page, "Next").isDisabled(), true);
 
     // Back goes to where the page before began.
     await pageButton(page, "Previous").click();
     await rows.first().and(rowsHolding(page, "fixture.batch.35")).waitFor();
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-36", kind: null });
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: "run-36", kind: null, status: null });
     await pageButton(page, "1").click();
     await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: null });
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: null, status: null });
     assert.equal(await pageButton(page, "Previous").isDisabled(), true);
     // The row opened before the first page was left is shut on the way back.
     assert.equal(await rows.nth(0).getAttribute("aria-expanded"), "false");
@@ -1356,8 +1356,8 @@ test("a page further on than any reached yet is walked to, a page at a time", as
     await pageButton(page, "3").click();
     await rows.first().and(rowsHolding(page, "fixture.batch.10")).waitFor();
     assert.deepEqual((await runRequests(page)).slice(asked), [
-      { limit: 25, before: "run-36", kind: null },
-      { limit: 25, before: "run-11", kind: null },
+      { limit: 25, before: "run-36", kind: null, status: null },
+      { limit: 25, before: "run-11", kind: null, status: null },
     ]);
     assert.equal(await currentPage(page).textContent(), "3");
   } finally { await page.close(); }
@@ -1373,7 +1373,7 @@ test("a new page size starts again from the first page", async () => {
     await rowsPerPage(page).getByRole("radio", { name: "50", exact: true }).click();
     await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
     assert.equal(await rows.count(), 50);
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 50, before: null, kind: null });
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 50, before: null, kind: null, status: null });
     assert.equal(await currentPage(page).textContent(), "1");
     await page.getByText("1–50 of 60", { exact: true }).waitFor();
   } finally { await page.close(); }
@@ -1396,10 +1396,56 @@ test("the trigger filter asks the daemon for one kind from its first page", asyn
     await rows.first().and(rowsHolding(page, "Post-processing")).waitFor();
     assert.equal(await rows.count(), 3);
     assert.equal(await rowsHolding(page, "Post-processing").count(), 3);
-    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: "POST_PROCESSING" });
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: "POST_PROCESSING", status: null });
     assert.equal(await currentPage(page).textContent(), "1");
     await page.getByText("1–3 of 3", { exact: true }).waitFor();
     assert.equal(await pageButton(page, "Next").isDisabled(), true);
+  } finally { await page.close(); }
+});
+
+// The tabs over the runs: one for every way a run can end, each with its count.
+const statusTabs = (page) => page.locator("button[aria-pressed]");
+const statusTab = (page, name, count) => statusTabs(page).filter({ hasText: new RegExp(`^${name}${count}$`) });
+
+test("the status tabs ask the daemon for runs that ended one way, from the first page", async () => {
+  const page = await open("?runs");
+  try {
+    const rows = runRows(page);
+    await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
+    // Every status has a tab, in one order, and says how many runs ended that way.
+    const tabs = [["All", 60], ["Succeeded", 58], ["Warning", 1], ["Failed", 1], ["Timed out", 0], ["Skipped", 0], ["Cancelled", 0]];
+    assert.deepEqual(
+      await statusTabs(page).evaluateAll((all) => all.map((tab) => tab.textContent)),
+      tabs.map(([name, count]) => `${name}${count}`),
+    );
+    assert.equal(await statusTab(page, "All", 60).getAttribute("aria-pressed"), "true");
+    await pageButton(page, "Next").click();
+    await rows.first().and(rowsHolding(page, "fixture.batch.35")).waitFor();
+
+    await statusTab(page, "Failed", 1).click();
+    await rows.first().and(rowsHolding(page, "retired.py")).waitFor();
+    assert.equal(await rows.count(), 1);
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: null, status: "FAILED" });
+    assert.equal(await statusTab(page, "Failed", 1).getAttribute("aria-pressed"), "true");
+    assert.equal(await currentPage(page).textContent(), "1");
+    await page.getByText("1–1 of 1", { exact: true }).waitFor();
+    // The other tabs keep their own counts while one is open.
+    assert.equal(await statusTab(page, "Succeeded", 58).count(), 1);
+    await shot(page, "runs-status-failed");
+
+    // A status no run ended with lists nothing, and says the filters are why.
+    await statusTab(page, "Timed out", 0).click();
+    await runsTable(page).getByText("No runs match these filters.", { exact: true }).waitFor();
+    assert.equal(await rows.count(), 0);
+
+    // A status narrows within the trigger, and the counts follow the trigger.
+    await page.locator("#controls").getByRole("button", { name: "Filter by trigger", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "Post-processing", exact: true }).click();
+    await statusTab(page, "All", 3).waitFor();
+    await statusTab(page, "Warning", 1).click();
+    await rows.first().and(rowsHolding(page, "cleanup.sh")).waitFor();
+    assert.equal(await rows.count(), 1);
+    assert.deepEqual((await runRequests(page)).at(-1), { limit: 25, before: null, kind: "POST_PROCESSING", status: "WARNING" });
   } finally { await page.close(); }
 });
 

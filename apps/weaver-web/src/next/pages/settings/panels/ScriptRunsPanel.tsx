@@ -8,6 +8,7 @@ import { FireAndForgetTag, ScriptRunName, ScriptStatusMark, scriptRunName } from
 import { Icon } from "../../../components/icons";
 import { Pagination } from "../../../components/Pagination";
 import { ScriptOutputLog } from "../../../components/ScriptOutputLog";
+import { Tabs } from "../../../components/Tabs";
 import { SecondaryButton, Select } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { EM_DASH, formatDate } from "../../../data/format";
@@ -22,10 +23,35 @@ import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } fro
  * of that job; this one also holds the runs no job owns, such as a scan or a
  * scheduled task. Nothing here is edited, so a row opens in place to show the
  * run's output, which is read only once a row is opened.
+ *
+ * The tabs over the list narrow it to the runs that ended one way. Each shows
+ * how many runs of the chosen trigger ended that way, whichever tab is open.
  */
 
 /** No trigger chosen: every run is listed. */
 const ANY_KIND = "";
+
+/** No status chosen: runs are listed however they ended. */
+const ANY_STATUS = "ALL";
+
+/** How a run can end, in the order the tabs list them. */
+const STATUSES = ["SUCCEEDED", "WARNING", "FAILED", "TIMED_OUT", "SKIPPED", "CANCELLED"] as const;
+
+type ScriptStatus = (typeof STATUSES)[number];
+
+/** The tabs over the list: every run, then one tab for each way of ending. */
+const STATUS_TABS = [ANY_STATUS, ...STATUSES] as const;
+
+/** Translation keys. */
+const STATUS_LABELS: Record<ScriptStatus | typeof ANY_STATUS, string> = {
+  ALL: "next.scriptRuns.status.all",
+  SUCCEEDED: "next.scriptRuns.status.succeeded",
+  WARNING: "next.scriptRuns.status.warning",
+  FAILED: "next.scriptRuns.status.failed",
+  TIMED_OUT: "next.scriptRuns.status.timedOut",
+  SKIPPED: "next.scriptRuns.status.skipped",
+  CANCELLED: "next.scriptRuns.status.cancelled",
+};
 
 /** The page sizes the list offers; the first is where it starts. */
 const PAGE_SIZES = [25, 50, 100] as const;
@@ -58,7 +84,11 @@ interface ScriptRunPage {
   runs: ScriptRun[];
   nextBefore: string | null;
   total: number;
+  /** How the runs of the chosen trigger ended; a status none ended with is absent. */
+  statusCounts: { status: ScriptStatus; count: number }[];
 }
+
+const NO_RUNS: ScriptRunPage = { runs: [], nextBefore: null, total: 0, statusCounts: [] };
 
 /** A run's output once its row has been opened: read, being read, or refused. */
 type RunOutput =
@@ -140,6 +170,7 @@ export function ScriptRunsPanel() {
   const t = useTranslate();
   const client = useClient();
   const [kind, setKind] = useState<ScriptKind | typeof ANY_KIND>(ANY_KIND);
+  const [status, setStatus] = useState<ScriptStatus | typeof ANY_STATUS>(ANY_STATUS);
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0]);
   const [pageIndex, setPageIndex] = useState(0);
   const [page, setPage] = useState<ScriptRunPage | null>(null);
@@ -155,8 +186,8 @@ export function ScriptRunsPanel() {
   // Where each page starts: the first at the top, every other below the last
   // run of the one before it. Only the pages reached so far are known.
   const cursorsRef = useRef<(string | null)[]>([null]);
-  // Only the newest request may land: a page asked for under one trigger or
-  // size must not replace the page of another.
+  // Only the newest request may land: a page asked for under one trigger,
+  // status or size must not replace the page of another.
   const requestRef = useRef(0);
 
   /** Shows page `target`, reading the pages before it first when their starts are not known yet. */
@@ -171,7 +202,12 @@ export function ScriptRunsPanel() {
         const result = await client
           .query<{ scriptRuns: ScriptRunPage }>(
             SCRIPT_RUNS_QUERY,
-            { limit: pageSize, before: cursorsRef.current[index], kind: kind === ANY_KIND ? null : kind },
+            {
+              limit: pageSize,
+              before: cursorsRef.current[index],
+              kind: kind === ANY_KIND ? null : kind,
+              status: status === ANY_STATUS ? null : status,
+            },
             { requestPolicy: "network-only" },
           )
           .toPromise();
@@ -181,10 +217,10 @@ export function ScriptRunsPanel() {
         if (result.error) {
           setLoading(false);
           setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
-          setPage((current) => current ?? { runs: [], nextBefore: null, total: 0 });
+          setPage((current) => current ?? NO_RUNS);
           return;
         }
-        const next = result.data?.scriptRuns ?? { runs: [], nextBefore: null, total: 0 };
+        const next = result.data?.scriptRuns ?? NO_RUNS;
         const cursors = cursorsRef.current.slice(0, index + 1);
         if (next.nextBefore !== null) {
           cursors.push(next.nextBefore);
@@ -201,11 +237,11 @@ export function ScriptRunsPanel() {
         index += 1;
       }
     },
-    [client, kind, pageSize],
+    [client, kind, pageSize, status],
   );
 
-  // The first page, again whenever the trigger or the page size changes. The
-  // rows on screen stay until it lands.
+  // The first page, again whenever the trigger, the status or the page size
+  // changes. The rows on screen stay until it lands.
   useEffect(() => {
     cursorsRef.current = [null];
     void goTo(0);
@@ -261,6 +297,19 @@ export function ScriptRunsPanel() {
     ...SCRIPT_KINDS.map((value) => ({ value, label: t(SCRIPT_KIND_LABELS[value]) })),
   ];
 
+  // Until the first page lands there is nothing to count.
+  const ended = page === null ? null : new Map(page.statusCounts.map((entry) => [entry.status, entry.count]));
+  const tabs = STATUS_TABS.map((id) => ({
+    id,
+    label: t(STATUS_LABELS[id]),
+    count:
+      ended === null
+        ? undefined
+        : id === ANY_STATUS
+          ? [...ended.values()].reduce((sum, count) => sum + count, 0)
+          : (ended.get(id) ?? 0),
+  }));
+
   const runs = page?.runs ?? [];
   const total = page?.total ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
@@ -281,7 +330,7 @@ export function ScriptRunsPanel() {
         t("next.scriptRuns.exitCode"),
         t("next.scriptRuns.duration"),
       ],
-      empty: t("next.job.noScriptRuns"),
+      empty: t(kind === ANY_KIND && status === ANY_STATUS ? "next.job.noScriptRuns" : "next.scriptRuns.noneMatch"),
       onRowClick: toggle,
       rows: runs.map((run) => {
         const finished = formatDate(run.finishedAtEpochMs);
@@ -362,6 +411,8 @@ export function ScriptRunsPanel() {
           {t("action.refresh")}
         </SecondaryButton>
       </PanelControls>
+
+      <Tabs tabs={tabs} active={status} onSelect={setStatus} />
 
       <SettingsBlocks blocks={blocks} loading={page === null} />
 

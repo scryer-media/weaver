@@ -159,6 +159,7 @@ impl PostProcessingQuery {
         kind: Option<ScriptKindGql>,
         script: Option<String>,
         job_id: Option<u64>,
+        status: Option<ScriptStatusGql>,
     ) -> Result<ScriptRunPageGql> {
         let db = ctx.data::<Database>()?.clone();
         let limit = limit
@@ -172,12 +173,14 @@ impl PostProcessingQuery {
             job_id,
             script,
             kind: kind.map(Into::into),
+            status: status.map(Into::into),
         };
         // One more than asked for says whether another page follows.
-        let (mut runs, total) = tokio::task::spawn_blocking(move || {
+        let (mut runs, total, status_counts) = tokio::task::spawn_blocking(move || {
             let total = db.script_run_count(&filter)?;
+            let status_counts = db.script_run_status_counts(&filter)?;
             db.script_runs(filter, before, limit as u32 + 1)
-                .map(|runs| (runs, total))
+                .map(|runs| (runs, total, status_counts))
         })
         .await
         .map_err(|error| async_graphql::Error::new(error.to_string()))?
@@ -188,6 +191,13 @@ impl PostProcessingQuery {
             next_before: runs.last().filter(|_| more).map(|run| run.seq.to_string()),
             runs: runs.into_iter().map(Into::into).collect(),
             total,
+            status_counts: status_counts
+                .into_iter()
+                .map(|(status, count)| ScriptRunStatusCountGql {
+                    status: status.into(),
+                    count,
+                })
+                .collect(),
         })
     }
 

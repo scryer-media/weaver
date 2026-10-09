@@ -372,13 +372,18 @@ const scriptRunRequests: Record<string, unknown>[] = [];
 // The run whose full output each request asked for, oldest first.
 const outputRequests: string[] = [];
 function scriptRunPage(variables: Record<string, any>) {
-  const matching = runs.filter((entry) => !variables.kind || entry.kind === variables.kind);
+  const ofKind = runs.filter((entry) => !variables.kind || entry.kind === variables.kind);
+  const matching = ofKind.filter((entry) => !variables.status || entry.status === variables.status);
   const start = variables.before ? matching.findIndex((entry) => entry.id === variables.before) + 1 : 0;
   const page = matching.slice(start, start + (variables.limit ?? 50));
+  // How the runs of the kind ended, whichever status was asked for.
+  const ended = new Map<string, number>();
+  for (const entry of ofKind) ended.set(entry.status, (ended.get(entry.status) ?? 0) + 1);
   return {
     runs: page,
     nextBefore: start + page.length < matching.length ? page[page.length - 1].id : null,
     total: matching.length,
+    statusCounts: [...ended].map(([status, count]) => ({ status, count })),
   };
 }
 
