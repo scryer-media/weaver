@@ -1,5 +1,85 @@
-use super::manifest::{ManifestError, detect_bare_script_adapter, parse_nzbget_manifest};
-use super::model::{ScriptAdapter, ScriptOptionType, ScriptSelectValue};
+use super::manifest::{
+    ManifestError, bare_script_options, detect_bare_script_adapter, option_name_suggests_secret,
+    parse_nzbget_manifest,
+};
+use super::model::{OptionValue, ScriptAdapter, ScriptOptionType, ScriptSelectValue};
+
+#[test]
+fn a_bare_nzbget_header_declares_its_options_and_hints_credentials_secret() {
+    let script = "#!/usr/bin/env python3\n\
+        ##############################################################################\n\
+        ### NZBGET POST-PROCESSING SCRIPT                                          ###\n\
+        \n\
+        # Sends a notice.\n\
+        \n\
+        ##############################################################################\n\
+        ### OPTIONS                                                                ###\n\
+        \n\
+        # Server to send to.\n\
+        #\n\
+        # A host name.\n\
+        #Server=localhost\n\
+        \n\
+        # Account password.\n\
+        #Password=changeme\n\
+        #ApiKey=\n\
+        #UserToken=abc\n\
+        #ClientSecret=x\n\
+        #Passphrase=y\n\
+        #Mode=fast\n\
+        #Mode=again\n\
+        \n\
+        ### NZBGET POST-PROCESSING SCRIPT                                          ###\n\
+        ##############################################################################\n\
+        #Ignored=after the header\n\
+        import sys\n";
+    let options = bare_script_options(script);
+    let shape = options
+        .iter()
+        .map(|option| {
+            (
+                option.name().as_str(),
+                option.option_type(),
+                option.default().cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shape,
+        [
+            (
+                "Server",
+                ScriptOptionType::String,
+                Some(OptionValue::String("localhost".into()))
+            ),
+            // A credential keeps no default from the header.
+            ("Password", ScriptOptionType::Secret, None),
+            ("ApiKey", ScriptOptionType::Secret, None),
+            ("UserToken", ScriptOptionType::Secret, None),
+            ("ClientSecret", ScriptOptionType::Secret, None),
+            ("Passphrase", ScriptOptionType::Secret, None),
+            (
+                "Mode",
+                ScriptOptionType::String,
+                Some(OptionValue::String("fast".into()))
+            ),
+        ]
+    );
+    assert_eq!(
+        options[0].description(),
+        ["Server to send to.", "A host name."]
+    );
+    assert_eq!(options[1].description(), ["Account password."]);
+
+    // A script that is not an NZBGet one declares nothing.
+    assert!(bare_script_options("#!/bin/sh\n### OPTIONS ###\n#Token=x\n").is_empty());
+    for name in ["apikey", "KEY", "token", "Password", "pass", "SECRET"] {
+        assert!(option_name_suggests_secret(name), "{name}");
+    }
+    for name in ["Server", "Host", "Category"] {
+        assert!(!option_name_suggests_secret(name), "{name}");
+    }
+}
 
 const NZBGET_V2_MANIFEST: &str = include_str!("fixtures/nzbget-v2-post-processing-manifest.json");
 

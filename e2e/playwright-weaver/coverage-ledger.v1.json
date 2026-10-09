@@ -102,6 +102,11 @@
       "oracle": "browser"
     },
     {
+      "path": "/settings/scripts/secrets",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
       "path": "/settings/scripts/runs",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
@@ -377,10 +382,22 @@
       "rationale": "Cancelling a test needs a script that is still executing; the server API tests and the web Scripts screen tests against a mocked daemon cover it."
     },
     {
+      "name": "createSecret",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow does not open the Secrets screen; the server core and API tests cover naming, encryption and the admin guards, and the web Secrets screen tests against a mocked daemon cover the dialog."
+    },
+    {
       "name": "createScriptInstance",
       "owner": "ui-post-processing",
       "oracle": "unit-only",
       "rationale": "The browser flow does not open the instance editor; the server API tests and the web Scripts screen tests against a mocked daemon cover creating an instance."
+    },
+    {
+      "name": "deleteSecret",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow does not delete a secret; the server core and API tests cover the refusal that names the instances still linking it, and the web Secrets screen tests cover how it is shown."
     },
     {
       "name": "deleteScriptInstance",
@@ -450,6 +467,12 @@
       "owner": "ui-post-processing",
       "oracle": "unit-only",
       "rationale": "The browser flow asserts the results of real runs, not a test run; the server API tests and the web Scripts screen tests against a mocked daemon cover the Test dialog."
+    },
+    {
+      "name": "updateSecret",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow does not rename or replace a secret; the server core and API tests cover both and that the next run is handed the new value, and the web Secrets screen tests cover the write-only value field."
     },
     {
       "name": "updateScriptInstance",

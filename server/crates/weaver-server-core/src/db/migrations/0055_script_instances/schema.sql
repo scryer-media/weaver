@@ -12,14 +12,24 @@ CREATE TABLE script_instances (
     updated_at_ms BIGINT NOT NULL
 );
 CREATE INDEX script_instances_trigger ON script_instances(trigger_kind, trigger_detail, run_order);
+CREATE TABLE secrets (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL UNIQUE,
+    value TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL
+);
 CREATE TABLE script_instance_inputs (
     instance_id TEXT NOT NULL,
     name TEXT NOT NULL,
     value TEXT NOT NULL,
-    secret BOOLEAN NOT NULL,
+    secret_id TEXT REFERENCES secrets(id) ON DELETE RESTRICT,
     position BIGINT NOT NULL,
-    PRIMARY KEY (instance_id, name)
+    PRIMARY KEY (instance_id, name),
+    CHECK (secret_id IS NULL OR value = '')
 );
+CREATE INDEX script_instance_inputs_secret ON script_instance_inputs(secret_id);
 CREATE TABLE script_instance_categories (
     instance_id TEXT NOT NULL,
     category TEXT NOT NULL,

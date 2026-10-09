@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
-import { useMutation } from "urql";
+import { useMutation, useQuery } from "urql";
 import {
   CREATE_SCRIPT_INSTANCE_MUTATION,
+  SECRETS_QUERY,
   UPDATE_SCRIPT_INSTANCE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -24,6 +25,7 @@ import {
   triggerTitle,
   unwiredTriggers,
   withScript,
+  withSecret,
   type DiscoveredScript,
   type InstanceForm,
   type InstanceInputForm,
@@ -31,7 +33,9 @@ import {
   type ScriptInstance,
   type ScriptKind,
 } from "../../../data/script-instances";
+import { sortedSecrets, type Secret, type SecretRef } from "../../../data/secrets";
 import { FieldControlView, type FieldSpec } from "../framework";
+import { SecretEditor } from "./SecretEditor";
 
 /**
  * The editor of one script instance: which script, what starts it, what it is
@@ -39,13 +43,17 @@ import { FieldControlView, type FieldSpec } from "../framework";
  *
  * A new instance is filled from the script's header and then belongs to the
  * operator; nothing here reads the header back into a saved instance. A secret
- * is never shown: its field starts blank, and left blank it keeps what is saved.
+ * input links a named secret, chosen from those there are or created here; its
+ * value is never shown.
  */
 
 /** What the editor was opened on: a saved instance, or a new one of a script. */
 export type InstanceEditorTarget =
   | { mode: "new"; script: string | null }
   | { mode: "edit"; instance: ScriptInstance };
+
+/** The secret picker's entry that opens the editor of a new secret. */
+const CREATE_SECRET = "\u0000create";
 
 const CHIP = "flex h-8 cursor-pointer items-center justify-center border px-[11px] font-wv-mono text-[11.5px]";
 const CHIP_ON = "border-wv-accent bg-wv-segment-active font-medium text-wv-strong";
@@ -91,6 +99,20 @@ export function ScriptInstanceEditor({
   const [newName, setNewName] = useState("");
   const [newSecret, setNewSecret] = useState(false);
   const [newProblem, setNewProblem] = useState<string | null>(null);
+  const [{ data: secretsData }] = useQuery<{ secrets: Secret[] }>({ query: SECRETS_QUERY });
+  // Secrets created from this editor, until the list is read again.
+  const [created, setCreated] = useState<Secret[]>([]);
+  // The input a new secret is being created for.
+  const [creatingFor, setCreatingFor] = useState<number | null>(null);
+  const secrets = useMemo(() => {
+    const listed = secretsData?.secrets ?? [];
+    return sortedSecrets([...listed, ...created.filter((entry) => !listed.some((own) => own.id === entry.id))]);
+  }, [secretsData?.secrets, created]);
+  // What a saved input links, for a secret the list does not hold.
+  const linked = useMemo(
+    () => new Map<string, SecretRef>((editing?.inputs ?? []).flatMap((input) => (input.secret ? [[input.secret.id, input.secret]] : []))),
+    [editing],
+  );
 
   const script = byName.get(form.script);
   const patch = (next: Partial<InstanceForm>) => {
@@ -214,12 +236,25 @@ export function ScriptInstanceEditor({
 
   /* ------------------------------------------------------------- its inputs */
 
-  const setInput = (index: number, value: string) => {
+  const changeInput = (index: number, change: (input: InstanceInputForm) => InstanceInputForm) => {
     setError(null);
     setForm((current) => ({
       ...current,
-      inputs: current.inputs.map((entry, at) => (at === index ? { ...entry, value } : entry)),
+      inputs: current.inputs.map((entry, at) => (at === index ? change(entry) : entry)),
     }));
+  };
+  const setInput = (index: number, value: string) => changeInput(index, (entry) => ({ ...entry, value }));
+  const linkSecret = (index: number, secretId: string | null) =>
+    changeInput(index, (entry) => ({ ...entry, secretId }));
+
+  const secretOptions = (input: InstanceInputForm) => {
+    const known = input.secretId === null || secrets.some((entry) => entry.id === input.secretId);
+    return [
+      ...(input.secretId === null ? [{ value: "", label: t("next.postProcessing.chooseSecret") }] : []),
+      ...secrets.map((entry) => ({ value: entry.id, label: entry.name })),
+      ...(known ? [] : [{ value: input.secretId!, label: linked.get(input.secretId!)?.name ?? input.secretId! }]),
+      { value: CREATE_SECRET, label: t("next.postProcessing.createSecret") },
+    ];
   };
 
   const inputField = (input: InstanceInputForm, index: number): FieldSpec => {
@@ -231,7 +266,7 @@ export function ScriptInstanceEditor({
       option?.defaultValue && !input.secret
         ? t("next.postProcessing.defaultValue", { value: option.defaultValue })
         : "",
-      input.secret ? t(input.stored ? "next.postProcessing.secretKeep" : "next.postProcessing.secretNew") : "",
+      input.secret ? t("next.postProcessing.secretLinkHelp") : "",
       script && !option ? t("next.postProcessing.undeclaredInput") : "",
     ]
       .filter(Boolean)
@@ -244,12 +279,16 @@ export function ScriptInstanceEditor({
       keywords: input.name,
       control: input.secret
         ? {
-            kind: "text",
-            type: "password",
-            secret: true,
-            value: input.value,
-            placeholder: input.stored ? t("next.postProcessing.secretSaved") : undefined,
-            onChange,
+            kind: "select",
+            value: input.secretId ?? "",
+            options: secretOptions(input),
+            onChange: (next: string) => {
+              if (next === CREATE_SECRET) {
+                setCreatingFor(index);
+              } else {
+                linkSecret(index, next === "" ? null : next);
+              }
+            },
           }
         : option && option.select.length > 0
           ? {
@@ -268,10 +307,8 @@ export function ScriptInstanceEditor({
               }
             : { kind: "text", value: input.value, onChange },
     };
-    if (option) {
-      return field;
-    }
-    // Only an input the header does not ask for can be taken away again.
+    // Any input can be made a secret or plain again, which empties it. Only
+    // an input the header does not ask for can be taken away.
     return {
       ...field,
       control: {
@@ -279,19 +316,28 @@ export function ScriptInstanceEditor({
         control: (
           <div className="flex min-w-0 items-center gap-2">
             <FieldControlView spec={field} />
-            <SecondaryButton
-              className="px-[10px]"
-              title={t("next.postProcessing.removeInput", { name: input.name })}
-              onClick={() => {
-                setError(null);
-                setForm((current) => ({
-                  ...current,
-                  inputs: current.inputs.filter((_, at) => at !== index),
-                }));
-              }}
-            >
-              <Icon name="remove" size={13} />
-            </SecondaryButton>
+            <span title={t("next.postProcessing.secret")} className="flex flex-none items-center">
+              <CheckBox
+                checked={input.secret}
+                onChange={(next) => changeInput(index, (entry) => withSecret(entry, next))}
+                label={t("next.postProcessing.inputIsSecret", { name: input.name })}
+              />
+            </span>
+            {option ? null : (
+              <SecondaryButton
+                className="px-[10px]"
+                title={t("next.postProcessing.removeInput", { name: input.name })}
+                onClick={() => {
+                  setError(null);
+                  setForm((current) => ({
+                    ...current,
+                    inputs: current.inputs.filter((_, at) => at !== index),
+                  }));
+                }}
+              >
+                <Icon name="remove" size={13} />
+              </SecondaryButton>
+            )}
           </div>
         ),
       },
@@ -307,7 +353,7 @@ export function ScriptInstanceEditor({
     setError(null);
     setForm((current) => ({
       ...current,
-      inputs: [...current.inputs, { name: newName.trim(), value: "", secret: newSecret, stored: false }],
+      inputs: [...current.inputs, { name: newName.trim(), value: "", secret: newSecret, secretId: null }],
     }));
     setNewName("");
     setNewSecret(false);
@@ -490,6 +536,7 @@ export function ScriptInstanceEditor({
   const canSetUp = editing === null && script !== undefined && unwiredTriggers(script, instances).length > 0;
 
   return (
+    <>
     <RecordEditor
       open
       title={editing ? editing.name : t("next.postProcessing.createInstance")}
@@ -525,5 +572,17 @@ export function ScriptInstanceEditor({
         </>
       }
     />
+    {creatingFor !== null ? (
+      <SecretEditor
+        target={{ mode: "new" }}
+        onSaved={(secret) => {
+          setCreated((current) => [...current, secret]);
+          linkSecret(creatingFor, secret.id);
+          setCreatingFor(null);
+        }}
+        onDismiss={() => setCreatingFor(null)}
+      />
+    ) : null}
+    </>
   );
 }

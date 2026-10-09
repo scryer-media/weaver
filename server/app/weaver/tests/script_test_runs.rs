@@ -333,12 +333,13 @@ async fn saved_inputs_reach_the_script_and_stay_out_of_what_a_test_reports() {
     .unwrap();
     fs::set_permissions(package.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
     let script = ScriptName::new("email").unwrap();
+    let token = fixture.db.create_secret("Mail token", "hunter2").unwrap();
     let email = fixture
         .db
         .create_script_instance(
             ScriptInstanceDraft::new(script, InstanceTrigger::PostProcessing)
                 .input("Host", "mail.example.invalid")
-                .secret_input("Token", "hunter2"),
+                .secret_input("Token", &token.id),
         )
         .unwrap();
 

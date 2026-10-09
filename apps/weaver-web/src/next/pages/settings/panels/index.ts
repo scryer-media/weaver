@@ -9,6 +9,7 @@ import { NetworkingPanel } from "./NetworkingPanel";
 import { RssPanel } from "./RssPanel";
 import { SchedulesPanel } from "./SchedulesPanel";
 import { ScriptRunsPanel } from "./ScriptRunsPanel";
+import { SecretsPanel } from "./SecretsPanel";
 import { SecurityPanel } from "./SecurityPanel";
 import { WatchFolderPanel } from "./WatchFolderPanel";
 
@@ -99,6 +100,14 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     tag: "beta",
     icon: "postProcessing",
     Component: ScriptConfigurationPanel,
+  },
+  {
+    slug: "scripts/secrets",
+    group: "scripts",
+    label: "next.settings.panel.secrets",
+    note: "next.settings.panel.secretsNote",
+    icon: "postProcessing",
+    Component: SecretsPanel,
   },
   {
     slug: "scripts/list",

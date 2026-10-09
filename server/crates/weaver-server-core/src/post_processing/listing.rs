@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use super::manifest::{
     MAX_LEGACY_METADATA_BYTES, ManifestError, NZBGET_MANIFEST_FILE, apply_bare_script_declarations,
-    detect_bare_script_adapter, parse_nzbget_manifest,
+    bare_script_options, detect_bare_script_adapter, parse_nzbget_manifest,
 };
 use super::model::{PostProcessingValidationError, ScriptAdapter, ScriptManifest, ScriptName};
 
@@ -166,7 +166,7 @@ fn read_bare_script(
         None,
         name.as_str().to_string(),
         vec![],
-        vec![],
+        bare_script_options(&preamble),
     )?;
     Ok(DiscoveredScript {
         name: name.clone(),

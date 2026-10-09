@@ -68,6 +68,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     // An instance is configuration: the script it names, its trigger, and
     // what the operator typed into it.
     table!("script_instances", Export, Replace),
+    // Named secrets travel encrypted, under the same key as every other
+    // credential in the bundle.
+    table!("secrets", Export, Replace),
     table!("script_instance_inputs", Export, Replace),
     table!("script_instance_categories", Export, Replace),
     table!("feed_scripts", Export, RequireEmpty),

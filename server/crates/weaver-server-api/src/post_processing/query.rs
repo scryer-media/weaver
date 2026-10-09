@@ -81,6 +81,18 @@ impl PostProcessingQuery {
         .map_err(|error| async_graphql::Error::new(error.to_string()))
     }
 
+    /// Every named secret, by name, with the instances that link it. Values
+    /// are never returned.
+    #[graphql(guard = "AdminGuard")]
+    async fn secrets(&self, ctx: &Context<'_>) -> Result<Vec<SecretGql>> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || db.secrets())
+            .await
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+            .map(|secrets| secrets.into_iter().map(Into::into).collect())
+            .map_err(|error| async_graphql::Error::new(error.to_string()))
+    }
+
     /// Live listing of the scripts directory, each script with the preset its
     /// header offers.
     ///

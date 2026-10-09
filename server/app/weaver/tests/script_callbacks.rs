@@ -365,9 +365,10 @@ async fn what_a_script_sends_through_the_api_is_stored_without_its_secrets() {
     )
     .unwrap();
     fs::set_permissions(package.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let token = db.create_secret("Notify token", "hunter2").unwrap();
     select(
         &db,
-        vec![on(DOWNLOADED, &ScriptName::new("notify").unwrap()).secret_input("Token", "hunter2")],
+        vec![on(DOWNLOADED, &ScriptName::new("notify").unwrap()).secret_input("Token", &token.id)],
     );
     let event = {
         let db = db.clone();
