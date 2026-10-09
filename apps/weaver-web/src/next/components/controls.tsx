@@ -3,7 +3,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { ignoredByPasswordManagers, PASSWORD_MANAGER_IGNORE } from "@/lib/password-manager";
 import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "./icons";
-import { Menu, MenuItem } from "./Menu";
+import { Menu, MenuCheckItem, MenuItem } from "./Menu";
 
 /* ------------------------------------------------------------------ buttons */
 
@@ -344,32 +344,8 @@ export function Select<T extends string>({
   menuClassName?: string;
   disabled?: boolean;
 }) {
-  const [placement, setPlacement] = useState<MenuPlacement | null>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const open = placement !== null;
+  const { placement, setPlacement, triggerRef, open } = usePinnedMenu();
   const current = options.find((option) => option.value === value);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    // Pinned to the viewport, the menu would drift off its trigger as anything
-    // under it scrolls, so it follows — except when the scroll is its own list.
-    const follow = (event: Event) => {
-      if ((event.target as Element | null)?.closest?.('[role="menu"]')) {
-        return;
-      }
-      if (triggerRef.current) {
-        setPlacement(placeMenu(triggerRef.current));
-      }
-    };
-    window.addEventListener("scroll", follow, true);
-    window.addEventListener("resize", follow);
-    return () => {
-      window.removeEventListener("scroll", follow, true);
-      window.removeEventListener("resize", follow);
-    };
-  }, [open]);
 
   return (
     <div className="relative">
@@ -415,6 +391,122 @@ export function Select<T extends string>({
       </Menu>
     </div>
   );
+}
+
+/**
+ * A dropdown of which several entries can be chosen at once. It is the Select
+ * in every other respect: the same trigger, the same pinned menu. Its entries
+ * are ticked and unticked with the menu left open, and the trigger names what
+ * is chosen, or says `placeholder` when nothing is.
+ */
+export function MultiSelect<T extends string>({
+  values,
+  options,
+  onChange,
+  label,
+  placeholder,
+  className,
+  menuClassName,
+  disabled = false,
+}: {
+  values: readonly T[];
+  options: readonly { value: T; label: string }[];
+  /** What is chosen after a change, in the order the options are listed. */
+  onChange: (next: T[]) => void;
+  label: string;
+  /** What the trigger says while nothing is chosen. */
+  placeholder: string;
+  className?: string;
+  menuClassName?: string;
+  disabled?: boolean;
+}) {
+  const { placement, setPlacement, triggerRef, open } = usePinnedMenu();
+  const chosen = options.filter((option) => values.includes(option.value));
+
+  return (
+    <div className="relative">
+      <button
+        ref={triggerRef}
+        type="button"
+        data-wv-menu-trigger=""
+        disabled={disabled}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={label}
+        onClick={(event) => setPlacement(open ? null : placeMenu(event.currentTarget))}
+        className={cn(
+          "flex h-[34px] min-w-[208px] cursor-pointer items-center justify-between gap-3 border border-wv-control bg-wv-input px-3 text-[13px] hover:border-wv-control-hover-strong",
+          chosen.length === 0 ? "text-wv-muted" : "text-wv-fg",
+          className,
+        )}
+      >
+        <span className="min-w-0 flex-1 truncate text-left">
+          {chosen.length === 0 ? placeholder : chosen.map((option) => option.label).join(", ")}
+        </span>
+        <Icon name="dropdown" size={13} className="flex-none text-wv-muted" />
+      </button>
+      <Menu
+        open={open}
+        onDismiss={() => setPlacement(null)}
+        label={label}
+        className={cn("fixed overflow-y-auto", menuClassName)}
+        style={placement ?? undefined}
+      >
+        {options.map((option) => {
+          const checked = values.includes(option.value);
+          return (
+            <MenuCheckItem
+              key={option.value}
+              checked={checked}
+              onToggle={() =>
+                onChange(
+                  options
+                    .filter((entry) => (entry.value === option.value ? !checked : values.includes(entry.value)))
+                    .map((entry) => entry.value),
+                )
+              }
+            >
+              <span className="truncate">{option.label}</span>
+            </MenuCheckItem>
+          );
+        })}
+      </Menu>
+    </div>
+  );
+}
+
+/**
+ * The open state of a dropdown whose menu is pinned to the viewport under its
+ * trigger: where the menu sits while it is open, and null while it is shut.
+ */
+function usePinnedMenu() {
+  const [placement, setPlacement] = useState<MenuPlacement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const open = placement !== null;
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    // Pinned to the viewport, the menu would drift off its trigger as anything
+    // under it scrolls, so it follows — except when the scroll is its own list.
+    const follow = (event: Event) => {
+      if ((event.target as Element | null)?.closest?.('[role="menu"]')) {
+        return;
+      }
+      if (triggerRef.current) {
+        setPlacement(placeMenu(triggerRef.current));
+      }
+    };
+    window.addEventListener("scroll", follow, true);
+    window.addEventListener("resize", follow);
+    return () => {
+      window.removeEventListener("scroll", follow, true);
+      window.removeEventListener("resize", follow);
+    };
+  }, [open]);
+
+  return { placement, setPlacement, triggerRef, open };
 }
 
 interface MenuPlacement {

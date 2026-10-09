@@ -651,35 +651,13 @@ export function ScriptInstanceEditor({
               offered.length === 0
                 ? { kind: "static" as const, value: t("next.postProcessing.noCategories") }
                 : {
-                    kind: "custom" as const,
-                    control: (
-                      <div
-                        role="group"
-                        aria-label={t("next.postProcessing.categories")}
-                        className="flex max-w-[380px] flex-wrap justify-end gap-1.5"
-                      >
-                        {offered.map((name) => {
-                          const active = form.categories.some((entry) => sameCategory(entry, name));
-                          return (
-                            <button
-                              key={name}
-                              type="button"
-                              aria-pressed={active}
-                              onClick={() =>
-                                patch({
-                                  categories: active
-                                    ? form.categories.filter((entry) => !sameCategory(entry, name))
-                                    : [...form.categories, name],
-                                })
-                              }
-                              className={`${CHIP} ${active ? CHIP_ON : CHIP_OFF}`}
-                            >
-                              {name}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    ),
+                    kind: "multiselect" as const,
+                    // What is saved may differ in case from the category as it is named now.
+                    values: offered.filter((name) => form.categories.some((entry) => sameCategory(entry, name))),
+                    options: offered.map((name) => ({ value: name, label: name })),
+                    placeholder: t("next.postProcessing.everyCategory"),
+                    className: "w-[268px] max-w-full",
+                    onChange: (next: string[]) => patch({ categories: next }),
                   },
           },
         ]

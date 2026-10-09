@@ -381,10 +381,23 @@ test("a new instance starts from what the chosen script's header declares", asyn
 
     await field(editor, "Job name").fill("Archive movies");
     await pick(page, editor, "Key", "Spare key");
-    const categories = editor.getByRole("group", { name: "Categories", exact: true });
-    assert.deepEqual(await categories.getByRole("button").allTextContents(), ["movies", "tv"]);
-    await action(categories, "movies").click();
-    await categories.locator('[aria-pressed="true"]').and(action(categories, "movies")).waitFor();
+    // Categories are one dropdown: it says every category until some are ticked, then names them.
+    const categories = action(editor, "Categories");
+    await categories.getByText("Every category", { exact: true }).waitFor();
+    await categories.click();
+    const choices = page.getByRole("menuitemcheckbox");
+    assert.deepEqual(await choices.allTextContents(), ["movies", "tv"]);
+    assert.deepEqual(await choices.evaluateAll((all) => all.map((one) => one.getAttribute("aria-checked"))), ["false", "false"]);
+    // Ticking leaves the menu open, so several can be chosen in one go, and a tick comes off again.
+    await choices.nth(1).click();
+    await choices.nth(0).click();
+    await categories.getByText("movies, tv", { exact: true }).waitFor();
+    await shot(page, "instance-editor-categories", { resize: false });
+    await choices.nth(1).click();
+    await categories.getByText("movies", { exact: true }).waitFor();
+    assert.deepEqual(await choices.evaluateAll((all) => all.map((one) => one.getAttribute("aria-checked"))), ["true", "false"]);
+    await page.keyboard.press("Escape");
+    await choices.first().waitFor({ state: "detached" });
     await editor.getByRole("radio", { name: "Fire and forget", exact: true }).click();
     const timeout = editor.getByRole("spinbutton", { name: "Timeout", exact: true });
     await timeout.fill("120");
@@ -463,7 +476,7 @@ test("a queue instance names its event, and each input the header declares draws
     ]);
     await page.getByRole("menuitemradio", { name: "NZB_DOWNLOADED", exact: true }).click();
     // Only a download has a category, so only its triggers can be narrowed to one.
-    const categories = editor.getByRole("group", { name: "Categories", exact: true });
+    const categories = action(editor, "Categories");
     assert.equal(await categories.count(), 1);
     await pick(page, editor, "Trigger", "Schedule");
     await categories.waitFor({ state: "detached" });
@@ -489,14 +502,17 @@ test("a job for downloads says there are no categories when none are defined", a
   try {
     const editor = await edit(page, "Notify");
     await editor.getByText("No categories defined", { exact: true }).waitFor();
-    assert.equal(await editor.getByRole("group", { name: "Categories", exact: true }).count(), 0);
+    assert.equal(await action(editor, "Categories").count(), 0);
     assert.equal(await editor.getByText("Every category", { exact: true }).count(), 0);
     await shot(page, "instance-editor-no-categories");
     await action(editor, "Cancel").click();
     await editor.waitFor({ state: "detached" });
     // A category a job was saved with is still offered, so it can be taken off.
     const narrowed = await edit(page, "Tidy tv");
-    assert.deepEqual(await narrowed.getByRole("group", { name: "Categories", exact: true }).getByRole("button").allTextContents(), ["tv"]);
+    await action(narrowed, "Categories").getByText("tv", { exact: true }).waitFor();
+    await action(narrowed, "Categories").click();
+    assert.deepEqual(await page.getByRole("menuitemcheckbox").allTextContents(), ["tv"]);
+    assert.equal(await page.getByRole("menuitemcheckbox").getAttribute("aria-checked"), "true");
   } finally { await page.close(); }
 });
 

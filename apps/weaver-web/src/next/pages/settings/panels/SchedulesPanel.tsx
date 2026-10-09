@@ -374,7 +374,7 @@ export function SchedulesPanel() {
                 control: {
                   kind: form.actionType === "run_script" ? "text" : "time",
                   value: form.time,
-                  onChange: (next) => setForm((current) => ({ ...current, time: next })),
+                  onChange: (next: string) => setForm((current) => ({ ...current, time: next })),
                 },
               },
               ...scheduleTimingFields(optionFields),

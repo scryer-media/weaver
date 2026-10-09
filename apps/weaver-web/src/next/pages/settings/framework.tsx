@@ -15,6 +15,7 @@ import { PathField } from "@/next/features/DirectoryBrowserDialog";
 import {
   NumberField,
   PrimaryButton,
+  MultiSelect,
   Segmented,
   Select,
   Slider,
@@ -58,6 +59,15 @@ export type FieldControl =
       value: string;
       options: readonly SelectOption[];
       onChange: (next: string) => void;
+      className?: string;
+    }
+  | {
+      kind: "multiselect";
+      values: readonly string[];
+      options: readonly SelectOption[];
+      onChange: (next: string[]) => void;
+      /** What the control says while nothing is chosen. */
+      placeholder: string;
       className?: string;
     }
   | {
@@ -153,6 +163,17 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           options={control.options}
           onChange={control.onChange}
           label={spec.label}
+          className={control.className}
+        />
+      );
+    case "multiselect":
+      return (
+        <MultiSelect
+          values={control.values}
+          options={control.options}
+          onChange={control.onChange}
+          label={spec.label}
+          placeholder={control.placeholder}
           className={control.className}
         />
       );
