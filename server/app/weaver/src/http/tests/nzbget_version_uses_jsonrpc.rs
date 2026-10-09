@@ -1272,7 +1272,7 @@ async fn nzbget_history_script_status_counts_only_blocking_post_processing() {
         PostProcessingSummary, QueueEvent, ScriptEventLabel, ScriptStatus,
     };
     let db = Database::open_in_memory().unwrap();
-    let jobs: [(u64, Vec<_>); 4] = [
+    let jobs: [(u64, Vec<_>); 6] = [
         (
             501,
             vec![
@@ -1309,6 +1309,32 @@ async fn nzbget_history_script_status_counts_only_blocking_post_processing() {
             )],
         ),
         (504, vec![]),
+        (
+            505,
+            vec![
+                nzbget_script_result(
+                    Some("Tidy up"),
+                    ScriptEventLabel::PostProcessing,
+                    false,
+                    ScriptStatus::Succeeded,
+                ),
+                nzbget_script_result(
+                    Some("Notify"),
+                    ScriptEventLabel::PostProcessing,
+                    false,
+                    ScriptStatus::Warning,
+                ),
+            ],
+        ),
+        (
+            506,
+            vec![nzbget_script_result(
+                Some("Tidy up"),
+                ScriptEventLabel::PostProcessing,
+                false,
+                ScriptStatus::Skipped,
+            )],
+        ),
     ];
     for (job_id, results) in &jobs {
         db.insert_job_history(&nzbget_history_row(
@@ -1340,13 +1366,38 @@ async fn nzbget_history_script_status_counts_only_blocking_post_processing() {
     assert_eq!(status, StatusCode::OK);
     let items = payload["result"].as_array().unwrap();
     let item = |id: u64| items.iter().find(|item| item["ID"] == id).unwrap();
+    // The list holds the same runs the rollup counts: the fire-and-forget
+    // Notify run is not listed, so it cannot fail the download either.
     assert_eq!(item(501)["ScriptStatus"], "SUCCESS");
-    assert_eq!(item(501)["ScriptStatuses"][0]["Name"], "Tidy up");
-    assert_eq!(item(501)["ScriptStatuses"][1]["Name"], "Notify");
+    assert_eq!(
+        item(501)["ScriptStatuses"],
+        serde_json::json!([{"Name": "Tidy up", "Status": "SUCCESS"}])
+    );
     assert_eq!(item(502)["ScriptStatus"], "FAILURE");
-    assert_eq!(item(502)["ScriptStatuses"][0]["Name"], "hook.sh");
+    assert_eq!(
+        item(502)["ScriptStatuses"],
+        serde_json::json!([{"Name": "hook.sh", "Status": "FAILURE"}])
+    );
+    // A queue-event script is not a post-processing script.
     assert_eq!(item(503)["ScriptStatus"], "NONE");
+    assert_eq!(item(503)["ScriptStatuses"], serde_json::json!([]));
     assert_eq!(item(504)["ScriptStatus"], "NONE");
+    assert_eq!(item(504)["ScriptStatuses"], serde_json::json!([]));
+    // A warning is a FAILURE in NZBGet, and one FAILURE fails the job.
+    assert_eq!(item(505)["ScriptStatus"], "FAILURE");
+    assert_eq!(
+        item(505)["ScriptStatuses"],
+        serde_json::json!([
+            {"Name": "Tidy up", "Status": "SUCCESS"},
+            {"Name": "Notify", "Status": "FAILURE"}
+        ])
+    );
+    // A skipped script is NONE, and a job whose only script skipped is NONE.
+    assert_eq!(item(506)["ScriptStatus"], "NONE");
+    assert_eq!(
+        item(506)["ScriptStatuses"],
+        serde_json::json!([{"Name": "Tidy up", "Status": "NONE"}])
+    );
 }
 
 #[tokio::test]

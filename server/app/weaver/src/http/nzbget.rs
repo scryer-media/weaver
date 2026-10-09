@@ -1712,10 +1712,9 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         let Some(scripts) = post_processing_results.get(&job_id) else {
             continue;
         };
-        // NZBGet reports one (name, status) pair per script plus a rollup, which
-        // is exactly what weaver now records on the job.
-        let statuses = scripts
-            .iter()
+        // NZBGet reports one (name, status) pair per post-processing script
+        // plus a rollup derived from those pairs.
+        let statuses = nzbget_post_processing_scripts(scripts)
             .map(|script| {
                 json!({
                     "Name": script.label(),
@@ -3281,7 +3280,22 @@ fn nzbget_queue_status(state: QueueItemState) -> &'static str {
 /// Group status for listgroups. Downloads that finished transfer but wait for
 /// a repair/extraction slot report NZBGet's PP_QUEUED instead of QUEUED so
 /// clients render them as post-processing, not "not started".
-/// NZBGet's per-script status vocabulary: SUCCESS, FAILURE, or NONE.
+/// The runs NZBGet would list under ScriptStatuses: its post-processing
+/// scripts run in the job's post-processing stage and nowhere else. Event
+/// scripts and fire-and-forget runs have no counterpart there, and a FAILURE
+/// from one would make Sonarr and Radarr reject a good download.
+fn nzbget_post_processing_scripts(
+    scripts: &[weaver_server_core::post_processing::model::ScriptResult],
+) -> impl Iterator<Item = &weaver_server_core::post_processing::model::ScriptResult> {
+    use weaver_server_core::post_processing::model::ScriptEventLabel;
+    scripts
+        .iter()
+        .filter(|script| script.event == ScriptEventLabel::PostProcessing && !script.background)
+}
+
+/// NZBGet's per-script status: SUCCESS for exit 93, NONE for exit 95
+/// (skipped), FAILURE for everything else including a script that could not
+/// start. A warning is a failure there, so it is one here too.
 fn nzbget_script_status(
     status: weaver_server_core::post_processing::model::ScriptStatus,
 ) -> &'static str {
@@ -3296,25 +3310,20 @@ fn nzbget_script_status(
     }
 }
 
-/// The job-level ScriptStatus that Sonarr and Radarr act on. A FAILURE makes
-/// them reject the download, so only blocking post-processing runs count:
-/// a fire-and-forget or event script cannot fail a good download.
+/// The job-level ScriptStatus that Sonarr and Radarr act on, derived from the
+/// per-script statuses the way NZBGet derives it: any FAILURE makes the job a
+/// FAILURE, otherwise any SUCCESS makes it a SUCCESS, otherwise NONE.
 fn nzbget_script_rollup(
     scripts: &[weaver_server_core::post_processing::model::ScriptResult],
 ) -> &'static str {
-    use weaver_server_core::post_processing::model::{ScriptEventLabel, ScriptStatus};
     let mut rollup = "NONE";
-    for script in scripts
-        .iter()
-        .filter(|script| script.event == ScriptEventLabel::PostProcessing && !script.background)
+    for status in
+        nzbget_post_processing_scripts(scripts).map(|script| nzbget_script_status(script.status))
     {
-        match script.status {
-            ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled => {
-                return "FAILURE";
-            }
-            ScriptStatus::Succeeded | ScriptStatus::Skipped | ScriptStatus::Warning => {
-                rollup = "SUCCESS";
-            }
+        match status {
+            "FAILURE" => return "FAILURE",
+            "SUCCESS" => rollup = "SUCCESS",
+            _ => {}
         }
     }
     rollup
