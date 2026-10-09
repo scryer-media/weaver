@@ -343,8 +343,6 @@ impl ScriptInstanceDraft {
 enum Updated {
     Done,
     NotFound,
-    /// The script changed while a secret was sent to be kept.
-    SecretsToEnterAgain,
 }
 
 /// A stored input value: what goes in the row, or a marker to keep the row's
@@ -601,17 +599,9 @@ impl Database {
                 let instance = instance.clone();
                 let id = target.clone();
                 Box::pin(async move {
-                    let Some(stored_script) = tx
-                        .fetch_optional(
-                            "SELECT script FROM script_instances WHERE id = {}",
-                            &[SqlArg::Text(id.clone())],
-                        )
-                        .await?
-                        .map(|row| row.text("script"))
-                        .transpose()?
-                    else {
-                        return Ok(Updated::NotFound);
-                    };
+                    // The secrets belong to the instance, and stay with it
+                    // whatever script it is pointed at: an operator who
+                    // swaps the script is not made to type them again.
                     let kept = tx
                         .fetch_all(
                             "SELECT name, value FROM script_instance_inputs
@@ -622,15 +612,6 @@ impl Database {
                         .into_iter()
                         .map(|row| Ok((row.text("name")?, row.text("value")?)))
                         .collect::<Result<BTreeMap<_, _>, StateError>>()?;
-                    // A secret was entered for the script it was handed to.
-                    // Another script is not handed it without being asked.
-                    if stored_script != instance.script
-                        && instance.inputs.iter().any(|(name, value, _)| {
-                            matches!(value, StoredValue::Keep) && kept.contains_key(name)
-                        })
-                    {
-                        return Ok(Updated::SecretsToEnterAgain);
-                    }
                     let (kind, detail) = instance.trigger.stored();
                     let updated = tx
                         .execute(
@@ -679,11 +660,6 @@ impl Database {
         match found? {
             Updated::Done => {}
             Updated::NotFound => return Err(ScriptInstanceError::NotFound),
-            Updated::SecretsToEnterAgain => {
-                return Err(ScriptInstanceError::Invalid(
-                    "secrets must be entered again when the script changes",
-                ));
-            }
         }
         self.script_instance(id)?
             .ok_or(ScriptInstanceError::NotFound)

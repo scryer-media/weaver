@@ -3,8 +3,8 @@ use super::instances::{
     InstanceInputDraft, InstanceTrigger, ScriptInstance, ScriptInstanceDraft, ScriptInstanceError,
 };
 use super::model::{
-    GlobalScriptsRun, PostProcessingSettings, PostProcessingSummary, QueueEvent, ScriptAdapter,
-    ScriptEventLabel, ScriptName, ScriptResult, ScriptStatus,
+    GlobalScriptsRun, OptionValue, PostProcessingSettings, PostProcessingSummary, QueueEvent,
+    ScriptAdapter, ScriptEventLabel, ScriptName, ScriptResult, ScriptStatus,
 };
 use super::settings::normalize_script_directory;
 use crate::persistence::Database;
@@ -217,7 +217,7 @@ fn an_update_keeps_a_secret_that_was_not_sent_again() {
 }
 
 #[test]
-fn a_secret_is_not_kept_for_another_script() {
+fn a_secret_stays_with_the_instance_when_its_script_changes() {
     let db = Database::open_in_memory().unwrap();
     let saved = db
         .create_script_instance(
@@ -226,29 +226,28 @@ fn a_secret_is_not_kept_for_another_script() {
         .unwrap();
     let sealed = stored_input(&db, &saved.id, "Token").unwrap();
 
-    // Pointed at another script with the secret left as it was.
+    // Pointed at another script with the secret left as it was: it goes
+    // along, as stored, without being typed again.
     let mut moved = ScriptInstanceDraft::from_instance(&saved);
     moved.script = ScriptName::new("other.sh").unwrap();
     assert!(moved.inputs.iter().all(|input| input.value.is_none()));
-    assert!(matches!(
-        db.update_script_instance(&saved.id, moved.clone()),
-        Err(ScriptInstanceError::Invalid(
-            "secrets must be entered again when the script changes"
-        ))
-    ));
-    let unchanged = db.script_instance(&saved.id).unwrap().unwrap();
-    assert_eq!(unchanged.script.as_str(), "notify.sh");
-    assert_eq!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
-
-    // Entered again, it goes with the instance to the other script.
-    moved.inputs[0].value = Some("hunter3".into());
     let updated = db.update_script_instance(&saved.id, moved).unwrap();
     assert_eq!(updated.script.as_str(), "other.sh");
-    assert_ne!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
+    assert_eq!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
+    let run = db.script_instance_run_inputs(&saved.id).unwrap().unwrap();
+    assert_eq!(run.len(), 1);
+    assert_eq!(run[0].name().as_str(), "Token");
+    assert!(matches!(
+        run[0].value(),
+        OptionValue::Secret(value) if value.expose_for_execution() == "hunter2"
+    ));
 
-    // Kept as it is while the script stays the same.
-    db.update_script_instance(&saved.id, ScriptInstanceDraft::from_instance(&updated))
-        .unwrap();
+    // A value sent with the change replaces it.
+    let mut rotated = ScriptInstanceDraft::from_instance(&updated);
+    rotated.script = ScriptName::new("notify.sh").unwrap();
+    rotated.inputs[0].value = Some("hunter3".into());
+    db.update_script_instance(&saved.id, rotated).unwrap();
+    assert_ne!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
 }
 
 #[test]
