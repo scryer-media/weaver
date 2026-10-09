@@ -74,6 +74,7 @@ fn script_lists_reject_duplicates_and_zero_timeouts() {
         script: script("a.sh"),
         enabled: true,
         timeout_seconds: Some(0),
+        blocking: true,
     };
     assert!(ScriptList::new(vec![zero]).is_err());
 }
@@ -115,6 +116,7 @@ fn disabled_entries_are_kept_in_order_but_never_run() {
             script: script("second.sh"),
             enabled: false,
             timeout_seconds: None,
+            blocking: true,
         },
         ScriptListEntry::new(script("third.sh")),
     ])
@@ -327,4 +329,41 @@ fn unacceptable_extension_patterns_reject_paths_dots_and_regex_syntax() {
         };
         assert!(settings.normalized().is_err(), "accepted {pattern:?}");
     }
+}
+
+#[test]
+fn an_entry_saved_before_run_modes_existed_is_waited_for() {
+    let entry: ScriptListEntry = serde_json::from_str(r#"{"script":"notify.sh"}"#).unwrap();
+    assert!(entry.blocking);
+    let detached = ScriptListEntry {
+        blocking: false,
+        ..entry
+    };
+    let stored = serde_json::to_string(&detached).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ScriptListEntry>(&stored).unwrap(),
+        detached
+    );
+}
+
+#[test]
+fn a_result_says_it_was_not_waited_for_only_when_that_is_so() {
+    let stored = r#"{"script":"notify.sh","adapter":"sabnzbd","status":"succeeded","exitCode":0,"durationMs":1,"finishedAtEpochMs":1}"#;
+    let result: super::model::ScriptResult = serde_json::from_str(stored).unwrap();
+    assert!(!result.background);
+    assert!(
+        !serde_json::to_string(&result)
+            .unwrap()
+            .contains("background")
+    );
+    let detached = super::model::ScriptResult {
+        background: true,
+        ..result
+    };
+    let stored = serde_json::to_string(&detached).unwrap();
+    assert!(
+        serde_json::from_str::<super::model::ScriptResult>(&stored)
+            .unwrap()
+            .background
+    );
 }

@@ -112,6 +112,47 @@ fn supervisor() -> Option<PathBuf> {
     Some(PathBuf::from(env!("CARGO_BIN_EXE_weaver")))
 }
 
+/// A pipe a test script stops at, so the test decides when the script goes on.
+fn gate(directory: &Path, name: &str) -> PathBuf {
+    let path = directory.join(name);
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    path
+}
+
+/// Lets the script stopped at `gate` go on. Returns once the script is there
+/// to be let through, however long it takes to arrive.
+async fn open_gate(gate: PathBuf) {
+    tokio::task::spawn_blocking(move || fs::write(gate, "go\n").unwrap())
+        .await
+        .unwrap();
+}
+
+/// Returns once the script has written to `gate`, which it does when it starts.
+async fn wait_at_gate(gate: PathBuf) {
+    tokio::task::spawn_blocking(move || fs::read(gate).unwrap())
+        .await
+        .unwrap();
+}
+
+fn not_waited_for(script: ScriptName) -> ScriptListEntry {
+    ScriptListEntry {
+        blocking: false,
+        ..ScriptListEntry::new(script)
+    }
+}
+
+fn select_entries(db: &Database, entries: Vec<ScriptListEntry>) {
+    db.save_post_processing_script_lists(&ScriptLists {
+        global: ScriptList::new(entries).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+}
+
 #[tokio::test]
 async fn scan_distinguishes_supervisor_launch_failure_from_script_exit_127() {
     let (db, data) = setup();
@@ -502,4 +543,141 @@ fn directives_reject_foreign_markers_and_later_user_parameters_win() {
         context.compatibility.parameters,
         [("value".into(), "user".into())]
     );
+}
+
+#[tokio::test]
+async fn a_queue_script_nothing_waits_for_does_not_hold_its_event() {
+    let (db, data) = setup();
+    let context = job(&db, data.path());
+    let gate = gate(data.path(), "gate");
+    let detached = script(
+        &db,
+        "detached.sh",
+        &format!(
+            "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nread line < '{}'\nprintf '[NZB] NZBPR_Detached=ran\\n'\nexit 0\n",
+            gate.display()
+        ),
+    );
+    let waited = script(
+        &db,
+        "waited.sh",
+        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n",
+    );
+    select_entries(
+        &db,
+        vec![
+            not_waited_for(detached.clone()),
+            ScriptListEntry::new(waited.clone()),
+        ],
+    );
+    let mut event = EventContext::from_job(&context, QueueEvent::NzbDownloaded);
+
+    // The first script cannot end until its gate opens, so an event that
+    // returns before then did not wait for it.
+    let results = run_event(&db, &mut event, "detached-queue", None, supervisor())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].script, waited);
+    assert!(!results[0].background);
+    assert_eq!(db.event_script_results(42).unwrap().len(), 1);
+
+    open_gate(gate).await;
+    db.background_scripts_settled().await;
+    let recorded = db.event_script_results(42).unwrap();
+    assert_eq!(recorded.len(), 2);
+    let run = recorded
+        .iter()
+        .find(|result| result.script == detached)
+        .unwrap();
+    assert!(run.background);
+    assert_eq!(run.status, ScriptStatus::Succeeded);
+    // What it asked for still reaches the job, whenever that turns out to be.
+    assert_eq!(
+        db.job_script_effects(42).unwrap().parameters["Detached"],
+        "ran"
+    );
+}
+
+#[tokio::test]
+async fn a_scan_script_is_waited_for_whatever_its_entry_says() {
+    let (db, data) = setup();
+    let path = data.path().join("input.nzb");
+    fs::write(&path, "original").unwrap();
+    let scan = script(
+        &db,
+        "scan.sh",
+        "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nprintf rewritten > \"$NZBNP_FILENAME\"\nexit 0\n",
+    );
+    select_entries(&db, vec![not_waited_for(scan)]);
+    let mut context = jobless(
+        data.path(),
+        ScriptEventLabel::Scan,
+        &[("NZBNP_FILENAME", path.to_string_lossy().into_owned())],
+    );
+    let results = run_event(&db, &mut context, "scan-not-detached", None, supervisor())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].background);
+    assert_eq!(fs::read_to_string(path).unwrap(), "rewritten");
+}
+
+#[tokio::test]
+async fn a_scheduled_script_nothing_waits_for_leaves_the_waited_scripts_their_turn() {
+    let (db, data) = setup();
+    let started = gate(data.path(), "started");
+    let release = gate(data.path(), "release");
+    let path = data.path().join("input.nzb");
+    fs::write(&path, "original").unwrap();
+    // One script at a time is waited for by default, and this one keeps that
+    // turn until it is released.
+    let holder = script(
+        &db,
+        "holder.sh",
+        &format!(
+            "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nprintf 'up\\n' > '{}'\nread line < '{}'\nexit 0\n",
+            started.display(),
+            release.display()
+        ),
+    );
+    let nightly = script(
+        &db,
+        "nightly.sh",
+        "#!/bin/sh\n### NZBGET SCHEDULER SCRIPT ###\nprintf 'nightly\\n'\nexit 0\n",
+    );
+    select_entries(
+        &db,
+        vec![
+            ScriptListEntry::new(holder),
+            not_waited_for(nightly.clone()),
+        ],
+    );
+    let scan = {
+        let db = db.clone();
+        let mut context = jobless(
+            data.path(),
+            ScriptEventLabel::Scan,
+            &[("NZBNP_FILENAME", path.to_string_lossy().into_owned())],
+        );
+        tokio::spawn(async move {
+            run_event(&db, &mut context, "scan-holder", None, supervisor())
+                .await
+                .unwrap()
+        })
+    };
+    wait_at_gate(started).await;
+
+    let mut scheduled = jobless(data.path(), ScriptEventLabel::Scheduler(3), &[]);
+    let results = run_event(&db, &mut scheduled, "scheduler:3:test", None, supervisor())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].script, nightly);
+    assert!(results[0].background);
+    assert_eq!(results[0].status, ScriptStatus::Succeeded);
+    assert_eq!(results[0].output_tail, "nightly\n");
+
+    open_gate(release).await;
+    assert_eq!(scan.await.unwrap().len(), 1);
 }

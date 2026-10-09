@@ -134,6 +134,7 @@ pub struct JobPostProcessingReport {
 }
 
 /// All name-based configuration captured when a job enters post-processing.
+#[derive(Clone)]
 pub struct PostProcessingJobAdmission {
     scripts_directory: PathBuf,
     scripts: ScriptList,
@@ -160,6 +161,16 @@ pub struct PostProcessingExecutor {
     /// because a test harness cannot serve as its own process supervisor.
     #[doc(hidden)]
     supervisor_executable: Option<PathBuf>,
+}
+
+/// What became of one entry of a job's list.
+enum Attempt {
+    /// The script ran. Its result and output are already kept.
+    Ran(ScriptResult),
+    /// The script is not a post-processing script.
+    WrongKind(ScriptResult),
+    /// The script could not be started.
+    NotStarted(ScriptResult),
 }
 
 struct CancellationRegistration {
@@ -230,8 +241,10 @@ impl PostProcessingExecutor {
             .clone()
     }
 
-    /// Signal every in-flight script for `job_id` to stop.
+    /// Signal every in-flight script for `job_id` to stop, the ones nothing
+    /// waits for included. Returns whether a pass was there to stop.
     pub fn cancel_job(&self, job_id: u64) -> bool {
+        self.db.cancel_background_scripts(job_id);
         let sender = self
             .cancellations
             .lock()
@@ -409,17 +422,23 @@ impl PostProcessingExecutor {
                 }
             }
         }
-        let _permit: OwnedSemaphorePermit = tokio::select! {
-            biased;
-            permit = self.concurrency.clone().acquire_owned() => {
-                permit.map_err(|_| PostProcessingExecutorError::Shutdown)?
+        // A list with nothing to wait for takes no place among the jobs that
+        // are post-processing: it only starts its scripts and moves on.
+        let _permit: Option<OwnedSemaphorePermit> = if entries.iter().any(|entry| entry.blocking) {
+            tokio::select! {
+                biased;
+                permit = self.concurrency.clone().acquire_owned() => {
+                    Some(permit.map_err(|_| PostProcessingExecutorError::Shutdown)?)
+                }
+                _ = cancel_rx.changed() => {
+                    return Ok(JobPostProcessingReport {
+                        summary: PostProcessingSummary::Cancelled,
+                        results: vec![],
+                    });
+                }
             }
-            _ = cancel_rx.changed() => {
-                return Ok(JobPostProcessingReport {
-                    summary: PostProcessingSummary::Cancelled,
-                    results: vec![],
-                });
-            }
+        } else {
+            None
         };
         if *cancel_rx.borrow() {
             return Ok(JobPostProcessingReport {
@@ -456,17 +475,34 @@ impl PostProcessingExecutor {
                 summary = merge_post_processing_summary(summary, PostProcessingSummary::Cancelled);
                 break;
             }
-            let result = {
-                let _active = GaugeGuard::enter(&counters::ACTIVE);
-                self.execute_one(
+            if !entry.blocking {
+                self.start_background(
                     &admission,
                     entry,
-                    &mut context,
+                    &context,
                     &interpreters,
                     termination_grace,
-                    Some(cancel_rx.clone()),
-                )
-                .await
+                );
+                continue;
+            }
+            let result = {
+                let _active = GaugeGuard::enter(&counters::ACTIVE);
+                match self
+                    .attempt(
+                        &admission,
+                        entry,
+                        &mut context,
+                        &interpreters,
+                        termination_grace,
+                        Some(cancel_rx.clone()),
+                        false,
+                    )
+                    .await
+                {
+                    Attempt::Ran(result)
+                    | Attempt::WrongKind(result)
+                    | Attempt::NotStarted(result) => result,
+                }
             };
             record_script_metrics(&result);
             context.compatibility.previous_script_status = match result.status {
@@ -505,7 +541,75 @@ impl PostProcessingExecutor {
         Ok(JobPostProcessingReport { summary, results })
     }
 
-    async fn execute_one(
+    /// Start an entry nothing waits for. It runs against the job as it stands
+    /// when its turn comes, and what it returns has no part in how the job's
+    /// post-processing ends.
+    fn start_background(
+        &self,
+        admission: &PostProcessingJobAdmission,
+        entry: &ScriptListEntry,
+        context: &JobExecutionContext,
+        interpreters: &InterpreterConfig,
+        termination_grace: Duration,
+    ) {
+        let registration = super::events::BackgroundRun::register(&self.db, Some(context.job_id));
+        let executor = self.clone();
+        let admission = admission.clone();
+        let entry = entry.clone();
+        let mut context = context.clone();
+        let interpreters = interpreters.clone();
+        tokio::spawn(async move {
+            let Some((_turn, cancellation)) = registration.turn().await else {
+                return;
+            };
+            let job_id = context.job_id;
+            let attempt = {
+                let _active = GaugeGuard::enter(&counters::ACTIVE);
+                executor
+                    .attempt(
+                        &admission,
+                        &entry,
+                        &mut context,
+                        &interpreters,
+                        termination_grace,
+                        Some(cancellation),
+                        true,
+                    )
+                    .await
+            };
+            let result = match attempt {
+                Attempt::Ran(result) => result,
+                // The pass is over by the time this is known, so the list of
+                // the job's runs is the only place left to say so.
+                Attempt::NotStarted(result) => executor.keep_unstarted(job_id, result).await,
+                Attempt::WrongKind(_) => return,
+            };
+            record_script_metrics(&result);
+            executor.publish_script_events(job_id, &result);
+        });
+    }
+
+    async fn keep_unstarted(&self, job_id: u64, result: ScriptResult) -> ScriptResult {
+        let limits = match self.db.post_processing_settings() {
+            Ok(settings) => settings.event_scripts,
+            Err(error) => {
+                tracing::warn!(job_id, %error, "could not record a script that did not start");
+                return result;
+            }
+        };
+        match super::output::retain_result(self.db.clone(), Some(job_id), result.clone(), limits)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(job_id, %error, "could not record a script that did not start");
+                result
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt(
         &self,
         admission: &PostProcessingJobAdmission,
         entry: &ScriptListEntry,
@@ -513,12 +617,17 @@ impl PostProcessingExecutor {
         interpreters: &InterpreterConfig,
         termination_grace: Duration,
         cancellation: Option<watch::Receiver<bool>>,
-    ) -> ScriptResult {
+        background: bool,
+    ) -> Attempt {
         let started = Instant::now();
+        let not_started = |mut result: ScriptResult| {
+            result.background = background;
+            Attempt::NotStarted(result)
+        };
         let script = match listing::resolve_script(&admission.scripts_directory, &entry.script) {
             Ok(script) => script,
             Err(error) => {
-                return unavailable_result(entry, started, &error);
+                return not_started(unavailable_result(entry, started, &error));
             }
         };
         if !script
@@ -533,40 +642,42 @@ impl PostProcessingExecutor {
                 "script does not declare post-processing".to_string(),
             );
             result.status = ScriptStatus::Skipped;
-            return result;
+            return Attempt::WrongKind(result);
         }
+        let adapter = script.manifest.adapter();
         let supplied = match self
             .db
             .resolve_post_processing_script_options(&admission.options, &entry.script)
         {
             Ok(options) => options,
             Err(error) => {
-                return failed_result(entry, script.manifest.adapter(), started, error.to_string());
+                return not_started(failed_result(entry, adapter, started, error.to_string()));
             }
         };
         let options = match script.manifest.resolve_options(&supplied) {
             Ok(options) => options,
             Err(error) => {
-                return failed_result(entry, script.manifest.adapter(), started, error.to_string());
+                return not_started(failed_result(entry, adapter, started, error.to_string()));
             }
         };
-        let adapter = script.manifest.adapter();
         let settings = match self.db.post_processing_settings() {
             Ok(settings) => settings,
-            Err(error) => return failed_result(entry, adapter, started, error.to_string()),
+            Err(error) => {
+                return not_started(failed_result(entry, adapter, started, error.to_string()));
+            }
         };
         if let Err(error) = self
             .db
             .refresh_script_job_inputs(context.job_id, &mut context.compatibility)
         {
-            return failed_result(entry, adapter, started, error.to_string());
+            return not_started(failed_result(entry, adapter, started, error.to_string()));
         }
         if let Err(error) = self
             .db
             .job_script_effects(context.job_id)
             .map(|effects| effects.apply_to_context(context))
         {
-            return failed_result(entry, adapter, started, error.to_string());
+            return not_started(failed_result(entry, adapter, started, error.to_string()));
         }
         let request = ScriptExecutionRequest {
             manifest: script.manifest,
@@ -599,6 +710,7 @@ impl PostProcessingExecutor {
                     script: entry.script.clone(),
                     event: Default::default(),
                     output_id: None,
+                    background,
                     adapter,
                     status: match result.disposition {
                         ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
@@ -615,23 +727,25 @@ impl PostProcessingExecutor {
                     error_message: result.error_message,
                     finished_at_epoch_ms: now_epoch_ms(),
                 };
-                match super::output::retain_output(
-                    self.db.clone(),
-                    Some(context.job_id),
-                    record.clone(),
-                    result.output,
-                    settings.event_scripts,
+                Attempt::Ran(
+                    match super::output::retain_output(
+                        self.db.clone(),
+                        Some(context.job_id),
+                        record.clone(),
+                        result.output,
+                        settings.event_scripts,
+                    )
+                    .await
+                    {
+                        Ok(record) => record,
+                        Err(error) => {
+                            tracing::warn!(job_id = context.job_id, %error, "could not retain script output");
+                            record
+                        }
+                    },
                 )
-                .await
-                {
-                    Ok(record) => record,
-                    Err(error) => {
-                        tracing::warn!(job_id = context.job_id, %error, "could not retain script output");
-                        record
-                    }
-                }
             }
-            Err(error) => failed_result(entry, adapter, started, error.to_string()),
+            Err(error) => not_started(failed_result(entry, adapter, started, error.to_string())),
         }
     }
 
@@ -748,6 +862,7 @@ fn unavailable_result(
         event: Default::default(),
         adapter: ScriptAdapter::Sabnzbd,
         output_id: None,
+        background: false,
         status: ScriptStatus::Warning,
         exit_code: None,
         duration_ms: started.elapsed().as_millis() as u64,
@@ -770,6 +885,7 @@ fn failed_result(
         adapter,
         status: ScriptStatus::Failed,
         output_id: None,
+        background: false,
         exit_code: None,
         duration_ms: started.elapsed().as_millis() as u64,
         output_tail: String::new(),

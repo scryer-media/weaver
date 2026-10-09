@@ -351,6 +351,7 @@ mod tests {
             script: ScriptName::new("scan.py").unwrap(),
             event: ScriptEventLabel::Scan,
             output_id: None,
+            background: false,
             adapter: ScriptAdapter::Nzbget,
             status: ScriptStatus::Failed,
             exit_code: None,

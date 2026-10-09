@@ -128,6 +128,18 @@ pub enum ScriptEventLabel {
     Feed(u64),
 }
 
+impl ScriptEventLabel {
+    pub fn kind(&self) -> ScriptKind {
+        match self {
+            Self::PostProcessing => ScriptKind::PostProcessing,
+            Self::Queue(_) => ScriptKind::Queue,
+            Self::Scan => ScriptKind::Scan,
+            Self::Scheduler(_) => ScriptKind::Scheduler,
+            Self::Feed(_) => ScriptKind::Feed,
+        }
+    }
+}
+
 impl fmt::Display for ScriptEventLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

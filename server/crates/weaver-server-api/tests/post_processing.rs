@@ -398,3 +398,163 @@ async fn results_are_readable_and_control_scope_owns_rerun_and_cancel() {
         .await;
     assert_has_errors(&denied);
 }
+
+#[tokio::test]
+async fn an_entry_keeps_whether_it_is_waited_for() {
+    let harness = TestHarness::new().await;
+    let response = harness
+        .execute(
+            r#"
+            mutation {
+              setScriptLists(input: {
+                global: [{ script: "notify.sh" }, { script: "ping.sh", blocking: false }]
+              }) {
+                global { script blocking }
+              }
+            }
+            "#,
+        )
+        .await;
+    assert_no_errors(&response);
+    let global = &response_data(&response)["setScriptLists"]["global"];
+    assert_eq!(
+        global[0]["blocking"], true,
+        "an entry is waited for unless it says otherwise"
+    );
+    assert_eq!(global[1]["blocking"], false);
+
+    let settings = harness
+        .execute("{ postProcessingSettings { lists { global { script blocking } } } }")
+        .await;
+    assert_no_errors(&settings);
+    let global = &response_data(&settings)["postProcessingSettings"]["lists"]["global"];
+    assert_eq!(global[0]["blocking"], true);
+    assert_eq!(global[1]["script"], "ping.sh");
+    assert_eq!(global[1]["blocking"], false);
+}
+
+#[tokio::test]
+async fn recorded_runs_are_listed_in_pages_for_any_reader() {
+    use weaver_server_core::post_processing::model::{
+        ScriptAdapter, ScriptEventLabel, ScriptName, ScriptResult, ScriptStatus,
+    };
+    use weaver_server_core::post_processing::output::retain_output;
+
+    let harness = TestHarness::new().await;
+    let recorded = [
+        (ScriptEventLabel::Scheduler(1), "nightly.sh", false),
+        (ScriptEventLabel::Scan, "scan.sh", false),
+        (ScriptEventLabel::Scheduler(2), "hourly.sh", true),
+    ];
+    for (event, script, background) in recorded {
+        retain_output(
+            harness.db.clone(),
+            None,
+            ScriptResult {
+                script: ScriptName::new(script).unwrap(),
+                event,
+                output_id: None,
+                background,
+                adapter: ScriptAdapter::Nzbget,
+                status: ScriptStatus::Succeeded,
+                exit_code: Some(93),
+                duration_ms: 5,
+                output_tail: String::new(),
+                output_truncated: false,
+                error_message: None,
+                finished_at_epoch_ms: 1_000,
+            },
+            format!("{script} output").into_bytes(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let fields = "runs { id jobId jobName script event kind background adapter status exitCode durationMs outputTail outputTruncated outputRetained errorMessage finishedAtEpochMs } nextBefore";
+    let first = harness
+        .execute_as(
+            &format!("{{ scriptRuns(limit: 2) {{ {fields} }} }}"),
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&first);
+    let first = &response_data(&first)["scriptRuns"];
+    let runs = first["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["script"], "hourly.sh");
+    assert_eq!(runs[0]["event"], "scheduler:2");
+    assert_eq!(runs[0]["kind"], "SCHEDULER");
+    assert_eq!(runs[0]["background"], true);
+    assert_eq!(runs[0]["status"], "SUCCEEDED");
+    assert_eq!(runs[0]["exitCode"], 93);
+    assert_eq!(runs[0]["outputTail"], "hourly.sh output");
+    assert_eq!(runs[0]["outputRetained"], true);
+    assert!(runs[0]["jobId"].is_null());
+    assert!(runs[0]["jobName"].is_null());
+    assert_eq!(runs[1]["script"], "scan.sh");
+    assert_eq!(runs[1]["kind"], "SCAN");
+    assert_eq!(runs[1]["background"], false);
+
+    // A run that belongs to no job has its output behind the same id.
+    let output = harness
+        .execute_as(
+            &format!(
+                r#"{{ scriptOutput(outputId: "{}") }}"#,
+                runs[1]["id"].as_str().unwrap()
+            ),
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&output);
+    assert_eq!(response_data(&output)["scriptOutput"], "scan.sh output");
+
+    let before = first["nextBefore"].as_str().unwrap();
+    let rest = harness
+        .execute_as(
+            &format!(r#"{{ scriptRuns(limit: 2, before: "{before}") {{ {fields} }} }}"#),
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&rest);
+    let rest = &response_data(&rest)["scriptRuns"];
+    assert_eq!(rest["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(rest["runs"][0]["script"], "nightly.sh");
+    assert!(
+        rest["nextBefore"].is_null(),
+        "nothing follows the last page"
+    );
+
+    let scheduled = harness
+        .execute_as(
+            "{ scriptRuns(kind: SCHEDULER, script: \"nightly.sh\") { runs { script } nextBefore } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&scheduled);
+    let scheduled = &response_data(&scheduled)["scriptRuns"];
+    assert_eq!(scheduled["runs"].as_array().unwrap().len(), 1);
+    assert!(scheduled["nextBefore"].is_null());
+
+    let of_a_job = harness
+        .execute_as(
+            "{ scriptRuns(jobId: 7) { runs { script } } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&of_a_job);
+    assert!(
+        response_data(&of_a_job)["scriptRuns"]["runs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let nowhere = harness
+        .execute_as(
+            r#"{ scriptRuns(before: "latest") { nextBefore } }"#,
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&nowhere);
+}

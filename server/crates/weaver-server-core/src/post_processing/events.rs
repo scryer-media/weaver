@@ -7,17 +7,111 @@ use tokio::sync::{mpsc, watch};
 
 use super::directives::{Directive, ScriptLogLevel, ScriptOutputEvent};
 use super::executor::{execution_refusal, resolve_script_list, strict_security_enabled};
+use super::listing::DiscoveredScript;
 use super::model::{
-    QueueEvent, ScriptEventLabel, ScriptKind, ScriptList, ScriptName, ScriptResult, ScriptStatus,
+    PostProcessingSettings, QueueEvent, ScriptEventLabel, ScriptKind, ScriptList, ScriptListEntry,
+    ScriptName, ScriptResult, ScriptStatus,
 };
 use super::runner::{
     CompatibilityFacts, ExecutionDisposition, ExecutionSpec, InterpreterConfig,
     JobExecutionContext, execute_spec,
 };
+use super::settings::ScriptOptionsSnapshot;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::persistence::{Database, StateError};
 
 type EventCancellations = BTreeMap<String, (Option<u64>, watch::Sender<bool>)>;
+type BackgroundRuns = BTreeMap<u64, (Option<u64>, watch::Sender<bool>)>;
+
+/// Fire-and-forget runs allowed at once. They are bounded apart from the
+/// scripts weaver waits for, so neither takes a turn from the other.
+const BACKGROUND_RUNS: usize = 8;
+
+struct BackgroundLane {
+    turns: std::sync::Arc<tokio::sync::Semaphore>,
+    runs: std::sync::Mutex<BackgroundRuns>,
+    next: std::sync::atomic::AtomicU64,
+    settled: tokio::sync::Notify,
+}
+
+impl Default for BackgroundLane {
+    fn default() -> Self {
+        Self {
+            turns: std::sync::Arc::new(tokio::sync::Semaphore::new(BACKGROUND_RUNS)),
+            runs: Default::default(),
+            next: Default::default(),
+            settled: Default::default(),
+        }
+    }
+}
+
+/// One fire-and-forget run, registered from the moment it is decided on so
+/// that a cancel reaches it while it still waits for its turn.
+pub(crate) struct BackgroundRun {
+    runtime: std::sync::Arc<ScriptRuntime>,
+    id: u64,
+    cancellation: watch::Receiver<bool>,
+}
+
+impl BackgroundRun {
+    pub(crate) fn register(db: &Database, job_id: Option<u64>) -> Self {
+        let runtime = db.script_runtime.clone();
+        let id = runtime
+            .background
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (cancel, cancellation) = watch::channel(false);
+        runtime
+            .background
+            .runs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, (job_id, cancel));
+        Self {
+            runtime,
+            id,
+            cancellation,
+        }
+    }
+
+    /// The run's turn and its cancel signal, or `None` when it was cancelled
+    /// while it waited for the turn.
+    pub(crate) async fn turn(
+        &self,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, watch::Receiver<bool>)> {
+        let mut cancellation = self.cancellation.clone();
+        let turn = background_turn(&self.runtime, &mut cancellation).await?;
+        Some((turn, cancellation))
+    }
+}
+
+impl Drop for BackgroundRun {
+    fn drop(&mut self) {
+        self.runtime
+            .background
+            .runs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+        self.runtime.background.settled.notify_waiters();
+    }
+}
+
+/// A turn among the fire-and-forget runs, or `None` when `cancellation` fired
+/// first.
+async fn background_turn(
+    runtime: &std::sync::Arc<ScriptRuntime>,
+    cancellation: &mut watch::Receiver<bool>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if *cancellation.borrow() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        turn = runtime.background.turns.clone().acquire_owned() => turn.ok(),
+        _ = cancellation.changed() => None,
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct ScriptRuntime {
@@ -34,6 +128,7 @@ pub(crate) struct ScriptRuntime {
     admission_hint: std::sync::Mutex<(u64, Option<AdmissionHint>)>,
     admissions: std::sync::Mutex<QueueAdmissions>,
     durable_events_seen: std::sync::atomic::AtomicBool,
+    background: BackgroundLane,
 }
 
 #[derive(Clone, Copy)]
@@ -178,12 +273,45 @@ impl EventContext {
     }
 
     fn kind(&self) -> ScriptKind {
-        match self.event {
-            ScriptEventLabel::PostProcessing => ScriptKind::PostProcessing,
-            ScriptEventLabel::Queue(_) => ScriptKind::Queue,
-            ScriptEventLabel::Scan => ScriptKind::Scan,
-            ScriptEventLabel::Scheduler(_) => ScriptKind::Scheduler,
-            ScriptEventLabel::Feed(_) => ScriptKind::Feed,
+        self.event.kind()
+    }
+}
+
+/// Whether the event waits for `entry`. A scan or feed script is always waited
+/// for: what it returns is what weaver goes on with.
+fn waits_for(event: &ScriptEventLabel, entry: &ScriptListEntry) -> bool {
+    entry.blocking || matches!(event, ScriptEventLabel::Scan | ScriptEventLabel::Feed(_))
+}
+
+/// A turn among the event scripts weaver waits for, or `None` when the run was
+/// cancelled while it waited for one.
+async fn event_turn(
+    db: &Database,
+    runtime: &std::sync::Arc<ScriptRuntime>,
+    cancellation: &mut watch::Receiver<bool>,
+) -> Result<Option<EventPermit>, StateError> {
+    loop {
+        let changed = runtime.capacity_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let limit = usize::from(
+            db.post_processing_settings()?
+                .event_scripts
+                .event_script_concurrency,
+        );
+        {
+            let mut running = runtime
+                .running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if *running < limit {
+                *running += 1;
+                return Ok(Some(EventPermit(runtime.clone())));
+            }
+        }
+        tokio::select! {
+            _ = changed => {},
+            _ = cancellation.changed() => return Ok(None),
         }
     }
 }
@@ -264,7 +392,9 @@ pub fn has_subscriber(db: &Database, context: &EventContext) -> Result<bool, Sta
 }
 
 /// Execute matching entries in configured order. Scan category directives are
-/// resolved again before selecting the next entry.
+/// resolved again before selecting the next entry. An entry the event does not
+/// wait for is started at its place in the order and left to finish on its
+/// own; it has no part in what this returns.
 pub async fn run_event(
     db: &Database,
     context: &mut EventContext,
@@ -305,33 +435,12 @@ pub async fn run_event(
     if *cancel_rx.borrow() {
         return Ok(Vec::new());
     }
-    let _permit = loop {
-        let changed = runtime.capacity_changed.notified();
-        tokio::pin!(changed);
-        changed.as_mut().enable();
-        let limit = usize::from(
-            db.post_processing_settings()?
-                .event_scripts
-                .event_script_concurrency,
-        );
-        {
-            let mut running = runtime
-                .running
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if *running < limit {
-                *running += 1;
-                break EventPermit(runtime.clone());
-            }
-        }
-        tokio::select! {
-            _ = changed => {},
-            _ = cancel_rx.changed() => return Ok(Vec::new()),
-        }
-    };
     let cancellation = Some(cancel_rx.clone());
-    let root = db.post_processing_script_directory()?;
-    let options = db.post_processing_script_options_snapshot();
+    let mut root = db.post_processing_script_directory()?;
+    let mut options = db
+        .post_processing_script_options_snapshot()
+        .map_err(|error| error.to_string());
+    let mut turn = None;
     let mut visited = BTreeSet::<ScriptName>::new();
     let mut results = Vec::new();
     loop {
@@ -382,128 +491,217 @@ pub async fn run_event(
                 break;
             }
         }
-        let started = Instant::now();
-        let adapter = script.manifest.adapter();
-        let resolved = options
-            .as_ref()
-            .map_err(ToString::to_string)
-            .and_then(|options| {
-                db.resolve_post_processing_script_options(options, &entry.script)
-                    .map_err(|error| error.to_string())
-            })
-            .and_then(|supplied| {
-                script
-                    .manifest
-                    .resolve_options(&supplied)
-                    .map_err(|error| error.to_string())
-            });
-        let execution = match resolved {
-            Err(error) => Err(format!("script configuration is invalid: {error}")),
-            Ok(resolved) => {
-                let spec = ExecutionSpec {
-                    manifest: script.manifest,
-                    root: script.root,
-                    options: resolved,
-                    cwd: context.cwd.clone(),
-                    env: context.env.clone(),
-                    argv: Vec::new(),
-                    timeout: Some(Duration::from_secs(
-                        entry
-                            .timeout_seconds
-                            .unwrap_or(settings.event_scripts.event_script_timeout_seconds),
-                    )),
-                    termination_grace: Duration::from_secs(settings.termination_grace_seconds),
-                    kind: context.event.clone(),
-                    run_id: run_id.into(),
-                    facts: context.facts.clone(),
-                    interpreters: InterpreterConfig {
-                        python: settings.python_interpreter.as_ref().map(PathBuf::from),
-                        powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
-                        batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
-                    },
-                    supervisor_executable: supervisor_executable.clone(),
-                    output_ceiling: settings.event_scripts.script_output_ceiling_bytes,
+        let run = EntryRun {
+            entry,
+            script,
+            settings,
+            options: options.clone(),
+            run_id: run_id.into(),
+            supervisor_executable: supervisor_executable.clone(),
+            background: false,
+        };
+        if !waits_for(&context.event, &run.entry) {
+            let run = EntryRun {
+                background: true,
+                ..run
+            };
+            if matches!(context.event, ScriptEventLabel::Scheduler(_)) {
+                // Nothing waits for a scheduled run but the rule that started
+                // it, which must still see it end to keep its runs from
+                // overlapping. It only gives up its place among the scripts
+                // that are waited for.
+                turn = None;
+                let Some(_turn) = background_turn(&runtime, &mut cancel_rx).await else {
+                    break;
                 };
-                let (sender, receiver) = mpsc::channel(64);
-                let (execution, ()) = tokio::join!(
-                    execute_spec(spec, cancellation.clone(), Some(sender)),
-                    consume_events(db, context, receiver),
-                );
-                execution.map_err(|error| error.to_string())
+                results.push(run_entry(db, context, run, cancellation.clone()).await?);
+            } else {
+                spawn_background_entry(db, context, run);
             }
-        };
-        let (status, exit_code, output, output_truncated, error_message) = match execution {
-            Ok(result) => (
-                match result.disposition {
-                    ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
-                    ExecutionDisposition::Skipped => ScriptStatus::Skipped,
-                    ExecutionDisposition::Warned => ScriptStatus::Warning,
-                    ExecutionDisposition::Failed => ScriptStatus::Failed,
-                    ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
-                    ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
-                },
-                result.exit_code,
-                result.output,
-                result.output_truncated,
-                result.error_message,
-            ),
-            Err(error) => (
-                ScriptStatus::Failed,
-                None,
-                Vec::new(),
-                false,
-                Some(error.to_string()),
-            ),
-        };
-        let result = ScriptResult {
-            script: entry.script,
-            event: context.event.clone(),
-            output_id: None,
-            adapter,
-            status,
-            exit_code,
-            duration_ms: started.elapsed().as_millis() as u64,
-            output_tail: String::new(),
-            output_truncated,
-            error_message,
-            finished_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
-        };
-        let result = super::output::retain_output(
-            db.clone(),
-            context.job_id,
-            result,
-            output,
-            settings.event_scripts.clone(),
-        )
-        .await?;
-        if matches!(
-            result.status,
-            ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled
-        ) {
-            if let Some(job_id) = context.job_id
-                && let Err(error) = db.insert_job_event(
-                    job_id,
-                    result.finished_at_epoch_ms,
-                    "ScriptWarning",
-                    &format!(
-                        "{} {}: {}",
-                        result.event,
-                        result.script,
-                        result.status.as_str()
-                    ),
-                    None,
-                )
-            {
-                // The result itself is retained; a missed timeline entry must
-                // not stop the scripts after this one.
-                tracing::warn!(%error, "could not record a script warning");
-            }
-            results.push(result);
-        } else {
-            results.push(result);
+            continue;
         }
+        if turn.is_none() {
+            let Some(acquired) = event_turn(db, &runtime, &mut cancel_rx).await? else {
+                break;
+            };
+            turn = Some(acquired);
+            // The wait may have been long. Everything this entry was chosen
+            // from is read again now that its turn has come.
+            root = db.post_processing_script_directory()?;
+            options = db
+                .post_processing_script_options_snapshot()
+                .map_err(|error| error.to_string());
+            visited.remove(&run.entry.script);
+            continue;
+        }
+        results.push(run_entry(db, context, run, cancellation.clone()).await?);
     }
     Ok(results)
+}
+
+/// One entry of an event, resolved and ready to run.
+struct EntryRun {
+    entry: ScriptListEntry,
+    script: DiscoveredScript,
+    settings: PostProcessingSettings,
+    options: Result<ScriptOptionsSnapshot, String>,
+    run_id: String,
+    supervisor_executable: Option<PathBuf>,
+    background: bool,
+}
+
+/// Start an entry nothing waits for. It takes its turn among the other
+/// fire-and-forget runs and records its own result.
+fn spawn_background_entry(db: &Database, context: &EventContext, mut run: EntryRun) {
+    let registration = BackgroundRun::register(db, context.job_id);
+    let db = db.clone();
+    let mut context = context.clone();
+    tokio::spawn(async move {
+        let Some((_turn, cancellation)) = registration.turn().await else {
+            return;
+        };
+        match db.post_processing_settings() {
+            Ok(settings) if execution_refusal(&settings, strict_security_enabled()).is_none() => {
+                run.settings = settings;
+            }
+            _ => return,
+        }
+        if let Some(job_id) = context.job_id
+            && let Err(error) = db.refresh_script_job_inputs(job_id, &mut context.facts)
+        {
+            tracing::warn!(event = %context.event, %error, "could not refresh a fire-and-forget script's inputs");
+        }
+        if let Err(error) = run_entry(&db, &mut context, run, Some(cancellation)).await {
+            tracing::warn!(event = %context.event, %error, "could not record a fire-and-forget script run");
+        }
+    });
+}
+
+/// Execute one entry and record what it did.
+async fn run_entry(
+    db: &Database,
+    context: &mut EventContext,
+    run: EntryRun,
+    cancellation: Option<watch::Receiver<bool>>,
+) -> Result<ScriptResult, StateError> {
+    let EntryRun {
+        entry,
+        script,
+        settings,
+        options,
+        run_id,
+        supervisor_executable,
+        background,
+    } = run;
+    let started = Instant::now();
+    let adapter = script.manifest.adapter();
+    let resolved = options
+        .and_then(|options| {
+            db.resolve_post_processing_script_options(&options, &entry.script)
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|supplied| {
+            script
+                .manifest
+                .resolve_options(&supplied)
+                .map_err(|error| error.to_string())
+        });
+    let execution = match resolved {
+        Err(error) => Err(format!("script configuration is invalid: {error}")),
+        Ok(resolved) => {
+            let spec = ExecutionSpec {
+                manifest: script.manifest,
+                root: script.root,
+                options: resolved,
+                cwd: context.cwd.clone(),
+                env: context.env.clone(),
+                argv: Vec::new(),
+                timeout: Some(Duration::from_secs(
+                    entry
+                        .timeout_seconds
+                        .unwrap_or(settings.event_scripts.event_script_timeout_seconds),
+                )),
+                termination_grace: Duration::from_secs(settings.termination_grace_seconds),
+                kind: context.event.clone(),
+                run_id,
+                facts: context.facts.clone(),
+                interpreters: InterpreterConfig {
+                    python: settings.python_interpreter.as_ref().map(PathBuf::from),
+                    powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
+                    batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
+                },
+                supervisor_executable,
+                output_ceiling: settings.event_scripts.script_output_ceiling_bytes,
+            };
+            let (sender, receiver) = mpsc::channel(64);
+            let (execution, ()) = tokio::join!(
+                execute_spec(spec, cancellation, Some(sender)),
+                consume_events(db, context, receiver),
+            );
+            execution.map_err(|error| error.to_string())
+        }
+    };
+    let (status, exit_code, output, output_truncated, error_message) = match execution {
+        Ok(result) => (
+            match result.disposition {
+                ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
+                ExecutionDisposition::Skipped => ScriptStatus::Skipped,
+                ExecutionDisposition::Warned => ScriptStatus::Warning,
+                ExecutionDisposition::Failed => ScriptStatus::Failed,
+                ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
+                ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
+            },
+            result.exit_code,
+            result.output,
+            result.output_truncated,
+            result.error_message,
+        ),
+        Err(error) => (ScriptStatus::Failed, None, Vec::new(), false, Some(error)),
+    };
+    let result = ScriptResult {
+        script: entry.script,
+        event: context.event.clone(),
+        output_id: None,
+        background,
+        adapter,
+        status,
+        exit_code,
+        duration_ms: started.elapsed().as_millis() as u64,
+        output_tail: String::new(),
+        output_truncated,
+        error_message,
+        finished_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let result = super::output::retain_output(
+        db.clone(),
+        context.job_id,
+        result,
+        output,
+        settings.event_scripts.clone(),
+    )
+    .await?;
+    if matches!(
+        result.status,
+        ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled
+    ) && let Some(job_id) = context.job_id
+        && let Err(error) = db.insert_job_event(
+            job_id,
+            result.finished_at_epoch_ms,
+            "ScriptWarning",
+            &format!(
+                "{} {}: {}",
+                result.event,
+                result.script,
+                result.status.as_str()
+            ),
+            None,
+        )
+    {
+        // The result itself is retained; a missed timeline entry must not
+        // stop the scripts after this one.
+        tracing::warn!(%error, "could not record a script warning");
+    }
+    Ok(result)
 }
 
 async fn consume_events(
@@ -839,6 +1037,49 @@ impl Database {
                     sender.send_replace(true);
                 }
             }
+        }
+        self.cancel_background_scripts(job_id);
+    }
+
+    /// Signal every fire-and-forget run of `job_id` to stop. Returns whether
+    /// there was one.
+    pub fn cancel_background_scripts(&self, job_id: u64) -> bool {
+        let mut cancelled = false;
+        for (job, sender) in self
+            .script_runtime
+            .background
+            .runs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            if *job == Some(job_id) {
+                sender.send_replace(true);
+                cancelled = true;
+            }
+        }
+        cancelled
+    }
+
+    /// Resolves once no fire-and-forget run is registered. Nothing in weaver
+    /// waits on this; it exists so a test can.
+    #[doc(hidden)]
+    pub async fn background_scripts_settled(&self) {
+        loop {
+            let settled = self.script_runtime.background.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            if self
+                .script_runtime
+                .background
+                .runs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+            {
+                return;
+            }
+            settled.await;
         }
     }
     pub fn enqueue_script_event(

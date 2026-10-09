@@ -300,13 +300,19 @@ impl PostProcessingMutation {
 
     #[graphql(guard = "ControlGuard")]
     async fn cancel_job_post_processing(&self, ctx: &Context<'_>, job_id: u64) -> Result<bool> {
+        // A job can have scripts nothing waits for and a pass still to stop,
+        // so stopping the first does not answer for the second.
+        let background = ctx.data::<Database>()?.cancel_background_scripts(job_id);
         if ctx.data::<PostProcessingExecutor>()?.cancel_job(job_id) {
             return Ok(true);
         }
-        ctx.data::<SchedulerHandle>()?
+        let pass = ctx
+            .data::<SchedulerHandle>()?
             .cancel_post_processing(JobId(job_id))
-            .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+            .await;
+        if !background {
+            pass.map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        }
         Ok(true)
     }
 }

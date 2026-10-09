@@ -263,6 +263,7 @@ fn job_results_and_summary_are_stored_on_the_job_and_read_back() {
         duration_ms: 12,
         output_tail: "tail".into(),
         output_id: None,
+        background: false,
         output_truncated: false,
         error_message: Some("exited 3".into()),
         finished_at_epoch_ms: 1_000,

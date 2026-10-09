@@ -1,6 +1,10 @@
 use super::*;
 use weaver_server_core::post_processing::executor::strict_security_enabled;
 use weaver_server_core::post_processing::listing::list_scripts;
+use weaver_server_core::post_processing::output::ScriptRunFilter;
+
+const SCRIPT_RUNS_PAGE: i32 = 50;
+const SCRIPT_RUNS_PAGE_MAX: i32 = 200;
 
 #[derive(Default)]
 pub(crate) struct PostProcessingQuery;
@@ -89,6 +93,45 @@ impl PostProcessingQuery {
         .await
         .map_err(|error| async_graphql::Error::new(error.to_string()))?
         .map_err(|error| async_graphql::Error::new(error.to_string()))
+    }
+
+    /// Recorded script runs, latest first, whatever started them. Runs that
+    /// belong to no job are listed here and nowhere else.
+    #[graphql(guard = "ReadGuard")]
+    async fn script_runs(
+        &self,
+        ctx: &Context<'_>,
+        limit: Option<i32>,
+        before: Option<String>,
+        kind: Option<ScriptKindGql>,
+        script: Option<String>,
+        job_id: Option<u64>,
+    ) -> Result<ScriptRunPageGql> {
+        let db = ctx.data::<Database>()?.clone();
+        let limit = limit
+            .unwrap_or(SCRIPT_RUNS_PAGE)
+            .clamp(1, SCRIPT_RUNS_PAGE_MAX) as usize;
+        let before = before
+            .map(|before| before.parse::<i64>())
+            .transpose()
+            .map_err(|_| async_graphql::Error::new("before is not a position in the list"))?;
+        let filter = ScriptRunFilter {
+            job_id,
+            script,
+            kind: kind.map(Into::into),
+        };
+        // One more than asked for says whether another page follows.
+        let mut runs =
+            tokio::task::spawn_blocking(move || db.script_runs(filter, before, limit as u32 + 1))
+                .await
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let more = runs.len() > limit;
+        runs.truncate(limit);
+        Ok(ScriptRunPageGql {
+            next_before: runs.last().filter(|_| more).map(|run| run.seq.to_string()),
+            runs: runs.into_iter().map(Into::into).collect(),
+        })
     }
 
     #[graphql(guard = "ReadGuard")]
