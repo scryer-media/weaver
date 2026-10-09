@@ -76,13 +76,10 @@ test("event script limits are a section of the configuration and save with the r
     const limit = (name) => events.getByRole("spinbutton", { name, exact: true });
     for (const [name, value] of [
       ["Concurrent event scripts", "1"], ["Default event timeout", "300"], ["File event interval", "0"],
-      ["Captured output per run", "1024"], ["Retained runs per job", "32"],
-      ["Compressed output budget", "64"], ["Compressed output cap per run", "2048"],
+      ["Retained runs per download", "32"], ["Retain failed runs", "8"],
     ]) assert.equal(await limit(name).inputValue(), value);
-    // A size is read in the unit beside it and stored in bytes.
-    for (const [name, unit] of [["Captured output per run", "KB"], ["Compressed output budget", "MB"], ["Compressed output cap per run", "KB"]]) {
-      await events.locator("label").filter({ has: page.getByRole("spinbutton", { name, exact: true }) }).getByText(unit, { exact: true }).waitFor();
-    }
+    assert.deepEqual(await events.getByRole("spinbutton").evaluateAll((fields) => fields.map((field) => field.getAttribute("aria-label"))),
+      ["Concurrent event scripts", "Default event timeout", "File event interval", "Retained runs per download", "Retain failed runs"]);
     // The execution limit keeps a name of its own beside the event one.
     assert.equal(await page.getByRole("spinbutton", { name: "Concurrent scripts", exact: true }).count(), 1);
     const save = page.getByRole("button", { name: "Save changes", exact: true });
@@ -92,15 +89,16 @@ test("event script limits are a section of the configuration and save with the r
     await limit("File event interval").blur();
     await limit("Concurrent event scripts").fill("12");
     await limit("Concurrent event scripts").blur();
-    await limit("Compressed output budget").fill("128");
-    await limit("Compressed output budget").blur();
+    await limit("Retain failed runs").fill("200");
+    await limit("Retain failed runs").blur();
     await save.click();
     await page.getByRole("contentinfo").getByText("Saved", { exact: true }).waitFor();
     const settings = await stored(page);
     assert.equal(settings.fileDownloadedEventInterval, -1);
     assert.equal(settings.eventScriptConcurrency, 8);
-    assert.equal(settings.scriptOutputRingBytes, 128 * 1024 * 1024);
+    assert.equal(settings.scriptOutputFailedRunsPerJob, 128);
     assert.equal(await limit("Concurrent event scripts").inputValue(), "8");
+    assert.equal(await limit("Retain failed runs").inputValue(), "128");
   } finally { await page.close(); }
 });
 
@@ -128,23 +126,41 @@ test("when instances for every category run is a setting saved with the rest of 
   } finally { await page.close(); }
 });
 
-test("a size its unit only rounds is stored as it was unless its field is changed", async () => {
-  const page = await open("?uneven");
+test("a retention limit lowered below what is saved warns that saving deletes runs", async () => {
+  const page = await open();
   try {
     const events = page.getByRole("region", { name: "Event scripts and output retention", exact: true });
     const limit = (name) => events.getByRole("spinbutton", { name, exact: true });
-    await limit("Compressed output cap per run").waitFor();
-    assert.equal(await limit("Compressed output cap per run").inputValue(), "2048");
-    // Leaving the field commits what it shows, which is not what is stored.
-    await limit("Compressed output cap per run").focus();
-    await limit("Compressed output cap per run").blur();
-    await limit("Retained runs per job").fill("16");
-    await limit("Retained runs per job").blur();
+    const warning = "Lowering this deletes the older runs of every download as soon as you save.";
+    const warnings = events.getByText(warning, { exact: true });
+    await events.getByText("How many of the newest runs are kept for each download, and for each scan, schedule or feed.", { exact: true }).waitFor();
+    await events.getByText("Failed runs kept past that count for each download, so failures stay inspectable.", { exact: true }).waitFor();
+    assert.equal(await warnings.count(), 0);
+    const set = async (name, value) => { await limit(name).fill(value); await limit(name).blur(); };
+
+    // Raising a limit deletes nothing, so it says nothing.
+    await set("Retained runs per download", "64");
+    assert.equal(await warnings.count(), 0);
+    await set("Retained runs per download", "16");
+    await events.getByTestId("scriptOutputRunsPerJob-lowered").getByText(warning, { exact: true }).waitFor();
+    await set("Retain failed runs", "2");
+    await events.getByTestId("scriptOutputFailedRunsPerJob-lowered").waitFor();
+    assert.equal(await warnings.count(), 2);
+    await shot(page, "retention-lowered");
+
+    // Back to what is saved, the warning goes.
+    await set("Retained runs per download", "32");
+    await events.getByTestId("scriptOutputRunsPerJob-lowered").waitFor({ state: "detached" });
+    assert.equal(await warnings.count(), 1);
+    await set("Retain failed runs", "8");
+    await warnings.first().waitFor({ state: "detached" });
+
+    // Once a lower limit is saved it is what is kept, and nothing is lowered any more.
+    await set("Retained runs per download", "16");
     await page.getByRole("button", { name: "Save changes", exact: true }).click();
-    await page.getByRole("contentinfo").getByText("Saved", { exact: true }).waitFor();
-    const settings = await stored(page);
-    assert.equal(settings.scriptOutputRunsPerJob, 16);
-    assert.equal(settings.scriptOutputRunCapBytes, 2097000);
+    await status(page, "Saved").waitFor();
+    assert.equal((await stored(page)).scriptOutputRunsPerJob, 16);
+    await warnings.first().waitFor({ state: "detached" });
   } finally { await page.close(); }
 });
 
@@ -152,7 +168,7 @@ test("the settings search reaches an event script limit", async () => {
   const page = await open("?search=retained");
   try {
     const events = page.getByRole("region", { name: "Event scripts and output retention", exact: true });
-    await events.getByRole("spinbutton", { name: "Retained runs per job", exact: true }).waitFor();
+    await events.getByRole("spinbutton", { name: "Retained runs per download", exact: true }).waitFor();
     assert.equal(await events.getByRole("spinbutton").count(), 1);
     assert.equal(await page.getByRole("region").count(), 1);
   } finally { await page.close(); }
@@ -1036,6 +1052,25 @@ test("testing an instance runs it once against made-up inputs and applies nothin
   } finally { await page.close(); }
 });
 
+test("a test that prints more than its log keeps is marked, and says how much was kept", async () => {
+  const page = await open("?scripts");
+  try {
+    await action(row(page, "Notify"), "Test").click();
+    const dialog = testDialog(page, "Notify");
+    const log = dialog.getByRole("region", { name: "Run log", exact: true });
+    await log.getByText("The script has printed nothing yet.", { exact: true }).waitFor();
+    assert.equal(await log.getByText("Truncated", { exact: true }).count(), 0);
+
+    await advance(page, "overflowed");
+    await log.getByText("Truncated", { exact: true }).waitFor();
+    await log.getByText("Only the last 32 KB of output was kept.", { exact: true }).waitFor();
+    await advance(page, "finished");
+    await dialog.getByText("SUCCEEDED", { exact: true }).waitFor();
+    assert.equal(await log.getByText("Truncated", { exact: true }).count(), 1);
+    await shot(page, "test-dialog-truncated");
+  } finally { await page.close(); }
+});
+
 test("closing the test of a run still going ends the run", async () => {
   const page = await open("?scripts");
   try {
@@ -1087,7 +1122,7 @@ test("a job's script runs group by event, name the instance that ran and open th
       for (const text of texts) assert.equal(await scope.getByText(text, { exact: true }).count(), 1, text);
     }
     await post.getByText("script is no longer in the scripts directory", { exact: true }).waitFor();
-    await post.getByText("Capture limit reached; output was truncated.", { exact: true }).waitFor();
+    await post.getByText("Only the last 32 KB of output was kept.", { exact: true }).waitFor();
     await post.getByText("[REDACTED]").waitFor();
     // Only the run nothing waited for is marked.
     assert.equal(await runs.getByText("Fire and forget", { exact: true }).count(), 1);
@@ -1170,6 +1205,9 @@ test("the runs screen is one table of every run, newest first, with no way to cr
     // Only the run nothing waited for is marked.
     assert.equal(await runsTable(page).getByText("Fire and forget", { exact: true }).count(), 1);
     assert.equal(await rows.nth(5).getByText("Fire and forget", { exact: true }).count(), 1);
+    // Only the run that printed more than was kept says so while shut.
+    assert.equal(await runsTable(page).getByText("Truncated", { exact: true }).count(), 1);
+    assert.equal(await rows.nth(5).getByText("Truncated", { exact: true }).count(), 1);
     // The top bar filters and refreshes; nothing on the screen adds a run.
     const controls = page.locator("#controls").getByRole("button");
     assert.equal(await controls.count(), 2);
@@ -1296,10 +1334,15 @@ test("an open run says why it failed, and when its output is cut or no longer ke
     await rows.nth(1).getByText("Scan", { exact: true }).click();
     await outputOf(page, "intake.py").waitFor({ state: "detached" });
 
-    // A run cut at the capture limit says so; one whose output the daemon has since let go
-    // keeps the excerpt it ended with.
+    // A run that printed more than was kept is marked while shut and says how much was kept
+    // once open; one whose output the daemon has since let go keeps the excerpt it ended with,
+    // and is still marked.
+    await rows.nth(5).getByText("Truncated", { exact: true }).waitFor();
+    assert.equal(await runsTable(page).getByText("Only the last 32 KB of output was kept.", { exact: true }).count(), 0);
     await rows.nth(5).getByText("WARNING", { exact: true }).click();
-    await runsTable(page).getByText("Capture limit reached; output was truncated.", { exact: true }).waitFor();
+    await runsTable(page).getByText("Only the last 32 KB of output was kept.", { exact: true }).waitFor();
+    assert.equal(await rows.nth(5).getByText("Truncated", { exact: true }).count(), 1);
+    await shot(page, "runs-truncated-open");
     await runsTable(page).getByText("Full output is no longer retained.", { exact: true }).waitFor();
     await outputOf(page, "Tidy tv").getByText("cleanup.sh finished", { exact: true }).waitFor();
     await runsTable(page).getByText("cleanup.sh · Fire and forget · SABnzbd · post_processing", { exact: true }).waitFor();

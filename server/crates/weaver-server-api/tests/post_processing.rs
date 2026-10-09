@@ -1310,6 +1310,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
                 finished_at_epoch_ms: 1_000,
             },
             format!("{script} output").into_bytes(),
+            format!("{script} output").len() as u64,
             Default::default(),
         )
         .await
@@ -1412,4 +1413,182 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
         )
         .await;
     assert_has_errors(&nowhere);
+}
+
+/// Record a finished run of `script` on the scan event, with no job.
+async fn record_scan_run(
+    harness: &TestHarness,
+    script: &str,
+    status: weaver_server_core::post_processing::model::ScriptStatus,
+    output_truncated: bool,
+) {
+    use weaver_server_core::post_processing::model::{
+        ScriptAdapter, ScriptEventLabel, ScriptName, ScriptResult,
+    };
+    use weaver_server_core::post_processing::output::retain_output;
+
+    let output = format!("{script} output").into_bytes();
+    let written = if output_truncated {
+        64 * 1024
+    } else {
+        output.len() as u64
+    };
+    retain_output(
+        harness.db.clone(),
+        None,
+        ScriptResult {
+            script: ScriptName::new(script).unwrap(),
+            instance_id: None,
+            instance_name: None,
+            event: ScriptEventLabel::Scan,
+            output_id: None,
+            background: false,
+            adapter: ScriptAdapter::Nzbget,
+            status,
+            exit_code: Some(0),
+            duration_ms: 5,
+            output_tail: String::new(),
+            output_truncated,
+            error_message: None,
+            finished_at_epoch_ms: 1_000,
+        },
+        output,
+        written,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+}
+
+/// The scripts of every recorded run, newest first.
+async fn recorded_scripts(harness: &TestHarness) -> Vec<String> {
+    let response = harness
+        .execute("{ scriptRuns(limit: 50) { runs { script } } }")
+        .await;
+    assert_no_errors(&response);
+    response_data(&response)["scriptRuns"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["script"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn lowering_the_retained_runs_deletes_older_runs_after_the_save_and_raising_deletes_none() {
+    use weaver_server_core::post_processing::model::ScriptStatus;
+
+    let harness = TestHarness::new().await;
+    for (script, status) in [
+        ("one.sh", ScriptStatus::Failed),
+        ("two.sh", ScriptStatus::Succeeded),
+        ("three.sh", ScriptStatus::TimedOut),
+        ("four.sh", ScriptStatus::Succeeded),
+        ("five.sh", ScriptStatus::Succeeded),
+        ("six.sh", ScriptStatus::Succeeded),
+    ] {
+        record_scan_run(&harness, script, status, false).await;
+    }
+    let save = |limits: &'static str| {
+        let harness = &harness;
+        async move {
+            let response = harness
+                .execute(&format!(
+                    "mutation {{ setPostProcessingSettings(input: {{
+                        executionEnabled: false
+                        concurrency: 1
+                        terminationGraceSeconds: 10
+                        {limits}
+                    }}) {{ scriptOutputRunsPerJob scriptOutputFailedRunsPerJob }} }}"
+                ))
+                .await;
+            assert_no_errors(&response);
+            let saved = &response_data(&response)["setPostProcessingSettings"];
+            (
+                saved["scriptOutputRunsPerJob"].as_u64().unwrap(),
+                saved["scriptOutputFailedRunsPerJob"].as_u64().unwrap(),
+            )
+        }
+    };
+
+    assert_eq!(save("").await, (32, 8), "the defaults");
+    assert_eq!(
+        save("scriptOutputRunsPerJob: 64, scriptOutputFailedRunsPerJob: 16").await,
+        (64, 16)
+    );
+    harness.db.script_output_trims_settled().await;
+    assert_eq!(
+        recorded_scripts(&harness).await.len(),
+        6,
+        "raising deletes nothing"
+    );
+
+    // The two newest runs, then the newest failed run of the older ones.
+    assert_eq!(
+        save("scriptOutputRunsPerJob: 2, scriptOutputFailedRunsPerJob: 1").await,
+        (2, 1)
+    );
+    harness.db.script_output_trims_settled().await;
+    assert_eq!(
+        recorded_scripts(&harness).await,
+        ["six.sh", "five.sh", "three.sh"]
+    );
+
+    // Left out, both limits stay as they were.
+    assert_eq!(save("").await, (2, 1));
+    let persisted = harness
+        .execute(
+            "{ postProcessingSettings { scriptOutputRunsPerJob scriptOutputFailedRunsPerJob } }",
+        )
+        .await;
+    assert_no_errors(&persisted);
+    assert_eq!(
+        response_data(&persisted)["postProcessingSettings"],
+        json!({ "scriptOutputRunsPerJob": 2, "scriptOutputFailedRunsPerJob": 1 })
+    );
+
+    for invalid in [
+        "scriptOutputRunsPerJob: 0",
+        "scriptOutputRunsPerJob: 129",
+        "scriptOutputFailedRunsPerJob: 129",
+    ] {
+        let response = harness
+            .execute(&format!(
+                "mutation {{ setPostProcessingSettings(input: {{
+                    executionEnabled: false
+                    concurrency: 1
+                    terminationGraceSeconds: 10
+                    {invalid}
+                }}) {{ scriptOutputRunsPerJob }} }}"
+            ))
+            .await;
+        assert_has_errors(&response);
+    }
+    assert_eq!(save("scriptOutputFailedRunsPerJob: 0").await, (2, 0));
+    harness.db.script_output_trims_settled().await;
+    assert_eq!(recorded_scripts(&harness).await, ["six.sh", "five.sh"]);
+}
+
+#[tokio::test]
+async fn a_run_says_whether_it_printed_more_than_was_kept() {
+    use weaver_server_core::post_processing::model::ScriptStatus;
+
+    let harness = TestHarness::new().await;
+    record_scan_run(&harness, "under.sh", ScriptStatus::Succeeded, false).await;
+    record_scan_run(&harness, "over.sh", ScriptStatus::Cancelled, true).await;
+
+    let response = harness
+        .execute_as(
+            "{ scriptRuns { runs { script status outputTruncated outputRetained } } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["scriptRuns"]["runs"],
+        json!([
+            { "script": "over.sh", "status": "CANCELLED", "outputTruncated": true, "outputRetained": true },
+            { "script": "under.sh", "status": "SUCCEEDED", "outputTruncated": false, "outputRetained": true },
+        ])
+    );
 }

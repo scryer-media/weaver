@@ -4,7 +4,7 @@ import { gql, useClient } from "urql";
 import { SCRIPT_RUNS_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
-import { FireAndForgetTag, ScriptRunName, ScriptStatusMark, scriptRunName } from "../../../components/JobScriptResults";
+import { FireAndForgetTag, ScriptRunName, ScriptStatusMark, TruncatedTag, scriptRunName } from "../../../components/JobScriptResults";
 import { Icon } from "../../../components/icons";
 import { Pagination } from "../../../components/Pagination";
 import { ScriptOutputLog } from "../../../components/ScriptOutputLog";
@@ -308,6 +308,7 @@ export function ScriptRunsPanel() {
             <div key="script" className="flex min-w-0 flex-wrap items-center gap-x-[10px] gap-y-1">
               <ScriptRunName run={run} />
               {run.background ? <FireAndForgetTag /> : null}
+              {run.outputTruncated ? <TruncatedTag /> : null}
             </div>,
             <Cell key="trigger" className="text-[12.5px] text-wv-secondary" title={trigger}>
               {trigger}

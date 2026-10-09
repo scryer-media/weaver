@@ -293,7 +293,7 @@ export function ScriptConfigurationPanel() {
         },
       ],
     },
-    eventScriptSection(t, values, patch),
+    eventScriptSection(t, values, patch, source),
     {
       kind: "section",
       id: "interpreters",

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 
-use super::model::{EventScriptSettings, ScriptEventLabel, ScriptKind, ScriptResult};
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use super::model::{EventScriptSettings, ScriptEventLabel, ScriptKind, ScriptResult, ScriptStatus};
+use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
 const MAX_DECODE_BYTES: usize = 8 * 1024 * 1024;
@@ -65,23 +65,138 @@ pub fn decode_output(bytes: &[u8], ceiling: usize) -> Result<String, StateError>
     Ok(String::from_utf8_lossy(&decoded).into_owned())
 }
 
+/// Kept output is small and written once, so it is compressed hard.
+const COMPRESSION_LEVEL: i32 = 19;
+
+/// Record a run and its kept output. `raw_bytes` is everything the script
+/// wrote, of which `output` is the newest part.
 pub async fn retain_output(
     db: Database,
     job_id: Option<u64>,
     mut result: ScriptResult,
     output: Vec<u8>,
+    raw_bytes: u64,
     limits: EventScriptSettings,
 ) -> Result<ScriptResult, StateError> {
     result.output_tail = excerpt(&output);
     tokio::task::spawn_blocking(move || {
-        let mut compressed = zstd::stream::encode_all(output.as_slice(), 3).map_err(error)?;
-        if compressed.len() as u64 > limits.script_output_run_cap_bytes {
-            compressed.clear();
-        }
-        db.insert_script_output(job_id, result, output.len(), compressed, limits)
+        let compressed =
+            zstd::stream::encode_all(output.as_slice(), COMPRESSION_LEVEL).map_err(error)?;
+        db.insert_script_output(job_id, result, raw_bytes, compressed, limits)
     })
     .await
     .map_err(error)?
+}
+
+/// A run counts against the failed-run allowance when it did not finish its
+/// work: it failed, ran out of time, or was cancelled.
+fn retained_as_failure(status: ScriptStatus) -> bool {
+    matches!(
+        status,
+        ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct StoredStatus {
+    status: ScriptStatus,
+}
+
+/// Of one job's runs (or one event kind's jobless runs), newest first, the
+/// ids the limits no longer keep: past the newest `runs_per_job`, only the
+/// newest `failed_runs_per_job` failed runs stay.
+fn expired_runs(runs: &[(String, bool)], limits: &EventScriptSettings) -> Vec<String> {
+    let mut failed_kept = 0;
+    runs.iter()
+        .skip(limits.script_output_runs_per_job as usize)
+        .filter(|(_, failed)| {
+            let keep = *failed && failed_kept < limits.script_output_failed_runs_per_job;
+            failed_kept += u32::from(keep);
+            !keep
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// The runs the limits count together: a job's runs, or the runs no job owns
+/// of one event (every scan, one schedule's runs, one feed's runs).
+type RetentionGroup = (Option<i64>, Option<String>);
+
+fn retention_group(job_id: Option<i64>, event: &str) -> RetentionGroup {
+    match job_id {
+        Some(_) => (job_id, None),
+        None => (None, Some(event.to_string())),
+    }
+}
+
+fn run_and_failure(row: &SqlRow) -> Result<(String, bool), StateError> {
+    let status = serde_json::from_str::<StoredStatus>(&row.text("result_json")?)
+        .map(|stored| retained_as_failure(stored.status))
+        .unwrap_or(false);
+    Ok((row.text("id")?, status))
+}
+
+async fn delete_runs(tx: &mut SqlTx<'_>, ids: Vec<String>) -> Result<(), StateError> {
+    for chunk in ids.chunks(256) {
+        let sql = format!(
+            "DELETE FROM script_outputs WHERE id IN ({})",
+            vec!["{}"; chunk.len()].join(", ")
+        );
+        let args = chunk.iter().cloned().map(SqlArg::Text).collect::<Vec<_>>();
+        tx.execute(&sql, &args).await?;
+    }
+    Ok(())
+}
+
+/// Apply the retention limits to every job and event kind at once.
+async fn trim_all_tx(tx: &mut SqlTx<'_>, limits: &EventScriptSettings) -> Result<u64, StateError> {
+    tx.execute(
+        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
+        &[],
+    )
+    .await?;
+    let rows = tx
+        .fetch_all(
+            "SELECT id, job_id, event, result_json FROM script_outputs ORDER BY seq DESC",
+            &[],
+        )
+        .await?;
+    let mut groups = std::collections::BTreeMap::<RetentionGroup, Vec<(String, bool)>>::new();
+    for row in rows {
+        let job_id = row.opt_i64("job_id")?;
+        groups
+            .entry(retention_group(job_id, &row.text("event")?))
+            .or_default()
+            .push(run_and_failure(&row)?);
+    }
+    let expired = groups
+        .values()
+        .flat_map(|runs| expired_runs(runs, limits))
+        .collect::<Vec<_>>();
+    let count = expired.len() as u64;
+    delete_runs(tx, expired).await?;
+    Ok(count)
+}
+
+/// Background trims after a retention limit was lowered: one at a time, and a
+/// request made while one runs folds into a single further pass.
+#[derive(Default)]
+pub(crate) struct RetentionTrim {
+    state: std::sync::Mutex<TrimState>,
+    settled: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct TrimState {
+    requested: u64,
+    completed: u64,
+    running: bool,
+}
+
+impl RetentionTrim {
+    fn state(&self) -> std::sync::MutexGuard<'_, TrimState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
 }
 
 /// Record a result that has no output to keep, such as a script that could
@@ -104,66 +219,129 @@ impl Database {
         &self,
         job_id: Option<u64>,
         result: ScriptResult,
-        raw_bytes: usize,
+        raw_bytes: u64,
         output: Vec<u8>,
         limits: EventScriptSettings,
     ) -> Result<ScriptResult, StateError> {
         let datastore = self.datastore();
         let job_id = job_id.map(i64::try_from).transpose().map_err(error)?;
+        let raw_bytes = i64::try_from(raw_bytes).unwrap_or(i64::MAX);
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "retain_script_output", |tx| {
                 let mut result = result.clone();
-                let mut output = output.clone();
+                let output = output.clone();
                 let limits = limits.clone();
                 Box::pin(async move {
-                    // This row serializes insertion/eviction on both SQL backends.
-                    let state = tx.fetch_optional("UPDATE script_output_state SET next_seq = next_seq + 1 WHERE singleton = 1 RETURNING next_seq, used_bytes", &[]).await?.ok_or_else(|| error("script output state is missing"))?;
+                    // This row serializes insertion and trimming on both SQL backends.
+                    let state = tx.fetch_optional("UPDATE script_output_state SET next_seq = next_seq + 1 WHERE singleton = 1 RETURNING next_seq", &[]).await?.ok_or_else(|| error("script output state is missing"))?;
                     let seq = state.i64("next_seq")?;
                     if let Some(job_id) = job_id
                         && tx.fetch_optional("SELECT job_id FROM active_jobs WHERE job_id = {} UNION ALL SELECT job_id FROM job_history WHERE job_id = {} LIMIT 1", &[SqlArg::I64(job_id), SqlArg::I64(job_id)]).await?.is_none() {
                         return Ok(result);
                     }
-                    let mut used = state.i64("used_bytes")?;
-                    let removed = tx.fetch_all("DELETE FROM script_outputs WHERE id IN (SELECT id FROM script_outputs WHERE job_id IS NOT DISTINCT FROM {} AND (job_id IS NOT NULL OR event = {}) ORDER BY seq DESC LIMIT 128 OFFSET {}) RETURNING stored_bytes", &[SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string()), SqlArg::I64(i64::from(limits.script_output_runs_per_job.saturating_sub(1)))]).await?;
-                    for row in removed { used -= row.i64("stored_bytes")?; }
-                    let stored_bytes = output.len() as i64;
-                    let ring_bytes = i64::try_from(limits.script_output_ring_bytes).unwrap_or(i64::MAX);
-                    // Every kept payload counts against the one budget. Event runs
-                    // give way first; post-processing output is evicted, oldest first,
-                    // only to make room for newer post-processing output. An evicted
-                    // run keeps its result and excerpt.
-                    let evictable = if result.event == ScriptEventLabel::PostProcessing {
-                        "stored_bytes > 0 ORDER BY CASE WHEN event = 'post_processing' THEN 1 ELSE 0 END, seq"
-                    } else {
-                        "event <> 'post_processing' AND stored_bytes > 0 ORDER BY seq"
-                    };
-                    let evict = format!("SELECT id, stored_bytes FROM script_outputs WHERE {evictable} LIMIT 128");
-                    'evict: while stored_bytes <= ring_bytes && used + stored_bytes > ring_bytes {
-                        let rows = tx.fetch_all(&evict, &[]).await?;
-                        if rows.is_empty() { break; }
-                        for row in rows {
-                            tx.execute("UPDATE script_outputs SET output = {}, stored_bytes = 0 WHERE id = {}", &[SqlArg::Bytes(Vec::new()), SqlArg::Text(row.text("id")?)]).await?;
-                            used -= row.i64("stored_bytes")?;
-                            if used + stored_bytes <= ring_bytes { break 'evict; }
-                        }
-                    }
-                    // When what may not be evicted fills the budget, the run keeps
-                    // only its excerpt.
-                    let retain = used + stored_bytes <= ring_bytes;
-                    if !retain { output.clear(); }
                     let stored_bytes = output.len() as i64;
                     let mut entropy = [0_u8; 16];
                     getrandom::fill(&mut entropy).map_err(error)?;
                     let id = format!("script-output-{}", hex::encode(entropy));
                     result.output_id = (stored_bytes > 0).then(|| id.clone());
-                        tx.execute("INSERT INTO script_outputs (id, job_id, event, script, seq, raw_bytes, truncated, output, stored_bytes, result_json, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})", &[
-                            SqlArg::Text(id), SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string()), SqlArg::Text(result.script.to_string()), SqlArg::I64(seq), SqlArg::I64(raw_bytes as i64), SqlArg::Bool(result.output_truncated), SqlArg::Bytes(output), SqlArg::I64(stored_bytes), SqlArg::Text(serde_json::to_string(&result).map_err(error)?), SqlArg::I64(result.finished_at_epoch_ms),
-                        ]).await?;
-                        used += stored_bytes;
-                    tx.execute("UPDATE script_output_state SET used_bytes = {} WHERE singleton = 1", &[SqlArg::I64(used.max(0))]).await?;
+                    tx.execute("INSERT INTO script_outputs (id, job_id, event, script, seq, raw_bytes, truncated, output, stored_bytes, result_json, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})", &[
+                        SqlArg::Text(id), SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string()), SqlArg::Text(result.script.to_string()), SqlArg::I64(seq), SqlArg::I64(raw_bytes), SqlArg::Bool(result.output_truncated), SqlArg::Bytes(output), SqlArg::I64(stored_bytes), SqlArg::Text(serde_json::to_string(&result).map_err(error)?), SqlArg::I64(result.finished_at_epoch_ms),
+                    ]).await?;
+                    // A job's runs are kept together; runs that belong to no
+                    // job are kept per kind of event.
+                    let runs = tx.fetch_all("SELECT id, result_json FROM script_outputs WHERE job_id IS NOT DISTINCT FROM {} AND (job_id IS NOT NULL OR event = {}) ORDER BY seq DESC", &[SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string())]).await?
+                        .iter()
+                        .map(run_and_failure)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    delete_runs(tx, expired_runs(&runs, &limits)).await?;
                     Ok(result)
                 })
             }).await
+        })
+    }
+
+    /// Trim every job and event kind to the stored retention limits, in the
+    /// background, after a limit was lowered. Returns at once; see
+    /// [`Database::script_output_trims_settled`].
+    pub fn request_script_output_trim(&self) {
+        let trim = &self.script_runtime.trim;
+        {
+            let mut state = trim.state();
+            state.requested += 1;
+            if state.running {
+                // The pass under way, or the one after it, sees this request.
+                return;
+            }
+            state.running = true;
+        }
+        let db = self.clone();
+        let pass = async move {
+            loop {
+                let target = db.script_runtime.trim.state().requested;
+                let worker = db.clone();
+                let outcome = tokio::task::spawn_blocking(move || worker.trim_script_outputs())
+                    .await
+                    .map_err(error)
+                    .and_then(|outcome| outcome);
+                if let Err(error) = outcome {
+                    tracing::warn!(%error, "could not trim retained script runs");
+                }
+                let trim = &db.script_runtime.trim;
+                let again = {
+                    let mut state = trim.state();
+                    state.completed = target;
+                    state.running = state.requested > target;
+                    state.running
+                };
+                trim.settled.notify_waiters();
+                if !again {
+                    break;
+                }
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(pass);
+            }
+            // Outside a runtime nothing is waiting on a request path: trim
+            // here.
+            Err(_) => {
+                drop(pass);
+                if let Err(error) = self.trim_script_outputs() {
+                    tracing::warn!(%error, "could not trim retained script runs");
+                }
+                let mut state = self.script_runtime.trim.state();
+                state.completed = state.requested;
+                state.running = false;
+            }
+        }
+    }
+
+    /// Wait until every trim requested before this call has finished.
+    pub async fn script_output_trims_settled(&self) {
+        let trim = &self.script_runtime.trim;
+        let target = trim.state().requested;
+        loop {
+            let settled = trim.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            if trim.state().completed >= target {
+                return;
+            }
+            settled.await;
+        }
+    }
+
+    /// Apply the stored retention limits to every recorded run now.
+    pub fn trim_script_outputs(&self) -> Result<u64, StateError> {
+        let limits = self.post_processing_settings()?.event_scripts;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "trim_script_outputs", |tx| {
+                let limits = limits.clone();
+                Box::pin(async move { trim_all_tx(tx, &limits).await })
+            })
+            .await
         })
     }
 
@@ -321,26 +499,15 @@ pub(crate) async fn delete_script_state_tx(
     tx: &mut SqlTx<'_>,
     job_id: i64,
 ) -> Result<(), StateError> {
+    // Taken in the same order as insertion takes it.
     tx.execute(
-        "UPDATE script_output_state SET used_bytes = used_bytes WHERE singleton = 1",
+        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
         &[],
     )
     .await?;
-    let rows = tx
-        .fetch_all(
-            "DELETE FROM script_outputs WHERE job_id = {} RETURNING stored_bytes",
-            &[SqlArg::I64(job_id)],
-        )
-        .await?;
-    let bytes = rows
-        .into_iter()
-        .map(|row| row.i64("stored_bytes"))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .sum::<i64>();
     tx.execute(
-        "UPDATE script_output_state SET used_bytes = used_bytes - {} WHERE singleton = 1",
-        &[SqlArg::I64(bytes)],
+        "DELETE FROM script_outputs WHERE job_id = {}",
+        &[SqlArg::I64(job_id)],
     )
     .await?;
     tx.execute(
@@ -358,7 +525,7 @@ pub(crate) async fn delete_script_state_tx(
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::{ScriptAdapter, ScriptName, ScriptStatus};
+    use super::super::model::{ScriptAdapter, ScriptName};
     use super::*;
 
     fn active(db: &Database, id: u64) {
@@ -383,6 +550,18 @@ mod tests {
         .unwrap();
     }
 
+    /// Record a run whose kept output is everything it wrote.
+    async fn retain_output(
+        db: Database,
+        job_id: Option<u64>,
+        result: ScriptResult,
+        output: Vec<u8>,
+        limits: EventScriptSettings,
+    ) -> Result<ScriptResult, StateError> {
+        let written = output.len() as u64;
+        super::retain_output(db, job_id, result, output, written, limits).await
+    }
+
     fn result(event: ScriptEventLabel) -> ScriptResult {
         ScriptResult {
             script: ScriptName::new("test.sh").unwrap(),
@@ -405,7 +584,7 @@ mod tests {
     #[test]
     fn decode_is_bounded_and_accepts_legacy_plain_text() {
         assert_eq!(decode_output(b"legacy", 6).unwrap(), "legacy");
-        let bytes = zstd::stream::encode_all(&b"1234567"[..], 3).unwrap();
+        let bytes = zstd::stream::encode_all(&b"1234567"[..], COMPRESSION_LEVEL).unwrap();
         assert!(decode_output(&bytes, 6).is_err());
         assert_eq!(decode_output(&bytes, 7).unwrap(), "1234567");
     }
@@ -501,169 +680,274 @@ mod tests {
         assert!(retained.contains(second.output_id.as_deref().unwrap()));
     }
 
-    #[tokio::test]
-    async fn global_eviction_preserves_terminal_output_and_event_excerpts() {
-        let db = Database::open_in_memory().unwrap();
-        for id in 1..=3 {
-            active(&db, id);
+    fn with_status(event: ScriptEventLabel, status: ScriptStatus) -> ScriptResult {
+        ScriptResult {
+            status,
+            ..result(event)
         }
-        let body: Vec<u8> = (0..=255).collect();
-        let compressed = zstd::stream::encode_all(body.as_slice(), 3).unwrap().len() as u64;
-        let limits = EventScriptSettings {
-            script_output_ring_bytes: compressed + 16,
-            ..Default::default()
-        };
-        let terminal = retain_output(
-            db.clone(),
-            Some(1),
-            result(ScriptEventLabel::PostProcessing),
-            b"PP".to_vec(),
-            limits.clone(),
-        )
-        .await
-        .unwrap();
-        let event = ScriptEventLabel::Queue(super::super::model::QueueEvent::NzbAdded);
-        let old = retain_output(
-            db.clone(),
-            Some(2),
-            result(event.clone()),
-            body.clone(),
-            limits.clone(),
-        )
-        .await
-        .unwrap();
-        let new = retain_output(db.clone(), Some(3), result(event), body, limits)
-            .await
-            .unwrap();
-        assert!(
-            db.script_output_retained(terminal.output_id.as_deref().unwrap())
-                .unwrap()
-        );
-        assert!(
-            !db.script_output_retained(old.output_id.as_deref().unwrap())
-                .unwrap()
-        );
-        assert!(
-            db.script_output_retained(new.output_id.as_deref().unwrap())
-                .unwrap()
-        );
-        assert_eq!(
-            db.event_script_results(2).unwrap()[0].output_tail,
-            old.output_tail
-        );
-        db.delete_active_job(crate::JobId(3)).unwrap();
-        assert!(
-            !db.script_output_retained(new.output_id.as_deref().unwrap())
-                .unwrap()
-        );
-        assert!(db.event_script_results(3).unwrap().is_empty());
+    }
+
+    fn runs_of(db: &Database, job_id: Option<u64>) -> Vec<ScriptRun> {
+        db.script_runs(Default::default(), None, 500)
+            .unwrap()
+            .into_iter()
+            .filter(|run| run.job_id == job_id)
+            .collect()
+    }
+
+    fn tails(runs: &[ScriptRun]) -> Vec<String> {
+        runs.iter()
+            .map(|run| run.result.output_tail.clone())
+            .collect()
     }
 
     #[tokio::test]
-    async fn global_budget_bounds_post_processing_output() {
-        let db = Database::open_in_memory().unwrap();
-        for id in 1..=4 {
-            active(&db, id);
-        }
-        let body: Vec<u8> = (0..=255).collect();
-        let compressed = zstd::stream::encode_all(body.as_slice(), 3).unwrap().len() as u64;
-        let limits = EventScriptSettings {
-            script_output_ring_bytes: compressed + compressed / 2,
-            ..Default::default()
-        };
-        let pass = |job_id: u64| {
-            retain_output(
-                db.clone(),
-                Some(job_id),
-                result(ScriptEventLabel::PostProcessing),
-                body.clone(),
-                limits.clone(),
-            )
-        };
-        let first = pass(1).await.unwrap();
-        let event = ScriptEventLabel::Queue(super::super::model::QueueEvent::NzbAdded);
-        // An event run does not displace post-processing output; it keeps only
-        // its excerpt.
-        let queued = retain_output(
-            db.clone(),
-            Some(2),
-            result(event),
-            body.clone(),
-            limits.clone(),
-        )
-        .await
-        .unwrap();
-        assert!(queued.output_id.is_none());
-        assert!(
-            db.script_output_retained(first.output_id.as_deref().unwrap())
-                .unwrap()
-        );
-
-        // A newer pass evicts the oldest pass's output, not its result.
-        let second = pass(3).await.unwrap();
-        assert!(
-            !db.script_output_retained(first.output_id.as_deref().unwrap())
-                .unwrap()
-        );
-        assert!(
-            db.script_output_retained(second.output_id.as_deref().unwrap())
-                .unwrap()
-        );
-        let runs = db
-            .script_runs(
-                ScriptRunFilter {
-                    job_id: Some(1),
-                    ..Default::default()
-                },
-                None,
-                10,
-            )
-            .unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].result.output_tail, first.output_tail);
-        assert!(!runs[0].output_retained);
-
-        // Output larger than the whole budget is not kept, and evicts nothing.
-        let tight = EventScriptSettings {
-            script_output_ring_bytes: compressed - 1,
-            ..limits
-        };
-        let oversized = retain_output(
-            db.clone(),
-            Some(4),
-            result(ScriptEventLabel::PostProcessing),
-            body,
-            tight,
-        )
-        .await
-        .unwrap();
-        assert!(oversized.output_id.is_none());
-        assert!(!oversized.output_tail.is_empty());
-        assert!(
-            db.script_output_retained(second.output_id.as_deref().unwrap())
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn cap_keeps_result_and_deleted_jobs_cannot_recreate_output() {
+    async fn a_job_keeps_only_its_newest_runs_rows_and_output_together() {
         let db = Database::open_in_memory().unwrap();
         active(&db, 1);
+        active(&db, 2);
         let limits = EventScriptSettings {
-            script_output_run_cap_bytes: 1,
+            script_output_runs_per_job: 3,
             ..Default::default()
         };
-        let event = ScriptEventLabel::Queue(super::super::model::QueueEvent::NzbAdded);
-        let stored = retain_output(
+        let mut kept = Vec::new();
+        for n in 0..6 {
+            kept.push(
+                retain_output(
+                    db.clone(),
+                    Some(1),
+                    result(ScriptEventLabel::PostProcessing),
+                    format!("run {n}").into_bytes(),
+                    limits.clone(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        retain_output(
             db.clone(),
-            Some(1),
-            result(event.clone()),
-            b"excerpt".to_vec(),
+            Some(2),
+            result(ScriptEventLabel::PostProcessing),
+            b"other job".to_vec(),
             limits,
         )
         .await
         .unwrap();
-        assert!(stored.output_id.is_none());
+        assert_eq!(tails(&runs_of(&db, Some(1))), ["run 5", "run 4", "run 3"]);
+        assert_eq!(tails(&runs_of(&db, Some(2))), ["other job"]);
+        // A run that is no longer kept leaves no output behind either.
+        assert_eq!(
+            db.script_output(kept[0].output_id.as_deref().unwrap())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.script_output(kept[5].output_id.as_deref().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("run 5")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_runs_outlast_the_newest_runs_up_to_their_own_limit() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        let limits = EventScriptSettings {
+            script_output_runs_per_job: 2,
+            script_output_failed_runs_per_job: 2,
+            ..Default::default()
+        };
+        let recorded = [
+            ("failed 0", ScriptStatus::Failed),
+            ("ok 1", ScriptStatus::Succeeded),
+            ("timed out 2", ScriptStatus::TimedOut),
+            ("warning 3", ScriptStatus::Warning),
+            ("cancelled 4", ScriptStatus::Cancelled),
+            ("skipped 5", ScriptStatus::Skipped),
+            ("ok 6", ScriptStatus::Succeeded),
+            ("ok 7", ScriptStatus::Succeeded),
+        ];
+        for (output, status) in recorded {
+            retain_output(
+                db.clone(),
+                Some(1),
+                with_status(ScriptEventLabel::PostProcessing, status),
+                output.as_bytes().to_vec(),
+                limits.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        // The newest two, then the newest two failures; the oldest failure,
+        // and every older run that did not fail, are gone.
+        assert_eq!(
+            tails(&runs_of(&db, Some(1))),
+            ["ok 7", "ok 6", "cancelled 4", "timed out 2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_without_a_job_are_kept_per_event() {
+        let db = Database::open_in_memory().unwrap();
+        let limits = EventScriptSettings {
+            script_output_runs_per_job: 1,
+            script_output_failed_runs_per_job: 1,
+            ..Default::default()
+        };
+        for (event, output, status) in [
+            (ScriptEventLabel::Scan, "scan failed", ScriptStatus::Failed),
+            (ScriptEventLabel::Scan, "scan old", ScriptStatus::Succeeded),
+            // Each feed keeps runs of its own.
+            (ScriptEventLabel::Feed(1), "feed 1", ScriptStatus::Succeeded),
+            (ScriptEventLabel::Feed(2), "feed 2", ScriptStatus::Succeeded),
+            (ScriptEventLabel::Scan, "scan new", ScriptStatus::Succeeded),
+        ] {
+            retain_output(
+                db.clone(),
+                None,
+                with_status(event, status),
+                output.as_bytes().to_vec(),
+                limits.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            tails(&runs_of(&db, None)),
+            ["scan new", "feed 2", "feed 1", "scan failed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn lowering_a_limit_trims_every_job_and_event_kind_soon_after_the_save() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        active(&db, 2);
+        let generous = EventScriptSettings::default();
+        for job_id in [Some(1), Some(2), None] {
+            for (n, status) in [
+                ScriptStatus::Failed,
+                ScriptStatus::Succeeded,
+                ScriptStatus::Failed,
+                ScriptStatus::Succeeded,
+                ScriptStatus::Succeeded,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                retain_output(
+                    db.clone(),
+                    job_id,
+                    with_status(ScriptEventLabel::Scan, status),
+                    format!("{n}").into_bytes(),
+                    generous.clone(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let mut settings = db.post_processing_settings().unwrap();
+        // Raising a limit deletes nothing.
+        settings.event_scripts.script_output_runs_per_job = 64;
+        db.save_post_processing_settings_preserving_extensions(settings.clone(), true)
+            .unwrap();
+        db.script_output_trims_settled().await;
+        assert_eq!(db.script_run_count(&Default::default()).unwrap(), 15);
+
+        settings.event_scripts.script_output_runs_per_job = 2;
+        settings.event_scripts.script_output_failed_runs_per_job = 1;
+        db.save_post_processing_settings_preserving_extensions(settings, true)
+            .unwrap();
+        db.script_output_trims_settled().await;
+        for job_id in [Some(1), Some(2), None] {
+            assert_eq!(tails(&runs_of(&db, job_id)), ["4", "3", "2"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trim_requested_while_one_runs_is_folded_into_one_more_pass() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        for n in 0..4 {
+            retain_output(
+                db.clone(),
+                Some(1),
+                result(ScriptEventLabel::PostProcessing),
+                format!("{n}").into_bytes(),
+                EventScriptSettings::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut settings = db.post_processing_settings().unwrap();
+        settings.event_scripts.script_output_runs_per_job = 3;
+        db.save_post_processing_settings(&settings).unwrap();
+        settings.event_scripts.script_output_runs_per_job = 1;
+        db.save_post_processing_settings(&settings).unwrap();
+        db.script_output_trims_settled().await;
+        // The later, lower limit is the one that holds.
+        assert_eq!(tails(&runs_of(&db, Some(1))), ["3"]);
+        let state = db.script_runtime.trim.state();
+        assert!(!state.running);
+        assert_eq!(state.completed, state.requested);
+    }
+
+    #[tokio::test]
+    async fn the_stored_run_counts_every_byte_written_and_is_compressed_hard() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        let output = b"kept tail\n".repeat(100);
+        let kept = super::retain_output(
+            db.clone(),
+            Some(1),
+            ScriptResult {
+                output_truncated: true,
+                ..result(ScriptEventLabel::PostProcessing)
+            },
+            output.clone(),
+            1_000_000,
+            EventScriptSettings::default(),
+        )
+        .await
+        .unwrap();
+        let id = kept.output_id.clone().unwrap();
+        let datastore = db.datastore();
+        let row = db
+            .run_sql_blocking_read(async move {
+                SqlRuntime::fetch_optional(
+                    datastore.read_exec(),
+                    "SELECT raw_bytes, truncated, output FROM script_outputs WHERE id = {}",
+                    &[SqlArg::Text(id)],
+                )
+                .await
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.i64("raw_bytes").unwrap(), 1_000_000);
+        assert!(row.bool("truncated").unwrap());
+        assert_eq!(
+            row.bytes("output").unwrap(),
+            zstd::stream::encode_all(output.as_slice(), 19).unwrap()
+        );
+        let runs = runs_of(&db, Some(1));
+        assert!(runs[0].result.output_truncated);
+    }
+
+    #[tokio::test]
+    async fn deleted_jobs_cannot_recreate_output() {
+        let db = Database::open_in_memory().unwrap();
+        active(&db, 1);
+        let event = ScriptEventLabel::Queue(super::super::model::QueueEvent::NzbAdded);
+        retain_output(
+            db.clone(),
+            Some(1),
+            result(event.clone()),
+            b"excerpt".to_vec(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             db.event_script_results(1).unwrap()[0].output_tail,
             "excerpt"

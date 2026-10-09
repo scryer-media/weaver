@@ -7,7 +7,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { Dialog } from "../../../components/Dialog";
-import { ScriptStatusMark } from "../../../components/JobScriptResults";
+import { ScriptStatusMark, TruncatedTag } from "../../../components/JobScriptResults";
 import { SectionHeader, Square } from "../../../components/chrome";
 import { SecondaryButton } from "../../../components/controls";
 import { EM_DASH } from "../../../data/format";
@@ -306,7 +306,10 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
                 </span>
               )}
               {run.logTruncated ? (
-                <span className="font-wv-mono text-[11px] text-wv-muted">{t("next.job.scriptOutputTruncated")}</span>
+                <span className="flex flex-wrap items-center gap-x-[10px] gap-y-1">
+                  <TruncatedTag />
+                  <span className="font-wv-mono text-[11px] text-wv-muted">{t("next.job.scriptOutputTruncated")}</span>
+                </span>
               ) : null}
             </div>
           </section>
