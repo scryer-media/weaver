@@ -371,6 +371,36 @@
       "rationale": "Cancelling mid-script needs a job that is still executing; the browser flow asserts completed script results instead."
     },
     {
+      "name": "cancelScriptTest",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "Cancelling a test needs a script that is still executing; the server API tests and the web Scripts screen tests against a mocked daemon cover it."
+    },
+    {
+      "name": "createScriptInstance",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow does not open the instance editor; the server API tests and the web Scripts screen tests against a mocked daemon cover creating an instance."
+    },
+    {
+      "name": "deleteScriptInstance",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow does not delete an instance; the server API tests cover the rules and feed attachments that go with it, and the web Scripts screen tests cover the confirmation."
+    },
+    {
+      "name": "reapplyScriptHeader",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "Header drift needs a script whose header changes under a saved instance; the server API tests and the web Scripts screen tests against a mocked daemon cover re-applying it."
+    },
+    {
+      "name": "reorderScriptInstances",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow does not reorder instances; the server API tests and the web Scripts screen tests against a mocked daemon cover the run order."
+    },
+    {
       "name": "reprocessJob",
       "owner": "ui-post-processing",
       "oracle": "unit-only",
@@ -404,14 +434,28 @@
       "oracle": "browser"
     },
     {
-      "name": "setScriptLists",
+      "name": "scriptRun",
       "owner": "ui-post-processing",
-      "oracle": "browser"
+      "oracle": "unit-only",
+      "rationale": "Only a running script calling with its run token reaches this; the server API tests play the run and the app tests drive real gated scripts against it. The browser never calls it."
     },
     {
-      "name": "setScriptOptions",
+      "name": "setUpScriptFromHeader",
       "owner": "ui-post-processing",
-      "oracle": "browser"
+      "oracle": "unit-only",
+      "rationale": "The browser flow does not set a script up from its header; the server API tests and the web Scripts screen tests against a mocked daemon cover the instances it creates."
+    },
+    {
+      "name": "testScriptInstance",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow asserts the results of real runs, not a test run; the server API tests and the web Scripts screen tests against a mocked daemon cover the Test dialog."
+    },
+    {
+      "name": "updateScriptInstance",
+      "owner": "ui-post-processing",
+      "oracle": "unit-only",
+      "rationale": "The browser flow does not edit an instance; the server API tests and the web Scripts screen tests against a mocked daemon cover saving one, a kept secret included."
     },
     {
       "name": "acceptHistoryDelete",

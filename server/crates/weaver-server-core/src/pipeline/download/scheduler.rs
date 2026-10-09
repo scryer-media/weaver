@@ -274,6 +274,7 @@ impl Pipeline {
                 let state = self.jobs.get(job_id)?;
                 if state.download_queue.is_empty()
                     || !Self::status_allows_download_dispatch(&state.status)
+                    || self.held_for_added_scripts(*job_id)
                 {
                     return None;
                 }

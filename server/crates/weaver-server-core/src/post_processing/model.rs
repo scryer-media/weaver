@@ -837,102 +837,24 @@ fn validate_sections(sections: &[NzbgetSection]) -> Result<(), PostProcessingVal
     }
 }
 
-/// One ordered entry in a script list.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScriptListEntry {
-    pub script: ScriptName,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// `None` runs the script under the 24-hour default timeout.
-    #[serde(default)]
-    pub timeout_seconds: Option<u64>,
-    /// A blocking script is run in line: the next script waits for it, and so
-    /// does whatever its trigger holds. One that is not is started and left to
-    /// finish on its own, and its result changes nothing. Scan and feed
-    /// scripts are always waited for, because what they return is used.
-    #[serde(default = "default_true")]
-    pub blocking: bool,
+/// Whether the instances that run for every category still run for a
+/// download whose category has instances of its own.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlobalScriptsRun {
+    /// Unscoped instances first, then the category's own.
+    #[default]
+    Always,
+    /// A category with instances of its own runs only those.
+    OnlyWithoutCategoryScripts,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-impl ScriptListEntry {
-    pub fn new(script: ScriptName) -> Self {
-        Self {
-            script,
-            enabled: true,
-            timeout_seconds: None,
-            blocking: true,
+impl GlobalScriptsRun {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::OnlyWithoutCategoryScripts => "only_without_category_scripts",
         }
-    }
-
-    fn validate(&self) -> Result<(), PostProcessingValidationError> {
-        if self.timeout_seconds == Some(0) {
-            return Err(PostProcessingValidationError::InvalidPolicy);
-        }
-        Ok(())
-    }
-}
-
-/// An ordered list of scripts, used for the global default and each category override.
-#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ScriptList(Vec<ScriptListEntry>);
-
-impl ScriptList {
-    pub fn new(entries: Vec<ScriptListEntry>) -> Result<Self, PostProcessingValidationError> {
-        let mut seen = HashSet::new();
-        for entry in &entries {
-            entry.validate()?;
-            if !seen.insert(entry.script.as_str().to_string()) {
-                return Err(PostProcessingValidationError::DuplicateScriptName);
-            }
-        }
-        Ok(Self(entries))
-    }
-
-    pub fn entries(&self) -> &[ScriptListEntry] {
-        &self.0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// The entries that will actually run, in order.
-    pub fn enabled_entries(&self) -> impl Iterator<Item = &ScriptListEntry> {
-        self.0.iter().filter(|entry| entry.enabled)
-    }
-}
-
-/// Global default plus per-category overrides. Resolution happens at execution time.
-#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScriptLists {
-    #[serde(default)]
-    pub global: ScriptList,
-    #[serde(default)]
-    pub categories: std::collections::BTreeMap<String, ScriptList>,
-}
-
-impl ScriptLists {
-    /// Category override when one exists for `category`, otherwise the global default.
-    ///
-    /// Category keys are matched case-insensitively because download clients echo
-    /// their own casing back to weaver.
-    pub fn resolve(&self, category: Option<&str>) -> &ScriptList {
-        category
-            .and_then(|category| {
-                let category = category.trim();
-                self.categories
-                    .iter()
-                    .find(|(key, _)| key.eq_ignore_ascii_case(category))
-                    .map(|(_, list)| list)
-            })
-            .unwrap_or(&self.global)
     }
 }
 
@@ -996,6 +918,8 @@ pub struct PostProcessingSettings {
     /// trustworthy output name. An empty list disables the policy.
     #[serde(default)]
     pub unacceptable_extensions: Vec<String>,
+    #[serde(default)]
+    pub global_scripts_run: GlobalScriptsRun,
 }
 
 impl Default for PostProcessingSettings {
@@ -1009,6 +933,7 @@ impl Default for PostProcessingSettings {
             powershell_interpreter: None,
             batch_interpreter: None,
             unacceptable_extensions: Vec::new(),
+            global_scripts_run: GlobalScriptsRun::default(),
         }
     }
 }
@@ -1179,6 +1104,12 @@ impl ScriptStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ScriptResult {
     pub script: ScriptName,
+    /// The instance that ran, when the run came from one. Its name is kept as
+    /// it was at the time, so a result still reads right after a rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_name: Option<String>,
     #[serde(default)]
     pub event: ScriptEventLabel,
     #[serde(default)]
@@ -1197,4 +1128,14 @@ pub struct ScriptResult {
     #[serde(default)]
     pub error_message: Option<String>,
     pub finished_at_epoch_ms: i64,
+}
+
+impl ScriptResult {
+    /// What the run is called wherever it is shown: the instance's name, or
+    /// the script's for a result recorded before there were instances.
+    pub fn label(&self) -> &str {
+        self.instance_name
+            .as_deref()
+            .unwrap_or_else(|| self.script.as_str())
+    }
 }

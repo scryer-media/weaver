@@ -49,7 +49,11 @@ impl Guard for FreshAdminGuard {
         let identity = ctx
             .data::<CallerIdentity>()
             .map_err(|_| internal_error("missing caller identity"))?;
-        if matches!(identity, CallerIdentity::ApiKey(_)) {
+        // A machine credential has no password to have typed recently.
+        if matches!(
+            identity,
+            CallerIdentity::ApiKey(_) | CallerIdentity::ScriptRun(_)
+        ) {
             return Ok(());
         }
         let CallerIdentity::Jwt(hash) = identity else {

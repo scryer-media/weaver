@@ -5,18 +5,18 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
+use super::callbacks::{RunAction, RunRequest, RunRequests};
 use super::directives::{Directive, ScriptLogLevel, ScriptOutputEvent};
-use super::executor::{execution_refusal, resolve_script_list, strict_security_enabled};
+use super::executor::{execution_refusal, strict_security_enabled};
+use super::instances::{InstanceTrigger, ScriptInstance};
 use super::listing::DiscoveredScript;
 use super::model::{
-    PostProcessingSettings, QueueEvent, ScriptEventLabel, ScriptKind, ScriptList, ScriptListEntry,
-    ScriptName, ScriptResult, ScriptStatus,
+    PostProcessingSettings, QueueEvent, ScriptAdapter, ScriptEventLabel, ScriptResult, ScriptStatus,
 };
 use super::runner::{
     CompatibilityFacts, ExecutionDisposition, ExecutionSpec, InterpreterConfig,
-    JobExecutionContext, execute_spec,
+    JobExecutionContext, RunIdentity, execute_spec,
 };
-use super::settings::ScriptOptionsSnapshot;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::persistence::{Database, StateError};
 
@@ -25,7 +25,7 @@ type BackgroundRuns = BTreeMap<u64, (Option<u64>, watch::Sender<bool>)>;
 
 /// Fire-and-forget runs allowed at once. They are bounded apart from the
 /// scripts weaver waits for, so neither takes a turn from the other.
-const BACKGROUND_RUNS: usize = 8;
+const BACKGROUND_RUNS: usize = 32;
 
 struct BackgroundLane {
     turns: std::sync::Arc<tokio::sync::Semaphore>,
@@ -129,6 +129,8 @@ pub(crate) struct ScriptRuntime {
     admissions: std::sync::Mutex<QueueAdmissions>,
     durable_events_seen: std::sync::atomic::AtomicBool,
     background: BackgroundLane,
+    pub(super) tests: super::test_run::TestRuns,
+    pub(super) live: std::sync::Arc<super::callbacks::LiveRuns>,
 }
 
 #[derive(Clone, Copy)]
@@ -209,7 +211,15 @@ pub struct EventContext {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub facts: CompatibilityFacts,
-    pub scripts: Option<ScriptList>,
+    /// The instances to run in place of the ones saved for the event's
+    /// trigger. A queued event never carries any: the saved ones are read
+    /// when its turn comes.
+    #[serde(skip)]
+    pub instances: Option<Vec<ScriptInstance>>,
+    /// Scratch files the run reads. A script nothing waits for keeps them
+    /// until it ends, after whatever raised the event has gone on.
+    #[serde(skip)]
+    pub scratch: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl EventContext {
@@ -268,19 +278,33 @@ impl EventContext {
             cwd: context.working_directory.clone(),
             env,
             facts: context.compatibility.clone(),
-            scripts: None,
+            instances: None,
+            scratch: None,
         }
     }
 
-    fn kind(&self) -> ScriptKind {
-        self.event.kind()
+    /// What weaver's own variables say about the thing the event is about.
+    pub(super) fn weaver_env(&self) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        if let Some(job_id) = self.job_id {
+            env.insert("WEAVER_JOB_ID".to_string(), job_id.to_string());
+        }
+        if let Some(name) = ["NZBNA_NZBNAME", "NZBNP_NZBNAME"]
+            .into_iter()
+            .find_map(|key| self.env.get(key))
+        {
+            env.insert("WEAVER_JOB_NAME".into(), name.clone());
+        }
+        env.insert(
+            "WEAVER_CATEGORY".into(),
+            self.category.clone().unwrap_or_default(),
+        );
+        env.insert(
+            "WEAVER_DIRECTORY".into(),
+            self.cwd.to_string_lossy().into_owned(),
+        );
+        env
     }
-}
-
-/// Whether the event waits for `entry`. A scan or feed script is always waited
-/// for: what it returns is what weaver goes on with.
-fn waits_for(event: &ScriptEventLabel, entry: &ScriptListEntry) -> bool {
-    entry.blocking || matches!(event, ScriptEventLabel::Scan | ScriptEventLabel::Feed(_))
 }
 
 /// A turn among the event scripts weaver waits for, or `None` when the run was
@@ -316,21 +340,25 @@ async fn event_turn(
     }
 }
 
-pub fn selected_scripts(db: &Database, context: &EventContext) -> Result<ScriptList, StateError> {
-    if let Some(list) = &context.scripts {
-        return Ok(list.clone());
+/// The instances an event runs: the ones handed to it, or the ones saved for
+/// its trigger and category.
+pub fn selected_scripts(
+    db: &Database,
+    context: &EventContext,
+) -> Result<Vec<ScriptInstance>, StateError> {
+    if let Some(instances) = &context.instances {
+        return Ok(instances
+            .iter()
+            .filter(|instance| instance.enabled)
+            .cloned()
+            .collect());
     }
-    let lists = db.post_processing_script_lists()?;
-    Ok(resolve_script_list(
-        &lists,
-        context.category.as_deref(),
-        super::settings::job_script_override(&context.facts.parameters),
-    ))
+    db.script_instances_for(&context.event, context.category.as_deref())
 }
 
-pub(crate) fn refresh_admission_hint(
-    db: &Database,
-) -> Result<(bool, super::model::ScriptLists), StateError> {
+/// Record whether a queue event could have anything to run, and return
+/// whether script execution is refused altogether.
+pub(crate) fn refresh_admission_hint(db: &Database) -> Result<bool, StateError> {
     let revision = db
         .script_runtime
         .admission_hint
@@ -339,19 +367,16 @@ pub(crate) fn refresh_admission_hint(
         .0;
     let settings = db.post_processing_settings()?;
     let disabled = execution_refusal(&settings, strict_security_enabled()).is_some();
-    let lists = db.post_processing_script_lists()?;
-    let hint = if disabled {
-        AdmissionHint::Disabled
-    } else if lists.global.enabled_entries().next().is_none()
-        && lists
-            .categories
-            .values()
-            .all(|list| list.enabled_entries().next().is_none())
-    {
-        AdmissionHint::NoConfiguredScripts
-    } else {
-        AdmissionHint::Possible
-    };
+    let hint =
+        if disabled {
+            AdmissionHint::Disabled
+        } else if db.script_instances()?.iter().any(|instance| {
+            instance.enabled && matches!(instance.trigger, InstanceTrigger::Queue(_))
+        }) {
+            AdmissionHint::Possible
+        } else {
+            AdmissionHint::NoConfiguredScripts
+        };
     {
         let mut cache = db
             .script_runtime
@@ -362,39 +387,20 @@ pub(crate) fn refresh_admission_hint(
             cache.1 = Some(hint);
         }
     }
-    Ok((disabled, lists))
+    Ok(disabled)
 }
 
 pub fn has_subscriber(db: &Database, context: &EventContext) -> Result<bool, StateError> {
-    let (disabled, lists) = refresh_admission_hint(db)?;
-    if disabled {
+    if refresh_admission_hint(db)? {
         return Ok(false);
     }
-    let root = db.post_processing_script_directory()?;
-    let list = context.scripts.clone().unwrap_or_else(|| {
-        resolve_script_list(
-            &lists,
-            context.category.as_deref(),
-            super::settings::job_script_override(&context.facts.parameters),
-        )
-    });
-    Ok(list.enabled_entries().any(|entry| {
-        super::listing::resolve_script(&root, &entry.script).is_ok_and(|script| {
-            script.manifest.kinds().contains(&context.kind())
-                && match context.event {
-                    ScriptEventLabel::Queue(event) => {
-                        script.manifest.queue_events().contains(&event)
-                    }
-                    _ => true,
-                }
-        })
-    }))
+    Ok(!selected_scripts(db, context)?.is_empty())
 }
 
-/// Execute matching entries in configured order. Scan category directives are
-/// resolved again before selecting the next entry. An entry the event does not
-/// wait for is started at its place in the order and left to finish on its
-/// own; it has no part in what this returns.
+/// Run the event's instances in order. A scan script may move the download to
+/// another category, so the instances are read again before each one. An
+/// instance the event does not wait for is started at its place in the order
+/// and left to finish on its own; it has no part in what this returns.
 pub async fn run_event(
     db: &Database,
     context: &mut EventContext,
@@ -437,11 +443,8 @@ pub async fn run_event(
     }
     let cancellation = Some(cancel_rx.clone());
     let mut root = db.post_processing_script_directory()?;
-    let mut options = db
-        .post_processing_script_options_snapshot()
-        .map_err(|error| error.to_string());
     let mut turn = None;
-    let mut visited = BTreeSet::<ScriptName>::new();
+    let mut visited = BTreeSet::<String>::new();
     let mut results = Vec::new();
     loop {
         let settings = db.post_processing_settings()?;
@@ -451,15 +454,13 @@ pub async fn run_event(
         if let Some(job_id) = context.job_id {
             db.refresh_script_job_inputs(job_id, &mut context.facts)?;
         }
-        let list = selected_scripts(db, context)?;
-        let Some(entry) = list
-            .enabled_entries()
-            .find(|entry| !visited.contains(&entry.script))
-            .cloned()
+        let Some(entry) = selected_scripts(db, context)?
+            .into_iter()
+            .find(|entry| !visited.contains(&entry.id))
         else {
             break;
         };
-        visited.insert(entry.script.clone());
+        visited.insert(entry.id.clone());
         if cancellation.as_ref().is_some_and(|cancel| *cancel.borrow()) {
             break;
         }
@@ -471,17 +472,10 @@ pub async fn run_event(
         {
             break;
         }
-        let Ok(script) = super::listing::resolve_script(&root, &entry.script) else {
-            continue;
-        };
-        if !script.manifest.kinds().contains(&context.kind()) {
-            continue;
-        }
-        if let ScriptEventLabel::Queue(event) = context.event
-            && !script.manifest.queue_events().contains(&event)
-        {
-            continue;
-        }
+        // The instance says what runs and when; nothing the script declares
+        // about itself is consulted.
+        let script =
+            super::listing::resolve_script(&root, &entry.script).map_err(|error| error.to_string());
         if let Some(job_id) = context.job_id {
             let effects = db.job_script_effects(job_id)?;
             effects.merge_parameters(&mut context.facts.parameters);
@@ -495,12 +489,11 @@ pub async fn run_event(
             entry,
             script,
             settings,
-            options: options.clone(),
             run_id: run_id.into(),
             supervisor_executable: supervisor_executable.clone(),
             background: false,
         };
-        if !waits_for(&context.event, &run.entry) {
+        if !run.entry.blocking {
             let run = EntryRun {
                 background: true,
                 ..run
@@ -528,10 +521,7 @@ pub async fn run_event(
             // The wait may have been long. Everything this entry was chosen
             // from is read again now that its turn has come.
             root = db.post_processing_script_directory()?;
-            options = db
-                .post_processing_script_options_snapshot()
-                .map_err(|error| error.to_string());
-            visited.remove(&run.entry.script);
+            visited.remove(&run.entry.id);
             continue;
         }
         results.push(run_entry(db, context, run, cancellation.clone()).await?);
@@ -539,12 +529,12 @@ pub async fn run_event(
     Ok(results)
 }
 
-/// One entry of an event, resolved and ready to run.
+/// One instance of an event, ready to run. `script` is why it cannot, when
+/// its script is not in the scripts directory.
 struct EntryRun {
-    entry: ScriptListEntry,
-    script: DiscoveredScript,
+    entry: ScriptInstance,
+    script: Result<DiscoveredScript, String>,
     settings: PostProcessingSettings,
-    options: Result<ScriptOptionsSnapshot, String>,
     run_id: String,
     supervisor_executable: Option<PathBuf>,
     background: bool,
@@ -588,78 +578,118 @@ async fn run_entry(
         entry,
         script,
         settings,
-        options,
         run_id,
         supervisor_executable,
         background,
     } = run;
     let started = Instant::now();
-    let adapter = script.manifest.adapter();
-    let resolved = options
-        .and_then(|options| {
-            db.resolve_post_processing_script_options(&options, &entry.script)
-                .map_err(|error| error.to_string())
-        })
-        .and_then(|supplied| {
-            script
-                .manifest
-                .resolve_options(&supplied)
-                .map_err(|error| error.to_string())
-        });
-    let execution = match resolved {
-        Err(error) => Err(format!("script configuration is invalid: {error}")),
-        Ok(resolved) => {
-            let spec = ExecutionSpec {
-                manifest: script.manifest,
-                root: script.root,
-                options: resolved,
-                cwd: context.cwd.clone(),
-                env: context.env.clone(),
-                argv: Vec::new(),
-                timeout: Some(Duration::from_secs(
-                    entry
-                        .timeout_seconds
-                        .unwrap_or(settings.event_scripts.event_script_timeout_seconds),
-                )),
-                termination_grace: Duration::from_secs(settings.termination_grace_seconds),
-                kind: context.event.clone(),
-                run_id,
-                facts: context.facts.clone(),
-                interpreters: InterpreterConfig {
-                    python: settings.python_interpreter.as_ref().map(PathBuf::from),
-                    powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
-                    batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
-                },
-                supervisor_executable,
-                output_ceiling: settings.event_scripts.script_output_ceiling_bytes,
-            };
-            let (sender, receiver) = mpsc::channel(64);
-            let (execution, ()) = tokio::join!(
-                execute_spec(spec, cancellation, Some(sender)),
-                consume_events(db, context, receiver),
-            );
-            execution.map_err(|error| error.to_string())
-        }
-    };
-    let (status, exit_code, output, output_truncated, error_message) = match execution {
-        Ok(result) => (
-            match result.disposition {
-                ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
-                ExecutionDisposition::Skipped => ScriptStatus::Skipped,
-                ExecutionDisposition::Warned => ScriptStatus::Warning,
-                ExecutionDisposition::Failed => ScriptStatus::Failed,
-                ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
-                ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
-            },
-            result.exit_code,
-            result.output,
-            result.output_truncated,
-            result.error_message,
+    let (adapter, status, exit_code, output, output_truncated, error_message) = match script {
+        // Nothing ran, so nothing failed: the operator is told, and whatever
+        // raised the event goes on.
+        Err(error) => (
+            ScriptAdapter::Sabnzbd,
+            ScriptStatus::Warning,
+            None,
+            Vec::new(),
+            false,
+            Some(error),
         ),
-        Err(error) => (ScriptStatus::Failed, None, Vec::new(), false, Some(error)),
+        Ok(script) => {
+            let adapter = script.manifest.adapter();
+            let prepared = db
+                .script_instance_run_inputs(&entry.id)
+                .map_err(|error| error.to_string())
+                .and_then(|inputs| {
+                    inputs.ok_or_else(|| "the script instance no longer exists".to_string())
+                })
+                .and_then(|inputs| {
+                    RunIdentity::of(&entry)
+                        .map(|identity| (inputs, identity))
+                        .map_err(|error| error.to_string())
+                });
+            let execution = match prepared {
+                Err(error) => Err(error),
+                Ok((inputs, mut identity)) => {
+                    let mut env = context.weaver_env();
+                    env.extend(context.env.clone());
+                    let timeout = Duration::from_secs(
+                        entry
+                            .timeout_seconds
+                            .unwrap_or(settings.event_scripts.event_script_timeout_seconds),
+                    );
+                    // The run is live, and its token good, until this is
+                    // dropped at the end of the block.
+                    let mut requests = db.open_script_run(
+                        &mut identity,
+                        context.job_id,
+                        &context.event,
+                        Some(timeout),
+                        false,
+                    );
+                    let spec = ExecutionSpec {
+                        manifest: script.manifest,
+                        root: script.root,
+                        options: inputs,
+                        cwd: context.cwd.clone(),
+                        env,
+                        argv: Vec::new(),
+                        timeout: Some(timeout),
+                        termination_grace: Duration::from_secs(settings.termination_grace_seconds),
+                        kind: context.event.clone(),
+                        run_id,
+                        identity,
+                        facts: context.facts.clone(),
+                        interpreters: InterpreterConfig {
+                            python: settings.python_interpreter.as_ref().map(PathBuf::from),
+                            powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
+                            batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
+                        },
+                        supervisor_executable,
+                        output_ceiling: settings.event_scripts.script_output_ceiling_bytes,
+                    };
+                    let (sender, receiver) = mpsc::channel(64);
+                    let (execution, ()) = tokio::join!(
+                        execute_spec(spec, cancellation, Some(sender)),
+                        consume_events(db, context, receiver, &mut requests),
+                    );
+                    execution
+                        .map(|mut result| {
+                            requests.settle(&mut result);
+                            result
+                        })
+                        .map_err(|error| error.to_string())
+                }
+            };
+            match execution {
+                Ok(result) => (
+                    adapter,
+                    match result.disposition {
+                        ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
+                        ExecutionDisposition::Skipped => ScriptStatus::Skipped,
+                        ExecutionDisposition::Failed => ScriptStatus::Failed,
+                        ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
+                        ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
+                    },
+                    result.exit_code,
+                    result.output,
+                    result.output_truncated,
+                    result.error_message,
+                ),
+                Err(error) => (
+                    adapter,
+                    ScriptStatus::Failed,
+                    None,
+                    Vec::new(),
+                    false,
+                    Some(error),
+                ),
+            }
+        }
     };
     let result = ScriptResult {
         script: entry.script,
+        instance_id: Some(entry.id),
+        instance_name: Some(entry.name),
         event: context.event.clone(),
         output_id: None,
         background,
@@ -691,7 +721,7 @@ async fn run_entry(
             &format!(
                 "{} {}: {}",
                 result.event,
-                result.script,
+                result.label(),
                 result.status.as_str()
             ),
             None,
@@ -704,10 +734,13 @@ async fn run_entry(
     Ok(result)
 }
 
+/// Take what the script prints and what it asks for through the API until it
+/// has ended. Both are applied here, one at a time.
 async fn consume_events(
     db: &Database,
     context: &mut EventContext,
     mut receiver: mpsc::Receiver<ScriptOutputEvent>,
+    requests: &mut RunRequests,
 ) {
     let mut logs = String::new();
     let mut severity = ScriptLogLevel::Debug;
@@ -718,17 +751,9 @@ async fn consume_events(
         tokio::select! {
             event = receiver.recv() => match event {
                 Some(ScriptOutputEvent::Directive(directive)) => {
-                    let worker_db = db.clone();
-                    let mut next_context = context.clone();
-                    let applied = tokio::task::spawn_blocking(move || {
-                        apply_directive(&worker_db, &mut next_context, directive)?;
-                        Ok::<_, String>(next_context)
-                    }).await.map_err(|error| error.to_string()).and_then(std::convert::identity);
-                    if let Err(error) = &applied {
+                    if let Err(error) = apply_to_context(db, context, directive).await {
                         severity = severity.max(ScriptLogLevel::Warning);
                         append_log(&mut logs, &format!("Invalid command: {error}"));
-                    } else if let Ok(next_context) = applied {
-                        *context = next_context;
                     }
                 }
                 Some(ScriptOutputEvent::Log { level, text }) => {
@@ -737,6 +762,19 @@ async fn consume_events(
                 }
                 None => break,
             },
+            request = requests.next() => {
+                let RunRequest { action, reply } = request;
+                let outcome = match action {
+                    RunAction::Command(directive) => apply_to_context(db, context, directive).await,
+                    RunAction::Log { level, text } => requests.log(&text).map(|text| {
+                        severity = severity.max(level);
+                        append_log(&mut logs, &format!("{level:?}: {text}"));
+                    }),
+                    RunAction::Fail(reason) => requests.fail(&reason),
+                };
+                // The script may have stopped waiting for the answer.
+                let _ = reply.send(outcome);
+            }
             _ = tick.tick(), if !logs.is_empty() => { flush_logs(db, context, &mut logs, severity).await; severity = ScriptLogLevel::Debug; }
         }
     }
@@ -744,6 +782,25 @@ async fn consume_events(
         tick.tick().await;
         flush_logs(db, context, &mut logs, severity).await;
     }
+}
+
+/// Apply one command to what the event is about. The context is left as it
+/// was when the command is refused.
+async fn apply_to_context(
+    db: &Database,
+    context: &mut EventContext,
+    directive: Directive,
+) -> Result<(), String> {
+    let worker_db = db.clone();
+    let mut next_context = context.clone();
+    *context = tokio::task::spawn_blocking(move || {
+        apply_directive(&worker_db, &mut next_context, directive)?;
+        Ok::<_, String>(next_context)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(std::convert::identity)?;
+    Ok(())
 }
 
 pub(super) fn append_log(logs: &mut String, text: &str) {
@@ -858,9 +915,6 @@ fn apply_directive(
             context.env.insert("NZBNP_NZBNAME".into(), value);
         }
         Directive::Category(value) => {
-            context.facts.parameters.retain(|(name, _)| {
-                !name.ends_with(':') && name != super::settings::JOB_SCRIPT_OVERRIDE_METADATA_KEY
-            });
             context.category = Some(value.clone());
             context.env.insert("NZBNP_CATEGORY".into(), value);
         }
@@ -909,29 +963,19 @@ impl Database {
         cache.1 = None;
     }
 
-    pub(crate) fn queue_scripts_possible(&self, parameters: &[(String, String)]) -> bool {
-        match self
-            .script_runtime
-            .admission_hint
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .1
-        {
-            Some(AdmissionHint::Disabled) => false,
-            Some(AdmissionHint::NoConfiguredScripts) => {
-                super::settings::job_script_override(parameters)
-                    .is_some_and(|entries| !entries.is_empty())
-            }
-            _ => true,
-        }
+    pub(crate) fn queue_scripts_possible(&self) -> bool {
+        !matches!(
+            self.script_runtime
+                .admission_hint
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .1,
+            Some(AdmissionHint::Disabled | AdmissionHint::NoConfiguredScripts)
+        )
     }
 
-    pub(crate) fn queue_barrier_possible(
-        &self,
-        job_id: u64,
-        parameters: &[(String, String)],
-    ) -> bool {
-        self.queue_scripts_possible(parameters)
+    pub(crate) fn queue_barrier_possible(&self, job_id: u64) -> bool {
+        self.queue_scripts_possible()
             || self
                 .script_runtime
                 .durable_events_seen

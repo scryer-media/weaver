@@ -347,6 +347,8 @@ mod tests {
     fn result(event: ScriptEventLabel) -> ScriptResult {
         ScriptResult {
             script: ScriptName::new("test.sh").unwrap(),
+            instance_id: None,
+            instance_name: None,
             event,
             output_id: None,
             background: false,

@@ -910,6 +910,7 @@ fn caller_idempotency_scope(caller: &CallerIdentity) -> String {
         CallerIdentity::Local(value) => format!("graphql:local:{}", hex::encode(value)),
         CallerIdentity::Jwt(value) => format!("graphql:jwt:{}", hex::encode(value)),
         CallerIdentity::ApiKey(value) => format!("graphql:api-key:{}", hex::encode(value)),
+        CallerIdentity::ScriptRun(run_id) => format!("graphql:script-run:{run_id}"),
     }
 }
 

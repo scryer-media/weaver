@@ -49,10 +49,7 @@ impl Pipeline {
         event: QueueEvent,
         delete_status: Option<&str>,
     ) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        if !self.db.queue_scripts_possible(&state.spec.metadata) {
+        if !self.jobs.contains_key(&job_id) || !self.db.queue_scripts_possible() {
             return;
         }
         if event == QueueEvent::FileDownloaded
@@ -79,6 +76,72 @@ impl Pipeline {
         drop(self.db.admit_queue_script_event(context, false));
     }
 
+    /// Raise the event for a job's arrival, and keep the job from downloading
+    /// while an instance that blocks on it runs.
+    ///
+    /// The hold is taken only when such an instance is wired up for this job's
+    /// category, so a job nobody is waiting on starts at once. It is released
+    /// by the end of the run, however that run ends: what a script decides is
+    /// in its directives, and a script that could not run decides nothing.
+    pub(crate) fn raise_added_script_event(&mut self, job_id: JobId) {
+        if !self.jobs.contains_key(&job_id) || !self.db.queue_scripts_possible() {
+            return;
+        }
+        let Some(context) = self.queue_script_context(job_id, QueueEvent::NzbAdded) else {
+            return;
+        };
+        let blocks = self
+            .db
+            .script_instances_for(&context.event, context.category.as_deref())
+            .is_ok_and(|instances| instances.iter().any(|instance| instance.blocking));
+        let admission = self.db.admit_queue_script_event(context, false);
+        if !blocks {
+            return;
+        }
+        self.added_script_holds.insert(job_id);
+        let db = self.db.clone();
+        let sender = self.terminal_post_processing_done_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                if let Some(run_id) = admission.await.map_err(|error| {
+                    crate::StateError::Database(format!("queue script admission lost: {error}"))
+                })?? {
+                    wait_for_event(&db, &run_id).await?;
+                }
+                Ok(())
+            }
+            .await;
+            let _ = sender
+                .send(TerminalPostProcessingEvent::AddedScriptsDone(
+                    job_id, result,
+                ))
+                .await;
+        });
+    }
+
+    /// Whether a job is being kept from downloading by the scripts that run on
+    /// its arrival.
+    pub(crate) fn held_for_added_scripts(&self, job_id: JobId) -> bool {
+        self.added_script_holds.contains(&job_id)
+    }
+
+    pub(crate) fn handle_added_scripts_done(
+        &mut self,
+        job_id: JobId,
+        result: Result<(), crate::StateError>,
+    ) {
+        if !self.added_script_holds.remove(&job_id) {
+            return;
+        }
+        if let Err(error) = result {
+            tracing::warn!(job_id = job_id.0, %error, "scripts for a new job could not run; starting the download");
+        }
+        // What the scripts asked for has to be in force before the first
+        // article is fetched.
+        self.apply_queue_script_effects(job_id);
+        self.publish_snapshot();
+    }
+
     /// Returns true while the completion pass must yield to its queue scripts.
     ///
     /// The barrier is raised once nothing more is coming off the wire, or once
@@ -102,11 +165,7 @@ impl Pipeline {
         if self.queue_scripts_completed.contains(&job_id) {
             return false;
         }
-        if self.jobs.get(&job_id).is_some_and(|state| {
-            !self
-                .db
-                .queue_barrier_possible(job_id.0, &state.spec.metadata)
-        }) {
+        if self.jobs.contains_key(&job_id) && !self.db.queue_barrier_possible(job_id.0) {
             return false;
         }
         let Some(context) = self.queue_script_context(job_id, QueueEvent::NzbDownloaded) else {

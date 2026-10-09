@@ -460,9 +460,9 @@ impl From<SchedulePruneFiles> for weaver_server_core::bandwidth::PruneFiles {
 
 #[derive(SimpleObject)]
 pub struct Schedule {
-    pub script: Option<String>,
+    /// The script instance a `run_script` rule runs.
+    pub instance_id: Option<String>,
     pub run_at_startup: bool,
-    pub implicit: bool,
     pub id: String,
     pub enabled: bool,
     pub label: String,
@@ -528,14 +528,14 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             _ => (None, None, None),
         };
         let mut hardware_profile = None;
-        let mut script = None;
+        let mut instance_id = None;
         let mut run_at_startup = false;
         let (action_type, speed_limit_bytes) = match &e.action {
             weaver_server_core::bandwidth::ScheduleAction::RunScript {
-                script: name,
+                instance_id: id,
                 run_at_startup: startup,
             } => {
-                script = Some(name.clone());
+                instance_id = Some(id.clone());
                 run_at_startup = *startup;
                 ("run_script".into(), None)
             }
@@ -567,8 +567,7 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             }
         };
         Self {
-            implicit: e.id.starts_with("implicit-script:"),
-            script,
+            instance_id,
             run_at_startup,
             id: e.id,
             track,
@@ -598,7 +597,9 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
 
 #[derive(InputObject)]
 pub struct ScheduleInput {
-    pub script: Option<String>,
+    /// The script instance a `run_script` rule runs. It must be one whose
+    /// trigger is a schedule.
+    pub instance_id: Option<String>,
     pub run_at_startup: Option<bool>,
     pub enabled: Option<bool>,
     pub label: Option<String>,
@@ -620,6 +621,14 @@ pub struct ScheduleInput {
 }
 
 impl ScheduleInput {
+    /// The instance a `run_script` rule names, for checking against what is
+    /// saved.
+    pub fn script_instance_id(&self) -> Option<String> {
+        (self.action_type == "run_script")
+            .then(|| self.instance_id.clone())
+            .flatten()
+    }
+
     /// Refuse a rule [`Self::into_entry`] would not build as asked. A
     /// `hardware_profile` rule needs a profile, and one this machine can
     /// honour: a rule that could never apply is refused by name here rather
@@ -633,12 +642,13 @@ impl ScheduleInput {
             {
                 return Err("a run_script schedule lists its times in time".into());
             }
-            let script = self
-                .script
-                .as_ref()
-                .ok_or("a run_script schedule needs a script")?;
-            weaver_server_core::post_processing::model::ScriptName::new(script.clone())
-                .map_err(|error| error.to_string())?;
+            if self
+                .instance_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err("a run_script schedule needs a script instance".into());
+            }
             for time in self.time.split([',', ';']) {
                 let time = time
                     .trim()
@@ -729,7 +739,7 @@ impl ScheduleInput {
 
         let action = match self.action_type.as_str() {
             "run_script" => ScheduleAction::RunScript {
-                script: self.script.unwrap_or_default(),
+                instance_id: self.instance_id.unwrap_or_default(),
                 run_at_startup: self.run_at_startup.unwrap_or(false),
             },
             "pause" => ScheduleAction::Pause,
@@ -818,7 +828,7 @@ mod schedule_script_tests {
 
     fn script_input(time: &str, startup: bool) -> ScheduleInput {
         ScheduleInput {
-            script: Some("scheduler.sh".into()),
+            instance_id: Some("nightly".into()),
             run_at_startup: Some(startup),
             enabled: Some(true),
             label: None,

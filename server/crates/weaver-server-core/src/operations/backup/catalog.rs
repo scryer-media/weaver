@@ -65,6 +65,12 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("script_job_state", ResetOnRestore, RequireEmpty),
     table!("script_outputs", ResetOnRestore, Replace),
     table!("script_output_state", Rebuild, Replace),
+    // An instance is configuration: the script it names, its trigger, and
+    // what the operator typed into it.
+    table!("script_instances", Export, Replace),
+    table!("script_instance_inputs", Export, Replace),
+    table!("script_instance_categories", Export, Replace),
+    table!("feed_scripts", Export, RequireEmpty),
     table!("duplicate_job_snapshots", Export, RequireEmpty),
     table!("job_fingerprints", Export, RequireEmpty),
     table!("duplicate_admission_claims", Export, RequireEmpty),

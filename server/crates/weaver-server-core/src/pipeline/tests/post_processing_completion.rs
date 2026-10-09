@@ -1,9 +1,7 @@
 use super::*;
 use crate::post_processing::executor::PostProcessingExecutor;
-use crate::post_processing::model::{
-    PostProcessingSettings, PostProcessingSummary, ScriptList, ScriptListEntry, ScriptLists,
-    ScriptName,
-};
+use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+use crate::post_processing::model::{PostProcessingSettings, PostProcessingSummary, ScriptName};
 use std::os::unix::fs::PermissionsExt;
 use tokio::io::AsyncWriteExt;
 
@@ -102,13 +100,10 @@ exit {exit_code}
         .unwrap();
     pipeline
         .db
-        .save_post_processing_script_lists(&ScriptLists {
-            global: ScriptList::new(vec![ScriptListEntry::new(
-                ScriptName::new("gated.sh").unwrap(),
-            )])
-            .unwrap(),
-            ..Default::default()
-        })
+        .create_script_instance(ScriptInstanceDraft::new(
+            ScriptName::new("gated.sh").unwrap(),
+            InstanceTrigger::PostProcessing,
+        ))
         .unwrap();
     pipeline.terminal_post_processing_executor =
         PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone(), 1)
@@ -279,16 +274,16 @@ exit 93
             ..Default::default()
         })
         .unwrap();
-    pipeline
-        .db
-        .save_post_processing_script_lists(&ScriptLists {
-            global: ScriptList::new(vec![ScriptListEntry::new(
+    // The instance is saved with the rest of what a restart keeps.
+    if pipeline.db.script_instances().unwrap().is_empty() {
+        pipeline
+            .db
+            .create_script_instance(ScriptInstanceDraft::new(
                 ScriptName::new("record.sh").unwrap(),
-            )])
-            .unwrap(),
-            ..Default::default()
-        })
-        .unwrap();
+                InstanceTrigger::PostProcessing,
+            ))
+            .unwrap();
+    }
     pipeline.terminal_post_processing_executor =
         PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone(), 1)
             .with_supervisor_executable(supervisor);

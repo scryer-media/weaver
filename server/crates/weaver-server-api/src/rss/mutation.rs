@@ -247,10 +247,6 @@ impl RssMutation {
 }
 
 fn validate_feed_input(input: &RssFeedInput) -> Result<()> {
-    for script in input.scripts.iter().flatten() {
-        weaver_server_core::post_processing::model::ScriptName::new(script.clone())
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-    }
     let url = reqwest::Url::parse(&input.url)
         .map_err(|e| async_graphql::Error::new(format!("invalid RSS feed URL: {e}")))?;
     match url.scheme() {

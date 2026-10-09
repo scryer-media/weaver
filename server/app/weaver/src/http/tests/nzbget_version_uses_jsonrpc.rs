@@ -1241,6 +1241,114 @@ async fn nzbget_history_maps_cancelled_db_rows_to_manual_delete() {
     assert_eq!(item["HistoryTime"], 1_700_000_500);
 }
 
+fn nzbget_script_result(
+    instance_name: Option<&str>,
+    event: weaver_server_core::post_processing::model::ScriptEventLabel,
+    background: bool,
+    status: weaver_server_core::post_processing::model::ScriptStatus,
+) -> weaver_server_core::post_processing::model::ScriptResult {
+    use weaver_server_core::post_processing::model::{ScriptAdapter, ScriptName, ScriptResult};
+    ScriptResult {
+        script: ScriptName::new("hook.sh").unwrap(),
+        instance_id: instance_name.map(|_| "instance".to_string()),
+        instance_name: instance_name.map(str::to_string),
+        event,
+        output_id: None,
+        background,
+        adapter: ScriptAdapter::Nzbget,
+        status,
+        exit_code: Some(0),
+        duration_ms: 1,
+        output_tail: String::new(),
+        output_truncated: false,
+        error_message: None,
+        finished_at_epoch_ms: 1,
+    }
+}
+
+#[tokio::test]
+async fn nzbget_history_script_status_counts_only_blocking_post_processing() {
+    use weaver_server_core::post_processing::model::{
+        PostProcessingSummary, QueueEvent, ScriptEventLabel, ScriptStatus,
+    };
+    let db = Database::open_in_memory().unwrap();
+    let jobs: [(u64, Vec<_>); 4] = [
+        (
+            501,
+            vec![
+                nzbget_script_result(
+                    Some("Tidy up"),
+                    ScriptEventLabel::PostProcessing,
+                    false,
+                    ScriptStatus::Succeeded,
+                ),
+                nzbget_script_result(
+                    Some("Notify"),
+                    ScriptEventLabel::PostProcessing,
+                    true,
+                    ScriptStatus::Failed,
+                ),
+            ],
+        ),
+        (
+            502,
+            vec![nzbget_script_result(
+                None,
+                ScriptEventLabel::PostProcessing,
+                false,
+                ScriptStatus::Failed,
+            )],
+        ),
+        (
+            503,
+            vec![nzbget_script_result(
+                Some("On add"),
+                ScriptEventLabel::Queue(QueueEvent::NzbAdded),
+                false,
+                ScriptStatus::Failed,
+            )],
+        ),
+        (504, vec![]),
+    ];
+    for (job_id, results) in &jobs {
+        db.insert_job_history(&nzbget_history_row(
+            *job_id,
+            "complete",
+            1_700_000_000 + *job_id as i64,
+            None,
+        ))
+        .unwrap();
+        if !results.is_empty() {
+            db.save_job_post_processing_results(*job_id, PostProcessingSummary::Succeeded, results)
+                .unwrap();
+        }
+    }
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "history", "params": [], "id": "history-scripts"}),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = payload["result"].as_array().unwrap();
+    let item = |id: u64| items.iter().find(|item| item["ID"] == id).unwrap();
+    assert_eq!(item(501)["ScriptStatus"], "SUCCESS");
+    assert_eq!(item(501)["ScriptStatuses"][0]["Name"], "Tidy up");
+    assert_eq!(item(501)["ScriptStatuses"][1]["Name"], "Notify");
+    assert_eq!(item(502)["ScriptStatus"], "FAILURE");
+    assert_eq!(item(502)["ScriptStatuses"][0]["Name"], "hook.sh");
+    assert_eq!(item(503)["ScriptStatus"], "NONE");
+    assert_eq!(item(504)["ScriptStatus"], "NONE");
+}
+
 #[tokio::test]
 async fn nzbget_history_repeat_poll_is_memo_transparent() {
     let db = Database::open_in_memory().unwrap();
@@ -1327,6 +1435,21 @@ async fn nzbget_config_exposes_real_categories_and_keep_history() {
     assert_eq!(value_for("Category1.Name"), "tv");
     assert_eq!(value_for("Category1.DestDir"), "/media/tv");
     assert_eq!(value_for("Category1.Aliases"), "series,shows");
+    assert_eq!(value_for("Category1.Unpack"), "yes");
+    // Sonarr and Radarr never read script entries, so none are sent.
+    for name in [
+        "Extensions",
+        "ScriptOrder",
+        "ScriptDir",
+        "EventInterval",
+        "Category1.Extensions",
+        "Category1.DefScript",
+    ] {
+        assert!(
+            entries.iter().all(|entry| entry["Name"] != name),
+            "{name} must not be emitted"
+        );
+    }
 }
 
 #[tokio::test]

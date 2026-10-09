@@ -36,10 +36,12 @@ fn context(category: Option<String>, parameters: Vec<(String, String)>) -> Event
             parameters,
             ..Default::default()
         },
-        scripts: None,
+        instances: None,
+        scratch: None,
     }
 }
 
+/// Whether a scan instance would run for an incoming NZB.
 pub async fn enabled(
     db: &Database,
     category: Option<&str>,
@@ -61,15 +63,20 @@ pub struct ScannedSubmission {
     pub options: SubmissionOptions,
 }
 
-/// Drop the directory before admitting another scan, including on cancellation.
-pub struct ScanScratch {
+/// The directory a scan works in. It goes, and another scan is admitted, once
+/// the import and every script still reading it have let go, including on
+/// cancellation.
+#[derive(Clone)]
+pub struct ScanScratch(Arc<ScanScratchFiles>);
+
+struct ScanScratchFiles {
     directory: tempfile::TempDir,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl ScanScratch {
     fn path(&self) -> &std::path::Path {
-        self.directory.path()
+        self.0.directory.path()
     }
 }
 
@@ -108,10 +115,10 @@ pub async fn scan_reader<R: Read + Send + 'static>(
         let directory = tempfile::Builder::new()
             .prefix("script-scan-")
             .tempdir_in(data_dir)?;
-        let scratch = ScanScratch {
+        let scratch = ScanScratch(Arc::new(ScanScratchFiles {
             directory,
             _permit: permit,
-        };
+        }));
         let mut file = std::fs::File::create(scratch.path().join("input.nzb"))?;
         copy_scan_input(source, &mut file, MAX_SCAN_INPUT_BYTES)?;
         file.flush()?;
@@ -122,6 +129,7 @@ pub async fn scan_reader<R: Read + Send + 'static>(
     .map_err(SubmitNzbError::Save)?;
     let input = scratch.path().join("input.nzb");
     context.cwd = scratch.path().to_path_buf();
+    context.scratch = Some(scratch.0.clone());
     let parameter = |key: &str, fallback: &str| {
         context
             .facts
@@ -189,7 +197,7 @@ pub async fn scan_reader<R: Read + Send + 'static>(
     if let Some(result) = results.iter().find(|result| scan_run_incomplete(result)) {
         return Err(SubmitNzbError::Save(std::io::Error::other(format!(
             "scan script {} did not complete: {}",
-            result.script,
+            result.label(),
             result.status.as_str(),
         ))));
     }
@@ -349,6 +357,8 @@ mod tests {
         use super::super::model::{ScriptAdapter, ScriptName, ScriptResult, ScriptStatus};
         let mut result = ScriptResult {
             script: ScriptName::new("scan.py").unwrap(),
+            instance_id: None,
+            instance_name: None,
             event: ScriptEventLabel::Scan,
             output_id: None,
             background: false,
@@ -374,9 +384,8 @@ mod tests {
 
     #[tokio::test]
     async fn scan_reader_rejects_input_when_execution_cannot_start() {
-        use super::super::model::{
-            PostProcessingSettings, ScriptList, ScriptListEntry, ScriptLists, ScriptName,
-        };
+        use super::super::instances::{InstanceTrigger, ScriptInstanceDraft};
+        use super::super::model::{PostProcessingSettings, ScriptName};
         let db = Database::open_in_memory().unwrap();
         let data = tempfile::tempdir().unwrap();
         let scripts = db
@@ -388,13 +397,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.save_post_processing_script_lists(&ScriptLists {
-            global: ScriptList::new(vec![ScriptListEntry::new(
-                ScriptName::new("scan.py").unwrap(),
-            )])
-            .unwrap(),
-            ..Default::default()
-        })
+        db.create_script_instance(ScriptInstanceDraft::new(
+            ScriptName::new("scan.py").unwrap(),
+            InstanceTrigger::Scan,
+        ))
         .unwrap();
         let selected =
             super::super::listing::resolve_script(&scripts, &ScriptName::new("scan.py").unwrap())
@@ -443,10 +449,10 @@ mod tests {
         let admission = Arc::new(tokio::sync::Semaphore::new(1));
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().to_path_buf();
-        let scratch = ScanScratch {
+        let scratch = ScanScratch(Arc::new(ScanScratchFiles {
             directory,
             _permit: admission.clone().acquire_owned().await.unwrap(),
-        };
+        }));
         let pending = admission.acquire_owned();
         tokio::pin!(pending);
         tokio::select! {

@@ -871,11 +871,7 @@ impl Pipeline {
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
-        self.raise_queue_script_event(
-            job_id,
-            crate::post_processing::model::QueueEvent::NzbAdded,
-            None,
-        );
+        self.raise_added_script_event(job_id);
 
         crate::runtime::perf_probe::record(
             "pipeline.add_job.runtime_state_inserted",

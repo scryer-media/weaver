@@ -11,7 +11,7 @@ import { isOneShot, type ScheduleOptionsForm, type ScheduleTargets } from "../da
  * under the clock, and an action's target and switches sit under the action.
  */
 
-const TARGETS = gql`query ScheduleTargets { servers { id host } rssFeeds { id name } }`;
+const TARGETS = gql`query ScheduleTargets { servers { id host } rssFeeds { id name } scriptInstances { id name script trigger } }`;
 
 export function useScheduleTargets() {
   const [{ data }] = useQuery<ScheduleTargets>({ query: TARGETS });

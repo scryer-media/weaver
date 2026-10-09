@@ -4,9 +4,8 @@ use std::path::PathBuf;
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 
 use super::events::{EventContext, run_event};
-use super::model::{
-    ScriptEventLabel, ScriptKind, ScriptList, ScriptListEntry, ScriptName, ScriptTaskTime,
-};
+use super::instances::InstanceTrigger;
+use super::model::{ScriptEventLabel, ScriptTaskTime};
 use super::runner::CompatibilityFacts;
 use crate::bandwidth::schedule::SharedSchedules;
 use crate::bandwidth::{ScheduleAction, ScheduleEntry, Weekday};
@@ -90,36 +89,6 @@ impl Occurrences {
     }
 }
 
-pub fn implicit_schedules(db: &Database) -> Result<Vec<ScheduleEntry>, StateError> {
-    let root = db.post_processing_script_directory()?;
-    let lists = db.post_processing_script_lists()?;
-    let mut rules = Vec::new();
-    for entry in lists.global.enabled_entries() {
-        let Ok(script) = super::listing::resolve_script(&root, &entry.script) else {
-            continue;
-        };
-        if !script.manifest.kinds().contains(&ScriptKind::Scheduler) {
-            continue;
-        }
-        for time in script.manifest.task_times() {
-            rules.push(ScheduleEntry {
-                id: format!("implicit-script:{}:{time}", entry.script),
-                enabled: *time != ScriptTaskTime::Startup,
-                label: format!("{} ({time})", entry.script),
-                days: Vec::new(),
-                time: time.to_string(),
-                times: Vec::new(),
-                every_hour_at_minute: None,
-                action: ScheduleAction::RunScript {
-                    script: entry.script.to_string(),
-                    run_at_startup: false,
-                },
-            });
-        }
-    }
-    Ok(rules)
-}
-
 pub fn spawn_script_evaluator(db: Database, config: SharedConfig, schedules: SharedSchedules) {
     tokio::spawn(async move {
         let mut occurrences = Occurrences::default();
@@ -129,26 +98,7 @@ pub fn spawn_script_evaluator(db: Database, config: SharedConfig, schedules: Sha
         loop {
             interval.tick().await;
             running.retain(|_, task| !task.is_finished());
-            let mut entries = schedules.read().await.clone();
-            let implicit = tokio::task::spawn_blocking({
-                let db = db.clone();
-                move || implicit_schedules(&db)
-            })
-            .await;
-            let implicit_ids = match implicit {
-                Ok(Ok(implicit)) => {
-                    let ids = implicit
-                        .iter()
-                        .map(|entry| entry.id.clone())
-                        .collect::<BTreeSet<_>>();
-                    entries.extend(implicit);
-                    ids
-                }
-                result => {
-                    tracing::warn!(?result, "could not load implicit script schedules");
-                    BTreeSet::new()
-                }
-            };
+            let entries = schedules.read().await.clone();
             for entry in occurrences.advance(&entries, crate::e2e_clock::local_now().naive_local())
             {
                 if running.contains_key(&entry.id) {
@@ -157,10 +107,9 @@ pub fn spawn_script_evaluator(db: Database, config: SharedConfig, schedules: Sha
                 }
                 let db = db.clone();
                 let config = config.clone();
-                let implicit = implicit_ids.contains(&entry.id);
                 let id = entry.id.clone();
                 let task = tokio::spawn(async move {
-                    if let Err(error) = run_scheduled_script(&db, &config, &entry, implicit).await {
+                    if let Err(error) = run_scheduled_script(&db, &config, &entry).await {
                         tracing::warn!(rule_id = %entry.id, %error, "scheduled script failed");
                     }
                 });
@@ -174,42 +123,29 @@ async fn run_scheduled_script(
     db: &Database,
     config: &SharedConfig,
     entry: &ScheduleEntry,
-    implicit: bool,
 ) -> Result<(), StateError> {
-    let ScheduleAction::RunScript { script, .. } = &entry.action else {
+    let ScheduleAction::RunScript { instance_id, .. } = &entry.action else {
         return Ok(());
     };
-    let task_id = if implicit {
-        0
-    } else {
-        let digest = blake3::hash(entry.id.as_bytes());
-        u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes")).max(1)
-    };
-    let script =
-        ScriptName::new(script.clone()).map_err(|error| StateError::Database(error.to_string()))?;
-    let lists = tokio::task::spawn_blocking({
+    let instance = tokio::task::spawn_blocking({
         let db = db.clone();
-        move || db.post_processing_script_lists()
+        let instance_id = instance_id.clone();
+        move || db.script_instance(&instance_id)
     })
     .await
     .map_err(|error| StateError::Database(error.to_string()))??;
-    let configured = lists
-        .global
-        .entries()
-        .iter()
-        .find(|entry| entry.script == script)
-        .cloned();
-    let mut script_entry = configured.unwrap_or(ScriptListEntry {
-        script,
-        enabled: true,
-        timeout_seconds: None,
-        blocking: true,
-    });
-    if !implicit {
-        script_entry.enabled = true;
-    }
-    let scripts = ScriptList::new(vec![script_entry])
-        .map_err(|error| StateError::Database(error.to_string()))?;
+    // A row may outlive the instance it names, or the instance may have been
+    // turned off or given another trigger since. Either way there is nothing
+    // for this row to run.
+    let Some(instance) = instance
+        .filter(|instance| instance.enabled && instance.trigger == InstanceTrigger::Schedule)
+    else {
+        tracing::debug!(rule_id = %entry.id, "scheduled script has no instance to run");
+        return Ok(());
+    };
+    let digest = blake3::hash(entry.id.as_bytes());
+    let task_id =
+        u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes")).max(1);
     let config = config.read().await;
     let cwd = PathBuf::from(&config.data_dir);
     let mut context = EventContext {
@@ -226,7 +162,8 @@ async fn run_scheduled_script(
             complete_dir: Some(PathBuf::from(config.complete_dir())),
             ..Default::default()
         },
-        scripts: Some(scripts),
+        instances: Some(vec![instance]),
+        scratch: None,
     };
     drop(config);
     let mut nonce = [0_u8; 16];
@@ -258,7 +195,7 @@ mod tests {
             times: Vec::new(),
             every_hour_at_minute: None,
             action: ScheduleAction::RunScript {
-                script: "test.sh".into(),
+                instance_id: "test".into(),
                 run_at_startup: false,
             },
         }
@@ -296,7 +233,7 @@ mod tests {
                 .is_empty()
         );
         startup.action = ScheduleAction::RunScript {
-            script: "test.sh".into(),
+            instance_id: "test".into(),
             run_at_startup: true,
         };
         let mut tracker = Occurrences::default();

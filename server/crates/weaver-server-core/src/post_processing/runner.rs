@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::directives::{ScriptOutputEvent, parse_line, valid_parameter_name};
 use super::model::{
-    OptionValue, PipelineOutcome, ResolvedOption, ScriptAdapter, ScriptEventLabel, ScriptManifest,
+    OptionValue, PipelineOutcome, ResolvedOption, ScriptEventLabel, ScriptManifest,
 };
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -102,6 +102,38 @@ pub struct CompatibilityFacts {
     pub previous_script_status: NzbgetScriptStatus,
 }
 
+/// Which run this is, as the script itself is told.
+#[derive(Debug, Clone, Default)]
+pub struct RunIdentity {
+    pub run_id: String,
+    pub instance_id: String,
+    pub instance_name: String,
+    pub trigger: String,
+    /// Where the script can call weaver back, and the token that lets it for
+    /// as long as this run lasts.
+    pub api_url: Option<String>,
+    pub token: Option<String>,
+    /// Where lines the script sends through the API join what it printed.
+    pub output: OutputInjector,
+}
+
+impl RunIdentity {
+    /// A fresh run of `instance`.
+    pub fn of(instance: &super::instances::ScriptInstance) -> Result<Self, RunnerError> {
+        let mut entropy = [0_u8; 12];
+        getrandom::fill(&mut entropy).map_err(|error| RunnerError::Io(io::Error::other(error)))?;
+        Ok(Self {
+            run_id: hex::encode(entropy),
+            instance_id: instance.id.clone(),
+            instance_name: instance.name.clone(),
+            trigger: instance.trigger.to_string(),
+            api_url: None,
+            token: None,
+            output: OutputInjector::default(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScriptExecutionRequest {
     pub manifest: ScriptManifest,
@@ -109,6 +141,7 @@ pub struct ScriptExecutionRequest {
     pub root: PathBuf,
     pub options: Vec<ResolvedOption>,
     pub context: JobExecutionContext,
+    pub identity: RunIdentity,
     pub timeout: Option<Duration>,
     pub termination_grace: Duration,
     pub interpreters: InterpreterConfig,
@@ -119,10 +152,8 @@ pub struct ScriptExecutionRequest {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ExecutionDisposition {
     Succeeded,
-    /// NZBGet exit 95: the script decided it had nothing to do.
+    /// Exit 95: the script decided it had nothing to do.
     Skipped,
-    /// A SABnzbd script exited nonzero, which SABnzbd records as a warning.
-    Warned,
     Failed,
     Cancelled,
     TimedOut,
@@ -191,6 +222,18 @@ pub async fn execute_script_observed(
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
     output_ceiling: u64,
 ) -> Result<ScriptExecutionResult, RunnerError> {
+    execute_script_tapped(request, cancellation, events, output_ceiling, None).await
+}
+
+/// [`execute_script_observed`], with each captured line also handed to `tap`
+/// as it arrives.
+pub async fn execute_script_tapped(
+    request: ScriptExecutionRequest,
+    cancellation: Option<watch::Receiver<bool>>,
+    events: Option<mpsc::Sender<ScriptOutputEvent>>,
+    output_ceiling: u64,
+    tap: Option<OutputTap>,
+) -> Result<ScriptExecutionResult, RunnerError> {
     let mut secrets = request
         .options
         .iter()
@@ -209,6 +252,9 @@ pub async fn execute_script_observed(
         .filter(|password| !password.is_empty())
     {
         secrets.push(password.as_bytes().to_vec());
+    }
+    if let Some(token) = request.identity.token.as_deref() {
+        secrets.push(token.as_bytes().to_vec());
     }
     if let Some(source_url) = request.context.source_url.as_deref() {
         append_source_url_secrets(&mut secrets, source_url);
@@ -232,8 +278,9 @@ pub async fn execute_script_observed(
     let mut prepared = prepare_execution(&request)?;
     prepared.capture = CapturePolicy {
         secrets: Arc::new(secrets.clone()),
-        event: (adapter == ScriptAdapter::Nzbget).then_some(ScriptEventLabel::PostProcessing),
+        event: Some(ScriptEventLabel::PostProcessing),
         events,
+        tap,
         ceiling: output_ceiling.clamp(MAX_LOGICAL_LINE_BYTES as u64, 8 * 1024 * 1024),
     };
     tracing::info!(
@@ -282,6 +329,7 @@ pub struct ExecutionSpec {
     pub termination_grace: Duration,
     pub kind: ScriptEventLabel,
     pub run_id: String,
+    pub identity: RunIdentity,
     pub facts: CompatibilityFacts,
     pub interpreters: InterpreterConfig,
     pub supervisor_executable: Option<PathBuf>,
@@ -293,6 +341,17 @@ pub async fn execute_spec(
     cancellation: Option<watch::Receiver<bool>>,
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
 ) -> Result<ScriptExecutionResult, RunnerError> {
+    execute_spec_tapped(spec, cancellation, events, None).await
+}
+
+/// [`execute_spec`], with each captured line also handed to `tap` as it
+/// arrives.
+pub async fn execute_spec_tapped(
+    spec: ExecutionSpec,
+    cancellation: Option<watch::Receiver<bool>>,
+    events: Option<mpsc::Sender<ScriptOutputEvent>>,
+    tap: Option<OutputTap>,
+) -> Result<ScriptExecutionResult, RunnerError> {
     let root = fs::canonicalize(&spec.root)?;
     let entrypoint = fs::canonicalize(root.join(spec.manifest.entrypoint()))?;
     if !entrypoint.starts_with(&root) || !entrypoint.is_file() {
@@ -303,6 +362,8 @@ pub async fn execute_spec(
     let mut env = sanitized_platform_environment()?;
     insert_nzbget_global_options(&mut env, &spec.facts)?;
     insert_compat_options(&mut env, "NZBPO", &spec.options)?;
+    insert_options(&mut env, "SAB_OPTION_", &spec.options)?;
+    insert_weaver_env(&mut env, &spec.identity, &spec.facts, &spec.options)?;
     insert_parameters(&mut env, &spec.facts.parameters, &spec.manifest)?;
     let source_url = spec
         .env
@@ -325,10 +386,14 @@ pub async fn execute_spec(
     if let Some(password) = spec.facts.password.filter(|value| !value.is_empty()) {
         secrets.push(password.into_bytes());
     }
+    if let Some(token) = spec.identity.token {
+        secrets.push(token.into_bytes());
+    }
     if let Some(source_url) = source_url.as_deref() {
         append_source_url_secrets(&mut secrets, source_url);
     }
     let prepared = PreparedExecution {
+        injector: spec.identity.output,
         supervisor_executable: spec.supervisor_executable,
         supervisor: SupervisorRequest {
             program,
@@ -339,11 +404,11 @@ pub async fn execute_spec(
             env,
             cwd: fs::canonicalize(spec.cwd)?,
         },
-        adapter: spec.manifest.adapter(),
         capture: CapturePolicy {
             secrets: Arc::new(secrets.clone()),
             event: Some(spec.kind.clone()),
             events,
+            tap,
             ceiling: spec
                 .output_ceiling
                 .clamp(MAX_LOGICAL_LINE_BYTES as u64, 8 * 1024 * 1024),
@@ -358,37 +423,22 @@ pub async fn execute_spec(
     )
     .await
     .map_err(|error| redact_runner_error(error, &secrets))?;
-    if result.exit_code.is_some()
-        && !matches!(
-            result.disposition,
-            ExecutionDisposition::Cancelled | ExecutionDisposition::TimedOut
-        )
-    {
-        result.disposition = match spec.kind {
-            ScriptEventLabel::Feed(_) if result.exit_code != Some(93) => {
-                ExecutionDisposition::Failed
-            }
-            ScriptEventLabel::Feed(_)
-            | ScriptEventLabel::Queue(_)
-            | ScriptEventLabel::Scan
-            | ScriptEventLabel::Scheduler(_) => ExecutionDisposition::Succeeded,
-            ScriptEventLabel::PostProcessing => result.disposition,
-        };
-        if result.disposition == ExecutionDisposition::Succeeded {
-            result.error_message = None;
-        }
-    }
     if let Some(message) = &mut result.error_message {
         *message = redact_string(message, &secrets);
     }
     Ok(result)
 }
 
+/// Receives each line of a run's captured output as it arrives: redacted, and
+/// with the commands the script issued already taken out.
+pub type OutputTap = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 #[derive(Clone)]
 struct CapturePolicy {
     secrets: Arc<Vec<Vec<u8>>>,
     event: Option<ScriptEventLabel>,
     events: Option<mpsc::Sender<ScriptOutputEvent>>,
+    tap: Option<OutputTap>,
     ceiling: u64,
 }
 
@@ -398,6 +448,7 @@ impl Default for CapturePolicy {
             secrets: Arc::new(Vec::new()),
             event: None,
             events: None,
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         }
     }
@@ -406,8 +457,78 @@ impl Default for CapturePolicy {
 struct PreparedExecution {
     supervisor_executable: Option<PathBuf>,
     supervisor: SupervisorRequest,
-    adapter: ScriptAdapter,
     capture: CapturePolicy,
+    injector: OutputInjector,
+}
+
+/// Adds lines to a run's captured output that the script did not print: what
+/// it logged through the API. It reaches the output only while the script is
+/// running; a line offered at any other time is dropped.
+#[derive(Clone, Default)]
+pub struct OutputInjector(Arc<Mutex<Option<InjectionTarget>>>);
+
+struct InjectionTarget {
+    output: Arc<Mutex<BoundedOutput>>,
+    secrets: Arc<Vec<Vec<u8>>>,
+    tap: Option<OutputTap>,
+}
+
+impl std::fmt::Debug for OutputInjector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OutputInjector")
+    }
+}
+
+impl OutputInjector {
+    fn target(&self) -> std::sync::MutexGuard<'_, Option<InjectionTarget>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn bind(&self, output: &Arc<Mutex<BoundedOutput>>, policy: &CapturePolicy) -> BoundInjector {
+        *self.target() = Some(InjectionTarget {
+            output: output.clone(),
+            secrets: policy.secrets.clone(),
+            tap: policy.tap.clone(),
+        });
+        BoundInjector(self.clone())
+    }
+
+    /// `text` with the run's secrets taken out, or `None` when the script is
+    /// not running and nothing is known about what must be kept out.
+    pub(crate) fn redact(&self, text: &str) -> Option<String> {
+        let target = self.target();
+        let target = target.as_ref()?;
+        Some(redact_string(text, &target.secrets))
+    }
+
+    /// Add `text` to the output as lines of its own. False when the script is
+    /// not running.
+    pub(crate) fn push(&self, text: &str) -> bool {
+        let target = self.target();
+        let Some(target) = target.as_ref() else {
+            return false;
+        };
+        let mut line = redact_string(text, &target.secrets).into_bytes();
+        line.push(b'\n');
+        if let Some(tap) = &target.tap {
+            tap(&line);
+        }
+        target
+            .output
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(line);
+        true
+    }
+}
+
+/// Lets go of the output when the capture that owns it is over.
+struct BoundInjector(OutputInjector);
+
+impl Drop for BoundInjector {
+    fn drop(&mut self) {
+        *self.0.target() = None;
+    }
 }
 
 fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecution, RunnerError> {
@@ -425,6 +546,7 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
     let final_directory = fs::canonicalize(&request.context.final_directory)?;
 
     Ok(PreparedExecution {
+        injector: request.identity.output.clone(),
         supervisor_executable: request.supervisor_executable.clone(),
         supervisor: SupervisorRequest {
             program,
@@ -435,7 +557,6 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
             env,
             cwd: final_directory,
         },
-        adapter: request.manifest.adapter(),
         capture: CapturePolicy::default(),
     })
 }
@@ -530,144 +651,206 @@ fn adapter_environment_and_args(
     env: &mut BTreeMap<OsStringWire, OsStringWire>,
 ) -> Result<Vec<OsString>, RunnerError> {
     let context = &request.context;
-    match request.manifest.adapter() {
-        ScriptAdapter::Sabnzbd => {
-            let status = sab_pipeline_status(&context.pipeline_outcome).to_string();
-            let script_name = request
-                .manifest
-                .compatibility_name()
-                .map(|name| name.as_str())
-                .unwrap_or_else(|| request.manifest.entrypoint());
-            for (name, value) in [
-                ("SAB_VERSION", env!("CARGO_PKG_VERSION").to_string()),
-                ("SAB_NZO_ID", context.job_id.to_string()),
-                ("SAB_FINAL_NAME", context.name.clone()),
-                ("SAB_FILENAME", context.nzb_filename.clone()),
-                ("SAB_CAT", context.category.clone().unwrap_or_default()),
-                ("SAB_GROUP", context.group.clone().unwrap_or_default()),
-                (
-                    "SAB_COMPLETE_DIR",
-                    path_text(&context.final_directory)?.to_string(),
-                ),
-                ("SAB_STATUS", "Running".to_string()),
-                ("SAB_PP_STATUS", status.clone()),
-                (
-                    "SAB_FAIL_MSG",
-                    context
-                        .compatibility
-                        .failure_message
-                        .clone()
-                        .unwrap_or_default(),
-                ),
-                ("SAB_URL", context.source_url.clone().unwrap_or_default()),
-                ("SAB_FAILURE_URL", String::new()),
-                ("SAB_BYTES", context.compatibility.total_bytes.to_string()),
-                (
-                    "SAB_BYTES_DOWNLOADED",
-                    context.compatibility.downloaded_bytes.to_string(),
-                ),
-                (
-                    "SAB_BYTES_TRIED",
-                    context.compatibility.downloaded_bytes.to_string(),
-                ),
-                (
-                    "SAB_PASSWORD",
-                    context.compatibility.password.clone().unwrap_or_default(),
-                ),
-                ("SAB_REPAIR", i32::from(context.par_status != 0).to_string()),
-                (
-                    "SAB_UNPACK",
-                    i32::from(context.unpack_status != 0).to_string(),
-                ),
-                ("SAB_SCRIPT", script_name.to_string()),
-            ] {
-                insert_env(env, name, &value)?;
-            }
-            for unavailable in [
-                "SAB_CORRECT_PASSWORD",
-                "SAB_DUPLICATE",
-                "SAB_DUPLICATE_KEY",
-                "SAB_ENCRYPTED",
-                "SAB_OVERSIZED",
-                "SAB_PP",
-                "SAB_PRIORITY",
-                "SAB_UNWANTED_EXT",
-            ] {
-                insert_env(env, unavailable, "")?;
-            }
-            if let Some(app_dir) = context.compatibility.app_dir.as_deref() {
-                insert_env(env, "SAB_PROGRAM_DIR", path_text(app_dir)?)?;
-            }
-            insert_options(env, "SAB_OPTION_", &request.options)?;
-            Ok(vec![
-                context.final_directory.as_os_str().to_owned(),
-                OsString::from(&context.nzb_filename),
-                OsString::from(&context.name),
-                OsString::new(),
-                OsString::from(context.category.as_deref().unwrap_or_default()),
-                OsString::from(context.group.as_deref().unwrap_or_default()),
-                OsString::from(status),
-                OsString::new(),
-            ])
-        }
-        ScriptAdapter::Nzbget => {
-            let status = nzbget_pipeline_status(context);
-            let total_status = status.split_once('/').map_or(status, |(total, _)| total);
-            insert_env(env, "NZBPP_NZBID", &context.job_id.to_string())?;
-            insert_env(env, "NZBPP_NZBNAME", &context.name)?;
-            insert_env(env, "NZBPP_DIRECTORY", path_text(&context.final_directory)?)?;
-            insert_env(env, "NZBPP_NZBFILENAME", &context.nzb_filename)?;
-            insert_env(env, "NZBPP_QUEUEDFILE", &context.nzb_filename)?;
-            insert_env(
-                env,
-                "NZBPP_URL",
-                context.source_url.as_deref().unwrap_or_default(),
-            )?;
-            insert_env(
-                env,
-                "NZBPP_FINALDIR",
-                path_text(
-                    context
-                        .compatibility
-                        .final_directory_override
-                        .as_deref()
-                        .unwrap_or(&context.final_directory),
-                )?,
-            )?;
-            insert_env(
-                env,
-                "NZBPP_CATEGORY",
-                context.category.as_deref().unwrap_or_default(),
-            )?;
-            insert_env(env, "NZBPP_STATUS", status)?;
-            insert_env(env, "NZBPP_TOTALSTATUS", total_status)?;
-            insert_env(
-                env,
-                "NZBPP_SCRIPTSTATUS",
-                context.compatibility.previous_script_status.as_str(),
-            )?;
-            insert_env(env, "NZBPP_PARSTATUS", &context.par_status.to_string())?;
-            insert_env(
-                env,
-                "NZBPP_UNPACKSTATUS",
-                &context.unpack_status.to_string(),
-            )?;
-            insert_env(
-                env,
-                "NZBPP_HEALTH",
-                &context.compatibility.health_milli.to_string(),
-            )?;
-            insert_env(
-                env,
-                "NZBPP_CRITICALHEALTH",
-                &context.compatibility.critical_health_milli.to_string(),
-            )?;
-            insert_compat_options(env, "NZBPO", &request.options)?;
-            insert_nzbget_global_options(env, &context.compatibility)?;
-            insert_parameters(env, &context.compatibility.parameters, &request.manifest)?;
-            Ok(vec![])
+    // Every script is handed every family of variables, so one written for
+    // either client runs as it is and a new one can use weaver's own.
+    let sab_status = sab_pipeline_status(&context.pipeline_outcome).to_string();
+    let script_name = request
+        .manifest
+        .compatibility_name()
+        .map(|name| name.as_str())
+        .unwrap_or_else(|| request.manifest.entrypoint());
+    for (name, value) in [
+        ("SAB_VERSION", env!("CARGO_PKG_VERSION").to_string()),
+        ("SAB_NZO_ID", context.job_id.to_string()),
+        ("SAB_FINAL_NAME", context.name.clone()),
+        ("SAB_FILENAME", context.nzb_filename.clone()),
+        ("SAB_CAT", context.category.clone().unwrap_or_default()),
+        ("SAB_GROUP", context.group.clone().unwrap_or_default()),
+        (
+            "SAB_COMPLETE_DIR",
+            path_text(&context.final_directory)?.to_string(),
+        ),
+        ("SAB_STATUS", "Running".to_string()),
+        ("SAB_PP_STATUS", sab_status.clone()),
+        (
+            "SAB_FAIL_MSG",
+            context
+                .compatibility
+                .failure_message
+                .clone()
+                .unwrap_or_default(),
+        ),
+        ("SAB_URL", context.source_url.clone().unwrap_or_default()),
+        ("SAB_FAILURE_URL", String::new()),
+        ("SAB_BYTES", context.compatibility.total_bytes.to_string()),
+        (
+            "SAB_BYTES_DOWNLOADED",
+            context.compatibility.downloaded_bytes.to_string(),
+        ),
+        (
+            "SAB_BYTES_TRIED",
+            context.compatibility.downloaded_bytes.to_string(),
+        ),
+        (
+            "SAB_PASSWORD",
+            context.compatibility.password.clone().unwrap_or_default(),
+        ),
+        ("SAB_REPAIR", i32::from(context.par_status != 0).to_string()),
+        (
+            "SAB_UNPACK",
+            i32::from(context.unpack_status != 0).to_string(),
+        ),
+        ("SAB_SCRIPT", script_name.to_string()),
+    ] {
+        insert_env(env, name, &value)?;
+    }
+    for unavailable in [
+        "SAB_CORRECT_PASSWORD",
+        "SAB_DUPLICATE",
+        "SAB_DUPLICATE_KEY",
+        "SAB_ENCRYPTED",
+        "SAB_OVERSIZED",
+        "SAB_PP",
+        "SAB_PRIORITY",
+        "SAB_UNWANTED_EXT",
+    ] {
+        insert_env(env, unavailable, "")?;
+    }
+    if let Some(app_dir) = context.compatibility.app_dir.as_deref() {
+        insert_env(env, "SAB_PROGRAM_DIR", path_text(app_dir)?)?;
+    }
+    insert_options(env, "SAB_OPTION_", &request.options)?;
+    let arguments = vec![
+        context.final_directory.as_os_str().to_owned(),
+        OsString::from(&context.nzb_filename),
+        OsString::from(&context.name),
+        OsString::new(),
+        OsString::from(context.category.as_deref().unwrap_or_default()),
+        OsString::from(context.group.as_deref().unwrap_or_default()),
+        OsString::from(sab_status),
+        OsString::new(),
+    ];
+
+    let status = nzbget_pipeline_status(context);
+    let total_status = status.split_once('/').map_or(status, |(total, _)| total);
+    insert_env(env, "NZBPP_NZBID", &context.job_id.to_string())?;
+    insert_env(env, "NZBPP_NZBNAME", &context.name)?;
+    insert_env(env, "NZBPP_DIRECTORY", path_text(&context.final_directory)?)?;
+    insert_env(env, "NZBPP_NZBFILENAME", &context.nzb_filename)?;
+    insert_env(env, "NZBPP_QUEUEDFILE", &context.nzb_filename)?;
+    insert_env(
+        env,
+        "NZBPP_URL",
+        context.source_url.as_deref().unwrap_or_default(),
+    )?;
+    insert_env(
+        env,
+        "NZBPP_FINALDIR",
+        path_text(
+            context
+                .compatibility
+                .final_directory_override
+                .as_deref()
+                .unwrap_or(&context.final_directory),
+        )?,
+    )?;
+    insert_env(
+        env,
+        "NZBPP_CATEGORY",
+        context.category.as_deref().unwrap_or_default(),
+    )?;
+    insert_env(env, "NZBPP_STATUS", status)?;
+    insert_env(env, "NZBPP_TOTALSTATUS", total_status)?;
+    insert_env(
+        env,
+        "NZBPP_SCRIPTSTATUS",
+        context.compatibility.previous_script_status.as_str(),
+    )?;
+    insert_env(env, "NZBPP_PARSTATUS", &context.par_status.to_string())?;
+    insert_env(
+        env,
+        "NZBPP_UNPACKSTATUS",
+        &context.unpack_status.to_string(),
+    )?;
+    insert_env(
+        env,
+        "NZBPP_HEALTH",
+        &context.compatibility.health_milli.to_string(),
+    )?;
+    insert_env(
+        env,
+        "NZBPP_CRITICALHEALTH",
+        &context.compatibility.critical_health_milli.to_string(),
+    )?;
+    insert_compat_options(env, "NZBPO", &request.options)?;
+    insert_nzbget_global_options(env, &context.compatibility)?;
+    insert_parameters(env, &context.compatibility.parameters, &request.manifest)?;
+    let final_directory = context
+        .compatibility
+        .final_directory_override
+        .as_deref()
+        .unwrap_or(&context.final_directory);
+    for (name, value) in [
+        ("WEAVER_JOB_ID", context.job_id.to_string()),
+        ("WEAVER_JOB_NAME", context.name.clone()),
+        (
+            "WEAVER_CATEGORY",
+            context.category.clone().unwrap_or_default(),
+        ),
+        (
+            "WEAVER_DIRECTORY",
+            path_text(&context.final_directory)?.to_string(),
+        ),
+        (
+            "WEAVER_FINAL_DIRECTORY",
+            path_text(final_directory)?.to_string(),
+        ),
+        ("WEAVER_STATUS", total_status.to_string()),
+    ] {
+        insert_env(env, name, &value)?;
+    }
+    insert_weaver_env(
+        env,
+        &request.identity,
+        &context.compatibility,
+        &request.options,
+    )?;
+    Ok(arguments)
+}
+
+/// What weaver tells every run about itself: which run and instance this is,
+/// where weaver keeps its files, and the instance's inputs.
+fn insert_weaver_env(
+    env: &mut BTreeMap<OsStringWire, OsStringWire>,
+    identity: &RunIdentity,
+    facts: &CompatibilityFacts,
+    options: &[ResolvedOption],
+) -> Result<(), RunnerError> {
+    for (name, value) in [
+        ("WEAVER_RUN_ID", Some(identity.run_id.as_str())),
+        ("WEAVER_INSTANCE_ID", Some(identity.instance_id.as_str())),
+        (
+            "WEAVER_INSTANCE_NAME",
+            Some(identity.instance_name.as_str()),
+        ),
+        ("WEAVER_TRIGGER", Some(identity.trigger.as_str())),
+        ("WEAVER_API_URL", identity.api_url.as_deref()),
+        ("WEAVER_RUN_TOKEN", identity.token.as_deref()),
+    ] {
+        if let Some(value) = value {
+            insert_env(env, name, value)?;
         }
     }
+    insert_env(env, "WEAVER_VERSION", env!("CARGO_PKG_VERSION"))?;
+    for (name, directory) in [
+        ("WEAVER_DATA_DIR", facts.data_dir.as_deref()),
+        ("WEAVER_COMPLETE_DIR", facts.complete_dir.as_deref()),
+    ] {
+        if let Some(directory) = directory {
+            insert_env(env, name, path_text(directory)?)?;
+        }
+    }
+    insert_options(env, "WEAVER_INPUT_", options)
 }
 
 fn sab_pipeline_status(outcome: &PipelineOutcome) -> i32 {
@@ -825,7 +1008,7 @@ fn insert_compat_options(
     Ok(())
 }
 
-fn option_value_text(value: &OptionValue) -> String {
+pub(super) fn option_value_text(value: &OptionValue) -> String {
     match value {
         OptionValue::String(value) => value.clone(),
         OptionValue::Integer(value) => value.to_string(),
@@ -1020,13 +1203,16 @@ async fn execute_supervised(
     let mut stdin = child.stdin.take().ok_or_else(|| {
         RunnerError::SupervisorProtocol("supervisor stdin was unavailable".into())
     })?;
-    stdin.write_all(&request_length.to_le_bytes()).await?;
-    stdin.write_all(&request_json).await?;
-
     let output = Arc::new(Mutex::new(BoundedOutput {
         ceiling: prepared.capture.ceiling,
         ..Default::default()
     }));
+    // Bound before the script is launched, so that nothing it asks for can
+    // arrive first, and let go of before the output is taken back below.
+    let injected = prepared.injector.bind(&output, &prepared.capture);
+    stdin.write_all(&request_length.to_le_bytes()).await?;
+    stdin.write_all(&request_json).await?;
+
     let stdout = child.stdout.take().ok_or_else(|| {
         RunnerError::SupervisorProtocol("supervisor stdout was unavailable".into())
     })?;
@@ -1105,13 +1291,14 @@ async fn execute_supervised(
             "supervisor did not confirm script launch".into(),
         ));
     }
+    drop(injected);
     let captured = Arc::try_unwrap(output)
         .map_err(|_| RunnerError::SupervisorProtocol("output collector remained shared".into()))?
         .into_inner()
         .map_err(|_| RunnerError::SupervisorProtocol("output collector was poisoned".into()))?;
     let exit_code = status.as_ref().and_then(ExitStatus::code);
-    let disposition = forced.unwrap_or_else(|| adapter_disposition(prepared.adapter, exit_code));
-    if prepared.adapter == ScriptAdapter::Nzbget && exit_code == Some(92) {
+    let disposition = forced.unwrap_or_else(|| exit_disposition(exit_code));
+    if exit_code == Some(92) {
         // NZBGet's par-check request has no successor: repair is native and
         // already authoritative by the time scripts run.
         tracing::info!(
@@ -1127,7 +1314,7 @@ async fn execute_supervised(
         error_message: match disposition {
             ExecutionDisposition::TimedOut => Some("post-processing script timed out".into()),
             ExecutionDisposition::Cancelled => Some("post-processing script was cancelled".into()),
-            ExecutionDisposition::Failed | ExecutionDisposition::Warned => Some(match exit_code {
+            ExecutionDisposition::Failed => Some(match exit_code {
                 Some(code) => format!("post-processing script exited with status {code}"),
                 None => "post-processing script terminated without an exit status".into(),
             }),
@@ -1245,6 +1432,9 @@ async fn capture_line(line: Vec<u8>, output: &Arc<Mutex<BoundedOutput>>, policy:
         (redacted, None)
     };
     if !tail.is_empty() {
+        if let Some(tap) = &policy.tap {
+            tap(&tail);
+        }
         output.lock().expect("output collector poisoned").push(tail);
     }
     if let (Some(sender), Some(event)) = (&policy.events, event) {
@@ -1252,14 +1442,14 @@ async fn capture_line(line: Vec<u8>, output: &Arc<Mutex<BoundedOutput>>, policy:
     }
 }
 
-/// SABnzbd records any nonzero exit as a warning; NZBGet defines 93/94/95.
-fn adapter_disposition(adapter: ScriptAdapter, exit_code: Option<i32>) -> ExecutionDisposition {
-    match (adapter, exit_code) {
-        (ScriptAdapter::Sabnzbd, Some(0)) => ExecutionDisposition::Succeeded,
-        (ScriptAdapter::Sabnzbd, _) => ExecutionDisposition::Warned,
-        (ScriptAdapter::Nzbget, Some(92 | 93)) => ExecutionDisposition::Succeeded,
-        (ScriptAdapter::Nzbget, Some(95)) => ExecutionDisposition::Skipped,
-        (ScriptAdapter::Nzbget, _) => ExecutionDisposition::Failed,
+/// One reading of an exit status for every script and every trigger, so a
+/// script may use whichever convention it was written for: 0 and NZBGet's 92
+/// and 93 are success, 95 is "nothing to do", and anything else is a failure.
+fn exit_disposition(exit_code: Option<i32>) -> ExecutionDisposition {
+    match exit_code {
+        Some(0 | 92 | 93) => ExecutionDisposition::Succeeded,
+        Some(95) => ExecutionDisposition::Skipped,
+        _ => ExecutionDisposition::Failed,
     }
 }
 
@@ -1441,6 +1631,14 @@ fn terminate_on_parent_pipe_loss(_child: &mut std::process::Child) {
 pub(crate) fn adapter_contract_for_test(
     request: &ScriptExecutionRequest,
 ) -> Result<(Vec<String>, BTreeMap<String, String>), RunnerError> {
+    adapter_contract(request)
+}
+
+/// The arguments and environment the adapter hands a post-processing script,
+/// without the platform environment it inherits.
+pub(crate) fn adapter_contract(
+    request: &ScriptExecutionRequest,
+) -> Result<(Vec<String>, BTreeMap<String, String>), RunnerError> {
     let mut env = BTreeMap::new();
     let args = adapter_environment_and_args(request, &mut env)?
         .into_iter()
@@ -1468,11 +1666,8 @@ pub(crate) fn adapter_contract_for_test(
 }
 
 #[cfg(test)]
-pub(crate) fn adapter_disposition_for_test(
-    adapter: ScriptAdapter,
-    exit_code: Option<i32>,
-) -> ExecutionDisposition {
-    adapter_disposition(adapter, exit_code)
+pub(crate) fn exit_disposition_for_test(exit_code: Option<i32>) -> ExecutionDisposition {
+    exit_disposition(exit_code)
 }
 
 #[cfg(test)]
@@ -1508,6 +1703,7 @@ mod capture_tests {
             secrets: Arc::new(vec![b"private-value".to_vec()]),
             event: None,
             events: Some(sender),
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let input = b"ordinary private-value\r\n[INFO] private-value\n[NZB] NZBPR_Token=private-value\nunterminated private-value";
@@ -1538,6 +1734,7 @@ mod capture_tests {
             secrets: Arc::new(secrets),
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let lines = format!(
@@ -1624,6 +1821,7 @@ mod capture_tests {
             secrets: Arc::new(vec![b"secret-alpha\r\n\r\nsecret-beta".to_vec()]),
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let input = b"secret-alpha\r\n\r\nsecret-beta\n[INFO] secret-alpha\n[NZB] NZBPR_Token=secret-beta\n";
@@ -1660,6 +1858,7 @@ mod capture_tests {
             secrets: Arc::new(vec![b"sensitive-value".to_vec()]),
             event: Some(ScriptEventLabel::Scan),
             events: Some(sender),
+            tap: None,
             ceiling: MAX_SCRIPT_OUTPUT_BYTES,
         };
         let mut input = b"[NZB] NZBPR_Token=sensitive-value\n[INFO] sensitive-value\r\n".to_vec();

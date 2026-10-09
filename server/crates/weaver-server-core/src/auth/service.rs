@@ -11,6 +11,16 @@ pub struct Claims {
     pub exp: u64,
 }
 
+/// What a token handed to a running script says about that run.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScriptRunClaims {
+    pub run_id: String,
+    pub instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<u64>,
+    pub exp: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum JwtError {
     #[error("malformed token")]
@@ -175,22 +185,61 @@ pub fn create_jwt(username: &str, secret: &[u8], ttl_secs: u64) -> String {
         .unwrap_or_default()
         .as_secs();
 
-    let header = base64url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-    let claims = Claims {
-        sub: username.to_string(),
-        iat: now,
-        exp: now + ttl_secs,
-    };
-    let payload = base64url_encode(&serde_json::to_vec(&claims).expect("claims serialization"));
+    sign_claims(
+        &Claims {
+            sub: username.to_string(),
+            iat: now,
+            exp: now + ttl_secs,
+        },
+        secret,
+    )
+}
 
-    let signing_input = format!("{header}.{payload}");
+pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
+    let claims: Claims = verified_claims(token, secret)?;
+    unexpired(claims.exp)?;
+    Ok(claims)
+}
+
+/// A token for one script run. Its claims name no user, so it is never
+/// accepted where a login token is, and a login token is never accepted here.
+pub fn create_script_run_jwt(claims: &ScriptRunClaims, secret: &[u8]) -> String {
+    sign_claims(claims, secret)
+}
+
+pub fn verify_script_run_jwt(token: &str, secret: &[u8]) -> Result<ScriptRunClaims, JwtError> {
+    let claims: ScriptRunClaims = verified_claims(token, secret)?;
+    unexpired(claims.exp)?;
+    Ok(claims)
+}
+
+/// Whether `token` has the shape of a token this server signs. Cheap enough
+/// to ask of every credential before anything is read to verify it.
+pub fn is_signed_token_shape(token: &str) -> bool {
+    let mut parts = token.split('.');
+    parts.next() == Some(TOKEN_HEADER)
+        && parts.next().is_some_and(|payload| !payload.is_empty())
+        && parts.next().is_some_and(|signature| !signature.is_empty())
+        && parts.next().is_none()
+}
+
+/// `{"alg":"HS256","typ":"JWT"}`, encoded.
+const TOKEN_HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
+fn sign_claims(claims: &impl Serialize, secret: &[u8]) -> String {
+    let payload = base64url_encode(&serde_json::to_vec(claims).expect("claims serialization"));
+    let signing_input = format!("{TOKEN_HEADER}.{payload}");
     let signature = sign_hs256(secret, signing_input.as_bytes());
     let sig_b64 = base64url_encode(&signature);
 
     format!("{signing_input}.{sig_b64}")
 }
 
-pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
+/// The claims of `token`, once its signature has been checked.
+fn verified_claims<T: serde::de::DeserializeOwned>(
+    token: &str,
+    secret: &[u8],
+) -> Result<T, JwtError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::Malformed);
@@ -205,18 +254,19 @@ pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
     }
 
     let payload_bytes = base64url_decode(parts[1]).map_err(|_| JwtError::Malformed)?;
-    let claims: Claims = serde_json::from_slice(&payload_bytes)
-        .map_err(|error| JwtError::InvalidClaims(error.to_string()))?;
+    serde_json::from_slice(&payload_bytes)
+        .map_err(|error| JwtError::InvalidClaims(error.to_string()))
+}
 
+fn unexpired(exp: u64) -> Result<(), JwtError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if claims.exp < now {
+    if exp < now {
         return Err(JwtError::Expired);
     }
-
-    Ok(claims)
+    Ok(())
 }
 
 fn sign_hs256(secret: &[u8], data: &[u8]) -> Vec<u8> {

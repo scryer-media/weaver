@@ -1,5 +1,6 @@
 use super::*;
-use crate::post_processing::model::{PostProcessingSettings, ScriptListEntry, ScriptLists};
+use crate::post_processing::instances::ScriptInstanceDraft;
+use crate::post_processing::model::ScriptName;
 
 fn configured() -> (Database, tempfile::TempDir) {
     let db = Database::open_in_memory().unwrap();
@@ -17,15 +18,18 @@ fn configured() -> (Database, tempfile::TempDir) {
         ..Default::default()
     })
     .unwrap();
-    db.save_post_processing_script_lists(&ScriptLists {
-        global: ScriptList::new(vec![ScriptListEntry::new(
-            ScriptName::new("queue.sh").unwrap(),
-        )])
-        .unwrap(),
-        ..Default::default()
-    })
-    .unwrap();
+    // One instance for each thing that can happen to a download.
+    for event in QueueEvent::ALL {
+        db.create_script_instance(queue_instance(event)).unwrap();
+    }
     (db, data)
+}
+
+fn queue_instance(event: QueueEvent) -> ScriptInstanceDraft {
+    ScriptInstanceDraft::new(
+        ScriptName::new("queue.sh").unwrap(),
+        InstanceTrigger::Queue(event),
+    )
 }
 
 fn event(job_id: u64, event: QueueEvent) -> EventContext {
@@ -36,7 +40,8 @@ fn event(job_id: u64, event: QueueEvent) -> EventContext {
         cwd: PathBuf::new(),
         env: BTreeMap::new(),
         facts: Default::default(),
-        scripts: None,
+        instances: None,
+        scratch: None,
     }
 }
 
@@ -387,52 +392,115 @@ async fn malformed_payload_is_quarantined_without_poisoning_another_job() {
 }
 
 #[test]
-fn subscriber_hint_invalidates_settings_and_lists_and_preserves_job_overrides() {
+fn the_subscriber_hint_follows_the_settings_and_the_saved_instances() {
     let (db, data) = configured();
     db.save_post_processing_settings(&PostProcessingSettings::default())
         .unwrap();
     refresh_admission_hint(&db).unwrap();
-    assert!(!db.queue_scripts_possible(&[]));
+    assert!(!db.queue_scripts_possible());
     db.save_post_processing_settings(&PostProcessingSettings {
         execution_enabled: true,
         ..Default::default()
     })
     .unwrap();
-    assert!(db.queue_scripts_possible(&[]));
-    db.save_post_processing_script_lists(&ScriptLists::default())
+    assert!(db.queue_scripts_possible());
+
+    for instance in db.script_instances().unwrap() {
+        db.delete_script_instance(&instance.id).unwrap();
+    }
+    refresh_admission_hint(&db).unwrap();
+    assert!(!db.queue_scripts_possible());
+    // An instance on another trigger has nothing to do with the queue.
+    db.create_script_instance(ScriptInstanceDraft::new(
+        ScriptName::new("queue.sh").unwrap(),
+        InstanceTrigger::PostProcessing,
+    ))
+    .unwrap();
+    refresh_admission_hint(&db).unwrap();
+    assert!(!db.queue_scripts_possible());
+    // Nor does one that is turned off.
+    db.create_script_instance(queue_instance(QueueEvent::NzbAdded).disabled())
         .unwrap();
     refresh_admission_hint(&db).unwrap();
-    assert!(!db.queue_scripts_possible(&[]));
-    let parameters = vec![(
-        super::super::settings::JOB_SCRIPT_OVERRIDE_METADATA_KEY.into(),
-        "queue.sh".into(),
-    )];
-    assert!(db.queue_scripts_possible(&parameters));
+    assert!(!db.queue_scripts_possible());
+
+    db.create_script_instance(queue_instance(QueueEvent::NzbAdded).category("tv"))
+        .unwrap();
+    // Saving an instance drops the hint, so the next event looks again.
+    assert!(db.queue_scripts_possible());
+    refresh_admission_hint(&db).unwrap();
+    assert!(db.queue_scripts_possible());
+
+    // The hint only says an event might have something to run. Whether this
+    // one does is down to its trigger and its category.
     let mut context = event(30, QueueEvent::NzbAdded);
-    context.facts.parameters = parameters;
+    assert!(!has_subscriber(&db, &context).unwrap());
+    context.category = Some("TV".into());
     assert!(has_subscriber(&db, &context).unwrap());
+    context.event = ScriptEventLabel::Queue(QueueEvent::NzbDeleted);
+    assert!(!has_subscriber(&db, &context).unwrap());
+
+    // A new scripts directory turns every instance off until the operator has
+    // looked it over.
     db.replace_post_processing_script_directory(&data.path().join("replacement"))
         .unwrap();
-    assert!(db.queue_scripts_possible(&[]));
+    assert!(db.queue_scripts_possible());
+    context.event = ScriptEventLabel::Queue(QueueEvent::NzbAdded);
+    assert!(!has_subscriber(&db, &context).unwrap());
+    assert!(!db.queue_scripts_possible());
 }
 
 #[test]
-fn queue_manifest_changes_are_live_even_after_a_negative_resolution() {
+fn an_instance_runs_on_its_trigger_whatever_its_script_says_about_itself() {
     let (db, _data) = configured();
     let path = db
         .post_processing_script_directory()
         .unwrap()
         .join("queue.sh");
+    let context = event(31, QueueEvent::NzbAdded);
+    assert!(has_subscriber(&db, &context).unwrap());
+    // A header is a starting point for a new instance and nothing more.
     std::fs::write(
         &path,
         "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\nexit 0\n",
     )
     .unwrap();
-    let context = event(31, QueueEvent::NzbAdded);
-    assert!(!has_subscriber(&db, &context).unwrap());
-    assert!(db.queue_scripts_possible(&[]));
-    std::fs::write(&path, "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n").unwrap();
     assert!(has_subscriber(&db, &context).unwrap());
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    assert!(has_subscriber(&db, &context).unwrap());
+}
+
+#[tokio::test]
+async fn an_instance_whose_script_is_gone_is_reported_and_holds_nothing_up() {
+    let (db, _data) = configured();
+    std::fs::remove_file(
+        db.post_processing_script_directory()
+            .unwrap()
+            .join("queue.sh"),
+    )
+    .unwrap();
+    let saved = db
+        .script_instances()
+        .unwrap()
+        .into_iter()
+        .find(|instance| instance.trigger == InstanceTrigger::Queue(QueueEvent::NzbAdded))
+        .unwrap();
+    let mut context = event(37, QueueEvent::NzbAdded);
+    context.job_id = None;
+    let results = run_event(&db, &mut context, "gone", None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result.status, ScriptStatus::Warning);
+    assert_eq!(result.exit_code, None);
+    assert_eq!(result.instance_id.as_deref(), Some(saved.id.as_str()));
+    assert_eq!(result.instance_name.as_deref(), Some("queue.sh"));
+    assert_eq!(result.event, ScriptEventLabel::Queue(QueueEvent::NzbAdded));
+    assert!(result.error_message.is_some());
+    assert!(!result.background);
+    assert_eq!(*db.script_runtime.running.lock().unwrap(), 0);
 }
 
 #[test]

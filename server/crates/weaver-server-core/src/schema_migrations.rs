@@ -12,6 +12,9 @@ use crate::migration_assets::{
     EngineScope, MigrationInstallKind,
 };
 use crate::migration_hook_ids;
+use crate::persistence::sql_runtime::SqlConn;
+
+pub(crate) mod script_instances_v55;
 
 const EMBEDDED_MIGRATION_CATALOG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/migration_catalog.json.zst"));
@@ -22,7 +25,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 54;
+const CURRENT_SCHEMA_VERSION: i64 = 55;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -786,6 +789,9 @@ async fn run_rust_hook(
         "upgrade_to_schema_25" => upgrade_to_schema_25(tx).await,
         "restart_active_jobs_drop_active_segments_v28" => {
             restart_active_jobs_drop_active_segments_v28(tx).await
+        }
+        script_instances_v55::HOOK_ID => {
+            script_instances_v55::move_script_wiring_to_instances(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"

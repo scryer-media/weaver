@@ -1,8 +1,14 @@
 use super::*;
 use crate::post_processing::effects::JobScriptEffects;
-use crate::post_processing::model::{
-    PostProcessingSettings, QueueEvent, ScriptList, ScriptListEntry, ScriptLists, ScriptName,
-};
+use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+use crate::post_processing::model::{PostProcessingSettings, QueueEvent, ScriptName, ScriptStatus};
+
+fn queue_instance(event: QueueEvent) -> ScriptInstanceDraft {
+    ScriptInstanceDraft::new(
+        ScriptName::new("queue.sh").unwrap(),
+        InstanceTrigger::Queue(event),
+    )
+}
 
 fn enable_queue_script(db: &Database, root: &Path) {
     let scripts = db
@@ -18,14 +24,10 @@ fn enable_queue_script(db: &Database, root: &Path) {
         ..Default::default()
     })
     .unwrap();
-    db.save_post_processing_script_lists(&ScriptLists {
-        global: ScriptList::new(vec![ScriptListEntry::new(
-            ScriptName::new("queue.sh").unwrap(),
-        )])
-        .unwrap(),
-        ..Default::default()
-    })
-    .unwrap();
+    // One instance for each thing that can happen to a download.
+    for event in QueueEvent::ALL {
+        db.create_script_instance(queue_instance(event)).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -33,6 +35,16 @@ async fn downloaded_barrier_persists_and_mark_bad_prevents_native_finalization()
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
     enable_queue_script(&pipeline.db, temp.path());
+    // Something to run once the job has ended, so the job is still there to
+    // look at after it is marked bad. Its script is not on disk: the run is
+    // reported and starts nothing.
+    pipeline
+        .db
+        .create_script_instance(ScriptInstanceDraft::new(
+            ScriptName::new("after.sh").unwrap(),
+            InstanceTrigger::PostProcessing,
+        ))
+        .unwrap();
     let job_id = JobId(164);
     insert_active_job(
         &mut pipeline,
@@ -222,13 +234,10 @@ async fn non_queue_script_does_not_publish_queue_wait_status() {
         .unwrap();
     pipeline
         .db
-        .save_post_processing_script_lists(&ScriptLists {
-            global: ScriptList::new(vec![ScriptListEntry::new(
-                ScriptName::new("post.sh").unwrap(),
-            )])
-            .unwrap(),
-            ..Default::default()
-        })
+        .create_script_instance(ScriptInstanceDraft::new(
+            ScriptName::new("post.sh").unwrap(),
+            InstanceTrigger::PostProcessing,
+        ))
         .unwrap();
     let job_id = JobId(168);
     insert_active_job(&mut pipeline, job_id, standalone_job_spec("no-queue", &[])).await;
@@ -496,4 +505,142 @@ async fn the_streamed_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_b
         pipeline.jobs[&job_id].status,
         JobStatus::AwaitingQueueScripts
     );
+}
+
+/// An instance that blocks on a job's arrival keeps the job from downloading
+/// until its run has ended.
+#[tokio::test]
+async fn a_new_job_waits_for_the_instances_that_block_on_its_arrival() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_queue_script(&pipeline.db, temp.path());
+    // With its script gone the instance has nothing to start, so its run ends
+    // as soon as its turn comes, with a result that says so.
+    std::fs::remove_file(
+        pipeline
+            .db
+            .post_processing_script_directory()
+            .unwrap()
+            .join("queue.sh"),
+    )
+    .unwrap();
+    let job_id = JobId(171);
+    insert_active_job(&mut pipeline, job_id, standalone_job_spec("held", &[])).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+
+    pipeline.raise_added_script_event(job_id);
+    assert!(pipeline.held_for_added_scripts(job_id));
+
+    let TerminalPostProcessingEvent::AddedScriptsDone(id, result) = pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    else {
+        panic!("expected the end of the arrival scripts");
+    };
+    assert_eq!(id, job_id);
+    result.as_ref().unwrap();
+    // The hold is the pipeline's to release, in step with its other state.
+    assert!(pipeline.held_for_added_scripts(job_id));
+    pipeline.handle_added_scripts_done(id, result);
+    assert!(!pipeline.held_for_added_scripts(job_id));
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+
+    let results = pipeline.db.event_script_results(job_id.0).unwrap();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0].status, ScriptStatus::Warning);
+    assert_eq!(results[0].instance_name.as_deref(), Some("queue.sh"));
+
+    // A second end for the same job changes nothing.
+    pipeline.handle_added_scripts_done(job_id, Ok(()));
+    assert!(!pipeline.held_for_added_scripts(job_id));
+}
+
+/// What a blocking arrival script asked for is in force before the job is let
+/// go, so a job it marked bad never starts downloading.
+#[tokio::test]
+async fn a_job_marked_bad_on_arrival_fails_when_its_hold_ends() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(173);
+    insert_active_job(&mut pipeline, job_id, standalone_job_spec("bad", &[])).await;
+    pipeline.added_script_holds.insert(job_id);
+    pipeline
+        .db
+        .save_job_script_effects(
+            job_id.0,
+            &JobScriptEffects {
+                marked_bad: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    pipeline.handle_added_scripts_done(job_id, Ok(()));
+    assert!(!pipeline.held_for_added_scripts(job_id));
+    let status = pipeline
+        .finished_jobs
+        .iter()
+        .find(|job| job.job_id == job_id)
+        .map(|job| job.status.clone())
+        .or_else(|| pipeline.jobs.get(&job_id).map(|state| state.status.clone()));
+    assert!(
+        matches!(&status, Some(JobStatus::Failed { error }) if error.contains("FAILURE/BAD")),
+        "{status:?}"
+    );
+}
+
+/// Scripts that could not be run at all decide nothing, so the job goes on.
+#[tokio::test]
+async fn arrival_scripts_that_cannot_run_let_the_job_go() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(174);
+    insert_active_job(&mut pipeline, job_id, standalone_job_spec("let-go", &[])).await;
+    pipeline.added_script_holds.insert(job_id);
+    pipeline.handle_added_scripts_done(
+        job_id,
+        Err(crate::StateError::Database("settings unavailable".into())),
+    );
+    assert!(!pipeline.held_for_added_scripts(job_id));
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+}
+
+/// Only an instance that blocks, on this event, for this job's category, holds
+/// the job.
+#[tokio::test]
+async fn a_new_job_starts_at_once_when_nothing_blocks_on_its_arrival() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let scripts = pipeline
+        .db
+        .initialize_post_processing_script_directory(temp.path(), None)
+        .unwrap();
+    assert!(!scripts.join("queue.sh").exists());
+    pipeline
+        .db
+        .save_post_processing_settings(&PostProcessingSettings {
+            execution_enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+    for instance in [
+        queue_instance(QueueEvent::NzbAdded).fire_and_forget(),
+        queue_instance(QueueEvent::NzbAdded).category("tv"),
+        queue_instance(QueueEvent::NzbAdded).disabled(),
+        queue_instance(QueueEvent::NzbDeleted),
+    ] {
+        pipeline.db.create_script_instance(instance).unwrap();
+    }
+    let job_id = JobId(172);
+    insert_active_job(&mut pipeline, job_id, standalone_job_spec("not-held", &[])).await;
+
+    pipeline.raise_added_script_event(job_id);
+    assert!(!pipeline.held_for_added_scripts(job_id));
 }

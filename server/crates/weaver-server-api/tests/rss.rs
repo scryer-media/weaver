@@ -41,26 +41,32 @@ async fn add_feed() {
 
 #[tokio::test]
 async fn feed_script_selection_is_validated_before_persistence() {
+    use weaver_server_core::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+    use weaver_server_core::post_processing::model::ScriptName;
+
     let h = TestHarness::new().await;
-    let data = tempfile::tempdir().unwrap();
-    let root =
-        h.db.initialize_post_processing_script_directory(data.path(), None)
-            .unwrap();
-    std::fs::write(
-        root.join("post.sh"),
-        "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\nexit 93\n",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("feed.sh"),
-        "#!/bin/sh\n### NZBGET FEED SCRIPT ###\nexit 93\n",
-    )
-    .unwrap();
-    for script in ["missing.sh", "post.sh"] {
+    let on = |trigger| {
+        h.db.create_script_instance(ScriptInstanceDraft::new(
+            ScriptName::new("rewrite.sh").unwrap(),
+            trigger,
+        ))
+        .unwrap()
+        .id
+    };
+    let post = on(InstanceTrigger::PostProcessing);
+    let feed = on(InstanceTrigger::Feed);
+    let other = on(InstanceTrigger::Feed);
+
+    // A feed runs feed instances that exist, each of them once.
+    for selection in [
+        r#""missing""#.to_string(),
+        format!(r#""{post}""#),
+        format!(r#""{feed}", "{feed}""#),
+    ] {
         let response = h
             .execute(&format!(
                 r#"mutation {{ addRssFeed(input: {{
-            name: "invalid", url: "https://example.com/rss", enabled: false, scripts: ["{script}"]
+            name: "invalid", url: "https://example.com/rss", enabled: false, scriptInstanceIds: [{selection}]
         }}) {{ id }} }}"#
             ))
             .await;
@@ -68,27 +74,60 @@ async fn feed_script_selection_is_validated_before_persistence() {
         assert!(h.db.list_rss_feeds().unwrap().is_empty());
     }
     let response = h
-        .execute(
-            r#"mutation { addRssFeed(input: {
-        name: "valid", url: "https://example.com/rss", enabled: false, scripts: ["feed.sh"]
-    }) { id } }"#,
-        )
+        .execute(&format!(
+            r#"mutation {{ addRssFeed(input: {{
+        name: "valid", url: "https://example.com/rss", enabled: false, scriptInstanceIds: ["{other}", "{feed}"]
+    }}) {{ id scriptInstanceIds }} }}"#
+        ))
         .await;
     assert_no_errors(&response);
-    let id = response_data(&response)["addRssFeed"]["id"]
-        .as_u64()
-        .unwrap();
+    let added = &response_data(&response)["addRssFeed"];
+    assert_eq!(
+        added["scriptInstanceIds"],
+        serde_json::json!([other, feed]),
+        "the order they are given in is the order they run in"
+    );
+    let id = added["id"].as_u64().unwrap();
     let response = h
         .execute(&format!(
             r#"mutation {{ updateRssFeed(id: {id}, input: {{
-        name: "invalid update", url: "https://example.com/rss", enabled: false, scripts: ["post.sh"]
+        name: "invalid update", url: "https://example.com/rss", enabled: false, scriptInstanceIds: ["{post}"]
     }}) {{ id }} }}"#
         ))
         .await;
     assert_has_errors(&response);
     let saved = h.db.get_rss_feed(id as u32).unwrap().unwrap();
     assert_eq!(saved.name, "valid");
-    assert_eq!(saved.scripts, vec!["feed.sh"]);
+    assert_eq!(saved.scripts, [other.clone(), feed.clone()]);
+
+    // Left out, the selection stays; an empty one clears it.
+    let response = h
+        .execute(&format!(
+            r#"mutation {{ updateRssFeed(id: {id}, input: {{
+        name: "renamed", url: "https://example.com/rss", enabled: false
+    }}) {{ name scriptInstanceIds }} }}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateRssFeed"],
+        serde_json::json!({ "name": "renamed", "scriptInstanceIds": [other, feed] })
+    );
+    let response = h
+        .execute(&format!(
+            r#"mutation {{ updateRssFeed(id: {id}, input: {{
+        name: "renamed", url: "https://example.com/rss", enabled: false, scriptInstanceIds: []
+    }}) {{ scriptInstanceIds }} }}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert!(
+        h.db.get_rss_feed(id as u32)
+            .unwrap()
+            .unwrap()
+            .scripts
+            .is_empty()
+    );
 }
 
 #[tokio::test]

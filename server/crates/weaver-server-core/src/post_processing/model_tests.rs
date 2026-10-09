@@ -1,12 +1,8 @@
 use super::model::{
     OptionName, OptionValue, PostProcessingSettings, PostProcessingSummary, ResolvedOption,
-    ScriptAdapter, ScriptList, ScriptListEntry, ScriptLists, ScriptManifest, ScriptName,
-    ScriptOption, ScriptOptionType, ScriptStatus, SecretOptionValue, merge_post_processing_summary,
+    ScriptAdapter, ScriptManifest, ScriptName, ScriptOption, ScriptOptionType, ScriptStatus,
+    SecretOptionValue, merge_post_processing_summary,
 };
-
-fn script(name: &str) -> ScriptName {
-    ScriptName::new(name).unwrap()
-}
 
 fn manifest(options: Vec<ScriptOption>) -> ScriptManifest {
     ScriptManifest::new(
@@ -58,75 +54,6 @@ fn script_names_stay_inside_the_scripts_directory() {
             "accepted {rejected:?} as a script name"
         );
     }
-}
-
-#[test]
-fn script_lists_reject_duplicates_and_zero_timeouts() {
-    assert!(ScriptList::new(vec![ScriptListEntry::new(script("a.sh"))]).is_ok());
-    assert!(
-        ScriptList::new(vec![
-            ScriptListEntry::new(script("a.sh")),
-            ScriptListEntry::new(script("a.sh")),
-        ])
-        .is_err()
-    );
-    let zero = ScriptListEntry {
-        script: script("a.sh"),
-        enabled: true,
-        timeout_seconds: Some(0),
-        blocking: true,
-    };
-    assert!(ScriptList::new(vec![zero]).is_err());
-}
-
-#[test]
-fn category_overrides_beat_the_global_default_case_insensitively() {
-    let mut lists = ScriptLists {
-        global: ScriptList::new(vec![ScriptListEntry::new(script("global.sh"))]).unwrap(),
-        ..ScriptLists::default()
-    };
-    lists.categories.insert(
-        "Movies".into(),
-        ScriptList::new(vec![ScriptListEntry::new(script("movies.sh"))]).unwrap(),
-    );
-
-    assert_eq!(
-        lists.resolve(None).entries()[0].script.as_str(),
-        "global.sh"
-    );
-    assert_eq!(
-        lists.resolve(Some("tv")).entries()[0].script.as_str(),
-        "global.sh"
-    );
-    // Download clients echo their own casing back, so the lookup cannot be exact.
-    for category in ["Movies", "movies", " MOVIES "] {
-        assert_eq!(
-            lists.resolve(Some(category)).entries()[0].script.as_str(),
-            "movies.sh",
-            "category {category:?} did not resolve its override"
-        );
-    }
-}
-
-#[test]
-fn disabled_entries_are_kept_in_order_but_never_run() {
-    let list = ScriptList::new(vec![
-        ScriptListEntry::new(script("first.sh")),
-        ScriptListEntry {
-            script: script("second.sh"),
-            enabled: false,
-            timeout_seconds: None,
-            blocking: true,
-        },
-        ScriptListEntry::new(script("third.sh")),
-    ])
-    .unwrap();
-    assert_eq!(list.entries().len(), 3);
-    let enabled = list
-        .enabled_entries()
-        .map(|entry| entry.script.as_str().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(enabled, ["first.sh", "third.sh"]);
 }
 
 #[test]
@@ -332,21 +259,6 @@ fn unacceptable_extension_patterns_reject_paths_dots_and_regex_syntax() {
 }
 
 #[test]
-fn an_entry_saved_before_run_modes_existed_is_waited_for() {
-    let entry: ScriptListEntry = serde_json::from_str(r#"{"script":"notify.sh"}"#).unwrap();
-    assert!(entry.blocking);
-    let detached = ScriptListEntry {
-        blocking: false,
-        ..entry
-    };
-    let stored = serde_json::to_string(&detached).unwrap();
-    assert_eq!(
-        serde_json::from_str::<ScriptListEntry>(&stored).unwrap(),
-        detached
-    );
-}
-
-#[test]
 fn a_result_says_it_was_not_waited_for_only_when_that_is_so() {
     let stored = r#"{"script":"notify.sh","adapter":"sabnzbd","status":"succeeded","exitCode":0,"durationMs":1,"finishedAtEpochMs":1}"#;
     let result: super::model::ScriptResult = serde_json::from_str(stored).unwrap();
@@ -366,4 +278,21 @@ fn a_result_says_it_was_not_waited_for_only_when_that_is_so() {
             .unwrap()
             .background
     );
+}
+
+#[test]
+fn a_result_names_its_instance_only_when_it_ran_as_one() {
+    let stored = r#"{"script":"notify.sh","adapter":"sabnzbd","status":"succeeded","exitCode":0,"durationMs":1,"finishedAtEpochMs":1}"#;
+    let result: super::model::ScriptResult = serde_json::from_str(stored).unwrap();
+    assert_eq!(result.instance_id, None);
+    assert_eq!(result.instance_name, None);
+    assert!(!serde_json::to_string(&result).unwrap().contains("instance"));
+    let named = super::model::ScriptResult {
+        instance_id: Some("one".into()),
+        instance_name: Some("Notify the family".into()),
+        ..result
+    };
+    let read_back: super::model::ScriptResult =
+        serde_json::from_str(&serde_json::to_string(&named).unwrap()).unwrap();
+    assert_eq!(read_back, named);
 }

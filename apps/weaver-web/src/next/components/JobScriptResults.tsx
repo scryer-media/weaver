@@ -24,8 +24,32 @@ export interface ScriptRunOutputSource {
   outputTruncated: boolean;
 }
 
-interface ScriptResult extends ScriptRunOutputSource {
+/** The instance a run belonged to, when the daemon still knows it. */
+export interface ScriptRunInstance {
   script: string;
+  instanceId: string | null;
+  instanceName: string | null;
+}
+
+/** What a run is called: its instance, or the script file when it had none. */
+export function scriptRunName(run: ScriptRunInstance): string {
+  return run.instanceName || run.script;
+}
+
+/** A run's name, with the script file beside it when the instance is named otherwise. */
+export function ScriptRunName({ run }: { run: ScriptRunInstance }) {
+  const name = scriptRunName(run);
+  return (
+    <span className="flex min-w-0 items-baseline gap-2">
+      <span className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg" title={name}>{name}</span>
+      {name === run.script ? null : (
+        <span className="min-w-0 truncate font-wv-mono text-[11px] text-wv-muted" title={run.script}>{run.script}</span>
+      )}
+    </span>
+  );
+}
+
+interface ScriptResult extends ScriptRunOutputSource, ScriptRunInstance {
   event: string;
   status: string;
   errorMessage: string | null;
@@ -110,7 +134,7 @@ function RunOutput({ result }: { result: ScriptResult }) {
     <div className="flex min-w-0 flex-col gap-2 border-t border-wv-hairline py-[10px] pl-5">
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
         <span className="flex min-w-0 items-center gap-[10px]">
-          <span className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">{result.script}</span>
+          <ScriptRunName run={result} />
           {result.background ? <FireAndForgetTag /> : null}
         </span>
         <ScriptStatusMark status={result.status} />

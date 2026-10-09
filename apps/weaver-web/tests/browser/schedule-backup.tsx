@@ -11,10 +11,16 @@ import { SettingsShellProvider } from "@/next/pages/settings/framework";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
-// A rule a script's manifest declares, as the daemon lists it.
-const manifestRule = { id: "manifest", time: "04:00", days: [], times: [], everyHourAtMinute: null, actionType: "run_script", script: "nightly.py", runAtStartup: false, implicit: true, enabled: true, label: null, track: "ONE_SHOT" };
+// The script instances the daemon holds. A rule can run only one whose trigger is the schedule.
+const scriptInstances = [
+  { id: "1", name: "Nightly report", script: "nightly.py", trigger: "SCHEDULER" },
+  { id: "2", name: "sweep.sh", script: "sweep.sh", trigger: "SCHEDULER" },
+  { id: "3", name: "Notify", script: "notify.py", trigger: "POST_PROCESSING" },
+];
+// A rule whose instance has since been given another trigger.
+const strandedRule = { id: "stranded", time: "04:00", days: [], times: [], everyHourAtMinute: null, actionType: "run_script", instanceId: "3", runAtStartup: false, enabled: true, label: "fixture stranded", track: "ONE_SHOT" };
 const state = {
-  schedules: (location.search.includes("manifest") ? [manifestRule] : []) as Record<string, unknown>[],
+  schedules: (location.search.includes("stranded") ? [strandedRule] : []) as Record<string, unknown>[],
   backups: [] as Record<string, unknown>[],
   backupSettings: { customBackupPath: null as string | null, backupPath: "/fixture/backups" },
   autoBackupSettings: { enabled: location.search.includes("automatic"), dailyTimeLocal: "03:00", autoBackupKeyPresent: location.search.includes("automatic"), nextRunAt: (location.search.includes("automatic") ? "2026-01-03T03:00:00Z" : null) as string | null },
@@ -39,6 +45,9 @@ function graphql(name: string, variables: Record<string, any>) {
     if (input.actionType === "set_quota_metering" && input.quotaMeteringEnabled == null) {
       return { errors: [{ message: "set_quota_metering requires quotaMeteringEnabled" }] };
     }
+    if (input.actionType === "run_script" && !input.instanceId) {
+      return { errors: [{ message: "a run_script schedule needs a script instance" }] };
+    }
   }
   if (name === "CreateSchedule") {
     state.schedules.push({ id: String(++sequence), ...variables.input, days: variables.input.days ?? [], times: variables.input.times ?? [], track: track(variables.input.actionType) });
@@ -62,7 +71,7 @@ function graphql(name: string, variables: Record<string, any>) {
   } else if (name === "DeleteBackup") {
     state.backups = state.backups.filter((row) => row.filename !== variables.filename); mutation = { deleteBackup: true };
   } else if (name === "BackupDownloadToken") mutation = { createBackupDownloadToken: "fixture-token" };
-  return { data: structuredClone({ ...state, settings: { dataDir: "/fixture" }, servers: [{ id: 1, host: "fixture-provider" }], rssFeeds: [{ id: 1, name: "Fixture feed" }], hardwareProfile: { available: ["balanced"], current: "balanced" }, ...mutation }) };
+  return { data: structuredClone({ ...state, settings: { dataDir: "/fixture" }, servers: [{ id: 1, host: "fixture-provider" }], rssFeeds: [{ id: 1, name: "Fixture feed" }], scriptInstances, hardwareProfile: { available: ["balanced"], current: "balanced" }, ...mutation }) };
 }
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });
 const originalFetch = window.fetch.bind(window);

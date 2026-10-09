@@ -6,12 +6,15 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { Dialog } from "../../../components/Dialog";
 import {
   FireAndForgetTag,
+  ScriptRunName,
   ScriptRunOutput,
   ScriptStatusMark,
+  scriptRunName,
 } from "../../../components/JobScriptResults";
 import { SecondaryButton, Select } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { EM_DASH, formatDate } from "../../../data/format";
+import { SCRIPT_KINDS, SCRIPT_KIND_LABELS, type ScriptKind } from "../../../data/script-instances";
 import { formatRunDuration, triggerLabel } from "../../../data/script-runs";
 import {
   FieldRows,
@@ -30,8 +33,6 @@ import {
  * or a scheduled task. Nothing here is edited, so a row opens the run itself.
  */
 
-type ScriptKind = "POST_PROCESSING" | "QUEUE" | "SCAN" | "SCHEDULER" | "FEED";
-
 /** No trigger chosen: every run is listed. */
 const ANY_KIND = "";
 
@@ -40,6 +41,9 @@ interface ScriptRun {
   jobId: number | null;
   jobName: string | null;
   script: string;
+  /** The instance that ran; null once it is gone, or for a run older than instances. */
+  instanceId: string | null;
+  instanceName: string | null;
   event: string;
   kind: ScriptKind;
   background: boolean;
@@ -74,6 +78,11 @@ function RunRecord({ run, onClose }: { run: ScriptRun; onClose: () => void }) {
       id: "finished",
       label: t("next.scriptRuns.finished"),
       control: { kind: "static", value: formatDate(run.finishedAtEpochMs) },
+    },
+    {
+      id: "instance",
+      label: t("next.scriptRuns.instance"),
+      control: { kind: "static", value: run.instanceName || EM_DASH },
     },
     {
       id: "script",
@@ -138,7 +147,7 @@ function RunRecord({ run, onClose }: { run: ScriptRun; onClose: () => void }) {
   return (
     <Dialog
       open
-      title={run.script}
+      title={scriptRunName(run)}
       note={run.event}
       width={680}
       onDismiss={onClose}
@@ -210,11 +219,7 @@ export function ScriptRunsPanel() {
 
   const kinds: { value: ScriptKind | typeof ANY_KIND; label: string }[] = [
     { value: ANY_KIND, label: t("next.scriptRuns.allTriggers") },
-    { value: "POST_PROCESSING", label: t("next.postProcessing.kindPostProcessing") },
-    { value: "QUEUE", label: t("next.postProcessing.kindQueue") },
-    { value: "SCAN", label: t("next.postProcessing.kindScan") },
-    { value: "SCHEDULER", label: t("next.schedules.schedule") },
-    { value: "FEED", label: t("next.postProcessing.kindFeed") },
+    ...SCRIPT_KINDS.map((value) => ({ value, label: t(SCRIPT_KIND_LABELS[value]) })),
   ];
 
   const blocks: SettingsBlock[] = [
@@ -226,7 +231,7 @@ export function ScriptRunsPanel() {
       columns: "152px minmax(124px, 1fr) minmax(118px, 0.8fr) minmax(72px, 1.2fr) 78px 72px 72px",
       headers: [
         t("next.scriptRuns.finished"),
-        t("next.postProcessing.script"),
+        t("next.scriptRuns.instance"),
         t("next.scriptRuns.trigger"),
         t("next.job.title"),
         t("table.status"),
@@ -246,15 +251,13 @@ export function ScriptRunsPanel() {
         const trigger = triggerLabel(t, run.event);
         return {
           id: run.id,
-          searchText: run.script,
+          searchText: `${scriptRunName(run)} ${run.script}`,
           cells: [
             <Cell key="finished" mono className="text-wv-muted" title={finished}>
               {finished}
             </Cell>,
             <div key="script" className="flex min-w-0 flex-wrap items-center gap-x-[10px] gap-y-1">
-              <Cell mono title={run.script}>
-                {run.script}
-              </Cell>
+              <ScriptRunName run={run} />
               {run.background ? <FireAndForgetTag /> : null}
             </div>,
             <Cell key="trigger" className="text-[12.5px] text-wv-secondary" title={trigger}>

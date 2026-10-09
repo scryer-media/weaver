@@ -1613,6 +1613,7 @@ pub(super) enum TerminalPostProcessingEvent {
     HistoryDeleteDone(orchestrator::HistoryDeleteDone),
     QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
+    AddedScriptsDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),
 }
@@ -2727,6 +2728,9 @@ pub struct Pipeline {
     pub(super) inflight_terminal_post_processing: HashSet<JobId>,
     pub(super) queue_script_waiters: HashSet<JobId>,
     pub(super) queue_scripts_completed: HashSet<JobId>,
+    /// Jobs kept from downloading while a blocking instance runs on their
+    /// arrival.
+    pub(super) added_script_holds: HashSet<JobId>,
     pub(super) script_data_dir: PathBuf,
     pub(super) pending_history_deletions: HashSet<JobId>,
     pub(super) terminal_post_processing_cancellations:

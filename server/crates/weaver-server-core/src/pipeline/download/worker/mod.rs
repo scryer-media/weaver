@@ -618,6 +618,16 @@ impl Pipeline {
                             status_allows_dispatch,
                             "dispatch idle: download pipeline draining"
                         );
+                    } else if self.held_for_added_scripts(*jid) {
+                        // Held on purpose until the scripts that block on its
+                        // arrival have run; their end releases it.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            "dispatch idle: waiting for scripts that run when a job is added"
+                        );
                     } else if matches!(
                         s.status,
                         JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }

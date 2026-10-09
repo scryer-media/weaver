@@ -292,6 +292,11 @@ export interface SettingsTableRowModel {
   /** Everything about this record the search box should match. */
   searchText: string;
   cells: ReactNode[];
+  /**
+   * How many columns each cell takes, for a row that holds fewer values than
+   * the table has columns. A cell without an entry takes one.
+   */
+  spans?: number[];
 }
 
 /** The rows of one kind in a table that lists several kinds under the same columns. */
@@ -475,11 +480,18 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
         }`}
         style={{ gridTemplateColumns: block.columns }}
       >
-        {entry.cells.map((cell, index) => (
-          <div key={index} className="flex min-w-0 items-center">
-            {cell}
-          </div>
-        ))}
+        {entry.cells.map((cell, index) => {
+          const span = entry.spans?.[index] ?? 1;
+          return (
+            <div
+              key={index}
+              className="flex min-w-0 items-center"
+              style={span > 1 ? { gridColumn: `span ${span}` } : undefined}
+            >
+              {cell}
+            </div>
+          );
+        })}
       </div>
     );
   };

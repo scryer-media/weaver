@@ -391,6 +391,7 @@ impl Pipeline {
             inflight_terminal_post_processing: HashSet::new(),
             queue_script_waiters: HashSet::new(),
             queue_scripts_completed: HashSet::new(),
+            added_script_holds: HashSet::new(),
             script_data_dir: data_dir.clone(),
             pending_history_deletions: HashSet::new(),
             terminal_post_processing_cancellations: HashMap::new(),
@@ -1147,6 +1148,9 @@ impl Pipeline {
                             }
                             TerminalPostProcessingEvent::QueueDone(job_id, result) => {
                                 self.handle_queue_scripts_done(job_id, result).await;
+                            }
+                            TerminalPostProcessingEvent::AddedScriptsDone(job_id, result) => {
+                                self.handle_added_scripts_done(job_id, result);
                             }
                             TerminalPostProcessingEvent::Started(job_id) => {
                                 self.handle_terminal_post_processing_started(job_id);

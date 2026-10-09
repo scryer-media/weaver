@@ -15,7 +15,7 @@ use weaver_server_core::{Database, SchedulerHandle};
 
 /// Refuse a schedule rule this machine could never apply, judged against the
 /// live probe as the hardware-profile choice is.
-fn validate_schedule_input(
+async fn validate_schedule_input(
     ctx: &Context<'_>,
     input: &crate::settings::types::ScheduleInput,
 ) -> Result<()> {
@@ -25,20 +25,35 @@ fn validate_schedule_input(
         .read()
         .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
         .clone();
-    input.validate(&probe).map_err(async_graphql::Error::new)
+    input.validate(&probe).map_err(async_graphql::Error::new)?;
+    let Some(instance_id) = input.script_instance_id() else {
+        return Ok(());
+    };
+    // A rule is saved against the instance it runs, so one that names nothing,
+    // or something a schedule cannot start, is refused here instead of being
+    // skipped every time it comes due.
+    let db = ctx.data::<Database>()?.clone();
+    let instance = tokio::task::spawn_blocking(move || db.script_instance(&instance_id)).await??;
+    match instance {
+        Some(instance)
+            if instance.trigger
+                == weaver_server_core::post_processing::instances::InstanceTrigger::Schedule =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(async_graphql::Error::new(
+            "that script instance does not run on a schedule",
+        )),
+        None => Err(async_graphql::Error::new(
+            "that script instance does not exist",
+        )),
+    }
 }
 
 async fn schedule_response(
-    ctx: &Context<'_>,
-    mut entries: Vec<weaver_server_core::bandwidth::ScheduleEntry>,
+    _ctx: &Context<'_>,
+    entries: Vec<weaver_server_core::bandwidth::ScheduleEntry>,
 ) -> Result<Vec<crate::settings::types::Schedule>> {
-    let db = ctx.data::<Database>()?.clone();
-    entries.extend(
-        tokio::task::spawn_blocking(move || {
-            weaver_server_core::post_processing::scheduler::implicit_schedules(&db)
-        })
-        .await??,
-    );
     Ok(entries.into_iter().map(Into::into).collect())
 }
 
@@ -473,7 +488,7 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
-        validate_schedule_input(ctx, &input)?;
+        validate_schedule_input(ctx, &input).await?;
         let entry = input.into_entry().map_err(async_graphql::Error::new)?;
         let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
@@ -499,16 +514,11 @@ impl SettingsMutation {
         id: String,
         input: crate::settings::types::ScheduleInput,
     ) -> Result<Vec<crate::settings::types::Schedule>> {
-        if id.starts_with("implicit-script:") {
-            return Err(async_graphql::Error::new(
-                "manifest schedules are read-only; create an explicit rule to opt into startup",
-            ));
-        }
         let db = ctx.data::<Database>()?.clone();
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
-        validate_schedule_input(ctx, &input)?;
+        validate_schedule_input(ctx, &input).await?;
         let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
@@ -536,11 +546,6 @@ impl SettingsMutation {
         ctx: &Context<'_>,
         id: String,
     ) -> Result<Vec<crate::settings::types::Schedule>> {
-        if id.starts_with("implicit-script:") {
-            return Err(async_graphql::Error::new(
-                "manifest schedules are read-only; create an explicit rule to opt into startup",
-            ));
-        }
         let db = ctx.data::<Database>()?.clone();
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
@@ -569,11 +574,6 @@ impl SettingsMutation {
         id: String,
         enabled: bool,
     ) -> Result<Vec<crate::settings::types::Schedule>> {
-        if id.starts_with("implicit-script:") {
-            return Err(async_graphql::Error::new(
-                "manifest schedules are read-only; create an explicit rule to opt into startup",
-            ));
-        }
         let db = ctx.data::<Database>()?.clone();
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?

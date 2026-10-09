@@ -17,7 +17,8 @@ import { blockedRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/pr
 import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton } from "../../../components/controls";
+import { PrimaryButton, SecondaryButton, Select } from "../../../components/controls";
+import { Icon } from "../../../components/icons";
 import { RoutingState } from "../../../components/RoutingState";
 import { RouteView } from "../../../features/networking/RouteView";
 import { Cell } from "../../../components/rows";
@@ -63,7 +64,8 @@ interface RssRule {
 }
 
 interface RssFeed {
-  scripts: string[];
+  /** The feed instances that run on this feed, in the order they run. */
+  scriptInstanceIds: string[];
   routing: RoutingPolicy | null;
   routingStatus?: RoutingStatus;
   id: number;
@@ -109,10 +111,12 @@ interface RssData {
   rssFeeds: RssFeed[];
   rssSeenItems: SeenItem[];
   categories: { id: number; name: string }[];
+  /** Every script instance; a feed can only run one whose trigger is the feed. */
+  scriptInstances?: { id: string; name: string; script: string; trigger: string; enabled: boolean }[];
 }
 
 interface FeedForm {
-  scripts: string;
+  scriptInstanceIds: string[];
   name: string;
   url: string;
   enabled: boolean;
@@ -145,7 +149,7 @@ interface RuleForm {
 const NO_CATEGORY = "";
 
 const NEW_FEED: FeedForm = {
-  scripts: "",
+  scriptInstanceIds: [],
   name: "",
   url: "",
   enabled: true,
@@ -337,7 +341,7 @@ export function RssPanel() {
             url: feed.url,
             enabled: feed.enabled,
             pollIntervalSecs: feed.pollIntervalSecs,
-            scripts: (feed.scripts ?? []).join(", "),
+            scriptInstanceIds: feed.scriptInstanceIds ?? [],
             username: feed.username ?? "",
             password: "",
             clearPassword: false,
@@ -393,7 +397,7 @@ export function RssPanel() {
       url: feedForm.url.trim(),
       enabled: feedForm.enabled,
       pollIntervalSecs: Math.max(30, Math.round(feedForm.pollIntervalSecs || 900)),
-      scripts: splitCommaList(feedForm.scripts),
+      scriptInstanceIds: feedForm.scriptInstanceIds,
       username: feedForm.username.trim(),
       // A blank password keeps the stored one; clearing it is explicit.
       password: feedForm.clearPassword ? "" : feedForm.password.trim() || null,
@@ -616,6 +620,77 @@ export function RssPanel() {
     },
   ];
 
+  // The scripts a feed runs are feed instances, attached in the order they run.
+  const feedInstances = (data?.scriptInstances ?? []).filter((instance) => instance.trigger === "FEED");
+  const feedInstanceName = (id: string) => feedInstances.find((instance) => instance.id === id)?.name ?? id;
+  const attached = feedForm.scriptInstanceIds;
+  const attachable = feedInstances.filter((instance) => !attached.includes(instance.id));
+  const moveAttached = (from: number, to: number) => {
+    const next = [...attached];
+    const [moved] = next.splice(from, 1);
+    if (moved !== undefined) {
+      next.splice(to, 0, moved);
+    }
+    patchFeed({ scriptInstanceIds: next });
+  };
+  const feedScripts = (
+    <div className="flex w-[340px] max-w-full flex-col gap-2">
+      {attached.map((id, index) => (
+        <div key={id} role="group" aria-label={feedInstanceName(id)} className="flex min-w-0 items-center gap-2">
+          <span className="w-4 flex-none font-wv-mono text-[11px] text-wv-faint">{index + 1}</span>
+          <span className="min-w-0 flex-1 truncate text-[12.5px] text-wv-fg" title={feedInstanceName(id)}>
+            {feedInstanceName(id)}
+          </span>
+          <SecondaryButton
+            className="h-7 px-2"
+            title={t("next.postProcessing.moveUp")}
+            disabled={index === 0}
+            onClick={() => moveAttached(index, index - 1)}
+          >
+            <Icon name="moveUp" size={13} />
+          </SecondaryButton>
+          <SecondaryButton
+            className="h-7 px-2"
+            title={t("next.postProcessing.moveDown")}
+            disabled={index === attached.length - 1}
+            onClick={() => moveAttached(index, index + 1)}
+          >
+            <Icon name="moveDown" size={13} />
+          </SecondaryButton>
+          <SecondaryButton
+            className="h-7 px-2"
+            title={t("next.common.remove")}
+            onClick={() => patchFeed({ scriptInstanceIds: attached.filter((entry) => entry !== id) })}
+          >
+            <Icon name="remove" size={13} />
+          </SecondaryButton>
+        </div>
+      ))}
+      {attachable.length > 0 ? (
+        <Select
+          label={t("next.rss.attachScript")}
+          value=""
+          className="w-full min-w-0"
+          options={[
+            { value: "", label: t("next.rss.attachScript") },
+            ...attachable.map((instance) => ({
+              value: instance.id,
+              label: instance.name === instance.script ? instance.name : `${instance.name} · ${instance.script}`,
+            })),
+          ]}
+          onChange={(next) => {
+            if (next) {
+              patchFeed({ scriptInstanceIds: [...attached, next] });
+            }
+          }}
+        />
+      ) : null}
+      {feedInstances.length === 0 ? (
+        <span className="text-[12px] leading-[1.45] text-wv-muted">{t("next.rss.noFeedInstances")}</span>
+      ) : null}
+    </div>
+  );
+
   const feedSections: EditorSection[] = [
     {
       id: "feed",
@@ -678,9 +753,13 @@ export function RssPanel() {
             onChange: (next) => patchFeed({ defaultCategory: next }),
           },
         },
-        { id: "scripts", label: "Feed scripts", help: "Comma-separated script names in execution order. Empty uses the global script list.", control: {
-          kind: "text", value: feedForm.scripts, onChange: (scripts) => patchFeed({ scripts }),
-        } },
+        {
+          id: "scriptInstanceIds",
+          label: t("next.rss.feedScripts"),
+          help: t("next.rss.feedScriptsHelp"),
+          keywords: feedForm.scriptInstanceIds.map(feedInstanceName).join(" "),
+          control: { kind: "custom", control: feedScripts },
+        },
         {
           id: "metadata",
           label: t("next.rss.defaultMetadata"),

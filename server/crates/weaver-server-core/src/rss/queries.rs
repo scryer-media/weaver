@@ -8,7 +8,7 @@ use super::repository::{decode_categories, decode_metadata, map_seen_item_row, p
 const RSS_FEED_SELECT: &str =
     "SELECT id, name, url, enabled, poll_interval_secs, username, password,
         default_category, default_metadata, etag, last_modified, last_polled_at,
-        last_success_at, last_error, consecutive_failures, scripts
+        last_success_at, last_error, consecutive_failures
    FROM rss_feeds";
 
 const RSS_RULE_SELECT: &str =
@@ -71,10 +71,25 @@ impl Database {
             )
             .await?;
 
+            let mut attached = std::collections::BTreeMap::<u32, Vec<String>>::new();
+            for row in SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT feed_id, instance_id FROM feed_scripts
+                  ORDER BY feed_id, run_order, instance_id",
+                &[],
+            )
+            .await?
+            {
+                attached
+                    .entry(row.i64("feed_id")? as u32)
+                    .or_default()
+                    .push(row.text("instance_id")?);
+            }
             rows.into_iter()
                 .map(|row| {
                     let mut feed = rss_feed_from_sql(row)?;
                     feed.password = maybe_decrypt(encryption_key.as_ref(), feed.password);
+                    feed.scripts = attached.remove(&feed.id).unwrap_or_default();
                     Ok(feed)
                 })
                 .collect()
@@ -87,18 +102,28 @@ impl Database {
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
         self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
+            let Some(row) = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 &format!("{RSS_FEED_SELECT} WHERE id = {{}}"),
                 &[SqlArg::I64(i64::from(id))],
             )
             .await?
-            .map(|row| {
-                let mut feed = rss_feed_from_sql(row)?;
-                feed.password = maybe_decrypt(encryption_key.as_ref(), feed.password);
-                Ok(feed)
-            })
-            .transpose()
+            else {
+                return Ok(None);
+            };
+            let mut feed = rss_feed_from_sql(row)?;
+            feed.password = maybe_decrypt(encryption_key.as_ref(), feed.password);
+            feed.scripts = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT instance_id FROM feed_scripts WHERE feed_id = {}
+                  ORDER BY run_order, instance_id",
+                &[SqlArg::I64(i64::from(id))],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.text("instance_id"))
+            .collect::<Result<_, _>>()?;
+            Ok(Some(feed))
         })
     }
 
@@ -184,7 +209,7 @@ fn rss_feed_from_sql(row: SqlRow) -> Result<RssFeedRow, StateError> {
         last_success_at: row.opt_i64("last_success_at")?,
         last_error: row.opt_text("last_error")?,
         consecutive_failures: row.i32("consecutive_failures")? as u32,
-        scripts: serde_json::from_str(&row.text("scripts")?).map_err(super::repository::db_err)?,
+        scripts: Vec::new(),
     })
 }
 
