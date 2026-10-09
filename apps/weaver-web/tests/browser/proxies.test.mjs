@@ -30,7 +30,7 @@ const daemon = (page) => page.evaluate(() => window.proxiesFixture);
 const action = (scope, name) => scope.getByRole("button", { name, exact: true });
 const field = (scope, name) => scope.getByLabel(name, { exact: true });
 const option = (scope, name) => scope.getByRole("radio", { name, exact: true });
-const dropZone = (scope) => action(scope, "Drop a WireGuard configuration file here, or click to choose");
+const dropZone = (scope) => action(scope, "Drop a config file here, or click to choose");
 const file = (name, text) => ({ name, mimeType: "text/plain", buffer: Buffer.from(text) });
 /** Drags a file of this name and text over `zone`, and lets go of it there. */
 async function drop(page, zone, name, text) {
@@ -159,17 +159,18 @@ test("a pasted configuration is checked as it is typed, and Parse fills the form
     // Every fault is listed at once, by the key at fault.
     await config.fill(`[Interface]\nPrivateKey = short\nMTU = big\n\n[Peer]\nEndpoint = vpn.fixture.invalid\n`);
     await faults(editor, [
-      "PrivateKey is not a WireGuard key: 32 bytes of base64, exactly as wg genkey prints them.",
+      "PrivateKey is not a WireGuard key.",
       "Address is missing from [Interface].",
       "MTU is not a number.",
       "PublicKey is missing from [Peer].",
-      "Endpoint is not a host and port, such as vpn.example.com:51820.",
+      "Endpoint is not host:port.",
     ]);
     assert.equal(await parse.isDisabled(), true);
     await shot(page, "proxy-wireguard-paste-errors");
 
     await config.fill(CONFIG);
-    await editor.getByText("Nothing is wrong with this configuration.", { exact: true }).waitFor();
+    // Parse comes on once nothing is wrong with it; a trial click waits for that.
+    await parse.click({ trial: true });
     assert.equal(await editor.getByRole("alert").count(), 0);
     assert.equal(await parse.isDisabled(), false);
     // Nothing is filled until Parse is pressed.
@@ -208,7 +209,7 @@ test("a configuration file dropped on the target or chosen through it is read, i
     await editor.getByText("broken.conf", { exact: true }).waitFor();
     await faults(editor, [
       "Address is missing from [Interface].",
-      "PublicKey is not a WireGuard key: 32 bytes of base64, exactly as wg genkey prints them.",
+      "PublicKey is not a WireGuard key.",
     ]);
     assert.equal(await action(editor, "Save").isDisabled(), true);
     await shot(page, "proxy-wireguard-upload-errors");
@@ -255,11 +256,7 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
     assert.equal(await field(editor, "Password").count(), 0);
     assert.equal(await editor.getByRole("radiogroup").count(), 0);
     assert.equal(await field(editor, "Port").inputValue(), "22");
-    await editor.getByText("The account on the SSH server. It signs in with the key below; SSH takes no password.", { exact: true }).waitFor();
-    await editor.getByText(
-      "An Ed25519 key in OpenSSH format. No other key type is accepted; ssh-keygen -t ed25519 makes one.",
-      { exact: true },
-    ).waitFor();
+    await editor.getByText("Ed25519 keys only.", { exact: true }).waitFor();
     await shot(page, "proxy-ssh");
     await field(editor, "Name").fill("Bastion");
     await field(editor, "Host").fill("bastion.fixture.invalid");
@@ -276,10 +273,7 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
     // A stored one says the same, beside what it says of the key it holds.
     const stored = await editing(page, "Seedbox");
     assert.equal(await field(stored, "Password").count(), 0);
-    await stored.getByText(
-      "An Ed25519 key in OpenSSH format. No other key type is accepted; ssh-keygen -t ed25519 makes one. Stored. Leave blank to keep it.",
-      { exact: true },
-    ).waitFor();
+    await stored.getByText("Ed25519 keys only. Stored. Leave blank to keep it.", { exact: true }).waitFor();
     await action(stored, "Cancel").click();
     // The types that do take a password still have one.
     const relay = await editing(page, "Relay");

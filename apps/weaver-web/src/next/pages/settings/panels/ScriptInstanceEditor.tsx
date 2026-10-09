@@ -432,7 +432,6 @@ export function ScriptInstanceEditor({
         ? t("next.postProcessing.defaultValue", { value: option.defaultValue })
         : "",
       input.secret ? t("next.postProcessing.secretLinkHelp") : "",
-      input.own ? t("next.postProcessing.ownSecretHelp") : "",
       script && !option ? t("next.postProcessing.undeclaredInput") : "",
     ]
       .filter(Boolean)
@@ -612,9 +611,6 @@ export function ScriptInstanceEditor({
             {t(newProblem)}
           </span>
         ) : null}
-        <span className="text-[12px] leading-[1.45] text-pretty text-wv-muted">
-          {t("next.postProcessing.addInputHelp")}
-        </span>
       </div>
     </>
   );

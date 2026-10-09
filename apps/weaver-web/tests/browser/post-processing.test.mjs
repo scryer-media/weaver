@@ -823,10 +823,6 @@ test("an input the header does not have is added as a value or as the job's own 
     const added = secretField(editor, "Extra.key");
     assert.equal(await added.getAttribute("type"), "password");
     assert.equal(await added.inputValue(), "fixture-own-secret");
-    await editor.getByText(
-      "This job's own secret. It is stored encrypted and never shown again. Not in the script's header.",
-      { exact: true },
-    ).waitFor();
     assert.equal(await own.isChecked(), false);
     assert.equal(await value.getAttribute("type"), "text");
     // What was added is a value or the job's own secret, and stays what it was added as.

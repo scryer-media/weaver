@@ -730,7 +730,7 @@ export function ProxyEditor({
           label: t("next.proxies.username"),
           help: editing?.hasUsername
             ? storedHelp("username")
-            : isSsh ? t("next.proxies.sshUsernameHelp") : t("next.proxies.optional"),
+            : isSsh ? undefined : t("next.proxies.optional"),
           control: editing?.hasUsername
             ? storedSecret("username", t("next.proxies.username"))
             : {
@@ -817,7 +817,6 @@ export function ProxyEditor({
       />
       {start === "upload" ? (
         <>
-          <div className="text-[12.5px] leading-[1.5] text-wv-muted">{t("next.proxies.wgUploadNote")}</div>
           <input
             ref={fileRef}
             type="file"
@@ -871,7 +870,6 @@ export function ProxyEditor({
       ) : null}
       {start === "paste" ? (
         <>
-          <div className="text-[12.5px] leading-[1.5] text-wv-muted">{t("next.proxies.wgPasteNote")}</div>
           <TextArea
             label={t("next.proxies.configLabel")}
             value={configText}
@@ -882,12 +880,7 @@ export function ProxyEditor({
             onChange={setConfigText}
           />
           {problemList(pasteProblems)}
-          <div className="flex items-center justify-end gap-4">
-            {pasteReady ? (
-              <div className="min-w-0 flex-1 text-[12px] leading-[1.45] text-wv-muted">
-                {t("next.proxies.configValid")}
-              </div>
-            ) : null}
+          <div className="flex justify-end">
             <SecondaryButton icon="inspectFile" onClick={() => applyConfig(configText)} disabled={!pasteReady}>
               {t("next.proxies.parse")}
             </SecondaryButton>
