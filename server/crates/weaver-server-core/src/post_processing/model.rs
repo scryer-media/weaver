@@ -909,6 +909,7 @@ pub struct PostProcessingSettings {
     #[serde(flatten)]
     pub event_scripts: EventScriptSettings,
     pub execution_enabled: bool,
+    /// Scripts that a job waits for allowed to run at once, across every job.
     pub concurrency: u8,
     pub termination_grace_seconds: u64,
     pub python_interpreter: Option<String>,
@@ -927,7 +928,7 @@ impl Default for PostProcessingSettings {
         Self {
             execution_enabled: false,
             event_scripts: EventScriptSettings::default(),
-            concurrency: 1,
+            concurrency: 4,
             termination_grace_seconds: 10,
             python_interpreter: None,
             powershell_interpreter: None,

@@ -1029,7 +1029,7 @@ export const nextKo: LocaleDictionary = {
   "next.postProcessing.runScripts": "스크립트 실행",
   "next.postProcessing.runScriptsHelp": "끄면 weaver가 스크립트를 찾기만 하고 실행하지는 않습니다.",
   "next.postProcessing.concurrency": "동시 스크립트",
-  "next.postProcessing.concurrencyHelp": "동시에 후처리할 수 있는 다운로드 수.",
+  "next.postProcessing.concurrencyHelp": "모든 다운로드를 통틀어 동시에 실행할 수 있는 블로킹 스크립트 수. 한 다운로드의 스크립트는 지금처럼 차례대로 실행됩니다. 다시 시작한 뒤 적용됩니다.",
   "next.postProcessing.grace": "종료 유예 시간",
   "next.postProcessing.graceHelp": "중지 요청을 받은 스크립트가 종료할 때까지 주어지는 시간.",
   "next.postProcessing.extensions": "허용하지 않는 확장자",

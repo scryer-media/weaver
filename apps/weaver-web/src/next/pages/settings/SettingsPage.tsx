@@ -7,7 +7,7 @@ import { useNextData } from "../../data/next-data";
 import { BetaTag, EmptyState } from "../../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
 import { SettingsShellProvider, type PanelFlags } from "./framework";
-import { SETTINGS_PANELS, findPanel, type PanelDefinition } from "./panels";
+import { findPanel, settingsRail } from "./panels";
 
 /**
  * The settings shell.
@@ -20,12 +20,6 @@ import { SETTINGS_PANELS, findPanel, type PanelDefinition } from "./panels";
  */
 
 const CLEAN: PanelFlags = { dirty: false, busy: false, status: null, failed: false };
-
-/** Translation key of the rail heading each group of panels sits under. */
-const GROUP_LABELS: Record<NonNullable<PanelDefinition["group"]>, string> = {
-  networking: "settings.networking",
-  scripts: "next.settings.panel.scripts",
-};
 
 export function SettingsPage() {
   const t = useTranslate();
@@ -52,24 +46,7 @@ export function SettingsPage() {
     );
   }, []);
 
-  const railItems = useMemo(
-    () =>
-      SETTINGS_PANELS.map((entry) => ({
-        to: `/settings/${entry.slug}`,
-        label: t(entry.label),
-        group: entry.group ? t(GROUP_LABELS[entry.group]) : undefined,
-        icon: entry.icon,
-        tag:
-          entry.tag === "beta"
-            ? t("next.settings.beta")
-            : entry.tag === "count:providers"
-              ? providers.length > 0
-                ? String(providers.length)
-                : undefined
-              : undefined,
-      })),
-    [providers.length, t],
-  );
+  const railItems = useMemo(() => settingsRail(t, providers.length), [providers.length, t]);
 
   const statusRight =
     flags.status ?? (flags.dirty ? t("next.settings.unsaved") : t("next.settings.allSaved"));

@@ -66,7 +66,7 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
     let settings = &response_data(&response)["postProcessingSettings"];
     assert!(std::path::Path::new(settings["scriptDirectory"].as_str().unwrap()).is_absolute());
     assert_eq!(settings["executionEnabled"], false);
-    assert_eq!(settings["concurrency"], 1);
+    assert_eq!(settings["concurrency"], 4);
     assert_eq!(settings["terminationGraceSeconds"], 10);
     assert_eq!(settings["unacceptableExtensions"], serde_json::json!([]));
     assert_eq!(settings["strictSecurityRefusesExecution"], false);

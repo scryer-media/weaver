@@ -1029,7 +1029,7 @@ export const nextZh: LocaleDictionary = {
   "next.postProcessing.runScripts": "运行脚本",
   "next.postProcessing.runScriptsHelp": "关闭后，weaver 会发现脚本，但不会执行任何脚本。",
   "next.postProcessing.concurrency": "并发脚本数",
-  "next.postProcessing.concurrencyHelp": "同时可进行后处理的下载数量。",
+  "next.postProcessing.concurrencyHelp": "所有下载合计可同时运行的阻塞脚本数量。同一下载的脚本仍按顺序依次运行。重启后生效。",
   "next.postProcessing.grace": "终止宽限时间",
   "next.postProcessing.graceHelp": "脚本被要求停止后可用于退出的时间。",
   "next.postProcessing.extensions": "不接受的扩展名",

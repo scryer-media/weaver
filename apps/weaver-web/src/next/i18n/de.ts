@@ -1029,7 +1029,7 @@ export const nextDe: LocaleDictionary = {
   "next.postProcessing.runScripts": "Skripte ausführen",
   "next.postProcessing.runScriptsHelp": "Ist dies aus, erkennt Weaver Skripte, führt aber keines aus.",
   "next.postProcessing.concurrency": "Gleichzeitige Skripte",
-  "next.postProcessing.concurrencyHelp": "Wie viele Downloads gleichzeitig nachbearbeitet werden dürfen.",
+  "next.postProcessing.concurrencyHelp": "Wie viele blockierende Skripte gleichzeitig laufen dürfen, über alle Downloads hinweg. Die Skripte eines Downloads laufen weiterhin nacheinander. Gilt nach einem Neustart.",
   "next.postProcessing.grace": "Frist zum Beenden",
   "next.postProcessing.graceHelp": "Wie lange ein Skript Zeit hat, sich zu beenden, nachdem es zum Stoppen aufgefordert wurde.",
   "next.postProcessing.extensions": "Unzulässige Dateiendungen",

@@ -92,7 +92,7 @@ const DEFAULTS: ExecutionForm = {
   ...eventScriptDefaults,
   executionEnabled: false,
   globalScriptsRun: "ALWAYS",
-  concurrency: 1,
+  concurrency: 4,
   terminationGraceSeconds: 10,
   pythonInterpreter: "",
   powershellInterpreter: "",

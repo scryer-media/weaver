@@ -1029,7 +1029,7 @@ export const nextJa: LocaleDictionary = {
   "next.postProcessing.runScripts": "スクリプトを実行",
   "next.postProcessing.runScriptsHelp": "オフの場合、weaver はスクリプトを検出しますが実行はしません。",
   "next.postProcessing.concurrency": "同時実行スクリプト数",
-  "next.postProcessing.concurrencyHelp": "同時に後処理できるダウンロードの数。",
+  "next.postProcessing.concurrencyHelp": "すべてのダウンロードを通じて、同時に実行できるブロッキングスクリプトの数。1 つのダウンロードのスクリプトはこれまでどおり順番に実行されます。再起動後に適用されます。",
   "next.postProcessing.grace": "終了猶予",
   "next.postProcessing.graceHelp": "停止を求められたスクリプトが終了するまでの猶予時間。",
   "next.postProcessing.extensions": "許可しない拡張子",
