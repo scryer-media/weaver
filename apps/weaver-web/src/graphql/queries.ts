@@ -1944,10 +1944,8 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     eventScriptConcurrency
     eventScriptTimeoutSeconds
     fileDownloadedEventInterval
-    scriptOutputCeilingBytes
     scriptOutputRunsPerJob
-    scriptOutputRingBytes
-    scriptOutputRunCapBytes
+    scriptOutputFailedRunsPerJob
     terminationGraceSeconds
     pythonInterpreter
     powershellInterpreter
@@ -2249,8 +2247,15 @@ export const POST_PROCESSING_RESULTS_QUERY = gql`
 `;
 
 export const SCRIPT_RUNS_QUERY = gql`
-  query ScriptRuns($limit: Int, $before: String, $kind: ScriptKind, $script: String, $jobId: Int) {
-    scriptRuns(limit: $limit, before: $before, kind: $kind, script: $script, jobId: $jobId) {
+  query ScriptRuns(
+    $limit: Int
+    $before: String
+    $kind: ScriptKind
+    $script: String
+    $jobId: Int
+    $status: ScriptStatusGql
+  ) {
+    scriptRuns(limit: $limit, before: $before, kind: $kind, script: $script, jobId: $jobId, status: $status) {
       runs {
         id
         jobId
@@ -2273,6 +2278,10 @@ export const SCRIPT_RUNS_QUERY = gql`
       }
       nextBefore
       total
+      statusCounts {
+        status
+        count
+      }
     }
   }
 `;

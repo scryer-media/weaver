@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useMutation } from "urql";
+import { useRef, useState } from "react";
+import { useMutation, type CombinedError } from "urql";
 import {
   CREATE_SECRET_MUTATION,
   DELETE_SECRET_MUTATION,
@@ -9,11 +9,20 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { NEW_SECRET, secretChange, type Secret, type SecretForm } from "../../../data/secrets";
+import {
+  needsPasswordCheck,
+  usePasswordCheck,
+  type CheckedOutcome,
+} from "../../../features/PasswordCheckDialog";
 
 /**
  * The editor of one named secret: its name, and a value that can be replaced
  * but never read back. Opened from the Secrets table, and from a script
  * instance's secret input to create one in place.
+ *
+ * Adding a secret needs no recent password check. Changing or deleting one
+ * does on an install that requires sign-in, so when the daemon refuses for
+ * that reason the password is asked for and the same change runs again.
  */
 
 export type SecretEditorTarget = { mode: "new" } | { mode: "edit"; secret: Secret };
@@ -42,51 +51,77 @@ export function SecretEditor({
   const [confirmDelete, setConfirmDelete] = useState(false);
   // A refused delete is said inside the question, as an instance's is.
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const passwordCheck = usePasswordCheck();
+  // Asked once per press of Save or Delete: a change refused again after the
+  // password was checked says why instead of asking in a loop.
+  const asked = useRef(false);
+  const askForPassword = (refusal: CombinedError | undefined) => {
+    if (asked.current || !needsPasswordCheck(refusal)) {
+      return false;
+    }
+    asked.current = true;
+    return true;
+  };
 
   const patch = (next: Partial<SecretForm>) => {
     setError(null);
     setForm((current) => ({ ...current, ...next }));
   };
 
-  const save = async () => {
+  const save = async (): Promise<CheckedOutcome> => {
     const change = secretChange(form, editing);
     if (!change.ok) {
       setError(t(change.problem));
-      return;
+      return "done";
     }
     if (editing && change.name === null && change.value === null) {
       onSaved(editing);
-      return;
+      return "done";
     }
     setBusy(true);
+    setError(null);
     const result = editing
       ? await updateSecret({ id: editing.id, name: change.name, value: change.value })
       : await createSecret({ name: change.name, value: change.value });
     setBusy(false);
+    if (askForPassword(result.error)) {
+      return "password";
+    }
     if (result.error) {
       setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
-      return;
+      return "done";
     }
     const saved = (editing ? result.data?.updateSecret : result.data?.createSecret) as Secret | undefined;
     if (saved) {
       onSaved(saved);
     }
+    return "done";
   };
 
-  const remove = async () => {
+  const remove = async (): Promise<CheckedOutcome> => {
     if (!editing) {
-      return;
+      return "done";
     }
     setBusy(true);
+    setDeleteError(null);
     const result = await deleteSecret({ id: editing.id });
     setBusy(false);
+    if (askForPassword(result.error)) {
+      return "password";
+    }
     if (result.error) {
       // Refused while an instance links it; the message names them.
       setDeleteError(result.error.graphQLErrors[0]?.message ?? result.error.message);
-      return;
+      return "done";
     }
     setConfirmDelete(false);
     onDeleted?.(editing);
+    return "done";
+  };
+
+  const checked = (attempt: () => Promise<CheckedOutcome>) => {
+    asked.current = false;
+    void passwordCheck.run(attempt);
   };
 
   return (
@@ -97,7 +132,7 @@ export function SecretEditor({
         note={editing ? t("next.secrets.editNote") : t("next.secrets.newNote")}
         error={error}
         busy={busy}
-        onSave={() => void save()}
+        onSave={() => checked(save)}
         onDismiss={onDismiss}
         onDelete={
           editing && onDeleted
@@ -156,9 +191,11 @@ export function SecretEditor({
             ) : null}
           </>
         }
-        onConfirm={() => void remove()}
+        onConfirm={() => checked(remove)}
         onDismiss={() => setConfirmDelete(false)}
       />
+      {/* Last, so it opens over the editor and the question it interrupts. */}
+      {passwordCheck.dialog}
     </>
   );
 }

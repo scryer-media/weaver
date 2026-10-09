@@ -24,10 +24,8 @@ export type ScriptSettings = {
   eventScriptConcurrency: number;
   eventScriptTimeoutSeconds: number;
   fileDownloadedEventInterval: number;
-  scriptOutputCeilingBytes: number;
   scriptOutputRunsPerJob: number;
-  scriptOutputRingBytes: number;
-  scriptOutputRunCapBytes: number;
+  scriptOutputFailedRunsPerJob: number;
   scriptDirectory: string;
   executionEnabled: boolean;
   concurrency: number;
@@ -53,7 +51,7 @@ export type ScriptInstanceInput = {
 };
 
 const SETTINGS_FIELDS = `eventScriptConcurrency eventScriptTimeoutSeconds fileDownloadedEventInterval
-  scriptOutputCeilingBytes scriptOutputRunsPerJob scriptOutputRingBytes scriptOutputRunCapBytes
+  scriptOutputRunsPerJob scriptOutputFailedRunsPerJob
   scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution globalScriptsRun`;
 const INSTANCE_FIELDS = "id name script trigger queueEvent inputs { name value secret { id name } } categories enabled blocking timeoutSeconds runOrder";
 

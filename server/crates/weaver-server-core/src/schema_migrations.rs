@@ -25,7 +25,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 55;
+const CURRENT_SCHEMA_VERSION: i64 = 56;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1373,6 +1373,56 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(usage_cascade, 1);
+    }
+
+    /// A run recorded before its status had a column of its own is still
+    /// found by how it ended.
+    #[tokio::test]
+    async fn sqlite_v56_upgrade_fills_in_how_each_recorded_run_ended() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(55), true)
+            .await
+            .unwrap();
+
+        for (seq, status) in [(1_i64, "succeeded"), (2, "timed_out")] {
+            sqlx::query(
+                "INSERT INTO script_outputs
+                    (id, job_id, event, script, seq, raw_bytes, truncated, output, stored_bytes,
+                     result_json, created_at)
+                 VALUES (?, NULL, 'scan', 'scan.sh', ?, 0, 0, x'', 0, ?, 1)",
+            )
+            .bind(format!("run-{seq}"))
+            .bind(seq)
+            .bind(format!(
+                r#"{{"script":"scan.sh","event":"scan","status":"{status}","outputTail":"\"status\":\"failed\""}}"#
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap();
+
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM script_outputs ORDER BY seq")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            [
+                ("run-1".to_string(), "succeeded".to_string()),
+                ("run-2".to_string(), "timed_out".to_string()),
+            ]
+        );
     }
 
     /// The proven BODY pipelining depth is optional: a server that has never

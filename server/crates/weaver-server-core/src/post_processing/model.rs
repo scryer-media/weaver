@@ -866,10 +866,11 @@ pub struct EventScriptSettings {
     pub event_script_concurrency: u8,
     pub event_script_timeout_seconds: u64,
     pub file_downloaded_event_interval: i64,
-    pub script_output_ceiling_bytes: u64,
+    /// The newest runs kept for each download (or each scan, schedule or feed
+    /// for runs that belong to no download).
     pub script_output_runs_per_job: u32,
-    pub script_output_ring_bytes: u64,
-    pub script_output_run_cap_bytes: u64,
+    /// Failed runs kept beyond `script_output_runs_per_job`, newest first.
+    pub script_output_failed_runs_per_job: u32,
 }
 
 impl Default for EventScriptSettings {
@@ -878,10 +879,8 @@ impl Default for EventScriptSettings {
             event_script_concurrency: 1,
             event_script_timeout_seconds: 300,
             file_downloaded_event_interval: 0,
-            script_output_ceiling_bytes: 1024 * 1024,
             script_output_runs_per_job: 32,
-            script_output_ring_bytes: 64 * 1024 * 1024,
-            script_output_run_cap_bytes: 2 * 1024 * 1024,
+            script_output_failed_runs_per_job: 8,
         }
     }
 }
@@ -891,10 +890,8 @@ impl EventScriptSettings {
         if !(1..=8).contains(&self.event_script_concurrency)
             || !(1..=86_400).contains(&self.event_script_timeout_seconds)
             || !(-1..=86_400).contains(&self.file_downloaded_event_interval)
-            || !(65_536..=8 * 1024 * 1024).contains(&self.script_output_ceiling_bytes)
             || !(1..=128).contains(&self.script_output_runs_per_job)
-            || !(1024 * 1024..=1024 * 1024 * 1024).contains(&self.script_output_ring_bytes)
-            || !(65_536..=8 * 1024 * 1024).contains(&self.script_output_run_cap_bytes)
+            || self.script_output_failed_runs_per_job > 128
         {
             return Err(PostProcessingValidationError::InvalidPolicy);
         }
@@ -1091,6 +1088,18 @@ impl ScriptStatus {
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_persisted(value: &str) -> Option<Self> {
+        match value {
+            "succeeded" => Some(Self::Succeeded),
+            "skipped" => Some(Self::Skipped),
+            "warning" => Some(Self::Warning),
+            "failed" => Some(Self::Failed),
+            "timed_out" => Some(Self::TimedOut),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
         }
     }
 

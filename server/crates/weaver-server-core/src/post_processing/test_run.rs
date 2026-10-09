@@ -25,8 +25,9 @@ use super::model::{
 };
 use super::runner::{
     CompatibilityFacts, ExecutionDisposition, ExecutionSpec, InterpreterConfig,
-    JobExecutionContext, OutputTap, RunIdentity, RunnerError, ScriptExecutionRequest,
-    ScriptExecutionResult, adapter_contract, execute_script_tapped, execute_spec_tapped,
+    JobExecutionContext, MAX_SCRIPT_OUTPUT_BYTES, OutputTap, RunIdentity, RunnerError,
+    ScriptExecutionRequest, ScriptExecutionResult, adapter_contract, execute_script_tapped,
+    execute_spec_tapped,
 };
 use crate::Database;
 use crate::settings::SharedConfig;
@@ -282,7 +283,7 @@ struct Directories {
 }
 
 enum Execution {
-    PostProcessing(Box<ScriptExecutionRequest>, u64),
+    PostProcessing(Box<ScriptExecutionRequest>),
     Event(Box<ExecutionSpec>),
 }
 
@@ -360,7 +361,6 @@ fn prepare(
     let adapter = script.manifest.adapter();
     let timeout = Some(time_limit);
     let termination_grace = Duration::from_secs(settings.termination_grace_seconds);
-    let ceiling = settings.event_scripts.script_output_ceiling_bytes;
     let interpreters = InterpreterConfig {
         python: settings.python_interpreter.as_ref().map(PathBuf::from),
         powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
@@ -406,7 +406,7 @@ fn prepare(
                 .filter(|(name, _)| !NOT_MADE_UP.iter().any(|prefix| name.starts_with(prefix)))
                 .collect();
             (
-                Execution::PostProcessing(Box::new(request), ceiling),
+                Execution::PostProcessing(Box::new(request)),
                 inputs,
                 arguments,
             )
@@ -430,7 +430,6 @@ fn prepare(
                 facts: context.facts,
                 interpreters,
                 supervisor_executable,
-                output_ceiling: ceiling,
             };
             (Execution::Event(Box::new(spec)), inputs, Vec::new())
         }
@@ -440,7 +439,7 @@ fn prepare(
     let run = Arc::new(TestRun {
         cancel,
         changed: tokio::sync::Notify::new(),
-        ceiling: usize::try_from(ceiling).unwrap_or(usize::MAX),
+        ceiling: MAX_SCRIPT_OUTPUT_BYTES as usize,
         state: Mutex::new(TestState {
             snapshot: ScriptTestSnapshot {
                 id,
@@ -514,15 +513,8 @@ async fn execute(
     };
     let execution = async {
         match execution {
-            Execution::PostProcessing(request, ceiling) => {
-                execute_script_tapped(
-                    *request,
-                    Some(cancellation),
-                    Some(sender),
-                    ceiling,
-                    Some(tap),
-                )
-                .await
+            Execution::PostProcessing(request) => {
+                execute_script_tapped(*request, Some(cancellation), Some(sender), Some(tap)).await
             }
             Execution::Event(spec) => {
                 execute_spec_tapped(*spec, Some(cancellation), Some(sender), Some(tap)).await

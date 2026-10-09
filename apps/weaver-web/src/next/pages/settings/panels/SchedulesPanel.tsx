@@ -22,7 +22,7 @@ import {
 } from "../../../data/hardware-profiles";
 import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
 import { scheduleActionFields, scheduleActionHelp, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleInstances, scheduleTimeLabel, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleInstances, scheduleTimeLabel, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -69,17 +69,6 @@ const MIB = 1024 * 1024;
 /** A stored limit as the editor shows it: mebibytes, to the two places its field keeps. */
 const toMib = (bytes: number) => Math.round((bytes / MIB) * 100) / 100;
 
-/** Labels are translation keys, resolved when the panel renders. */
-const DAYS = [
-  { key: "mon", label: "next.weekday.monShort" },
-  { key: "tue", label: "next.weekday.tueShort" },
-  { key: "wed", label: "next.weekday.wedShort" },
-  { key: "thu", label: "next.weekday.thuShort" },
-  { key: "fri", label: "next.weekday.friShort" },
-  { key: "sat", label: "next.weekday.satShort" },
-  { key: "sun", label: "next.weekday.sunShort" },
-];
-
 const ACTIONS: { value: string; label: string }[] = [
   ...ADDITIONAL_SCHEDULE_ACTIONS,
   { value: "run_script", label: "next.schedules.runScript" },
@@ -124,15 +113,6 @@ function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets
   }
   const action = ACTIONS.find((option) => option.value === schedule.actionType);
   return action ? t(action.label) : schedule.actionType;
-}
-
-function daysLabel(t: Translate, days: string[]): string {
-  if (days.length === 0 || days.length === DAYS.length) {
-    return t("next.schedules.everyDay");
-  }
-  return DAYS.filter((day) => days.includes(day.key))
-    .map((day) => t(day.label))
-    .join(" ");
 }
 
 export function SchedulesPanel() {
@@ -268,13 +248,13 @@ export function SchedulesPanel() {
 
   const row = (schedule: Schedule, problem: string | null) => ({
     id: schedule.id,
-    searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""} ${problem ?? ""}`,
+    searchText: `${scheduleTimeLabel(schedule)} ${scheduleDaysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""} ${problem ?? ""}`,
     cells: [
       <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
         {scheduleTimeLabel(schedule)}
       </Cell>,
       <Cell key="days" mono className="text-wv-secondary">
-        {daysLabel(t, schedule.days)}
+        {scheduleDaysLabel(t, schedule.days)}
       </Cell>,
       <div key="action" className="flex min-w-0 flex-col gap-1">
         <Cell title={actionLabel(t, schedule, targets)}>
@@ -373,7 +353,7 @@ export function SchedulesPanel() {
             ? t("next.schedules.add")
             : editing?.label || editing?.time || t("next.schedules.schedule")
         }
-        note={editingId === "new" ? t("next.schedules.newNote") : daysLabel(t, editing?.days ?? [])}
+        note={editingId === "new" ? t("next.schedules.newNote") : scheduleDaysLabel(t, editing?.days ?? [])}
         error={error}
         busy={busy}
         onSave={() => void save()}
@@ -406,7 +386,7 @@ export function SchedulesPanel() {
                   kind: "custom",
                   control: (
                     <div role="group" aria-label={t("next.schedules.days")} className="flex flex-wrap justify-end gap-1.5">
-                      {DAYS.map((day) => {
+                      {SCHEDULE_DAYS.map((day) => {
                         const active = form.days.includes(day.key);
                         return (
                           <button

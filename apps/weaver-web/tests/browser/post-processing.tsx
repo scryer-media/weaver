@@ -80,14 +80,17 @@ const instance = (id: string, name: string, script: string, trigger: string, ext
   timeoutSeconds: null, runOrder: 0, ...extra,
 });
 
+const rule = (id: string, instanceId: string, time: string, extra: Record<string, unknown> = {}) => ({
+  id, enabled: true, label: null as string | null, days: [] as string[], time, actionType: "run_script",
+  instanceId, runAtStartup: false, ...extra,
+});
+
 const state = {
   settings: {
     scriptDirectory: "/fixture/scripts", executionEnabled: true, concurrency: 2,
     globalScriptsRun: has("cascade") ? "ONLY_WITHOUT_CATEGORY_SCRIPTS" : "ALWAYS",
     eventScriptConcurrency: 1, eventScriptTimeoutSeconds: 300, fileDownloadedEventInterval: 0,
-    scriptOutputCeilingBytes: 1048576, scriptOutputRunsPerJob: 32, scriptOutputRingBytes: 67108864,
-    // A size set through the API need not be a whole number of the unit its field shows.
-    scriptOutputRunCapBytes: has("uneven") ? 2097000 : 2097152, terminationGraceSeconds: 10,
+    scriptOutputRunsPerJob: 32, scriptOutputFailedRunsPerJob: 8, terminationGraceSeconds: 10,
     pythonInterpreter: null as string | null, powershellInterpreter: null as string | null,
     batchInterpreter: null as string | null, goInterpreter: null as string | null,
     unacceptableExtensions: ["exe", "scr"],
@@ -126,10 +129,16 @@ const state = {
     instance("6", "Nightly report", "nightly.py", "SCHEDULER", { timeoutSeconds: 3600 }),
     instance("7", "Feed intake", "intake.py", "FEED", { blocking: false }),
   ],
-  categories: [{ id: 1, name: "movies" }, { id: 2, name: "tv" }],
+  categories: has("nocategories") ? [] : [{ id: 1, name: "movies" }, { id: 2, name: "tv" }],
+  // The schedule rules that run an instance.
+  schedules: empty ? [] : [
+    rule("r1", "6", "04:00"),
+    rule("r2", "6", "*:20", { days: ["sat", "sun"], runAtStartup: true }),
+  ],
 };
 let lastInstance = 7;
 let lastSecret = 2;
+let lastRule = 2;
 // Every instance mutation the screens sent, oldest first.
 const requests: { name: string; variables: Record<string, any> }[] = [];
 
@@ -222,6 +231,14 @@ function deleteSecret(id: string) {
 }
 
 const refused = (message: string) => ({ data: null, errors: [{ message }] });
+// An install that requires sign-in changes or deletes a secret only for a
+// session whose password was checked lately; adding one is never held back.
+const PASSWORD = "fixture-password";
+let passwordVerified = !has("signedin");
+const REAUTH = {
+  data: null,
+  errors: [{ message: "recent password verification required", extensions: { code: "REAUTH_REQUIRED" } }],
+};
 const inTrigger = (trigger: string) => state.instances.filter((entry) => entry.trigger === trigger).length;
 
 function saveInstance(variables: Record<string, any>): Stored | string {
@@ -261,7 +278,8 @@ interface TestRun {
 // Every test the daemon was asked to start, oldest first. A run does nothing by
 // itself: it prints, ends or is forgotten only once the page under test says so,
 // and the screen sees that the next time it reads the run.
-const tests: { run: TestRun; printed: boolean; finished: boolean; forgotten: boolean; cancelled: boolean }[] = [];
+// `overflowed` makes it print more than the log keeps.
+const tests: { run: TestRun; printed: boolean; overflowed: boolean; finished: boolean; forgotten: boolean; cancelled: boolean }[] = [];
 
 function startTest(id: string) {
   const target = state.instances.find((entry) => entry.id === id);
@@ -282,7 +300,7 @@ function startTest(id: string) {
     ],
     arguments: [`/fixture/scratch/test-${number}`, "weaver-test-download.nzb"], commands: [], commandsTruncated: false,
   };
-  tests.push({ run, printed: false, finished: false, forgotten: false, cancelled: false });
+  tests.push({ run, printed: false, overflowed: false, finished: false, forgotten: false, cancelled: false });
   return { data: { testScriptInstance: structuredClone(run) } };
 }
 
@@ -295,6 +313,10 @@ function readTest(id: string) {
   const { run } = held;
   if (run.running && held.printed && run.log === "") {
     run.log = `token=${MASKED}\nresolved 1 recipient\n`;
+  }
+  if (run.running && held.overflowed && !run.logTruncated) {
+    // Only the newest of what it printed is kept.
+    Object.assign(run, { log: "line 4096 of 4096\n", logTruncated: true });
   }
   if (run.running && held.finished) {
     Object.assign(run, {
@@ -373,13 +395,18 @@ const scriptRunRequests: Record<string, unknown>[] = [];
 // The run whose full output each request asked for, oldest first.
 const outputRequests: string[] = [];
 function scriptRunPage(variables: Record<string, any>) {
-  const matching = runs.filter((entry) => !variables.kind || entry.kind === variables.kind);
+  const ofKind = runs.filter((entry) => !variables.kind || entry.kind === variables.kind);
+  const matching = ofKind.filter((entry) => !variables.status || entry.status === variables.status);
   const start = variables.before ? matching.findIndex((entry) => entry.id === variables.before) + 1 : 0;
   const page = matching.slice(start, start + (variables.limit ?? 50));
+  // How the runs of the kind ended, whichever status was asked for.
+  const ended = new Map<string, number>();
+  for (const entry of ofKind) ended.set(entry.status, (ended.get(entry.status) ?? 0) + 1);
   return {
     runs: page,
     nextBefore: start + page.length < matching.length ? page[page.length - 1].id : null,
     total: matching.length,
+    statusCounts: [...ended].map(([status, count]) => ({ status, count })),
   };
 }
 
@@ -448,15 +475,23 @@ function graphql(name: string, variables: Record<string, any>) {
       return declared.secret ? [] : [held(declared.name, declared.value)];
     });
     mutation = { reapplyScriptHeader: view(target) };
+  } else if (name === "CreateSchedule") {
+    requests.push({ name, variables });
+    // With `norule`, the daemon takes the instance and refuses its rule.
+    if (has("norule")) return refused("the schedule could not be written");
+    const { instanceId, time, ...rest } = variables.input;
+    const created = rule(`r${++lastRule}`, instanceId, time, { ...rest, days: rest.days ?? [] });
+    state.schedules.push(created);
+    mutation = { createSchedule: created };
   } else if (name === "CreateSecret") {
     requests.push({ name, variables });
     return createSecret(variables);
   } else if (name === "UpdateSecret") {
     requests.push({ name, variables });
-    return updateSecret(variables);
+    return passwordVerified ? updateSecret(variables) : REAUTH;
   } else if (name === "DeleteSecret") {
     requests.push({ name, variables });
-    return deleteSecret(variables.id);
+    return passwordVerified ? deleteSecret(variables.id) : REAUTH;
   } else if (name === "TestScriptInstance") {
     return startTest(variables.id);
   } else if (name === "ScriptTestRun") {
@@ -469,7 +504,7 @@ function graphql(name: string, variables: Record<string, any>) {
     outputRequests.push(variables.outputId);
   }
   return { data: structuredClone({ postProcessingSettings: state.settings, categories: state.categories,
-    scriptInstances: state.instances.map(view), discoveredScripts: state.scripts, secrets: state.secrets.map(secretView),
+    scriptInstances: state.instances.map(view), discoveredScripts: state.scripts, schedules: state.schedules, secrets: state.secrets.map(secretView),
     postProcessingResults: results, scriptRuns: scriptRunPage(variables), scriptRunRequests,
     scriptOutput: retainedOutput[variables.outputId] ?? null,
     browseDirectories: { currentPath: variables.path ?? state.settings.scriptDirectory, parentPath: "/fixture", entries: [] },
@@ -477,11 +512,17 @@ function graphql(name: string, variables: Record<string, any>) {
 }
 // What the daemon holds, secrets included, and what it was asked to do, for the
 // test to read and for it to move a test run along.
-Object.assign(window, { scriptsFixture: { instances: state.instances, secrets: state.secrets, requests, tests, outputRequests } });
+Object.assign(window, { scriptsFixture: { instances: state.instances, secrets: state.secrets, schedules: state.schedules, requests, tests, outputRequests } });
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });
 const originalFetch = window.fetch.bind(window);
 window.fetch = async (request, init) => {
   const url = new URL(String(request), document.baseURI);
+  if (url.pathname.endsWith("/api/auth/verify")) {
+    passwordVerified = JSON.parse(String(init?.body)).password === PASSWORD;
+    return passwordVerified
+      ? Response.json({ authenticated: true })
+      : Response.json({ error: "invalid credentials" }, { status: 401 });
+  }
   if (url.pathname !== "/graphql") return originalFetch(request, init);
   const body = JSON.parse(String(init?.body));
   return Response.json(graphql(body.operationName, body.variables));

@@ -24,10 +24,11 @@ pub struct PostProcessingSettingsGql {
     pub event_script_concurrency: u8,
     pub event_script_timeout_seconds: u64,
     pub file_downloaded_event_interval: i64,
-    pub script_output_ceiling_bytes: u64,
+    /// The newest runs kept for each download (or each scan, schedule or feed
+    /// for runs that belong to no download).
     pub script_output_runs_per_job: u32,
-    pub script_output_ring_bytes: u64,
-    pub script_output_run_cap_bytes: u64,
+    /// Failed runs kept beyond the newest, so failures stay inspectable.
+    pub script_output_failed_runs_per_job: u32,
     pub script_directory: String,
     pub execution_enabled: bool,
     pub concurrency: u8,
@@ -83,10 +84,10 @@ impl PostProcessingSettingsGql {
             event_script_concurrency: value.event_scripts.event_script_concurrency,
             event_script_timeout_seconds: value.event_scripts.event_script_timeout_seconds,
             file_downloaded_event_interval: value.event_scripts.file_downloaded_event_interval,
-            script_output_ceiling_bytes: value.event_scripts.script_output_ceiling_bytes,
             script_output_runs_per_job: value.event_scripts.script_output_runs_per_job,
-            script_output_ring_bytes: value.event_scripts.script_output_ring_bytes,
-            script_output_run_cap_bytes: value.event_scripts.script_output_run_cap_bytes,
+            script_output_failed_runs_per_job: value
+                .event_scripts
+                .script_output_failed_runs_per_job,
             execution_enabled: value.execution_enabled,
             concurrency: value.concurrency,
             termination_grace_seconds: value.termination_grace_seconds,
@@ -106,10 +107,11 @@ pub struct PostProcessingSettingsInput {
     pub event_script_concurrency: Option<u8>,
     pub event_script_timeout_seconds: Option<u64>,
     pub file_downloaded_event_interval: Option<i64>,
-    pub script_output_ceiling_bytes: Option<u64>,
+    /// Lowering it deletes older runs soon after the save. Omission keeps it.
     pub script_output_runs_per_job: Option<u32>,
-    pub script_output_ring_bytes: Option<u64>,
-    pub script_output_run_cap_bytes: Option<u64>,
+    /// Lowering it deletes older failed runs soon after the save. Omission
+    /// keeps it.
+    pub script_output_failed_runs_per_job: Option<u32>,
     pub execution_enabled: bool,
     pub concurrency: u8,
     pub termination_grace_seconds: u64,
@@ -612,6 +614,19 @@ impl From<weaver_server_core::post_processing::model::ScriptStatus> for ScriptSt
     }
 }
 
+impl From<ScriptStatusGql> for weaver_server_core::post_processing::model::ScriptStatus {
+    fn from(value: ScriptStatusGql) -> Self {
+        match value {
+            ScriptStatusGql::Succeeded => Self::Succeeded,
+            ScriptStatusGql::Skipped => Self::Skipped,
+            ScriptStatusGql::Warning => Self::Warning,
+            ScriptStatusGql::Failed => Self::Failed,
+            ScriptStatusGql::TimedOut => Self::TimedOut,
+            ScriptStatusGql::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct ScriptResultGql {
     pub output_id: Option<String>,
@@ -730,6 +745,16 @@ pub struct ScriptRunPageGql {
     pub next_before: Option<String>,
     /// How many runs the filter matches across every page.
     pub total: u64,
+    /// How the runs the filter matches ended, leaving its own `status` out.
+    /// A status no run ended with is absent.
+    pub status_counts: Vec<ScriptRunStatusCountGql>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptRunStatusCount")]
+pub struct ScriptRunStatusCountGql {
+    pub status: ScriptStatusGql,
+    pub count: u64,
 }
 
 impl From<ScriptKindGql> for weaver_server_core::post_processing::model::ScriptKind {

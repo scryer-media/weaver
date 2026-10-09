@@ -911,7 +911,7 @@ async fn a_script_runs_token_may_not_create_change_or_delete_a_secret() {
 }
 
 #[tokio::test]
-async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secret() {
+async fn a_browser_session_without_a_recent_password_check_may_add_a_secret_but_not_change_one() {
     use weaver_server_core::security::{AUTHENTICATED_POLICY_REVISION, RuntimeSecurityConfig};
 
     let security = RuntimeSecurityConfig::default();
@@ -937,7 +937,8 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
         .unwrap();
     let kept = harness.db.create_secret("Kept", "hunter2").unwrap();
     let before = stored_secrets(&harness);
-    for mutation in secret_mutations(&kept.id) {
+    let [create, change, delete] = secret_mutations(&kept.id);
+    for mutation in [change, delete] {
         let response = harness
             .schema
             .execute(
@@ -951,6 +952,20 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
     }
     assert_eq!(stored_secrets(&harness), before);
 
+    // Adding one touches nothing already saved, and is not held back.
+    let added = harness
+        .schema
+        .execute(
+            async_graphql::Request::new(create.as_str())
+                .data(CallerScope::Admin)
+                .data(weaver_server_api::auth::CallerIdentity::Jwt([7; 32])),
+        )
+        .await;
+    assert_no_errors(&added);
+    let mut after = stored_secrets(&harness);
+    after.retain(|(name, _)| name != "From outside");
+    assert_eq!(after, before);
+
     // Listing names needs no fresh password check.
     let listed = harness
         .schema
@@ -961,10 +976,14 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
         )
         .await;
     assert_no_errors(&listed);
-    assert_eq!(
-        response_data(&listed)["secrets"],
-        json!([{ "name": "Kept" }])
-    );
+    let mut names: Vec<String> = response_data(&listed)["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|secret| secret["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["From outside", "Kept"]);
 }
 
 #[tokio::test]
@@ -1283,16 +1302,29 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
 
     let harness = TestHarness::new().await;
     let recorded = [
-        (ScriptEventLabel::Scheduler(1), "nightly.sh", false, None),
-        (ScriptEventLabel::Scan, "scan.sh", false, None),
+        (
+            ScriptEventLabel::Scheduler(1),
+            "nightly.sh",
+            false,
+            None,
+            ScriptStatus::Succeeded,
+        ),
+        (
+            ScriptEventLabel::Scan,
+            "scan.sh",
+            false,
+            None,
+            ScriptStatus::Failed,
+        ),
         (
             ScriptEventLabel::Scheduler(2),
             "hourly.sh",
             true,
             Some(("instance-1", "Every hour")),
+            ScriptStatus::Succeeded,
         ),
     ];
-    for (event, script, background, instance) in recorded {
+    for (event, script, background, instance, status) in recorded {
         retain_output(
             harness.db.clone(),
             None,
@@ -1304,7 +1336,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
                 output_id: None,
                 background,
                 adapter: ScriptAdapter::Nzbget,
-                status: ScriptStatus::Succeeded,
+                status,
                 exit_code: Some(93),
                 duration_ms: 5,
                 output_tail: String::new(),
@@ -1313,6 +1345,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
                 finished_at_epoch_ms: 1_000,
             },
             format!("{script} output").into_bytes(),
+            format!("{script} output").len() as u64,
             Default::default(),
         )
         .await
@@ -1394,6 +1427,36 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     assert_eq!(scheduled["total"], 1, "the total is of the filtered runs");
     assert!(scheduled["nextBefore"].is_null());
 
+    let failed = harness
+        .execute_as(
+            "{ scriptRuns(status: FAILED) { runs { script status } total statusCounts { status count } } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&failed);
+    let failed = &response_data(&failed)["scriptRuns"];
+    assert_eq!(failed["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(failed["runs"][0]["script"], "scan.sh");
+    assert_eq!(failed["runs"][0]["status"], "FAILED");
+    assert_eq!(failed["total"], 1);
+    // The counts cover every status, so each quick filter can show its own.
+    let mut counts = failed["statusCounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["status"].as_str().unwrap().to_string(),
+                entry["count"].as_u64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    counts.sort();
+    assert_eq!(
+        counts,
+        [("FAILED".to_string(), 1), ("SUCCEEDED".to_string(), 2)]
+    );
+
     let of_a_job = harness
         .execute_as(
             "{ scriptRuns(jobId: 7) { runs { script } } }",
@@ -1415,4 +1478,182 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
         )
         .await;
     assert_has_errors(&nowhere);
+}
+
+/// Record a finished run of `script` on the scan event, with no job.
+async fn record_scan_run(
+    harness: &TestHarness,
+    script: &str,
+    status: weaver_server_core::post_processing::model::ScriptStatus,
+    output_truncated: bool,
+) {
+    use weaver_server_core::post_processing::model::{
+        ScriptAdapter, ScriptEventLabel, ScriptName, ScriptResult,
+    };
+    use weaver_server_core::post_processing::output::retain_output;
+
+    let output = format!("{script} output").into_bytes();
+    let written = if output_truncated {
+        64 * 1024
+    } else {
+        output.len() as u64
+    };
+    retain_output(
+        harness.db.clone(),
+        None,
+        ScriptResult {
+            script: ScriptName::new(script).unwrap(),
+            instance_id: None,
+            instance_name: None,
+            event: ScriptEventLabel::Scan,
+            output_id: None,
+            background: false,
+            adapter: ScriptAdapter::Nzbget,
+            status,
+            exit_code: Some(0),
+            duration_ms: 5,
+            output_tail: String::new(),
+            output_truncated,
+            error_message: None,
+            finished_at_epoch_ms: 1_000,
+        },
+        output,
+        written,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+}
+
+/// The scripts of every recorded run, newest first.
+async fn recorded_scripts(harness: &TestHarness) -> Vec<String> {
+    let response = harness
+        .execute("{ scriptRuns(limit: 50) { runs { script } } }")
+        .await;
+    assert_no_errors(&response);
+    response_data(&response)["scriptRuns"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["script"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn lowering_the_retained_runs_deletes_older_runs_after_the_save_and_raising_deletes_none() {
+    use weaver_server_core::post_processing::model::ScriptStatus;
+
+    let harness = TestHarness::new().await;
+    for (script, status) in [
+        ("one.sh", ScriptStatus::Failed),
+        ("two.sh", ScriptStatus::Succeeded),
+        ("three.sh", ScriptStatus::TimedOut),
+        ("four.sh", ScriptStatus::Succeeded),
+        ("five.sh", ScriptStatus::Succeeded),
+        ("six.sh", ScriptStatus::Succeeded),
+    ] {
+        record_scan_run(&harness, script, status, false).await;
+    }
+    let save = |limits: &'static str| {
+        let harness = &harness;
+        async move {
+            let response = harness
+                .execute(&format!(
+                    "mutation {{ setPostProcessingSettings(input: {{
+                        executionEnabled: false
+                        concurrency: 1
+                        terminationGraceSeconds: 10
+                        {limits}
+                    }}) {{ scriptOutputRunsPerJob scriptOutputFailedRunsPerJob }} }}"
+                ))
+                .await;
+            assert_no_errors(&response);
+            let saved = &response_data(&response)["setPostProcessingSettings"];
+            (
+                saved["scriptOutputRunsPerJob"].as_u64().unwrap(),
+                saved["scriptOutputFailedRunsPerJob"].as_u64().unwrap(),
+            )
+        }
+    };
+
+    assert_eq!(save("").await, (32, 8), "the defaults");
+    assert_eq!(
+        save("scriptOutputRunsPerJob: 64, scriptOutputFailedRunsPerJob: 16").await,
+        (64, 16)
+    );
+    harness.db.script_output_trims_settled().await;
+    assert_eq!(
+        recorded_scripts(&harness).await.len(),
+        6,
+        "raising deletes nothing"
+    );
+
+    // The two newest runs, then the newest failed run of the older ones.
+    assert_eq!(
+        save("scriptOutputRunsPerJob: 2, scriptOutputFailedRunsPerJob: 1").await,
+        (2, 1)
+    );
+    harness.db.script_output_trims_settled().await;
+    assert_eq!(
+        recorded_scripts(&harness).await,
+        ["six.sh", "five.sh", "three.sh"]
+    );
+
+    // Left out, both limits stay as they were.
+    assert_eq!(save("").await, (2, 1));
+    let persisted = harness
+        .execute(
+            "{ postProcessingSettings { scriptOutputRunsPerJob scriptOutputFailedRunsPerJob } }",
+        )
+        .await;
+    assert_no_errors(&persisted);
+    assert_eq!(
+        response_data(&persisted)["postProcessingSettings"],
+        json!({ "scriptOutputRunsPerJob": 2, "scriptOutputFailedRunsPerJob": 1 })
+    );
+
+    for invalid in [
+        "scriptOutputRunsPerJob: 0",
+        "scriptOutputRunsPerJob: 129",
+        "scriptOutputFailedRunsPerJob: 129",
+    ] {
+        let response = harness
+            .execute(&format!(
+                "mutation {{ setPostProcessingSettings(input: {{
+                    executionEnabled: false
+                    concurrency: 1
+                    terminationGraceSeconds: 10
+                    {invalid}
+                }}) {{ scriptOutputRunsPerJob }} }}"
+            ))
+            .await;
+        assert_has_errors(&response);
+    }
+    assert_eq!(save("scriptOutputFailedRunsPerJob: 0").await, (2, 0));
+    harness.db.script_output_trims_settled().await;
+    assert_eq!(recorded_scripts(&harness).await, ["six.sh", "five.sh"]);
+}
+
+#[tokio::test]
+async fn a_run_says_whether_it_printed_more_than_was_kept() {
+    use weaver_server_core::post_processing::model::ScriptStatus;
+
+    let harness = TestHarness::new().await;
+    record_scan_run(&harness, "under.sh", ScriptStatus::Succeeded, false).await;
+    record_scan_run(&harness, "over.sh", ScriptStatus::Cancelled, true).await;
+
+    let response = harness
+        .execute_as(
+            "{ scriptRuns { runs { script status outputTruncated outputRetained } } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["scriptRuns"]["runs"],
+        json!([
+            { "script": "over.sh", "status": "CANCELLED", "outputTruncated": true, "outputRetained": true },
+            { "script": "under.sh", "status": "SUCCEEDED", "outputTruncated": false, "outputRetained": true },
+        ])
+    );
 }

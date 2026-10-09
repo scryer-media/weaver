@@ -578,3 +578,20 @@ scope = "all"
 kind = "rust"
 hook_id = "move_script_wiring_to_instances_v55"
 scope = "upgrade_only"
+
+[[migration]]
+version = 56
+description = "how each recorded script run ended, as a column to filter on"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0056_script_run_status/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0056_script_run_status/postgres.sql"
+engine = "postgres"
+scope = "all"

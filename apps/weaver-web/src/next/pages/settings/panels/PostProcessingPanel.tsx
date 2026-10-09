@@ -1,6 +1,5 @@
 import { useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { useMutation, useQuery, type CombinedError } from "urql";
-import { ScriptKinds } from "@/next/components/ScriptKinds";
 import { eventScriptDefaults, eventScriptOptions, eventScriptSection, type EventScriptOptions } from "@/next/components/EventScriptSettings";
 import {
   DELETE_SCRIPT_INSTANCE_MUTATION,
@@ -28,7 +27,6 @@ import {
   groupInstances,
   inputFromInstance,
   reorderedIds,
-  scriptsWithoutInstance,
   triggerTitle,
   type DiscoveredScript,
   type InstanceGroup,
@@ -53,9 +51,9 @@ import { ScriptTestDialog } from "./ScriptTestDialog";
  *
  * Configuration holds what applies to every script: the execution settings, a
  * draft behind the top bar's Save, and the scripts directory, destructive
- * enough to ask first. Scripts holds the instances, which are what runs: a
+ * enough to ask first. Jobs holds the instances, which are what runs: a
  * script wired to one trigger, with the inputs and run policy saved for it. A
- * script's header only offers a starting point for one.
+ * script's header only offers a starting point for one, in its editor.
  */
 
 /** When the instances that are not narrowed to a category run. */
@@ -298,7 +296,7 @@ export function ScriptConfigurationPanel() {
         },
       ],
     },
-    eventScriptSection(t, values, patch),
+    eventScriptSection(t, values, patch, source),
     {
       kind: "section",
       id: "interpreters",
@@ -451,7 +449,10 @@ function RowAction({
   );
 }
 
-/** The instances that run, by what starts them, and the scripts nothing is wired to yet. */
+/**
+ * The instances that run, by what starts them. The scripts themselves are not
+ * listed here: one is chosen in the editor of a new instance.
+ */
 export function ScriptListPanel() {
   const t = useTranslate();
   const [{ data, fetching, error: instancesError }, reloadInstances] = useQuery<InstancesData>({
@@ -494,13 +495,11 @@ export function ScriptListPanel() {
   const instances = reordered && reordered.base === fetched ? reordered.value : (fetched ?? NO_INSTANCES);
   const scripts = discovered?.discoveredScripts.scripts ?? NO_SCRIPTS;
   const problems = discovered?.discoveredScripts.problems ?? [];
-  const scriptDirectory = data?.postProcessingSettings.scriptDirectory ?? "";
   const categories = useMemo(
     () => (data?.categories ?? []).map((category) => category.name).sort((left, right) => left.localeCompare(right)),
     [data?.categories],
   );
   const groups = useMemo(() => groupInstances(instances), [instances]);
-  const unused = useMemo(() => scriptsWithoutInstance(scripts, instances), [scripts, instances]);
 
   const queryError = instancesError ?? scriptsError;
   const shownError = error ?? (queryError ? errorText(queryError) : null);
@@ -691,43 +690,6 @@ export function ScriptListPanel() {
     };
   };
 
-  const unusedRow = (script: DiscoveredScript): SettingsTableRowModel => ({
-    id: `s:${script.name}`,
-    searchText: `${script.name} ${script.displayName} ${script.adapter}`,
-    // A script nothing is wired to has no run policy to show, so its actions take those columns.
-    spans: [1, 1, 5],
-    cells: [
-      <div key="name" className="flex min-w-0 flex-col gap-[6px]">
-        <span className="truncate text-[13px] text-wv-muted" title={script.displayName}>
-          {script.displayName}
-        </span>
-        <ScriptKinds script={script} />
-      </div>,
-      <div key="script" className="flex min-w-0 flex-col gap-1">
-        <Cell mono className="text-wv-muted" title={script.name}>
-          {script.name}
-        </Cell>
-        <span className="truncate font-wv-mono text-[11px] text-wv-faint">
-          {script.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet"}
-          {script.version ? ` · ${script.version}` : ""}
-        </span>
-      </div>,
-      // The row itself opens a new instance of its script; the top bar's Create is the list's only Add.
-      <span key="actions" className="ml-auto flex flex-wrap items-center justify-end gap-2" {...own}>
-        {script.preset.triggers.length > 0 ? (
-          <SecondaryButton
-            size="compact"
-            disabled={working}
-            title={t("next.postProcessing.setUpFromHeaderHelp")}
-            onClick={() => void setUp(script).then(setError)}
-          >
-            {t("next.postProcessing.setUpFromHeader")}
-          </SecondaryButton>
-        ) : null}
-      </span>,
-    ],
-  });
-
   const groupNote = (group: InstanceGroup): string | undefined => {
     if (group.trigger === "SCHEDULER") {
       return t("next.postProcessing.scheduleGroupNote");
@@ -735,7 +697,7 @@ export function ScriptListPanel() {
     return group.trigger === "FEED" ? t("next.postProcessing.feedGroupNote") : undefined;
   };
 
-  const blocks: (SettingsBlock | null)[] = [
+  const blocks: SettingsBlock[] = [
     {
       kind: "table",
       id: "instances",
@@ -756,57 +718,22 @@ export function ScriptListPanel() {
         t("next.postProcessing.enabled"),
         "",
       ],
-      empty: t("next.postProcessing.discoveredEmpty"),
+      empty: t("next.postProcessing.noInstances"),
+      emptyAction: { label: t("next.postProcessing.createInstance"), onClick: () => openEditor({ mode: "new" }) },
       onRowClick: (id) => {
-        if (id.startsWith("s:")) {
-          openEditor({ mode: "new", script: id.slice(2) });
-          return;
-        }
         const instance = instances.find((entry) => `i:${entry.id}` === id);
         if (instance) {
           openEditor({ mode: "edit", instance });
         }
       },
       rows: [],
-      groups: [
-        ...groups.map((group) => ({
-          id: group.id,
-          title: triggerTitle(t, group.trigger, group.queueEvent),
-          note: groupNote(group),
-          rows: group.instances.map((instance, index) => instanceRow(group, instance, index)),
-        })),
-        {
-          id: "unused",
-          title: t("next.postProcessing.unusedScripts"),
-          note: scriptDirectory || undefined,
-          rows: unused.map(unusedRow),
-        },
-      ],
+      groups: groups.map((group) => ({
+        id: group.id,
+        title: triggerTitle(t, group.trigger, group.queueEvent),
+        note: groupNote(group),
+        rows: group.instances.map((instance, index) => instanceRow(group, instance, index)),
+      })),
     },
-    problems.length > 0
-      ? {
-          kind: "custom",
-          id: "problems",
-          title: t("next.postProcessing.problems"),
-          note: `${problems.length}`,
-          searchText: problems.map((problem) => `${problem.name} ${problem.message}`).join(" "),
-          body: (
-            <div className="flex flex-col">
-              {problems.map((problem) => (
-                <div
-                  key={problem.name}
-                  className="flex flex-wrap items-baseline gap-x-5 gap-y-1 border-b border-wv-hairline px-4 sm:px-6 py-3"
-                >
-                  <span className="font-wv-mono text-[12.5px] text-wv-fg">{problem.name}</span>
-                  <span className="min-w-0 flex-1 text-[12.5px] text-wv-error-text">
-                    {problem.message}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ),
-        }
-      : null,
   ];
 
   const confirmBody = (text: string) => (
@@ -832,11 +759,7 @@ export function ScriptListPanel() {
         >
           {t("action.refresh")}
         </SecondaryButton>
-        <PrimaryButton
-          icon="add"
-          disabled={scripts.length === 0}
-          onClick={() => openEditor({ mode: "new", script: null })}
-        >
+        <PrimaryButton icon="add" onClick={() => openEditor({ mode: "new" })}>
           {t("next.postProcessing.createInstance")}
         </PrimaryButton>
       </PanelControls>
@@ -848,11 +771,12 @@ export function ScriptListPanel() {
           key={editor.key}
           target={editor.target}
           scripts={scripts}
+          problems={problems}
           instances={instances}
           categories={categories}
-          onSaved={(saved) => {
+          onSaved={(saved, problem) => {
             setEditor(null);
-            setError(null);
+            setError(problem ?? null);
             setStatus(saved);
             refetchInstances();
           }}

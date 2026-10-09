@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::auth::{FreshAdminGuard, graphql_error};
+use crate::auth::{AdminGuard, FreshAdminGuard, graphql_error};
 use weaver_server_core::bandwidth::ScheduleAction;
 use weaver_server_core::bandwidth::schedule::SharedSchedules;
 use weaver_server_core::post_processing::executor::{
@@ -102,10 +102,8 @@ impl PostProcessingMutation {
             event_script_concurrency,
             event_script_timeout_seconds,
             file_downloaded_event_interval,
-            script_output_ceiling_bytes,
             script_output_runs_per_job,
-            script_output_ring_bytes,
-            script_output_run_cap_bytes,
+            script_output_failed_runs_per_job,
             execution_enabled,
             concurrency,
             termination_grace_seconds,
@@ -147,17 +145,11 @@ impl PostProcessingMutation {
             if let Some(value) = file_downloaded_event_interval {
                 event_scripts.file_downloaded_event_interval = value;
             }
-            if let Some(value) = script_output_ceiling_bytes {
-                event_scripts.script_output_ceiling_bytes = value;
-            }
             if let Some(value) = script_output_runs_per_job {
                 event_scripts.script_output_runs_per_job = value;
             }
-            if let Some(value) = script_output_ring_bytes {
-                event_scripts.script_output_ring_bytes = value;
-            }
-            if let Some(value) = script_output_run_cap_bytes {
-                event_scripts.script_output_run_cap_bytes = value;
+            if let Some(value) = script_output_failed_runs_per_job {
+                event_scripts.script_output_failed_runs_per_job = value;
             }
             let settings = PostProcessingSettings {
                 event_scripts,
@@ -256,8 +248,10 @@ impl PostProcessingMutation {
     }
 
     /// Keep a value encrypted under a name, for script inputs to link. The
-    /// value can be replaced but never read back.
-    #[graphql(guard = "FreshAdminGuard")]
+    /// value can be replaced but never read back. Adding one changes nothing
+    /// already saved, so it asks for no recent password check; changing or
+    /// removing one does.
+    #[graphql(guard = "AdminGuard")]
     async fn create_secret(
         &self,
         ctx: &Context<'_>,

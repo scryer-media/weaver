@@ -131,6 +131,7 @@ pub(crate) struct ScriptRuntime {
     background: BackgroundLane,
     pub(super) tests: super::test_run::TestRuns,
     pub(super) live: std::sync::Arc<super::callbacks::LiveRuns>,
+    pub(super) trim: super::output::RetentionTrim,
 }
 
 #[derive(Clone, Copy)]
@@ -583,106 +584,111 @@ async fn run_entry(
         background,
     } = run;
     let started = Instant::now();
-    let (adapter, status, exit_code, output, output_truncated, error_message) = match script {
-        // Nothing ran, so nothing failed: the operator is told, and whatever
-        // raised the event goes on.
-        Err(error) => (
-            ScriptAdapter::Sabnzbd,
-            ScriptStatus::Warning,
-            None,
-            Vec::new(),
-            false,
-            Some(error),
-        ),
-        Ok(script) => {
-            let adapter = script.manifest.adapter();
-            let prepared = db
-                .script_instance_run_inputs(&entry.id)
-                .map_err(|error| error.to_string())
-                .and_then(|inputs| {
-                    inputs.ok_or_else(|| "the script instance no longer exists".to_string())
-                })
-                .and_then(|inputs| {
-                    RunIdentity::of(&entry)
-                        .map(|identity| (inputs, identity))
-                        .map_err(|error| error.to_string())
-                });
-            let execution = match prepared {
-                Err(error) => Err(error),
-                Ok((inputs, mut identity)) => {
-                    let mut env = context.weaver_env();
-                    env.extend(context.env.clone());
-                    let timeout = entry.time_limit(&settings);
-                    // The run is live, and its token good, until this is
-                    // dropped at the end of the block.
-                    let mut requests = db.open_script_run(
-                        &mut identity,
-                        context.job_id,
-                        &context.event,
-                        Some(timeout),
-                        false,
-                    );
-                    let spec = ExecutionSpec {
-                        manifest: script.manifest,
-                        root: script.root,
-                        options: inputs,
-                        cwd: context.cwd.clone(),
-                        env,
-                        argv: Vec::new(),
-                        timeout: Some(timeout),
-                        termination_grace: Duration::from_secs(settings.termination_grace_seconds),
-                        kind: context.event.clone(),
-                        run_id,
-                        identity,
-                        facts: context.facts.clone(),
-                        interpreters: InterpreterConfig {
-                            python: settings.python_interpreter.as_ref().map(PathBuf::from),
-                            powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
-                            batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
-                            go: settings.go_interpreter.as_ref().map(PathBuf::from),
+    let (adapter, status, exit_code, (output, output_bytes), output_truncated, error_message) =
+        match script {
+            // Nothing ran, so nothing failed: the operator is told, and whatever
+            // raised the event goes on.
+            Err(error) => (
+                ScriptAdapter::Sabnzbd,
+                ScriptStatus::Warning,
+                None,
+                (Vec::new(), 0),
+                false,
+                Some(error),
+            ),
+            Ok(script) => {
+                let adapter = script.manifest.adapter();
+                let prepared = db
+                    .script_instance_run_inputs(&entry.id)
+                    .map_err(|error| error.to_string())
+                    .and_then(|inputs| {
+                        inputs.ok_or_else(|| "the script instance no longer exists".to_string())
+                    })
+                    .and_then(|inputs| {
+                        RunIdentity::of(&entry)
+                            .map(|identity| (inputs, identity))
+                            .map_err(|error| error.to_string())
+                    });
+                let execution = match prepared {
+                    Err(error) => Err(error),
+                    Ok((inputs, mut identity)) => {
+                        let mut env = context.weaver_env();
+                        env.extend(context.env.clone());
+                        let timeout = entry.time_limit(&settings);
+                        // The run is live, and its token good, until this is
+                        // dropped at the end of the block.
+                        let mut requests = db.open_script_run(
+                            &mut identity,
+                            context.job_id,
+                            &context.event,
+                            Some(timeout),
+                            false,
+                        );
+                        let spec = ExecutionSpec {
+                            manifest: script.manifest,
+                            root: script.root,
+                            options: inputs,
+                            cwd: context.cwd.clone(),
+                            env,
+                            argv: Vec::new(),
+                            timeout: Some(timeout),
+                            termination_grace: Duration::from_secs(
+                                settings.termination_grace_seconds,
+                            ),
+                            kind: context.event.clone(),
+                            run_id,
+                            identity,
+                            facts: context.facts.clone(),
+                            interpreters: InterpreterConfig {
+                                python: settings.python_interpreter.as_ref().map(PathBuf::from),
+                                powershell: settings
+                                    .powershell_interpreter
+                                    .as_ref()
+                                    .map(PathBuf::from),
+                                batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
+                                go: settings.go_interpreter.as_ref().map(PathBuf::from),
+                            },
+                            supervisor_executable,
+                        };
+                        let (sender, receiver) = mpsc::channel(64);
+                        let (execution, ()) = tokio::join!(
+                            execute_spec(spec, cancellation, Some(sender)),
+                            consume_events(db, context, receiver, &mut requests),
+                        );
+                        execution
+                            .map(|mut result| {
+                                requests.settle(&mut result);
+                                result
+                            })
+                            .map_err(|error| error.to_string())
+                    }
+                };
+                match execution {
+                    Ok(result) => (
+                        adapter,
+                        match result.disposition {
+                            ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
+                            ExecutionDisposition::Skipped => ScriptStatus::Skipped,
+                            ExecutionDisposition::Failed => ScriptStatus::Failed,
+                            ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
+                            ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
                         },
-                        supervisor_executable,
-                        output_ceiling: settings.event_scripts.script_output_ceiling_bytes,
-                    };
-                    let (sender, receiver) = mpsc::channel(64);
-                    let (execution, ()) = tokio::join!(
-                        execute_spec(spec, cancellation, Some(sender)),
-                        consume_events(db, context, receiver, &mut requests),
-                    );
-                    execution
-                        .map(|mut result| {
-                            requests.settle(&mut result);
-                            result
-                        })
-                        .map_err(|error| error.to_string())
+                        result.exit_code,
+                        (result.output, result.output_bytes),
+                        result.output_truncated,
+                        result.error_message,
+                    ),
+                    Err(error) => (
+                        adapter,
+                        ScriptStatus::Failed,
+                        None,
+                        (Vec::new(), 0),
+                        false,
+                        Some(error),
+                    ),
                 }
-            };
-            match execution {
-                Ok(result) => (
-                    adapter,
-                    match result.disposition {
-                        ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
-                        ExecutionDisposition::Skipped => ScriptStatus::Skipped,
-                        ExecutionDisposition::Failed => ScriptStatus::Failed,
-                        ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
-                        ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
-                    },
-                    result.exit_code,
-                    result.output,
-                    result.output_truncated,
-                    result.error_message,
-                ),
-                Err(error) => (
-                    adapter,
-                    ScriptStatus::Failed,
-                    None,
-                    Vec::new(),
-                    false,
-                    Some(error),
-                ),
             }
-        }
-    };
+        };
     let result = ScriptResult {
         script: entry.script,
         instance_id: Some(entry.id),
@@ -704,6 +710,7 @@ async fn run_entry(
         context.job_id,
         result,
         output,
+        output_bytes,
         settings.event_scripts.clone(),
     )
     .await?;

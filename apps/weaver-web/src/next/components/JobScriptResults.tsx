@@ -93,6 +93,16 @@ export function FireAndForgetTag() {
   );
 }
 
+/** Marks a run that printed more than its kept output holds. */
+export function TruncatedTag() {
+  const t = useTranslate();
+  return (
+    <span className="flex flex-none whitespace-nowrap" title={t("next.job.scriptOutputTruncated")}>
+      <Tag>{t("next.postProcessing.outputTruncatedChip")}</Tag>
+    </span>
+  );
+}
+
 /** A run's output: the excerpt it ended with, and the retained output on request. */
 export function ScriptRunOutput({ run }: { run: ScriptRunOutputSource }) {
   const t = useTranslate();

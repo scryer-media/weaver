@@ -497,6 +497,14 @@ printf 'FINAL-LINE\n'
     let output = String::from_utf8_lossy(&result.output);
     assert!(output.contains("FINAL-LINE"), "the tail must survive");
     assert!(!output.contains("line-0 "), "the head is what gets dropped");
+    let written = (0..2048)
+        .map(|i| format!("line-{i} ").len() as u64 + 1025)
+        .sum::<u64>()
+        + "FINAL-LINE\n".len() as u64;
+    assert_eq!(
+        result.output_bytes, written,
+        "every byte written is counted, kept or not"
+    );
 }
 
 #[tokio::test]

@@ -848,12 +848,10 @@ async fn import_sqlite(
             )
             .await?;
         }
-        sqlx::query(
-            "INSERT INTO script_output_state (singleton, next_seq, used_bytes) VALUES (1, 0, 0)",
-        )
-        .execute(&mut *conn)
-        .await
-        .map_err(db_err)?;
+        sqlx::query("INSERT INTO script_output_state (singleton, next_seq) VALUES (1, 0)")
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
         if source_schema_version < EGRESS_CATALOG_SCHEMA_VERSION
             && !expected.contains_key("egress_interfaces")
         {
@@ -945,12 +943,10 @@ async fn import_postgres(
         )
         .await?;
     }
-    sqlx::query(
-        "INSERT INTO script_output_state (singleton, next_seq, used_bytes) VALUES (1, 0, 0)",
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(db_err)?;
+    sqlx::query("INSERT INTO script_output_state (singleton, next_seq) VALUES (1, 0)")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
     if source_schema_version < EGRESS_CATALOG_SCHEMA_VERSION
         && !expected.contains_key("egress_interfaces")
     {
