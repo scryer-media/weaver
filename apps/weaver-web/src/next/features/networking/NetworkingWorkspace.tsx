@@ -6,7 +6,14 @@ import type { Egress } from "@/lib/networking";
 import { EmptyState, MetricCell, MetricStrip } from "../../components/chrome";
 import { NumberField, SecondaryButton } from "../../components/controls";
 import { countLabel } from "../../i18n/labels";
-import { FieldRows, SettingsBlocks, usePanelStatus, type FieldSpec } from "../../pages/settings/framework";
+import {
+  FieldRows,
+  SettingsBlocks,
+  usePanelStatus,
+  useSearchReport,
+  useSettingsPanelSlug,
+  type FieldSpec,
+} from "../../pages/settings/framework";
 import {
   egressInput,
   NETWORKING_PAGES,
@@ -48,10 +55,18 @@ export function NetworkingWorkspace({
 }) {
   const t = useTranslate();
   const location = useLocation();
-  const page = location.pathname.split("/networking/")[1] ?? "overview";
+  // Every networking page shares this component. While the settings search
+  // mounts all of them at once, each must draw the page it was mounted for,
+  // not the one the address names.
+  const panelSlug = useSettingsPanelSlug();
+  const page = panelSlug?.startsWith("networking/")
+    ? panelSlug.slice("networking/".length)
+    : (location.pathname.split("/networking/")[1] ?? "overview");
   const workspace = useNetworkingWorkspace(page);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
   const { data, error, fetching, flow, consumers, egresses, measured, action, busy, message, failed } = workspace;
+  // The pages draw their blocks only once the data is here.
+  useSearchReport(0, !data && fetching);
 
   if (!NETWORKING_PAGES.includes(page as NetworkingPage)) {
     return <Navigate to="/settings/networking/overview" replace />;
@@ -199,7 +214,11 @@ function EgressLimits({
           kind: "custom",
           id: "egress-limits",
           title: t("next.networking.limits.title"),
-          searchText: `${t("next.networking.limits.title")} ${egresses.map((egress) => egress.name).join(" ")}`,
+          searchText: [
+            t("next.networking.limits.note"),
+            t("next.networking.egress.limitHelp"),
+            ...fields.map((field) => field.label),
+          ].join(" "),
           body: (
             <>
               <Hint>{t("next.networking.limits.note")}</Hint>
