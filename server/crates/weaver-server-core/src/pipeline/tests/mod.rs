@@ -50,6 +50,7 @@ mod direct_unpack;
 mod download_dispatch;
 mod hardware_profile;
 mod health_probe;
+mod idle;
 mod par2_completion;
 mod par2_multiset_binding;
 mod par2_multiset_gate;

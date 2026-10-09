@@ -60,6 +60,9 @@ impl Pipeline {
             first_sample_at: None,
         };
         self.phase_progress.insert(key, runtime);
+        if phase != JobPhase::Downloading {
+            self.post_download_phases += 1;
+        }
         self.phase_publish_state.remove(&job_id);
         // Stage timing rides the phase lifecycle, which is per job per phase —
         // a handful of events over a job's whole life, never a per-segment
@@ -71,9 +74,11 @@ impl Pipeline {
 
     pub(crate) fn phase_end(&mut self, job_id: JobId, phase: JobPhase) {
         self.note_stage_finished(job_id, stage_kind_for_phase(phase));
-        if self.phase_progress.remove(&(job_id, phase)).is_some()
-            && let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id)
-        {
+        let removed = self.phase_progress.remove(&(job_id, phase)).is_some();
+        if removed && phase != JobPhase::Downloading {
+            self.post_download_phases = self.post_download_phases.saturating_sub(1);
+        }
+        if removed && let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id) {
             phases.retain(|progress| progress.phase != phase);
             if phases.is_empty() {
                 self.phase_progress_snapshots.remove(&job_id);
@@ -184,7 +189,17 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_phase_progress_runtime(&mut self, job_id: JobId) {
-        self.phase_progress.retain(|(jid, _), _| *jid != job_id);
+        let mut removed_post_download = 0;
+        self.phase_progress.retain(|(jid, phase), _| {
+            let keep = *jid != job_id;
+            if !keep && *phase != JobPhase::Downloading {
+                removed_post_download += 1;
+            }
+            keep
+        });
+        self.post_download_phases = self
+            .post_download_phases
+            .saturating_sub(removed_post_download);
         self.phase_progress_snapshots.remove(&job_id);
         self.phase_publish_state.remove(&job_id);
     }
@@ -284,8 +299,13 @@ impl Pipeline {
             phases.sort_by_key(|progress| progress.phase);
         }
 
+        // Nothing to show before or after means the published rows already
+        // carry no phase progress; republishing them would change nothing.
+        let shows_progress = !by_job.is_empty() || !self.phase_progress_snapshots.is_empty();
         self.phase_progress_snapshots = by_job;
-        self.publish_snapshot();
+        if shows_progress {
+            self.publish_snapshot();
+        }
         self.emit_phase_progress_update_events(now);
     }
 

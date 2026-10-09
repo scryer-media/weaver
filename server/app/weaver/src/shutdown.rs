@@ -1,5 +1,6 @@
 use tracing::error;
 
+use weaver_server_core::operations::MetricsHistoryCadence;
 use weaver_server_core::{Database, SchedulerHandle};
 
 pub(crate) async fn wait_for_shutdown() {
@@ -39,20 +40,22 @@ pub(crate) fn spawn_metrics_history_task(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut cadence = MetricsHistoryCadence::default();
 
         loop {
             interval.tick().await;
 
             let metrics = handle.get_metrics();
-            let jobs = handle.list_jobs();
+            let job_counts = handle.job_status_counts();
             let db = db.clone();
             let recorded_at_epoch_sec = epoch_sec_now();
+            let plan = cadence.plan(recorded_at_epoch_sec);
             match tokio::task::spawn_blocking(move || {
-                db.record_metrics_history_sample(recorded_at_epoch_sec, &metrics, &jobs)
+                db.record_metrics_history_point(recorded_at_epoch_sec, &metrics, &job_counts, plan)
             })
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => cadence.commit(recorded_at_epoch_sec, &plan),
                 Ok(Err(error)) => {
                     tracing::warn!(error = %error, "failed to persist metrics history sample");
                 }

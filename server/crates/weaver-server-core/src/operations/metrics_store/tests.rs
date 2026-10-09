@@ -485,7 +485,7 @@ fn prune_metrics_history_discards_expired_points_per_tier() {
         RawMetricsHistoryPoint::from_snapshot(
             now - RAW_METRICS_RETENTION_SECS - RAW_METRICS_RESOLUTION_SECS,
             &sample_snapshot(100, 50, 25, 10, 1, 1.0, 0.5),
-            &[],
+            &JobStatusCounts::default(),
         ),
     );
     upsert_raw_point_for_test(
@@ -493,7 +493,7 @@ fn prune_metrics_history_discards_expired_points_per_tier() {
         RawMetricsHistoryPoint::from_snapshot(
             now,
             &sample_snapshot(200, 100, 50, 20, 1, 1.0, 0.5),
-            &[],
+            &JobStatusCounts::default(),
         ),
     );
     prune_metrics_history_for_test(&db, MetricsHistoryTier::Raw10s, now);
@@ -571,4 +571,84 @@ fn prune_metrics_history_discards_expired_points_per_tier() {
     };
     assert_eq!(hourly_points.len(), 1);
     assert_eq!(hourly_points[0].timestamp_epoch_sec, now);
+}
+
+#[test]
+fn metrics_history_cadence_writes_rollups_and_prunes_only_when_due() {
+    let mut cadence = MetricsHistoryCadence::default();
+    let mut rollup_5m = Vec::new();
+    let mut rollup_1h = Vec::new();
+    let (mut prune_raw, mut prune_5m, mut prune_1h) = (0, 0, 0);
+    // Two hours of samples at the sampler's 10 s period.
+    for ts in (10..=7_200).step_by(10) {
+        let plan = cadence.plan(ts);
+        rollup_5m.extend(plan.rollup_5m_bucket);
+        rollup_1h.extend(plan.rollup_1h_bucket);
+        prune_raw += usize::from(plan.prune_raw);
+        prune_5m += usize::from(plan.prune_5m);
+        prune_1h += usize::from(plan.prune_1h);
+        cadence.commit(ts, &plan);
+    }
+
+    // The first sample closes the bucket before it; after that each bucket
+    // is aggregated exactly once, by the first sample past its end.
+    let expected_5m: Vec<i64> = (0..=6_900).step_by(300).collect();
+    assert_eq!(rollup_5m, expected_5m);
+    assert_eq!(rollup_1h, vec![0, 3_600]);
+    assert_eq!(prune_raw, 24);
+    assert_eq!(prune_5m, 2);
+    assert_eq!(prune_1h, 1);
+}
+
+#[test]
+fn metrics_history_cadence_replans_work_from_a_failed_write() {
+    let mut cadence = MetricsHistoryCadence::default();
+    let first = cadence.plan(290);
+    cadence.commit(290, &first);
+    let closing = cadence.plan(300);
+    assert_eq!(closing.rollup_5m_bucket, None);
+    cadence.commit(300, &closing);
+
+    // The sample that moves past the 5-minute bucket fails to write and is
+    // not committed, so the next sample still carries the bucket.
+    let failed = cadence.plan(310);
+    assert_eq!(failed.rollup_5m_bucket, Some(300));
+    let retried = cadence.plan(320);
+    assert_eq!(retried.rollup_5m_bucket, Some(300));
+}
+
+#[test]
+fn metrics_history_points_written_by_cadence_build_closed_rollups() {
+    let db = Database::open_in_memory().unwrap();
+    let mut cadence = MetricsHistoryCadence::default();
+    let counts = JobStatusCounts::from_jobs(&[job_info(1, JobStatus::Queued)]);
+    for ts in (10..=610).step_by(10) {
+        let plan = cadence.plan(ts);
+        db.record_metrics_history_point(
+            ts,
+            &sample_snapshot(ts as u64 * 10, 0, 0, 100, 1, 1.0, 0.5),
+            &counts,
+            plan,
+        )
+        .unwrap();
+        cadence.commit(ts, &plan);
+    }
+
+    let MetricsHistoryQueryData::Rollup(points) = db
+        .read_metrics_history(MetricsHistoryTier::Rollup5m, 0, 900)
+        .unwrap()
+        .data
+    else {
+        panic!("expected rollup metrics history points");
+    };
+    let ends: Vec<i64> = points
+        .iter()
+        .map(|point| point.timestamp_epoch_sec)
+        .collect();
+    assert_eq!(ends, vec![300, 600]);
+    for point in &points {
+        assert!((point.gauge_values[0].avg - 100.0).abs() < 0.001);
+        assert_eq!(point.gauge_values[0].sample_count, 30);
+        assert!((point.job_status_values[0].avg - 1.0).abs() < 0.001);
+    }
 }

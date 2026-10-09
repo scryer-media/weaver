@@ -212,7 +212,100 @@ pub fn address_flags(name: &str, address: IpAddr) -> (bool, bool) {
     if address.is_ipv4() {
         return (false, false);
     }
-    native_address_flags(name, address).unwrap_or((false, true))
+    NativeFlags::open().flags(name, address)
+}
+
+/// [`address_flags`] for every `(interface, address)` pair, in order, from one
+/// read of the platform's address state: one parse of `/proc/net/if_inet6` on
+/// Linux and one ioctl socket on macOS, instead of one per address.
+pub fn address_flags_many(addresses: &[(&str, IpAddr)]) -> Vec<(bool, bool)> {
+    if addresses.iter().all(|(_, address)| address.is_ipv4()) {
+        return vec![(false, false); addresses.len()];
+    }
+    let native = NativeFlags::open();
+    addresses
+        .iter()
+        .map(|&(name, address)| {
+            if address.is_ipv4() {
+                (false, false)
+            } else {
+                native.flags(name, address)
+            }
+        })
+        .collect()
+}
+
+/// The platform's IPv6 address state, opened once and asked per address.
+/// Unknown flags fail closed as tentative.
+struct NativeFlags {
+    #[cfg(target_os = "linux")]
+    table: Option<std::collections::HashMap<(String, u128), (bool, bool)>>,
+    #[cfg(target_os = "macos")]
+    socket: Option<std::os::fd::OwnedFd>,
+}
+
+impl NativeFlags {
+    fn open() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            table: std::fs::read_to_string("/proc/net/if_inet6")
+                .ok()
+                .map(|text| parse_if_inet6(&text)),
+            #[cfg(target_os = "macos")]
+            socket: macos_flags_socket(),
+        }
+    }
+
+    fn flags(&self, name: &str, address: IpAddr) -> (bool, bool) {
+        self.native(name, address).unwrap_or((false, true))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native(&self, name: &str, address: IpAddr) -> Option<(bool, bool)> {
+        let IpAddr::V6(address) = address else {
+            return Some((false, false));
+        };
+        self.table
+            .as_ref()?
+            .get(&(name.to_owned(), u128::from(address)))
+            .copied()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native(&self, name: &str, address: IpAddr) -> Option<(bool, bool)> {
+        macos_address_flags(self.socket.as_ref()?, name, address)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn native(&self, name: &str, address: IpAddr) -> Option<(bool, bool)> {
+        native_address_flags(name, address)
+    }
+}
+
+/// `/proc/net/if_inet6` rows keyed by interface and address, mapped to
+/// (deprecated, tentative). The first row for a pair wins.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_if_inet6(text: &str) -> std::collections::HashMap<(String, u128), (bool, bool)> {
+    let mut table = std::collections::HashMap::new();
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 6 {
+            continue;
+        }
+        let (Ok(address), Ok(flags)) = (
+            u128::from_str_radix(fields[0], 16),
+            u32::from_str_radix(fields[4], 16),
+        ) else {
+            continue;
+        };
+        if fields[0].len() != 32 {
+            continue;
+        }
+        table
+            .entry((fields[5].to_owned(), address))
+            .or_insert((flags & 0x20 != 0, flags & (0x40 | 0x08) != 0));
+    }
+    table
 }
 
 pub fn usable_address(address: IpAddr) -> bool {
@@ -227,26 +320,25 @@ pub fn usable_address(address: IpAddr) -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn native_address_flags(name: &str, address: IpAddr) -> Option<(bool, bool)> {
-    let IpAddr::V6(address) = address else {
-        return Some((false, false));
-    };
-    let text = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
-    let expected = format!("{:032x}", u128::from(address));
-    text.lines().find_map(|line| {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() != 6 || fields[0] != expected || fields[5] != name {
-            return None;
-        }
-        let flags = u32::from_str_radix(fields[4], 16).ok()?;
-        Some((flags & 0x20 != 0, flags & (0x40 | 0x08) != 0))
-    })
+#[cfg(target_os = "macos")]
+fn macos_flags_socket() -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: socket has no pointer arguments. OwnedFd closes it on every exit.
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is the newly created, uniquely owned descriptor above.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(target_os = "macos")]
-fn native_address_flags(name: &str, address: IpAddr) -> Option<(bool, bool)> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+fn macos_address_flags(
+    fd: &std::os::fd::OwnedFd,
+    name: &str,
+    address: IpAddr,
+) -> Option<(bool, bool)> {
+    use std::os::fd::AsRawFd;
     let IpAddr::V6(address) = address else {
         return Some((false, false));
     };
@@ -282,13 +374,6 @@ fn native_address_flags(name: &str, address: IpAddr) -> Option<(bool, bool)> {
         },
         sin6_scope_id: 0,
     };
-    // SAFETY: socket has no pointer arguments. OwnedFd closes it on every exit.
-    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: fd is the newly created, uniquely owned descriptor above.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     // SIOCGIFAFLAG_IN6 = _IOWR('i',73,struct in6_ifreq), verified against the SDK.
     // SAFETY: request has Darwin's exact size/alignment and initialized storage.
     if unsafe { libc::ioctl(fd.as_raw_fd(), 0xc1206949 as libc::c_ulong, &mut request) } < 0 {
@@ -297,6 +382,69 @@ fn native_address_flags(name: &str, address: IpAddr) -> Option<(bool, bool)> {
     // SAFETY: this ioctl writes the union's flags member on success.
     let flags = unsafe { request.value.flags };
     Some((flags & 0x10 != 0, flags & (0x02 | 0x04 | 0x08) != 0))
+}
+
+#[cfg(test)]
+mod flags_tests {
+    use super::*;
+
+    #[test]
+    fn if_inet6_rows_map_by_interface_and_address() {
+        let text = "\
+00000000000000000000000000000001 01 80 10 80       lo
+20010db8000000000000000000000001 02 40 00 20     eth0
+20010db8000000000000000000000002 02 40 00 40     eth0
+20010db8000000000000000000000002 03 40 00 00     eth1
+fe800000000000000000000000000001 02 40 20 08     eth0
+malformed line
+";
+        let table = parse_if_inet6(text);
+        let flags = |name: &str, address: &str| {
+            let address: std::net::Ipv6Addr = address.parse().unwrap();
+            table.get(&(name.to_owned(), u128::from(address))).copied()
+        };
+        assert_eq!(flags("lo", "::1"), Some((false, false)));
+        assert_eq!(flags("eth0", "2001:db8::1"), Some((true, false)));
+        assert_eq!(flags("eth0", "2001:db8::2"), Some((false, true)));
+        assert_eq!(flags("eth1", "2001:db8::2"), Some((false, false)));
+        assert_eq!(flags("eth0", "fe80::1"), Some((false, true)));
+        assert_eq!(flags("eth1", "2001:db8::1"), None);
+        assert_eq!(table.len(), 5);
+    }
+
+    #[test]
+    fn batch_flags_match_the_one_address_answer_in_order() {
+        let mut pairs: Vec<(String, IpAddr)> = if_addrs::get_if_addrs()
+            .unwrap()
+            .into_iter()
+            .map(|iface| (iface.name.clone(), iface.ip()))
+            .collect();
+        // An address no interface carries fails closed as tentative, and an
+        // IPv4 address has no duplicate-address state at all.
+        pairs.push(("weaver-none0".into(), "2001:db8::7".parse().unwrap()));
+        pairs.push(("weaver-none0".into(), "192.0.2.7".parse().unwrap()));
+        let borrowed: Vec<(&str, IpAddr)> = pairs
+            .iter()
+            .map(|(name, address)| (name.as_str(), *address))
+            .collect();
+        let batch = address_flags_many(&borrowed);
+        let one_by_one: Vec<_> = borrowed
+            .iter()
+            .map(|&(name, address)| address_flags(name, address))
+            .collect();
+        assert_eq!(batch, one_by_one);
+        assert_eq!(batch[batch.len() - 2], (false, true));
+        assert_eq!(batch[batch.len() - 1], (false, false));
+    }
+
+    #[test]
+    fn an_all_ipv4_batch_reads_no_platform_state() {
+        let addresses = [
+            ("eth0", "192.0.2.1".parse().unwrap()),
+            ("eth1", "198.51.100.1".parse().unwrap()),
+        ];
+        assert_eq!(address_flags_many(&addresses), vec![(false, false); 2]);
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

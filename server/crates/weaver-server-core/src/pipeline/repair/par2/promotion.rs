@@ -1338,9 +1338,9 @@ impl Pipeline {
         moved_segments
     }
 
-    /// List all jobs.
-    pub(crate) fn list_jobs(&self) -> Vec<JobInfo> {
-        let mut list = Vec::with_capacity(self.jobs.len() + self.finished_jobs.len());
+    /// List the jobs still in the pipeline, without history.
+    pub(crate) fn list_live_jobs(&self) -> Vec<JobInfo> {
+        let mut list = Vec::with_capacity(self.jobs.len());
         let mut seen = HashSet::with_capacity(self.jobs.len());
         let jobs_fetching_repair_data = self.jobs_fetching_repair_data();
 
@@ -1481,6 +1481,13 @@ impl Pipeline {
             push_state(state);
         }
 
+        list
+    }
+
+    /// List all jobs: the live ones, then history.
+    #[cfg(test)]
+    pub(crate) fn list_jobs(&self) -> Vec<JobInfo> {
+        let mut list = self.list_live_jobs();
         list.extend(self.finished_jobs.iter().cloned());
         list
     }

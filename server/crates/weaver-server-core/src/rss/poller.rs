@@ -11,7 +11,7 @@ use crate::rss::service::{
 use crate::{RssFeedRow, RssRuleAction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RssSyncTarget {
+pub(super) enum RssSyncTarget {
     AllEnabledFeeds,
     Feed(u32),
 }
@@ -86,11 +86,7 @@ impl RssService {
     pub fn start_background_loop(&self) -> tokio::task::JoinHandle<()> {
         let service = self.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(RSS_SYNC_TICK_SECS));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
                 let svc = service.clone();
                 match tokio::spawn(async move { svc.try_run_due_sync().await }).await {
                     Ok(Ok(DueSyncOutcome::Completed(report))) => {
@@ -108,8 +104,30 @@ impl RssService {
                         tracing::error!(error = %panic, "CRITICAL: RSS sync task panicked — loop continues");
                     }
                 }
+                tokio::time::sleep(service.next_due_sync_delay()).await;
             }
         })
+    }
+
+    /// How long the poller sleeps before looking again: until the earliest
+    /// enabled feed falls due, and never longer than one sync tick, so a feed
+    /// added or edited meanwhile is noticed within the tick as before.
+    pub(super) fn next_due_sync_delay(&self) -> std::time::Duration {
+        let tick = std::time::Duration::from_secs(RSS_SYNC_TICK_SECS);
+        let Ok(schedules) = self.inner.db.list_rss_feed_schedules() else {
+            return tick;
+        };
+        let now = unix_now_secs();
+        schedules
+            .iter()
+            .filter(|schedule| schedule.enabled)
+            .map(|schedule| schedule.next_due_at().saturating_sub(now))
+            .min()
+            .map_or(tick, |secs| {
+                // A feed already due is retried on the next second rather
+                // than in a tight loop, should its poll keep failing to land.
+                std::time::Duration::from_secs(secs.max(1) as u64).min(tick)
+            })
     }
 
     pub async fn reload_state(&self) {}
@@ -269,7 +287,7 @@ impl RssService {
         Ok(report)
     }
 
-    fn load_target_feeds(
+    pub(super) fn load_target_feeds(
         &self,
         target: RssSyncTarget,
         due_only: bool,
@@ -285,6 +303,40 @@ impl RssService {
                     return Err(RssServiceError::FeedNotFound(feed_id));
                 };
                 vec![feed]
+            }
+            RssSyncTarget::AllEnabledFeeds if due_only => {
+                // The due check needs four columns; the full rows, with their
+                // decrypted credentials and attached scripts, are read only
+                // for the feeds that are actually due.
+                let now = unix_now_secs();
+                let due: Vec<u32> = self
+                    .inner
+                    .db
+                    .list_rss_feed_schedules()
+                    .map_err(|e| RssServiceError::Http(e.to_string()))?
+                    .into_iter()
+                    .filter(|schedule| schedule.enabled && schedule.is_due(now))
+                    .map(|schedule| schedule.id)
+                    .collect();
+                let mut feeds = Vec::with_capacity(due.len());
+                for feed_id in due {
+                    #[cfg(test)]
+                    self.inner
+                        .full_feed_loads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(feed) = self
+                        .inner
+                        .db
+                        .get_rss_feed(feed_id)
+                        .map_err(|e| RssServiceError::Http(e.to_string()))?
+                        // Re-checked on the full row: it may have been
+                        // edited between the two reads.
+                        .filter(|feed| feed.enabled && is_due(feed, now))
+                    {
+                        feeds.push(feed);
+                    }
+                }
+                return Ok(feeds);
             }
             RssSyncTarget::AllEnabledFeeds => self
                 .inner

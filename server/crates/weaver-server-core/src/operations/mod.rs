@@ -42,7 +42,8 @@ pub use logs::snapshot_service_logs;
 pub use maintenance::spawn_maintenance_worker;
 pub use metrics_store::{
     COUNTER_METRIC_KEYS, CounterRollupValue, GAUGE_METRIC_KEYS, GaugeRollupValue, JOB_STATUS_KEYS,
-    MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier,
+    JobStatusCounts, MetricsHistoryCadence, MetricsHistoryChunkRow, MetricsHistoryQueryData,
+    MetricsHistoryQueryResult, MetricsHistoryTier, MetricsHistoryWritePlan,
     RAW_METRICS_RESOLUTION_SECS, RAW_METRICS_RETENTION_SECS, ROLLUP_1H_RESOLUTION_SECS,
     ROLLUP_1H_RETENTION_SECS, ROLLUP_5M_RESOLUTION_SECS, ROLLUP_5M_RETENTION_SECS,
     RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
