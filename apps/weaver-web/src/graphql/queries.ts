@@ -598,7 +598,7 @@ const RSS_FEED_FIELDS = `
     url
     enabled
     pollIntervalSecs
-    scripts
+    scriptInstanceIds
     username
     hasPassword
     defaultCategory
@@ -1658,6 +1658,13 @@ export const RSS_SETTINGS_QUERY = gql`
     categories {
       ...CategoryFields
     }
+    scriptInstances {
+      id
+      name
+      script
+      trigger
+      enabled
+    }
   }
   ${RSS_RULE_FIELDS}
   ${RSS_FEED_FIELDS}
@@ -1815,9 +1822,8 @@ export const SCHEDULES_QUERY = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
-      script
+      instanceId
       runAtStartup
-      implicit
     }
   }
 `;
@@ -1843,9 +1849,8 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
-      script
+      instanceId
       runAtStartup
-      implicit
     }
   }
 `;
@@ -1871,9 +1876,8 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
-      script
+      instanceId
       runAtStartup
-      implicit
     }
   }
 `;
@@ -1899,9 +1903,8 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
-      script
+      instanceId
       runAtStartup
-      implicit
     }
   }
 `;
@@ -1927,9 +1930,8 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       pruneCancelled { deleteFiles }
       speedLimitBytes
       hardwareProfile
-      script
+      instanceId
       runAtStartup
-      implicit
     }
   }
 `;
@@ -1952,23 +1954,57 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     batchInterpreter
     unacceptableExtensions
     strictSecurityRefusesExecution
-    lists {
-      global {
-        script
-        enabled
-        timeoutSeconds
-        blocking
-      }
-      categories {
-        category
-        entries {
-          script
-          enabled
-          timeoutSeconds
-          blocking
-        }
-      }
+    globalScriptsRun
+  }
+`;
+
+const SCRIPT_INSTANCE_FIELDS = gql`
+  fragment ScriptInstanceFields on ScriptInstance {
+    id
+    name
+    script
+    trigger
+    queueEvent
+    inputs {
+      name
+      value
+      secret
     }
+    categories
+    enabled
+    blocking
+    timeoutSeconds
+    runOrder
+    scriptProblem
+    headerDrift
+  }
+`;
+
+const SCRIPT_TEST_RUN_FIELDS = gql`
+  fragment ScriptTestRunFields on ScriptTestRun {
+    id
+    instanceId
+    instanceName
+    script
+    event
+    kind
+    adapter
+    startedAtEpochMs
+    timeoutSeconds
+    running
+    status
+    exitCode
+    durationMs
+    errorMessage
+    log
+    logTruncated
+    inputs {
+      name
+      value
+    }
+    arguments
+    commands
+    commandsTruncated
   }
 `;
 
@@ -1977,7 +2013,36 @@ export const POST_PROCESSING_SETTINGS_QUERY = gql`
     postProcessingSettings {
       ...PostProcessingSettingsFields
     }
-    scripts {
+  }
+  ${POST_PROCESSING_SETTINGS_FIELDS}
+`;
+
+/** What runs, and the categories an instance can be narrowed to. */
+export const SCRIPT_INSTANCES_QUERY = gql`
+  query ScriptInstances {
+    postProcessingSettings {
+      scriptDirectory
+      globalScriptsRun
+    }
+    scriptInstances {
+      ...ScriptInstanceFields
+    }
+    categories {
+      id
+      name
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+/**
+ * What the scripts directory holds. Asked for on its own: a directory that
+ * cannot be listed fails this query and nothing else, so the instances that
+ * are saved stay on screen.
+ */
+export const DISCOVERED_SCRIPTS_QUERY = gql`
+  query DiscoveredScripts {
+    discoveredScripts {
       scripts {
         name
         displayName
@@ -1995,7 +2060,18 @@ export const POST_PROCESSING_SETTINGS_QUERY = gql`
           select
           required
           defaultValue
-          value
+        }
+        preset {
+          triggers {
+            trigger
+            queueEvent
+          }
+          taskTimes
+          inputs {
+            name
+            value
+            secret
+          }
         }
       }
       problems {
@@ -2003,12 +2079,7 @@ export const POST_PROCESSING_SETTINGS_QUERY = gql`
         message
       }
     }
-    categories {
-      id
-      name
-    }
   }
-  ${POST_PROCESSING_SETTINGS_FIELDS}
 `;
 
 export const SET_POST_PROCESSING_SETTINGS_MUTATION = gql`
@@ -2029,38 +2100,78 @@ export const SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION = gql`
   ${POST_PROCESSING_SETTINGS_FIELDS}
 `;
 
-export const SET_SCRIPT_LISTS_MUTATION = gql`
-  mutation SetScriptLists($input: ScriptListsInput!) {
-    setScriptLists(input: $input) {
-      global {
-        script
-        enabled
-        timeoutSeconds
-        blocking
-      }
-      categories {
-        category
-        entries {
-          script
-          enabled
-          timeoutSeconds
-          blocking
-        }
-      }
+export const CREATE_SCRIPT_INSTANCE_MUTATION = gql`
+  mutation CreateScriptInstance($input: ScriptInstanceInput!) {
+    createScriptInstance(input: $input) {
+      ...ScriptInstanceFields
     }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const UPDATE_SCRIPT_INSTANCE_MUTATION = gql`
+  mutation UpdateScriptInstance($id: String!, $input: ScriptInstanceInput!) {
+    updateScriptInstance(id: $id, input: $input) {
+      ...ScriptInstanceFields
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const DELETE_SCRIPT_INSTANCE_MUTATION = gql`
+  mutation DeleteScriptInstance($id: String!) {
+    deleteScriptInstance(id: $id)
   }
 `;
 
-export const SET_SCRIPT_OPTIONS_MUTATION = gql`
-  mutation SetScriptOptions($script: String!, $options: [ScriptOptionInput!]!) {
-    setScriptOptions(script: $script, options: $options) {
-      name
-      options {
-        name
-        optionType
-        value
-      }
+export const REORDER_SCRIPT_INSTANCES_MUTATION = gql`
+  mutation ReorderScriptInstances($trigger: ScriptKind!, $ids: [String!]!) {
+    reorderScriptInstances(trigger: $trigger, ids: $ids) {
+      ...ScriptInstanceFields
     }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const SET_UP_SCRIPT_FROM_HEADER_MUTATION = gql`
+  mutation SetUpScriptFromHeader($script: String!) {
+    setUpScriptFromHeader(script: $script) {
+      ...ScriptInstanceFields
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const REAPPLY_SCRIPT_HEADER_MUTATION = gql`
+  mutation ReapplyScriptHeader($id: String!) {
+    reapplyScriptHeader(id: $id) {
+      ...ScriptInstanceFields
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const TEST_SCRIPT_INSTANCE_MUTATION = gql`
+  mutation TestScriptInstance($id: String!) {
+    testScriptInstance(id: $id) {
+      ...ScriptTestRunFields
+    }
+  }
+  ${SCRIPT_TEST_RUN_FIELDS}
+`;
+
+export const SCRIPT_TEST_RUN_QUERY = gql`
+  query ScriptTestRun($id: String!) {
+    scriptTestRun(id: $id) {
+      ...ScriptTestRunFields
+    }
+  }
+  ${SCRIPT_TEST_RUN_FIELDS}
+`;
+
+export const CANCEL_SCRIPT_TEST_MUTATION = gql`
+  mutation CancelScriptTest($id: String!) {
+    cancelScriptTest(id: $id)
   }
 `;
 
@@ -2068,6 +2179,8 @@ export const POST_PROCESSING_RESULTS_QUERY = gql`
   query PostProcessingResults($jobId: Int!) {
     postProcessingResults(jobId: $jobId) {
       script
+      instanceId
+      instanceName
       event
       adapter
       status
@@ -2092,6 +2205,8 @@ export const SCRIPT_RUNS_QUERY = gql`
         jobId
         jobName
         script
+        instanceId
+        instanceName
         event
         kind
         background

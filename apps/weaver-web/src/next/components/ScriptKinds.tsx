@@ -1,21 +1,12 @@
 import { useTranslate } from "@/lib/context/translate-context";
+import { SCRIPT_KIND_LABELS, type ScriptKind } from "../data/script-instances";
 import { Tag } from "./chrome";
-
-export type ScriptKind = "POST_PROCESSING" | "QUEUE" | "SCAN" | "SCHEDULER" | "FEED";
 
 export interface ScriptDeclarations {
   kinds: ScriptKind[];
   queueEvents: string[];
   taskTimes: string[];
 }
-
-const LABELS: Record<ScriptKind, string> = {
-  POST_PROCESSING: "next.postProcessing.kindPostProcessing",
-  QUEUE: "next.postProcessing.kindQueue",
-  SCAN: "next.postProcessing.kindScan",
-  SCHEDULER: "next.postProcessing.kindScheduler",
-  FEED: "next.postProcessing.kindFeed",
-};
 
 const DETAIL = "font-wv-mono text-[11px] leading-[1.45] break-words whitespace-normal text-wv-muted";
 
@@ -27,7 +18,7 @@ export function ScriptKinds({ script }: { script: ScriptDeclarations }) {
       {script.kinds.length > 0 ? (
         <div className="flex flex-wrap gap-1.5">
           {script.kinds.map((kind) => (
-            <Tag key={kind}>{t(LABELS[kind])}</Tag>
+            <Tag key={kind}>{t(SCRIPT_KIND_LABELS[kind])}</Tag>
           ))}
         </div>
       ) : null}

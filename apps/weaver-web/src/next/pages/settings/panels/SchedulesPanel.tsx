@@ -11,7 +11,6 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
-import { Tag } from "../../../components/chrome";
 import { PrimaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatRate } from "../../../data/format";
@@ -23,7 +22,7 @@ import {
 } from "../../../data/hardware-profiles";
 import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
 import { scheduleActionFields, scheduleActionHelp, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleTimeLabel, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleInstances, scheduleTimeLabel, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -35,9 +34,9 @@ import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, isOneShot, optionsFr
  */
 
 interface Schedule extends ScheduleOptions {
-  script: string | null;
+  /** The script instance a `run_script` rule runs. */
+  instanceId: string | null;
   runAtStartup: boolean;
-  implicit: boolean;
   id: string;
   enabled: boolean;
   label: string | null;
@@ -51,7 +50,8 @@ interface Schedule extends ScheduleOptions {
 
 interface ScheduleForm {
   options: ScheduleOptionsForm;
-  script: string;
+  /** Empty until an instance is picked. */
+  instanceId: string;
   runAtStartup: boolean;
   enabled: boolean;
   label: string;
@@ -94,7 +94,7 @@ const ACTIONS: { value: string; label: string }[] = [
 
 const NEW_SCHEDULE: ScheduleForm = {
   options: NEW_SCHEDULE_OPTIONS,
-  script: "",
+  instanceId: "",
   runAtStartup: false,
   enabled: true,
   label: "",
@@ -107,7 +107,11 @@ const NEW_SCHEDULE: ScheduleForm = {
 };
 
 function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets): string {
-  if (schedule.actionType === "run_script") return t("next.schedules.runScriptNamed", { script: schedule.script ?? "" });
+  if (schedule.actionType === "run_script") {
+    // A rule names its instance by id; the list shows the name the operator gave it.
+    const instance = scheduleInstances(targets).find((entry) => entry.id === schedule.instanceId);
+    return instance ? t("next.schedules.runScriptNamed", { script: instance.name }) : t("next.schedules.runScript");
+  }
   const details = scheduleActionDetails(t, schedule, targets);
   if (details) return details;
   if (schedule.actionType === "speed_limit") {
@@ -166,14 +170,12 @@ export function SchedulesPanel() {
 
   const open = (schedule: Schedule | null) => {
     setError(null);
-    // A script's own task times are the script's to change, not the panel's.
-    setStatus(schedule?.implicit ? t("next.schedules.manifestReadOnly") : null);
-    if (schedule?.implicit) return;
+    setStatus(null);
     setForm(
       schedule
         ? {
             enabled: schedule.enabled,
-            script: schedule.script ?? "",
+            instanceId: schedule.instanceId ?? "",
             runAtStartup: schedule.runAtStartup,
             label: schedule.label ?? "",
             days: schedule.days,
@@ -212,7 +214,10 @@ export function SchedulesPanel() {
     if (form.actionType === "hardware_profile") {
       input.hardwareProfile = formProfile;
     }
-    if (form.actionType === "run_script") { input.script = form.script; input.runAtStartup = form.runAtStartup; }
+    if (form.actionType === "run_script") {
+      input.instanceId = form.instanceId || null;
+      input.runAtStartup = form.runAtStartup;
+    }
     const result =
       editingId === "new"
         ? await createSchedule({ input })
@@ -253,7 +258,7 @@ export function SchedulesPanel() {
 
   const row = (schedule: Schedule) => ({
     id: schedule.id,
-    searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.implicit ? t("next.schedules.manifest") : ""} ${schedule.label ?? ""}`,
+    searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""}`,
     cells: [
       <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
         {scheduleTimeLabel(schedule)}
@@ -261,11 +266,9 @@ export function SchedulesPanel() {
       <Cell key="days" mono className="text-wv-secondary">
         {daysLabel(t, schedule.days)}
       </Cell>,
-      <div key="action" className="flex min-w-0 items-center gap-[10px]">
-        <Cell title={actionLabel(t, schedule, targets)}>{actionLabel(t, schedule, targets)}</Cell>
-        {/* A rule a script's manifest declares: listed here, changed in the script. */}
-        {schedule.implicit ? <Tag>{t("next.schedules.manifest")}</Tag> : null}
-      </div>,
+      <Cell key="action" title={actionLabel(t, schedule, targets)}>
+        {actionLabel(t, schedule, targets)}
+      </Cell>,
       <Cell key="label" className="text-wv-muted">
         {schedule.label || "—"}
       </Cell>,
@@ -273,7 +276,6 @@ export function SchedulesPanel() {
         <Toggle
           size="table"
           checked={schedule.enabled}
-          disabled={schedule.implicit}
           label={t("next.schedules.enabledAria", { time: schedule.time })}
           onChange={(next) => void toggle(schedule, next)}
         />
@@ -321,6 +323,21 @@ export function SchedulesPanel() {
     value: form.options,
     onChange: (options: ScheduleOptionsForm) => setForm((current) => ({ ...current, options })),
   };
+  // A rule runs one schedule instance, picked by the name it was given.
+  const runnable = scheduleInstances(targets);
+  const instanceOptions = [
+    ...(form.instanceId === ""
+      ? [{ value: "", label: t(runnable.length > 0 ? "next.schedules.chooseInstance" : "next.schedules.noInstances") }]
+      : []),
+    ...runnable.map((instance) => ({
+      value: instance.id,
+      label: instance.name === instance.script ? instance.name : `${instance.name} · ${instance.script}`,
+    })),
+    // A rule can outlive its instance; say so rather than show a bare id.
+    ...(form.instanceId !== "" && !runnable.some((instance) => instance.id === form.instanceId)
+      ? [{ value: form.instanceId, label: t("next.schedules.instanceGone") }]
+      : []),
+  ];
   // The editor says how long a rule lasts in the words its group uses in the list.
   const runsOnce = form.actionType === "run_script" || isOneShot(form.actionType);
 
@@ -419,8 +436,9 @@ export function SchedulesPanel() {
                 },
               },
               ...(form.actionType === "run_script" ? [
-                { id: "script", label: t("next.schedules.script"), help: t("next.schedules.scriptHelp"), control: {
-                  kind: "text" as const, value: form.script, onChange: (script: string) => setForm((current) => ({ ...current, script })),
+                { id: "instanceId", label: t("next.schedules.instance"), help: t("next.schedules.instanceHelp"), control: {
+                  kind: "select" as const, value: form.instanceId, options: instanceOptions,
+                  onChange: (instanceId: string) => setForm((current) => ({ ...current, instanceId })),
                 } },
                 { id: "runAtStartup", label: t("next.schedules.runAtStartup"), help: t("next.schedules.runAtStartupHelp"), control: {
                   kind: "toggle" as const, value: form.runAtStartup, onChange: (runAtStartup: boolean) => setForm((current) => ({ ...current, runAtStartup })),

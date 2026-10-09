@@ -30,6 +30,13 @@ export interface ScheduleOptionsForm extends Omit<ScheduleOptions, "times"> {
 export interface ScheduleTargets {
   servers: { id: number; host: string }[];
   rssFeeds: { id: number; name: string }[];
+  /** Every script instance; a rule can only run one whose trigger is the schedule. */
+  scriptInstances?: { id: string; name: string; script: string; trigger: string }[];
+}
+
+/** The script instances a schedule rule can run. */
+export function scheduleInstances(targets: ScheduleTargets | undefined) {
+  return (targets?.scriptInstances ?? []).filter((instance) => instance.trigger === "SCHEDULER");
 }
 
 export function scheduleActionDetails(

@@ -180,19 +180,86 @@ test("the schedules are one list with one Add, headed only by the groups that ho
   } finally { await page.close(); }
 });
 
-test("a rule a script declares is listed read-only among the one-shot actions", async () => {
-  const page = await open("?schedules&manifest");
+// The rules as the fixture's daemon holds them.
+const storedSchedules = (page) => page.evaluate(() => fetch("/graphql", {
+  method: "POST", body: JSON.stringify({ operationName: "Schedules", variables: {} }),
+}).then((response) => response.json()).then((payload) => payload.data.schedules));
+const oneShotRow = (page, label) => page.getByRole("region", { name: "One-shot actions", exact: true })
+  .getByRole("button").filter({ has: page.getByText(label, { exact: true }) });
+
+test("a rule that runs a script names a schedule instance, and is listed by that instance's name", async () => {
+  const page = await open("?schedules");
   try {
+    await addSchedule(page).click();
+    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    await form.getByLabel("Label", { exact: true }).fill("fixture script");
+    assert.equal(await form.getByRole("button", { name: "Script instance", exact: true }).count(), 0);
+    await choose(page, form, "Action", "Run script");
+    const instance = form.getByRole("button", { name: "Script instance", exact: true });
+    await instance.getByText("Choose an instance", { exact: true }).waitFor();
+    await form.getByText("A rule can only run an instance whose trigger is Schedule.", { exact: true }).waitFor();
+    // A rule with no instance to run is refused, and the editor stays open to say so.
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await form.getByText("a run_script schedule needs a script instance", { exact: true }).waitFor();
+    assert.deepEqual(await storedSchedules(page), []);
+    // Only the instances a schedule starts are offered, each by its name with its script beside it.
+    await instance.click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Choose an instance", "Nightly report · nightly.py", "sweep.sh"]);
+    await page.getByRole("menuitemradio", { name: "Nightly report · nightly.py", exact: true }).click();
+    await instance.getByText("Nightly report · nightly.py", { exact: true }).waitFor();
+    // A script rule's time takes the script evaluator's own notation.
+    await form.getByText("Local time. HH:MM, or *:MM for every hour; separate several with commas.", { exact: true }).waitFor();
+    await form.getByLabel("Time", { exact: true }).fill("*:20");
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await form.waitFor({ state: "hidden" });
+
     const list = page.getByRole("region", { name: "Schedules", exact: true });
-    await list.getByText("local time · holds until the next rule in the group", { exact: true }).waitFor();
-    const oneShot = list.getByRole("region", { name: "One-shot actions", exact: true });
-    await oneShot.getByText("local time · runs once each time", { exact: true }).waitFor();
-    const declared = oneShot.getByRole("button").filter({ has: page.getByText("Run nightly.py", { exact: true }) });
-    await declared.getByText("Manifest", { exact: true }).waitFor();
-    assert.equal(await declared.getByRole("switch").isDisabled(), true);
-    await declared.click();
-    await page.getByRole("contentinfo").getByText("A script declares this rule itself, so it is read-only here.", { exact: true }).waitFor();
-    assert.equal(await page.getByRole("dialog").count(), 0);
+    await list.getByRole("region", { name: "One-shot actions", exact: true }).getByText("local time · runs once each time", { exact: true }).waitFor();
+    const row = oneShotRow(page, "fixture script");
+    for (const text of ["*:20", "Run Nightly report"]) await row.getByText(text, { exact: true }).waitFor();
+    // Every rule is the operator's own: none is read-only.
+    assert.equal(await row.getByRole("switch").isDisabled(), false);
+    const [rule] = await storedSchedules(page);
+    assert.deepEqual(
+      [rule.actionType, rule.instanceId, rule.runAtStartup, rule.time, rule.times, rule.everyHourAtMinute],
+      ["run_script", "1", false, "*:20", [], null],
+    );
+    assert.equal("script" in rule, false);
+
+    // Reopened, the rule shows the instance it runs, and a chosen instance cannot be unchosen.
+    await row.getByText("fixture script", { exact: true }).click();
+    const edit = page.getByRole("dialog", { name: "fixture script", exact: true });
+    await edit.getByRole("button", { name: "Script instance", exact: true }).getByText("Nightly report · nightly.py", { exact: true }).waitFor();
+    await edit.getByRole("button", { name: "Script instance", exact: true }).click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Nightly report · nightly.py", "sweep.sh"]);
+    await page.getByRole("menuitemradio", { name: "sweep.sh", exact: true }).click();
+    await toggle(edit, "Also run at startup").click();
+    await edit.getByRole("button", { name: "Save", exact: true }).click();
+    await edit.waitFor({ state: "hidden" });
+    await row.getByText("Run sweep.sh", { exact: true }).waitFor();
+    const [updated] = await storedSchedules(page);
+    assert.deepEqual([updated.instanceId, updated.runAtStartup], ["2", true]);
+  } finally { await page.close(); }
+});
+
+test("a rule whose instance no longer runs on a schedule says so, and can be pointed at one that does", async () => {
+  const page = await open("?schedules&stranded");
+  try {
+    const row = oneShotRow(page, "fixture stranded");
+    // The instance is still there, but nothing about it is a schedule's any more.
+    await row.getByText("Run script", { exact: true }).waitFor();
+    assert.equal(await row.getByRole("switch").isDisabled(), false);
+    await row.getByText("fixture stranded", { exact: true }).click();
+    const edit = page.getByRole("dialog", { name: "fixture stranded", exact: true });
+    const instance = edit.getByRole("button", { name: "Script instance", exact: true });
+    await instance.getByText("No longer a schedule instance", { exact: true }).waitFor();
+    await instance.click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Nightly report · nightly.py", "sweep.sh", "No longer a schedule instance"]);
+    await page.getByRole("menuitemradio", { name: "Nightly report · nightly.py", exact: true }).click();
+    await edit.getByRole("button", { name: "Save", exact: true }).click();
+    await edit.waitFor({ state: "hidden" });
+    await row.getByText("Run Nightly report", { exact: true }).waitFor();
+    assert.equal((await storedSchedules(page))[0].instanceId, "1");
   } finally { await page.close(); }
 });
 
