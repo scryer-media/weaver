@@ -11,20 +11,21 @@ Everything below is new since 0.14.7. This is a pre-release.
   is unknown or down takes no traffic. Each egress can cap the traffic that
   leaves through it. The Networking screen shows the live flow from every
   consumer through its legs to the network.
-- Scripts are wired as instances. A script instance is one script on one
-  trigger (post-processing, a queue event, scan, schedule or feed) with its
-  own inputs, categories, blocking flag and time limit. The script header is
-  a preset that fills the form; after that the instance is the truth. One
-  Scripts table lists every instance, grouped by trigger, with a Test dialog.
-  A running script can call back into weaver with a run-scoped token.
+- Scripts are wired as jobs. A script job is one script on one trigger
+  (post-processing, a queue event, scan, schedule or feed) with its own
+  inputs, categories, blocking flag and time limit. The script header is a
+  preset that fills the form; after that the job is the truth. One Scripts
+  table lists every job, grouped by trigger, with a Test dialog. A running
+  script can call back into weaver with a run-scoped token. The Runs table
+  opens each run in place and shows its full output in the log viewer.
 - Secrets are their own records. A token or password is typed once under a
   name on the new Secrets screen, kept encrypted, and linked from any script
-  instance input that needs it; the same secret can serve many instances,
-  and a secret stays linked when the instance is pointed at another script.
-  A secret's value is never read back out. Deleting one is refused while an
-  instance links it.
-- Schedules can run a script instance, set a speed limit, prune history or
-  turn a server on or off, from one Schedules table.
+  job input that needs it; the same secret can serve many jobs, and a
+  secret stays linked when the job is pointed at another script. A secret's
+  value is never read back out. Deleting one is refused while a job links
+  it.
+- Schedules can run a script job, set a speed limit, prune history or turn
+  a server on or off, from one Schedules table.
 - The legacy web UI is gone. The Next UI is the only interface.
 
 ## Kill switch
@@ -70,7 +71,7 @@ enforced never-direct setting is planned for a later release.
   `ScriptOption.value` and `Schedule.script` are gone. Script wiring is the
   `scriptInstances` query and the `createScriptInstance`,
   `updateScriptInstance`, `deleteScriptInstance` and `testScriptInstance`
-  mutations. Schedules that ran a script now name an instance.
+  mutations. Schedules that ran a script now name a script job.
 - Implicit schedules derived from a script's `### TASK TIME:` header are
   gone. "Set up from header" creates real schedule rows instead.
 - The NZBGet `<Script>:=no` per-download opt-out is not supported.
@@ -79,9 +80,9 @@ enforced never-direct setting is planned for a later release.
 
 - The database moves from schema 50 to 55 in one step. Scripts, their
   options, category lists, feed scripts and script schedules are carried
-  over as instances automatically. Each secret option a script had saved
-  becomes one named secret, "<script> <option>", linked by every instance of
-  that script. The upgrade stops with a message if the
+  over as script jobs automatically. Each secret option a script had saved
+  becomes one named secret, "<script> <option>", linked by every job of that
+  script. The upgrade stops with a message if the
   saved scripts directory exists but cannot be read; make it readable and
   start again. A script named in a list but missing from the directory is
   carried over turned off, with a warning in the log.
