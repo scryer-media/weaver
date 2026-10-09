@@ -349,7 +349,7 @@ metric_families! {
 
     // ---- post-processing --------------------------------------------------------
     PP_QUEUE_DEPTH = ("weaver_post_processing_queue_depth", Gauge, [],
-        "Jobs waiting for a post-processing slot.");
+        "Jobs waiting for a turn to run a post-processing script.");
     PP_ACTIVE_ATTEMPTS = ("weaver_post_processing_active_attempts", Gauge, [],
         "Post-processing scripts currently running.");
     PP_ATTEMPT_DURATION = ("weaver_post_processing_attempt_duration_seconds", Summary, [],

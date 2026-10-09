@@ -1029,7 +1029,7 @@ export const nextIt: LocaleDictionary = {
   "next.postProcessing.runScripts": "Esegui script",
   "next.postProcessing.runScriptsHelp": "Se disattivato, weaver rileva gli script ma non ne esegue nessuno.",
   "next.postProcessing.concurrency": "Script simultanei",
-  "next.postProcessing.concurrencyHelp": "Quanti download possono essere in post-elaborazione contemporaneamente.",
+  "next.postProcessing.concurrencyHelp": "Quanti script bloccanti possono essere in esecuzione contemporaneamente, tra tutti i download. Gli script di uno stesso download vengono comunque eseguiti uno dopo l'altro. Si applica dopo un riavvio.",
   "next.postProcessing.grace": "Tempo di chiusura",
   "next.postProcessing.graceHelp": "Quanto tempo ha uno script per uscire dopo che gli è stato chiesto di fermarsi.",
   "next.postProcessing.extensions": "Estensioni non accettate",

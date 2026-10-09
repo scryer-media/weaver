@@ -1,9 +1,10 @@
 //! Bounded, sequential execution of a job's post-processing instances.
 //!
-//! This is the whole scheduler: a semaphore sized by the concurrency setting
-//! admits jobs, and each admitted job runs its scripts one after another. The
-//! semaphore's FIFO is the queue, exactly as SABnzbd's post-processing worker
-//! and NZBGet's post thread are.
+//! This is the whole scheduler: a job runs its scripts one after another, and
+//! each script it waits for takes a turn from a semaphore sized by the
+//! concurrency setting. The semaphore's FIFO is the queue, so the setting is
+//! how many such scripts run at once across every job, and a job between two
+//! of its scripts holds no turn another job could use.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -192,8 +193,9 @@ impl Drop for CancellationRegistration {
 }
 
 impl PostProcessingExecutor {
-    /// `concurrency` sizes the admission semaphore for the process lifetime; a
-    /// changed setting takes effect on the next restart, as it did before.
+    /// `concurrency` is how many scripts that a job waits for may run at once.
+    /// It sizes the semaphore for the process lifetime; a changed setting takes
+    /// effect on the next restart, as it did before.
     pub fn new(db: Database, scripts_directory: PathBuf, concurrency: usize) -> Self {
         let (paused, _) = watch::channel(false);
         Self {
@@ -296,7 +298,8 @@ impl PostProcessingExecutor {
         Ok(self.db.post_processing_settings()?.execution_enabled)
     }
 
-    /// Run `scripts` for one job, sequentially, under the concurrency semaphore.
+    /// Run `scripts` for one job, sequentially, each on its own turn from the
+    /// concurrency semaphore.
     pub async fn execute_job(
         &self,
         job_id: u64,
@@ -394,36 +397,34 @@ impl PostProcessingExecutor {
             forwarder,
         };
 
-        let _queued = GaugeGuard::enter(&counters::QUEUE_DEPTH);
-        let mut pause_rx = self.paused.subscribe();
-        while *pause_rx.borrow() {
-            tokio::select! {
-                changed = pause_rx.changed() => {
-                    changed.map_err(|_| PostProcessingExecutorError::Shutdown)?;
-                }
-                _ = cancel_rx.changed() => {
-                    return Ok(JobPostProcessingReport {
-                        summary: PostProcessingSummary::Cancelled,
-                        results: vec![],
-                    });
+        {
+            let _queued = GaugeGuard::enter(&counters::QUEUE_DEPTH);
+            let mut pause_rx = self.paused.subscribe();
+            while *pause_rx.borrow() {
+                tokio::select! {
+                    changed = pause_rx.changed() => {
+                        changed.map_err(|_| PostProcessingExecutorError::Shutdown)?;
+                    }
+                    _ = cancel_rx.changed() => {
+                        return Ok(JobPostProcessingReport {
+                            summary: PostProcessingSummary::Cancelled,
+                            results: vec![],
+                        });
+                    }
                 }
             }
         }
-        // A list with nothing to wait for takes no place among the jobs that
-        // are post-processing: it only starts its scripts and moves on.
-        let _permit: Option<OwnedSemaphorePermit> = if entries.iter().any(|entry| entry.blocking) {
-            tokio::select! {
-                biased;
-                permit = self.concurrency.clone().acquire_owned() => {
-                    Some(permit.map_err(|_| PostProcessingExecutorError::Shutdown)?)
-                }
-                _ = cancel_rx.changed() => {
-                    return Ok(JobPostProcessingReport {
-                        summary: PostProcessingSummary::Cancelled,
-                        results: vec![],
-                    });
-                }
-            }
+        // The job counts as started once its first waited-for script has a
+        // turn. A list with nothing to wait for takes no turn at all: it only
+        // starts its scripts and moves on.
+        let mut first_turn = if entries.iter().any(|entry| entry.blocking) {
+            let Some(turn) = self.script_turn(&mut cancel_rx).await? else {
+                return Ok(JobPostProcessingReport {
+                    summary: PostProcessingSummary::Cancelled,
+                    results: vec![],
+                });
+            };
+            Some(turn)
         } else {
             None
         };
@@ -433,7 +434,6 @@ impl PostProcessingExecutor {
                 results: vec![],
             });
         }
-        drop(_queued);
         // Durable marker before the first script: if weaver dies now, the
         // startup scan finds the job and reports it as interrupted.
         self.db.mark_job_post_processing_running(job_id)?;
@@ -472,7 +472,23 @@ impl PostProcessingExecutor {
                 );
                 continue;
             }
+            // The turn is the script's, not the job's: it is given back when
+            // the script ends, and the next one waits for its own.
+            let turn = match first_turn.take() {
+                Some(turn) => turn,
+                None => match self.script_turn(&mut cancel_rx).await? {
+                    Some(turn) => turn,
+                    None => {
+                        summary = merge_post_processing_summary(
+                            summary,
+                            PostProcessingSummary::Cancelled,
+                        );
+                        break;
+                    }
+                },
+            };
             let result = {
+                let _turn = turn;
                 let _active = GaugeGuard::enter(&counters::ACTIVE);
                 match self
                     .attempt(
@@ -524,6 +540,22 @@ impl PostProcessingExecutor {
             "post-processing for job finished"
         );
         Ok(JobPostProcessingReport { summary, results })
+    }
+
+    /// A turn among the scripts jobs wait for, or `None` when the job was
+    /// cancelled while it waited for one.
+    async fn script_turn(
+        &self,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<Option<OwnedSemaphorePermit>, PostProcessingExecutorError> {
+        let _queued = GaugeGuard::enter(&counters::QUEUE_DEPTH);
+        tokio::select! {
+            biased;
+            permit = self.concurrency.clone().acquire_owned() => {
+                Ok(Some(permit.map_err(|_| PostProcessingExecutorError::Shutdown)?))
+            }
+            _ = cancel_rx.changed() => Ok(None),
+        }
     }
 
     /// Start an entry nothing waits for. It runs against the job as it stands

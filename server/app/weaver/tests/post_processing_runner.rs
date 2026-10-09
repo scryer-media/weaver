@@ -997,8 +997,8 @@ async fn a_pass_with_nothing_to_wait_for_does_not_queue_behind_another_job() {
     finished_job(&db, 112, &working_directory);
     let release = gate(&working_directory, "release");
 
-    // One job at a time is post-processed here, and this one stays in that
-    // place until it is released.
+    // One script at a time runs here, and this one keeps that turn until it
+    // is released.
     let holder = write_script(
         data.path(),
         "holder.sh",
@@ -1061,6 +1061,78 @@ async fn a_pass_with_nothing_to_wait_for_does_not_queue_behind_another_job() {
     open_gate(release).await;
     let held = holding.await.unwrap().unwrap();
     assert_eq!(held.summary, PostProcessingSummary::Succeeded);
+}
+
+#[tokio::test]
+async fn a_turn_belongs_to_one_script_and_not_to_the_whole_job() {
+    let data = tempfile::tempdir().unwrap();
+    let working_directory = data.path().join("work");
+    fs::create_dir_all(&working_directory).unwrap();
+    let db = Database::open_in_memory().unwrap();
+    enable_execution(&db);
+    let first_release = gate(&working_directory, "first");
+    let second_release = gate(&working_directory, "second");
+
+    let first = write_script(
+        data.path(),
+        "first.sh",
+        "#!/bin/sh\nread line < \"$SAB_COMPLETE_DIR/first\"\n",
+    );
+    let second = write_script(
+        data.path(),
+        "second.sh",
+        "#!/bin/sh\nread line < \"$SAB_COMPLETE_DIR/second\"\n",
+    );
+    let other = write_script(data.path(), "other.sh", "#!/bin/sh\nprintf 'other\\n'\n");
+
+    // One script at a time runs here, and the first job's first script has
+    // that turn until it is released.
+    let executor = executor(&db, data.path());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let two_scripts = {
+        let executor = executor.clone();
+        let list = vec![instance(&db, &first), instance(&db, &second)];
+        let context = context(114, working_directory.clone());
+        tokio::spawn(async move {
+            executor
+                .execute_job(114, list, context, None, Some(started_tx))
+                .await
+        })
+    };
+    started_rx.await.unwrap();
+
+    // The other job asks for a turn while the first job holds the only one, so
+    // it is next in line when that turn is given back.
+    let one_script = executor.execute_job(
+        115,
+        vec![instance(&db, &other)],
+        context(115, working_directory.clone()),
+        None,
+        None,
+    );
+    tokio::pin!(one_script);
+    let in_line = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(one_script.as_mut(), cx).is_pending())
+    })
+    .await;
+    assert!(in_line, "the other job waits while the only turn is taken");
+
+    // The first job's second script is never released before the other job
+    // ends, so the other job can only end on the turn the first script gave up.
+    open_gate(first_release).await;
+    let report = one_script.await.unwrap();
+    assert_eq!(report.summary, PostProcessingSummary::Succeeded);
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].output_tail, "other\n");
+    assert!(
+        !two_scripts.is_finished(),
+        "the first job still has a script to run"
+    );
+
+    open_gate(second_release).await;
+    let report = two_scripts.await.unwrap().unwrap();
+    assert_eq!(report.summary, PostProcessingSummary::Succeeded);
+    assert_eq!(report.results.len(), 2);
 }
 
 #[tokio::test]

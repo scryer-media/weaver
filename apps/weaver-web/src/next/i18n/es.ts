@@ -1029,7 +1029,7 @@ export const nextEs: LocaleDictionary = {
   "next.postProcessing.runScripts": "Ejecutar scripts",
   "next.postProcessing.runScriptsHelp": "Si está desactivado, weaver detecta los scripts pero nunca ejecuta ninguno.",
   "next.postProcessing.concurrency": "Scripts simultáneos",
-  "next.postProcessing.concurrencyHelp": "Cuántas descargas pueden estar en posprocesado a la vez.",
+  "next.postProcessing.concurrencyHelp": "Cuántos scripts bloqueantes pueden ejecutarse a la vez, entre todas las descargas. Los scripts de una misma descarga siguen ejecutándose uno tras otro. Se aplica tras reiniciar.",
   "next.postProcessing.grace": "Margen de finalización",
   "next.postProcessing.graceHelp": "Cuánto tiempo tiene un script para salir después de que se le pida detenerse.",
   "next.postProcessing.extensions": "Extensiones no aceptadas",
