@@ -905,7 +905,10 @@ async fn an_input_may_be_a_secret_of_the_instances_own_and_is_never_read_back() 
             refused.errors[0].message
         );
     }
-    assert_eq!(ids(&instances(&harness).await), [instance_id.clone()]);
+    assert_eq!(
+        ids(&instances(&harness).await),
+        std::slice::from_ref(&instance_id)
+    );
 
     let update = |inputs: String| {
         let harness = &harness;
