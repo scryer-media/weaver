@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
   DELETE_PROXY_MUTATION,
@@ -9,6 +9,7 @@ import {
 } from "@/graphql/proxies";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
+import { cn } from "@/lib/utils";
 import {
   WIREGUARD_KEY,
   parseWireguardConfig,
@@ -367,8 +368,10 @@ export function ProxyEditor({
   const [, resetTrust] = useMutation(RESET_PROXY_TRUST_MUTATION);
 
   const [form, setForm] = useState<ProxyForm>(() => (editing ? formFor(editing) : NEW_PROXY));
-  // A stored profile opens on its details; a new one waits to be told where they come from.
-  const [start, setStart] = useState<WireguardStart | null>(editing ? "manual" : null);
+  // A stored profile opens on its details; a new one on the file most people have them in.
+  const [start, setStart] = useState<WireguardStart>(editing ? "manual" : "upload");
+  const [dragging, setDragging] = useState(false);
+  const fileNameId = useId();
   const [configText, setConfigText] = useState("");
   const [fileName, setFileName] = useState<string | null>(null);
   const [fileProblems, setFileProblems] = useState<string[]>([]);
@@ -803,7 +806,7 @@ export function ProxyEditor({
     <div className="flex flex-none flex-col gap-3 border-b border-wv-hairline px-4 py-4 sm:px-6">
       <Segmented
         label={t("next.proxies.wgStart")}
-        value={start ?? ""}
+        value={start}
         className="w-full [&>button]:flex-1 [&>button]:justify-center"
         options={[
           { value: "upload", label: t("next.proxies.wgUpload") },
@@ -815,29 +818,54 @@ export function ProxyEditor({
       {start === "upload" ? (
         <>
           <div className="text-[12.5px] leading-[1.5] text-wv-muted">{t("next.proxies.wgUploadNote")}</div>
-          <div className="flex min-w-0 flex-wrap items-center gap-3">
-            <input
-              ref={fileRef}
-              type="file"
-              accept=".conf,.txt,text/plain"
-              aria-label={t("next.proxies.configLabel")}
-              className="hidden"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                // Cleared so the same file, corrected, can be chosen again.
-                event.target.value = "";
-                if (file) {
-                  void readFile(file);
-                }
-              }}
-            />
-            <SecondaryButton icon="chooseFile" onClick={() => fileRef.current?.click()}>
-              {t("next.proxies.wgChooseFile")}
-            </SecondaryButton>
-            {fileName === null ? null : (
-              <span className="min-w-0 truncate font-wv-mono text-[11.5px] text-wv-muted">{fileName}</span>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".conf,.txt,text/plain"
+            aria-label={t("next.proxies.configLabel")}
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              // Cleared so the same file, corrected, can be chosen again.
+              event.target.value = "";
+              if (file) {
+                void readFile(file);
+              }
+            }}
+          />
+          <button
+            type="button"
+            // The file last read is described, not named, so the target keeps one name.
+            aria-label={t("next.proxies.wgDropZone")}
+            aria-describedby={fileName === null ? undefined : fileNameId}
+            onClick={() => fileRef.current?.click()}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(event) => {
+              event.preventDefault();
+              setDragging(false);
+              const file = event.dataTransfer.files[0];
+              if (file) {
+                void readFile(file);
+              }
+            }}
+            className={cn(
+              "flex h-[104px] flex-none cursor-pointer flex-col items-center justify-center gap-2 border border-dashed px-4 text-[13px]",
+              dragging
+                ? "border-wv-accent bg-wv-selected text-wv-strong"
+                : "border-wv-control bg-wv-input text-wv-muted hover:border-wv-control-hover-strong",
             )}
-          </div>
+          >
+            <span className="font-medium text-wv-fg">{t("next.proxies.wgDropZone")}</span>
+            {fileName === null ? null : (
+              <span id={fileNameId} className="max-w-full truncate font-wv-mono text-[11px] text-wv-faint">
+                {fileName}
+              </span>
+            )}
+          </button>
           {problemList(fileProblems)}
         </>
       ) : null}

@@ -30,6 +30,18 @@ const daemon = (page) => page.evaluate(() => window.proxiesFixture);
 const action = (scope, name) => scope.getByRole("button", { name, exact: true });
 const field = (scope, name) => scope.getByLabel(name, { exact: true });
 const option = (scope, name) => scope.getByRole("radio", { name, exact: true });
+const dropZone = (scope) => action(scope, "Drop a WireGuard configuration file here, or click to choose");
+const file = (name, text) => ({ name, mimeType: "text/plain", buffer: Buffer.from(text) });
+/** Drags a file of this name and text over `zone`, and lets go of it there. */
+async function drop(page, zone, name, text) {
+  const dragged = await page.evaluateHandle(([fileName, content]) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([content], fileName, { type: "text/plain" }));
+    return transfer;
+  }, [name, text]);
+  await zone.dispatchEvent("dragover", { dataTransfer: dragged });
+  await zone.dispatchEvent("drop", { dataTransfer: dragged });
+}
 /** Waits for the faults listed to be exactly these: the last of them is the one no earlier reading had. */
 async function faults(scope, expected) {
   const list = scope.getByRole("alert").getByRole("listitem");
@@ -94,7 +106,7 @@ async function filled(editor) {
   assert.equal(await field(editor, "Keepalive").inputValue(), "0");
 }
 
-test("a new WireGuard proxy starts with three ways in, and entering the details by hand opens an empty form", async () => {
+test("a new WireGuard proxy has three ways in and opens on the file, and entering the details by hand opens an empty form", async () => {
   const page = await open();
   try {
     const editor = await adding(page);
@@ -102,8 +114,9 @@ test("a new WireGuard proxy starts with three ways in, and entering the details 
     assert.deepEqual(await start.getByRole("radio").allTextContents(), [
       "Upload a file", "Paste raw config", "Enter details manually",
     ]);
-    // None is chosen yet, so there are no details to fill in and nothing to save.
-    assert.equal(await start.locator("[aria-checked='true']").count(), 0);
+    // It opens waiting for a file, so there are no details to fill in yet and nothing to save.
+    assert.deepEqual(await start.locator("[aria-checked='true']").allTextContents(), ["Upload a file"]);
+    await dropZone(editor).waitFor();
     for (const name of DETAILS) assert.equal(await field(editor, name).count(), 0, name);
     assert.equal(await editor.getByRole("textbox", { name: "WireGuard configuration", exact: true }).count(), 0);
     assert.equal(await action(editor, "Save").isDisabled(), true);
@@ -121,6 +134,7 @@ test("a new WireGuard proxy starts with three ways in, and entering the details 
     // Another way in shuts the details again without losing them.
     await field(editor, "Endpoint").fill("typed.fixture.invalid");
     await option(editor, "Paste raw config").click();
+    assert.equal(await dropZone(editor).count(), 0);
     assert.equal(await field(editor, "Endpoint").count(), 0);
     assert.equal(await action(editor, "Save").isDisabled(), true);
     await option(editor, "Enter details manually").click();
@@ -177,21 +191,20 @@ test("a pasted configuration is checked as it is typed, and Parse fills the form
   } finally { await page.close(); }
 });
 
-test("an uploaded configuration file is read, its faults are listed, and a sound one fills the form", async () => {
+test("a configuration file dropped on the target or chosen through it is read, its faults are listed, and a sound one fills the form", async () => {
   const page = await open();
   try {
     const editor = await adding(page);
-    await option(editor, "Upload a file").click();
-    await action(editor, "Choose file").waitFor();
+    const zone = dropZone(editor);
+    await zone.waitFor();
     const input = editor.locator("input[type='file']");
-    const file = (name, text) => ({ name, mimeType: "text/plain", buffer: Buffer.from(text) });
 
     await input.setInputFiles(file("notes.conf", "the quick brown fox"));
     await editor.getByText("notes.conf", { exact: true }).waitFor();
     await faults(editor, ["That does not look like a WireGuard configuration."]);
     assert.equal(await field(editor, "Endpoint").count(), 0);
 
-    await input.setInputFiles(file("broken.conf", CONFIG.replace(KEY("b"), "short").replace("Address", "#Address")));
+    await drop(page, zone, "broken.conf", CONFIG.replace(KEY("b"), "short").replace("Address", "#Address"));
     await editor.getByText("broken.conf", { exact: true }).waitFor();
     await faults(editor, [
       "Address is missing from [Interface].",
@@ -204,7 +217,7 @@ test("an uploaded configuration file is read, its faults are listed, and a sound
     await editor.getByText("too-large.conf", { exact: true }).waitFor();
     await faults(editor, ["That configuration is larger than 64 KiB."]);
 
-    await input.setInputFiles(file("wg0.conf", CONFIG));
+    await drop(page, zone, "wg0.conf", CONFIG);
     await filled(editor);
     assert.equal(await editor.getByRole("alert").count(), 0);
     await field(editor, "Name").fill("Uploaded");
@@ -224,9 +237,9 @@ test("a stored WireGuard proxy opens on its details, and a configuration can sti
     assert.equal(await field(editor, "Endpoint").inputValue(), "amsterdam.fixture.invalid");
     assert.equal(await field(editor, "Interface addresses").inputValue(), "10.0.0.1/32");
     assert.equal(await action(editor, "Save").isDisabled(), false);
-    await option(editor, "Paste raw config").click();
-    await editor.getByRole("textbox", { name: "WireGuard configuration", exact: true }).fill(CONFIG);
-    await action(editor, "Parse").click();
+    await option(editor, "Upload a file").click();
+    await dropZone(editor).waitFor();
+    await editor.locator("input[type='file']").setInputFiles(file("wg0.conf", CONFIG));
     await filled(editor);
   } finally { await page.close(); }
 });
