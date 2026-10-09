@@ -881,7 +881,7 @@ impl PipelineMetrics {
 }
 
 /// Point-in-time snapshot of metrics (non-atomic, for reporting).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub bytes_downloaded: u64,
     pub bytes_decoded: u64,

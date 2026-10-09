@@ -360,3 +360,75 @@ async fn leg_rate_is_the_sustained_rate_over_recent_windows() {
         settle_rate(&mut updates, expected).await;
     }
 }
+
+fn timer_snapshots(weighted: &Weighted) -> u64 {
+    weighted.shared.timer_snapshots.load(Ordering::Relaxed)
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_route_timer_builds_no_snapshot_and_publishes_nothing() {
+    let (weighted, _) = create(5);
+    let _open = weighted.dial(&target()).await.unwrap();
+    let mut updates = weighted.subscribe();
+    updates.borrow_and_update();
+    let before = timer_snapshots(&weighted);
+    // Paused clock: this minute is virtual, sixty of the old one-second ticks.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(timer_snapshots(&weighted), before);
+    assert!(!updates.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn restating_unchanged_egress_health_publishes_nothing() {
+    let (weighted, _) = create(5);
+    let mut updates = weighted.subscribe();
+    updates.borrow_and_update();
+    weighted.set_egress_health(0, EgressHealth::Up);
+    assert!(!updates.has_changed().unwrap());
+    weighted.set_egress_health(0, EgressHealth::Down("link down".into()));
+    assert!(updates.has_changed().unwrap());
+    assert!(matches!(
+        updates.borrow_and_update()[0].health,
+        LegHealthState::Down(_)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_decayed_rate_is_published_at_zero_once_then_the_timer_sleeps() {
+    let (weighted, _) = create(5);
+    let dialed = weighted.dial(&target()).await.unwrap();
+    let mut updates = weighted.subscribe();
+    dialed.outcome.read(1024);
+    settle_rate(&mut updates, 1024).await;
+    settle_rate(&mut updates, 0).await;
+    let settled = timer_snapshots(&weighted);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(timer_snapshots(&weighted), settled);
+    assert!(!updates.has_changed().unwrap());
+
+    // The first read after the quiet minute wakes the timer, and its window
+    // covers that one second, not the quiet minute: alongside the three
+    // empty windows left from the decay it reads 2048 / 4.
+    dialed.outcome.read(2048);
+    settle_rate(&mut updates, 512).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cooling_leg_is_published_as_probing_when_its_cooldown_lapses() {
+    let (route, stages) = create(5);
+    stages[0].mode.store(1, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(route.dial(&target()).await.is_err());
+    }
+    let cooled_at = Instant::now();
+    let mut updates = route.subscribe();
+    updates.borrow_and_update();
+    let before = timer_snapshots(&route);
+    while updates.borrow_and_update()[0].health != LegHealthState::Probing {
+        updates.changed().await.unwrap();
+    }
+    // The timer slept through the cooldown and woke once, at its end.
+    assert_eq!(Instant::now() - cooled_at, Duration::from_secs(30));
+    assert_eq!(timer_snapshots(&route), before + 1);
+    assert_eq!(updates.borrow()[0].target, 1);
+}

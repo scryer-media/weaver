@@ -73,6 +73,9 @@ pub(super) struct RssServiceInner {
     pub(super) security: RuntimeSecurityConfig,
     pub(super) sync_lock: Mutex<()>,
     pub(super) scheduled_paused: std::sync::atomic::AtomicBool,
+    /// Full feed rows the due-sync path has loaded.
+    #[cfg(test)]
+    pub(super) full_feed_loads: std::sync::atomic::AtomicU64,
 }
 
 impl RssService {
@@ -111,6 +114,8 @@ impl RssService {
                 security,
                 sync_lock: Mutex::new(()),
                 scheduled_paused: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                full_feed_loads: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }

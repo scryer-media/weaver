@@ -91,7 +91,7 @@ pub struct RoutingStatus {
     pub failures: Vec<RoutingFailure>,
 }
 
-#[derive(SimpleObject)]
+#[derive(Clone, PartialEq, SimpleObject)]
 #[graphql(name = "ProxyProfile")]
 pub struct ProxyProfileGql {
     pub id: u32,

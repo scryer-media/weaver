@@ -497,30 +497,62 @@ impl Database {
 
     /// Every instance, in run order.
     pub fn script_instances(&self) -> Result<Vec<ScriptInstance>, StateError> {
+        self.load_script_instances(None)
+    }
+
+    /// Every instance, or only the one with id `only`. A secret input carries
+    /// the secret's name and id, never its value.
+    fn load_script_instances(
+        &self,
+        only: Option<String>,
+    ) -> Result<Vec<ScriptInstance>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
+            let (instance_filter, input_filter, category_filter) = if only.is_some() {
+                (
+                    "WHERE id = {}",
+                    "WHERE i.instance_id = {}",
+                    "WHERE instance_id = {}",
+                )
+            } else {
+                ("", "", "")
+            };
+            let args = || {
+                only.iter()
+                    .map(|id| SqlArg::Text(id.clone()))
+                    .collect::<Vec<_>>()
+            };
             let instances = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT id, name, script, trigger_kind, trigger_detail, enabled, blocking,
-                        timeout_seconds, run_order
-                   FROM script_instances ORDER BY run_order, created_at_ms, id",
-                &[],
+                &format!(
+                    "SELECT id, name, script, trigger_kind, trigger_detail, enabled, blocking,
+                            timeout_seconds, run_order
+                       FROM script_instances {instance_filter}
+                      ORDER BY run_order, created_at_ms, id"
+                ),
+                &args(),
             )
             .await?;
             let inputs = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT i.instance_id, i.name, i.value, i.secret_id, s.name AS secret_name
-                   FROM script_instance_inputs i
-                   LEFT JOIN secrets s ON s.id = i.secret_id
-                  ORDER BY i.instance_id, i.position, i.name",
-                &[],
+                &format!(
+                    "SELECT i.instance_id, i.name, i.value, i.secret_id, s.name AS secret_name
+                       FROM script_instance_inputs i
+                       LEFT JOIN secrets s ON s.id = i.secret_id
+                      {input_filter}
+                      ORDER BY i.instance_id, i.position, i.name"
+                ),
+                &args(),
             )
             .await?;
             let categories = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT instance_id, category FROM script_instance_categories
-                  ORDER BY instance_id, category",
-                &[],
+                &format!(
+                    "SELECT instance_id, category FROM script_instance_categories
+                      {category_filter}
+                      ORDER BY instance_id, category"
+                ),
+                &args(),
             )
             .await?;
             let mut inputs_by_instance = BTreeMap::<String, Vec<InstanceInput>>::new();
@@ -589,9 +621,9 @@ impl Database {
 
     pub fn script_instance(&self, id: &str) -> Result<Option<ScriptInstance>, StateError> {
         Ok(self
-            .script_instances()?
+            .load_script_instances(Some(id.to_owned()))?
             .into_iter()
-            .find(|instance| instance.id == id))
+            .next())
     }
 
     /// The instances `event` starts for a download in `category`, in run order.

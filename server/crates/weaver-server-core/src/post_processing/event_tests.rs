@@ -392,6 +392,42 @@ async fn malformed_payload_is_quarantined_without_poisoning_another_job() {
 }
 
 #[test]
+fn a_held_script_instance_admission_hint_is_not_worked_out_again() {
+    let (db, _data) = configured();
+    for instance in db.script_instances().unwrap() {
+        db.delete_script_instance(&instance.id).unwrap();
+    }
+    refresh_admission_hint(&db).unwrap();
+    assert!(!db.queue_scripts_possible());
+
+    // Hold a hint the saved instances contradict: a refresh that read them
+    // would replace it.
+    db.script_runtime.admission_hint.lock().unwrap().1 = Some(AdmissionHint::Possible);
+    assert!(!refresh_admission_hint(&db).unwrap());
+    assert!(db.queue_scripts_possible());
+
+    // Dropping the hint, as every save does, makes the next refresh look.
+    db.invalidate_queue_script_admission();
+    refresh_admission_hint(&db).unwrap();
+    assert!(!db.queue_scripts_possible());
+}
+
+#[test]
+fn script_instance_reads_only_the_named_instance() {
+    let (db, _data) = configured();
+    let all = db.script_instances().unwrap();
+    assert!(all.len() > 1);
+    for expected in &all {
+        let found = db.script_instance(&expected.id).unwrap().unwrap();
+        assert_eq!(found.id, expected.id);
+        assert_eq!(found.trigger, expected.trigger);
+        assert_eq!(found.inputs.len(), expected.inputs.len());
+        assert_eq!(found.categories, expected.categories);
+    }
+    assert!(db.script_instance("no-such-instance").unwrap().is_none());
+}
+
+#[test]
 fn the_subscriber_hint_follows_the_settings_and_the_saved_instances() {
     let (db, data) = configured();
     db.save_post_processing_settings(&PostProcessingSettings::default())

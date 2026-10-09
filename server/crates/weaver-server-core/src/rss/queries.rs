@@ -127,6 +127,32 @@ impl Database {
         })
     }
 
+    /// When each feed is next due, without loading or decrypting the feeds.
+    pub(crate) fn list_rss_feed_schedules(
+        &self,
+    ) -> Result<Vec<crate::rss::model::RssFeedSchedule>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT id, enabled, poll_interval_secs, last_polled_at
+                   FROM rss_feeds ORDER BY id",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(crate::rss::model::RssFeedSchedule {
+                    id: row.i32("id")? as u32,
+                    enabled: row.bool("enabled")?,
+                    poll_interval_secs: row.i32("poll_interval_secs")? as u32,
+                    last_polled_at: row.opt_i64("last_polled_at")?,
+                })
+            })
+            .collect()
+        })
+    }
+
     pub fn list_rss_rules(&self, feed_id: u32) -> Result<Vec<RssRuleRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {

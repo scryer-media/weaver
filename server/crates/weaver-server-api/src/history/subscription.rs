@@ -77,6 +77,7 @@ impl HistorySubscription {
             tokio::pin!(triggers);
             let mut terminal_settled = false;
             let mut last_terminal_reload = tokio::time::Instant::now();
+            let mut last_revision: Option<u64> = None;
 
             while let Some(trigger) = triggers.next().await {
                 // A terminal (archived) job's event log and history are
@@ -91,6 +92,20 @@ impl HistorySubscription {
                 {
                     continue;
                 }
+                // A live job's heartbeat reloads only when the job list was
+                // republished or bytes are moving. Every progress change,
+                // including post-download phase progress, republishes the job
+                // list, so an unchanged revision with no download activity
+                // means the database read would return what was last sent.
+                let revision = handle.job_revision();
+                if matches!(trigger, JobDetailTrigger::Heartbeat)
+                    && !terminal_settled
+                    && last_revision == Some(revision)
+                    && handle.get_metrics().current_download_speed == 0
+                {
+                    continue;
+                }
+                last_revision = Some(revision);
                 if matches!(trigger, JobDetailTrigger::Event) {
                     tokio::time::sleep(JOB_DETAIL_SETTLE_DELAY).await;
                 }

@@ -268,6 +268,38 @@ async fn topology_queries_and_subscription_require_admin_scope() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn network_flow_subscription_sends_changes_and_otherwise_a_slow_heartbeat() {
+    use async_graphql::futures_util::StreamExt;
+    let h = harness().await;
+    let request =
+        async_graphql::Request::new("subscription { networkFlow { egresses { id name } } }")
+            .data(CallerScope::Admin);
+    let mut stream = h.schema.execute_stream(request);
+    assert_no_errors(&stream.next().await.unwrap());
+
+    // Nothing changes, so the one-second sampler sends nothing until the
+    // heartbeat is due. The clock is paused; the gap is virtual time.
+    let sent = tokio::time::Instant::now();
+    assert_no_errors(&stream.next().await.unwrap());
+    assert!(sent.elapsed() >= std::time::Duration::from_secs(10));
+
+    let create = r#"mutation {createEgressInterface(input:{name:"Second path",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1"}){id}}"#;
+    assert_no_errors(&h.execute(create).await);
+    let response = stream.next().await.unwrap();
+    assert_no_errors(&response);
+    let egresses = response_data(&response)["networkFlow"]["egresses"].clone();
+    assert!(
+        egresses
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|egress| egress["name"] == "Second path"),
+        "the frame after a change carries it: {egresses}"
+    );
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 #[tokio::test]
 async fn route_save_rejects_missing_consumers_without_persisting() {
     let h = harness().await;

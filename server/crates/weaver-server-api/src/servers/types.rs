@@ -80,7 +80,7 @@ impl From<ServerDownloadQuotaWeekdayGql> for QuotaWeekday {
     }
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
 pub struct ServerDownloadQuota {
     pub enabled: bool,
     pub limit_bytes: u64,
@@ -137,7 +137,7 @@ impl ServerDownloadQuota {
 }
 
 /// The live usage of a download allowance in its current window.
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
 pub struct DownloadQuotaUsage {
     pub lifetime_bytes: u64,
     pub used_bytes: u64,

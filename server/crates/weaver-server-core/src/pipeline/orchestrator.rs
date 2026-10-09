@@ -7,7 +7,7 @@ mod runtime;
 mod scripts;
 mod state;
 
-pub(crate) use history::HistoryDeleteDone;
+pub(crate) use history::{FinishedJobs, HistoryDeleteDone};
 pub(super) use runtime::timestamp_secs;
 pub(crate) use runtime::{
     DirectWriteBatches, close_cached_write_handles_under, is_terminal_status,

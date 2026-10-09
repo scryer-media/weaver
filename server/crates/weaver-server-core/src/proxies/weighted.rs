@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{
     Arc, Mutex, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -55,6 +55,11 @@ impl Throughput {
     /// Whether a full second has passed since the last window closed.
     fn due(&self, now: Instant) -> bool {
         now.duration_since(self.sampled_at).as_secs_f64() >= 1.0
+    }
+    /// Restart the open window at `now` without recording one. A quiet leg
+    /// whose windows are all empty gains nothing from another empty window.
+    fn restart(&mut self, now: Instant) {
+        self.sampled_at = now;
     }
     fn record(&mut self, bytes: u64, now: Instant) {
         let elapsed = now.duration_since(self.sampled_at).as_secs_f64();
@@ -136,6 +141,12 @@ impl LegState {
             Some(_) => LegHealthState::Probing,
             None => LegHealthState::Up,
         }
+    }
+    /// `health(now) == Probing` without building the state or its reason.
+    fn is_probing(&self, now: Instant) -> bool {
+        self.blocked.is_none()
+            && matches!(self.egress, EgressHealth::Up)
+            && self.until.is_some_and(|until| until <= now)
     }
     fn failed(&mut self, error: &DialError) {
         if !error.is_path_evidence() {
@@ -229,8 +240,95 @@ struct Shared {
     changed: Arc<Notify>,
     targets: watch::Sender<Vec<LegAllocation>>,
     socket_targets: watch::Sender<Vec<u16>>,
+    /// Set while the rate timer sleeps with no bytes moving. The first read
+    /// on any leg, and any publish, wake it through `timer_wake`.
+    timer_parked: AtomicBool,
+    timer_wake: Notify,
+    #[cfg(test)]
+    timer_snapshots: AtomicU64,
 }
 impl Shared {
+    /// Wake a parked rate timer so it re-plans its next wake: a publish may
+    /// have set or cleared a leg's cooldown.
+    fn wake_timer(&self) {
+        if self.timer_parked.load(Ordering::SeqCst) {
+            self.timer_wake.notify_one();
+        }
+    }
+    /// One pass of the rate timer: close due throughput windows, publish
+    /// what changed, and say when the next pass is due. `None` means no
+    /// bytes are moving and no cooldown is pending, so only a read or a
+    /// publish can make a pass worth running.
+    fn sample(&self, state: &mut AllocationState, last_pass: Instant) -> Option<Instant> {
+        let now = Instant::now();
+        if self.timer_parked.swap(false, Ordering::SeqCst) {
+            // Every window was empty while parked; open fresh ones from now
+            // so the first busy second is not spread over the parked span.
+            for leg in &mut state.legs {
+                leg.throughput.restart(now);
+            }
+        }
+        let mut evaluate = false;
+        let mut moving = false;
+        let mut next_until: Option<Instant> = None;
+        for leg in &mut state.legs {
+            let active = leg.throughput.bytes_per_second() > 0;
+            if leg.throughput.due(now) {
+                let bytes = leg.reads.swap(0, Ordering::SeqCst);
+                if bytes > 0 || active {
+                    leg.throughput.record(bytes, now);
+                    evaluate = true;
+                } else {
+                    leg.throughput.restart(now);
+                }
+            }
+            moving |= leg.reads.load(Ordering::SeqCst) > 0 || leg.throughput.bytes_per_second() > 0;
+            if let Some(until) = leg.until {
+                if until > last_pass && until <= now {
+                    evaluate = true;
+                }
+                if until > now {
+                    next_until = Some(next_until.map_or(until, |next| next.min(until)));
+                }
+            }
+        }
+        if evaluate {
+            #[cfg(test)]
+            self.timer_snapshots.fetch_add(1, Ordering::Relaxed);
+            let next = state.snapshot();
+            let previous = self.targets.borrow();
+            let capacity_changed = next
+                .iter()
+                .zip(previous.iter())
+                .any(|(a, b)| a.target != b.target || a.health != b.health);
+            let metrics_changed = next
+                .iter()
+                .zip(previous.iter())
+                .any(|(a, b)| a.bytes_per_second != b.bytes_per_second);
+            drop(previous);
+            if capacity_changed {
+                self.publish(state);
+            } else if metrics_changed {
+                self.targets.send_replace(next);
+            }
+        }
+        if moving {
+            let tick = now + Duration::from_secs(1);
+            return Some(next_until.map_or(tick, |until| until.min(tick)));
+        }
+        self.timer_parked.store(true, Ordering::SeqCst);
+        // A read that landed before the flag was set saw no parked timer and
+        // sent no wake; pick it up here instead of sleeping past it.
+        if state
+            .legs
+            .iter()
+            .any(|leg| leg.reads.load(Ordering::SeqCst) > 0)
+        {
+            self.timer_parked.store(false, Ordering::SeqCst);
+            return Some(now + Duration::from_secs(1));
+        }
+        next_until
+    }
     fn publish(&self, state: &AllocationState) {
         let snapshot = state.snapshot();
         let next = snapshot.iter().map(|leg| leg.target).collect::<Vec<_>>();
@@ -243,6 +341,7 @@ impl Shared {
         });
         self.targets.send_replace(snapshot);
         self.changed.notify_waiters();
+        self.wake_timer();
     }
 }
 
@@ -281,41 +380,39 @@ impl Weighted {
                 changed: Arc::new(Notify::new()),
                 targets,
                 socket_targets,
+                timer_parked: AtomicBool::new(false),
+                timer_wake: Notify::new(),
+                #[cfg(test)]
+                timer_snapshots: AtomicU64::new(0),
             }),
             timer: Mutex::new(None),
         });
         let weak = Arc::downgrade(&result);
+        let shared = result.shared.clone();
         *result.timer.lock().expect("allocation timer") = Some(handle.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The timer runs only when something can change: once a second
+            // while bytes move or a rate is still decaying, at the instant a
+            // cooldown lapses, and when a read or a publish wakes it.
+            // Otherwise it sleeps, and an idle route costs nothing.
+            let mut last_pass = Instant::now();
             loop {
-                interval.tick().await;
-                let Some(route) = weak.upgrade() else {
-                    break;
+                let next = {
+                    let Some(route) = weak.upgrade() else {
+                        break;
+                    };
+                    let mut state = route.shared.state.lock().expect("leg allocation");
+                    let next = route.shared.sample(&mut state, last_pass);
+                    last_pass = Instant::now();
+                    next
                 };
-                let mut state = route.shared.state.lock().expect("leg allocation");
-                let now = Instant::now();
-                for leg in &mut state.legs {
-                    if leg.throughput.due(now) {
-                        let bytes = leg.reads.swap(0, Ordering::Relaxed);
-                        leg.throughput.record(bytes, now);
+                match next {
+                    Some(at) => {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(at) => {}
+                            () = shared.timer_wake.notified() => {}
+                        }
                     }
-                }
-                let next = state.snapshot();
-                let previous = route.shared.targets.borrow();
-                let capacity_changed = next
-                    .iter()
-                    .zip(previous.iter())
-                    .any(|(a, b)| a.target != b.target || a.health != b.health);
-                let metrics_changed = next
-                    .iter()
-                    .zip(previous.iter())
-                    .any(|(a, b)| a.bytes_per_second != b.bytes_per_second);
-                drop(previous);
-                if capacity_changed {
-                    route.shared.publish(&state);
-                } else if metrics_changed {
-                    route.shared.targets.send_replace(next);
+                    None => shared.timer_wake.notified().await,
                 }
             }
         }));
@@ -329,8 +426,12 @@ impl Weighted {
     }
     pub fn set_egress_health(&self, position: usize, health: EgressHealth) {
         let mut state = self.shared.state.lock().expect("leg allocation");
-        if let Some(leg) = state.legs.get_mut(position) {
-            leg.egress = health;
+        // The network runtime restates every leg's egress health on a fixed
+        // cadence; a restatement that changes nothing publishes nothing.
+        match state.legs.get_mut(position) {
+            Some(leg) if leg.egress == health => return,
+            Some(leg) => leg.egress = health,
+            None => {}
         }
         self.shared.publish(&state);
     }
@@ -521,8 +622,13 @@ impl Opening {
         let shared = self.shared.clone();
         let position = self.position;
         let generation = self.generation;
+        let wake = self.shared.clone();
         dialed.outcome.on_read(move |bytes| {
-            reads.fetch_add(bytes as u64, Ordering::Relaxed);
+            // Only the first read after the timer drained the counter can
+            // find it parked, so steady traffic pays one extra load at most.
+            if reads.fetch_add(bytes as u64, Ordering::SeqCst) == 0 {
+                wake.wake_timer();
+            }
         });
         dialed.outcome.on_close(move || {
             let mut state = shared.state.lock().expect("leg allocation");
@@ -576,9 +682,14 @@ impl Dialer for Weighted {
         Some(self.shared.socket_targets.subscribe())
     }
     fn needs_probe(&self) -> bool {
-        self.allocations()
+        // Read the leg states in place: the full allocation snapshot clones
+        // every leg's path and reason, and this question needs none of it.
+        let state = self.shared.state.lock().expect("leg allocation");
+        let now = Instant::now();
+        state
+            .legs
             .iter()
-            .any(|leg| matches!(leg.health, LegHealthState::Probing) && leg.open + leg.opening == 0)
+            .any(|leg| leg.is_probing(now) && leg.open + leg.opening == 0)
     }
     fn has_capacity(&self) -> bool {
         self.allocations()

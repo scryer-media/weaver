@@ -501,33 +501,55 @@ impl NntpPool {
             let weak = Arc::downgrade(self);
             let stopped = self.shutdown.clone();
             dialer.runtime.spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(1));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // A leg that needs a probe changes the route's leg targets
+                // when its cooldown lapses, so the loop wakes on that change
+                // rather than on a clock. It probes at most once per change;
+                // only a probe held back by this server's own gates (auth
+                // admission, over-limit, health, permits, socket budget)
+                // retries a second later, and only while one is still needed.
+                let mut retry_at: Option<tokio::time::Instant> = None;
+                let mut first = true;
                 loop {
-                    tokio::select! {
-                        _ = stopped.cancelled() => break,
-                        result = targets.changed() => if result.is_err() { break; },
-                        _ = tick.tick() => {},
+                    if !first {
+                        tokio::select! {
+                            _ = stopped.cancelled() => break,
+                            result = targets.changed() => if result.is_err() { break; },
+                            () = async {
+                                match retry_at {
+                                    Some(at) => tokio::time::sleep_until(at).await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {},
+                        }
                     }
+                    first = false;
+                    retry_at = None;
                     let Some(pool) = weak.upgrade() else {
                         break;
                     };
                     let route = pool.configs[idx].dialer.as_ref().expect("route probe");
-                    if !route.inner.needs_probe()
-                        || pool.auth_admission[idx].check().is_err()
+                    if !route.inner.needs_probe() {
+                        continue;
+                    }
+                    let held_back = tokio::time::Instant::now() + Duration::from_secs(1);
+                    if pool.auth_admission[idx].check().is_err()
                         || pool.is_over_limit(ServerId(idx))
                         || !pool.health.lock().await.is_available(idx)
                     {
+                        retry_at = Some(held_back);
                         continue;
                     }
                     let Ok(permit) = pool.semaphores[idx].clone().try_acquire_owned() else {
+                        retry_at = Some(held_back);
                         continue;
                     };
                     let Some(slot) = pool.socket_budgets[idx].try_acquire() else {
                         pool.socket_budgets[idx].recall_idle();
+                        retry_at = Some(held_back);
                         continue;
                     };
                     let Some(health_lease) = pool.recovery_gates[idx].admit(false) else {
+                        retry_at = Some(held_back);
                         continue;
                     };
                     let result = tokio::select! {
@@ -1890,6 +1912,85 @@ mod tests {
             pool.health.lock().await.server(0).state(),
             ServerState::Healthy
         ));
+        pool.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_probe_checks_on_target_changes_and_dials_once_per_change() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Target};
+        struct Counting {
+            needed: AtomicBool,
+            checks: AtomicUsize,
+            dials: AtomicUsize,
+            targets: tokio::sync::watch::Sender<Vec<u16>>,
+            checked: tokio::sync::mpsc::UnboundedSender<()>,
+            dialed: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+        #[async_trait::async_trait]
+        impl Dialer for Counting {
+            fn leg_targets(&self) -> Option<tokio::sync::watch::Receiver<Vec<u16>>> {
+                Some(self.targets.subscribe())
+            }
+            fn needs_probe(&self) -> bool {
+                self.checks.fetch_add(1, Ordering::AcqRel);
+                self.checked.send(()).ok();
+                self.needed.load(Ordering::Acquire)
+            }
+            async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
+                self.dials.fetch_add(1, Ordering::AcqRel);
+                self.dialed.send(()).ok();
+                Err(DialError::Egress(std::io::Error::other("fixture leg down")))
+            }
+            fn budget(&self) -> Duration {
+                Duration::from_secs(30)
+            }
+            fn describe(&self) -> String {
+                "counting fixture".into()
+            }
+        }
+        let (checked, mut checks) = tokio::sync::mpsc::unbounded_channel();
+        let (dialed, mut dials) = tokio::sync::mpsc::unbounded_channel();
+        let route = Arc::new(Counting {
+            needed: AtomicBool::new(false),
+            checks: AtomicUsize::new(0),
+            dials: AtomicUsize::new(0),
+            targets: tokio::sync::watch::channel(vec![4]).0,
+            checked,
+            dialed,
+        });
+        let mut config = test_pool_config(4);
+        config.servers[0].server.tls = false;
+        config.servers[0].server.dialer = Some(Arc::new(crate::route_dialer::RouteDialer {
+            inner: route.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        }));
+        let pool = Arc::new(NntpPool::new(config));
+        pool.start_route_probes();
+        checks.recv().await.unwrap();
+
+        // Nothing needs a probe and the targets hold still: a minute of
+        // (paused, virtual) time brings no further check and no dial.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(route.checks.load(Ordering::Acquire), 1);
+        assert_eq!(route.dials.load(Ordering::Acquire), 0);
+
+        // A lapse changes the targets: one probe dial for that change, and
+        // none after it while the targets stay put, even though the leg
+        // still reports that it needs one.
+        route.needed.store(true, Ordering::Release);
+        route.targets.send_modify(|_| {});
+        dials.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(route.dials.load(Ordering::Acquire), 1);
+
+        // The next lapse gets its own probe.
+        route.targets.send_modify(|_| {});
+        dials.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(route.dials.load(Ordering::Acquire), 2);
         pool.shutdown().await;
     }
 
