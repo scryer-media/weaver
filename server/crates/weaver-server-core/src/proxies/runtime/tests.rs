@@ -613,3 +613,19 @@ fn ssh_profiles_require_a_valid_key_even_if_a_password_is_present() {
     p.validate().unwrap();
     assert!(!format!("{:?}", p.ssh_spec()).contains("password-is-not-authentication"));
 }
+
+#[test]
+fn an_ssh_profile_is_stored_without_a_password() {
+    let db = Database::open_in_memory().unwrap();
+    let mut p = profile(1);
+    p.kind = ProxyKind::Ssh;
+    p.secrets.username = Some("operator".into());
+    p.secrets.password = Some("password-is-not-authentication".into());
+    p.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
+    let saved = db.save_proxy_profile(&p).unwrap();
+    assert_eq!(saved.secrets.password, None);
+    let stored = &db.list_proxy_profiles().unwrap()[0].secrets;
+    assert_eq!(stored.password, None);
+    assert_eq!(stored.username.as_deref(), Some("operator"));
+    assert!(stored.private_key.is_some());
+}

@@ -180,6 +180,11 @@ impl ProxyProfileInput {
         if existing.is_some_and(|p| p.kind != self.kind.into()) {
             return Err("create a new profile to change proxy type".into());
         }
+        if matches!(self.kind, ProxyKind::Ssh)
+            && matches!(&self.password, MaybeUndefined::Value(password) if !password.is_empty())
+        {
+            return Err("SSH requires an Ed25519 private key and takes no password".into());
+        }
         let mut secrets = existing.map(|p| p.secrets.clone()).unwrap_or_default();
         secret_update(&mut secrets.username, self.username);
         secret_update(&mut secrets.password, self.password);
