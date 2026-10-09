@@ -1957,6 +1957,7 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
         script
         enabled
         timeoutSeconds
+        blocking
       }
       categories {
         category
@@ -1964,6 +1965,7 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
           script
           enabled
           timeoutSeconds
+          blocking
         }
       }
     }
@@ -2034,6 +2036,7 @@ export const SET_SCRIPT_LISTS_MUTATION = gql`
         script
         enabled
         timeoutSeconds
+        blocking
       }
       categories {
         category
@@ -2041,6 +2044,7 @@ export const SET_SCRIPT_LISTS_MUTATION = gql`
           script
           enabled
           timeoutSeconds
+          blocking
         }
       }
     }
@@ -2075,6 +2079,33 @@ export const POST_PROCESSING_RESULTS_QUERY = gql`
       outputTruncated
       errorMessage
       finishedAtEpochMs
+      background
+    }
+  }
+`;
+
+export const SCRIPT_RUNS_QUERY = gql`
+  query ScriptRuns($limit: Int, $before: String, $kind: ScriptKind, $script: String, $jobId: Int) {
+    scriptRuns(limit: $limit, before: $before, kind: $kind, script: $script, jobId: $jobId) {
+      runs {
+        id
+        jobId
+        jobName
+        script
+        event
+        kind
+        background
+        adapter
+        status
+        exitCode
+        durationMs
+        outputTail
+        outputTruncated
+        outputRetained
+        errorMessage
+        finishedAtEpochMs
+      }
+      nextBefore
     }
   }
 `;

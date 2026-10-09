@@ -92,8 +92,18 @@
       "oracle": "browser"
     },
     {
-      "path": "/settings/post-processing",
+      "path": "/settings/scripts/configuration",
       "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/scripts/list",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/scripts/runs",
+      "owner": "ui-runtime-observability",
       "oracle": "browser"
     },
     {

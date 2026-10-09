@@ -8,6 +8,7 @@ import { ProvidersPanel } from "./ProvidersPanel";
 import { NetworkingPanel } from "./NetworkingPanel";
 import { RssPanel } from "./RssPanel";
 import { SchedulesPanel } from "./SchedulesPanel";
+import { ScriptRunsPanel } from "./ScriptRunsPanel";
 import { SecurityPanel } from "./SecurityPanel";
 import { WatchFolderPanel } from "./WatchFolderPanel";
 
@@ -107,6 +108,15 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     tag: "beta",
     icon: "postProcessing",
     Component: ScriptListPanel,
+  },
+  {
+    slug: "scripts/runs",
+    group: "scripts",
+    label: "next.settings.panel.scriptRuns",
+    note: "next.settings.panel.scriptRunsNote",
+    tag: "beta",
+    icon: "postProcessing",
+    Component: ScriptRunsPanel,
   },
   {
     slug: "watch-folder",

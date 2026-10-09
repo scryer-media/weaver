@@ -68,6 +68,8 @@ interface ListEntry {
   script: string;
   enabled: boolean;
   timeoutSeconds?: number | null;
+  /** Whether weaver waits for the script. Left out, it does. */
+  blocking?: boolean | null;
 }
 
 interface ScriptLists {
@@ -283,19 +285,17 @@ function ScriptsPanel({ section }: { section: ScriptsSection }) {
     setError(null);
     setLocalLists({ base: serverLists, value: next });
     setListSaves((count) => count + 1);
+    const stored = (entry: ListEntry) => ({
+      script: entry.script,
+      enabled: entry.enabled,
+      timeoutSeconds: entry.timeoutSeconds ?? null,
+      blocking: entry.blocking ?? true,
+    });
     const input = {
-      global: next.global.map((entry) => ({
-        script: entry.script,
-        enabled: entry.enabled,
-        timeoutSeconds: entry.timeoutSeconds ?? null,
-      })),
+      global: next.global.map(stored),
       categories: next.categories.map((category) => ({
         category: category.category,
-        entries: category.entries.map((entry) => ({
-          script: entry.script,
-          enabled: entry.enabled,
-          timeoutSeconds: entry.timeoutSeconds ?? null,
-        })),
+        entries: category.entries.map(stored),
       })),
     };
     listQueue.current = listQueue.current.then(async () => {
@@ -575,12 +575,13 @@ function ScriptsPanel({ section }: { section: ScriptsSection }) {
       kind: "table",
       id: "run-list",
       title: t("next.postProcessing.runList"),
-      note: scopeNote,
-      columns: "64px minmax(0, 1fr) 176px 76px 104px",
+      note: `${scopeNote} · ${t("next.postProcessing.runModeNote")}`,
+      columns: "64px minmax(120px, 1fr) 176px 168px 76px 104px",
       headers: [
         t("next.postProcessing.order"),
         t("next.postProcessing.script"),
         t("next.postProcessing.timeout"),
+        t("next.postProcessing.runMode"),
         t("next.postProcessing.enabled"),
         "",
       ],
@@ -600,7 +601,10 @@ function ScriptsPanel({ section }: { section: ScriptsSection }) {
             ]}
             onChange={(next) => {
               if (next) {
-                patchEntries([...entries, { script: next, enabled: true, timeoutSeconds: null }]);
+                patchEntries([
+                  ...entries,
+                  { script: next, enabled: true, timeoutSeconds: null, blocking: true },
+                ]);
               }
             }}
           />
@@ -636,6 +640,21 @@ function ScriptsPanel({ section }: { section: ScriptsSection }) {
               onChange={(next) => {
                 const updated = [...entries];
                 updated[index] = { ...entry, timeoutSeconds: next > 0 ? next : null };
+                patchEntries(updated);
+              }}
+            />,
+            <Select
+              key="run-mode"
+              label={t("next.postProcessing.runModeFor", { name: entry.script })}
+              value={(entry.blocking ?? true) ? "blocking" : "background"}
+              className="h-7 w-[168px] min-w-0 gap-2 text-[12.5px]"
+              options={[
+                { value: "blocking", label: t("next.postProcessing.blocking") },
+                { value: "background", label: t("next.postProcessing.fireAndForget") },
+              ]}
+              onChange={(next) => {
+                const updated = [...entries];
+                updated[index] = { ...entry, blocking: next === "blocking" };
                 patchEntries(updated);
               }}
             />,

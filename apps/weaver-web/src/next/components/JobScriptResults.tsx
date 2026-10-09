@@ -5,7 +5,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
-import { DetailBlock, Square } from "./chrome";
+import { DetailBlock, Square, Tag } from "./chrome";
 import { Icon } from "./icons";
 
 /**
@@ -15,16 +15,22 @@ import { Icon } from "./icons";
  * eyebrow and a count, hairline rows, and a run's state as a square and a word.
  */
 
-interface ScriptResult {
-  script: string;
-  event: string;
-  status: string;
+/** What a run's output is drawn from, wherever the run was listed. */
+export interface ScriptRunOutputSource {
   outputTail: string;
+  /** What the daemon keeps the full output under; null when it kept none. */
   outputId: string | null;
   outputRetained: boolean;
   outputTruncated: boolean;
+}
+
+interface ScriptResult extends ScriptRunOutputSource {
+  script: string;
+  event: string;
+  status: string;
   errorMessage: string | null;
   finishedAtEpochMs: number;
+  background: boolean;
 }
 
 const OUTPUT_QUERY = gql`query ScriptOutput($outputId: String!) { scriptOutput(outputId: $outputId) }`;
@@ -42,37 +48,48 @@ const QUIET_TONE = { color: WV.idle, text: "text-wv-muted" };
 
 const QUIET_ACTION = "cursor-pointer text-wv-dim hover:text-wv-fg";
 
-function RunOutput({ result }: { result: ScriptResult }) {
+/** How a run ended: a square and the status beside it. */
+export function ScriptStatusMark({ status }: { status: string }) {
+  const tone = STATUS_TONE[status] ?? QUIET_TONE;
+  return (
+    <span className="flex flex-none items-center gap-[7px]">
+      <Square color={tone.color} />
+      <span className={cn("font-wv-mono text-[11px]", tone.text)}>{status}</span>
+    </span>
+  );
+}
+
+/** Marks a run nothing waited for. */
+export function FireAndForgetTag() {
+  const t = useTranslate();
+  return (
+    <span className="flex flex-none whitespace-nowrap">
+      <Tag>{t("next.postProcessing.fireAndForget")}</Tag>
+    </span>
+  );
+}
+
+/** A run's output: the excerpt it ended with, and the retained output on request. */
+export function ScriptRunOutput({ run }: { run: ScriptRunOutputSource }) {
   const t = useTranslate();
   const [expanded, setExpanded] = useState(false);
   const [{ data, fetching, error }] = useQuery<{ scriptOutput: string | null }>({
-    query: OUTPUT_QUERY, variables: { outputId: result.outputId ?? "" },
-    pause: !expanded || !result.outputId,
+    query: OUTPUT_QUERY, variables: { outputId: run.outputId ?? "" },
+    pause: !expanded || !run.outputId,
   });
-  const tone = STATUS_TONE[result.status] ?? QUIET_TONE;
   const retained = expanded ? data?.scriptOutput : undefined;
   // The excerpt stays up until the retained output arrives, so the row does not jump.
-  const output = retained ?? result.outputTail;
+  const output = retained ?? run.outputTail;
   const gone = t("next.job.scriptOutputGone");
   return (
-    <div className="flex min-w-0 flex-col gap-2 border-t border-wv-hairline py-[10px] pl-5">
-      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
-        <span className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">{result.script}</span>
-        <span className="flex flex-none items-center gap-[7px]">
-          <Square color={tone.color} />
-          <span className={cn("font-wv-mono text-[11px]", tone.text)}>{result.status}</span>
-        </span>
-      </div>
-      {result.errorMessage ? (
-        <span className="text-[12.5px] text-wv-error-text">{result.errorMessage}</span>
-      ) : null}
+    <>
       {output ? (
         <pre className="max-h-80 overflow-auto bg-wv-input px-3 py-2 font-wv-mono text-[12px] leading-[1.55] break-words whitespace-pre-wrap text-wv-fg">
           {output}
         </pre>
       ) : null}
       <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 font-wv-mono text-[11px] text-wv-muted">
-        {result.outputRetained && result.outputId ? (
+        {run.outputRetained && run.outputId ? (
           <button type="button" onClick={() => setExpanded(!expanded)} className={QUIET_ACTION}>
             {t(expanded ? "next.job.scriptOutputExcerpt" : "next.job.scriptOutputShow")}
           </button>
@@ -82,8 +99,26 @@ function RunOutput({ result }: { result: ScriptResult }) {
         {expanded && retained == null ? (
           <span>{fetching ? t("next.common.loading") : (error?.message ?? gone)}</span>
         ) : null}
-        {result.outputTruncated ? <span>{t("next.job.scriptOutputTruncated")}</span> : null}
+        {run.outputTruncated ? <span>{t("next.job.scriptOutputTruncated")}</span> : null}
       </div>
+    </>
+  );
+}
+
+function RunOutput({ result }: { result: ScriptResult }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-2 border-t border-wv-hairline py-[10px] pl-5">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
+        <span className="flex min-w-0 items-center gap-[10px]">
+          <span className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">{result.script}</span>
+          {result.background ? <FireAndForgetTag /> : null}
+        </span>
+        <ScriptStatusMark status={result.status} />
+      </div>
+      {result.errorMessage ? (
+        <span className="text-[12.5px] text-wv-error-text">{result.errorMessage}</span>
+      ) : null}
+      <ScriptRunOutput run={result} />
     </div>
   );
 }
