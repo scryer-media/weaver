@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 
-use super::model::{EventScriptSettings, ScriptEventLabel, ScriptKind, ScriptResult};
+use super::model::{EventScriptSettings, ScriptEventLabel, ScriptKind, ScriptResult, ScriptStatus};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
@@ -18,6 +18,7 @@ pub struct ScriptRunFilter {
     pub job_id: Option<u64>,
     pub script: Option<String>,
     pub kind: Option<ScriptKind>,
+    pub status: Option<ScriptStatus>,
 }
 
 /// One recorded run of a script, whatever started it.
@@ -156,8 +157,8 @@ impl Database {
                     getrandom::fill(&mut entropy).map_err(error)?;
                     let id = format!("script-output-{}", hex::encode(entropy));
                     result.output_id = (stored_bytes > 0).then(|| id.clone());
-                        tx.execute("INSERT INTO script_outputs (id, job_id, event, script, seq, raw_bytes, truncated, output, stored_bytes, result_json, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})", &[
-                            SqlArg::Text(id), SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string()), SqlArg::Text(result.script.to_string()), SqlArg::I64(seq), SqlArg::I64(raw_bytes as i64), SqlArg::Bool(result.output_truncated), SqlArg::Bytes(output), SqlArg::I64(stored_bytes), SqlArg::Text(serde_json::to_string(&result).map_err(error)?), SqlArg::I64(result.finished_at_epoch_ms),
+                        tx.execute("INSERT INTO script_outputs (id, job_id, event, script, status, seq, raw_bytes, truncated, output, stored_bytes, result_json, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})", &[
+                            SqlArg::Text(id), SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string()), SqlArg::Text(result.script.to_string()), SqlArg::Text(result.status.as_str().to_string()), SqlArg::I64(seq), SqlArg::I64(raw_bytes as i64), SqlArg::Bool(result.output_truncated), SqlArg::Bytes(output), SqlArg::I64(stored_bytes), SqlArg::Text(serde_json::to_string(&result).map_err(error)?), SqlArg::I64(result.finished_at_epoch_ms),
                         ]).await?;
                         used += stored_bytes;
                     tx.execute("UPDATE script_output_state SET used_bytes = {} WHERE singleton = 1", &[SqlArg::I64(used.max(0))]).await?;
@@ -288,6 +289,35 @@ impl Database {
         })?;
         u64::try_from(total).map_err(error)
     }
+
+    /// How many of the runs the filter matches ended each way. The filter's
+    /// own status is left out, so the answer covers every status at once.
+    pub fn script_run_status_counts(
+        &self,
+        filter: &ScriptRunFilter,
+    ) -> Result<Vec<(ScriptStatus, u64)>, StateError> {
+        let datastore = self.datastore();
+        let (conditions, args) = script_run_conditions(&ScriptRunFilter {
+            status: None,
+            ..filter.clone()
+        })?;
+        let mut sql = String::from("SELECT o.status, COUNT(*) AS total FROM script_outputs o");
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" GROUP BY o.status");
+        self.run_sql_blocking_read(async move {
+            let mut counts = Vec::new();
+            for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
+                // A status this build does not know is counted under no tab.
+                if let Some(status) = ScriptStatus::from_persisted(&row.text("status")?) {
+                    counts.push((status, u64::try_from(row.i64("total")?).map_err(error)?));
+                }
+            }
+            Ok(counts)
+        })
+    }
 }
 
 /// The SQL conditions, over `script_outputs o`, that select the runs a filter matches.
@@ -312,6 +342,10 @@ fn script_run_conditions(
             ScriptKind::Scheduler => "o.event LIKE 'scheduler:%'",
             ScriptKind::Feed => "o.event LIKE 'feed:%'",
         });
+    }
+    if let Some(status) = filter.status {
+        conditions.push("o.status = {}");
+        args.push(SqlArg::Text(status.as_str().to_string()));
     }
     Ok((conditions, args))
 }
@@ -898,5 +932,80 @@ mod tests {
             1
         );
         assert_eq!(db.script_run_count(&kind(ScriptKind::Scan)).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn runs_are_listed_and_counted_by_how_they_ended() {
+        let db = Database::open_in_memory().unwrap();
+        let limits = EventScriptSettings::default();
+        let recorded = [
+            (ScriptEventLabel::Scan, "a.sh", ScriptStatus::Succeeded),
+            (ScriptEventLabel::Scan, "b.sh", ScriptStatus::Failed),
+            (ScriptEventLabel::Feed(9), "c.sh", ScriptStatus::Failed),
+            (ScriptEventLabel::Scan, "d.sh", ScriptStatus::TimedOut),
+            (ScriptEventLabel::Feed(9), "e.sh", ScriptStatus::Succeeded),
+        ];
+        for (event, script, status) in recorded {
+            retain_output(
+                db.clone(),
+                None,
+                ScriptResult {
+                    status,
+                    ..named(event, script)
+                },
+                script.as_bytes().to_vec(),
+                limits.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        let ended = |status| ScriptRunFilter {
+            status: Some(status),
+            ..Default::default()
+        };
+        let scripts = |filter: ScriptRunFilter| {
+            db.script_runs(filter, None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|run| run.result.script.to_string())
+                .collect::<Vec<_>>()
+        };
+        let counts = |filter: &ScriptRunFilter| {
+            let mut counts = db.script_run_status_counts(filter).unwrap();
+            counts.sort_by_key(|(status, _)| status.as_str());
+            counts
+        };
+
+        assert_eq!(scripts(ended(ScriptStatus::Failed)), ["c.sh", "b.sh"]);
+        assert_eq!(scripts(ended(ScriptStatus::TimedOut)), ["d.sh"]);
+        assert_eq!(scripts(ended(ScriptStatus::Warning)), [] as [&str; 0]);
+        assert_eq!(
+            db.script_run_count(&ended(ScriptStatus::Failed)).unwrap(),
+            2
+        );
+        // A status narrows within the trigger, not instead of it.
+        let scan_failures = ScriptRunFilter {
+            kind: Some(ScriptKind::Scan),
+            ..ended(ScriptStatus::Failed)
+        };
+        assert_eq!(scripts(scan_failures.clone()), ["b.sh"]);
+
+        assert_eq!(
+            counts(&Default::default()),
+            [
+                (ScriptStatus::Failed, 2),
+                (ScriptStatus::Succeeded, 2),
+                (ScriptStatus::TimedOut, 1),
+            ]
+        );
+        // The counts answer for every status, whichever one is being shown.
+        assert_eq!(
+            counts(&scan_failures),
+            [
+                (ScriptStatus::Failed, 1),
+                (ScriptStatus::Succeeded, 1),
+                (ScriptStatus::TimedOut, 1),
+            ]
+        );
     }
 }

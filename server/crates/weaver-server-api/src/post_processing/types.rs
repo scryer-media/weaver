@@ -609,6 +609,19 @@ impl From<weaver_server_core::post_processing::model::ScriptStatus> for ScriptSt
     }
 }
 
+impl From<ScriptStatusGql> for weaver_server_core::post_processing::model::ScriptStatus {
+    fn from(value: ScriptStatusGql) -> Self {
+        match value {
+            ScriptStatusGql::Succeeded => Self::Succeeded,
+            ScriptStatusGql::Skipped => Self::Skipped,
+            ScriptStatusGql::Warning => Self::Warning,
+            ScriptStatusGql::Failed => Self::Failed,
+            ScriptStatusGql::TimedOut => Self::TimedOut,
+            ScriptStatusGql::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct ScriptResultGql {
     pub output_id: Option<String>,
@@ -727,6 +740,16 @@ pub struct ScriptRunPageGql {
     pub next_before: Option<String>,
     /// How many runs the filter matches across every page.
     pub total: u64,
+    /// How the runs the filter matches ended, leaving its own `status` out.
+    /// A status no run ended with is absent.
+    pub status_counts: Vec<ScriptRunStatusCountGql>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptRunStatusCount")]
+pub struct ScriptRunStatusCountGql {
+    pub status: ScriptStatusGql,
+    pub count: u64,
 }
 
 impl From<ScriptKindGql> for weaver_server_core::post_processing::model::ScriptKind {

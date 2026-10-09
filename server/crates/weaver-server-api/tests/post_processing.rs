@@ -908,7 +908,7 @@ async fn a_script_runs_token_may_not_create_change_or_delete_a_secret() {
 }
 
 #[tokio::test]
-async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secret() {
+async fn a_browser_session_without_a_recent_password_check_may_add_a_secret_but_not_change_one() {
     use weaver_server_core::security::{AUTHENTICATED_POLICY_REVISION, RuntimeSecurityConfig};
 
     let security = RuntimeSecurityConfig::default();
@@ -934,7 +934,8 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
         .unwrap();
     let kept = harness.db.create_secret("Kept", "hunter2").unwrap();
     let before = stored_secrets(&harness);
-    for mutation in secret_mutations(&kept.id) {
+    let [create, change, delete] = secret_mutations(&kept.id);
+    for mutation in [change, delete] {
         let response = harness
             .schema
             .execute(
@@ -948,6 +949,20 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
     }
     assert_eq!(stored_secrets(&harness), before);
 
+    // Adding one touches nothing already saved, and is not held back.
+    let added = harness
+        .schema
+        .execute(
+            async_graphql::Request::new(create.as_str())
+                .data(CallerScope::Admin)
+                .data(weaver_server_api::auth::CallerIdentity::Jwt([7; 32])),
+        )
+        .await;
+    assert_no_errors(&added);
+    let mut after = stored_secrets(&harness);
+    after.retain(|(name, _)| name != "From outside");
+    assert_eq!(after, before);
+
     // Listing names needs no fresh password check.
     let listed = harness
         .schema
@@ -958,10 +973,14 @@ async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secr
         )
         .await;
     assert_no_errors(&listed);
-    assert_eq!(
-        response_data(&listed)["secrets"],
-        json!([{ "name": "Kept" }])
-    );
+    let mut names: Vec<String> = response_data(&listed)["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|secret| secret["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["From outside", "Kept"]);
 }
 
 #[tokio::test]
@@ -1280,16 +1299,29 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
 
     let harness = TestHarness::new().await;
     let recorded = [
-        (ScriptEventLabel::Scheduler(1), "nightly.sh", false, None),
-        (ScriptEventLabel::Scan, "scan.sh", false, None),
+        (
+            ScriptEventLabel::Scheduler(1),
+            "nightly.sh",
+            false,
+            None,
+            ScriptStatus::Succeeded,
+        ),
+        (
+            ScriptEventLabel::Scan,
+            "scan.sh",
+            false,
+            None,
+            ScriptStatus::Failed,
+        ),
         (
             ScriptEventLabel::Scheduler(2),
             "hourly.sh",
             true,
             Some(("instance-1", "Every hour")),
+            ScriptStatus::Succeeded,
         ),
     ];
-    for (event, script, background, instance) in recorded {
+    for (event, script, background, instance, status) in recorded {
         retain_output(
             harness.db.clone(),
             None,
@@ -1301,7 +1333,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
                 output_id: None,
                 background,
                 adapter: ScriptAdapter::Nzbget,
-                status: ScriptStatus::Succeeded,
+                status,
                 exit_code: Some(93),
                 duration_ms: 5,
                 output_tail: String::new(),
@@ -1390,6 +1422,36 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     assert_eq!(scheduled["runs"].as_array().unwrap().len(), 1);
     assert_eq!(scheduled["total"], 1, "the total is of the filtered runs");
     assert!(scheduled["nextBefore"].is_null());
+
+    let failed = harness
+        .execute_as(
+            "{ scriptRuns(status: FAILED) { runs { script status } total statusCounts { status count } } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&failed);
+    let failed = &response_data(&failed)["scriptRuns"];
+    assert_eq!(failed["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(failed["runs"][0]["script"], "scan.sh");
+    assert_eq!(failed["runs"][0]["status"], "FAILED");
+    assert_eq!(failed["total"], 1);
+    // The counts cover every status, so each quick filter can show its own.
+    let mut counts = failed["statusCounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["status"].as_str().unwrap().to_string(),
+                entry["count"].as_u64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    counts.sort();
+    assert_eq!(
+        counts,
+        [("FAILED".to_string(), 1), ("SUCCEEDED".to_string(), 2)]
+    );
 
     let of_a_job = harness
         .execute_as(
