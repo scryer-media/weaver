@@ -241,9 +241,9 @@ impl PostProcessingMutation {
     }
 
     /// Replace everything saved in an instance. A secret input sent without a
-    /// value keeps the one already stored, unless the instance is given
-    /// another script: then its secrets must be entered again. An instance
-    /// that no longer runs on a schedule loses the schedule rules that ran it.
+    /// value keeps the one already stored, whichever script the instance is
+    /// given. An instance that no longer runs on a schedule loses the
+    /// schedule rules that ran it.
     #[graphql(guard = "FreshAdminGuard")]
     async fn update_script_instance(
         &self,
