@@ -136,6 +136,8 @@ struct Saved {
     settings: Option<String>,
     /// Each feed with the script names it was given.
     feeds: Vec<(i64, String)>,
+    /// Secret names already taken, in their compared form.
+    secret_names: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,9 +165,19 @@ impl Trigger {
 #[derive(Debug, Clone)]
 struct Input {
     name: String,
-    /// Plain text, or the ciphertext that was saved for a secret.
+    /// Plain text; empty for a secret.
     value: String,
-    secret: bool,
+    /// The planned secret this input links.
+    secret_id: Option<String>,
+}
+
+/// A named secret made from a secret option that was saved for a script. The
+/// ciphertext is carried across as it was saved: the step never needs the key.
+#[derive(Debug, Clone)]
+struct PlannedSecret {
+    id: String,
+    name: String,
+    ciphertext: String,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +196,9 @@ struct Instance {
 /// What to write, worked out before anything is written.
 #[derive(Debug, Default)]
 struct Plan {
+    /// One per secret option saved for a script, shared by every instance of
+    /// that script.
+    secrets: Vec<PlannedSecret>,
     /// In run order.
     instances: Vec<Instance>,
     schedules: Option<String>,
@@ -229,11 +244,29 @@ async fn read(conn: &mut SqlConn<'_>) -> Result<Saved, StateError> {
             row.opt_text("scripts")?.unwrap_or_default(),
         ));
     }
+    for row in conn.fetch_all("SELECT name_key FROM secrets", &[]).await? {
+        saved.secret_names.insert(row.text("name_key")?);
+    }
     Ok(saved)
 }
 
 async fn write(conn: &mut SqlConn<'_>, plan: &Plan) -> Result<(), StateError> {
     let now = chrono::Utc::now().timestamp_millis();
+    for secret in &plan.secrets {
+        conn.execute(
+            "INSERT INTO secrets (id, name, name_key, value, created_at_ms, updated_at_ms)
+             VALUES ({}, {}, {}, {}, {}, {})",
+            &[
+                SqlArg::Text(secret.id.clone()),
+                SqlArg::Text(secret.name.clone()),
+                SqlArg::Text(name_key(&secret.name)),
+                SqlArg::Text(secret.ciphertext.clone()),
+                SqlArg::I64(now),
+                SqlArg::I64(now),
+            ],
+        )
+        .await?;
+    }
     for (run_order, instance) in plan.instances.iter().enumerate() {
         let (kind, detail) = instance.trigger.stored();
         conn.execute(
@@ -258,13 +291,13 @@ async fn write(conn: &mut SqlConn<'_>, plan: &Plan) -> Result<(), StateError> {
         .await?;
         for (position, input) in instance.inputs.iter().enumerate() {
             conn.execute(
-                "INSERT INTO script_instance_inputs (instance_id, name, value, secret, position)
+                "INSERT INTO script_instance_inputs (instance_id, name, value, secret_id, position)
                  VALUES ({}, {}, {}, {}, {})",
                 &[
                     SqlArg::Text(instance.id.clone()),
                     SqlArg::Text(input.name.clone()),
                     SqlArg::Text(input.value.clone()),
-                    SqlArg::Bool(input.secret),
+                    SqlArg::OptText(input.secret_id.clone()),
                     SqlArg::I64(position as i64),
                 ],
             )
@@ -321,6 +354,33 @@ async fn write(conn: &mut SqlConn<'_>, plan: &Plan) -> Result<(), StateError> {
 
 fn yes_no(value: bool) -> String {
     if value { "yes" } else { "no" }.to_string()
+}
+
+/// The form a secret's name is compared in: names that differ only by case
+/// are one name.
+fn name_key(name: &str) -> String {
+    name.to_lowercase()
+}
+
+/// `<script> <option>`, cut to fit and made unique with a counter.
+fn secret_name(script: &str, option: &str, taken: &BTreeSet<String>) -> String {
+    let base = format!("{script} {option}");
+    for counter in 1_usize.. {
+        let suffix = if counter == 1 {
+            String::new()
+        } else {
+            format!(" {counter}")
+        };
+        let mut name = base.clone();
+        while name.len() + suffix.len() > MAX_NAME_BYTES {
+            name.pop();
+        }
+        name.push_str(&suffix);
+        if !taken.contains(&name_key(&name)) {
+            return name;
+        }
+    }
+    unreachable!("a counter always finds a free name")
 }
 
 fn new_id() -> Result<String, StateError> {
@@ -386,6 +446,10 @@ impl Policy {
 struct Planner<'a> {
     root: Option<&'a Path>,
     options: BTreeMap<String, SavedOptions>,
+    /// The planned secret for each script and upper-cased option name.
+    secret_ids: BTreeMap<(String, String), String>,
+    /// Secret names in use, in their compared form.
+    secret_names: BTreeSet<String>,
     plan: Plan,
 }
 
@@ -409,8 +473,50 @@ impl Planner<'_> {
 
     /// The options saved for a script, as an instance's inputs: every option
     /// its header declares, at the value the operator gave it or the header's
-    /// default, then anything else that was saved under its name.
-    fn inputs(&self, script: &Known) -> Vec<Input> {
+    /// default, then anything else that was saved under its name. A saved
+    /// secret becomes a named secret, one per script and option, which every
+    /// instance of that script links.
+    fn inputs(&mut self, script: &Known) -> Result<Vec<Input>, StateError> {
+        let mut inputs = Vec::new();
+        for (name, value, ciphertext) in self.saved_inputs(script) {
+            let secret_id = match ciphertext {
+                Some(ciphertext) => Some(self.secret_for(&script.name, &name, ciphertext)?),
+                None => None,
+            };
+            inputs.push(Input {
+                name,
+                value,
+                secret_id,
+            });
+        }
+        Ok(inputs)
+    }
+
+    fn secret_for(
+        &mut self,
+        script: &str,
+        option: &str,
+        ciphertext: String,
+    ) -> Result<String, StateError> {
+        let key = (script.to_string(), option.to_ascii_uppercase());
+        if let Some(id) = self.secret_ids.get(&key) {
+            return Ok(id.clone());
+        }
+        let name = secret_name(script, option, &self.secret_names);
+        self.secret_names.insert(name_key(&name));
+        let id = new_id()?;
+        self.plan.secrets.push(PlannedSecret {
+            id: id.clone(),
+            name,
+            ciphertext,
+        });
+        self.secret_ids.insert(key, id.clone());
+        Ok(id)
+    }
+
+    /// Each input as a name, its plain value, and the saved ciphertext when
+    /// it is a secret.
+    fn saved_inputs(&self, script: &Known) -> Vec<(String, String, Option<String>)> {
         let saved = self.options.get(&script.name);
         let plain = |name: &str| {
             saved?
@@ -428,18 +534,15 @@ impl Planner<'_> {
         };
         let mut seen = BTreeSet::new();
         let mut inputs = Vec::new();
-        let mut push = |name: &str, value: String, secret: bool| {
+        let mut push = |name: &str, value: String, ciphertext: Option<String>| {
+            let stored = ciphertext.as_deref().unwrap_or(&value);
             if inputs.len() < MAX_INPUTS
                 && OptionName::new(name).is_ok()
-                && value.len() <= MAX_INPUT_VALUE_BYTES
-                && !value.contains('\0')
+                && stored.len() <= MAX_INPUT_VALUE_BYTES
+                && !stored.contains('\0')
                 && seen.insert(name.to_ascii_uppercase())
             {
-                inputs.push(Input {
-                    name: name.to_string(),
-                    value,
-                    secret,
-                });
+                inputs.push((name.to_string(), value, ciphertext));
             }
         };
         for option in script
@@ -450,7 +553,7 @@ impl Planner<'_> {
             let name = option.name().as_str();
             if option.is_secret() {
                 if let Some(ciphertext) = secret(name) {
-                    push(name, ciphertext, true);
+                    push(name, String::new(), Some(ciphertext));
                 }
                 continue;
             }
@@ -459,15 +562,15 @@ impl Planner<'_> {
             let value = plain(name)
                 .or_else(|| option.default().and_then(default_text))
                 .unwrap_or_default();
-            push(name, value, false);
+            push(name, value, None);
         }
         for option in saved.iter().flat_map(|saved| &saved.plain) {
             if let Some(value) = option.value.text() {
-                push(&option.name, value, false);
+                push(&option.name, value, None);
             }
         }
         for secret in saved.iter().flat_map(|saved| &saved.secrets) {
-            push(&secret.name, secret.ciphertext.clone(), true);
+            push(&secret.name, String::new(), Some(secret.ciphertext.clone()));
         }
         inputs
     }
@@ -489,7 +592,7 @@ impl Planner<'_> {
             name,
             script: script.name.clone(),
             trigger,
-            inputs: self.inputs(script),
+            inputs: self.inputs(script)?,
             category: category.map(str::to_string),
             enabled: policy.enabled,
             blocking: policy.blocking,
@@ -575,6 +678,8 @@ fn plan(saved: &Saved) -> Result<Plan, StateError> {
     let mut planner = Planner {
         root: saved.directory.as_deref(),
         options,
+        secret_ids: BTreeMap::new(),
+        secret_names: saved.secret_names.clone(),
         plan: Plan {
             warnings,
             ..Plan::default()
@@ -1146,16 +1251,29 @@ mod tests {
             instances[0]
                 .inputs
                 .iter()
-                .map(|input| (input.name.as_str(), input.value.as_str(), input.secret))
+                .map(|input| (
+                    input.name.as_str(),
+                    input.value.as_str(),
+                    input.secret.as_ref().map(|secret| secret.name.as_str())
+                ))
                 .collect::<Vec<_>>(),
             [
-                ("Server", "example.test", false),
-                ("Token", "", true),
-                ("Mode", "fast", false),
-                ("Extra", "7", false),
+                ("Server", "example.test", None),
+                ("Token", "", Some("notify Token")),
+                ("Mode", "fast", None),
+                ("Extra", "7", None),
             ]
         );
+        // Every instance of the script links the one secret made for it.
         assert_eq!(instances[7].inputs, instances[0].inputs);
+        let secrets = db.secrets().unwrap();
+        assert_eq!(
+            secrets
+                .iter()
+                .map(|secret| (secret.name.as_str(), secret.used_by.len()))
+                .collect::<Vec<_>>(),
+            [("notify Token", 6)]
+        );
 
         let id = |script: &str, trigger: InstanceTrigger| {
             instances
@@ -1229,12 +1347,11 @@ mod tests {
             sqlx::SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&path))
                 .await
                 .unwrap();
-        let sealed: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT value FROM script_instance_inputs WHERE name = 'Token' AND secret",
-        )
-        .fetch_all(&mut conn)
-        .await
-        .unwrap();
+        // The ciphertext is carried across as it was saved.
+        let sealed: Vec<String> = sqlx::query_scalar("SELECT value FROM secrets")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
         assert_eq!(sealed, ["sealed"]);
         let applied: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?1 AND success",
@@ -1344,6 +1461,65 @@ mod tests {
         // The options, the script name, the empty category list, the schedules
         // and the settings.
         assert_eq!(plan.warnings.len(), 5, "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_saved_secret_option_becomes_one_uniquely_named_secret_per_script() {
+        let plan = plan(&Saved {
+            lists: Some(
+                json!({
+                    "global": [{"script": "post.sh"}],
+                    "categories": {"tv": [{"script": "post.sh"}]},
+                })
+                .to_string(),
+            ),
+            options: Some(
+                json!({
+                    "post.sh": {
+                        "plain": [{"name": "Host", "value": {"type": "string", "value": "h"}}],
+                        "secrets": [
+                            {"name": "Token", "ciphertext": "sealed-token"},
+                            {"name": "Password", "ciphertext": "sealed-password"},
+                        ],
+                    },
+                })
+                .to_string(),
+            ),
+            secret_names: BTreeSet::from(["post.sh token".to_string()]),
+            ..Saved::default()
+        })
+        .unwrap();
+        assert_eq!(
+            plan.secrets
+                .iter()
+                .map(|secret| (secret.name.as_str(), secret.ciphertext.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                // The plain name was already taken.
+                ("post.sh Token 2", "sealed-token"),
+                ("post.sh Password", "sealed-password"),
+            ]
+        );
+        assert_eq!(plan.instances.len(), 2);
+        for instance in &plan.instances {
+            assert_eq!(
+                instance
+                    .inputs
+                    .iter()
+                    .map(|input| (
+                        input.name.as_str(),
+                        input.value.as_str(),
+                        input.secret_id.as_deref()
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    ("Host", "h", None),
+                    ("Token", "", Some(plan.secrets[0].id.as_str())),
+                    ("Password", "", Some(plan.secrets[1].id.as_str())),
+                ]
+            );
+        }
+        assert!(secret_name(&"x".repeat(200), "Token", &BTreeSet::new()).len() <= MAX_NAME_BYTES);
     }
 
     #[test]

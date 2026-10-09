@@ -13,7 +13,8 @@ use super::model::{
     GlobalScriptsRun, OptionName, OptionValue, PostProcessingSettings, QueueEvent, ResolvedOption,
     ScriptEventLabel, ScriptKind, ScriptName, SecretOptionValue,
 };
-use crate::persistence::encryption::{decrypt_value, encrypt_value};
+use super::secrets::SecretRef;
+use crate::persistence::encryption::decrypt_value;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
@@ -120,14 +121,21 @@ impl<'de> Deserialize<'de> for InstanceTrigger {
     }
 }
 
-/// One saved input. A secret's value is never read back out for display.
+/// One saved input: a plain value, or a link to a named secret. A secret's
+/// value is never read back out for display.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceInput {
     pub name: OptionName,
     /// Empty for a secret.
     pub value: String,
-    pub secret: bool,
+    pub secret: Option<SecretRef>,
+}
+
+impl InstanceInput {
+    pub fn is_secret(&self) -> bool {
+        self.secret.is_some()
+    }
 }
 
 /// A script wired to one trigger.
@@ -236,13 +244,31 @@ pub enum ScriptInstanceError {
     Storage(#[from] StateError),
 }
 
-/// One input as the operator sent it.
-#[derive(Debug, Clone)]
+/// One input as the operator sent it: exactly one of a plain value or the id
+/// of a secret to link.
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InstanceInputDraft {
     pub name: String,
-    /// `None` on a secret keeps the value already stored under this name.
     pub value: Option<String>,
-    pub secret: bool,
+    pub secret_id: Option<String>,
+}
+
+impl InstanceInputDraft {
+    pub fn plain(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: Some(value.into()),
+            secret_id: None,
+        }
+    }
+
+    pub fn secret(name: impl Into<String>, secret_id: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: None,
+            secret_id: Some(secret_id.into()),
+        }
+    }
 }
 
 /// An instance as the operator sent it, before it has an id or a place in the
@@ -280,20 +306,14 @@ impl ScriptInstanceDraft {
     }
 
     pub fn input(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.inputs.push(InstanceInputDraft {
-            name: name.into(),
-            value: Some(value.into()),
-            secret: false,
-        });
+        self.inputs.push(InstanceInputDraft::plain(name, value));
         self
     }
 
-    pub fn secret_input(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.inputs.push(InstanceInputDraft {
-            name: name.into(),
-            value: Some(value.into()),
-            secret: true,
-        });
+    /// An input linked to the secret `secret_id`.
+    pub fn secret_input(mut self, name: impl Into<String>, secret_id: impl Into<String>) -> Self {
+        self.inputs
+            .push(InstanceInputDraft::secret(name, secret_id));
         self
     }
 
@@ -325,10 +345,9 @@ impl ScriptInstanceDraft {
             inputs: instance
                 .inputs
                 .iter()
-                .map(|input| InstanceInputDraft {
-                    name: input.name.as_str().to_string(),
-                    value: (!input.secret).then(|| input.value.clone()),
-                    secret: input.secret,
+                .map(|input| match &input.secret {
+                    Some(secret) => InstanceInputDraft::secret(input.name.as_str(), &secret.id),
+                    None => InstanceInputDraft::plain(input.name.as_str(), &input.value),
                 })
                 .collect(),
             categories: instance.categories.clone(),
@@ -345,12 +364,11 @@ enum Updated {
     NotFound,
 }
 
-/// A stored input value: what goes in the row, or a marker to keep the row's
-/// present value.
+/// What an input row holds.
 #[derive(Debug, Clone)]
 enum StoredValue {
-    Write(String),
-    Keep,
+    Plain(String),
+    Secret(String),
 }
 
 #[derive(Debug, Clone)]
@@ -358,7 +376,7 @@ struct ValidatedInstance {
     name: String,
     script: String,
     trigger: InstanceTrigger,
-    inputs: Vec<(String, StoredValue, bool)>,
+    inputs: Vec<(String, StoredValue)>,
     categories: Vec<String>,
     enabled: bool,
     blocking: bool,
@@ -411,33 +429,38 @@ impl Database {
         if draft.inputs.len() > MAX_INPUTS {
             return Err(ScriptInstanceError::Invalid("too many inputs"));
         }
-        let key = self.encryption_key();
         let mut seen = BTreeSet::new();
         let mut inputs = Vec::with_capacity(draft.inputs.len());
+        let mut linked = Vec::new();
         for input in draft.inputs {
             let name = OptionName::new(input.name.trim())
                 .map_err(|_| ScriptInstanceError::Invalid("input name is invalid"))?;
             if !seen.insert(name.as_str().to_ascii_uppercase()) {
                 return Err(ScriptInstanceError::Invalid("input names must be unique"));
             }
-            if input
-                .value
-                .as_deref()
-                .is_some_and(|value| value.len() > MAX_INPUT_VALUE_BYTES || value.contains('\0'))
-            {
-                return Err(ScriptInstanceError::Invalid("input value is invalid"));
-            }
-            let stored = match (input.secret, input.value) {
-                (true, None) => StoredValue::Keep,
-                (true, Some(value)) => {
-                    let key = key.ok_or(ScriptInstanceError::Invalid(
-                        "an encryption key is required to store a secret input",
-                    ))?;
-                    StoredValue::Write(encrypt_value(key, &value).map_err(storage)?)
+            let stored = match (input.value, input.secret_id) {
+                (Some(value), None) => {
+                    if value.len() > MAX_INPUT_VALUE_BYTES || value.contains('\0') {
+                        return Err(ScriptInstanceError::Invalid("input value is invalid"));
+                    }
+                    StoredValue::Plain(value)
                 }
-                (false, value) => StoredValue::Write(value.unwrap_or_default()),
+                (None, Some(secret_id)) => {
+                    linked.push(secret_id.clone());
+                    StoredValue::Secret(secret_id)
+                }
+                _ => {
+                    return Err(ScriptInstanceError::Invalid(
+                        "an input holds either a value or a secret",
+                    ));
+                }
             };
-            inputs.push((name.as_str().to_string(), stored, input.secret));
+            inputs.push((name.as_str().to_string(), stored));
+        }
+        if !self.secrets_exist(&linked)? {
+            return Err(ScriptInstanceError::Invalid(
+                "a linked secret does not exist",
+            ));
         }
         Ok(ValidatedInstance {
             name,
@@ -465,8 +488,10 @@ impl Database {
             .await?;
             let inputs = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT instance_id, name, value, secret FROM script_instance_inputs
-                  ORDER BY instance_id, position, name",
+                "SELECT i.instance_id, i.name, i.value, i.secret_id, s.name AS secret_name
+                   FROM script_instance_inputs i
+                   LEFT JOIN secrets s ON s.id = i.secret_id
+                  ORDER BY i.instance_id, i.position, i.name",
                 &[],
             )
             .await?;
@@ -479,16 +504,22 @@ impl Database {
             .await?;
             let mut inputs_by_instance = BTreeMap::<String, Vec<InstanceInput>>::new();
             for row in inputs {
-                let secret = row.bool("secret")?;
                 let Ok(name) = OptionName::new(row.text("name")?) else {
                     continue;
+                };
+                let secret = match row.opt_text("secret_id")? {
+                    Some(id) => Some(SecretRef {
+                        name: row.opt_text("secret_name")?.unwrap_or_default(),
+                        id,
+                    }),
+                    None => None,
                 };
                 inputs_by_instance
                     .entry(row.text("instance_id")?)
                     .or_default()
                     .push(InstanceInput {
                         name,
-                        value: if secret {
+                        value: if secret.is_some() {
                             String::new()
                         } else {
                             row.text("value")?
@@ -599,19 +630,6 @@ impl Database {
                 let instance = instance.clone();
                 let id = target.clone();
                 Box::pin(async move {
-                    // The secrets belong to the instance, and stay with it
-                    // whatever script it is pointed at: an operator who
-                    // swaps the script is not made to type them again.
-                    let kept = tx
-                        .fetch_all(
-                            "SELECT name, value FROM script_instance_inputs
-                              WHERE instance_id = {} AND secret",
-                            &[SqlArg::Text(id.clone())],
-                        )
-                        .await?
-                        .into_iter()
-                        .map(|row| Ok((row.text("name")?, row.text("value")?)))
-                        .collect::<Result<BTreeMap<_, _>, StateError>>()?;
                     let (kind, detail) = instance.trigger.stored();
                     let updated = tx
                         .execute(
@@ -650,7 +668,7 @@ impl Database {
                         )
                         .await?;
                     }
-                    insert_instance_details_tx(tx, &id, &instance, &kept).await?;
+                    insert_instance_details_tx(tx, &id, &instance).await?;
                     Ok(Updated::Done)
                 })
             })
@@ -776,13 +794,22 @@ impl Database {
             }
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT name, value, secret FROM script_instance_inputs
-                  WHERE instance_id = {} ORDER BY position, name",
+                "SELECT i.name, i.value, i.secret_id, s.value AS sealed
+                   FROM script_instance_inputs i
+                   LEFT JOIN secrets s ON s.id = i.secret_id
+                  WHERE i.instance_id = {} ORDER BY i.position, i.name",
                 &[SqlArg::Text(target)],
             )
             .await?
             .into_iter()
-            .map(|row| Ok((row.text("name")?, row.text("value")?, row.bool("secret")?)))
+            .map(|row| {
+                let linked = row.opt_text("secret_id")?.is_some();
+                Ok((
+                    row.text("name")?,
+                    row.text("value")?,
+                    linked.then(|| row.opt_text("sealed")).transpose()?,
+                ))
+            })
             .collect::<Result<Vec<_>, StateError>>()
             .map(Some)
         })?;
@@ -791,17 +818,24 @@ impl Database {
         };
         let key = self.encryption_key();
         let mut inputs = Vec::with_capacity(rows.len());
-        for (name, value, secret) in rows {
+        for (name, value, sealed) in rows {
             let name = OptionName::new(name).map_err(storage)?;
-            let value = if secret {
-                let key = key.ok_or_else(|| {
-                    StateError::Database("encryption key is required to load secret inputs".into())
-                })?;
-                OptionValue::Secret(SecretOptionValue::for_execution(
-                    decrypt_value(key, &value).map_err(storage)?,
-                ))
-            } else {
-                OptionValue::String(value)
+            let value = match sealed {
+                None => OptionValue::String(value),
+                Some(sealed) => {
+                    let sealed = sealed.ok_or_else(|| {
+                        StateError::Database(format!(
+                            "the secret linked to input {} is gone",
+                            name.as_str()
+                        ))
+                    })?;
+                    let key = key.ok_or_else(|| {
+                        StateError::Database("encryption key is required to load secrets".into())
+                    })?;
+                    OptionValue::Secret(SecretOptionValue::for_execution(
+                        decrypt_value(key, &sealed).map_err(storage)?,
+                    ))
+                }
             };
             inputs.push(ResolvedOption::new(name, value));
         }
@@ -962,32 +996,27 @@ async fn insert_instance_tx(
         ],
     )
     .await?;
-    insert_instance_details_tx(tx, id, instance, &BTreeMap::new()).await
+    insert_instance_details_tx(tx, id, instance).await
 }
 
 async fn insert_instance_details_tx(
     tx: &mut SqlTx<'_>,
     id: &str,
     instance: &ValidatedInstance,
-    kept: &BTreeMap<String, String>,
 ) -> Result<(), StateError> {
-    for (position, (name, value, secret)) in instance.inputs.iter().enumerate() {
-        let value = match value {
-            StoredValue::Write(value) => value.clone(),
-            // A secret that was never stored has nothing to keep.
-            StoredValue::Keep => match kept.get(name) {
-                Some(value) => value.clone(),
-                None => continue,
-            },
+    for (position, (name, stored)) in instance.inputs.iter().enumerate() {
+        let (value, secret_id) = match stored {
+            StoredValue::Plain(value) => (value.clone(), None),
+            StoredValue::Secret(secret_id) => (String::new(), Some(secret_id.clone())),
         };
         tx.execute(
-            "INSERT INTO script_instance_inputs (instance_id, name, value, secret, position)
+            "INSERT INTO script_instance_inputs (instance_id, name, value, secret_id, position)
              VALUES ({}, {}, {}, {}, {})",
             &[
                 SqlArg::Text(id.into()),
                 SqlArg::Text(name.clone()),
                 SqlArg::Text(value),
-                SqlArg::Bool(*secret),
+                SqlArg::OptText(secret_id),
                 SqlArg::I64(position as i64),
             ],
         )

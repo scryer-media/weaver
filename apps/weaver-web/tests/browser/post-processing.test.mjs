@@ -172,8 +172,10 @@ async function edit(page, name) {
 }
 const creator = (page) => page.getByRole("dialog", { name: "Create instance", exact: true });
 const field = (editor, name) => editor.getByRole("textbox", { name, exact: true });
-// A secret's field is a password input, which has no role to be found by.
-const secretField = (editor, name) => editor.getByLabel(name, { exact: true });
+// A password input has no role to be found by.
+const secretField = (scope, name) => scope.getByLabel(name, { exact: true });
+const secretBox = (editor, name) => editor.getByRole("checkbox", { name: `${name} is a secret`, exact: true });
+const secretDialog = (page, name) => page.getByRole("dialog", { name, exact: true });
 
 test("the scripts screen is one table of instances, under a heading for each thing that starts them", async () => {
   const page = await open("?scripts");
@@ -334,11 +336,16 @@ test("a new instance starts from what the chosen script's header declares", asyn
     assert.equal(await editor.getByText("This instance has no inputs.", { exact: true }).count(), 0);
     assert.equal(await field(editor, "Target").inputValue(), "/fixture/archive");
     await editor.getByText("Where a finished download is copied. Default /fixture/archive.", { exact: true }).waitFor();
-    // A secret is never filled in from the header, and nothing is saved for it yet.
-    assert.equal(await secretField(editor, "Key").getAttribute("type"), "password");
-    assert.equal(await secretField(editor, "Key").inputValue(), "");
-    assert.equal(await secretField(editor, "Key").getAttribute("placeholder"), null);
-    await editor.getByText("Once saved, the value is never shown again.", { exact: true }).waitFor();
+    // A secret is never filled in from the header: it links one of the saved secrets, and none is chosen yet.
+    await action(editor, "Key").getByText("Choose a secret", { exact: true }).waitFor();
+    assert.equal(await secretBox(editor, "Key").isChecked(), true);
+    assert.equal(await secretBox(editor, "Target").isChecked(), false);
+    await editor.getByText("Linked from Settings · Scripts · Secrets. The script is given its value when it runs; it is never shown here.", { exact: true }).waitFor();
+    await action(editor, "Key").click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
+      "Choose a secret", "Notify token", "Spare key", "Create new secret…",
+    ]);
+    await page.getByRole("menuitemradio", { name: "Choose a secret", exact: true }).click();
     // The triggers the header declares are marked among all there are.
     await action(editor, "Trigger").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
@@ -347,7 +354,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
     await page.getByRole("menuitemradio", { name: "Post-processing · declared", exact: true }).click();
 
     await field(editor, "Name").fill("Archive movies");
-    await secretField(editor, "Key").fill("fixture-key-1");
+    await pick(page, editor, "Key", "Spare key");
     const categories = editor.getByRole("group", { name: "Categories", exact: true });
     assert.deepEqual(await categories.getByRole("button").allTextContents(), ["movies", "tv"]);
     await action(categories, "movies").click();
@@ -369,10 +376,10 @@ test("a new instance starts from what the chosen script's header declares", asyn
     }
     assert.equal(await unusedRow(page, "archive.py").count(), 0);
     assert.equal(await rows(unused(page)).count(), 1);
-    assert.equal(await page.getByText("fixture-key-1").count(), 0);
+    assert.equal(await page.getByText("fixture-token").count(), 0);
     assert.deepEqual((await daemon(page)).requests, [{ name: "CreateScriptInstance", variables: { input: {
       name: "Archive movies", script: "archive.py", trigger: "POST_PROCESSING", queueEvent: null,
-      inputs: [{ name: "Target", value: "/fixture/archive", secret: false }, { name: "Key", value: "fixture-key-1", secret: true }],
+      inputs: [{ name: "Target", value: "/fixture/archive" }, { name: "Key", secretId: "s2" }],
       categories: ["movies"], enabled: true, blocking: false, timeoutSeconds: 120,
     } } }]);
   } finally { await page.close(); }
@@ -394,7 +401,7 @@ test("an instance can be started from its script's row, and a queue instance nam
       "FILE_DOWNLOADED", "URL_COMPLETED", "NZB_MARKED", "NZB_ADDED", "NZB_NAMED", "NZB_DOWNLOADED", "NZB_DELETED",
     ]);
     await page.getByRole("menuitemradio", { name: "NZB_NAMED", exact: true }).click();
-    // Saved with no name and no secret: it takes its script's name, and the secret is not stored at all.
+    // Saved with no name and no secret chosen: it takes its script's name, and the secret is not sent at all.
     await action(editor, "Save").click();
     await status(page, "archive.py created").waitFor();
     await rows(group(page, "Queue · NZB_NAMED")).first().and(row(page, "archive.py")).waitFor();
@@ -404,11 +411,11 @@ test("an instance can be started from its script's row, and a queue instance nam
     let held = await daemon(page);
     assert.deepEqual(held.requests.at(-1), { name: "CreateScriptInstance", variables: { input: {
       name: "", script: "archive.py", trigger: "QUEUE", queueEvent: "NZB_NAMED",
-      inputs: [{ name: "Target", value: "/fixture/archive", secret: false }, { name: "Key", value: null, secret: true }],
+      inputs: [{ name: "Target", value: "/fixture/archive" }],
       categories: [], enabled: true, blocking: true, timeoutSeconds: null,
     } } });
     assert.equal(held.instances.at(-1).name, "archive.py");
-    assert.deepEqual(held.instances.at(-1).inputs, [{ name: "Target", value: "/fixture/archive", secret: false }]);
+    assert.deepEqual(held.instances.at(-1).inputs, [{ name: "Target", value: "/fixture/archive", secretId: null }]);
 
     // Each input the header declares draws the control its header asks for.
     await action(controls(page), "Create instance").click();
@@ -418,7 +425,7 @@ test("an instance can be started from its script's row, and a queue instance nam
     await editor.getByText("Shown in the notification title. Required.", { exact: true }).waitFor();
     await action(editor, "Mode").getByText("quiet", { exact: true }).waitFor();
     assert.equal(await editor.getByRole("switch", { name: "Attach the log", exact: true }).isChecked(), false);
-    assert.equal(await secretField(editor, "Token").getAttribute("type"), "password");
+    await action(editor, "Token").getByText("Choose a secret", { exact: true }).waitFor();
     await field(editor, "Label").fill("downloads");
     await pick(page, editor, "Mode", "verbose");
     await editor.getByRole("switch", { name: "Attach the log", exact: true }).click();
@@ -445,8 +452,7 @@ test("an instance can be started from its script's row, and a queue instance nam
     assert.deepEqual(held.requests.at(-1), { name: "CreateScriptInstance", variables: { input: {
       name: "", script: "notify.py", trigger: "QUEUE", queueEvent: "NZB_DOWNLOADED",
       inputs: [
-        { name: "Label", value: "downloads", secret: false }, { name: "Token", value: null, secret: true },
-        { name: "Mode", value: "verbose", secret: false }, { name: "Attach", value: "yes", secret: false },
+        { name: "Label", value: "downloads" }, { name: "Mode", value: "verbose" }, { name: "Attach", value: "yes" },
       ],
       categories: [], enabled: true, blocking: true, timeoutSeconds: null,
     } } });
@@ -471,7 +477,7 @@ test("what the daemon refuses is said inside the editor, which stays open", asyn
   } finally { await page.close(); }
 });
 
-test("a saved secret is never shown, is kept when its field is left blank and replaced when it is not", async () => {
+test("a secret input shows the secret it links and never its value, and can link another or a new one", async () => {
   const page = await open("?scripts");
   try {
     let editor = await edit(page, "Notify");
@@ -481,10 +487,9 @@ test("a saved secret is never shown, is kept when its field is left blank and re
     await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
     assert.equal(await field(editor, "Name").inputValue(), "Notify");
     assert.equal(await field(editor, "Label").inputValue(), "fixture");
-    // The secret's field is blank, and says that something is saved behind it.
-    assert.equal(await secretField(editor, "Token").inputValue(), "");
-    assert.equal(await secretField(editor, "Token").getAttribute("placeholder"), "Saved · leave blank to keep");
-    await editor.getByText("The service's access token. Leave blank to keep the saved value.", { exact: true }).waitFor();
+    // The secret input names the secret it links; nothing can be typed into it.
+    await action(editor, "Token").getByText("Notify token", { exact: true }).waitFor();
+    await editor.getByText("The service's access token. Linked from Settings · Scripts · Secrets. The script is given its value when it runs; it is never shown here.", { exact: true }).waitFor();
     await field(editor, "Label").fill("renamed");
     await field(editor, "Name").fill("Notify all");
     await action(editor, "Save").click();
@@ -495,37 +500,78 @@ test("a saved secret is never shown, is kept when its field is left blank and re
     assert.deepEqual(held.requests, [{ name: "UpdateScriptInstance", variables: { id: "1", input: {
       name: "Notify all", script: "notify.py", trigger: "POST_PROCESSING", queueEvent: null,
       inputs: [
-        { name: "Label", value: "renamed", secret: false }, { name: "Token", value: null, secret: true },
-        { name: "Mode", value: "quiet", secret: false }, { name: "Attach", value: "no", secret: false },
+        { name: "Label", value: "renamed" }, { name: "Token", secretId: "s1" },
+        { name: "Mode", value: "quiet" }, { name: "Attach", value: "no" },
       ],
       categories: [], enabled: true, blocking: true, timeoutSeconds: null,
     } } }]);
-    assert.deepEqual(held.instances[0].inputs[1], { name: "Token", value: "fixture-token-1", secret: true });
+    assert.deepEqual(held.instances[0].inputs[1], { name: "Token", value: "", secretId: "s1" });
 
-    // Typed into, the field replaces what was saved.
+    // A linked input offers the other secrets and a new one, but not going back to none.
     editor = await edit(page, "Notify all");
-    assert.equal(await field(editor, "Label").inputValue(), "renamed");
-    assert.equal(await secretField(editor, "Token").inputValue(), "");
-    await secretField(editor, "Token").fill("fixture-token-2");
+    await action(editor, "Token").click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Notify token", "Spare key", "Create new secret…"]);
+    await page.getByRole("menuitemradio", { name: "Spare key", exact: true }).click();
     await action(editor, "Save").click();
     await editor.waitFor({ state: "detached" });
     await status(page, "Notify all saved").waitFor();
     held = await daemon(page);
-    assert.deepEqual(held.requests.at(-1).variables.input.inputs[1], { name: "Token", value: "fixture-token-2", secret: true });
-    assert.deepEqual(held.instances[0].inputs[1], { name: "Token", value: "fixture-token-2", secret: true });
-    assert.equal(await page.getByText("fixture-token").count(), 0);
+    assert.deepEqual(held.requests.at(-1).variables.input.inputs[1], { name: "Token", secretId: "s2" });
 
-    // A secret the instance was never given is still offered, and left blank it stays unset.
+    // A secret the instance never linked is offered unchosen, and one can be created on the spot.
     editor = await edit(page, "Log removal");
     await action(editor, "Queue event").getByText("NZB_DELETED", { exact: true }).waitFor();
-    assert.equal(await secretField(editor, "Token").getAttribute("placeholder"), null);
-    await editor.getByText("The service's access token. Once saved, the value is never shown again.", { exact: true }).waitFor();
+    await action(editor, "Token").getByText("Choose a secret", { exact: true }).waitFor();
+    await pick(page, editor, "Token", "Create new secret…");
+    const created = secretDialog(page, "Add secret");
+    await created.waitFor();
+    await action(created, "Save").click();
+    await created.getByText("Give the secret a name of up to 128 bytes.", { exact: true }).waitFor();
+    await field(created, "Name").fill("Notify token");
+    await secretField(created, "Value").fill("fixture-token-3");
+    await action(created, "Save").click();
+    // A name is taken whatever its case, and the daemon's refusal is said inside the dialog.
+    await created.getByText("a secret named 'Notify token' already exists", { exact: true }).waitFor();
+    await field(created, "Name").fill("Mail token");
+    await action(created, "Save").click();
+    await created.waitFor({ state: "detached" });
+    await action(editor, "Token").getByText("Mail token", { exact: true }).waitFor();
     await action(editor, "Save").click();
     await editor.waitFor({ state: "detached" });
     await status(page, "Log removal saved").waitFor();
     held = await daemon(page);
-    assert.deepEqual(held.requests.at(-1).variables.input.inputs.at(-1), { name: "Token", value: null, secret: true });
-    assert.deepEqual(held.instances.find((entry) => entry.id === "5").inputs.map((input) => input.name), ["Label", "Mode", "Attach"]);
+    assert.deepEqual(held.requests.slice(-2), [
+      { name: "CreateSecret", variables: { name: "Mail token", value: "fixture-token-3" } },
+      { name: "UpdateScriptInstance", variables: { id: "5", input: {
+        name: "Log removal", script: "notify.py", trigger: "QUEUE", queueEvent: "NZB_DELETED",
+        inputs: [
+          { name: "Label", value: "removed" }, { name: "Mode", value: "verbose" }, { name: "Attach", value: "yes" },
+          { name: "Token", secretId: "s3" },
+        ],
+        categories: [], enabled: true, blocking: true, timeoutSeconds: null,
+      } } },
+    ]);
+    assert.equal(await page.getByText("fixture-token").count(), 0);
+  } finally { await page.close(); }
+});
+
+test("an input's secret box turns it into a choice of secrets or back into a blank field", async () => {
+  const page = await open("?scripts");
+  try {
+    const editor = await edit(page, "Notify");
+    // A header's hint is not a lock: the declared secret can be made plain, and a plain input secret.
+    await secretBox(editor, "Token").click();
+    assert.equal(await field(editor, "Token").inputValue(), "");
+    await secretBox(editor, "Label").click();
+    await action(editor, "Label").getByText("Choose a secret", { exact: true }).waitFor();
+    assert.equal(await field(editor, "Label").count(), 0);
+    await field(editor, "Token").fill("typed");
+    await action(editor, "Save").click();
+    await status(page, "Notify saved").waitFor();
+    // A secret input with no secret chosen is not sent.
+    assert.deepEqual((await daemon(page)).requests.at(-1).variables.input.inputs, [
+      { name: "Token", value: "typed" }, { name: "Mode", value: "quiet" }, { name: "Attach", value: "no" },
+    ]);
   } finally { await page.close(); }
 });
 
@@ -556,22 +602,21 @@ test("an input the header does not declare can be added, and taken away again", 
     await name.fill("Extra.key");
     await secret.click();
     await action(editor, "Add input").click();
-    await secretField(editor, "Extra.key").waitFor();
-    assert.equal(await secretField(editor, "Extra.key").getAttribute("type"), "password");
+    await action(editor, "Extra.key").getByText("Choose a secret", { exact: true }).waitFor();
+    assert.equal(await secretBox(editor, "Extra.key").isChecked(), true);
     assert.equal(await name.inputValue(), "");
     assert.equal(await secret.isChecked(), false);
-    await secretField(editor, "Extra.key").fill("fixture-extra-1");
+    await pick(page, editor, "Extra.key", "Notify token");
     await action(editor, "Remove Legacy").click();
     await field(editor, "Legacy").waitFor({ state: "detached" });
     await action(editor, "Save").click();
     await status(page, "Announce saved").waitFor();
-    // The secret the header declares and the instance was never given goes along unset, between what was saved and what was added.
+    // The secret the header declares and the instance never linked is not sent; the added one goes as its link.
     assert.deepEqual((await daemon(page)).requests.at(-1).variables.input.inputs, [
-      { name: "Label", value: "queued", secret: false }, { name: "Token", value: null, secret: true },
-      { name: "Extra.key", value: "fixture-extra-1", secret: true },
+      { name: "Label", value: "queued" }, { name: "Extra.key", secretId: "s1" },
     ]);
     assert.deepEqual((await daemon(page)).instances.find((entry) => entry.id === "4").inputs, [
-      { name: "Label", value: "queued", secret: false }, { name: "Extra.key", value: "fixture-extra-1", secret: true },
+      { name: "Label", value: "queued", secretId: null }, { name: "Extra.key", value: "", secretId: "s1" },
     ]);
   } finally { await page.close(); }
 });
@@ -605,12 +650,12 @@ test("the switch in a row turns its instance on or off without opening it, and k
       name: "Tidy tv", script: "cleanup.sh", trigger: "POST_PROCESSING", queueEvent: null, inputs: [],
       categories: ["tv"], enabled: true, blocking: false, timeoutSeconds: 600,
     } }],
-    // A secret goes back without a value, which keeps the one saved.
+    // A secret goes back as the link it is.
     ["Notify", false, { id: "1", input: {
       name: "Notify", script: "notify.py", trigger: "POST_PROCESSING", queueEvent: null,
       inputs: [
-        { name: "Label", value: "fixture", secret: false }, { name: "Token", value: null, secret: true },
-        { name: "Mode", value: "quiet", secret: false }, { name: "Attach", value: "no", secret: false },
+        { name: "Label", value: "fixture" }, { name: "Token", secretId: "s1" },
+        { name: "Mode", value: "quiet" }, { name: "Attach", value: "no" },
       ],
       categories: [], enabled: false, blocking: true, timeoutSeconds: null,
     } }],
@@ -623,7 +668,7 @@ test("the switch in a row turns its instance on or off without opening it, and k
       assert.equal(await page.getByRole("dialog").count(), 0);
       const held = await daemon(page);
       assert.deepEqual(held.requests, [{ name: "UpdateScriptInstance", variables: sent }]);
-      assert.equal(held.instances[0].inputs[1].value, "fixture-token-1");
+      assert.equal(held.instances[0].inputs[1].secretId, "s1");
     } finally { await page.close(); }
   }
 });
@@ -715,8 +760,8 @@ test("an instance its header has moved away from is brought back in line, from i
       assert.deepEqual(held.requests, [{ name: "ReapplyScriptHeader", variables: { id: "4" } }]);
       // The saved value is kept, the inputs it lacked arrive at their defaults, and the one never declared is gone.
       assert.deepEqual(held.instances.find((entry) => entry.id === "4").inputs, [
-        { name: "Label", value: "queued", secret: false }, { name: "Mode", value: "quiet", secret: false },
-        { name: "Attach", value: "no", secret: false },
+        { name: "Label", value: "queued", secretId: null }, { name: "Mode", value: "quiet", secretId: null },
+        { name: "Attach", value: "no", secretId: null },
       ]);
     } finally { await page.close(); }
   }
@@ -738,8 +783,8 @@ test("set up from header creates an instance for each trigger the header declare
     assert.deepEqual(held.requests, [{ name: "SetUpScriptFromHeader", variables: { script: "archive.py" } }]);
     // The header's defaults are saved; a secret has no value to copy.
     assert.deepEqual(held.instances.slice(-2).map((entry) => [entry.trigger, entry.inputs]), [
-      ["POST_PROCESSING", [{ name: "Target", value: "/fixture/archive", secret: false }]],
-      ["SCHEDULER", [{ name: "Target", value: "/fixture/archive", secret: false }]],
+      ["POST_PROCESSING", [{ name: "Target", value: "/fixture/archive", secretId: null }]],
+      ["SCHEDULER", [{ name: "Target", value: "/fixture/archive", secretId: null }]],
     ]);
 
     // The editor of a new instance offers the same, while its script has a declared trigger with no instance.
@@ -761,6 +806,116 @@ test("set up from header creates an instance for each trigger the header declare
     assert.deepEqual(held.requests.at(-1), { name: "SetUpScriptFromHeader", variables: { script: "notify.py" } });
     const made = held.instances.at(-1);
     assert.deepEqual([made.name, made.trigger, made.queueEvent], ["notify.py", "QUEUE", "NZB_DOWNLOADED"]);
+  } finally { await page.close(); }
+});
+
+// The secrets screen: its one table and the row holding a given name.
+const secretsTable = (page) => page.getByRole("region", { name: "Secrets", exact: true });
+const secretRow = (page, name) => rows(secretsTable(page)).filter({ has: page.getByText(name, { exact: true }) });
+
+test("the secrets screen is one table of names and who links them, with one way to add", async () => {
+  const page = await open("?secrets");
+  try {
+    await secretRow(page, "Notify token").waitFor();
+    assert.equal(await page.getByRole("region").count(), 1);
+    for (const header of ["Name", "Used by", "Updated"]) {
+      assert.equal(await secretsTable(page).getByText(header, { exact: true }).count(), 1, header);
+    }
+    assert.equal(await rows(secretsTable(page)).count(), 2);
+    assert.equal(await secretRow(page, "Notify token").getByText("Notify", { exact: true }).count(), 1);
+    assert.equal(await secretRow(page, "Spare key").getByText("Not used", { exact: true }).count(), 1);
+    // One Add for the whole list, in the top bar, and no value anywhere.
+    assert.deepEqual(await controls(page).getByRole("button").allTextContents(), ["Add secret"]);
+    assert.equal(await page.getByText("fixture-token").count(), 0);
+    await shot(page, "secrets-table");
+  } finally { await page.close(); }
+});
+
+test("a secret is added, renamed and given a new value without its value ever being shown", async () => {
+  const page = await open("?secrets");
+  try {
+    await action(controls(page), "Add secret").click();
+    let editor = secretDialog(page, "Add secret");
+    assert.equal(await secretField(editor, "Value").getAttribute("type"), "password");
+    assert.equal(await secretField(editor, "Value").getAttribute("placeholder"), null);
+    await field(editor, "Name").fill("Mail token");
+    // A new secret needs a value, and the dialog says so itself.
+    await action(editor, "Save").click();
+    await editor.getByText("Type the value to keep.", { exact: true }).waitFor();
+    assert.equal(await page.locator("#status").textContent(), "");
+    await secretField(editor, "Value").fill("fixture-token-3");
+    await action(editor, "Save").click();
+    await status(page, "Secret Mail token created").waitFor();
+    await editor.waitFor({ state: "detached" });
+    await secretRow(page, "Mail token").getByText("Not used", { exact: true }).waitFor();
+
+    // A row opens its secret: the name to change, and a value field that starts blank.
+    await secretRow(page, "Mail token").getByText("Mail token", { exact: true }).click();
+    editor = secretDialog(page, "Mail token");
+    assert.equal(await field(editor, "Name").inputValue(), "Mail token");
+    assert.equal(await secretField(editor, "Value").inputValue(), "");
+    assert.equal(await secretField(editor, "Value").getAttribute("placeholder"), "Saved · leave blank to keep");
+    await shot(page, "secret-editor");
+    await field(editor, "Name").fill("Mail key");
+    await action(editor, "Save").click();
+    await status(page, "Secret Mail key saved").waitFor();
+    await secretRow(page, "Mail key").waitFor();
+
+    await secretRow(page, "Mail key").getByText("Mail key", { exact: true }).click();
+    editor = secretDialog(page, "Mail key");
+    await secretField(editor, "Value").fill("fixture-token-4");
+    await action(editor, "Save").click();
+    await status(page, "Secret Mail key saved").waitFor();
+    // A rename sends only the name; a blank value field is not sent, and a typed one is.
+    const held = await daemon(page);
+    assert.deepEqual(held.requests, [
+      { name: "CreateSecret", variables: { name: "Mail token", value: "fixture-token-3" } },
+      { name: "UpdateSecret", variables: { id: "s3", name: "Mail key", value: null } },
+      { name: "UpdateSecret", variables: { id: "s3", name: null, value: "fixture-token-4" } },
+    ]);
+    assert.equal(held.secrets.find((entry) => entry.id === "s3").value, "fixture-token-4");
+    assert.equal(await page.getByText("fixture-token").count(), 0);
+  } finally { await page.close(); }
+});
+
+test("a secret an instance links cannot be deleted, and the refusal names the instance inside its dialog", async () => {
+  const page = await open("?secrets");
+  try {
+    const confirm = page.getByRole("dialog", { name: "Delete secret", exact: true });
+    await secretRow(page, "Notify token").getByText("Notify token", { exact: true }).click();
+    let editor = secretDialog(page, "Notify token");
+    await action(editor, "Delete").click();
+    await confirm.getByText("Delete Notify token? An instance that still links it keeps it from being deleted.", { exact: true }).waitFor();
+    await action(confirm, "Delete").click();
+    await editor.getByText("secret 'Notify token' is used by Notify", { exact: true }).waitFor();
+    await confirm.waitFor({ state: "detached" });
+    assert.equal(await page.locator("#status").textContent(), "");
+    await action(editor, "Cancel").click();
+    await editor.waitFor({ state: "detached" });
+    assert.equal(await secretRow(page, "Notify token").count(), 1);
+
+    // One nothing links goes.
+    await secretRow(page, "Spare key").getByText("Spare key", { exact: true }).click();
+    editor = secretDialog(page, "Spare key");
+    await action(editor, "Delete").click();
+    await action(confirm, "Delete").click();
+    await status(page, "Secret Spare key deleted").waitFor();
+    await editor.waitFor({ state: "detached" });
+    await secretRow(page, "Spare key").waitFor({ state: "detached" });
+    assert.deepEqual((await daemon(page)).requests, [
+      { name: "DeleteSecret", variables: { id: "s1" } },
+      { name: "DeleteSecret", variables: { id: "s2" } },
+    ]);
+  } finally { await page.close(); }
+});
+
+test("no secrets says so and offers to add one", async () => {
+  const page = await open("?secrets&empty");
+  try {
+    await secretsTable(page).getByText("No secrets yet.", { exact: true }).waitFor();
+    assert.equal(await rows(secretsTable(page)).count(), 0);
+    await action(secretsTable(page), "Add secret").click();
+    await secretDialog(page, "Add secret").waitFor();
   } finally { await page.close(); }
 });
 

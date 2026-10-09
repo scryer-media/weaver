@@ -1,4 +1,5 @@
 import type { Translate } from "@/lib/context/translate-context";
+import type { SecretRef } from "./secrets";
 
 /**
  * Script instances: a script wired to one trigger, with what was saved for it.
@@ -49,10 +50,18 @@ export interface ScriptOption {
   defaultValue?: string | null;
 }
 
-/** One input. A secret's value is never read back, so it is null. */
+/** One saved input: a value, or the named secret it links. A secret's value is never read back. */
 export interface ScriptInstanceValue {
   name: string;
-  value: string | null;
+  /** Empty when the input links a secret. */
+  value: string;
+  secret: SecretRef | null;
+}
+
+/** One input a header declares, at its default. A secret input has no value: it links a secret. */
+export interface ScriptPresetValue {
+  name: string;
+  value: string;
   secret: boolean;
 }
 
@@ -65,7 +74,7 @@ export interface ScriptPresetTrigger {
 export interface ScriptPreset {
   triggers: ScriptPresetTrigger[];
   taskTimes: string[];
-  inputs: ScriptInstanceValue[];
+  inputs: ScriptPresetValue[];
 }
 
 export interface DiscoveredScript {
@@ -231,14 +240,14 @@ export function unwiredTriggers(
 
 /* -------------------------------------------------------------------- form */
 
-/** One input as the editor holds it. */
+/** One input as the editor holds it: a value, or a slot that links a named secret. */
 export interface InstanceInputForm {
   name: string;
-  /** What is typed. A secret starts blank, whatever is saved. */
+  /** What is typed. Unused while the input is a secret. */
   value: string;
   secret: boolean;
-  /** A secret the daemon already holds a value for: left blank, it is kept. */
-  stored: boolean;
+  /** The secret a secret input links; null until one is chosen. */
+  secretId: string | null;
 }
 
 export interface InstanceForm {
@@ -264,9 +273,9 @@ function presetInputs(script: DiscoveredScript | undefined): InstanceInputForm[]
   return (script?.preset.inputs ?? []).map((input) => ({
     name: input.name,
     // A secret is never pre-filled from the header.
-    value: input.secret ? "" : (input.value ?? ""),
+    value: input.secret ? "" : input.value,
     secret: input.secret,
-    stored: false,
+    secretId: null,
   }));
 }
 
@@ -297,15 +306,16 @@ export function firstQueueEvent(script: DiscoveredScript | undefined): QueueEven
 /**
  * A saved instance as the editor shows it.
  *
- * A secret the header declares and the instance was never given has no saved
- * input at all, so it is added here: otherwise there would be nowhere to type it.
+ * A secret the header declares and the instance was never linked to has no
+ * saved input at all, so it is added here: otherwise there would be nowhere to
+ * choose one.
  */
 export function formFromInstance(instance: ScriptInstance, script: DiscoveredScript | undefined): InstanceForm {
   const inputs: InstanceInputForm[] = instance.inputs.map((input) => ({
     name: input.name,
-    value: input.secret ? "" : (input.value ?? ""),
-    secret: input.secret,
-    stored: input.secret,
+    value: input.secret ? "" : input.value,
+    secret: input.secret !== null,
+    secretId: input.secret?.id ?? null,
   }));
   for (const declared of presetInputs(script)) {
     if (declared.secret && !inputs.some((input) => sameName(input.name, declared.name))) {
@@ -337,30 +347,41 @@ export function withScript(form: InstanceForm, script: DiscoveredScript | undefi
   return { ...fresh, name: form.name, enabled: form.enabled, blocking: form.blocking, timeoutSeconds: form.timeoutSeconds };
 }
 
+/** An input as the daemon is sent it: a plain value, or the id of the secret it links. */
+export type ScriptInstanceValueInput = { name: string; value: string } | { name: string; secretId: string };
+
 export interface ScriptInstanceInput {
   name: string;
   script: string;
   trigger: ScriptKind;
   queueEvent: QueueEvent | null;
-  inputs: { name: string; value: string | null; secret: boolean }[];
+  inputs: ScriptInstanceValueInput[];
   categories: string[];
   enabled: boolean;
   blocking: boolean;
   timeoutSeconds: number | null;
 }
 
-/** What the daemon is sent for a form. A secret left blank is sent without a value, which keeps the saved one. */
+/**
+ * The input as it is sent. A secret input sends the secret it links; one with
+ * no secret chosen is left out, as there is nothing to give the script.
+ */
+function sentInput(input: InstanceInputForm): ScriptInstanceValueInput[] {
+  const name = input.name.trim();
+  if (!input.secret) {
+    return [{ name, value: input.value }];
+  }
+  return input.secretId === null ? [] : [{ name, secretId: input.secretId }];
+}
+
+/** What the daemon is sent for a form. */
 export function inputFromForm(form: InstanceForm): ScriptInstanceInput {
   return {
     name: form.name.trim(),
     script: form.script,
     trigger: form.trigger,
     queueEvent: form.trigger === "QUEUE" ? form.queueEvent : null,
-    inputs: form.inputs.map((input) => ({
-      name: input.name.trim(),
-      value: input.secret && input.value === "" ? null : input.value,
-      secret: input.secret,
-    })),
+    inputs: form.inputs.flatMap(sentInput),
     categories: categoryScoped(form.trigger) ? form.categories : [],
     enabled: form.enabled,
     blocking: form.blocking,
@@ -368,7 +389,7 @@ export function inputFromForm(form: InstanceForm): ScriptInstanceInput {
   };
 }
 
-/** A saved instance sent back as it is, apart from `patch`. Its secrets are kept. */
+/** A saved instance sent back as it is, apart from `patch`. Its secret links are kept. */
 export function inputFromInstance(
   instance: ScriptInstance,
   patch: Partial<Pick<ScriptInstanceInput, "enabled" | "blocking">> = {},
@@ -378,17 +399,24 @@ export function inputFromInstance(
     script: instance.script,
     trigger: instance.trigger,
     queueEvent: instance.trigger === "QUEUE" ? instance.queueEvent : null,
-    inputs: instance.inputs.map((input) => ({
-      name: input.name,
-      value: input.secret ? null : (input.value ?? ""),
-      secret: input.secret,
-    })),
+    inputs: instance.inputs.map((input) =>
+      input.secret ? { name: input.name, secretId: input.secret.id } : { name: input.name, value: input.value },
+    ),
     categories: instance.categories,
     enabled: instance.enabled,
     blocking: instance.blocking,
     timeoutSeconds: instance.timeoutSeconds,
     ...patch,
   };
+}
+
+/**
+ * The input after its secret box is ticked or cleared. Either way it starts
+ * empty: a typed value never becomes a secret, and a secret's link never
+ * becomes a value.
+ */
+export function withSecret(input: InstanceInputForm, secret: boolean): InstanceInputForm {
+  return { ...input, secret, value: "", secretId: null };
 }
 
 /** Letters, digits, `_` and `-`, starting with a letter; dots join such parts. */

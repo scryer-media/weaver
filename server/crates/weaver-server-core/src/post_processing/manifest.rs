@@ -114,6 +114,113 @@ pub fn apply_bare_script_declarations(manifest: ScriptManifest, script: &str) ->
     apply_declarations(manifest, kinds, queue_events, task_times)
 }
 
+/// Words that mark a header option as a credential. A hint for the form, not
+/// a lock: the operator may still save the input as plain text.
+const SECRET_NAME_HINTS: [&str; 6] = ["key", "token", "password", "pass", "secret", "apikey"];
+const MAX_HEADER_OPTIONS: usize = 256;
+
+/// Whether an option's name says it holds a credential.
+pub fn option_name_suggests_secret(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SECRET_NAME_HINTS.iter().any(|hint| name.contains(hint))
+}
+
+/// The options a bare NZBGet script declares in its header: the `#Name=value`
+/// lines of the `### OPTIONS ###` section, each with the comment lines above
+/// it as its description. An option whose name reads as a credential is
+/// declared secret and loses its default, since a secret never has one.
+pub fn bare_script_options(script: &str) -> Vec<ScriptOption> {
+    if bare_script_kind_header(script).is_none() {
+        return Vec::new();
+    }
+    let mut options = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut in_options = false;
+    let mut description = Vec::<String>::new();
+    let mut bytes = 0;
+    for line in script.split_inclusive('\n') {
+        bytes += line.len();
+        if bytes > MAX_LEGACY_METADATA_BYTES || options.len() >= MAX_HEADER_OPTIONS {
+            break;
+        }
+        let line = line.trim();
+        // A rule of `#` characters only separates parts of the header.
+        if !line.is_empty() && line.chars().all(|character| character == '#') {
+            continue;
+        }
+        if let Some(heading) = line.strip_prefix("###") {
+            if in_options {
+                break;
+            }
+            let heading = heading.trim().trim_end_matches('#').trim();
+            in_options = heading.eq_ignore_ascii_case("OPTIONS")
+                || heading.eq_ignore_ascii_case("OPTIONS SECTION");
+            continue;
+        }
+        if !in_options {
+            continue;
+        }
+        let Some(comment) = line.strip_prefix('#') else {
+            if line.is_empty() {
+                continue;
+            }
+            break;
+        };
+        if comment.is_empty() || comment.starts_with(char::is_whitespace) {
+            let text = comment.trim();
+            if !text.is_empty() {
+                description.push(text.to_string());
+            }
+            continue;
+        }
+        let described = std::mem::take(&mut description);
+        let Some((name, default)) = comment.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let Ok(option_name) = OptionName::new(name) else {
+            continue;
+        };
+        if !seen.insert(name.to_ascii_uppercase()) {
+            continue;
+        }
+        let (option_type, default) = if option_name_suggests_secret(name) {
+            (ScriptOptionType::Secret, None)
+        } else {
+            (
+                ScriptOptionType::String,
+                Some(OptionValue::String(default.trim().to_string())),
+            )
+        };
+        let option = ScriptOption::new(
+            None,
+            option_name.clone(),
+            option_type,
+            default.clone(),
+            None,
+            described,
+            Vec::new(),
+            false,
+        )
+        .or_else(|_| {
+            ScriptOption::new(
+                None,
+                option_name,
+                option_type,
+                default,
+                None,
+                Vec::new(),
+                Vec::new(),
+                false,
+            )
+        });
+        if let Ok(option) = option {
+            options.push(option);
+        }
+    }
+    options
+}
+
 fn apply_declarations(
     manifest: ScriptManifest,
     kind: &str,

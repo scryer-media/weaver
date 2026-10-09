@@ -41,19 +41,21 @@ export type ScriptLists = { global: ListEntry[]; categories: Array<{ category: s
 export type ScriptTrigger = "POST_PROCESSING" | "QUEUE" | "SCAN" | "SCHEDULER" | "FEED";
 export type ScriptInstance = {
   id: string; name: string; script: string; trigger: ScriptTrigger; queueEvent: string | null;
-  inputs: Array<{ name: string; value: string | null; secret: boolean }>;
+  /** A secret input shows the secret it links, never a value. */
+  inputs: Array<{ name: string; value: string; secret: { id: string; name: string } | null }>;
   categories: string[]; enabled: boolean; blocking: boolean; timeoutSeconds: number | null; runOrder: number;
 };
 export type ScriptInstanceInput = {
   name?: string; script: string; trigger: ScriptTrigger; queueEvent?: string | null;
-  inputs?: Array<{ name: string; value: string | null; secret?: boolean }>;
+  /** Each input is a plain `value` or the `secretId` of a named secret. */
+  inputs?: Array<{ name: string; value?: string; secretId?: string }>;
   categories?: string[]; enabled?: boolean; blocking?: boolean; timeoutSeconds?: number | null;
 };
 
 const SETTINGS_FIELDS = `eventScriptConcurrency eventScriptTimeoutSeconds fileDownloadedEventInterval
   scriptOutputCeilingBytes scriptOutputRunsPerJob scriptOutputRingBytes scriptOutputRunCapBytes
   scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution globalScriptsRun`;
-const INSTANCE_FIELDS = "id name script trigger queueEvent inputs { name value secret } categories enabled blocking timeoutSeconds runOrder";
+const INSTANCE_FIELDS = "id name script trigger queueEvent inputs { name value secret { id name } } categories enabled blocking timeoutSeconds runOrder";
 
 /** Every saved instance, in run order. */
 export async function scriptInstances(request: APIRequestContext): Promise<ScriptInstance[]> {
@@ -64,6 +66,20 @@ export async function scriptInstances(request: APIRequestContext): Promise<Scrip
 export async function createScriptInstance(request: APIRequestContext, input: ScriptInstanceInput): Promise<ScriptInstance> {
   return (await graphql<{ createScriptInstance: ScriptInstance }>(request,
     `mutation($input: ScriptInstanceInput!) { createScriptInstance(input: $input) { ${INSTANCE_FIELDS} } }`, { input })).createScriptInstance;
+}
+
+export type Secret = { id: string; name: string; usedBy: Array<{ id: string; name: string }> };
+
+/** Keep `value` under `name`, for a secret input to link by id. The value is never read back. */
+export async function createSecret(request: APIRequestContext, name: string, value: string): Promise<Secret> {
+  return (await graphql<{ createSecret: Secret }>(request,
+    "mutation($name: String!, $value: String!) { createSecret(name: $name, value: $value) { id name usedBy { id name } } }",
+    { name, value })).createSecret;
+}
+
+/** Remove a secret no instance links any more. */
+export async function deleteSecret(request: APIRequestContext, id: string): Promise<void> {
+  await graphql(request, "mutation($id: String!) { deleteSecret(id: $id) }", { id });
 }
 
 /** Remove an instance; any schedule rule that ran it goes with it. */
@@ -130,7 +146,7 @@ export async function setScriptSettings(request: APIRequestContext, patch: Parti
 type Preset = {
   triggers: Array<{ trigger: ScriptTrigger; queueEvent: string | null }>;
   taskTimes: string[];
-  inputs: Array<{ name: string; value: string | null; secret: boolean }>;
+  inputs: Array<{ name: string; value: string; secret: boolean }>;
 };
 
 /** What each listed script's header asks for, by script name. */
@@ -161,7 +177,7 @@ export async function setScriptLists(request: APIRequestContext, lists: Partial<
       const instance = await createScriptInstance(request, {
         script: entry.script, trigger, queueEvent, enabled, timeoutSeconds: entry.timeoutSeconds ?? null,
         categories: category === null ? [] : [category],
-        inputs: (preset?.inputs ?? []).filter(input => !input.secret).map(({ name, value }) => ({ name, value: value ?? "" })),
+        inputs: (preset?.inputs ?? []).filter(input => !input.secret).map(({ name, value }) => ({ name, value })),
       });
       if (trigger !== "SCHEDULER" || category !== null) continue;
       // A start-up time is only run by a rule that opts into it.

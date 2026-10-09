@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use weaver_server_api::auth::CallerScope;
 
 /// Every field of a saved instance.
-const INSTANCE: &str = "id name script trigger queueEvent inputs { name value secret } categories enabled blocking timeoutSeconds runOrder scriptProblem headerDrift";
+const INSTANCE: &str = "id name script trigger queueEvent inputs { name value secret { id name } } categories enabled blocking timeoutSeconds runOrder scriptProblem headerDrift";
 
 /// Write a bare script into the harness's `data_dir/scripts`.
 async fn write_script(harness: &TestHarness, name: &str, body: &str) {
@@ -115,7 +115,7 @@ async fn scripts_directory_is_admin_owned_and_turns_every_instance_off_when_chan
     assert_eq!(saved[0]["enabled"], false);
     assert_eq!(
         saved[0]["inputs"],
-        json!([{ "name": "Host", "value": "example.invalid", "secret": false }])
+        json!([{ "name": "Host", "value": "example.invalid", "secret": null }])
     );
     assert!(
         saved[0]["scriptProblem"]
@@ -543,7 +543,7 @@ async fn an_update_replaces_what_is_saved_and_may_keep_naming_a_script_that_has_
     assert_eq!(updated["runOrder"], created["runOrder"]);
     assert_eq!(
         updated["inputs"],
-        json!([{ "name": "Port", "value": "25", "secret": false }])
+        json!([{ "name": "Port", "value": "25", "secret": null }])
     );
     assert_eq!(instances(&harness).await, vec![updated.clone()]);
 
@@ -551,6 +551,30 @@ async fn an_update_replaces_what_is_saved_and_may_keep_naming_a_script_that_has_
     let moved = update(r#"script: "other.sh", trigger: SCAN"#).await;
     assert_has_errors(&moved);
     assert_eq!(instances(&harness).await, vec![updated.clone()]);
+}
+
+fn error_code(response: &async_graphql::Response) -> String {
+    match response.errors[0]
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get("code"))
+    {
+        Some(async_graphql::Value::String(code)) => code.clone(),
+        other => panic!("no error code: {other:?}"),
+    }
+}
+
+/// Create a named secret and return what the API reports for it.
+async fn create_secret(harness: &TestHarness, name: &str, value: &str) -> Value {
+    let response = harness
+        .execute(&format!(
+            "mutation {{ createSecret(name: {}, value: {}) {{ id name createdAt updatedAt usedBy {{ id name }} }} }}",
+            serde_json::to_string(name).unwrap(),
+            serde_json::to_string(value).unwrap(),
+        ))
+        .await;
+    assert_no_errors(&response);
+    response_data(&response)["createSecret"].clone()
 }
 
 #[tokio::test]
@@ -587,7 +611,8 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     .unwrap();
     std::fs::write(package.join("email.py"), "#!/usr/bin/env python3\n").unwrap();
 
-    // The header is offered as a starting point and nothing more.
+    // The header is offered as a starting point and nothing more. A secret
+    // input is a slot for a secret, never a value.
     let listing = harness
         .execute(
             "{ discoveredScripts { scripts { name options { name optionType defaultValue } preset { triggers { trigger queueEvent } taskTimes inputs { name value secret } } } } }",
@@ -608,51 +633,67 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
             "taskTimes": [],
             "inputs": [
                 { "name": "Host", "value": "mail.example.invalid", "secret": false },
-                { "name": "Token", "value": null, "secret": true }
+                { "name": "Token", "value": "", "secret": true }
             ]
         })
     );
 
-    // What is sent is what is saved, whatever the header declares.
-    let created = create_instance(
-        &harness,
-        r#"script: "email", trigger: POST_PROCESSING, inputs: [
-            { name: "Host", value: "smtp.example.invalid" }
-            { name: "Token", value: "hunter2", secret: true }
-            { name: "Extra", value: "x" }
-        ]"#,
-    )
-    .await;
-    let secret = json!({ "name": "Token", "value": null, "secret": true });
+    // What is sent is what is saved, whatever the header declares. A secret
+    // input is a link to a named secret.
+    let mail = create_secret(&harness, "Mail token", "hunter2").await;
+    let mail_id = mail["id"].as_str().unwrap().to_string();
+    let response = harness
+        .execute(&format!(
+            r#"mutation {{ createScriptInstance(input: {{ script: "email", trigger: POST_PROCESSING, inputs: [
+                {{ name: "Host", value: "smtp.example.invalid" }}
+                {{ name: "Token", secretId: "{mail_id}" }}
+                {{ name: "Extra", value: "x" }}
+            ] }}) {{ {INSTANCE} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert!(!format!("{:?}", response.data).contains("hunter2"));
+    let created = response_data(&response)["createScriptInstance"].clone();
+    let linked = json!({
+        "name": "Token",
+        "value": "",
+        "secret": { "id": mail_id, "name": "Mail token" }
+    });
     assert_eq!(
         created["inputs"],
         json!([
-            { "name": "Host", "value": "smtp.example.invalid", "secret": false },
-            secret,
-            { "name": "Extra", "value": "x", "secret": false }
+            { "name": "Host", "value": "smtp.example.invalid", "secret": null },
+            linked,
+            { "name": "Extra", "value": "x", "secret": null }
         ]),
-        "a stored secret must never be echoed back"
     );
     assert_eq!(
         created["headerDrift"], true,
         "the instance holds an input the header does not declare"
     );
-    let stored = harness.db.script_instance(&id(&created)).unwrap().unwrap();
-    assert!(
-        stored
-            .inputs
-            .iter()
-            .all(|input| !input.value.contains("hunter2")),
-        "a secret is not carried in what is read from the store"
-    );
 
-    // A secret sent without a value is kept; everything else is replaced.
+    // An input is a value or a link, never both or neither, and a link has
+    // to name a secret that exists.
+    for inputs in [
+        format!(r#"{{ name: "Token", value: "x", secretId: "{mail_id}" }}"#),
+        r#"{ name: "Token" }"#.to_string(),
+        r#"{ name: "Token", secretId: "missing" }"#.to_string(),
+    ] {
+        let refused = harness
+            .execute(&format!(
+                r#"mutation {{ createScriptInstance(input: {{ script: "email", trigger: POST_PROCESSING, inputs: [{inputs}] }}) {{ id }} }}"#
+            ))
+            .await;
+        assert_has_errors(&refused);
+    }
+
+    // Everything is replaced by what is sent; a link is sent as a link.
     let updated = harness
         .execute(&format!(
             r#"mutation {{ updateScriptInstance(id: "{}", input: {{ script: "email", trigger: POST_PROCESSING, inputs: [
-                {{ name: "Token", secret: true }}
+                {{ name: "Token", secretId: "{mail_id}" }}
                 {{ name: "Extra", value: "y" }}
-            ] }}) {{ inputs {{ name value secret }} headerDrift }} }}"#,
+            ] }}) {{ inputs {{ name value secret {{ id name }} }} headerDrift }} }}"#,
             id(&created)
         ))
         .await;
@@ -660,12 +701,13 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     let updated = &response_data(&updated)["updateScriptInstance"];
     assert_eq!(
         updated["inputs"],
-        json!([secret, { "name": "Extra", "value": "y", "secret": false }])
+        json!([linked, { "name": "Extra", "value": "y", "secret": null }])
     );
     assert_eq!(updated["headerDrift"], true);
 
     // Bringing it back in line with the header keeps what the operator saved
-    // under a name the header still declares and drops the rest.
+    // under a name the header still declares, link included, and drops the
+    // rest.
     let denied = harness
         .execute_as(
             &format!(
@@ -678,7 +720,7 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     assert_has_errors(&denied);
     let reapplied = harness
         .execute(&format!(
-            r#"mutation {{ reapplyScriptHeader(id: "{}") {{ inputs {{ name value secret }} headerDrift }} }}"#,
+            r#"mutation {{ reapplyScriptHeader(id: "{}") {{ inputs {{ name value secret {{ id name }} }} headerDrift }} }}"#,
             id(&created)
         ))
         .await;
@@ -687,8 +729,8 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     assert_eq!(
         reapplied["inputs"],
         json!([
-            { "name": "Host", "value": "mail.example.invalid", "secret": false },
-            secret
+            { "name": "Host", "value": "mail.example.invalid", "secret": null },
+            linked
         ])
     );
     assert_eq!(reapplied["headerDrift"], false);
@@ -697,6 +739,124 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
         .execute(r#"mutation { reapplyScriptHeader(id: "nope") { id } }"#)
         .await;
     assert_has_errors(&nothing_there);
+}
+
+#[tokio::test]
+async fn secrets_are_admin_only_named_once_kept_while_linked_and_never_read_back() {
+    let harness = TestHarness::new().await;
+    write_script(&harness, "notify.sh", "#!/bin/sh\nexit 0\n").await;
+
+    // Listing names needs an administrator; changing them a fresh one.
+    let listed = harness
+        .execute_as("{ secrets { id name } }", CallerScope::Read)
+        .await;
+    assert_has_errors(&listed);
+    let listed = harness
+        .execute_as("{ secrets { id name } }", CallerScope::Control)
+        .await;
+    assert_has_errors(&listed);
+    let denied = harness
+        .execute_as(
+            r#"mutation { createSecret(name: "Token", value: "hunter2") { id } }"#,
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&denied);
+    assert!(harness.db.secrets().unwrap().is_empty());
+
+    let mut responses = Vec::new();
+    let token = create_secret(&harness, "Notify token", "hunter2").await;
+    let token_id = token["id"].as_str().unwrap().to_string();
+    assert_eq!(token["name"], "Notify token");
+    assert_eq!(token["usedBy"], json!([]));
+    assert_eq!(token["createdAt"], token["updatedAt"]);
+
+    let taken = harness
+        .execute(r#"mutation { createSecret(name: "NOTIFY TOKEN", value: "other") { id } }"#)
+        .await;
+    assert_has_errors(&taken);
+    assert_eq!(error_code(&taken), "NAME_TAKEN");
+    responses.push(taken);
+    let blank = harness
+        .execute(r#"mutation { createSecret(name: "  ", value: "other") { id } }"#)
+        .await;
+    assert_eq!(error_code(&blank), "INVALID_INPUT");
+
+    let instance = create_instance(
+        &harness,
+        &format!(
+            r#"name: "Notify", script: "notify.sh", trigger: POST_PROCESSING, inputs: [{{ name: "Token", secretId: "{token_id}" }}]"#
+        ),
+    )
+    .await;
+
+    // Renaming it shows on every link.
+    let rotated = harness
+        .execute(&format!(
+            r#"mutation {{ updateSecret(id: "{token_id}", name: "Renamed token", value: "hunter3") {{ id name usedBy {{ id name }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&rotated);
+    assert_eq!(
+        response_data(&rotated)["updateSecret"],
+        json!({
+            "id": token_id,
+            "name": "Renamed token",
+            "usedBy": [{ "id": id(&instance), "name": "Notify" }]
+        })
+    );
+    responses.push(rotated);
+    let missing = harness
+        .execute(r#"mutation { updateSecret(id: "missing", value: "x") { id } }"#)
+        .await;
+    assert_eq!(error_code(&missing), "NOT_FOUND");
+
+    // A linked secret cannot be deleted, and the refusal names who links it.
+    let in_use = harness
+        .execute(&format!(r#"mutation {{ deleteSecret(id: "{token_id}") }}"#))
+        .await;
+    assert_has_errors(&in_use);
+    assert_eq!(error_code(&in_use), "SECRET_IN_USE");
+    assert!(in_use.errors[0].message.contains("Notify"));
+    responses.push(in_use);
+
+    let listing = harness
+        .execute("{ secrets { id name createdAt updatedAt usedBy { id name } } }")
+        .await;
+    assert_no_errors(&listing);
+    assert_eq!(
+        response_data(&listing)["secrets"][0]["usedBy"],
+        json!([{ "id": id(&instance), "name": "Notify" }])
+    );
+    responses.push(listing);
+    responses.push(
+        harness
+            .execute(&format!("{{ scriptInstances {{ {INSTANCE} }} }}"))
+            .await,
+    );
+
+    // No response ever carries a value, however the secret was reached.
+    for response in &responses {
+        let text = format!("{response:?}");
+        assert!(!text.contains("hunter2") && !text.contains("hunter3"));
+    }
+
+    let deleted = harness
+        .execute(&format!(
+            r#"mutation {{ deleteScriptInstance(id: "{}") }}"#,
+            id(&instance)
+        ))
+        .await;
+    assert_no_errors(&deleted);
+    let removed = harness
+        .execute(&format!(r#"mutation {{ deleteSecret(id: "{token_id}") }}"#))
+        .await;
+    assert_no_errors(&removed);
+    let again = harness
+        .execute(&format!(r#"mutation {{ deleteSecret(id: "{token_id}") }}"#))
+        .await;
+    assert_eq!(error_code(&again), "NOT_FOUND");
+    assert!(harness.db.secrets().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ pub mod preset;
 pub mod runner;
 pub mod scan;
 pub mod scheduler;
+pub mod secrets;
 pub mod settings;
 pub mod test_run;
 

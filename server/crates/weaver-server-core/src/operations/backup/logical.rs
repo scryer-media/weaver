@@ -1862,6 +1862,11 @@ mod logical_reader_tests {
         }
         // The wiring as the build before instances saved it.
         let source = Database::open_in_memory().unwrap();
+        let sealed = crate::persistence::encryption::encrypt_value(
+            source.encryption_key().unwrap(),
+            "carried",
+        )
+        .unwrap();
         for (key, value) in [
             (
                 "post_processing.script_directory.v1",
@@ -1875,7 +1880,13 @@ mod logical_reader_tests {
                 })
                 .to_string(),
             ),
-            ("post_processing.script_options.v1", "{}".into()),
+            (
+                "post_processing.script_options.v1",
+                serde_json::json!({
+                    "tv.sh": {"secrets": [{"name": "Token", "ciphertext": sealed.clone()}]},
+                })
+                .to_string(),
+            ),
         ] {
             source.set_setting(key, &value).unwrap();
         }
@@ -1886,12 +1897,15 @@ mod logical_reader_tests {
             "script_instances",
             "script_instance_inputs",
             "script_instance_categories",
+            "secrets",
             "feed_scripts",
         ] {
             archive.tables.remove(table);
         }
 
-        let target = Database::open_in_memory().unwrap();
+        // A restore brings the bundle's key along with its values.
+        let mut target = Database::open_in_memory().unwrap();
+        target.set_encryption_key(source.encryption_key().unwrap().clone());
         target
             .import_logical_backup(&tables, &archive.tables, SCHEMA_VERSION - 1)
             .unwrap();
@@ -1938,6 +1952,82 @@ mod logical_reader_tests {
         ] {
             assert_eq!(target.get_setting(key).unwrap(), None, "{key}");
         }
+        // The saved secret option came across as a named secret the instance
+        // links.
+        let secrets = target.secrets().unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "tv.sh Token");
+        let tv = &target.script_instances().unwrap()[1];
+        assert_eq!(
+            tv.inputs[0]
+                .secret
+                .as_ref()
+                .map(|secret| secret.id.as_str()),
+            Some(secrets[0].id.as_str())
+        );
+        assert!(matches!(
+            target.script_instance_run_inputs(&tv.id).unwrap().unwrap()[0].value(),
+            crate::post_processing::model::OptionValue::Secret(value)
+                if value.expose_for_execution() == "carried"
+        ));
+    }
+
+    #[test]
+    fn named_secrets_and_their_links_round_trip_through_a_bundle() {
+        use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+        use crate::post_processing::model::{OptionValue, ScriptName};
+
+        let source = Database::open_in_memory().unwrap();
+        let token = source.create_secret("Mail token", "round-trip").unwrap();
+        let unused = source.create_secret("Spare", "unused").unwrap();
+        let instance = source
+            .create_script_instance(
+                ScriptInstanceDraft::new(
+                    ScriptName::new("notify.sh").unwrap(),
+                    InstanceTrigger::PostProcessing,
+                )
+                .input("Host", "mail.example.invalid")
+                .secret_input("Token", &token.id),
+            )
+            .unwrap();
+        let archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        assert_eq!(archive.tables["secrets"].rows, 2);
+        // The bundle carries the value sealed, never in clear.
+        let rows = read_table_objects(archive.staging.path(), "secrets").unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| !serde_json::to_string(row).unwrap().contains("round-trip"))
+        );
+
+        let mut target = Database::open_in_memory().unwrap();
+        target.set_encryption_key(source.encryption_key().unwrap().clone());
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap();
+        let restored = target.secrets().unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|secret| (
+                    secret.id.as_str(),
+                    secret.name.as_str(),
+                    secret.used_by.len()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (token.id.as_str(), "Mail token", 1),
+                (unused.id.as_str(), "Spare", 0),
+            ]
+        );
+        assert_eq!(
+            target.script_instance(&instance.id).unwrap().unwrap(),
+            instance
+        );
+        assert!(matches!(
+            target.script_instance_run_inputs(&instance.id).unwrap().unwrap()[1].value(),
+            OptionValue::Secret(value) if value.expose_for_execution() == "round-trip"
+        ));
     }
 
     #[test]

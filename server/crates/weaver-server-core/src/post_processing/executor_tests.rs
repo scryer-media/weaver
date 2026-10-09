@@ -6,6 +6,7 @@ use super::model::{
     GlobalScriptsRun, OptionValue, PostProcessingSettings, PostProcessingSummary, QueueEvent,
     ScriptAdapter, ScriptEventLabel, ScriptName, ScriptResult, ScriptStatus,
 };
+use super::secrets::SecretError;
 use super::settings::normalize_script_directory;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
@@ -95,15 +96,65 @@ fn settings_round_trip_through_the_settings_kv() {
     assert_eq!(db.post_processing_settings().unwrap(), settings);
 }
 
+/// What each input of an instance shows: its name, its plain value, and the
+/// name of the secret it links.
+fn shown(instance: &ScriptInstance) -> Vec<(&str, &str, Option<&str>)> {
+    instance
+        .inputs
+        .iter()
+        .map(|input| {
+            (
+                input.name.as_str(),
+                input.value.as_str(),
+                input.secret.as_ref().map(|secret| secret.name.as_str()),
+            )
+        })
+        .collect()
+}
+
+/// The value a run of `instance` is handed for input `name`, secrets included.
+fn run_value(db: &Database, instance: &str, name: &str) -> String {
+    let inputs = db.script_instance_run_inputs(instance).unwrap().unwrap();
+    match inputs
+        .iter()
+        .find(|input| input.name().as_str() == name)
+        .unwrap()
+        .value()
+    {
+        OptionValue::Secret(value) => value.expose_for_execution().to_string(),
+        OptionValue::String(value) => value.clone(),
+        other => panic!("unexpected input value {other:?}"),
+    }
+}
+
+/// The stored value of one secret, exactly as the row holds it.
+fn stored_secret(db: &Database, id: &str) -> String {
+    let datastore = db.datastore();
+    let id = id.to_string();
+    db.run_sql_blocking_read(async move {
+        SqlRuntime::fetch_optional(
+            datastore.read_exec(),
+            "SELECT value FROM secrets WHERE id = {}",
+            &[SqlArg::Text(id)],
+        )
+        .await?
+        .map(|row| row.text("value"))
+        .transpose()
+    })
+    .unwrap()
+    .unwrap()
+}
+
 #[test]
 fn an_instance_reads_back_as_it_was_saved() {
     let db = Database::open_in_memory().unwrap();
+    let token = db.create_secret("Family token", "hunter2").unwrap();
     let saved = db
         .create_script_instance(
             draft("notify.sh", InstanceTrigger::Queue(QueueEvent::NzbAdded))
                 .named("  Tell the family  ")
                 .input("Host", "mail.example.invalid")
-                .secret_input("Token", "hunter2")
+                .secret_input("Token", &token.id)
                 .input("Empty", "")
                 .category(" Movies ")
                 .category("movies")
@@ -122,27 +173,25 @@ fn an_instance_reads_back_as_it_was_saved() {
     assert!(!saved.blocking);
     assert_eq!(saved.timeout_seconds, Some(90));
     assert_eq!(
-        saved
-            .inputs
-            .iter()
-            .map(|input| (input.name.as_str(), input.value.as_str(), input.secret))
-            .collect::<Vec<_>>(),
-        // A secret's value is never handed back.
+        shown(&saved),
+        // A secret's value is never handed back, only its name.
         [
-            ("Host", "mail.example.invalid", false),
-            ("Token", "", true),
-            ("Empty", "", false),
+            ("Host", "mail.example.invalid", None),
+            ("Token", "", Some("Family token")),
+            ("Empty", "", None),
         ]
     );
     assert_eq!(db.script_instances().unwrap(), std::slice::from_ref(&saved));
     assert_eq!(db.script_instance(&saved.id).unwrap(), Some(saved.clone()));
     assert_eq!(db.script_instance("missing").unwrap(), None);
 
-    let sealed = stored_input(&db, &saved.id, "Token").unwrap();
+    // The input row holds only the link; the secret holds the value, sealed.
+    assert_eq!(stored_input(&db, &saved.id, "Token").unwrap(), "");
     assert!(
-        !sealed.contains("hunter2"),
-        "a secret input must not be stored in clear"
+        !stored_secret(&db, &token.id).contains("hunter2"),
+        "a secret must not be stored in clear"
     );
+    assert_eq!(run_value(&db, &saved.id, "Token"), "hunter2");
     let inputs = db.script_instance_run_inputs(&saved.id).unwrap().unwrap();
     assert_eq!(
         inputs
@@ -164,51 +213,76 @@ fn an_instance_reads_back_as_it_was_saved() {
 }
 
 #[test]
-fn an_update_keeps_a_secret_that_was_not_sent_again() {
+fn an_update_stores_the_links_it_is_sent() {
     let db = Database::open_in_memory().unwrap();
+    let token = db.create_secret("Token", "hunter2").unwrap();
+    let other = db.create_secret("Other", "second").unwrap();
     let saved = db
         .create_script_instance(
             draft("notify.sh", InstanceTrigger::PostProcessing)
                 .input("Host", "old.example.invalid")
-                .secret_input("Token", "hunter2")
-                .secret_input("Other", "second"),
+                .secret_input("Token", &token.id)
+                .secret_input("Other", &other.id),
         )
         .unwrap();
-    let sealed = stored_input(&db, &saved.id, "Token").unwrap();
 
-    // What the editor sends back: plain values as shown, secrets left alone.
+    // What the editor sends back: plain values as shown, links as shown.
     let mut edit = ScriptInstanceDraft::from_instance(&saved).named("Renamed");
     edit.inputs[0].value = Some("new.example.invalid".into());
     edit.inputs.retain(|input| input.name != "Other");
-    edit.inputs.push(InstanceInputDraft {
-        name: "NeverSet".into(),
-        value: None,
-        secret: true,
-    });
     let updated = db.update_script_instance(&saved.id, edit).unwrap();
 
     assert_eq!(updated.id, saved.id);
     assert_eq!(updated.name, "Renamed");
     assert_eq!(updated.run_order, saved.run_order);
     assert_eq!(
-        updated
-            .inputs
-            .iter()
-            .map(|input| (input.name.as_str(), input.value.as_str(), input.secret))
-            .collect::<Vec<_>>(),
-        // A secret that was never given a value has nothing to keep.
-        [("Host", "new.example.invalid", false), ("Token", "", true)]
+        shown(&updated),
+        [
+            ("Host", "new.example.invalid", None),
+            ("Token", "", Some("Token"))
+        ]
     );
-    assert_eq!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
     assert_eq!(stored_input(&db, &saved.id, "Other"), None);
+    // The secret the instance stopped linking is still there.
+    assert!(db.secret(&other.id).unwrap().unwrap().used_by.is_empty());
 
-    // Sending a value replaces what was stored.
+    // Linking another secret is just storing the other link.
     let mut edit = ScriptInstanceDraft::from_instance(&updated);
-    edit.inputs[1].value = Some("rotated".into());
+    edit.inputs[1] = InstanceInputDraft::secret("Token", &other.id);
     db.update_script_instance(&saved.id, edit).unwrap();
-    let rotated = stored_input(&db, &saved.id, "Token").unwrap();
-    assert_ne!(rotated, sealed);
-    assert!(!rotated.contains("rotated"));
+    assert_eq!(run_value(&db, &saved.id, "Token"), "second");
+
+    // An input is a value or a link, never both or neither, and a link must
+    // name a secret that exists.
+    for (input, reason) in [
+        (
+            InstanceInputDraft {
+                name: "Token".into(),
+                value: Some("x".into()),
+                secret_id: Some(token.id.clone()),
+            },
+            "an input holds either a value or a secret",
+        ),
+        (
+            InstanceInputDraft {
+                name: "Token".into(),
+                value: None,
+                secret_id: None,
+            },
+            "an input holds either a value or a secret",
+        ),
+        (
+            InstanceInputDraft::secret("Token", "missing"),
+            "a linked secret does not exist",
+        ),
+    ] {
+        let mut edit = ScriptInstanceDraft::from_instance(&updated);
+        edit.inputs[1] = input;
+        assert!(matches!(
+            db.update_script_instance(&saved.id, edit),
+            Err(ScriptInstanceError::Invalid(found)) if found == reason
+        ));
+    }
 
     assert!(matches!(
         db.update_script_instance("missing", draft("notify.sh", InstanceTrigger::Scan)),
@@ -217,23 +291,22 @@ fn an_update_keeps_a_secret_that_was_not_sent_again() {
 }
 
 #[test]
-fn a_secret_stays_with_the_instance_when_its_script_changes() {
+fn a_linked_secret_stays_with_the_instance_and_a_run_resolves_its_current_value() {
     let db = Database::open_in_memory().unwrap();
+    let token = db.create_secret("Token", "hunter2").unwrap();
     let saved = db
         .create_script_instance(
-            draft("notify.sh", InstanceTrigger::PostProcessing).secret_input("Token", "hunter2"),
+            draft("notify.sh", InstanceTrigger::PostProcessing).secret_input("Token", &token.id),
         )
         .unwrap();
-    let sealed = stored_input(&db, &saved.id, "Token").unwrap();
 
-    // Pointed at another script with the secret left as it was: it goes
-    // along, as stored, without being typed again.
+    // Pointed at another script, the link goes along without being chosen
+    // again.
     let mut moved = ScriptInstanceDraft::from_instance(&saved);
     moved.script = ScriptName::new("other.sh").unwrap();
     assert!(moved.inputs.iter().all(|input| input.value.is_none()));
     let updated = db.update_script_instance(&saved.id, moved).unwrap();
     assert_eq!(updated.script.as_str(), "other.sh");
-    assert_eq!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
     let run = db.script_instance_run_inputs(&saved.id).unwrap().unwrap();
     assert_eq!(run.len(), 1);
     assert_eq!(run[0].name().as_str(), "Token");
@@ -242,12 +315,115 @@ fn a_secret_stays_with_the_instance_when_its_script_changes() {
         OptionValue::Secret(value) if value.expose_for_execution() == "hunter2"
     ));
 
-    // A value sent with the change replaces it.
-    let mut rotated = ScriptInstanceDraft::from_instance(&updated);
-    rotated.script = ScriptName::new("notify.sh").unwrap();
-    rotated.inputs[0].value = Some("hunter3".into());
-    db.update_script_instance(&saved.id, rotated).unwrap();
-    assert_ne!(stored_input(&db, &saved.id, "Token").unwrap(), sealed);
+    // Rotating the secret changes what the next run is handed.
+    db.update_secret(&token.id, None, Some("hunter3")).unwrap();
+    assert_eq!(run_value(&db, &saved.id, "Token"), "hunter3");
+    // Renaming it changes what the input shows, not what the script sees.
+    db.update_secret(&token.id, Some("Renamed token"), None)
+        .unwrap();
+    assert_eq!(
+        shown(&db.script_instance(&saved.id).unwrap().unwrap()),
+        [("Token", "", Some("Renamed token"))]
+    );
+    assert_eq!(run_value(&db, &saved.id, "Token"), "hunter3");
+}
+
+#[test]
+fn secrets_are_created_renamed_rotated_and_deleted_only_when_unused() {
+    let db = Database::open_in_memory().unwrap();
+    let token = db.create_secret("  Mail token ", "first").unwrap();
+    assert_eq!(token.name, "Mail token");
+    assert!(token.used_by.is_empty());
+    let sealed = stored_secret(&db, &token.id);
+    assert!(!sealed.contains("first"));
+
+    // Names are unique without regard to case.
+    assert!(matches!(
+        db.create_secret("MAIL TOKEN", "x"),
+        Err(SecretError::NameTaken)
+    ));
+    for name in ["", "   ", "two\nlines", &"x".repeat(129)] {
+        assert!(matches!(
+            db.create_secret(name, "x"),
+            Err(SecretError::Invalid(_))
+        ));
+    }
+    assert!(matches!(
+        db.create_secret("Nul", "a\0b"),
+        Err(SecretError::Invalid(_))
+    ));
+    db.create_secret(&"x".repeat(128), "x").unwrap();
+
+    let spare = db.create_secret("Spare", "spare").unwrap();
+    assert!(matches!(
+        db.update_secret(&spare.id, Some("mail Token"), None),
+        Err(SecretError::NameTaken)
+    ));
+    // Its own name under another casing is still its own.
+    let renamed = db
+        .update_secret(&token.id, Some("MAIL TOKEN"), None)
+        .unwrap();
+    assert_eq!(renamed.name, "MAIL TOKEN");
+    assert_eq!(stored_secret(&db, &token.id), sealed);
+    let rotated = db.update_secret(&token.id, None, Some("second")).unwrap();
+    assert_ne!(stored_secret(&db, &token.id), sealed);
+    assert_eq!(rotated.created_at_ms, token.created_at_ms);
+    assert!(matches!(
+        db.update_secret("missing", None, Some("x")),
+        Err(SecretError::NotFound)
+    ));
+
+    let first = db
+        .create_script_instance(
+            draft("a.sh", InstanceTrigger::PostProcessing)
+                .named("Zeta")
+                .secret_input("Token", &token.id),
+        )
+        .unwrap();
+    let second = db
+        .create_script_instance(
+            draft("b.sh", InstanceTrigger::Scan)
+                .named("alpha")
+                .secret_input("Token", &token.id)
+                .secret_input("Again", &token.id),
+        )
+        .unwrap();
+    let listed = db.secret(&token.id).unwrap().unwrap();
+    assert_eq!(
+        listed
+            .used_by
+            .iter()
+            .map(|usage| (usage.instance_id.as_str(), usage.instance_name.as_str()))
+            .collect::<Vec<_>>(),
+        [(second.id.as_str(), "alpha"), (first.id.as_str(), "Zeta")]
+    );
+    assert_eq!(db.secret_usages().unwrap().len(), 1);
+
+    // Deleting a secret in use is refused, naming who uses it.
+    let error = db.delete_secret(&token.id).unwrap_err();
+    assert!(matches!(&error, SecretError::InUse(usages) if usages.len() == 2));
+    let message = error.to_string();
+    assert!(
+        message.contains("alpha") && message.contains("Zeta"),
+        "{message}"
+    );
+    assert!(!message.contains("second"), "{message}");
+
+    db.delete_script_instance(&first.id).unwrap();
+    db.delete_script_instance(&second.id).unwrap();
+    db.delete_secret(&token.id).unwrap();
+    assert!(matches!(
+        db.delete_secret(&token.id),
+        Err(SecretError::NotFound)
+    ));
+    assert_eq!(
+        db.secrets()
+            .unwrap()
+            .iter()
+            .map(|secret| secret.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Spare", "x".repeat(128).as_str()]
+    );
 }
 
 #[test]

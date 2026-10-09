@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::auth::FreshAdminGuard;
+use crate::auth::{FreshAdminGuard, graphql_error};
 use weaver_server_core::bandwidth::ScheduleAction;
 use weaver_server_core::bandwidth::schedule::SharedSchedules;
 use weaver_server_core::post_processing::executor::{
@@ -13,6 +13,7 @@ use weaver_server_core::post_processing::model::{
     PipelineOutcome, PostProcessingSettings, ScriptName,
 };
 use weaver_server_core::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
+use weaver_server_core::post_processing::secrets::SecretError;
 use weaver_server_core::post_processing::settings::normalize_script_directory;
 use weaver_server_core::post_processing::test_run::start_script_test;
 
@@ -46,6 +47,18 @@ fn require_script(db: &Database, script: &ScriptName) -> std::result::Result<(),
     resolve_script(&directory, script)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// The messages carry names only, never a secret's value.
+fn secret_error(error: SecretError) -> async_graphql::Error {
+    let message = error.to_string();
+    match error {
+        SecretError::Invalid(_) => graphql_error("INVALID_INPUT", message),
+        SecretError::NameTaken => graphql_error("NAME_TAKEN", message),
+        SecretError::InUse(_) => graphql_error("SECRET_IN_USE", message),
+        SecretError::NotFound => graphql_error("NOT_FOUND", message),
+        SecretError::Storage(_) => graphql_error("INTERNAL", message),
+    }
 }
 
 fn view(db: &Database, instance: ScriptInstance) -> ScriptInstanceGql {
@@ -240,10 +253,57 @@ impl PostProcessingMutation {
         .await
     }
 
-    /// Replace everything saved in an instance. A secret input sent without a
-    /// value keeps the one already stored, whichever script the instance is
-    /// given. An instance that no longer runs on a schedule loses the
-    /// schedule rules that ran it.
+    /// Keep a value encrypted under a name, for script inputs to link. The
+    /// value can be replaced but never read back.
+    #[graphql(guard = "FreshAdminGuard")]
+    async fn create_secret(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        value: String,
+    ) -> Result<SecretGql> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || db.create_secret(&name, &value))
+            .await
+            .map_err(refused)?
+            .map(Into::into)
+            .map_err(secret_error)
+    }
+
+    /// Rename a secret, replace its value, or both. Whatever links it follows
+    /// along: the next run is handed the new value.
+    #[graphql(guard = "FreshAdminGuard")]
+    async fn update_secret(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+        name: Option<String>,
+        value: Option<String>,
+    ) -> Result<SecretGql> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            db.update_secret(&id, name.as_deref(), value.as_deref())
+        })
+        .await
+        .map_err(refused)?
+        .map(Into::into)
+        .map_err(secret_error)
+    }
+
+    /// Remove a secret. Refused while any instance links it.
+    #[graphql(guard = "FreshAdminGuard")]
+    async fn delete_secret(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || db.delete_secret(&id))
+            .await
+            .map_err(refused)?
+            .map(|()| true)
+            .map_err(secret_error)
+    }
+
+    /// Replace everything saved in an instance. Each input is sent as a value
+    /// or as the secret it links. An instance that no longer runs on a
+    /// schedule loses the schedule rules that ran it.
     #[graphql(guard = "FreshAdminGuard")]
     async fn update_script_instance(
         &self,

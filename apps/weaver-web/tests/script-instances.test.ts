@@ -18,6 +18,7 @@ import {
   triggerTitle,
   unwiredTriggers,
   withScript,
+  withSecret,
   type DiscoveredScript,
   type ScriptInstance,
 } from "../src/next/data/script-instances.ts";
@@ -176,9 +177,14 @@ test("a new instance is filled from the header, and a secret never is", () => {
   assert.equal(form.queueEvent, "NZB_ADDED");
   assert.equal(form.timeoutSeconds, 0);
   assert.deepEqual(form.inputs, [
-    { name: "Url", value: "http://127.0.0.1", secret: false, stored: false },
-    { name: "Token", value: "", secret: true, stored: false },
-    { name: "Verbose", value: "no", secret: false, stored: false },
+    { name: "Url", value: "http://127.0.0.1", secret: false, secretId: null },
+    { name: "Token", value: "", secret: true, secretId: null },
+    { name: "Verbose", value: "no", secret: false, secretId: null },
+  ]);
+  // A secret slot with no secret chosen is not sent: there is nothing to give the script.
+  assert.deepEqual(inputFromForm(form).inputs, [
+    { name: "Url", value: "http://127.0.0.1" },
+    { name: "Verbose", value: "no" },
   ]);
 });
 
@@ -198,45 +204,57 @@ test("picking another script starts a new instance again and leaves a saved one 
   assert.equal(picked.timeoutSeconds, 90);
   assert.equal(picked.inputs.length, 3);
 
-  const saved = formFromInstance(instance("one", { script: "cleanup.py", inputs: [{ name: "Path", value: "/data", secret: false }] }), undefined);
+  const saved = formFromInstance(instance("one", { script: "cleanup.py", inputs: [{ name: "Path", value: "/data", secret: null }] }), undefined);
   const moved = withScript(saved, NOTIFY, false);
   assert.equal(moved.script, "notify.sh");
   assert.deepEqual(moved.inputs, saved.inputs);
 });
 
-test("a saved secret opens blank and is kept when it is left blank", () => {
+test("a secret input opens on the secret it links and is sent as that link", () => {
   const saved = instance("one", {
     name: "Notify",
     timeoutSeconds: 120,
     inputs: [
-      { name: "Url", value: "http://127.0.0.1/hook", secret: false },
-      { name: "Token", value: null, secret: true },
+      { name: "Url", value: "http://127.0.0.1/hook", secret: null },
+      { name: "Token", value: "", secret: { id: "s1", name: "Notify token" } },
     ],
   });
   const form = formFromInstance(saved, NOTIFY);
   assert.deepEqual(form.inputs, [
-    { name: "Url", value: "http://127.0.0.1/hook", secret: false, stored: false },
-    { name: "Token", value: "", secret: true, stored: true },
+    { name: "Url", value: "http://127.0.0.1/hook", secret: false, secretId: null },
+    { name: "Token", value: "", secret: true, secretId: "s1" },
   ]);
   assert.equal(form.timeoutSeconds, 120);
 
   assert.deepEqual(inputFromForm(form).inputs, [
-    { name: "Url", value: "http://127.0.0.1/hook", secret: false },
-    { name: "Token", value: null, secret: true },
+    { name: "Url", value: "http://127.0.0.1/hook" },
+    { name: "Token", secretId: "s1" },
   ]);
 
-  const retyped = { ...form, inputs: form.inputs.map((input) => (input.secret ? { ...input, value: "new-token" } : input)) };
-  assert.deepEqual(inputFromForm(retyped).inputs[1], { name: "Token", value: "new-token", secret: true });
+  const relinked = { ...form, inputs: form.inputs.map((input) => (input.secret ? { ...input, secretId: "s2" } : input)) };
+  assert.deepEqual(inputFromForm(relinked).inputs[1], { name: "Token", secretId: "s2" });
+});
+
+test("ticking or clearing an input's secret box empties it either way", () => {
+  const plain = { name: "Password", value: "typed", secret: false, secretId: null };
+  // A value typed in clear never becomes a secret's value.
+  assert.deepEqual(withSecret(plain, true), { name: "Password", value: "", secret: true, secretId: null });
+  // A header's hint is not a lock: a secret slot can be made plain again, and its link goes.
+  const linked = { name: "Password", value: "", secret: true, secretId: "s1" };
+  assert.deepEqual(withSecret(linked, false), { name: "Password", value: "", secret: false, secretId: null });
 });
 
 test("a secret the header declares and the instance was never given is offered", () => {
-  const form = formFromInstance(instance("one", { inputs: [{ name: "Url", value: "x", secret: false }] }), NOTIFY);
-  assert.deepEqual(form.inputs.map((input) => [input.name, input.secret, input.stored]), [
-    ["Url", false, false],
-    ["Token", true, false],
+  const form = formFromInstance(instance("one", { inputs: [{ name: "Url", value: "x", secret: null }] }), NOTIFY);
+  assert.deepEqual(form.inputs.map((input) => [input.name, input.secret, input.secretId]), [
+    ["Url", false, null],
+    ["Token", true, null],
   ]);
   // The header's name matches whatever case the instance holds it in.
-  const held = formFromInstance(instance("two", { inputs: [{ name: "token", value: null, secret: true }] }), NOTIFY);
+  const held = formFromInstance(
+    instance("two", { inputs: [{ name: "token", value: "", secret: { id: "s1", name: "Token" } }] }),
+    NOTIFY,
+  );
   assert.deepEqual(held.inputs.map((input) => input.name), ["token"]);
 });
 
@@ -271,7 +289,7 @@ test("only a download's triggers can be narrowed to a category", () => {
   assert.equal(categoryScoped("FEED"), false);
 });
 
-test("an instance sent back from its row keeps its secrets and changes only what was asked", () => {
+test("an instance sent back from its row keeps its secret links and changes only what was asked", () => {
   const saved = instance("one", {
     name: "Notify",
     trigger: "QUEUE",
@@ -279,8 +297,8 @@ test("an instance sent back from its row keeps its secrets and changes only what
     categories: ["tv"],
     timeoutSeconds: 30,
     inputs: [
-      { name: "Url", value: "http://127.0.0.1/hook", secret: false },
-      { name: "Token", value: null, secret: true },
+      { name: "Url", value: "http://127.0.0.1/hook", secret: null },
+      { name: "Token", value: "", secret: { id: "s1", name: "Notify token" } },
     ],
   });
   assert.deepEqual(inputFromInstance(saved, { enabled: false }), {
@@ -289,8 +307,8 @@ test("an instance sent back from its row keeps its secrets and changes only what
     trigger: "QUEUE",
     queueEvent: "NZB_ADDED",
     inputs: [
-      { name: "Url", value: "http://127.0.0.1/hook", secret: false },
-      { name: "Token", value: null, secret: true },
+      { name: "Url", value: "http://127.0.0.1/hook" },
+      { name: "Token", secretId: "s1" },
     ],
     categories: ["tv"],
     enabled: false,

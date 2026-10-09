@@ -766,10 +766,11 @@ async fn an_instance_gives_its_script_the_inputs_it_holds_and_nothing_else() {
 
     // The script declares `Host` with a default and knows nothing of `Port`.
     let script = ScriptName::new("email").unwrap();
+    let token = db.create_secret("Mail token", "hunter2").unwrap();
     let saved = db
         .create_script_instance(
             draft(&script)
-                .secret_input("Token", "hunter2")
+                .secret_input("Token", &token.id)
                 .input("Port", "587"),
         )
         .unwrap();
@@ -777,7 +778,7 @@ async fn an_instance_gives_its_script_the_inputs_it_holds_and_nothing_else() {
         saved
             .inputs
             .iter()
-            .all(|input| !input.secret || input.value.is_empty())
+            .all(|input| input.secret.is_none() || input.value.is_empty())
     );
 
     let list = vec![saved];

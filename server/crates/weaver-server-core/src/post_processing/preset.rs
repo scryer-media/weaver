@@ -4,7 +4,7 @@
 //! from the script each time it is wanted and is never saved: once an instance
 //! exists, editing the header changes nothing about it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::instances::{
     InstanceInputDraft, InstanceTrigger, ScriptInstance, ScriptInstanceDraft, ScriptInstanceError,
@@ -15,6 +15,16 @@ use super::runner::option_value_text;
 use crate::bandwidth::{ScheduleAction, ScheduleEntry};
 use crate::persistence::{Database, StateError};
 
+/// One input a header declares.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PresetInput {
+    pub name: String,
+    /// The header's default. Always empty for a secret.
+    pub value: String,
+    /// The slot takes a link to a named secret rather than a value.
+    pub secret: bool,
+}
+
 /// The triggers, run times and inputs a script's header declares.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptPreset {
@@ -23,8 +33,12 @@ pub struct ScriptPreset {
     /// When a schedule instance is meant to run.
     pub task_times: Vec<ScriptTaskTime>,
     /// Every declared input at its default. A secret is never pre-filled.
-    pub inputs: Vec<InstanceInputDraft>,
+    pub inputs: Vec<PresetInput>,
 }
+
+/// Secret links already saved for a script, by upper-cased input name, so a
+/// new instance of it starts linked to the same secrets.
+pub type SecretLinks = BTreeMap<String, String>;
 
 impl ScriptPreset {
     pub fn of(manifest: &ScriptManifest) -> Self {
@@ -49,12 +63,12 @@ impl ScriptPreset {
             .iter()
             .map(|option| {
                 let secret = option.is_secret();
-                InstanceInputDraft {
+                PresetInput {
                     name: option.name().as_str().to_string(),
                     value: match option.default() {
-                        _ if secret => None,
-                        Some(OptionValue::Secret(_)) | None => Some(String::new()),
-                        Some(value) => Some(option_value_text(value)),
+                        _ if secret => String::new(),
+                        Some(OptionValue::Secret(_)) | None => String::new(),
+                        Some(value) => option_value_text(value),
                     },
                     secret,
                 }
@@ -93,7 +107,7 @@ impl ScriptPreset {
                 .any(|input| input.name.eq_ignore_ascii_case(name))
         };
         self.inputs.iter().any(|input| match saved(&input.name) {
-            Some(saved) => saved.secret != input.secret,
+            Some(saved) => saved.is_secret() != input.secret,
             None => !input.secret,
         }) || instance
             .inputs
@@ -105,39 +119,79 @@ impl ScriptPreset {
     /// declared input, at the value already saved under that name or else its
     /// default, and nothing the header no longer declares.
     ///
-    /// An input that changed between secret and plain starts again from the
-    /// header, because a stored secret is never turned back into plain text.
+    /// A secret slot keeps the secret it is linked to. One with no link yet
+    /// is left out until the operator picks a secret for it. An input that
+    /// changed between secret and plain starts again from the header, because
+    /// a stored secret is never turned back into plain text.
     pub fn reapplied_to(&self, instance: &ScriptInstance) -> ScriptInstanceDraft {
         let mut draft = ScriptInstanceDraft::from_instance(instance);
         draft.inputs = self
             .inputs
             .iter()
-            .map(|declared| {
+            .filter_map(|declared| {
                 let saved = instance.inputs.iter().find(|input| {
                     input.name.as_str().eq_ignore_ascii_case(&declared.name)
-                        && input.secret == declared.secret
+                        && input.is_secret() == declared.secret
                 });
-                InstanceInputDraft {
-                    name: declared.name.clone(),
-                    value: match saved {
-                        // `None` keeps what is stored for a secret.
-                        Some(_) if declared.secret => None,
-                        Some(saved) => Some(saved.value.clone()),
-                        None => declared.value.clone(),
-                    },
-                    secret: declared.secret,
+                match (saved, declared.secret) {
+                    (Some(saved), true) => saved
+                        .secret
+                        .as_ref()
+                        .map(|secret| InstanceInputDraft::secret(&declared.name, &secret.id)),
+                    (None, true) => None,
+                    (Some(saved), false) => {
+                        Some(InstanceInputDraft::plain(&declared.name, &saved.value))
+                    }
+                    (None, false) => {
+                        Some(InstanceInputDraft::plain(&declared.name, &declared.value))
+                    }
                 }
             })
             .collect();
         draft
     }
 
-    /// A new instance of `script` on `trigger`, filled from the header.
-    pub fn draft(&self, script: &ScriptName, trigger: InstanceTrigger) -> ScriptInstanceDraft {
+    /// A new instance of `script` on `trigger`, filled from the header. A
+    /// secret slot is linked when `links` has a secret for it, and left out
+    /// otherwise.
+    pub fn draft(
+        &self,
+        script: &ScriptName,
+        trigger: InstanceTrigger,
+        links: &SecretLinks,
+    ) -> ScriptInstanceDraft {
         let mut draft = ScriptInstanceDraft::new(script.clone(), trigger);
-        draft.inputs = self.inputs.clone();
+        draft.inputs = self
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                if input.secret {
+                    links
+                        .get(&input.name.to_ascii_uppercase())
+                        .map(|id| InstanceInputDraft::secret(&input.name, id))
+                } else {
+                    Some(InstanceInputDraft::plain(&input.name, &input.value))
+                }
+            })
+            .collect();
         draft
     }
+}
+
+/// The secrets the instances of one script already link, by input name. The
+/// first instance in run order wins where two differ.
+pub fn secret_links_of<'a>(instances: impl IntoIterator<Item = &'a ScriptInstance>) -> SecretLinks {
+    let mut links = SecretLinks::new();
+    for instance in instances {
+        for input in &instance.inputs {
+            if let Some(secret) = &input.secret {
+                links
+                    .entry(input.name.as_str().to_ascii_uppercase())
+                    .or_insert_with(|| secret.id.clone());
+            }
+        }
+    }
+    links
 }
 
 /// What setting a script up from its header added.
@@ -181,18 +235,22 @@ impl Database {
         if preset.triggers.is_empty() {
             return Err(HeaderSetupError::NothingDeclared);
         }
-        let wired = self
+        let siblings = self
             .script_instances()?
             .into_iter()
             .filter(|instance| &instance.script == script)
+            .collect::<Vec<_>>();
+        let wired = siblings
+            .iter()
             .map(|instance| instance.trigger)
             .collect::<BTreeSet<_>>();
+        let links = secret_links_of(&siblings);
         let mut setup = HeaderSetup::default();
         for trigger in preset.triggers.iter().copied() {
             if wired.contains(&trigger) {
                 continue;
             }
-            let instance = self.create_script_instance(preset.draft(script, trigger))?;
+            let instance = self.create_script_instance(preset.draft(script, trigger, &links))?;
             if trigger == InstanceTrigger::Schedule {
                 for time in &preset.task_times {
                     setup.schedules.push(schedule_row(&instance, *time)?);
@@ -244,21 +302,26 @@ fn schedule_row(
 mod tests {
     use super::super::instances::InstanceInput;
     use super::super::model::OptionName;
+    use super::super::secrets::SecretRef;
     use super::*;
 
-    fn declared(name: &str, value: Option<&str>, secret: bool) -> InstanceInputDraft {
-        InstanceInputDraft {
+    fn declared(name: &str, value: Option<&str>, secret: bool) -> PresetInput {
+        PresetInput {
             name: name.into(),
-            value: value.map(str::to_string),
+            value: value.unwrap_or_default().into(),
             secret,
         }
     }
 
+    /// A saved input; a secret one is linked to the secret `value` names.
     fn saved(name: &str, value: &str, secret: bool) -> InstanceInput {
         InstanceInput {
             name: OptionName::new(name).unwrap(),
-            value: value.into(),
-            secret,
+            value: if secret { String::new() } else { value.into() },
+            secret: secret.then(|| SecretRef {
+                id: value.into(),
+                name: value.into(),
+            }),
         }
     }
 
@@ -277,7 +340,7 @@ mod tests {
         }
     }
 
-    fn preset(inputs: Vec<InstanceInputDraft>) -> ScriptPreset {
+    fn preset(inputs: Vec<PresetInput>) -> ScriptPreset {
         ScriptPreset {
             triggers: vec![InstanceTrigger::PostProcessing],
             task_times: Vec::new(),
@@ -294,7 +357,7 @@ mod tests {
         assert!(!header.drifted_from(&instance(vec![saved("server", "example.test", false)])));
         assert!(!header.drifted_from(&instance(vec![
             saved("Server", "example.test", false),
-            saved("Token", "", true),
+            saved("Token", "token-secret", true),
         ])));
     }
 
@@ -318,33 +381,106 @@ mod tests {
             declared("Port", Some("80"), false),
             declared("Token", None, true),
             declared("Mode", Some("fast"), false),
+            declared("Password", None, true),
+            declared("ApiKey", None, true),
         ]);
         let before = instance(vec![
             saved("server", "example.test", false),
-            saved("Token", "", true),
-            saved("Mode", "", true),
+            saved("Token", "token-secret", true),
+            saved("Mode", "mode-secret", true),
+            saved("ApiKey", "typed in clear", false),
             saved("Gone", "x", false),
         ]);
-        let inputs = header
-            .reapplied_to(&before)
-            .inputs
-            .into_iter()
-            .map(|input| (input.name, input.value, input.secret))
-            .collect::<Vec<_>>();
+        let inputs = header.reapplied_to(&before).inputs;
         assert_eq!(
             inputs,
             [
-                (
-                    "Server".to_string(),
-                    Some("example.test".to_string()),
-                    false
-                ),
-                ("Port".to_string(), Some("80".to_string()), false),
-                // Kept as stored.
-                ("Token".to_string(), None, true),
-                // Was a secret, is plain now: starts again from the header.
-                ("Mode".to_string(), Some("fast".to_string()), false),
+                InstanceInputDraft::plain("Server", "example.test"),
+                InstanceInputDraft::plain("Port", "80"),
+                // The link is kept as it was.
+                InstanceInputDraft::secret("Token", "token-secret"),
+                // Was a secret, is plain now: starts again from the header,
+                // and the secret's value is never what fills it.
+                InstanceInputDraft::plain("Mode", "fast"),
+                // A secret slot with no link yet, and one whose saved value was
+                // plain, are left for the operator to link.
             ]
         );
+    }
+
+    #[test]
+    fn a_new_instance_starts_linked_to_the_secrets_its_siblings_use() {
+        let header = preset(vec![
+            declared("Server", Some("localhost"), false),
+            declared("Token", None, true),
+            declared("Password", None, true),
+        ]);
+        let sibling = instance(vec![saved("token", "shared", true)]);
+        let links = secret_links_of([&sibling]);
+        let draft = header.draft(
+            &ScriptName::new("notify.sh").unwrap(),
+            InstanceTrigger::PostProcessing,
+            &links,
+        );
+        assert_eq!(
+            draft.inputs,
+            [
+                InstanceInputDraft::plain("Server", "localhost"),
+                InstanceInputDraft::secret("Token", "shared"),
+            ]
+        );
+    }
+
+    #[test]
+    fn header_setup_and_reapply_keep_a_secret_link() {
+        let db = Database::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let scripts = crate::post_processing::settings::normalize_script_directory(
+            &root.path().join("scripts"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("notify.sh"),
+            "#!/bin/sh\n\
+             ### NZBGET POST-PROCESSING/QUEUE SCRIPT ###\n\
+             ### QUEUE EVENTS: NZB_ADDED ###\n\
+             ### OPTIONS ###\n\
+             # Where to send it.\n\
+             #Server=localhost\n\
+             # The account's API token.\n\
+             #ApiToken=do-not-use\n\
+             ### NZBGET POST-PROCESSING/QUEUE SCRIPT ###\n",
+        )
+        .unwrap();
+        db.replace_post_processing_script_directory(&scripts)
+            .unwrap();
+        let script = ScriptName::new("notify.sh").unwrap();
+
+        let token = db.create_secret("Notify token", "first").unwrap();
+        let first = db
+            .create_script_instance(
+                ScriptInstanceDraft::new(script.clone(), InstanceTrigger::PostProcessing)
+                    .input("Server", "example.test")
+                    .secret_input("ApiToken", &token.id),
+            )
+            .unwrap();
+
+        // The queue instance is new, and starts linked to the same secret.
+        let setup = db.set_up_script_from_header(&script).unwrap();
+        assert_eq!(setup.instances.len(), 1);
+        let added = &setup.instances[0];
+        assert_eq!(
+            added.inputs[1]
+                .secret
+                .as_ref()
+                .map(|secret| secret.id.as_str()),
+            Some(token.id.as_str())
+        );
+        // The header's default for the token is never offered.
+        assert_eq!(added.inputs[0].value, "localhost");
+
+        let reapplied = db.reapply_script_header(&first.id).unwrap();
+        assert_eq!(reapplied.inputs, first.inputs);
     }
 }

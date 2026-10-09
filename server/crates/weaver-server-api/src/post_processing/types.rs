@@ -1,4 +1,5 @@
 use async_graphql::{Enum, InputObject, MaybeUndefined, SimpleObject};
+use chrono::{DateTime, TimeZone, Utc};
 use weaver_server_core::post_processing::instances::{
     InstanceInputDraft, InstanceTrigger, ScriptInstance, ScriptInstanceDraft,
 };
@@ -11,6 +12,7 @@ use weaver_server_core::post_processing::model::{
 };
 use weaver_server_core::post_processing::output::ScriptRun;
 use weaver_server_core::post_processing::preset::ScriptPreset;
+use weaver_server_core::post_processing::secrets::{Secret, SecretRef};
 use weaver_server_core::post_processing::test_run::ScriptTestSnapshot;
 
 /// Placeholder shown instead of a stored secret. Secrets leave the process only
@@ -274,13 +276,86 @@ pub struct ScriptListingGql {
     pub problems: Vec<ScriptProblemGql>,
 }
 
-/// One input: its name, and its value unless it is a secret.
+/// One saved input: a value, or a link to a named secret. A secret's value is
+/// never read back out.
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(name = "ScriptInstanceValue")]
 pub struct ScriptInstanceValueGql {
     pub name: String,
-    /// Null for a secret, which is never read back out.
-    pub value: Option<String>,
+    /// Empty when the input is linked to a secret.
+    pub value: String,
+    /// The secret the input is linked to, or null for a plain value.
+    pub secret: Option<SecretRefGql>,
+}
+
+/// A named secret an input is linked to.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "SecretRef")]
+pub struct SecretRefGql {
+    pub id: String,
+    pub name: String,
+}
+
+impl From<SecretRef> for SecretRefGql {
+    fn from(value: SecretRef) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+        }
+    }
+}
+
+/// An instance that links a secret.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptInstanceRef")]
+pub struct ScriptInstanceRefGql {
+    pub id: String,
+    pub name: String,
+}
+
+/// A value kept encrypted under its own name, for script inputs to link.
+/// The value is write-only.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "Secret")]
+pub struct SecretGql {
+    pub id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// The instances that link it, by name.
+    pub used_by: Vec<ScriptInstanceRefGql>,
+}
+
+fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms).single().unwrap_or_default()
+}
+
+impl From<Secret> for SecretGql {
+    fn from(value: Secret) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            created_at: ms_to_datetime(value.created_at_ms),
+            updated_at: ms_to_datetime(value.updated_at_ms),
+            used_by: value
+                .used_by
+                .into_iter()
+                .map(|usage| ScriptInstanceRefGql {
+                    id: usage.instance_id,
+                    name: usage.instance_name,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One input a script's header declares, at its default. A secret input has
+/// no value: it is filled by linking a secret.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptPresetValue")]
+pub struct ScriptPresetValueGql {
+    pub name: String,
+    pub value: String,
     pub secret: bool,
 }
 
@@ -303,7 +378,7 @@ pub struct ScriptPresetGql {
     /// When a schedule instance is meant to run.
     pub task_times: Vec<String>,
     /// Every declared input at its default. A secret has no value.
-    pub inputs: Vec<ScriptInstanceValueGql>,
+    pub inputs: Vec<ScriptPresetValueGql>,
 }
 
 fn trigger_parts(trigger: InstanceTrigger) -> (ScriptKindGql, Option<QueueEventGql>) {
@@ -332,9 +407,13 @@ impl From<ScriptPreset> for ScriptPresetGql {
             inputs: value
                 .inputs
                 .into_iter()
-                .map(|input| ScriptInstanceValueGql {
+                .map(|input| ScriptPresetValueGql {
+                    value: if input.secret {
+                        String::new()
+                    } else {
+                        input.value
+                    },
                     name: input.name,
-                    value: input.value.filter(|_| !input.secret),
                     secret: input.secret,
                 })
                 .collect(),
@@ -421,8 +500,12 @@ impl ScriptDirectoryView {
                 .into_iter()
                 .map(|input| ScriptInstanceValueGql {
                     name: input.name.as_str().to_string(),
-                    value: (!input.secret).then_some(input.value),
-                    secret: input.secret,
+                    value: if input.secret.is_some() {
+                        String::new()
+                    } else {
+                        input.value
+                    },
+                    secret: input.secret.map(Into::into),
                 })
                 .collect(),
             categories: instance.categories,
@@ -440,10 +523,10 @@ impl ScriptDirectoryView {
 #[graphql(name = "ScriptInstanceValueInput")]
 pub struct ScriptInstanceValueInput {
     pub name: String,
-    /// Null on a secret keeps the value already saved under this name.
+    /// A plain value. Give this or `secretId`, not both.
     pub value: Option<String>,
-    #[graphql(default)]
-    pub secret: bool,
+    /// The secret to link. Give this or `value`, not both.
+    pub secret_id: Option<String>,
 }
 
 #[derive(Debug, Clone, InputObject)]
@@ -491,7 +574,7 @@ impl ScriptInstanceInput {
                 .map(|input| InstanceInputDraft {
                     name: input.name,
                     value: input.value,
-                    secret: input.secret,
+                    secret_id: input.secret_id,
                 })
                 .collect(),
             categories: self.categories,

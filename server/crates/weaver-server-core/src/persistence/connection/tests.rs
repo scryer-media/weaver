@@ -3000,6 +3000,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
     assert_eq!(db.post_processing_settings().unwrap(), settings);
 
     let script = crate::post_processing::model::ScriptName::new("notify.sh").unwrap();
+    let token = db.create_secret("Notify token", "hunter2").unwrap();
     let instance = db
         .create_script_instance(
             crate::post_processing::instances::ScriptInstanceDraft::new(
@@ -3010,7 +3011,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
             )
             .named("Notify")
             .input("Server", "example.test")
-            .secret_input("Token", "hunter2")
+            .secret_input("Token", &token.id)
             .category("movies")
             .fire_and_forget()
             .timeout(90),
@@ -3025,10 +3026,21 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         instance
             .inputs
             .iter()
-            .map(|input| (input.name.as_str(), input.value.as_str(), input.secret))
+            .map(|input| (
+                input.name.as_str(),
+                input.value.as_str(),
+                input.secret.as_ref().map(|secret| secret.name.as_str())
+            ))
             .collect::<Vec<_>>(),
-        [("Server", "example.test", false), ("Token", "", true)]
+        [
+            ("Server", "example.test", None),
+            ("Token", "", Some("Notify token"))
+        ]
     );
+    assert!(matches!(
+        db.delete_secret(&token.id),
+        Err(crate::post_processing::secrets::SecretError::InUse(_))
+    ));
     let run_inputs = db
         .script_instance_run_inputs(&instance.id)
         .unwrap()

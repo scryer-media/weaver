@@ -1968,7 +1968,10 @@ const SCRIPT_INSTANCE_FIELDS = gql`
     inputs {
       name
       value
-      secret
+      secret {
+        id
+        name
+      }
     }
     categories
     enabled
@@ -2116,6 +2119,53 @@ export const UPDATE_SCRIPT_INSTANCE_MUTATION = gql`
     }
   }
   ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+const SECRET_FIELDS = gql`
+  fragment SecretFields on Secret {
+    id
+    name
+    createdAt
+    updatedAt
+    usedBy {
+      id
+      name
+    }
+  }
+`;
+
+/** Every named secret, with the instances that link it. Values never come back. */
+export const SECRETS_QUERY = gql`
+  query Secrets {
+    secrets {
+      ...SecretFields
+    }
+  }
+  ${SECRET_FIELDS}
+`;
+
+export const CREATE_SECRET_MUTATION = gql`
+  mutation CreateSecret($name: String!, $value: String!) {
+    createSecret(name: $name, value: $value) {
+      ...SecretFields
+    }
+  }
+  ${SECRET_FIELDS}
+`;
+
+export const UPDATE_SECRET_MUTATION = gql`
+  mutation UpdateSecret($id: String!, $name: String, $value: String) {
+    updateSecret(id: $id, name: $name, value: $value) {
+      ...SecretFields
+    }
+  }
+  ${SECRET_FIELDS}
+`;
+
+export const DELETE_SECRET_MUTATION = gql`
+  mutation DeleteSecret($id: String!) {
+    deleteSecret(id: $id)
+  }
 `;
 
 export const DELETE_SCRIPT_INSTANCE_MUTATION = gql`
