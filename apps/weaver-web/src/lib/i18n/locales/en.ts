@@ -5,7 +5,7 @@ import { nextEn } from "@/next/i18n/en";
 const en: LocaleDictionary = {
   "settings.networking": "Networking",
   "settings.networkOverview": "Overview",
-  "settings.networkEgress": "Egress interfaces",
+  "settings.networkEgress": "Egress",
   "settings.networkRoutes": "Routes",
   "settings.networkingDesc": "Egress interfaces, proxy pools and consumer routes",
   "settings.proxies": "Proxies",
