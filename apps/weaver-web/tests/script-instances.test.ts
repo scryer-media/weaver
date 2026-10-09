@@ -11,10 +11,11 @@ import {
   inputFromForm,
   inputFromInstance,
   inputNameProblem,
+  jobScheduleRule,
   MAX_TIMEOUT_SECONDS,
   newInstanceForm,
   reorderedIds,
-  scriptsWithoutInstance,
+  scheduleFromHeader,
   triggerTitle,
   unwiredTriggers,
   withScript,
@@ -141,15 +142,6 @@ test("a move past the end of its group, or of an instance that is gone, asks for
   assert.equal(reorderedIds(instances, "post-a", -1), null);
   assert.equal(reorderedIds(instances, "post-b", 1), null);
   assert.equal(reorderedIds(instances, "missing", 1), null);
-});
-
-test("a script counts as unused until an instance runs it", () => {
-  const scripts = [NOTIFY, script("cleanup.py")];
-  assert.deepEqual(scriptsWithoutInstance(scripts, []).map((entry) => entry.name), ["notify.sh", "cleanup.py"]);
-  assert.deepEqual(
-    scriptsWithoutInstance(scripts, [instance("one", { script: "notify.sh" })]).map((entry) => entry.name),
-    ["cleanup.py"],
-  );
 });
 
 test("the header's triggers stay unwired until an instance of that script runs on each", () => {
@@ -369,4 +361,38 @@ test("a timeout reads exactly as it was set", () => {
   assert.equal(formatTimeout(7200), "2h");
   assert.equal(formatTimeout(3661), "1h 1m 1s");
   assert.equal(formatTimeout(MAX_TIMEOUT_SECONDS), "7d");
+});
+
+test("a new job's schedule starts from the times its script's header asks for", () => {
+  assert.deepEqual(scheduleFromHeader(undefined), { times: "", days: [], startup: false });
+  const timed = script("nightly.py", { preset: { triggers: [], taskTimes: ["04:00", "*:20"], inputs: [] } });
+  assert.deepEqual(scheduleFromHeader(timed), { times: "04:00, *:20", days: [], startup: false });
+  // A run at startup is its switch, not one of the times.
+  const atStartup = script("boot.sh", { preset: { triggers: [], taskTimes: ["*", "06:00"], inputs: [] } });
+  assert.deepEqual(scheduleFromHeader(atStartup), { times: "06:00", days: [], startup: true });
+});
+
+test("a schedule job's rule is made of its times, its days and whether it runs at startup", () => {
+  const form = { times: "", days: [] as string[], startup: false };
+  assert.deepEqual(jobScheduleRule({ ...form, times: " 4:5 ; *:20,23:59, " }), {
+    time: "4:5, *:20, 23:59",
+    days: null,
+    runAtStartup: false,
+  });
+  assert.deepEqual(jobScheduleRule({ times: "03:30", days: ["sat", "sun"], startup: true }), {
+    time: "03:30",
+    days: ["sat", "sun"],
+    runAtStartup: true,
+  });
+  // Startup alone, by its switch or typed among the times, is a rule of its own.
+  for (const alone of [{ ...form, startup: true }, { ...form, times: "*" }]) {
+    assert.deepEqual(jobScheduleRule(alone), { time: "*", days: null, runAtStartup: true });
+  }
+  assert.deepEqual(jobScheduleRule({ ...form, times: "*, 01:00" }), { time: "01:00", days: null, runAtStartup: true });
+  // A job with nothing to run at has no rule, and a time the daemon would refuse is named.
+  assert.deepEqual(jobScheduleRule(form), { problem: "none" });
+  assert.deepEqual(jobScheduleRule({ ...form, times: " , " }), { problem: "none" });
+  for (const bad of ["24:00", "12:60", "noon", "1:2:3", "*:", ":30", "**", "012:00"]) {
+    assert.deepEqual(jobScheduleRule({ ...form, times: `01:00, ${bad}` }), { problem: "invalid", time: bad }, bad);
+  }
 });

@@ -80,6 +80,11 @@ const instance = (id: string, name: string, script: string, trigger: string, ext
   timeoutSeconds: null, runOrder: 0, ...extra,
 });
 
+const rule = (id: string, instanceId: string, time: string, extra: Record<string, unknown> = {}) => ({
+  id, enabled: true, label: null as string | null, days: [] as string[], time, actionType: "run_script",
+  instanceId, runAtStartup: false, ...extra,
+});
+
 const state = {
   settings: {
     scriptDirectory: "/fixture/scripts", executionEnabled: true, concurrency: 2,
@@ -123,10 +128,16 @@ const state = {
     instance("6", "Nightly report", "nightly.py", "SCHEDULER", { timeoutSeconds: 3600 }),
     instance("7", "Feed intake", "intake.py", "FEED", { blocking: false }),
   ],
-  categories: [{ id: 1, name: "movies" }, { id: 2, name: "tv" }],
+  categories: has("nocategories") ? [] : [{ id: 1, name: "movies" }, { id: 2, name: "tv" }],
+  // The schedule rules that run an instance.
+  schedules: empty ? [] : [
+    rule("r1", "6", "04:00"),
+    rule("r2", "6", "*:20", { days: ["sat", "sun"], runAtStartup: true }),
+  ],
 };
 let lastInstance = 7;
 let lastSecret = 2;
+let lastRule = 2;
 // Every instance mutation the screens sent, oldest first.
 const requests: { name: string; variables: Record<string, any> }[] = [];
 
@@ -463,6 +474,14 @@ function graphql(name: string, variables: Record<string, any>) {
       return declared.secret ? [] : [held(declared.name, declared.value)];
     });
     mutation = { reapplyScriptHeader: view(target) };
+  } else if (name === "CreateSchedule") {
+    requests.push({ name, variables });
+    // With `norule`, the daemon takes the instance and refuses its rule.
+    if (has("norule")) return refused("the schedule could not be written");
+    const { instanceId, time, ...rest } = variables.input;
+    const created = rule(`r${++lastRule}`, instanceId, time, { ...rest, days: rest.days ?? [] });
+    state.schedules.push(created);
+    mutation = { createSchedule: created };
   } else if (name === "CreateSecret") {
     requests.push({ name, variables });
     return createSecret(variables);
@@ -484,7 +503,7 @@ function graphql(name: string, variables: Record<string, any>) {
     outputRequests.push(variables.outputId);
   }
   return { data: structuredClone({ postProcessingSettings: state.settings, categories: state.categories,
-    scriptInstances: state.instances.map(view), discoveredScripts: state.scripts, secrets: state.secrets.map(secretView),
+    scriptInstances: state.instances.map(view), discoveredScripts: state.scripts, schedules: state.schedules, secrets: state.secrets.map(secretView),
     postProcessingResults: results, scriptRuns: scriptRunPage(variables), scriptRunRequests,
     scriptOutput: retainedOutput[variables.outputId] ?? null,
     browseDirectories: { currentPath: variables.path ?? state.settings.scriptDirectory, parentPath: "/fixture", entries: [] },
@@ -492,7 +511,7 @@ function graphql(name: string, variables: Record<string, any>) {
 }
 // What the daemon holds, secrets included, and what it was asked to do, for the
 // test to read and for it to move a test run along.
-Object.assign(window, { scriptsFixture: { instances: state.instances, secrets: state.secrets, requests, tests, outputRequests } });
+Object.assign(window, { scriptsFixture: { instances: state.instances, secrets: state.secrets, schedules: state.schedules, requests, tests, outputRequests } });
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });
 const originalFetch = window.fetch.bind(window);
 window.fetch = async (request, init) => {

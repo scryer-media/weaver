@@ -215,15 +215,6 @@ export function reorderedIds(
   return { trigger: moving.trigger, ids };
 }
 
-/** The discovered scripts nothing has been wired to yet. */
-export function scriptsWithoutInstance(
-  scripts: readonly DiscoveredScript[],
-  instances: readonly ScriptInstance[],
-): DiscoveredScript[] {
-  const wired = new Set(instances.map((instance) => instance.script));
-  return scripts.filter((script) => !wired.has(script.name));
-}
-
 function sameTrigger(left: ScriptPresetTrigger, instance: ScriptInstance): boolean {
   return left.trigger === instance.trigger
     && (left.trigger !== "QUEUE" || left.queueEvent === instance.queueEvent);
@@ -464,4 +455,59 @@ export function formatTimeout(seconds: number): string {
   ] as const;
   const shown = parts.filter(([amount]) => amount > 0).map(([amount, unit]) => `${amount}${unit}`);
   return shown.length > 0 ? shown.join(" ") : "0s";
+}
+
+/** One time a Schedule job runs at: `HH:MM`, `*:MM` for every hour, or `*` for startup. */
+const SCRIPT_TIME = /^(?:\*|(?:\*|[01]?\d|2[0-3]):[0-5]?\d)$/;
+/** A run at startup, as a script's list of times spells it. */
+const AT_STARTUP = "*";
+
+/** When a new Schedule job runs, as its editor holds it. */
+export interface JobScheduleForm {
+  /** The times as typed, separated by commas. */
+  times: string;
+  /** Empty runs on every day. */
+  days: string[];
+  startup: boolean;
+}
+
+/** Where a new job's schedule starts: the times its script's header asks for. */
+export function scheduleFromHeader(script: DiscoveredScript | undefined): JobScheduleForm {
+  const times = script?.preset.taskTimes ?? [];
+  return {
+    times: times.filter((time) => time !== AT_STARTUP).join(", "),
+    days: [],
+    startup: times.includes(AT_STARTUP),
+  };
+}
+
+/** The schedule rule a new Schedule job is given, or why what was entered makes none. */
+export type JobScheduleRule =
+  | { time: string; days: string[] | null; runAtStartup: boolean }
+  | { problem: "none" }
+  | { problem: "invalid"; time: string };
+
+/**
+ * The rule for what was entered. A job with no time and no run at startup would
+ * never run, so that is a problem rather than a job without a rule.
+ */
+export function jobScheduleRule(form: JobScheduleForm): JobScheduleRule {
+  const typed = form.times
+    .split(/[,;]/)
+    .map((time) => time.trim())
+    .filter((time) => time !== "");
+  const invalid = typed.find((time) => !SCRIPT_TIME.test(time));
+  if (invalid !== undefined) {
+    return { problem: "invalid", time: invalid };
+  }
+  const clock = typed.filter((time) => time !== AT_STARTUP);
+  const runAtStartup = form.startup || clock.length < typed.length;
+  if (clock.length === 0 && !runAtStartup) {
+    return { problem: "none" };
+  }
+  return {
+    time: clock.length > 0 ? clock.join(", ") : AT_STARTUP,
+    days: form.days.length > 0 ? form.days : null,
+    runAtStartup,
+  };
 }

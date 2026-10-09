@@ -52,10 +52,10 @@ async function pick(page, scope, label, option) {
 test("configuration and scripts are two screens that share nothing but the settings behind them", async () => {
   const region = (page, name) => page.getByRole("region", { name, exact: true });
   const configuration = ["Execution", "Event scripts and output retention", "Interpreters", "Scripts directory"];
-  const scripts = ["Jobs", "Scripts that could not be read"];
+  const scripts = ["Jobs"];
   for (const [query, shown, absent, buttons] of [
     ["", configuration, scripts, []],
-    ["?scripts", scripts, configuration, ["Refresh", "Create job"]],
+    ["?scripts", scripts, configuration, ["Refresh", "Add job"]],
   ]) {
     const page = await open(query);
     try {
@@ -182,9 +182,6 @@ const group = (page, title) => table(page).getByRole("region", { name: title, ex
 const rows = (scope) => scope.locator('[role="button"]');
 const row = (page, name) => rows(table(page)).filter({ has: page.getByText(name, { exact: true }) });
 const headings = (page) => table(page).getByRole("region").evaluateAll((sections) => sections.map((section) => section.getAttribute("aria-label")));
-// The scripts no instance runs, which close the table, and the row of one of them by its file.
-const unused = (page) => group(page, "Scripts with no job");
-const unusedRow = (page, file) => rows(unused(page)).filter({ has: page.getByText(file, { exact: true }) });
 /** Opens the editor of the instance called `name`, which the dialog is then titled by. */
 async function edit(page, name) {
   await row(page, name).getByText(name, { exact: true }).first().click();
@@ -192,7 +189,7 @@ async function edit(page, name) {
   await editor.waitFor();
   return editor;
 }
-const creator = (page) => page.getByRole("dialog", { name: "Create job", exact: true });
+const creator = (page) => page.getByRole("dialog", { name: "Add job", exact: true });
 const field = (editor, name) => editor.getByRole("textbox", { name, exact: true });
 // A password input has no role to be found by.
 const secretField = (scope, name) => scope.getByLabel(name, { exact: true });
@@ -203,13 +200,12 @@ test("the scripts screen is one table of instances, under a heading for each thi
   const page = await open("?scripts");
   try {
     await row(page, "Notify").waitFor();
-    await unused(page).waitFor();
     for (const header of ["Job name", "Script", "Categories", "Run mode", "Timeout", "Enabled"]) {
       assert.equal(await table(page).getByText(header, { exact: true }).count(), 1, header);
     }
     await table(page).getByText("jobs for every category run ahead of a category's own", { exact: true }).waitFor();
     assert.deepEqual(await headings(page), [
-      "Post-processing", "Queue · NZB_ADDED", "Queue · NZB_DELETED", "Schedule", "Feed", "Scripts with no job",
+      "Post-processing", "Queue · NZB_ADDED", "Queue · NZB_DELETED", "Schedule", "Feed",
     ]);
     // Each row: its name, script, categories, run mode and timeout, and whether it is on.
     for (const [title, entries] of [
@@ -255,36 +251,32 @@ test("the scripts screen is one table of instances, under a heading for each thi
     // An instance alone under its heading has nowhere to go.
     for (const name of ["Move up", "Move down"]) assert.equal(await action(row(page, "Feed intake"), name).isDisabled(), true);
     // One Create for the whole list, in the top bar.
-    assert.deepEqual(await controls(page).getByRole("button").allTextContents(), ["Refresh", "Create job"]);
-    assert.equal(await action(controls(page), "Create job").isDisabled(), false);
+    assert.deepEqual(await controls(page).getByRole("button").allTextContents(), ["Refresh", "Add job"]);
+    assert.equal(await action(controls(page), "Add job").isDisabled(), false);
+    assert.equal(await action(table(page), "Add job").count(), 0);
+    // It is the list of jobs and nothing else: no script without one, and no file that could not be read.
+    for (const file of ["archive.py", "plain.sh", "broken.py"]) assert.equal(await page.getByText(file, { exact: true }).count(), 0, file);
+    assert.equal(await page.getByRole("main").getByRole("region").count(), 6);
     await shot(page, "scripts-table");
   } finally { await page.close(); }
 });
 
-test("a script nothing is wired to closes the table, with what its header declares and a way to start", async () => {
+test("a file that could not be read as a script is named where a script is chosen, not among the jobs", async () => {
   const page = await open("?scripts");
   try {
-    await unused(page).getByText("/fixture/scripts", { exact: true }).waitFor();
-    assert.equal(await rows(unused(page)).count(), 2);
-    for (const line of [
-      "Archive", "archive.py", "NZBGet · 0.9", "Post-processing", "Queue", "Schedule",
-      "Declared events: None recognised", "Task times: 03:30",
-    ]) assert.equal(await unusedRow(page, "archive.py").getByText(line, { exact: true }).count(), 1, line);
-    assert.equal(await action(unusedRow(page, "archive.py"), "Set up jobs from header").count(), 1);
-    // A script whose header declares nothing has nothing to be set up from.
-    for (const line of ["SABnzbd", "Post-processing"]) {
-      assert.equal(await unusedRow(page, "plain.sh").getByText(line, { exact: true }).count(), 1, line);
-    }
-    assert.equal(await unusedRow(page, "plain.sh").getByText("Declared events:").count(), 0);
-    assert.equal(await action(unusedRow(page, "plain.sh"), "Set up jobs from header").count(), 0);
-    // The row opens a new instance of its script; the top bar's Create is the list's only one.
-    assert.equal(await action(table(page), "Create job").count(), 0);
-    // Neither is an instance, so neither has a switch, an order or a test.
-    assert.equal(await unused(page).getByRole("switch").count(), 0);
-    for (const name of ["Move up", "Test", "Delete"]) assert.equal(await action(unused(page), name).count(), 0, name);
-    // What could not be read at all is listed under the table.
-    const problems = page.getByRole("region", { name: "Scripts that could not be read", exact: true });
-    for (const text of ["broken.py", "option 3 declares an unknown type"]) await problems.getByText(text, { exact: true }).waitFor();
+    await row(page, "Notify").waitFor();
+    const unreadable = (scope) => scope.getByRole("group", { name: "Scripts that could not be read", exact: true });
+    assert.equal(await unreadable(page).count(), 0);
+    await action(controls(page), "Add job").click();
+    const editor = creator(page);
+    for (const text of ["broken.py", "option 3 declares an unknown type"]) await unreadable(editor).getByText(text, { exact: true }).waitFor();
+    // There are scripts to choose from, so nothing says there are none.
+    assert.equal(await editor.getByText("No scripts found. Put one in the scripts directory, then refresh.", { exact: true }).count(), 0);
+    await shot(page, "create-dialog-unreadable");
+    await action(editor, "Cancel").click();
+    await editor.waitFor({ state: "detached" });
+    // A saved job's editor is about its own script.
+    assert.equal(await unreadable(await edit(page, "Notify")).count(), 0);
   } finally { await page.close(); }
 });
 
@@ -304,23 +296,32 @@ test("a scripts directory that cannot be listed still shows every instance, and 
     await status(page, problem).waitFor();
     assert.equal(await rows(table(page)).count(), 7);
     assert.equal(await table(page).getByText(problem, { exact: true }).count(), 7);
-    assert.equal(await unused(page).count(), 0);
-    assert.equal(await page.getByRole("region", { name: "Scripts that could not be read", exact: true }).count(), 0);
-    // With no script known, there is nothing a new instance could run.
-    assert.equal(await action(controls(page), "Create job").isDisabled(), true);
+    // A job can still be started; its editor has no script to offer, so nothing can be saved.
+    await action(controls(page), "Add job").click();
+    const editor = creator(page);
+    await editor.getByText("No scripts found. Put one in the scripts directory, then refresh.", { exact: true }).waitFor();
+    assert.equal(await action(editor, "Save").isDisabled(), true);
   } finally { await page.close(); }
 });
 
-test("a directory with no scripts and no instances says so", async () => {
+test("with no jobs the table says so and offers the first, as the top bar always does", async () => {
   const page = await open("?scripts&empty");
   try {
-    await table(page).getByText("Nothing here. Put a script in the scripts directory, then reload.", { exact: true }).waitFor();
+    await table(page).getByText("No jobs yet.", { exact: true }).waitFor();
     assert.equal(await page.getByRole("region").count(), 1);
     assert.equal(await rows(table(page)).count(), 0);
-    assert.equal(await action(controls(page), "Create job").isDisabled(), true);
-    // The top bar's Create is the only one, even with nothing listed.
-    assert.equal(await table(page).getByRole("button").count(), 0);
+    assert.deepEqual(await table(page).getByRole("button").allTextContents(), ["Add job"]);
+    assert.equal(await action(controls(page), "Add job").isDisabled(), false);
     await shot(page, "scripts-empty");
+    // Either opens the new job's editor, which says there is no script for one to run yet.
+    await action(table(page), "Add job").click();
+    const editor = creator(page);
+    await editor.getByText("No scripts found. Put one in the scripts directory, then refresh.", { exact: true }).waitFor();
+    assert.equal(await action(editor, "Save").isDisabled(), true);
+    await action(editor, "Cancel").click();
+    await editor.waitFor({ state: "detached" });
+    await action(controls(page), "Add job").click();
+    await editor.waitFor();
   } finally { await page.close(); }
 });
 
@@ -339,8 +340,8 @@ test("refresh reads the instances again", async () => {
 test("a new instance starts from what the chosen script's header declares", async () => {
   const page = await open("?scripts");
   try {
-    await unused(page).waitFor();
-    await action(controls(page), "Create job").click();
+    await row(page, "Notify").waitFor();
+    await action(controls(page), "Add job").click();
     const editor = creator(page);
     await editor.getByText("new job", { exact: true }).waitFor();
     // Nothing can be saved until there is a script to run.
@@ -355,7 +356,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
     await page.getByRole("menuitemradio", { name: "Archive · archive.py", exact: true }).click();
 
     // The first trigger the header declares, and every input it declares at its default.
-    await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Post-processing", { exact: true }).waitFor();
     assert.equal(await action(editor, "Save").isDisabled(), false);
     assert.equal(await editor.getByText("This job has no inputs.", { exact: true }).count(), 0);
     assert.equal(await field(editor, "Target").inputValue(), "/fixture/archive");
@@ -363,19 +364,20 @@ test("a new instance starts from what the chosen script's header declares", asyn
     // A secret is never filled in from the header: it links one of the saved secrets, and none is chosen yet.
     await action(editor, "Key").getByText("Choose a secret", { exact: true }).waitFor();
     assert.equal(await secretBox(editor, "Key").isChecked(), true);
-    assert.equal(await secretBox(editor, "Target").isChecked(), false);
+    // What the header calls plain is a value, with no box to make it a secret.
+    assert.equal(await secretBox(editor, "Target").count(), 0);
     await editor.getByText("Linked from Settings · Scripts · Secrets. The script is given its value when it runs; it is never shown here.", { exact: true }).waitFor();
     await action(editor, "Key").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
       "Choose a secret", "Notify token", "Spare key", "Create new secret…",
     ]);
     await page.getByRole("menuitemradio", { name: "Choose a secret", exact: true }).click();
-    // The triggers the header declares are marked among all there are.
+    // Every trigger is offered by its plain name, whatever the header asks for.
     await action(editor, "Trigger").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
-      "Post-processing · declared", "Queue", "Scan", "Schedule · declared", "Feed",
+      "Post-processing", "Queue", "Scan", "Schedule", "Feed",
     ]);
-    await page.getByRole("menuitemradio", { name: "Post-processing · declared", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "Post-processing", exact: true }).click();
 
     await field(editor, "Job name").fill("Archive movies");
     await pick(page, editor, "Key", "Spare key");
@@ -392,14 +394,12 @@ test("a new instance starts from what the chosen script's header declares", asyn
     await status(page, "Archive movies created").waitFor();
     await editor.waitFor({ state: "detached" });
 
-    // It runs last under its trigger's heading, and its script has left the ones with no instance.
+    // It runs last under its trigger's heading.
     const created = rows(group(page, "Post-processing")).nth(3);
     await created.and(row(page, "Archive movies")).waitFor();
     for (const text of ["archive.py", "movies", "Fire and forget", "2m"]) {
       assert.equal(await created.getByText(text, { exact: true }).count(), 1, text);
     }
-    assert.equal(await unusedRow(page, "archive.py").count(), 0);
-    assert.equal(await rows(unused(page)).count(), 1);
     assert.equal(await page.getByText("fixture-token").count(), 0);
     assert.deepEqual((await daemon(page)).requests, [{ name: "CreateScriptInstance", variables: { input: {
       name: "Archive movies", script: "archive.py", trigger: "POST_PROCESSING", queueEvent: null,
@@ -409,16 +409,17 @@ test("a new instance starts from what the chosen script's header declares", asyn
   } finally { await page.close(); }
 });
 
-test("an instance can be started from its script's row, and a queue instance names its event", async () => {
+test("a queue instance names its event, and each input the header declares draws its own control", async () => {
   const page = await open("?scripts");
   try {
-    await unusedRow(page, "archive.py").getByText("archive.py", { exact: true }).click();
+    await row(page, "Notify").waitFor();
+    await action(controls(page), "Add job").click();
     const editor = creator(page);
-    // The row's script is already chosen.
+    await pick(page, editor, "Script", "Archive · archive.py");
     await action(editor, "Script").getByText("Archive · archive.py", { exact: true }).waitFor();
     assert.equal(await action(editor, "Queue event").count(), 0);
     await pick(page, editor, "Trigger", "Queue");
-    // The header declares no queue event, so none of them is marked.
+    // The header declares no queue event, so the first of them all is the one offered.
     await action(editor, "Queue event").getByText("NZB_ADDED", { exact: true }).waitFor();
     await action(editor, "Queue event").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
@@ -430,7 +431,7 @@ test("an instance can be started from its script's row, and a queue instance nam
     await status(page, "archive.py created").waitFor();
     await rows(group(page, "Queue · NZB_NAMED")).first().and(row(page, "archive.py")).waitFor();
     assert.deepEqual(await headings(page), [
-      "Post-processing", "Queue · NZB_ADDED", "Queue · NZB_NAMED", "Queue · NZB_DELETED", "Schedule", "Feed", "Scripts with no job",
+      "Post-processing", "Queue · NZB_ADDED", "Queue · NZB_NAMED", "Queue · NZB_DELETED", "Schedule", "Feed",
     ]);
     let held = await daemon(page);
     assert.deepEqual(held.requests.at(-1), { name: "CreateScriptInstance", variables: { input: {
@@ -442,9 +443,9 @@ test("an instance can be started from its script's row, and a queue instance nam
     assert.deepEqual(held.instances.at(-1).inputs, [{ name: "Target", value: "/fixture/archive", secretId: null }]);
 
     // Each input the header declares draws the control its header asks for.
-    await action(controls(page), "Create job").click();
+    await action(controls(page), "Add job").click();
     await pick(page, editor, "Script", "Notify · notify.py");
-    await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Post-processing", { exact: true }).waitFor();
     assert.equal(await field(editor, "Label").inputValue(), "");
     await editor.getByText("Shown in the notification title. Required.", { exact: true }).waitFor();
     await action(editor, "Mode").getByText("quiet", { exact: true }).waitFor();
@@ -453,22 +454,22 @@ test("an instance can be started from its script's row, and a queue instance nam
     await field(editor, "Label").fill("downloads");
     await pick(page, editor, "Mode", "verbose");
     await editor.getByRole("switch", { name: "Attach the log", exact: true }).click();
-    // The events the header declares are marked, and the first of them is the one offered.
-    await pick(page, editor, "Trigger", "Queue · declared");
-    await action(editor, "Queue event").getByText("NZB_ADDED · declared", { exact: true }).waitFor();
+    // The first event the header declares is the one offered, among all of them by their plain names.
+    await pick(page, editor, "Trigger", "Queue");
+    await action(editor, "Queue event").getByText("NZB_ADDED", { exact: true }).waitFor();
     await action(editor, "Queue event").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
-      "FILE_DOWNLOADED", "URL_COMPLETED", "NZB_MARKED", "NZB_ADDED · declared", "NZB_NAMED", "NZB_DOWNLOADED · declared", "NZB_DELETED",
+      "FILE_DOWNLOADED", "URL_COMPLETED", "NZB_MARKED", "NZB_ADDED", "NZB_NAMED", "NZB_DOWNLOADED", "NZB_DELETED",
     ]);
-    await page.getByRole("menuitemradio", { name: "NZB_DOWNLOADED · declared", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "NZB_DOWNLOADED", exact: true }).click();
     // Only a download has a category, so only its triggers can be narrowed to one.
     const categories = editor.getByRole("group", { name: "Categories", exact: true });
     assert.equal(await categories.count(), 1);
     await pick(page, editor, "Trigger", "Schedule");
     await categories.waitFor({ state: "detached" });
     assert.equal(await action(editor, "Queue event").count(), 0);
-    await pick(page, editor, "Trigger", "Queue · declared");
-    await action(editor, "Queue event").getByText("NZB_DOWNLOADED · declared", { exact: true }).waitFor();
+    await pick(page, editor, "Trigger", "Queue");
+    await action(editor, "Queue event").getByText("NZB_DOWNLOADED", { exact: true }).waitFor();
     await action(editor, "Save").click();
     await status(page, "notify.py created").waitFor();
     await rows(group(page, "Queue · NZB_DOWNLOADED")).first().and(row(page, "notify.py")).waitFor();
@@ -480,6 +481,143 @@ test("an instance can be started from its script's row, and a queue instance nam
       ],
       categories: [], enabled: true, blocking: true, timeoutSeconds: null,
     } } });
+  } finally { await page.close(); }
+});
+
+test("a job for downloads says there are no categories when none are defined", async () => {
+  const page = await open("?scripts&nocategories");
+  try {
+    const editor = await edit(page, "Notify");
+    await editor.getByText("No categories defined", { exact: true }).waitFor();
+    assert.equal(await editor.getByRole("group", { name: "Categories", exact: true }).count(), 0);
+    assert.equal(await editor.getByText("Every category", { exact: true }).count(), 0);
+    await shot(page, "instance-editor-no-categories");
+    await action(editor, "Cancel").click();
+    await editor.waitFor({ state: "detached" });
+    // A category a job was saved with is still offered, so it can be taken off.
+    const narrowed = await edit(page, "Tidy tv");
+    assert.deepEqual(await narrowed.getByRole("group", { name: "Categories", exact: true }).getByRole("button").allTextContents(), ["tv"]);
+  } finally { await page.close(); }
+});
+
+test("a new job on the schedule is given when it runs, starting from the times its header asks for", async () => {
+  const page = await open("?scripts");
+  try {
+    await row(page, "Notify").waitFor();
+    await action(controls(page), "Add job").click();
+    const editor = creator(page);
+    const times = field(editor, "Run times");
+    const days = editor.getByRole("group", { name: "Days", exact: true });
+    const startup = editor.getByRole("switch", { name: "Also run at startup", exact: true });
+    // Only a job on the schedule has times.
+    await pick(page, editor, "Script", "Notify · notify.py");
+    assert.equal(await times.count(), 0);
+    await pick(page, editor, "Script", "Nightly report · nightly.py");
+    await action(editor, "Trigger").getByText("Schedule", { exact: true }).waitFor();
+    assert.equal(await times.inputValue(), "04:00, *:20");
+    assert.deepEqual(await days.getByRole("button").allTextContents(), ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]);
+    assert.equal(await days.locator('[aria-pressed="true"]').count(), 0);
+    assert.equal(await startup.isChecked(), false);
+    await editor.getByText("Local time. HH:MM, or *:MM for every hour; separate several with commas.", { exact: true }).waitFor();
+    await shot(page, "create-dialog-schedule");
+
+    // What is not a time, and no time at all, are said before anything is created.
+    await times.fill("04:00, 25:00");
+    await action(editor, "Save").click();
+    const invalid = editor.getByText("25:00 is not a time. Use HH:MM, or *:MM for every hour.", { exact: true });
+    await invalid.waitFor();
+    await times.fill("");
+    await invalid.waitFor({ state: "detached" });
+    await action(editor, "Save").click();
+    await editor.getByText("Give this job a time to run at, or turn on running at startup.", { exact: true }).waitFor();
+    assert.deepEqual((await daemon(page)).requests, []);
+
+    await times.fill("06:30, *:15");
+    await action(days, "Sat").click();
+    await action(days, "Sun").click();
+    assert.equal(await days.locator('[aria-pressed="true"]').count(), 2);
+    await startup.click();
+    await field(editor, "Job name").fill("Weekend report");
+    await action(editor, "Save").click();
+    await status(page, "Weekend report created").waitFor();
+    await editor.waitFor({ state: "detached" });
+    await rows(group(page, "Schedule")).nth(1).and(row(page, "Weekend report")).waitFor();
+    // The job, and then the one schedule rule that runs it.
+    assert.deepEqual((await daemon(page)).requests, [
+      { name: "CreateScriptInstance", variables: { input: {
+        name: "Weekend report", script: "nightly.py", trigger: "SCHEDULER", queueEvent: null,
+        inputs: [], categories: [], enabled: true, blocking: true, timeoutSeconds: null,
+      } } },
+      { name: "CreateSchedule", variables: { input: {
+        time: "06:30, *:15", days: ["sat", "sun"], runAtStartup: true,
+        actionType: "run_script", label: "Weekend report", enabled: true, instanceId: "8",
+      } } },
+    ]);
+
+    // Saved, it shows the rule it was given, which is changed among the schedules.
+    const saved = await edit(page, "Weekend report");
+    await saved.getByText("06:30, *:15 · at startup · Sat Sun", { exact: true }).waitFor();
+    await saved.getByText("The schedule rules that run this job. Change them in Schedules.", { exact: true }).waitFor();
+    assert.equal(await field(saved, "Run times").count(), 0);
+    assert.equal(await saved.getByRole("group", { name: "Days", exact: true }).count(), 0);
+  } finally { await page.close(); }
+});
+
+test("a script whose header asks for no time starts with none, and a job may run at startup alone", async () => {
+  const page = await open("?scripts");
+  try {
+    await row(page, "Notify").waitFor();
+    await action(controls(page), "Add job").click();
+    const editor = creator(page);
+    // The header's times belong to its script: a script with none starts with none.
+    await pick(page, editor, "Script", "Cleanup · cleanup.sh");
+    await pick(page, editor, "Trigger", "Schedule");
+    assert.equal(await field(editor, "Run times").inputValue(), "");
+    await editor.getByRole("switch", { name: "Also run at startup", exact: true }).click();
+    await field(editor, "Job name").fill("Startup tidy");
+    await action(editor, "Save").click();
+    await status(page, "Startup tidy created").waitFor();
+    assert.deepEqual((await daemon(page)).requests.at(-1), { name: "CreateSchedule", variables: { input: {
+      time: "*", days: null, runAtStartup: true, actionType: "run_script", label: "Startup tidy", enabled: true, instanceId: "8",
+    } } });
+    const saved = await edit(page, "Startup tidy");
+    await saved.getByText("at startup · Every day", { exact: true }).waitFor();
+  } finally { await page.close(); }
+});
+
+test("a saved job on the schedule lists the rules that run it, and one with none says so", async () => {
+  const page = await open("?scripts");
+  try {
+    let editor = await edit(page, "Nightly report");
+    for (const line of ["04:00 · Every day", "*:20 · at startup · Sat Sun"]) await editor.getByText(line, { exact: true }).waitFor();
+    await shot(page, "instance-editor-schedule");
+    // Saving the job sends nothing about its rules.
+    await action(editor, "Save").click();
+    await status(page, "Nightly report saved").waitFor();
+    assert.deepEqual((await daemon(page)).requests.map((request) => request.name), ["UpdateScriptInstance"]);
+    await page.evaluate(() => { window.scriptsFixture.schedules.length = 0; });
+    editor = await edit(page, "Nightly report");
+    await editor.getByText("No schedule rule runs this job", { exact: true }).waitFor();
+    // A job of another trigger has no such line.
+    await action(editor, "Cancel").click();
+    await editor.waitFor({ state: "detached" });
+    assert.equal(await (await edit(page, "Notify")).getByText("Run times", { exact: true }).count(), 0);
+  } finally { await page.close(); }
+});
+
+test("a job whose schedule rule the daemon refuses is still created, and the screen says its schedule was not", async () => {
+  const page = await open("?scripts&norule");
+  try {
+    await row(page, "Notify").waitFor();
+    await action(controls(page), "Add job").click();
+    const editor = creator(page);
+    await pick(page, editor, "Script", "Nightly report · nightly.py");
+    await action(editor, "Save").click();
+    await status(page, "nightly.py was created, but its schedule was not: the schedule could not be written. Add it in Schedules.").waitFor();
+    // The editor goes, so that saving again cannot make a second job.
+    await editor.waitFor({ state: "detached" });
+    await rows(group(page, "Schedule")).nth(1).and(row(page, "nightly.py")).waitFor();
+    assert.deepEqual((await daemon(page)).requests.map((request) => request.name), ["CreateScriptInstance", "CreateSchedule"]);
   } finally { await page.close(); }
 });
 
@@ -506,9 +644,9 @@ test("a secret input shows the secret it links and never its value, and can link
   try {
     let editor = await edit(page, "Notify");
     // The instance's trigger sits beside its name, and its script and trigger are the ones saved.
-    await editor.getByText("Post-processing", { exact: true }).waitFor();
     await action(editor, "Script").getByText("Notify · notify.py", { exact: true }).waitFor();
-    await action(editor, "Trigger").getByText("Post-processing · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Post-processing", { exact: true }).waitFor();
+    assert.equal(await editor.getByText("Post-processing", { exact: true }).count(), 2);
     assert.equal(await field(editor, "Job name").inputValue(), "Notify");
     assert.equal(await field(editor, "Label").inputValue(), "fixture");
     // The secret input names the secret it links; nothing can be typed into it.
@@ -595,22 +733,27 @@ test("a secret input shows the secret it links and never its value, and can link
   } finally { await page.close(); }
 });
 
-test("an input's secret box turns it into a choice of secrets or back into a blank field", async () => {
+test("only an input the header takes for a secret has the secret box, which gives it a blank field or its choice back", async () => {
   const page = await open("?scripts");
   try {
     const editor = await edit(page, "Notify");
-    // A header's hint is not a lock: the declared secret can be made plain, and a plain input secret.
+    // The header says which inputs are secrets; one it calls plain has no box to make it one.
+    for (const name of ["Label", "Mode", "Attach"]) assert.equal(await secretBox(editor, name).count(), 0, name);
+    assert.equal(await editor.getByRole("checkbox").count(), 1);
+    assert.equal(await secretBox(editor, "Token").isChecked(), true);
+    // It takes an input for a secret by its name, so that one can be made plain, and back.
     await secretBox(editor, "Token").click();
     assert.equal(await field(editor, "Token").inputValue(), "");
-    await secretBox(editor, "Label").click();
-    await action(editor, "Label").getByText("Choose a secret", { exact: true }).waitFor();
-    assert.equal(await field(editor, "Label").count(), 0);
+    await secretBox(editor, "Token").click();
+    await action(editor, "Token").getByText("Choose a secret", { exact: true }).waitFor();
+    assert.equal(await field(editor, "Token").count(), 0);
+    await secretBox(editor, "Token").click();
     await field(editor, "Token").fill("typed");
     await action(editor, "Save").click();
     await status(page, "Notify saved").waitFor();
-    // A secret input with no secret chosen is not sent.
     assert.deepEqual((await daemon(page)).requests.at(-1).variables.input.inputs, [
-      { name: "Token", value: "typed" }, { name: "Mode", value: "quiet" }, { name: "Attach", value: "no" },
+      { name: "Label", value: "fixture" }, { name: "Token", value: "typed" },
+      { name: "Mode", value: "quiet" }, { name: "Attach", value: "no" },
     ]);
   } finally { await page.close(); }
 });
@@ -625,12 +768,16 @@ test("an input the header does not declare can be added, and taken away again", 
       { exact: true },
     ).waitFor();
     assert.equal(await field(editor, "Legacy").inputValue(), "1");
-    await editor.getByText("Not declared by the script's header.", { exact: true }).waitFor();
+    await editor.getByText("Not in the script's header.", { exact: true }).waitFor();
     await shot(page, "instance-editor-drift");
     // Only what the header does not ask for can be removed.
     assert.equal(await editor.getByRole("button", { name: /^Remove / }).count(), 1);
+    // An input is added in one step, as a name with its value or a name with its secret.
     const name = field(editor, "New input name");
-    const secret = editor.getByRole("checkbox", { name: "The new input is a secret", exact: true });
+    const value = field(editor, "New input value");
+    const kind = editor.getByRole("radiogroup", { name: "Kind of new input", exact: true });
+    assert.deepEqual(await kind.getByRole("radio").allTextContents(), ["Value", "Secret"]);
+    assert.equal(await kind.getByRole("radio", { name: "Value", exact: true }).isChecked(), true);
     assert.equal(await action(editor, "Add input").isDisabled(), true);
     await name.fill("bad name");
     await action(editor, "Add input").click();
@@ -640,25 +787,50 @@ test("an input the header does not declare can be added, and taken away again", 
     await editor.getByRole("alert").waitFor({ state: "detached" });
     await name.press("Enter");
     await editor.getByRole("alert").filter({ hasText: "This job already has an input with that name." }).waitFor();
-    await name.fill("Extra.key");
-    await secret.click();
-    await action(editor, "Add input").click();
-    await action(editor, "Extra.key").getByText("Choose a secret", { exact: true }).waitFor();
-    assert.equal(await secretBox(editor, "Extra.key").isChecked(), true);
+    await name.fill("Retries");
+    await value.fill("3");
+    await value.press("Enter");
+    assert.equal(await field(editor, "Retries").inputValue(), "3");
     assert.equal(await name.inputValue(), "");
-    assert.equal(await secret.isChecked(), false);
-    await pick(page, editor, "Extra.key", "Notify token");
+    assert.equal(await value.inputValue(), "");
+    // A secret input is added with the secret it links; with none chosen there is nothing to add.
+    await kind.getByRole("radio", { name: "Secret", exact: true }).click();
+    await value.waitFor({ state: "detached" });
+    await name.fill("Extra.key");
+    await action(editor, "New input secret").getByText("Choose a secret", { exact: true }).waitFor();
+    assert.equal(await action(editor, "Add input").isDisabled(), true);
+    await action(editor, "New input secret").click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
+      "Choose a secret", "Notify token", "Spare key", "Create new secret…",
+    ]);
+    // A secret made on the spot is the one chosen.
+    await page.getByRole("menuitemradio", { name: "Create new secret…", exact: true }).click();
+    const created = secretDialog(page, "Add secret");
+    await field(created, "Name").fill("Extra token");
+    await secretField(created, "Value").fill("fixture-token-3");
+    await action(created, "Save").click();
+    await created.waitFor({ state: "detached" });
+    await action(editor, "New input secret").getByText("Extra token", { exact: true }).waitFor();
+    await shot(page, "instance-editor-add-input");
+    await action(editor, "Add input").click();
+    await action(editor, "Extra.key").getByText("Extra token", { exact: true }).waitFor();
+    await action(editor, "New input secret").getByText("Choose a secret", { exact: true }).waitFor();
+    // What was added is a value or a secret, and stays what it was added as.
+    for (const added of ["Retries", "Extra.key"]) assert.equal(await secretBox(editor, added).count(), 0, added);
+    assert.equal(await editor.getByRole("button", { name: /^Remove / }).count(), 3);
     await action(editor, "Remove Legacy").click();
     await field(editor, "Legacy").waitFor({ state: "detached" });
     await action(editor, "Save").click();
     await status(page, "Announce saved").waitFor();
-    // The secret the header declares and the instance never linked is not sent; the added one goes as its link.
+    // The secret the header declares and the instance never linked is not sent; the added ones go as a value and a link.
     assert.deepEqual((await daemon(page)).requests.at(-1).variables.input.inputs, [
-      { name: "Label", value: "queued" }, { name: "Extra.key", secretId: "s1" },
+      { name: "Label", value: "queued" }, { name: "Retries", value: "3" }, { name: "Extra.key", secretId: "s3" },
     ]);
     assert.deepEqual((await daemon(page)).instances.find((entry) => entry.id === "4").inputs, [
-      { name: "Label", value: "queued", secretId: null }, { name: "Extra.key", value: "", secretId: "s1" },
+      { name: "Label", value: "queued", secretId: null }, { name: "Retries", value: "3", secretId: null },
+      { name: "Extra.key", value: "", secretId: "s3" },
     ]);
+    assert.equal(await page.getByText("fixture-token").count(), 0);
   } finally { await page.close(); }
 });
 
@@ -732,9 +904,9 @@ test("deleting an instance asks first, and says what goes with it", async () => 
     await action(confirm, "Delete").click();
     await status(page, "Feed intake deleted").waitFor();
     await row(page, "Feed intake").waitFor({ state: "detached" });
-    // Its heading goes with its last instance, and its script is back among those with none.
+    // Its heading goes with its last instance, and its script is not listed in its place.
     assert.equal(await group(page, "Feed").count(), 0);
-    await unusedRow(page, "intake.py").waitFor();
+    assert.equal(await page.getByText("intake.py", { exact: true }).count(), 0);
     assert.deepEqual((await daemon(page)).requests, [{ name: "DeleteScriptInstance", variables: { id: "7" } }]);
 
     // The editor's own Delete asks the same question, and the editor goes with the instance.
@@ -811,15 +983,19 @@ test("an instance its header has moved away from is brought back in line, from i
 test("set up from header creates an instance for each trigger the header declares that has none", async () => {
   const page = await open("?scripts");
   try {
-    await action(unusedRow(page, "archive.py"), "Set up jobs from header").click();
+    await row(page, "Notify").waitFor();
+    await action(controls(page), "Add job").click();
+    const editor = creator(page);
+    await pick(page, editor, "Script", "Archive · archive.py");
+    await action(editor, "Set up jobs from header").click();
     await status(page, "2 jobs created for Archive").waitFor();
+    await editor.waitFor({ state: "detached" });
     // One under each heading the header names, last in its order and named after the file.
     for (const [title, index] of [["Post-processing", 3], ["Schedule", 1]]) {
       const created = rows(group(page, title)).nth(index);
       await created.waitFor();
       assert.equal(await created.getByText("archive.py", { exact: true }).count(), 2, title);
     }
-    assert.equal(await unusedRow(page, "archive.py").count(), 0);
     let held = await daemon(page);
     assert.deepEqual(held.requests, [{ name: "SetUpScriptFromHeader", variables: { script: "archive.py" } }]);
     // The header's defaults are saved; a secret has no value to copy.
@@ -828,13 +1004,12 @@ test("set up from header creates an instance for each trigger the header declare
       ["SCHEDULER", [{ name: "Target", value: "/fixture/archive", secretId: null }]],
     ]);
 
-    // The editor of a new instance offers the same, while its script has a declared trigger with no instance.
-    await action(controls(page), "Create job").click();
-    const editor = creator(page);
+    // It is offered only while the chosen script has a declared trigger with no instance.
+    await action(controls(page), "Add job").click();
     await action(editor, "Script").getByText("Choose a script", { exact: true }).waitFor();
     assert.equal(await action(editor, "Set up jobs from header").count(), 0);
     await pick(page, editor, "Script", "Nightly report · nightly.py");
-    await action(editor, "Trigger").getByText("Schedule · declared", { exact: true }).waitFor();
+    await action(editor, "Trigger").getByText("Schedule", { exact: true }).waitFor();
     assert.equal(await action(editor, "Set up jobs from header").count(), 0);
     await pick(page, editor, "Script", "Notify · notify.py");
     await action(editor, "Set up jobs from header").click();

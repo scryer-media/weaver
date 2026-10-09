@@ -141,7 +141,7 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
   {
     slug: "scripts/list",
     group: "scripts",
-    label: "next.settings.panel.scripts",
+    label: "next.settings.panel.scriptJobs",
     note: "next.settings.panel.scriptsNote",
     tag: "beta",
     icon: "scriptList",
