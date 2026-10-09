@@ -281,16 +281,19 @@ pub struct ScriptListingGql {
     pub problems: Vec<ScriptProblemGql>,
 }
 
-/// One saved input: a value, or a link to a named secret. A secret's value is
-/// never read back out.
+/// One saved input: a value, a link to a named secret, or a secret of the
+/// instance's own. A secret's value is never read back out.
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(name = "ScriptInstanceValue")]
 pub struct ScriptInstanceValueGql {
     pub name: String,
-    /// Empty when the input is linked to a secret.
+    /// Empty when the input is a secret, linked or the instance's own.
     pub value: String,
-    /// The secret the input is linked to, or null for a plain value.
+    /// The named secret the input is linked to, or null.
     pub secret: Option<SecretRefGql>,
+    /// The input is a secret of the instance's own: kept encrypted with the
+    /// instance, write-only, and not among the named secrets.
+    pub sealed: bool,
 }
 
 /// A named secret an input is linked to.
@@ -505,12 +508,13 @@ impl ScriptDirectoryView {
                 .into_iter()
                 .map(|input| ScriptInstanceValueGql {
                     name: input.name.as_str().to_string(),
-                    value: if input.secret.is_some() {
+                    value: if input.is_secret() {
                         String::new()
                     } else {
                         input.value
                     },
                     secret: input.secret.map(Into::into),
+                    sealed: input.sealed,
                 })
                 .collect(),
             categories: instance.categories,
@@ -524,14 +528,38 @@ impl ScriptDirectoryView {
     }
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Clone, InputObject)]
 #[graphql(name = "ScriptInstanceValueInput")]
 pub struct ScriptInstanceValueInput {
     pub name: String,
-    /// A plain value. Give this or `secretId`, not both.
+    /// A plain value, or with `secret` the value to keep as a secret of the
+    /// instance's own. Give this or `secretId`, not both.
     pub value: Option<String>,
-    /// The secret to link. Give this or `value`, not both.
+    /// The named secret to link. Give this or `value`, not both, and never
+    /// with `secret`.
     pub secret_id: Option<String>,
+    /// True makes the input a secret of the instance's own: `value` is kept
+    /// encrypted with the instance, is never read back, and does not become a
+    /// named secret. On an update, true with no `value` keeps the secret the
+    /// instance already holds under this name. Omitted means false.
+    pub secret: Option<bool>,
+}
+
+/// A value sent to be kept as a secret is not printed.
+impl std::fmt::Debug for ScriptInstanceValueInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match &self.value {
+            Some(_) if self.secret == Some(true) => Some("<sealed>"),
+            value => value.as_deref(),
+        };
+        formatter
+            .debug_struct("ScriptInstanceValueInput")
+            .field("name", &self.name)
+            .field("value", &value)
+            .field("secret_id", &self.secret_id)
+            .field("secret", &self.secret)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, InputObject)]
@@ -580,6 +608,7 @@ impl ScriptInstanceInput {
                     name: input.name,
                     value: input.value,
                     secret_id: input.secret_id,
+                    sealed: input.secret.unwrap_or(false),
                 })
                 .collect(),
             categories: self.categories,
@@ -893,5 +922,28 @@ impl From<ScriptTestSnapshot> for ScriptTestRunGql {
             commands: value.commands,
             commands_truncated: value.commands_truncated,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScriptInstanceValueInput;
+
+    #[test]
+    fn a_value_sent_to_be_kept_as_a_secret_is_not_printed() {
+        let sent = |secret| {
+            format!(
+                "{:?}",
+                ScriptInstanceValueInput {
+                    name: "Token".to_string(),
+                    value: Some("hunter2".to_string()),
+                    secret_id: None,
+                    secret,
+                }
+            )
+        };
+        assert!(!sent(Some(true)).contains("hunter2"));
+        assert!(sent(Some(false)).contains("hunter2"));
+        assert!(sent(None).contains("hunter2"));
     }
 }

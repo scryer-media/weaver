@@ -25,9 +25,11 @@ CREATE TABLE script_instance_inputs (
     name TEXT NOT NULL,
     value TEXT NOT NULL,
     secret_id TEXT REFERENCES secrets(id) ON DELETE RESTRICT,
+    sealed_value TEXT,
     position BIGINT NOT NULL,
     PRIMARY KEY (instance_id, name),
-    CHECK (secret_id IS NULL OR value = '')
+    CHECK (secret_id IS NULL OR sealed_value IS NULL),
+    CHECK ((secret_id IS NULL AND sealed_value IS NULL) OR value = '')
 );
 CREATE INDEX script_instance_inputs_secret ON script_instance_inputs(secret_id);
 CREATE TABLE script_instance_categories (

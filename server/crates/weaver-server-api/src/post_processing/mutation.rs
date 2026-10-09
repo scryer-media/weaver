@@ -297,9 +297,11 @@ impl PostProcessingMutation {
             .map_err(secret_error)
     }
 
-    /// Replace everything saved in an instance. Each input is sent as a value
-    /// or as the secret it links. An instance that no longer runs on a
-    /// schedule loses the schedule rules that ran it.
+    /// Replace everything saved in an instance. Each input is sent as a value,
+    /// as the secret it links, or as a secret of the instance's own; one of
+    /// those sent without a value keeps the secret already saved under that
+    /// name. An instance that no longer runs on a schedule loses the schedule
+    /// rules that ran it.
     #[graphql(guard = "FreshAdminGuard")]
     async fn update_script_instance(
         &self,
