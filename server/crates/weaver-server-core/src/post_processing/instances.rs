@@ -13,9 +13,9 @@ use super::model::{
     GlobalScriptsRun, OptionName, OptionValue, PostProcessingSettings, QueueEvent, ResolvedOption,
     ScriptEventLabel, ScriptKind, ScriptName, SecretOptionValue,
 };
-use super::secrets::SecretRef;
+use super::secrets::{SecretRef, secrets_exist_tx};
 use crate::persistence::encryption::decrypt_value;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, is_foreign_key_violation};
 use crate::persistence::{Database, StateError};
 
 const MAX_INSTANCE_NAME_BYTES: usize = 128;
@@ -362,6 +362,22 @@ impl ScriptInstanceDraft {
 enum Updated {
     Done,
     NotFound,
+    MissingSecret,
+}
+
+const MISSING_SECRET: ScriptInstanceError =
+    ScriptInstanceError::Invalid("a linked secret does not exist");
+
+/// A write that lost a race to a secret being deleted hits the foreign key
+/// on the input row: that is a missing secret, not a storage failure.
+fn missing_secret_race<T>(result: Result<T, StateError>) -> Result<T, ScriptInstanceError> {
+    result.map_err(|error| {
+        if is_foreign_key_violation(&error) {
+            MISSING_SECRET
+        } else {
+            ScriptInstanceError::Storage(error)
+        }
+    })
 }
 
 /// What an input row holds.
@@ -381,6 +397,19 @@ struct ValidatedInstance {
     enabled: bool,
     blocking: bool,
     timeout_seconds: Option<i64>,
+}
+
+impl ValidatedInstance {
+    /// The ids of the secrets its inputs link.
+    fn linked_secrets(&self) -> Vec<String> {
+        self.inputs
+            .iter()
+            .filter_map(|(_, stored)| match stored {
+                StoredValue::Secret(id) => Some(id.clone()),
+                StoredValue::Plain(_) => None,
+            })
+            .collect()
+    }
 }
 
 impl Database {
@@ -431,7 +460,6 @@ impl Database {
         }
         let mut seen = BTreeSet::new();
         let mut inputs = Vec::with_capacity(draft.inputs.len());
-        let mut linked = Vec::new();
         for input in draft.inputs {
             let name = OptionName::new(input.name.trim())
                 .map_err(|_| ScriptInstanceError::Invalid("input name is invalid"))?;
@@ -445,10 +473,7 @@ impl Database {
                     }
                     StoredValue::Plain(value)
                 }
-                (None, Some(secret_id)) => {
-                    linked.push(secret_id.clone());
-                    StoredValue::Secret(secret_id)
-                }
+                (None, Some(secret_id)) => StoredValue::Secret(secret_id),
                 _ => {
                     return Err(ScriptInstanceError::Invalid(
                         "an input holds either a value or a secret",
@@ -457,11 +482,7 @@ impl Database {
             };
             inputs.push((name.as_str().to_string(), stored));
         }
-        if !self.secrets_exist(&linked)? {
-            return Err(ScriptInstanceError::Invalid(
-                "a linked secret does not exist",
-            ));
-        }
+        // Linked secrets are checked inside the write's transaction.
         Ok(ValidatedInstance {
             name,
             script: draft.script.as_str().to_string(),
@@ -604,14 +625,19 @@ impl Database {
                 let instance = instance.clone();
                 let id = id.clone();
                 Box::pin(async move {
+                    if !secrets_exist_tx(tx, &instance.linked_secrets()).await? {
+                        return Ok(false);
+                    }
                     insert_instance_tx(tx, &id, &instance, now).await?;
-                    Ok(())
+                    Ok(true)
                 })
             })
             .await
         });
         self.invalidate_queue_script_admission();
-        result?;
+        if !missing_secret_race(result)? {
+            return Err(MISSING_SECRET);
+        }
         self.script_instance(&created)?
             .ok_or(ScriptInstanceError::NotFound)
     }
@@ -630,6 +656,9 @@ impl Database {
                 let instance = instance.clone();
                 let id = target.clone();
                 Box::pin(async move {
+                    if !secrets_exist_tx(tx, &instance.linked_secrets()).await? {
+                        return Ok(Updated::MissingSecret);
+                    }
                     let (kind, detail) = instance.trigger.stored();
                     let updated = tx
                         .execute(
@@ -675,9 +704,10 @@ impl Database {
             .await
         });
         self.invalidate_queue_script_admission();
-        match found? {
+        match missing_secret_race(found)? {
             Updated::Done => {}
             Updated::NotFound => return Err(ScriptInstanceError::NotFound),
+            Updated::MissingSecret => return Err(MISSING_SECRET),
         }
         self.script_instance(id)?
             .ok_or(ScriptInstanceError::NotFound)

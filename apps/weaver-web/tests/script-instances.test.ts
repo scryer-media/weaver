@@ -18,6 +18,7 @@ import {
   triggerTitle,
   unwiredTriggers,
   withScript,
+  withLinkedSecret,
   withSecret,
   type DiscoveredScript,
   type ScriptInstance,
@@ -231,8 +232,24 @@ test("a secret input opens on the secret it links and is sent as that link", () 
     { name: "Token", secretId: "s1" },
   ]);
 
-  const relinked = { ...form, inputs: form.inputs.map((input) => (input.secret ? { ...input, secretId: "s2" } : input)) };
+  const relinked = { ...form, inputs: form.inputs.map((input) => (input.secret ? withLinkedSecret(input, "s2") : input)) };
   assert.deepEqual(inputFromForm(relinked).inputs[1], { name: "Token", secretId: "s2" });
+});
+
+test("clearing a secret input's link keeps the slot and leaves it out of what is sent", () => {
+  const saved = instance("one", {
+    inputs: [
+      { name: "Url", value: "http://127.0.0.1/hook", secret: null },
+      { name: "Token", value: "", secret: { id: "s1", name: "Notify token" } },
+    ],
+  });
+  const form = formFromInstance(saved, NOTIFY);
+  const cleared = { ...form, inputs: form.inputs.map((input) => (input.secret ? withLinkedSecret(input, null) : input)) };
+  assert.deepEqual(cleared.inputs[1], { name: "Token", value: "", secret: true, secretId: null });
+  assert.deepEqual(inputFromForm(cleared).inputs, [{ name: "Url", value: "http://127.0.0.1/hook" }]);
+  // Linking it again sends the link once more.
+  const relinked = { ...cleared, inputs: cleared.inputs.map((input) => (input.secret ? withLinkedSecret(input, "s1") : input)) };
+  assert.deepEqual(inputFromForm(relinked).inputs, inputFromForm(form).inputs);
 });
 
 test("ticking or clearing an input's secret box empties it either way", () => {

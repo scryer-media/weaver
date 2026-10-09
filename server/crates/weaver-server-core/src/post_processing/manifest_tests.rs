@@ -81,6 +81,75 @@ fn a_bare_nzbget_header_declares_its_options_and_hints_credentials_secret() {
     }
 }
 
+#[test]
+fn a_credential_hint_matches_whole_words_of_the_option_name_only() {
+    for name in [
+        "ApiKey",
+        "API_KEY",
+        "APIKey",
+        "api-key",
+        "AuthToken",
+        "SmtpPassword",
+        "SMTP_PASSWD",
+        "DbPass",
+        "pass",
+        "Secret",
+        "WebhookSecret",
+        "Pass.Phrase",
+        "Key2",
+    ] {
+        assert!(option_name_suggests_secret(name), "{name}");
+    }
+    // A hint inside a longer word, or `pass` leading a name, is not a
+    // credential. `Tokenizer` is one word, so it is not one either.
+    for name in [
+        "IgnoreKeywords",
+        "Passive",
+        "Bypass",
+        "PassThrough",
+        "Keyboard",
+        "Tokenizer",
+        "Monkey",
+        "",
+    ] {
+        assert!(!option_name_suggests_secret(name), "{name}");
+    }
+
+    let script = "#!/bin/sh\n\
+        ### NZBGET POST-PROCESSING SCRIPT ###\n\
+        ### OPTIONS ###\n\
+        #IgnoreKeywords=sample\n\
+        #PassThrough=yes\n\
+        #WebhookSecret=x\n\
+        ### NZBGET POST-PROCESSING SCRIPT ###\n";
+    let shape = bare_script_options(script)
+        .iter()
+        .map(|option| {
+            (
+                option.name().as_str().to_string(),
+                option.option_type(),
+                option.default().cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shape,
+        [
+            (
+                "IgnoreKeywords".to_string(),
+                ScriptOptionType::String,
+                Some(OptionValue::String("sample".into()))
+            ),
+            (
+                "PassThrough".to_string(),
+                ScriptOptionType::String,
+                Some(OptionValue::String("yes".into()))
+            ),
+            ("WebhookSecret".to_string(), ScriptOptionType::Secret, None),
+        ]
+    );
+}
+
 const NZBGET_V2_MANIFEST: &str = include_str!("fixtures/nzbget-v2-post-processing-manifest.json");
 
 #[test]

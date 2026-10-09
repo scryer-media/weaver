@@ -1035,6 +1035,30 @@ pub(crate) fn is_postgres_connection_error(error: &StateError) -> bool {
         || normalized.contains("no connection to the server")
 }
 
+/// A write refused by a unique constraint or index: SQLSTATE 23505 on
+/// Postgres, `UNIQUE constraint failed` on SQLite.
+pub(crate) fn is_unique_violation(error: &StateError) -> bool {
+    let StateError::Database(message) = error else {
+        return false;
+    };
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("sqlstate=23505")
+        || normalized.contains("unique constraint failed")
+        || normalized.contains("duplicate key value violates unique constraint")
+}
+
+/// A write refused by a foreign key: SQLSTATE 23503 on Postgres,
+/// `FOREIGN KEY constraint failed` on SQLite.
+pub(crate) fn is_foreign_key_violation(error: &StateError) -> bool {
+    let StateError::Database(message) = error else {
+        return false;
+    };
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("sqlstate=23503")
+        || normalized.contains("foreign key constraint failed")
+        || normalized.contains("violates foreign key constraint")
+}
+
 async fn run_with_postgres_retries<T, Op, Fut>(
     op_name: &str,
     retry_connection_errors: bool,
@@ -1347,6 +1371,46 @@ mod tests {
         )));
         assert!(!is_postgres_rolled_back_transient(&StateError::Database(
             "syntax error".to_string()
+        )));
+    }
+
+    #[test]
+    fn classifies_unique_and_foreign_key_violations_on_both_backends() {
+        let error = |message: &str| StateError::Database(message.to_string());
+        // SQLite.
+        let sqlite_unique = error(
+            "error returned from database: (code: 2067) UNIQUE constraint failed: secrets.name_key",
+        );
+        let sqlite_foreign =
+            error("error returned from database: (code: 787) FOREIGN KEY constraint failed");
+        assert!(is_unique_violation(&sqlite_unique));
+        assert!(!is_foreign_key_violation(&sqlite_unique));
+        assert!(is_foreign_key_violation(&sqlite_foreign));
+        assert!(!is_unique_violation(&sqlite_foreign));
+        // Postgres, as `pg_db_err` renders it.
+        let postgres_unique = error(
+            "sqlstate=23505; error returned from database: duplicate key value violates unique constraint \"secrets_name_key_key\"",
+        );
+        let postgres_foreign = error(
+            "sqlstate=23503; error returned from database: update or delete on table \"secrets\" violates foreign key constraint \"script_instance_inputs_secret_id_fkey\" on table \"script_instance_inputs\"",
+        );
+        assert!(is_unique_violation(&postgres_unique));
+        assert!(!is_foreign_key_violation(&postgres_unique));
+        assert!(is_foreign_key_violation(&postgres_foreign));
+        assert!(!is_unique_violation(&postgres_foreign));
+        // The bare driver messages, without the SQLSTATE prefix.
+        assert!(is_unique_violation(&error(
+            "duplicate key value violates unique constraint \"x\""
+        )));
+        assert!(is_foreign_key_violation(&error(
+            "insert or update on table \"x\" violates foreign key constraint \"y\""
+        )));
+        for unrelated in ["database is locked", "syntax error", "sqlstate=40001; x"] {
+            assert!(!is_unique_violation(&error(unrelated)), "{unrelated}");
+            assert!(!is_foreign_key_violation(&error(unrelated)), "{unrelated}");
+        }
+        assert!(!is_unique_violation(&StateError::Conflict(
+            "UNIQUE constraint failed".to_string()
         )));
     }
 

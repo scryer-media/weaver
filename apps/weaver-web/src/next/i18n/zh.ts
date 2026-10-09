@@ -1103,6 +1103,7 @@ export const nextZh: LocaleDictionary = {
   "next.postProcessing.secret": "机密",
   "next.postProcessing.secretLinkHelp": "在 设置 · 脚本 · 机密 中关联。脚本运行时会获得其值，此处永不显示。",
   "next.postProcessing.chooseSecret": "选择机密",
+  "next.postProcessing.noSecret": "无机密",
   "next.postProcessing.createSecret": "新建机密…",
   "next.postProcessing.inputIsSecret": "{{name}} 是机密",
   "next.postProcessing.undeclaredInput": "脚本头部未声明。",

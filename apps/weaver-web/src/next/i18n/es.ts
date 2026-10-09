@@ -1103,6 +1103,7 @@ export const nextEs: LocaleDictionary = {
   "next.postProcessing.secret": "Secreto",
   "next.postProcessing.secretLinkHelp": "Enlazado desde Ajustes · Scripts · Secretos. El script recibe su valor al ejecutarse; aquí nunca se muestra.",
   "next.postProcessing.chooseSecret": "Elige un secreto",
+  "next.postProcessing.noSecret": "Ningún secreto",
   "next.postProcessing.createSecret": "Crear un secreto nuevo…",
   "next.postProcessing.inputIsSecret": "{{name}} es un secreto",
   "next.postProcessing.undeclaredInput": "No la declara la cabecera del script.",

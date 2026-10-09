@@ -419,6 +419,14 @@ export function withSecret(input: InstanceInputForm, secret: boolean): InstanceI
   return { ...input, secret, value: "", secretId: null };
 }
 
+/**
+ * The secret input linked to `secretId`, or unlinked when it is null. An
+ * unlinked secret input stays a secret slot and is left out of what is sent.
+ */
+export function withLinkedSecret(input: InstanceInputForm, secretId: string | null): InstanceInputForm {
+  return { ...input, secret: true, value: "", secretId };
+}
+
 /** Letters, digits, `_` and `-`, starting with a letter; dots join such parts. */
 const INPUT_NAME = /^[A-Za-z][A-Za-z0-9_-]*(\.[A-Za-z][A-Za-z0-9_-]*)*$/;
 

@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::encryption::encrypt_value;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{
+    SqlArg, SqlRuntime, SqlTx, is_foreign_key_violation, is_unique_violation,
+};
 use crate::persistence::{Database, StateError};
 
 const MAX_SECRET_NAME_BYTES: usize = 128;
@@ -57,6 +59,9 @@ pub enum SecretError {
 }
 
 fn in_use_names(usages: &[SecretUsage]) -> String {
+    if usages.is_empty() {
+        return "a script instance".to_string();
+    }
     usages
         .iter()
         .map(|usage| usage.instance_name.as_str())
@@ -204,8 +209,8 @@ impl Database {
                 })
             })
             .await
-        })?;
-        self.finish(outcome, &created)
+        });
+        self.finish(name_race_outcome(outcome)?, &created)
     }
 
     /// Rename a secret, give it a new value, or both. A run started after
@@ -262,8 +267,8 @@ impl Database {
                 })
             })
             .await
-        })?;
-        self.finish(outcome, id)
+        });
+        self.finish(name_race_outcome(outcome)?, id)
     }
 
     /// Remove a secret. Refused while any instance links it.
@@ -306,7 +311,22 @@ impl Database {
                 })
             })
             .await
-        })?;
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // An instance linked the secret between the check and the delete;
+            // the foreign key refused it. Name whoever links it now.
+            Err(error) if is_foreign_key_violation(&error) => Outcome::InUse(
+                self.secret_usages()?
+                    .remove(id)
+                    .map(|mut usages| {
+                        usages.sort();
+                        usages
+                    })
+                    .unwrap_or_default(),
+            ),
+            Err(error) => return Err(error.into()),
+        };
         match outcome {
             Outcome::Done => Ok(()),
             Outcome::NotFound => Err(SecretError::NotFound),
@@ -323,30 +343,36 @@ impl Database {
             Outcome::InUse(usages) => Err(SecretError::InUse(usages)),
         }
     }
+}
 
-    /// Whether every id names a stored secret.
-    pub(crate) fn secrets_exist(&self, ids: &[String]) -> Result<bool, StateError> {
-        if ids.is_empty() {
-            return Ok(true);
-        }
-        let datastore = self.datastore();
-        let ids = ids.to_vec();
-        self.run_sql_blocking_read(async move {
-            for id in ids {
-                if SqlRuntime::fetch_optional(
-                    datastore.read_exec(),
-                    "SELECT id FROM secrets WHERE id = {}",
-                    &[SqlArg::Text(id)],
-                )
-                .await?
-                .is_none()
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        })
+/// A name write that lost a race to another with the same name hits the
+/// unique index on `name_key`: that is the name being taken, not a failure.
+fn name_race_outcome(result: Result<Outcome, StateError>) -> Result<Outcome, SecretError> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if is_unique_violation(&error) => Ok(Outcome::NameTaken),
+        Err(error) => Err(error.into()),
     }
+}
+
+/// Whether every id names a stored secret, read inside `tx`.
+pub(crate) async fn secrets_exist_tx(
+    tx: &mut SqlTx<'_>,
+    ids: &[String],
+) -> Result<bool, StateError> {
+    for id in ids {
+        if tx
+            .fetch_optional(
+                "SELECT id FROM secrets WHERE id = {}",
+                &[SqlArg::Text(id.clone())],
+            )
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn name_taken_tx(

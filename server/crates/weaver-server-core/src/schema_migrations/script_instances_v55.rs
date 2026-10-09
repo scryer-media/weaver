@@ -362,20 +362,34 @@ fn name_key(name: &str) -> String {
     name.to_lowercase()
 }
 
-/// `<script> <option>`, cut to fit and made unique with a counter.
+/// The longest prefix of `text` that fits in `max` bytes, cut on a character
+/// boundary.
+fn cut_to(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// `<script> <option>`, made unique with a counter. When it does not fit,
+/// the script part is cut first so the option's name survives whole.
 fn secret_name(script: &str, option: &str, taken: &BTreeSet<String>) -> String {
-    let base = format!("{script} {option}");
     for counter in 1_usize.. {
         let suffix = if counter == 1 {
             String::new()
         } else {
             format!(" {counter}")
         };
-        let mut name = base.clone();
-        while name.len() + suffix.len() > MAX_NAME_BYTES {
-            name.pop();
-        }
-        name.push_str(&suffix);
+        let option = cut_to(option.trim(), MAX_NAME_BYTES - suffix.len()).trim_end();
+        let room = MAX_NAME_BYTES.saturating_sub(option.len() + suffix.len() + 1);
+        let script = cut_to(script.trim(), room).trim_end();
+        let base = if script.is_empty() {
+            option.to_string()
+        } else {
+            format!("{script} {option}")
+        };
+        let name = format!("{}{suffix}", base.trim_end());
         if !taken.contains(&name_key(&name)) {
             return name;
         }
@@ -1519,7 +1533,29 @@ mod tests {
                 ]
             );
         }
-        assert!(secret_name(&"x".repeat(200), "Token", &BTreeSet::new()).len() <= MAX_NAME_BYTES);
+        // A long script name is cut, never the option's name, and the cut
+        // leaves no trailing space before the option or the counter.
+        let long = secret_name(&"x".repeat(200), "Token", &BTreeSet::new());
+        assert!(long.len() <= MAX_NAME_BYTES, "{long}");
+        assert!(long.ends_with("x Token"), "{long}");
+        // The cut for the plain name lands right after the script's space.
+        let spaced = format!("{} {}", "x".repeat(MAX_NAME_BYTES - 7), "y".repeat(50));
+        let taken = BTreeSet::from([name_key(&secret_name(&spaced, "Token", &BTreeSet::new()))]);
+        for name in [
+            secret_name(&spaced, "Token", &BTreeSet::new()),
+            secret_name(&spaced, "Token", &taken),
+        ] {
+            assert!(name.len() <= MAX_NAME_BYTES, "{name}");
+            assert!(!name.contains("  "), "{name}");
+            assert!(!name.ends_with(char::is_whitespace), "{name}");
+            assert!(name.contains(" Token"), "{name}");
+        }
+        assert!(secret_name(&spaced, "Token", &taken).ends_with(" Token 2"));
+        // A multi-byte script name is cut on a character boundary.
+        let wide = secret_name(&"ü".repeat(100), "Password", &BTreeSet::new());
+        assert!(wide.len() <= MAX_NAME_BYTES, "{wide}");
+        assert!(wide.ends_with("ü Password"), "{wide}");
+        assert!(wide.trim_end_matches(" Password").chars().all(|c| c == 'ü'));
     }
 
     #[test]
@@ -1614,6 +1650,16 @@ mod tests {
     /// the scripts in `scripts`, and return it with the warnings the step
     /// gave.
     async fn upgraded(root: &Path, scripts: &Path, lists: Value) -> (Database, Vec<String>) {
+        upgraded_with_options(root, scripts, lists, json!({})).await
+    }
+
+    /// [`upgraded`], with `options` saved for the scripts as well.
+    async fn upgraded_with_options(
+        root: &Path,
+        scripts: &Path,
+        lists: Value,
+        options: Value,
+    ) -> (Database, Vec<String>) {
         let path = root.join("weaver.db");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1635,7 +1681,7 @@ mod tests {
         .unwrap();
         let saved = Saved {
             lists: Some(lists.to_string()),
-            options: Some("{}".into()),
+            options: Some(options.to_string()),
             ..saved(scripts)
         };
         for (key, value) in [
@@ -1692,6 +1738,97 @@ mod tests {
         );
         package(&scripts, "notify", "QUEUE", "NZB_ADDED", json!([]));
         scripts
+    }
+
+    #[tokio::test]
+    async fn scripts_whose_names_differ_only_by_case_get_distinct_secrets_through_open() {
+        let root = tempfile::tempdir().unwrap();
+        // Neither script is on disk, so the saved options alone say what
+        // each instance holds; no case-folding filesystem is involved.
+        let scripts = root.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let scripts = fs::canonicalize(&scripts).unwrap();
+        let (db, _) = upgraded_with_options(
+            root.path(),
+            &scripts,
+            json!({"global": [{"script": "Notify.sh"}, {"script": "notify.sh"}]}),
+            json!({
+                "Notify.sh": {"secrets": [{"name": "Token", "ciphertext": "sealed-upper"}]},
+                "notify.sh": {"secrets": [{"name": "Token", "ciphertext": "sealed-lower"}]},
+            }),
+        )
+        .await;
+
+        let secrets = db.secrets().unwrap();
+        let mut names = secrets
+            .iter()
+            .map(|secret| secret.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["Notify.sh Token", "notify.sh Token 2"]);
+        let id_of = |name: &str| {
+            secrets
+                .iter()
+                .find(|secret| secret.name == name)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let linked = db
+            .script_instances()
+            .unwrap()
+            .iter()
+            .map(|instance| {
+                (
+                    instance.script.as_str().to_string(),
+                    instance
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            (
+                                input.name.as_str().to_string(),
+                                input.secret.as_ref().map(|secret| secret.id.clone()),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            linked,
+            [
+                (
+                    "Notify.sh".to_string(),
+                    vec![("Token".to_string(), Some(id_of("Notify.sh Token")))]
+                ),
+                (
+                    "notify.sh".to_string(),
+                    vec![("Token".to_string(), Some(id_of("notify.sh Token 2")))]
+                ),
+            ]
+        );
+        // Each secret carries its own script's ciphertext across unchanged.
+        let datastore = db.datastore();
+        let rows = db
+            .run_sql_blocking_read(async move {
+                crate::persistence::sql_runtime::SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    "SELECT name, value FROM secrets ORDER BY value",
+                    &[],
+                )
+                .await
+            })
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.text("name").unwrap(), row.text("value").unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                ("notify.sh Token 2".to_string(), "sealed-lower".to_string()),
+                ("Notify.sh Token".to_string(), "sealed-upper".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

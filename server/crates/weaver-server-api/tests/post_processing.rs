@@ -859,6 +859,111 @@ async fn secrets_are_admin_only_named_once_kept_while_linked_and_never_read_back
     assert!(harness.db.secrets().unwrap().is_empty());
 }
 
+/// The secret mutations, each aimed at `id`.
+fn secret_mutations(id: &str) -> [String; 3] {
+    [
+        r#"mutation { createSecret(name: "From outside", value: "hunter9") { id } }"#.to_string(),
+        format!(
+            r#"mutation {{ updateSecret(id: "{id}", name: "Changed", value: "hunter9") {{ id }} }}"#
+        ),
+        format!(r#"mutation {{ deleteSecret(id: "{id}") }}"#),
+    ]
+}
+
+/// The names of the stored secrets, with when each was last changed.
+fn stored_secrets(harness: &TestHarness) -> Vec<(String, i64)> {
+    harness
+        .db
+        .secrets()
+        .unwrap()
+        .into_iter()
+        .map(|secret| (secret.name, secret.updated_at_ms))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_script_runs_token_may_not_create_change_or_delete_a_secret() {
+    let harness = TestHarness::new().await;
+    let kept = harness.db.create_secret("Kept", "hunter2").unwrap();
+    let before = stored_secrets(&harness);
+    for mutation in secret_mutations(&kept.id) {
+        let response = harness
+            .schema
+            .execute(
+                async_graphql::Request::new(mutation.as_str())
+                    .data(CallerScope::ScriptRun)
+                    .data(weaver_server_api::auth::CallerIdentity::ScriptRun(
+                        "run-1".into(),
+                    )),
+            )
+            .await;
+        assert_has_errors(&response);
+        assert_eq!(
+            error_code(&response),
+            "NOT_ALLOWED_FOR_SCRIPT_RUN",
+            "{mutation}"
+        );
+    }
+    assert_eq!(stored_secrets(&harness), before);
+}
+
+#[tokio::test]
+async fn a_browser_session_without_a_recent_password_check_may_not_change_a_secret() {
+    use weaver_server_core::security::{AUTHENTICATED_POLICY_REVISION, RuntimeSecurityConfig};
+
+    let security = RuntimeSecurityConfig::default();
+    security.apply_stored_access_policy_revision(None, Some(AUTHENTICATED_POLICY_REVISION), true);
+    let harness = TestHarness::new_with_security(security).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Signed in an hour ago, and the password not typed since.
+    harness
+        .db
+        .create_browser_session(&weaver_server_core::auth::BrowserSession {
+            token_hash: "07".repeat(32),
+            csrf_verifier: "test-verifier".into(),
+            origin: "https://test".into(),
+            client_ip: None,
+            remembered: false,
+            created_at: now - 3600,
+            expires_at: now + 3600,
+            revoked_at: None,
+        })
+        .unwrap();
+    let kept = harness.db.create_secret("Kept", "hunter2").unwrap();
+    let before = stored_secrets(&harness);
+    for mutation in secret_mutations(&kept.id) {
+        let response = harness
+            .schema
+            .execute(
+                async_graphql::Request::new(mutation.as_str())
+                    .data(CallerScope::Admin)
+                    .data(weaver_server_api::auth::CallerIdentity::Jwt([7; 32])),
+            )
+            .await;
+        assert_has_errors(&response);
+        assert_eq!(error_code(&response), "REAUTH_REQUIRED", "{mutation}");
+    }
+    assert_eq!(stored_secrets(&harness), before);
+
+    // Listing names needs no fresh password check.
+    let listed = harness
+        .schema
+        .execute(
+            async_graphql::Request::new("{ secrets { name } }")
+                .data(CallerScope::Admin)
+                .data(weaver_server_api::auth::CallerIdentity::Jwt([7; 32])),
+        )
+        .await;
+    assert_no_errors(&listed);
+    assert_eq!(
+        response_data(&listed)["secrets"],
+        json!([{ "name": "Kept" }])
+    );
+}
+
 #[tokio::test]
 async fn a_script_is_set_up_from_its_header_once_and_its_schedule_goes_with_it() {
     let harness = TestHarness::new().await;

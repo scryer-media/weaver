@@ -1103,6 +1103,7 @@ export const nextKo: LocaleDictionary = {
   "next.postProcessing.secret": "비밀 값",
   "next.postProcessing.secretLinkHelp": "설정 · 스크립트 · 비밀 값에서 연결합니다. 스크립트는 실행할 때 값을 받으며, 여기에는 표시되지 않습니다.",
   "next.postProcessing.chooseSecret": "비밀 값 선택",
+  "next.postProcessing.noSecret": "비밀 값 없음",
   "next.postProcessing.createSecret": "새 비밀 값 만들기…",
   "next.postProcessing.inputIsSecret": "{{name}}은(는) 비밀 값",
   "next.postProcessing.undeclaredInput": "스크립트 헤더에 선언되지 않았습니다.",
