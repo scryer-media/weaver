@@ -1453,6 +1453,7 @@ export const nextEn: LocaleDictionary = {
   "next.schedules.chooseInstance": "Choose an instance",
   "next.schedules.noInstances": "No schedule instances yet",
   "next.schedules.instanceGone": "No longer a schedule instance",
+  "next.schedules.instanceProblem": "Does nothing: its script instance is gone or no longer runs on a schedule",
   "next.schedules.scriptTimeHelp": "Local time. HH:MM, or *:MM for every hour; separate several with commas.",
   "next.schedules.runAtStartup": "Also run at startup",
   "next.schedules.runAtStartupHelp": "A script runs at startup only when a rule turns this on.",

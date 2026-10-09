@@ -1646,6 +1646,7 @@ impl Database {
                 "SELECT password FROM proxy_profiles WHERE password IS NOT NULL",
                 "SELECT password FROM active_jobs WHERE password IS NOT NULL",
                 "SELECT source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
+                "SELECT value AS password FROM script_instance_inputs WHERE secret",
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
                 for row in rows {
@@ -1744,6 +1745,25 @@ impl Database {
                 decrypt_value(&credential_key, &ciphertext).map_err(|error| {
                     StateError::Conflict(format!(
                         "cannot decrypt persisted post-processing secret option: {error}"
+                    ))
+                })?;
+            }
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT instance_id, name, value FROM script_instance_inputs WHERE secret",
+                &[],
+            )
+            .await?;
+            for row in rows {
+                let value = row.text("value")?;
+                if !is_encrypted(&value) {
+                    continue;
+                }
+                decrypt_value(&credential_key, &value).map_err(|error| {
+                    StateError::Conflict(format!(
+                        "cannot decrypt secret input {} of script instance {}: {error}",
+                        row.text("name").unwrap_or_default(),
+                        row.text("instance_id").unwrap_or_default(),
                     ))
                 })?;
             }

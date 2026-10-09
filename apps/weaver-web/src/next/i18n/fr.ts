@@ -1445,6 +1445,7 @@ export const nextFr: LocaleDictionary = {
   "next.schedules.chooseInstance": "Choisir une instance",
   "next.schedules.noInstances": "Aucune instance de planification pour l'instant",
   "next.schedules.instanceGone": "N'est plus une instance de planification",
+  "next.schedules.instanceProblem": "Sans effet : son instance de script a été supprimée ou ne s'exécute plus selon un planning",
   "next.schedules.scriptTimeHelp": "Heure locale. HH:MM, ou *:MM pour chaque heure ; séparez-en plusieurs par des virgules.",
   "next.schedules.runAtStartup": "Exécuter aussi au démarrage",
   "next.schedules.runAtStartupHelp": "Un script ne s’exécute au démarrage que si une règle l’active ici.",

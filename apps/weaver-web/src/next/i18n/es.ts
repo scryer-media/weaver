@@ -1445,6 +1445,7 @@ export const nextEs: LocaleDictionary = {
   "next.schedules.chooseInstance": "Elegir instancia",
   "next.schedules.noInstances": "Aún no hay instancias de programación",
   "next.schedules.instanceGone": "Ya no es una instancia de programación",
+  "next.schedules.instanceProblem": "No hace nada: su instancia de script ya no existe o ya no se ejecuta según una programación",
   "next.schedules.scriptTimeHelp": "Hora local. HH:MM, o *:MM para cada hora; separa varias con comas.",
   "next.schedules.runAtStartup": "Ejecutar también al iniciar",
   "next.schedules.runAtStartupHelp": "Un script solo se ejecuta al iniciar cuando una regla lo activa aquí.",

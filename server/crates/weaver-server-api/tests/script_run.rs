@@ -17,6 +17,16 @@ fn open(
     job_id: Option<u64>,
     event: ScriptEventLabel,
 ) -> RunRequests {
+    open_run(harness, run_id, job_id, event, false)
+}
+
+fn open_run(
+    harness: &TestHarness,
+    run_id: &str,
+    job_id: Option<u64>,
+    event: ScriptEventLabel,
+    test: bool,
+) -> RunRequests {
     let mut identity = RunIdentity {
         run_id: run_id.into(),
         instance_id: "instance-1".into(),
@@ -25,7 +35,7 @@ fn open(
     };
     harness
         .db
-        .open_script_run(&mut identity, job_id, &event, None, false)
+        .open_script_run(&mut identity, job_id, &event, None, test)
 }
 
 /// Ask as the script of run `run_id` would, with the token it was handed.
@@ -34,7 +44,7 @@ async fn as_run(harness: &TestHarness, run_id: &str, query: &str) -> Response {
         .schema
         .execute(
             Request::new(query)
-                .data(CallerScope::Admin)
+                .data(CallerScope::ScriptRun)
                 .data(CallerIdentity::ScriptRun(run_id.into())),
         )
         .await
@@ -391,4 +401,163 @@ async fn what_the_run_makes_of_a_request_is_what_the_script_is_told() {
         refused(&as_run(&harness, "run-post", MOVE).await).0,
         "SCRIPT_RUN_ENDED"
     );
+}
+
+#[tokio::test]
+async fn a_second_run_under_the_same_id_leaves_the_first_alone() {
+    let harness = TestHarness::new().await;
+    harness.db.set_script_api_url("http://127.0.0.1:1/graphql");
+    let mut first = RunIdentity {
+        run_id: "run-1".into(),
+        instance_id: "instance-1".into(),
+        ..Default::default()
+    };
+    let _first = harness.db.open_script_run(
+        &mut first,
+        Some(7),
+        &ScriptEventLabel::PostProcessing,
+        None,
+        false,
+    );
+    let first_token = first.token.clone().expect("the first run can call back");
+
+    let mut second = RunIdentity {
+        run_id: "run-1".into(),
+        instance_id: "instance-2".into(),
+        ..Default::default()
+    };
+    let second_requests = harness.db.open_script_run(
+        &mut second,
+        Some(8),
+        &ScriptEventLabel::PostProcessing,
+        None,
+        false,
+    );
+    // The second goes ahead without calling back.
+    assert_eq!((second.token, second.api_url), (None, None));
+    let live = harness.db.live_script_run("run-1").unwrap();
+    assert_eq!(
+        (live.instance_id.as_str(), live.job_id),
+        ("instance-1", Some(7))
+    );
+
+    // Its end is not the end of the first.
+    drop(second_requests);
+    assert_eq!(
+        harness
+            .db
+            .script_run_for_token(&first_token)
+            .map(|run| run.instance_id),
+        Some("instance-1".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_script_run_reads_what_it_likes_and_changes_nothing_but_its_own_run() {
+    let harness = TestHarness::new().await;
+    let mut real = open_run(
+        &harness,
+        "run-real",
+        Some(7),
+        ScriptEventLabel::PostProcessing,
+        false,
+    );
+    let mut test = open_run(
+        &harness,
+        "run-test",
+        Some(7),
+        ScriptEventLabel::PostProcessing,
+        true,
+    );
+
+    for (run, requests) in [("run-real", &mut real), ("run-test", &mut test)] {
+        // Nothing an administrator's key may change is the run's to change.
+        for mutation in [
+            r#"mutation { createApiKey(name: "from a script", scope: ADMIN) { rawKey } }"#,
+            r#"mutation { updateScriptInstance(id: "instance-1", input: {
+                script: "tidy.sh", trigger: POST_PROCESSING, enabled: false
+            }) { id } }"#,
+        ] {
+            let (code, _) = refused(&as_run(&harness, run, mutation).await);
+            assert_eq!(code, "NOT_ALLOWED_FOR_SCRIPT_RUN", "{run}: {mutation}");
+        }
+
+        // Whatever may be read, it may read, an administrator's reads too.
+        let response = as_run(
+            &harness,
+            run,
+            "{ queueItems { id } historyItems { id } apiKeys { id } scriptRun { runId } }",
+        )
+        .await;
+        assert_no_errors(&response);
+        assert_eq!(response_data(&response)["scriptRun"]["runId"], run);
+
+        // And its own run is still its to ask of.
+        let (response, taken) = tokio::join!(
+            as_run(
+                &harness,
+                run,
+                r#"mutation { scriptRun { setParameter(name: "Seen", value: "yes") } }"#,
+            ),
+            agree(requests, 1),
+        );
+        assert_no_errors(&response);
+        assert_eq!(
+            taken,
+            [RunAction::Command(Directive::Parameter {
+                name: "Seen".into(),
+                value: "yes".into(),
+            })]
+        );
+    }
+
+    let keys = harness.execute("{ apiKeys { id } }").await;
+    assert_no_errors(&keys);
+    assert_eq!(response_data(&keys)["apiKeys"], json!([]));
+}
+
+#[tokio::test]
+async fn set_duplicate_sends_all_of_what_it_names_or_none_of_it() {
+    let harness = TestHarness::new().await;
+    let mut scan = open(&harness, "run-scan", None, ScriptEventLabel::Scan);
+
+    // The key could not be written on one line, so neither the score nor the
+    // mode that came with it is sent.
+    let response = as_run(
+        &harness,
+        "run-scan",
+        r#"mutation { scriptRun { setDuplicate(key: "two\nlines", score: 5, mode: ALL) } }"#,
+    )
+    .await;
+    assert_eq!(refused(&response).0, "REFUSED");
+
+    // The next thing the run is handed is the next thing asked for.
+    let (response, taken) = tokio::join!(
+        as_run(
+            &harness,
+            "run-scan",
+            r#"mutation { scriptRun { setCategory(category: "tv") } }"#,
+        ),
+        agree(&mut scan, 1),
+    );
+    assert_no_errors(&response);
+    assert_eq!(
+        taken,
+        [RunAction::Command(Directive::Category("tv".into()))]
+    );
+
+    // Nor does a run whose trigger allows none of them get any.
+    let _post = open(
+        &harness,
+        "run-post",
+        Some(7),
+        ScriptEventLabel::PostProcessing,
+    );
+    let response = as_run(
+        &harness,
+        "run-post",
+        r#"mutation { scriptRun { setDuplicate(key: "show-1", score: 5) } }"#,
+    )
+    .await;
+    assert_eq!(refused(&response).0, "NOT_ALLOWED_FOR_TRIGGER");
 }

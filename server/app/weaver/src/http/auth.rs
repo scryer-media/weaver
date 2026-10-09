@@ -476,8 +476,9 @@ pub(super) async fn resolve_script_run(
     headers: &HeaderMap,
 ) -> Option<ResolvedCaller> {
     let token = explicit_api_key(headers).ok()??;
-    // Checked before anything is read, so that an API key costs nothing here.
-    if !jwt::service::is_signed_token_shape(&token) {
+    // Checked before anything is read, so that an API key or a login token
+    // costs nothing here.
+    if !jwt::service::is_script_run_token_shape(&token) {
         return None;
     }
     let db = db.clone();
@@ -485,9 +486,9 @@ pub(super) async fn resolve_script_run(
         .await
         .ok()??;
     Some(ResolvedCaller {
-        // Scripts are the operator's own programs, already running as this
-        // server does: the token is not held to less than an admin key.
-        scope: CallerScope::Admin,
+        // A script may read what an administrator may, but may change
+        // nothing beyond what its own run allows it to ask for.
+        scope: CallerScope::ScriptRun,
         identity: CallerIdentity::ScriptRun(run.run_id),
     })
 }
@@ -1846,13 +1847,14 @@ mod tests {
         );
         let token = identity.token.clone().unwrap();
 
-        // With its token a script is its run, and may do what an
-        // administrator's key may.
+        // With its token a script is its run: it may read what an
+        // administrator may, and change only what its run allows.
         let mut by_key_header = HeaderMap::new();
         by_key_header.insert("x-api-key", token.parse().unwrap());
         for headers in [bearer(&token), by_key_header] {
             let caller = resolve_script_run(&db, &headers).await.unwrap();
-            assert!(matches!(caller.scope, CallerScope::Admin));
+            assert!(matches!(caller.scope, CallerScope::ScriptRun));
+            assert!(!caller.scope.is_admin() && !caller.scope.can_control());
             assert!(matches!(caller.identity, CallerIdentity::ScriptRun(run) if run == "run-1"));
         }
 
@@ -1903,6 +1905,44 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn a_login_token_is_turned_away_without_reading_the_database() {
+        use weaver_server_core::post_processing::model::ScriptEventLabel;
+        use weaver_server_core::post_processing::runner::RunIdentity;
+
+        fn bearer(value: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {value}").parse().unwrap(),
+            );
+            headers
+        }
+        const SIGNING_SECRET: &str = "auth.jwt_signing_secret";
+
+        // A fresh database has no signing secret until something asks for
+        // one, and asking is the only way into it from here: one still
+        // missing afterwards means nothing was read.
+        let db = Database::open_in_memory().unwrap();
+        let login = jwt::create_jwt("admin", &[9; 32], JWT_TTL_SECS);
+        assert!(jwt::service::is_signed_token_shape(&login));
+        assert!(resolve_script_run(&db, &bearer(&login)).await.is_none());
+        assert_eq!(db.get_setting(SIGNING_SECRET).unwrap(), None);
+
+        // A run's token is still read and verified.
+        db.set_script_api_url("http://127.0.0.1:6789/graphql");
+        let mut identity = RunIdentity {
+            run_id: "run-1".into(),
+            instance_id: "instance-1".into(),
+            ..Default::default()
+        };
+        let _run = db.open_script_run(&mut identity, None, &ScriptEventLabel::Scan, None, false);
+        let caller = resolve_script_run(&db, &bearer(identity.token.as_deref().unwrap()))
+            .await
+            .unwrap();
+        assert!(matches!(caller.identity, CallerIdentity::ScriptRun(run) if run == "run-1"));
     }
 
     #[tokio::test]

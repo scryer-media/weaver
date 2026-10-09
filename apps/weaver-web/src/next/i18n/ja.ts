@@ -1445,6 +1445,7 @@ export const nextJa: LocaleDictionary = {
   "next.schedules.chooseInstance": "インスタンスを選択",
   "next.schedules.noInstances": "スケジュールインスタンスはまだありません",
   "next.schedules.instanceGone": "スケジュールインスタンスではなくなりました",
+  "next.schedules.instanceProblem": "何も実行されません: スクリプトインスタンスが削除されたか、スケジュールで実行されなくなりました",
   "next.schedules.scriptTimeHelp": "現地時刻。HH:MM、または毎時を表す *:MM。複数指定はカンマで区切ります。",
   "next.schedules.runAtStartup": "起動時にも実行",
   "next.schedules.runAtStartupHelp": "スクリプトが起動時に実行されるのは、ルールでこれをオンにした場合だけです。",

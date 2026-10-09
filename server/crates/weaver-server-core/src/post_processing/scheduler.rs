@@ -93,6 +93,11 @@ pub fn spawn_script_evaluator(db: Database, config: SharedConfig, schedules: Sha
     tokio::spawn(async move {
         let mut occurrences = Occurrences::default();
         let mut running = std::collections::BTreeMap::<String, tokio::task::JoinHandle<()>>::new();
+        // Rules already reported as naming nothing that can run, so each is
+        // reported once rather than at every occurrence.
+        let orphans = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<
+            String,
+        >::new()));
         let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -108,9 +113,25 @@ pub fn spawn_script_evaluator(db: Database, config: SharedConfig, schedules: Sha
                 let db = db.clone();
                 let config = config.clone();
                 let id = entry.id.clone();
+                let orphans = orphans.clone();
                 let task = tokio::spawn(async move {
-                    if let Err(error) = run_scheduled_script(&db, &config, &entry).await {
-                        tracing::warn!(rule_id = %entry.id, %error, "scheduled script failed");
+                    match run_scheduled_script(&db, &config, &entry).await {
+                        Ok(Scheduled::Orphaned) => {
+                            let first = orphans
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .insert(entry.id.clone());
+                            if first {
+                                tracing::warn!(
+                                    rule_id = %entry.id,
+                                    "a schedule rule names a script instance that is gone or no longer runs on a schedule; the rule does nothing"
+                                );
+                            }
+                        }
+                        Ok(Scheduled::Ran | Scheduled::Disabled) => {}
+                        Err(error) => {
+                            tracing::warn!(rule_id = %entry.id, %error, "scheduled script failed");
+                        }
                     }
                 });
                 running.insert(id, task);
@@ -119,13 +140,23 @@ pub fn spawn_script_evaluator(db: Database, config: SharedConfig, schedules: Sha
     });
 }
 
+/// What came of a schedule rule's occurrence.
+#[derive(Debug, Eq, PartialEq)]
+enum Scheduled {
+    Ran,
+    /// The instance is turned off.
+    Disabled,
+    /// The instance is gone, or no longer runs on a schedule.
+    Orphaned,
+}
+
 async fn run_scheduled_script(
     db: &Database,
     config: &SharedConfig,
     entry: &ScheduleEntry,
-) -> Result<(), StateError> {
+) -> Result<Scheduled, StateError> {
     let ScheduleAction::RunScript { instance_id, .. } = &entry.action else {
-        return Ok(());
+        return Ok(Scheduled::Ran);
     };
     let instance = tokio::task::spawn_blocking({
         let db = db.clone();
@@ -135,14 +166,16 @@ async fn run_scheduled_script(
     .await
     .map_err(|error| StateError::Database(error.to_string()))??;
     // A row may outlive the instance it names, or the instance may have been
-    // turned off or given another trigger since. Either way there is nothing
-    // for this row to run.
-    let Some(instance) = instance
-        .filter(|instance| instance.enabled && instance.trigger == InstanceTrigger::Schedule)
+    // given another trigger since: that is a mistake to report. One that was
+    // turned off is the operator's choice.
+    let Some(instance) = instance.filter(|instance| instance.trigger == InstanceTrigger::Schedule)
     else {
-        tracing::debug!(rule_id = %entry.id, "scheduled script has no instance to run");
-        return Ok(());
+        return Ok(Scheduled::Orphaned);
     };
+    if !instance.enabled {
+        tracing::debug!(rule_id = %entry.id, "scheduled script instance is turned off");
+        return Ok(Scheduled::Disabled);
+    }
     let digest = blake3::hash(entry.id.as_bytes());
     let task_id =
         u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes")).max(1);
@@ -176,7 +209,7 @@ async fn run_scheduled_script(
         None,
     )
     .await?;
-    Ok(())
+    Ok(Scheduled::Ran)
 }
 
 #[cfg(test)]

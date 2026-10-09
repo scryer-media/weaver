@@ -20,8 +20,8 @@ use super::model::{
     merge_post_processing_summary,
 };
 use super::runner::{
-    DEFAULT_TIMEOUT, ExecutionDisposition, InterpreterConfig, JobExecutionContext,
-    NzbgetScriptStatus, RunIdentity, ScriptExecutionRequest, execute_script_observed,
+    ExecutionDisposition, InterpreterConfig, JobExecutionContext, NzbgetScriptStatus, RunIdentity,
+    ScriptExecutionRequest, execute_script_observed,
 };
 use crate::persistence::{Database, StateError};
 
@@ -656,10 +656,7 @@ impl PostProcessingExecutor {
         {
             return not_started(failed_result(entry, adapter, started, error.to_string()));
         }
-        let timeout = entry
-            .timeout_seconds
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_TIMEOUT);
+        let timeout = entry.time_limit(&settings);
         // The run is live, and its token good, until this is dropped when the
         // attempt is over.
         let mut requests = self.db.open_script_run(
@@ -803,8 +800,8 @@ impl PostProcessingExecutor {
                 }
             }
         }
+        // The script has ended: what is left goes now, not at the next tick.
         if !buffer.is_empty() {
-            interval.tick().await;
             super::events::record_log_batch(&self.db, context.job_id, buffer, severity).await;
         }
     }

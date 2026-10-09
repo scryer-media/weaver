@@ -1,7 +1,22 @@
+use async_graphql::parser::types::OperationType;
 use async_graphql::{Context, Error, ErrorExtensions, Guard, Result};
 
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::CallerScope;
+
+/// What every guard says to a running script: it may read what is guarded,
+/// and change nothing. `Mutation.scriptRun`, which carries no guard, is the
+/// one thing it may ask for.
+fn script_run_verdict(ctx: &Context<'_>) -> Result<()> {
+    if ctx.query_env.operation.node.ty == OperationType::Mutation {
+        Err(graphql_error(
+            "NOT_ALLOWED_FOR_SCRIPT_RUN",
+            "a script run's token may read, and change nothing but through scriptRun",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 pub struct ReadGuard;
 
@@ -10,6 +25,9 @@ impl Guard for ReadGuard {
         let scope = ctx
             .data::<CallerScope>()
             .map_err(|_| internal_error("missing caller scope"))?;
+        if *scope == CallerScope::ScriptRun {
+            return script_run_verdict(ctx);
+        }
         if scope.can_read() {
             Ok(())
         } else {
@@ -25,6 +43,9 @@ impl Guard for AdminGuard {
         let scope = ctx
             .data::<CallerScope>()
             .map_err(|_| internal_error("missing caller scope"))?;
+        if *scope == CallerScope::ScriptRun {
+            return script_run_verdict(ctx);
+        }
         if scope.is_admin() {
             Ok(())
         } else {
@@ -49,7 +70,9 @@ impl Guard for FreshAdminGuard {
         let identity = ctx
             .data::<CallerIdentity>()
             .map_err(|_| internal_error("missing caller identity"))?;
-        // A machine credential has no password to have typed recently.
+        // A machine credential has no password to have typed recently. A
+        // script run only gets this far on a query: the admin check above
+        // refuses it any mutation.
         if matches!(
             identity,
             CallerIdentity::ApiKey(_) | CallerIdentity::ScriptRun(_)
@@ -88,6 +111,9 @@ impl Guard for ControlGuard {
         let scope = ctx
             .data::<CallerScope>()
             .map_err(|_| internal_error("missing caller scope"))?;
+        if *scope == CallerScope::ScriptRun {
+            return script_run_verdict(ctx);
+        }
         if scope.can_control() {
             Ok(())
         } else {

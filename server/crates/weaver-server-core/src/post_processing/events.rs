@@ -612,11 +612,7 @@ async fn run_entry(
                 Ok((inputs, mut identity)) => {
                     let mut env = context.weaver_env();
                     env.extend(context.env.clone());
-                    let timeout = Duration::from_secs(
-                        entry
-                            .timeout_seconds
-                            .unwrap_or(settings.event_scripts.event_script_timeout_seconds),
-                    );
+                    let timeout = entry.time_limit(&settings);
                     // The run is live, and its token good, until this is
                     // dropped at the end of the block.
                     let mut requests = db.open_script_run(
@@ -778,8 +774,8 @@ async fn consume_events(
             _ = tick.tick(), if !logs.is_empty() => { flush_logs(db, context, &mut logs, severity).await; severity = ScriptLogLevel::Debug; }
         }
     }
+    // The script has ended: what is left goes now, not at the next tick.
     if !logs.is_empty() {
-        tick.tick().await;
         flush_logs(db, context, &mut logs, severity).await;
     }
 }

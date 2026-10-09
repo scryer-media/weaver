@@ -336,9 +336,9 @@ fn prepare(
     let script = resolve_script(&root, &instance.script)
         .map_err(|error| ScriptTestError::Unavailable(error.to_string()))?;
     let event = test_event(instance.trigger);
-    let timeout_seconds = instance
-        .timeout_seconds
-        .unwrap_or(settings.event_scripts.event_script_timeout_seconds);
+    // Held to the limit a real run of the instance would have.
+    let time_limit = instance.time_limit(&settings);
+    let timeout_seconds = time_limit.as_secs();
 
     std::fs::create_dir_all(&directories.data).map_err(setup)?;
     let scratch = tempfile::Builder::new()
@@ -358,10 +358,7 @@ fn prepare(
         ..RunIdentity::of(&instance).map_err(setup)?
     };
     let adapter = script.manifest.adapter();
-    let timeout = Some(Duration::from_secs(timeout_seconds));
-    // The script can call back as it could in a real run. What it asks for
-    // comes here, where none of it is applied.
-    let requests = db.open_script_run(&mut identity, None, &event, timeout, true);
+    let timeout = Some(time_limit);
     let termination_grace = Duration::from_secs(settings.termination_grace_seconds);
     let ceiling = settings.event_scripts.script_output_ceiling_bytes;
     let interpreters = InterpreterConfig {
@@ -381,6 +378,14 @@ fn prepare(
         )),
         InstanceTrigger::Feed => Some(simulated_feed(&job, scratch.path()).map_err(setup)?),
     };
+    // The made-up download the run is about, when it is about one: the same
+    // id the script is handed as `WEAVER_JOB_ID`.
+    let job_id = context
+        .as_ref()
+        .map_or(Some(job.job_id), |context| context.job_id);
+    // The script can call back as it could in a real run. What it asks for
+    // comes here, where none of it is applied.
+    let requests = db.open_script_run(&mut identity, job_id, &event, timeout, true);
     let (execution, inputs, arguments) = match context {
         None => {
             let request = ScriptExecutionRequest {

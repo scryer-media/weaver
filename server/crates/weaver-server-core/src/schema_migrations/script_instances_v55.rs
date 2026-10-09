@@ -212,6 +212,8 @@ async fn read(conn: &mut SqlConn<'_>) -> Result<Saved, StateError> {
         match row.text("key")?.as_str() {
             LISTS_KEY => saved.lists = Some(value),
             OPTIONS_KEY => saved.options = Some(value),
+            // A blank value never named a directory.
+            DIRECTORY_KEY if value.trim().is_empty() => {}
             DIRECTORY_KEY => saved.directory = Some(PathBuf::from(value)),
             SETTINGS_KEY => saved.settings = Some(value),
             SCHEDULES_KEY => saved.schedules = Some(value),
@@ -305,6 +307,15 @@ async fn write(conn: &mut SqlConn<'_>, plan: &Plan) -> Result<(), StateError> {
             .await?;
         }
     }
+    // The instances hold all of it now, so nothing reads these again.
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ({}, {})",
+        &[
+            SqlArg::Text(LISTS_KEY.into()),
+            SqlArg::Text(OPTIONS_KEY.into()),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -548,6 +559,16 @@ fn schedule_row(
 }
 
 fn plan(saved: &Saved) -> Result<Plan, StateError> {
+    // Without the headers every script would be carried across turned off, so
+    // a directory that is there but cannot be read stops the step instead.
+    if let Some(directory) = &saved.directory
+        && let Err(error) = std::fs::read_dir(directory)
+    {
+        return Err(StateError::Database(format!(
+            "the scripts directory {} could not be read ({error}); make it readable and start again",
+            directory.display()
+        )));
+    }
     let mut warnings = Vec::new();
     let lists: SavedLists = decode(saved.lists.as_deref(), "script lists", &mut warnings);
     let options = decode(saved.options.as_deref(), "script options", &mut warnings);
@@ -634,16 +655,25 @@ fn plan(saved: &Saved) -> Result<Plan, StateError> {
         if category.is_empty() || category.chars().any(char::is_control) {
             continue;
         }
+        // A category's list kept the list for every download from running for
+        // it even when nothing in it ran. Now only a turned-on instance for
+        // the trigger at hand does that.
         if entries.is_empty() {
             planner.plan.warnings.push(format!(
                 "category {category} had an empty script list, which kept scripts from running for it; scripts for every category now run for it"
             ));
+        } else if entries.iter().all(|entry| !entry.enabled) {
+            planner.plan.warnings.push(format!(
+                "category {category} had every script in its list turned off, which kept scripts from running for it; scripts for every category now run for it"
+            ));
         }
+        let mut post_processes = false;
         for entry in entries {
             let Some(script) = planner.known(&entry.script) else {
                 continue;
             };
             let policy = Policy::of(entry);
+            post_processes |= script.declares(ScriptKind::PostProcessing);
             if script.manifest.is_none() {
                 planner.add(
                     &script,
@@ -653,6 +683,20 @@ fn plan(saved: &Saved) -> Result<Plan, StateError> {
                 )?;
                 planner.plan.warnings.push(format!(
                     "script {} in category {category} could not be read to see what it ran on; it was kept as a turned-off instance",
+                    entry.script
+                ));
+                continue;
+            }
+            if ![
+                ScriptKind::PostProcessing,
+                ScriptKind::Queue,
+                ScriptKind::Scan,
+            ]
+            .into_iter()
+            .any(|kind| script.declares(kind))
+            {
+                planner.plan.warnings.push(format!(
+                    "script {} in category {category} runs only on a schedule or for a feed, neither of which has a category; it was left out of the category",
                     entry.script
                 ));
                 continue;
@@ -674,6 +718,11 @@ fn plan(saved: &Saved) -> Result<Plan, StateError> {
                     entry.script
                 ));
             }
+        }
+        if !post_processes && entries.iter().any(|entry| entry.enabled) {
+            planner.plan.warnings.push(format!(
+                "category {category} had no post-processing script in its list, which kept post-processing scripts from running for it; post-processing scripts for every category now run for it"
+            ));
         }
     }
 
@@ -833,7 +882,8 @@ mod tests {
     use super::*;
     use crate::Database;
     use crate::bandwidth::ScheduleAction;
-    use crate::post_processing::instances::{InstanceTrigger, ScriptInstance};
+    use crate::post_processing::instances::{InstanceTrigger, ScriptInstance, resolve_instances};
+    use crate::post_processing::model::ScriptEventLabel;
 
     /// A script whose header is a line of its own source.
     fn bare(root: &Path, name: &str, header: &str) {
@@ -1218,7 +1268,8 @@ mod tests {
             plan.instances.iter().map(shape).collect::<Vec<_>>(),
             [("scan.sh", Trigger::Scan, None, false, true)]
         );
-        assert_eq!(plan.warnings.len(), 1);
+        // The scan, and a list with no post-processing script.
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
         // Nothing was saved, so the settings start from what a category list meant.
         let settings: PostProcessingSettings =
             serde_json::from_str(plan.settings.as_deref().unwrap()).unwrap();
@@ -1306,5 +1357,280 @@ mod tests {
             plan.instances.iter().map(shape).collect::<Vec<_>>(),
             [("post.sh", Trigger::PostProcessing, None, false, true)]
         );
+    }
+
+    #[test]
+    fn a_scripts_directory_that_cannot_be_read_stops_the_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let lists = Some(json!({"global": [{"script": "post.sh"}]}).to_string());
+        let file = root.path().join("not-a-directory");
+        fs::write(&file, "").unwrap();
+        for directory in [root.path().join("missing"), file] {
+            let error = plan(&Saved {
+                lists: lists.clone(),
+                ..saved(&directory)
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&directory.display().to_string())
+                    && error.contains("make it readable and start again"),
+                "{error}"
+            );
+        }
+
+        // One that is there and empty is read, and has nothing in it.
+        let empty = root.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        let plan = plan(&Saved {
+            lists,
+            ..saved(&empty)
+        })
+        .unwrap();
+        assert_eq!(
+            plan.instances.iter().map(shape).collect::<Vec<_>>(),
+            [("post.sh", Trigger::PostProcessing, None, false, true)]
+        );
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_category_entry_for_a_schedule_or_feed_script_is_left_out_with_a_warning() {
+        let root = tempfile::tempdir().unwrap();
+        bare(
+            root.path(),
+            "nightly.sh",
+            "### NZBGET SCHEDULER SCRIPT ###\n### TASK TIME: 03:30 ###",
+        );
+        bare(root.path(), "feed.sh", "### NZBGET FEED SCRIPT ###");
+        bare(
+            root.path(),
+            "post.sh",
+            "### NZBGET POST-PROCESSING SCRIPT ###",
+        );
+        let plan = plan(&Saved {
+            lists: Some(
+                json!({"categories": {"tv": [
+                    {"script": "nightly.sh"},
+                    {"script": "feed.sh"},
+                    {"script": "post.sh"},
+                ]}})
+                .to_string(),
+            ),
+            ..saved(root.path())
+        })
+        .unwrap();
+        assert_eq!(
+            plan.instances.iter().map(shape).collect::<Vec<_>>(),
+            [("post.sh", Trigger::PostProcessing, Some("tv"), true, true)]
+        );
+        let left_out = plan
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("left out of the category"))
+            .collect::<Vec<_>>();
+        assert_eq!(left_out.len(), 2, "{:?}", plan.warnings);
+        assert!(left_out[0].contains("nightly.sh") && left_out[1].contains("feed.sh"));
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+    }
+
+    /// Upgrade a database the build before instances left with `lists` and
+    /// the scripts in `scripts`, and return it with the warnings the step
+    /// gave.
+    async fn upgraded(root: &Path, scripts: &Path, lists: Value) -> (Database, Vec<String>) {
+        let path = root.join("weaver.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        replay_catalog_into_fresh_db(
+            &pool,
+            &embedded_catalog().unwrap(),
+            &embedded_payload_bytes().unwrap(),
+            Some(SCHEMA_VERSION - 1),
+            true,
+        )
+        .await
+        .unwrap();
+        let saved = Saved {
+            lists: Some(lists.to_string()),
+            options: Some("{}".into()),
+            ..saved(scripts)
+        };
+        for (key, value) in [
+            (DIRECTORY_KEY, scripts.to_string_lossy().into_owned()),
+            (LISTS_KEY, saved.lists.clone().unwrap()),
+            (OPTIONS_KEY, saved.options.clone().unwrap()),
+        ] {
+            sqlx::query("INSERT INTO settings (key, value) VALUES (?1, ?2)")
+                .bind(key)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+        let warnings = plan(&saved).unwrap().warnings;
+        let db = Database::open(&path).unwrap();
+        // The instances hold the wiring now, so what it was saved as is gone.
+        for key in [LISTS_KEY, OPTIONS_KEY] {
+            assert_eq!(db.get_setting(key).unwrap(), None, "{key}");
+        }
+        (db, warnings)
+    }
+
+    /// What `event` starts for a download in category tv, as each instance's
+    /// script and categories.
+    fn runs_for_tv(db: &Database, event: ScriptEventLabel) -> Vec<(String, Vec<String>)> {
+        let settings = db.post_processing_settings().unwrap();
+        assert_eq!(
+            settings.global_scripts_run,
+            GlobalScriptsRun::OnlyWithoutCategoryScripts
+        );
+        resolve_instances(
+            &db.script_instances().unwrap(),
+            &event,
+            Some("tv"),
+            settings.global_scripts_run,
+        )
+        .into_iter()
+        .map(|instance| (instance.script.as_str().to_string(), instance.categories))
+        .collect()
+    }
+
+    /// A scripts directory with a post-processing script and a queue script.
+    fn scripts(root: &Path) -> PathBuf {
+        let scripts = root.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let scripts = fs::canonicalize(&scripts).unwrap();
+        bare(&scripts, "post.sh", "### NZBGET POST-PROCESSING SCRIPT ###");
+        bare(
+            &scripts,
+            "tv-post.sh",
+            "### NZBGET POST-PROCESSING SCRIPT ###",
+        );
+        package(&scripts, "notify", "QUEUE", "NZB_ADDED", json!([]));
+        scripts
+    }
+
+    #[tokio::test]
+    async fn a_category_list_of_queue_scripts_lets_post_processing_for_every_category_run() {
+        let root = tempfile::tempdir().unwrap();
+        let scripts = scripts(root.path());
+        let (db, warnings) = upgraded(
+            root.path(),
+            &scripts,
+            json!({
+                "global": [{"script": "post.sh"}],
+                "categories": {"tv": [{"script": "notify"}]},
+            }),
+        )
+        .await;
+        use InstanceTrigger::{PostProcessing, Queue};
+        assert_eq!(
+            db.script_instances()
+                .unwrap()
+                .iter()
+                .map(stored)
+                .collect::<Vec<_>>(),
+            [
+                ("post.sh", PostProcessing, vec![], true, true, None),
+                (
+                    "notify",
+                    Queue(QueueEvent::NzbAdded),
+                    vec!["tv"],
+                    true,
+                    true,
+                    None
+                ),
+            ]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("no post-processing script"));
+        assert_eq!(
+            runs_for_tv(&db, ScriptEventLabel::PostProcessing),
+            [("post.sh".to_string(), vec![])]
+        );
+        assert_eq!(
+            runs_for_tv(&db, ScriptEventLabel::Queue(QueueEvent::NzbAdded)),
+            [("notify".to_string(), vec!["tv".to_string()])]
+        );
+        db.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_category_list_with_every_script_turned_off_lets_scripts_for_every_category_run() {
+        let root = tempfile::tempdir().unwrap();
+        let scripts = scripts(root.path());
+        let (db, warnings) = upgraded(
+            root.path(),
+            &scripts,
+            json!({
+                "global": [{"script": "post.sh"}],
+                "categories": {"tv": [{"script": "tv-post.sh", "enabled": false}]},
+            }),
+        )
+        .await;
+        use InstanceTrigger::PostProcessing;
+        assert_eq!(
+            db.script_instances()
+                .unwrap()
+                .iter()
+                .map(stored)
+                .collect::<Vec<_>>(),
+            [
+                ("post.sh", PostProcessing, vec![], true, true, None),
+                ("tv-post.sh", PostProcessing, vec!["tv"], false, true, None),
+            ]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("every script in its list turned off"));
+        assert_eq!(
+            runs_for_tv(&db, ScriptEventLabel::PostProcessing),
+            [("post.sh".to_string(), vec![])]
+        );
+        db.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_category_list_lets_scripts_for_every_category_run() {
+        let root = tempfile::tempdir().unwrap();
+        let scripts = scripts(root.path());
+        let (db, warnings) = upgraded(
+            root.path(),
+            &scripts,
+            json!({
+                "global": [{"script": "post.sh"}],
+                "categories": {"tv": []},
+            }),
+        )
+        .await;
+        assert_eq!(
+            db.script_instances()
+                .unwrap()
+                .iter()
+                .map(stored)
+                .collect::<Vec<_>>(),
+            [(
+                "post.sh",
+                InstanceTrigger::PostProcessing,
+                vec![],
+                true,
+                true,
+                None
+            )]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("empty script list"));
+        assert_eq!(
+            runs_for_tv(&db, ScriptEventLabel::PostProcessing),
+            [("post.sh".to_string(), vec![])]
+        );
+        db.close().unwrap();
     }
 }

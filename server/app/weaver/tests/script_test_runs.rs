@@ -155,6 +155,34 @@ fn scratch_directories(fixture: &Fixture) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
+async fn a_test_run_is_held_to_the_limit_a_real_run_of_its_instance_gets() {
+    let fixture = fixture(true);
+    let script = script(
+        &fixture,
+        "limits.sh",
+        "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\n### NZBGET QUEUE SCRIPT ###\n### QUEUE EVENTS: NZB_ADDED ###\nexit 93\n",
+    );
+    let settings = fixture.db.post_processing_settings().unwrap();
+    for (trigger, expected) in [
+        (
+            InstanceTrigger::PostProcessing,
+            weaver_server_core::post_processing::runner::DEFAULT_TIMEOUT,
+        ),
+        (
+            InstanceTrigger::Queue(QueueEvent::NzbAdded),
+            std::time::Duration::from_secs(settings.event_scripts.event_script_timeout_seconds),
+        ),
+    ] {
+        let instance = instance(&fixture, &script, trigger);
+        assert_eq!(instance.timeout_seconds, None);
+        assert_eq!(instance.time_limit(&settings), expected);
+        let run = run_to_end(&fixture, &instance).await;
+        assert_eq!(run.timeout_seconds, expected.as_secs(), "{trigger:?}");
+        assert_eq!(status(&run), ScriptStatus::Succeeded);
+    }
+}
+
+#[tokio::test]
 async fn a_post_processing_test_hands_over_a_made_up_download_and_leaves_nothing_behind() {
     let fixture = fixture(true);
     let script = script(

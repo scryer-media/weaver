@@ -1846,6 +1846,101 @@ mod logical_reader_tests {
     }
 
     #[test]
+    fn a_bundle_from_before_instances_restores_its_script_wiring_as_instances() {
+        use crate::post_processing::instances::InstanceTrigger;
+        use crate::post_processing::model::GlobalScriptsRun;
+        use crate::schema_migrations::script_instances_v55::SCHEMA_VERSION;
+
+        let root = tempfile::tempdir().unwrap();
+        let scripts = std::fs::canonicalize(root.path()).unwrap();
+        for name in ["post.sh", "tv.sh"] {
+            std::fs::write(
+                scripts.join(name),
+                "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\n",
+            )
+            .unwrap();
+        }
+        // The wiring as the build before instances saved it.
+        let source = Database::open_in_memory().unwrap();
+        for (key, value) in [
+            (
+                "post_processing.script_directory.v1",
+                scripts.to_string_lossy().into_owned(),
+            ),
+            (
+                "post_processing.script_lists.v1",
+                serde_json::json!({
+                    "global": [{"script": "post.sh"}],
+                    "categories": {"tv": [{"script": "tv.sh", "timeoutSeconds": 60}]},
+                })
+                .to_string(),
+            ),
+            ("post_processing.script_options.v1", "{}".into()),
+        ] {
+            source.set_setting(key, &value).unwrap();
+        }
+        let mut archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        // The source predates instances, so its bundle has no part for them.
+        for table in [
+            "script_instances",
+            "script_instance_inputs",
+            "script_instance_categories",
+            "feed_scripts",
+        ] {
+            archive.tables.remove(table);
+        }
+
+        let target = Database::open_in_memory().unwrap();
+        target
+            .import_logical_backup(&tables, &archive.tables, SCHEMA_VERSION - 1)
+            .unwrap();
+        assert_eq!(
+            target
+                .script_instances()
+                .unwrap()
+                .iter()
+                .map(|instance| (
+                    instance.script.as_str().to_string(),
+                    instance.trigger,
+                    instance.categories.clone(),
+                    instance.enabled,
+                    instance.timeout_seconds,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "post.sh".to_string(),
+                    InstanceTrigger::PostProcessing,
+                    vec![],
+                    true,
+                    None
+                ),
+                (
+                    "tv.sh".to_string(),
+                    InstanceTrigger::PostProcessing,
+                    vec!["tv".to_string()],
+                    true,
+                    Some(60)
+                ),
+            ]
+        );
+        assert_eq!(
+            target
+                .post_processing_settings()
+                .unwrap()
+                .global_scripts_run,
+            GlobalScriptsRun::OnlyWithoutCategoryScripts
+        );
+        for key in [
+            "post_processing.script_lists.v1",
+            "post_processing.script_options.v1",
+        ] {
+            assert_eq!(target.get_setting(key).unwrap(), None, "{key}");
+        }
+    }
+
+    #[test]
     fn bounded_line_reader_rejects_before_buffering_an_oversized_row() {
         let mut reader = BufReader::new(std::io::Cursor::new(vec![b'x'; 9]));
         let mut line = Vec::new();

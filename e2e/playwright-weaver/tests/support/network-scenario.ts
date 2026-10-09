@@ -95,8 +95,11 @@ export class NetworkWorld {
     return saveRoute(this.request, kind, id, route);
   }
 
-  async feed(options: { url: string; route?: RouteInput; scripts?: string[] }): Promise<number> {
-    const input = { name: `network-feed-${Date.now()}`, url: options.url, enabled: false, pollIntervalSecs: 86400, ...(options.scripts ? { scripts: options.scripts } : {}) };
+  async feed(options: { url: string; route?: RouteInput; scriptInstanceIds?: string[] }): Promise<number> {
+    const input = {
+      name: `network-feed-${Date.now()}`, url: options.url, enabled: false, pollIntervalSecs: 86400,
+      ...(options.scriptInstanceIds ? { scriptInstanceIds: options.scriptInstanceIds } : {}),
+    };
     const id = (await graphql<{ addRssFeed: { id: number } }>(this.request,
       "mutation($input: RssFeedInput!) { addRssFeed(input: $input) { id } }", { input })).addRssFeed.id;
     this.feeds.push(id);

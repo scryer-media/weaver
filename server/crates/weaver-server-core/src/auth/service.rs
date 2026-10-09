@@ -223,6 +223,28 @@ pub fn is_signed_token_shape(token: &str) -> bool {
         && parts.next().is_none()
 }
 
+/// Whether `token` could be a script run's token: signed as this server signs
+/// and with the claims of a run, read without checking the signature. A login
+/// token fails this, so nothing is read from the database to turn it away.
+pub fn is_script_run_token_shape(token: &str) -> bool {
+    if !is_signed_token_shape(token) {
+        return false;
+    }
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(bytes) = base64url_decode(payload) else {
+        return false;
+    };
+    let Ok(serde_json::Value::Object(claims)) = serde_json::from_slice(&bytes) else {
+        return false;
+    };
+    claims
+        .get("run_id")
+        .is_some_and(serde_json::Value::is_string)
+        && claims.contains_key("instance_id")
+}
+
 /// `{"alg":"HS256","typ":"JWT"}`, encoded.
 const TOKEN_HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 

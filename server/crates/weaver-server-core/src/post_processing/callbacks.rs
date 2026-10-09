@@ -17,7 +17,7 @@ use super::model::ScriptEventLabel;
 use super::runner::{ExecutionDisposition, OutputInjector, RunIdentity, ScriptExecutionResult};
 use crate::Database;
 use crate::auth::service::{
-    ScriptRunClaims, create_script_run_jwt, is_signed_token_shape, verify_script_run_jwt,
+    ScriptRunClaims, create_script_run_jwt, is_script_run_token_shape, verify_script_run_jwt,
 };
 
 /// Requests of one run that may wait to be taken.
@@ -46,7 +46,7 @@ pub enum RunAction {
 
 impl RunAction {
     /// Whether a run for `event` may ask for this at all.
-    fn check(&self, event: &ScriptEventLabel) -> Result<(), RunActionError> {
+    pub fn check(&self, event: &ScriptEventLabel) -> Result<(), RunActionError> {
         match self {
             Self::Command(directive) => {
                 if !directive.well_formed() {
@@ -121,6 +121,8 @@ pub struct RunRequest {
 struct Registered {
     run: LiveScriptRun,
     requests: mpsc::Sender<RunRequest>,
+    /// Takes the run's secrets out of what the script sends.
+    output: OutputInjector,
 }
 
 /// The runs going on now, and where their scripts reach this server.
@@ -148,6 +150,9 @@ impl LiveRuns {
 pub struct RunRequests {
     live: Arc<LiveRuns>,
     run_id: String,
+    /// False when another run already held this id: this one was never put
+    /// among the live runs, and so must not take that one out of them.
+    registered: bool,
     receiver: mpsc::Receiver<RunRequest>,
     output: OutputInjector,
     failure: Option<String>,
@@ -204,7 +209,9 @@ impl RunRequests {
 
 impl Drop for RunRequests {
     fn drop(&mut self) {
-        self.live.runs().remove(&self.run_id);
+        if self.registered {
+            self.live.runs().remove(&self.run_id);
+        }
     }
 }
 
@@ -269,11 +276,31 @@ impl Database {
             }
         }
         let run_id = run.run_id.clone();
-        live.runs()
-            .insert(run_id.clone(), Registered { run, requests });
+        let registered = match live.runs().entry(run_id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Registered {
+                    run,
+                    requests,
+                    output: identity.output.clone(),
+                });
+                true
+            }
+            // The id is the caller's to choose. The run already holding it
+            // keeps it; this one goes ahead without calling back.
+            std::collections::hash_map::Entry::Occupied(_) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    "a script run with this id is already going on; this one cannot call back"
+                );
+                identity.token = None;
+                identity.api_url = None;
+                false
+            }
+        };
         RunRequests {
             live,
             run_id,
+            registered,
             receiver,
             output: identity.output.clone(),
             failure: None,
@@ -292,7 +319,7 @@ impl Database {
     /// The run `token` was issued to, when that run is still going on. A token
     /// is worth nothing once its run has ended, whatever date it carries.
     pub fn script_run_for_token(&self, token: &str) -> Option<LiveScriptRun> {
-        if !is_signed_token_shape(token) {
+        if !is_script_run_token_shape(token) {
             return None;
         }
         let secret = self.get_or_create_jwt_signing_secret().ok()?;
@@ -307,10 +334,23 @@ impl Database {
         run_id: &str,
         action: RunAction,
     ) -> Result<(), RunActionError> {
-        let (event, requests) = {
+        let (event, requests, output) = {
             let runs = self.script_runtime.live.runs();
             let registered = runs.get(run_id).ok_or(RunActionError::Ended)?;
-            (registered.run.event.clone(), registered.requests.clone())
+            (
+                registered.run.event.clone(),
+                registered.requests.clone(),
+                registered.output.clone(),
+            )
+        };
+        // What the script sends is kept and shown, so its secrets are taken
+        // out first, as they are from a command it prints. A script that is
+        // not running has handed over no secrets to take out.
+        let action = match action {
+            RunAction::Command(directive) => RunAction::Command(
+                directive.map_text(|text| output.redact(text).unwrap_or_else(|| text.to_string())),
+            ),
+            other => other,
         };
         action.check(&event)?;
         let (reply, answer) = oneshot::channel();

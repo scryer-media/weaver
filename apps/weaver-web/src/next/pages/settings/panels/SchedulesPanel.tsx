@@ -256,9 +256,19 @@ export function SchedulesPanel() {
     void reexecute({ requestPolicy: "network-only" });
   };
 
-  const row = (schedule: Schedule) => ({
+  // A script rule can outlive its instance, or the instance can stop running
+  // on a schedule; the rule then does nothing, and its row says so. Nothing
+  // is said until the instances have loaded.
+  const instanceProblem = (schedule: Schedule) =>
+    schedule.actionType === "run_script" &&
+    targets?.scriptInstances !== undefined &&
+    !scheduleInstances(targets).some((instance) => instance.id === schedule.instanceId)
+      ? t("next.schedules.instanceProblem")
+      : null;
+
+  const row = (schedule: Schedule, problem: string | null) => ({
     id: schedule.id,
-    searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""}`,
+    searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""} ${problem ?? ""}`,
     cells: [
       <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
         {scheduleTimeLabel(schedule)}
@@ -266,9 +276,14 @@ export function SchedulesPanel() {
       <Cell key="days" mono className="text-wv-secondary">
         {daysLabel(t, schedule.days)}
       </Cell>,
-      <Cell key="action" title={actionLabel(t, schedule, targets)}>
-        {actionLabel(t, schedule, targets)}
-      </Cell>,
+      <div key="action" className="flex min-w-0 flex-col gap-1">
+        <Cell title={actionLabel(t, schedule, targets)}>
+          {actionLabel(t, schedule, targets)}
+        </Cell>
+        {problem ? (
+          <span className="text-[11.5px] leading-[1.4] text-wv-error-text">{problem}</span>
+        ) : null}
+      </div>,
       <Cell key="label" className="text-wv-muted">
         {schedule.label || "—"}
       </Cell>,
@@ -312,7 +327,9 @@ export function SchedulesPanel() {
         title: t(track.label),
         // The one group whose rules do not hold says so in place of the list's note.
         note: track.value === "ONE_SHOT" ? t("next.schedules.oneShotNote") : undefined,
-        rows: schedules.filter((schedule) => schedule.track === track.value).map(row),
+        rows: schedules
+          .filter((schedule) => schedule.track === track.value)
+          .map((schedule) => row(schedule, instanceProblem(schedule))),
       })),
     },
   ];
