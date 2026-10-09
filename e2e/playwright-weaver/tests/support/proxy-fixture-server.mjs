@@ -1,5 +1,5 @@
-// Isolated e2e infrastructure, deliberately limited to the fixture destinations.
-// No arbitrary forwarding, subscriptions, credentials, or internet DNS.
+// Isolated e2e infrastructure. Ordinary runs forward only fixture destinations;
+// the opt-in real-provider runner supplies an exact host/port allowlist.
 import net from "node:net";
 import http from "node:http";
 import dgram from "node:dgram";
@@ -62,6 +62,20 @@ export function parseHostTable(text) {
   return out;
 }
 
+export function parsePublicTargets(text) {
+  const targets = text ? JSON.parse(text) : [];
+  if (!Array.isArray(targets)) throw new Error("public targets must be an array");
+  return targets.map(target => {
+    if (typeof target.host !== "string" || !/^[a-zA-Z0-9.-]+$/.test(target.host)
+      || !Number.isInteger(target.port) || target.port < 1 || target.port > 65535
+      || !Array.isArray(target.addresses) || !target.addresses.length
+      || target.addresses.some(address => !net.isIPv4(address))) {
+      throw new Error("invalid public target");
+    }
+    return { host: target.host.toLowerCase(), port: target.port, addresses: [...target.addresses] };
+  });
+}
+
 export async function startProxyFixture(options = {}) {
   const ip = options.ip ?? process.env.PROXY_FIXTURE_IP;
   if (!net.isIPv4(ip)) throw new Error("PROXY_FIXTURE_IP must be an IPv4 address");
@@ -69,6 +83,7 @@ export async function startProxyFixture(options = {}) {
   const extraRoutes = options.routes ?? parseRouteList(process.env.PROXY_FIXTURE_ROUTES);
   const addresses = options.addresses ?? parseAddressList(process.env.PROXY_FIXTURE_ADDRESSES, ip);
   const hosts = options.hosts ?? parseHostTable(process.env.PROXY_FIXTURE_HOSTS);
+  const publicTargets = parsePublicTargets(JSON.stringify(options.publicTargets ?? []));
   const ports = {
     primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090,
     ...Object.fromEntries(extraRoutes.map(name => [name, EXTRA_ROUTES[name].port])),
@@ -139,14 +154,19 @@ export async function startProxyFixture(options = {}) {
   function forward(client, route, host, port, reply) {
     const peer = client.remoteAddress;
     record("attempt", { route, host, port, client: peer });
+    const publicTarget = publicTargets.find(target => target.port === port
+      && (target.host === host.toLowerCase() || target.addresses.includes(host)));
     const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.test$/.test(host);
-    if (!allowedHost || ![ports.dns, ports.nntp, ports.http].includes(port) || !routes[route].up) {
+    const fixtureTarget = publicTargets.length === 0 && allowedHost && [ports.dns, ports.nntp, ports.http].includes(port);
+    const fixtureDns = (host === ip || addresses.includes(host)) && port === ports.dns;
+    if ((!publicTarget && !fixtureTarget && !fixtureDns) || !routes[route].up) {
       reply(false); client.end(); return;
     }
     record("connected", { route, host, port, client: peer });
     reply(true);
-    const targetHost = port === ports.nntp ? (options.nntpHost ?? "nntp") : "127.0.0.1";
-    const targetPort = port === ports.nntp ? (options.nntpPort ?? 119) : port;
+    const targetHost = publicTarget ? publicTarget.addresses[0]
+      : port === ports.nntp ? (options.nntpHost ?? "nntp") : "127.0.0.1";
+    const targetPort = publicTarget ? publicTarget.port : port === ports.nntp ? (options.nntpPort ?? 119) : port;
     pipe(client, targetHost, targetPort, route);
     client.resume();
   }
@@ -247,7 +267,7 @@ export async function startProxyFixture(options = {}) {
     const name = labels.join(".").toLowerCase();
     const type = query.readUInt16BE(cursor + 1);
     const fixture = name.endsWith(".proxy.test");
-    const local = hosts[name];
+    const local = hosts[name] ?? publicTargets.find(target => target.host === name)?.addresses;
     // Resolve only infrastructure names through the container's own resolvers.
     // Every destination name above is answered locally, even when direct.
     if (!local && ["nntp", "nntp2", "weaver-postgres"].includes(name)) {
