@@ -1,13 +1,15 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
+  CREATE_SCHEDULE_MUTATION,
   CREATE_SCRIPT_INSTANCE_MUTATION,
+  SCHEDULES_QUERY,
   SECRETS_QUERY,
   UPDATE_SCRIPT_INSTANCE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { CheckBox, SecondaryButton, TextField } from "../../../components/controls";
+import { CheckBox, SecondaryButton, Segmented, Select, TextField } from "../../../components/controls";
 import { Icon } from "../../../components/icons";
 import {
   MAX_TIMEOUT_SECONDS,
@@ -21,7 +23,9 @@ import {
   formFromInstance,
   inputFromForm,
   inputNameProblem,
+  jobScheduleRule,
   newInstanceForm,
+  scheduleFromHeader,
   triggerTitle,
   unwiredTriggers,
   withScript,
@@ -30,10 +34,12 @@ import {
   type DiscoveredScript,
   type InstanceForm,
   type InstanceInputForm,
+  type JobScheduleForm,
   type QueueEvent,
   type ScriptInstance,
   type ScriptKind,
 } from "../../../data/script-instances";
+import { SCHEDULE_DAYS, scheduleDaysLabel } from "../../../data/schedule-options";
 import { sortedSecrets, type Secret, type SecretRef } from "../../../data/secrets";
 import { FieldControlView, type FieldSpec } from "../framework";
 import { SecretEditor } from "./SecretEditor";
@@ -42,16 +48,29 @@ import { SecretEditor } from "./SecretEditor";
  * The editor of one script instance: which script, what starts it, what it is
  * given, and how it is run.
  *
- * A new instance is filled from the script's header and then belongs to the
- * operator; nothing here reads the header back into a saved instance. A secret
- * input links a named secret, chosen from those there are or created here; its
- * value is never shown.
+ * A new instance starts with no script. Choosing one fills the form from that
+ * script's header, and from then on the instance belongs to the operator;
+ * nothing here reads the header back into a saved instance. A secret input
+ * links a named secret, chosen from those there are or created here; its value
+ * is never shown.
+ *
+ * A new instance on the schedule is given when it runs here, starting from the
+ * times the header asks for, and is saved with the schedule rule that runs it.
+ * A saved one shows its rules; they are changed among the schedules.
  */
 
-/** What the editor was opened on: a saved instance, or a new one of a script. */
-export type InstanceEditorTarget =
-  | { mode: "new"; script: string | null }
-  | { mode: "edit"; instance: ScriptInstance };
+/** What the editor was opened on: a saved instance, or a new one. */
+export type InstanceEditorTarget = { mode: "new" } | { mode: "edit"; instance: ScriptInstance };
+
+/** A schedule rule, as far as the instance it runs shows it. */
+interface InstanceRule {
+  id: string;
+  actionType: string;
+  instanceId: string | null;
+  time: string;
+  days: string[];
+  runAtStartup: boolean;
+}
 
 /** The secret picker's entry that opens the editor of a new secret. */
 const CREATE_SECRET = "\u0000create";
@@ -63,6 +82,7 @@ const CHIP_OFF = "border-wv-control bg-wv-input text-wv-muted hover:border-wv-co
 export function ScriptInstanceEditor({
   target,
   scripts,
+  problems,
   instances,
   categories,
   onSaved,
@@ -73,11 +93,16 @@ export function ScriptInstanceEditor({
 }: {
   target: InstanceEditorTarget;
   scripts: readonly DiscoveredScript[];
+  /** The files in the scripts directory that could not be read as scripts, and why. */
+  problems: readonly { name: string; message: string }[];
   instances: readonly ScriptInstance[];
   /** Every category's name, for narrowing an instance to some of them. */
   categories: readonly string[];
-  /** The instance was saved; `status` says so in the panel's own words. */
-  onSaved: (status: string) => void;
+  /**
+   * The instance was saved; `status` says so in the panel's own words, and
+   * `problem` what did not go with it.
+   */
+  onSaved: (status: string, problem?: string) => void;
   onDismiss: () => void;
   onDelete: (instance: ScriptInstance) => void;
   onReapply: (instance: ScriptInstance) => void;
@@ -87,24 +112,34 @@ export function ScriptInstanceEditor({
   const t = useTranslate();
   const [, createInstance] = useMutation(CREATE_SCRIPT_INSTANCE_MUTATION);
   const [, updateInstance] = useMutation(UPDATE_SCRIPT_INSTANCE_MUTATION);
+  const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
 
   const editing = target.mode === "edit" ? target.instance : null;
   const byName = useMemo(() => new Map(scripts.map((entry) => [entry.name, entry])), [scripts]);
   const [form, setForm] = useState<InstanceForm>(() =>
     target.mode === "edit"
       ? formFromInstance(target.instance, byName.get(target.instance.script))
-      : newInstanceForm(target.script === null ? undefined : byName.get(target.script)),
+      : newInstanceForm(undefined),
   );
+  // When a new instance on the schedule runs.
+  const [schedule, setSchedule] = useState<JobScheduleForm>(() => scheduleFromHeader(undefined));
+  const [{ data: rulesData }] = useQuery<{ schedules: InstanceRule[] }>({
+    query: SCHEDULES_QUERY,
+    pause: target.mode !== "edit",
+  });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // The input being added: a name with a value, or a name with a secret.
+  const [newKind, setNewKind] = useState<"value" | "secret">("value");
   const [newName, setNewName] = useState("");
-  const [newSecret, setNewSecret] = useState(false);
+  const [newValue, setNewValue] = useState("");
+  const [newSecretId, setNewSecretId] = useState<string | null>(null);
   const [newProblem, setNewProblem] = useState<string | null>(null);
   const [{ data: secretsData }] = useQuery<{ secrets: Secret[] }>({ query: SECRETS_QUERY });
   // Secrets created from this editor, until the list is read again.
   const [created, setCreated] = useState<Secret[]>([]);
-  // The input a new secret is being created for.
-  const [creatingFor, setCreatingFor] = useState<number | null>(null);
+  // The input a new secret is being created for; `new` is the one being added.
+  const [creatingFor, setCreatingFor] = useState<number | "new" | null>(null);
   const secrets = useMemo(() => {
     const listed = secretsData?.secrets ?? [];
     return sortedSecrets([...listed, ...created.filter((entry) => !listed.some((own) => own.id === entry.id))]);
@@ -121,22 +156,60 @@ export function ScriptInstanceEditor({
     setForm((current) => ({ ...current, ...next }));
   };
 
+  const scheduled = form.trigger === "SCHEDULER";
+  const patchSchedule = (next: Partial<JobScheduleForm>) => {
+    setError(null);
+    setSchedule((current) => ({ ...current, ...next }));
+  };
+
   const save = async () => {
+    // What is wrong with the times is said before anything is created.
+    const rule = editing === null && scheduled ? jobScheduleRule(schedule) : null;
+    if (rule && "problem" in rule) {
+      setError(
+        rule.problem === "invalid"
+          ? t("next.postProcessing.runTimeInvalid", { time: rule.time })
+          : t("next.postProcessing.runTimeNeeded"),
+      );
+      return;
+    }
     setBusy(true);
     const input = inputFromForm(form);
     const result = editing
       ? await updateInstance({ id: editing.id, input })
       : await createInstance({ input });
-    setBusy(false);
     if (result.error) {
+      setBusy(false);
       setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
       return;
     }
-    onSaved(
-      t(editing ? "next.postProcessing.instanceSaved" : "next.postProcessing.instanceCreated", {
-        name: input.name || input.script,
-      }),
-    );
+    const name = input.name || input.script;
+    const status = t(editing ? "next.postProcessing.instanceSaved" : "next.postProcessing.instanceCreated", { name });
+    if (rule) {
+      const made = await createSchedule({
+        input: {
+          ...rule,
+          actionType: "run_script",
+          label: name,
+          enabled: true,
+          instanceId: result.data.createScriptInstance.id,
+        },
+      });
+      if (made.error) {
+        // The instance is there; saving again would make a second one.
+        setBusy(false);
+        onSaved(
+          status,
+          t("next.postProcessing.scheduleNotCreated", {
+            name,
+            error: made.error.graphQLErrors[0]?.message ?? made.error.message,
+          }),
+        );
+        return;
+      }
+    }
+    setBusy(false);
+    onSaved(status);
   };
 
   const setUp = async () => {
@@ -183,6 +256,9 @@ export function ScriptInstanceEditor({
         onChange: (next) => {
           setError(null);
           setForm((current) => withScript(current, byName.get(next), editing === null));
+          if (editing === null) {
+            setSchedule(scheduleFromHeader(byName.get(next)));
+          }
         },
       },
     },
@@ -234,6 +310,99 @@ export function ScriptInstanceEditor({
       },
     },
   ];
+
+  /* ----------------------------------------------------------- when it runs */
+
+  const rules = (rulesData?.schedules ?? []).filter(
+    (rule) => rule.actionType === "run_script" && rule.instanceId === editing?.id,
+  );
+  const ruleLine = (rule: InstanceRule) =>
+    [
+      rule.time === "*" ? t("next.postProcessing.atStartup") : rule.time,
+      rule.time !== "*" && rule.runAtStartup ? t("next.postProcessing.atStartup") : "",
+      scheduleDaysLabel(t, rule.days),
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
+  const scheduleFields: FieldSpec[] = editing
+    ? [
+        {
+          id: "runTimes",
+          label: t("next.postProcessing.runTimes"),
+          help: t("next.postProcessing.runTimesElsewhere"),
+          control: {
+            kind: "static",
+            value:
+              rulesData === undefined ? (
+                ""
+              ) : rules.length === 0 ? (
+                t("next.postProcessing.noRunTimes")
+              ) : (
+                <span className="flex flex-col items-end gap-1 font-wv-mono">
+                  {rules.map((rule) => (
+                    <span key={rule.id}>{ruleLine(rule)}</span>
+                  ))}
+                </span>
+              ),
+          },
+        },
+      ]
+    : [
+        {
+          id: "runTimes",
+          label: t("next.postProcessing.runTimes"),
+          help: t("next.schedules.scriptTimeHelp"),
+          control: {
+            kind: "text",
+            value: schedule.times,
+            placeholder: "04:00, *:30",
+            onChange: (next) => patchSchedule({ times: next }),
+          },
+        },
+        {
+          id: "runDays",
+          label: t("next.schedules.days"),
+          help: t("next.schedules.daysHelp"),
+          control: {
+            kind: "custom",
+            control: (
+              <div role="group" aria-label={t("next.schedules.days")} className="flex flex-wrap justify-end gap-1.5">
+                {SCHEDULE_DAYS.map((day) => {
+                  const active = schedule.days.includes(day.key);
+                  return (
+                    <button
+                      key={day.key}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() =>
+                        patchSchedule({
+                          days: active
+                            ? schedule.days.filter((entry) => entry !== day.key)
+                            : [...schedule.days, day.key],
+                        })
+                      }
+                      className={`${CHIP} ${active ? CHIP_ON : CHIP_OFF}`}
+                    >
+                      {t(day.label)}
+                    </button>
+                  );
+                })}
+              </div>
+            ),
+          },
+        },
+        {
+          id: "runAtStartup",
+          label: t("next.schedules.runAtStartup"),
+          help: t("next.postProcessing.runAtStartupHelp"),
+          control: {
+            kind: "toggle",
+            value: schedule.startup,
+            onChange: (next) => patchSchedule({ startup: next }),
+          },
+        },
+      ];
 
   /* ------------------------------------------------------------- its inputs */
 
@@ -317,8 +486,13 @@ export function ScriptInstanceEditor({
               }
             : { kind: "text", value: input.value, onChange },
     };
-    // Any input can be made a secret or plain again, which empties it. Only
-    // an input the header does not ask for can be taken away.
+    // An input is a value or a secret, not a thing switched between the two:
+    // the header says which for one it declares, and one added here is added
+    // as either. The box is only for where the header can be wrong. It takes
+    // an input for a secret by its name, and an input it calls plain may have
+    // been saved as a secret; either can be made plain, which empties it.
+    // Only an input the header does not ask for can be taken away.
+    const secretChoice = option !== undefined && (option.optionType === "SECRET" || input.secret);
     return {
       ...field,
       control: {
@@ -327,14 +501,16 @@ export function ScriptInstanceEditor({
           <div className="flex min-w-0 items-center gap-2">
             <FieldControlView spec={field} />
             {/* Named on screen as the new input's box is, rather than by a tooltip alone. */}
-            <label className="flex flex-none cursor-pointer items-center gap-2 text-[12.5px] text-wv-secondary">
-              <CheckBox
-                checked={input.secret}
-                onChange={(next) => changeInput(index, (entry) => withSecret(entry, next))}
-                label={t("next.postProcessing.inputIsSecret", { name: input.name })}
-              />
-              {t("next.postProcessing.secret")}
-            </label>
+            {secretChoice ? (
+              <label className="flex flex-none cursor-pointer items-center gap-2 text-[12.5px] text-wv-secondary">
+                <CheckBox
+                  checked={input.secret}
+                  onChange={(next) => changeInput(index, (entry) => withSecret(entry, next))}
+                  label={t("next.postProcessing.inputIsSecret", { name: input.name })}
+                />
+                {t("next.postProcessing.secret")}
+              </label>
+            ) : null}
             {option ? null : (
               <SecondaryButton
                 className="px-[10px]"
@@ -363,12 +539,27 @@ export function ScriptInstanceEditor({
       return;
     }
     setError(null);
+    const secret = newKind === "secret";
     setForm((current) => ({
       ...current,
-      inputs: [...current.inputs, { name: newName.trim(), value: "", secret: newSecret, secretId: null }],
+      inputs: [
+        ...current.inputs,
+        { name: newName.trim(), value: secret ? "" : newValue, secret, secretId: secret ? newSecretId : null },
+      ],
     }));
     setNewName("");
-    setNewSecret(false);
+    setNewValue("");
+    setNewSecretId(null);
+  };
+  // A secret input with no secret chosen would give the script nothing.
+  const canAdd = newName.trim() !== "" && (newKind === "value" || newSecretId !== null);
+  const addOnEnter = (event: { key: string; preventDefault: () => void }) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (canAdd) {
+        addInput();
+      }
+    }
   };
 
   const inputsBody = (
@@ -384,32 +575,56 @@ export function ScriptInstanceEditor({
         </div>
       ) : null}
       <div className="flex flex-none flex-col gap-2 border-b border-wv-hairline px-4 py-[14px] sm:px-6">
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Segmented
+            label={t("next.postProcessing.newInputKind")}
+            value={newKind}
+            options={[
+              { value: "value", label: t("next.secrets.value") },
+              { value: "secret", label: t("next.postProcessing.secret") },
+            ]}
+            onChange={setNewKind}
+          />
           <TextField
             label={t("next.postProcessing.newInputName")}
             placeholder={t("next.postProcessing.newInputName")}
             value={newName}
-            className="w-[220px] max-w-full"
+            className="w-[136px] max-w-full"
             onChange={(next) => {
               setNewProblem(null);
               setNewName(next);
             }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                addInput();
-              }
-            }}
+            onKeyDown={addOnEnter}
           />
-          <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-wv-secondary">
-            <CheckBox
-              checked={newSecret}
-              onChange={setNewSecret}
-              label={t("next.postProcessing.newInputSecret")}
+          {newKind === "value" ? (
+            <TextField
+              label={t("next.postProcessing.newInputValue")}
+              placeholder={t("next.secrets.value")}
+              value={newValue}
+              className="w-[150px] max-w-full"
+              onChange={setNewValue}
+              onKeyDown={addOnEnter}
             />
-            {t("next.postProcessing.secret")}
-          </label>
-          <SecondaryButton icon="add" disabled={newName.trim() === ""} onClick={addInput}>
+          ) : (
+            <Select
+              label={t("next.postProcessing.newInputSecretChoice")}
+              value={newSecretId ?? ""}
+              className="w-[150px] max-w-full"
+              options={[
+                { value: "", label: t("next.postProcessing.chooseSecret") },
+                ...secrets.map((entry) => ({ value: entry.id, label: entry.name })),
+                { value: CREATE_SECRET, label: t("next.postProcessing.createSecret") },
+              ]}
+              onChange={(next) => {
+                if (next === CREATE_SECRET) {
+                  setCreatingFor("new");
+                } else {
+                  setNewSecretId(next === "" ? null : next);
+                }
+              }}
+            />
+          )}
+          <SecondaryButton icon="add" disabled={!canAdd} onClick={addInput}>
             {t("next.postProcessing.addInput")}
           </SecondaryButton>
         </div>
@@ -444,7 +659,7 @@ export function ScriptInstanceEditor({
             keywords: offered.join(" "),
             control:
               offered.length === 0
-                ? { kind: "static" as const, value: t("next.postProcessing.everyCategory") }
+                ? { kind: "static" as const, value: t("next.postProcessing.noCategories") }
                 : {
                     kind: "custom" as const,
                     control: (
@@ -518,17 +733,42 @@ export function ScriptInstanceEditor({
     },
   ];
 
+  // Under the choice of script: why a saved instance's script cannot run, or,
+  // for a new one, why the script looked for is not among the choices.
+  const NOTE = "flex-none border-b border-wv-hairline px-4 py-3 text-[12.5px] leading-[1.5] sm:px-6";
+  const scriptNotes = editing ? (
+    editing.scriptProblem ? (
+      <div className={`${NOTE} text-wv-error-text`}>{editing.scriptProblem}</div>
+    ) : undefined
+  ) : scripts.length === 0 || problems.length > 0 ? (
+    <>
+      {scripts.length === 0 ? (
+        <div className={`${NOTE} text-wv-muted`}>{t("next.postProcessing.discoveredEmpty")}</div>
+      ) : null}
+      {problems.length > 0 ? (
+        <div role="group" aria-label={t("next.postProcessing.problems")} className={`${NOTE} flex flex-col gap-1`}>
+          <span className="text-wv-muted">{t("next.postProcessing.problems")}</span>
+          {problems.map((problem) => (
+            <span key={problem.name} className="flex flex-wrap items-baseline gap-x-3">
+              <span className="font-wv-mono text-wv-fg">{problem.name}</span>
+              <span className="min-w-0 flex-1 text-wv-error-text">{problem.message}</span>
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </>
+  ) : undefined;
+
   const sections: EditorSection[] = [
     {
       id: "script",
       title: t("next.postProcessing.script"),
       fields: scriptFields,
-      body: editing?.scriptProblem ? (
-        <div className="flex-none border-b border-wv-hairline px-4 py-3 text-[12.5px] leading-[1.5] text-wv-error-text sm:px-6">
-          {editing.scriptProblem}
-        </div>
-      ) : undefined,
+      body: scriptNotes,
     },
+    ...(scheduled
+      ? [{ id: "schedule", title: t("next.schedules.schedule"), fields: scheduleFields }]
+      : []),
     {
       id: "inputs",
       title: t("next.postProcessing.inputs"),
@@ -589,7 +829,11 @@ export function ScriptInstanceEditor({
         target={{ mode: "new" }}
         onSaved={(secret) => {
           setCreated((current) => [...current, secret]);
-          linkSecret(creatingFor, secret.id);
+          if (creatingFor === "new") {
+            setNewSecretId(secret.id);
+          } else {
+            linkSecret(creatingFor, secret.id);
+          }
           setCreatingFor(null);
         }}
         onDismiss={() => setCreatingFor(null)}

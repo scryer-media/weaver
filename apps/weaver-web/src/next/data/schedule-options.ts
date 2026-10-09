@@ -11,6 +11,27 @@ export const ADDITIONAL_SCHEDULE_ACTIONS = [
   { value: "prune_history", label: "next.schedules.pruneHistory" },
 ];
 
+/** The weekdays a rule may be narrowed to. Labels are translation keys. */
+export const SCHEDULE_DAYS = [
+  { key: "mon", label: "next.weekday.monShort" },
+  { key: "tue", label: "next.weekday.tueShort" },
+  { key: "wed", label: "next.weekday.wedShort" },
+  { key: "thu", label: "next.weekday.thuShort" },
+  { key: "fri", label: "next.weekday.friShort" },
+  { key: "sat", label: "next.weekday.satShort" },
+  { key: "sun", label: "next.weekday.sunShort" },
+];
+
+/** The days a rule runs on; none chosen, like all of them, is every day. */
+export function scheduleDaysLabel(t: Translate, days: readonly string[]): string {
+  if (days.length === 0 || days.length === SCHEDULE_DAYS.length) {
+    return t("next.schedules.everyDay");
+  }
+  return SCHEDULE_DAYS.filter((day) => days.includes(day.key))
+    .map((day) => t(day.label))
+    .join(" ");
+}
+
 export interface ScheduleOptions {
   times: string[];
   everyHourAtMinute: number | null;
