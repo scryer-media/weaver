@@ -1,6 +1,20 @@
 #!/bin/sh
 set -eu
 
+# Check paths before inspecting added lines, so force-added provider files
+# are refused without ever printing their contents.
+if git diff --cached --name-only --diff-filter=ACMR -- e2e/private/real-network/ |
+  awk '$0 != "e2e/private/real-network/.gitkeep" { found = 1 } END { exit !found }'; then
+  echo "pre-commit blocked: private real-network files must never be committed." >&2
+  exit 1
+fi
+
+if git cat-file -e :e2e/private/real-network/.gitkeep 2>/dev/null &&
+  [ "$(git cat-file -s :e2e/private/real-network/.gitkeep)" != 0 ]; then
+  echo "pre-commit blocked: the private real-network .gitkeep must be empty." >&2
+  exit 1
+fi
+
 current_user="${USER:-}"
 if [ -z "$current_user" ]; then
   current_user="$(id -un 2>/dev/null || printf '')"
