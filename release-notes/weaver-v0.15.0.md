@@ -17,6 +17,12 @@ Everything below is new since 0.14.7. This is a pre-release.
   a preset that fills the form; after that the instance is the truth. One
   Scripts table lists every instance, grouped by trigger, with a Test dialog.
   A running script can call back into weaver with a run-scoped token.
+- Secrets are their own records. A token or password is typed once under a
+  name on the new Secrets screen, kept encrypted, and linked from any script
+  instance input that needs it; the same secret can serve many instances,
+  and a secret stays linked when the instance is pointed at another script.
+  A secret's value is never read back out. Deleting one is refused while an
+  instance links it.
 - Schedules can run a script instance, set a speed limit, prune history or
   turn a server on or off, from one Schedules table.
 - The legacy web UI is gone. The Next UI is the only interface.
@@ -52,6 +58,11 @@ enforced never-direct setting is planned for a later release.
   event-script output; the oldest is evicted first.
 - The NZB analyzer caps its input while reading instead of after.
 - A RAR chase counts the articles after a short first one.
+- On Windows, a route leg cannot bind to an interface by name; choose a
+  source address instead, and Windows sends through the adapter that owns
+  it. That adapter needs its own default gateway, as Windows picks the way
+  out by the source address alone. Proxies, WireGuard, chains, pools and
+  the kill switch work the same on every platform.
 
 ## Removed
 
@@ -68,7 +79,9 @@ enforced never-direct setting is planned for a later release.
 
 - The database moves from schema 50 to 55 in one step. Scripts, their
   options, category lists, feed scripts and script schedules are carried
-  over as instances automatically. The upgrade stops with a message if the
+  over as instances automatically. Each secret option a script had saved
+  becomes one named secret, "<script> <option>", linked by every instance of
+  that script. The upgrade stops with a message if the
   saved scripts directory exists but cannot be read; make it readable and
   start again. A script named in a list but missing from the directory is
   carried over turned off, with a warning in the log.
