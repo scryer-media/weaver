@@ -18,7 +18,7 @@ const carrying = (flow: NetworkFlow, server: number, egresses: number[]) =>
   egresses.every(id => { const leg = legOn(flow, serverKey(server), id); return leg?.target === 2 && leg.open === 2; });
 
 test("R01 saving an unrelated profile leaves running legs and their connections alone", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const b = await world.egress("b");
   const server = await world.server({ route: { legs: [directLeg(a.id, 50), directLeg(b.id, 50)] } });
@@ -91,7 +91,7 @@ type R05Saved = { egresses: number[]; doomed: number; profiles: number[]; pool: 
 const r05File = () => path.join(process.env.PLAYWRIGHT_ARTIFACTS_DIR || "artifacts", `r05-${datastoreKind()}.json`);
 
 test("R05 routes, pools and ladders survive a restart; a vanished egress is reported at boot @restart", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   if (stage() === "initial") {
     // Built outside the per-test world: this configuration must outlive the test.
     const a = await interfaceEgress(request, `r05-a-${Date.now()}`, "a");

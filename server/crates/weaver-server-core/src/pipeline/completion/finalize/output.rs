@@ -894,10 +894,9 @@ impl Pipeline {
     async fn claim_complete_destination(
         &self,
         job_id: JobId,
-        job_name: &str,
+        dir_name: &str,
         category: Option<&str>,
     ) -> Result<PathBuf, String> {
-        let dir_name = crate::jobs::working_dir::sanitize_dirname(job_name);
         let parent = {
             let cfg = self.config.read().await;
             complete_parent_for_category(&self.complete_dir, &cfg.categories, category)?
@@ -908,7 +907,7 @@ impl Pipeline {
             .filter(|(reserved_job_id, _)| **reserved_job_id != job_id)
             .map(|(_, path)| path.clone())
             .collect();
-        claim_complete_destination_path(&parent, &dir_name, job_id, &reserved)
+        claim_complete_destination_path(&parent, dir_name, job_id, &reserved)
             .await
             .map_err(|error| {
                 format!(
@@ -1007,7 +1006,9 @@ impl Pipeline {
     /// Move extracted/completed files from the intermediate working directory
     /// to the complete directory, organized by category.
     ///
-    /// Layout: `{complete_dir}/[{category}/]{job_name}/`
+    /// Layout: `{complete_dir}/[{category}/]{release title}/`, the title as
+    /// posted rather than the display name (see
+    /// [`crate::ingest::completed_folder_name`]).
     /// On collision, appends `.#<job_id>` (and a numeric suffix if needed).
     ///
     /// Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
@@ -1036,7 +1037,7 @@ impl Pipeline {
         // `weaver_verifications_total` entirely. No-op when a pass ruled.
         self.note_job_unverifiable_if_no_par2_set(job_id);
 
-        let (working_dir, staging_dir, job_name, category) = {
+        let (working_dir, staging_dir, job_name, folder_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return Err(format!("job {} not found for final move", job_id.0));
             };
@@ -1044,6 +1045,7 @@ impl Pipeline {
                 state.working_dir.clone(),
                 state.staging_dir.clone(),
                 state.spec.name.clone(),
+                crate::ingest::completed_folder_name(&state.spec.name, &state.spec.metadata),
                 state.spec.category.clone(),
             )
         };
@@ -1089,7 +1091,7 @@ impl Pipeline {
             (path, Some((self.db.clone(), context)))
         } else {
             (
-                self.claim_complete_destination(job_id, &job_name, category.as_deref())
+                self.claim_complete_destination(job_id, &folder_name, category.as_deref())
                     .await?,
                 None,
             )

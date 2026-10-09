@@ -279,7 +279,7 @@ async fn async_main() {
         )),
         _ => None,
     };
-    if matches!(&command, Command::Serve { .. }) {
+    if command.opens_database() {
         if reset_automatic_backup_settings
             && let Err(error) =
                 weaver_server_core::operations::backup::reset_automatic_backup_settings(

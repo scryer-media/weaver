@@ -153,8 +153,12 @@ async function connect(url: URL): Promise<{ socket: tls.TLSSocket | net.Socket; 
     if (sslmode === "require" || sslmode.startsWith("verify")) throw new Error("postgres refused TLS");
     return { socket: plain, reader: new MessageReader(plain) };
   }
-  // The e2e service uses a self-signed certificate; `require` encrypts without verifying, as libpq does.
-  const secure = tls.connect({ socket: plain, servername: net.isIP(host) ? undefined : host, rejectUnauthorized: false });
+  // `require` encrypts without verifying, as libpq does.
+  const secure = tls.connect({
+    socket: plain,
+    servername: net.isIP(host) ? undefined : host,
+    rejectUnauthorized: false, // the e2e Postgres container's self-signed certificate
+  });
   await new Promise<void>((resolve, reject) => { secure.once("secureConnect", resolve); secure.once("error", reject); });
   return { socket: secure, reader: new MessageReader(secure) };
 }
@@ -171,12 +175,6 @@ async function authenticate(socket: net.Socket | tls.TLSSocket, reader: MessageR
     const code = message.body.readInt32BE(0);
     if (code === 0) continue; // AuthenticationOk; wait for ReadyForQuery
     if (code === 3) { socket.write(frame("p", cstring(password))); continue; }
-    if (code === 5) {
-      const salt = message.body.subarray(4, 8);
-      const inner = crypto.createHash("md5").update(password + user).digest("hex");
-      socket.write(frame("p", cstring(`md5${crypto.createHash("md5").update(inner).update(salt).digest("hex")}`)));
-      continue;
-    }
     if (code === 10) {
       const mechanisms = message.body.subarray(4).toString("utf8").split("\0").filter(Boolean);
       if (!mechanisms.includes("SCRAM-SHA-256")) throw new Error(`postgres offers no supported SASL mechanism: ${mechanisms}`);
@@ -205,6 +203,14 @@ async function authenticate(socket: net.Socket | tls.TLSSocket, reader: MessageR
     if (code === 12) {
       const verifier = message.body.subarray(4).toString("utf8");
       if (verifier !== `v=${serverSignature.toString("base64")}`) throw new Error("postgres SCRAM server signature mismatch");
+      continue;
+    }
+    // The server picks the method: SCRAM above whenever it offers it, the
+    // protocol's MD5 exchange only for a server configured to demand it.
+    if (code === 5) {
+      const salt = message.body.subarray(4, 8);
+      const inner = crypto.createHash("md5").update(password + user).digest("hex");
+      socket.write(frame("p", cstring(`md5${crypto.createHash("md5").update(inner).update(salt).digest("hex")}`)));
       continue;
     }
     throw new Error(`unsupported postgres authentication request ${code}`);

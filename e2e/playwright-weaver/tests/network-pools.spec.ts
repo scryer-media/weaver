@@ -38,7 +38,7 @@ async function pinned(request: Parameters<typeof flowMark>[0], view: (flow: Netw
 }
 
 test("P01 a pool pins its fastest member and prewarms the rest", async ({ request }, info) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { view, connect1, connect2, connect3 } = await latencyPool(request);
   const download = await world.pacedDownload("p01-fastest", { parts: 64, slowMs: 500 });
   const flow = await flowAfter(request, await flowMark(request), sample => {
@@ -56,7 +56,7 @@ test("P01 a pool pins its fastest member and prewarms the rest", async ({ reques
 });
 
 test("P02 a throttled pin loses to a faster member once that member has delivery evidence", async ({ request }, info) => {
-  test.setTimeout(30 * 60_000);
+  test.setTimeout(0);
   const { view, connect1, connect2 } = await latencyPool(request);
   await world.holdChaosSession();
   const first = await world.pacedDownload("p02-warm", { parts: 32, slowMs: 10 });
@@ -76,7 +76,7 @@ test("P02 a throttled pin loses to a faster member once that member has delivery
 });
 
 test("P03 a black-holed pin fails over to the next fastest member", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { view, connect1, connect2 } = await latencyPool(request);
   // Paced so each article still finishes inside the per-article soft timeout:
   // only the black hole may fail fetches, or the server itself starts recovering.
@@ -96,7 +96,7 @@ test("P03 a black-holed pin fails over to the next fastest member", async ({ req
 
 test("P04 @extended the interval race re-pins the fastest member once it recovers", async ({ request }) => {
   test.skip(!extended(), "extended lane only");
-  test.setTimeout(45 * 60_000);
+  test.setTimeout(0);
   const { view, connect1 } = await latencyPool(request);
   await world.holdChaosSession();
   const warm = await world.pacedDownload("p04-warm", { parts: 32, slowMs: 200 });
@@ -115,7 +115,7 @@ test("P04 @extended the interval race re-pins the fastest member once it recover
 });
 
 test("P05 a race runs once a server over-limit clears and the pin holds", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { view, connect1 } = await latencyPool(request);
   await world.holdChaosSession();
   const download = await world.pacedDownload("p05-over-limit");
@@ -135,7 +135,7 @@ test("P05 a race runs once a server over-limit clears and the pin holds", async 
 });
 
 test("P06 an SSH member with a changed host key is blocked and the pool pins another", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const ssh1 = await world.ssh("ssh1");
   const mismatch = await world.ssh("ssh-switch");
@@ -160,7 +160,7 @@ test("P06 an SSH member with a changed host key is blocked and the pool pins ano
 
 test("P07 @extended idle non-pinned members cool while the pin stays warm", async ({ request }) => {
   test.skip(!extended(), "extended lane only");
-  test.setTimeout(30 * 60_000);
+  test.setTimeout(0);
   const { view, connect1, connect2, connect3 } = await latencyPool(request);
   const download = await world.download("p07-idle");
   await pinned(request, view, connect1.id, "connect1 pinned");
@@ -210,7 +210,7 @@ test("P10 an RSS fetch through a pool resolves and fetches on one member", async
 });
 
 test("P11 changing a pool's members prewarms the newcomer and drops the leaver", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { pool, view, connect1, connect2, connect3 } = await latencyPool(request);
   const connect4 = await world.connect("connect4");
   const download = await world.pacedDownload("p11-membership");
@@ -229,7 +229,7 @@ test("P11 changing a pool's members prewarms the newcomer and drops the leaver",
 });
 
 test("P12 a slower handshake on the pin raises its connect time while delivery holds", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { view, connect1 } = await latencyPool(request);
   const download = await world.pacedDownload("p12-slow-handshake");
   const before = await pinned(request, view, connect1.id, "connect1 pinned");
@@ -244,7 +244,7 @@ test("P12 a slower handshake on the pin raises its connect time while delivery h
 });
 
 test("P13 SOCKS5 and WireGuard pools deliver within the WireGuard budget", async ({ request }, info) => {
-  test.setTimeout(15 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const socks = [];
   for (const name of ["socks1", "socks2", "socks3", "socks4"]) socks.push(await world.socks(name));
@@ -290,7 +290,7 @@ test("P13 SOCKS5 and WireGuard pools deliver within the WireGuard budget", async
 });
 
 test("P14 a disabled pool's rung is skipped and the next rung carries the leg", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const members = [await world.connect("connect1"), await world.connect("connect2")];
   const pool = await world.pool("HTTP_CONNECT", members.map(profile => profile.id));

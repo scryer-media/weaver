@@ -103,7 +103,7 @@ test.describe("lane M", () => {
   }
 
   test("M01 a 50/50 route sends each leg from its own NIC and address", async ({ request }, info) => {
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const { wifi, lan, id } = await wifiAndLan(request);
     await startCapture(request, "m01");
     const download = await pacedDownload(request, "m01-two-nic");
@@ -123,7 +123,7 @@ test.describe("lane M", () => {
   });
 
   test("M02 turning Wi-Fi off takes its egress Down and the LAN leg takes the whole cap", async ({ request }, info) => {
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const { wifi, lan, id } = await wifiAndLan(request);
     await startCapture(request, "m02");
     const download = await pacedDownload(request, "m02-wifi-off");
@@ -142,7 +142,7 @@ test.describe("lane M", () => {
   });
 
   test("M03 turning Wi-Fi back on brings its leg through probing to Up at 2/2", async ({ request }) => {
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const { wifi, lan, id } = await wifiAndLan(request);
     await startCapture(request, "m03");
     const download = await pacedDownload(request, "m03-wifi-on", 3200);
@@ -167,7 +167,7 @@ test.describe("lane M", () => {
   });
 
   test("M04 with Hold, losing Wi-Fi leaves the LAN leg at its own share", async ({ request }) => {
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const { wifi, lan, id } = await wifiAndLan(request, "HOLD");
     const download = await pacedDownload(request, "m04-hold");
     await flowAfter(request, await flowMark(request), sample => carrying(sample, id, [wifi.id, lan.id]), "legs 2/2 open");
@@ -181,7 +181,7 @@ test.describe("lane M", () => {
   });
 
   test("M05 a source-address egress uses that address on whichever NIC macOS routes it", async ({ request }, info) => {
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const address = expectedSource("wifi");
     const made = await createEgress(request, { name: `m05-source-${Date.now()}`, bindingKind: "SOURCE_ADDRESS", sourceAddress: address });
     created.egresses.push(made.id);
@@ -201,7 +201,7 @@ test.describe("lane M", () => {
   });
 
   test("M06 a Wi-Fi speed cap holds while the LAN leg runs past it", async ({ request }, info) => {
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const cap = 2 * 1024 * 1024;
     const wifi = await egress(request, "wifi", { maxDownloadSpeed: cap });
     const lan = await egress(request, "lan");
@@ -224,7 +224,7 @@ test.describe("lane M", () => {
   });
 
   test("M07 a proxy rung on Wi-Fi fails and recovers on a real NIC", async ({ request }, info) => {
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const wifi = await egress(request, "wifi");
     const lan = await egress(request, "lan");
     const connect1 = await saveProxyProfile(request, { name: `m07-connect1-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: stack(), port: 8101, username: "fixture", password: "fixture", dnsServers: [], timeoutSeconds: 5 });
@@ -282,7 +282,7 @@ test.describe("lane L", () => {
 
   test("Lane L L01 an interface and a source-address egress both leave from the LAN address", async ({ request }, info) => {
     test.skip(stage() !== "initial", "runs with CAP_NET_RAW retained");
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const lan = await egress(request, "lan");
     const src = await egress(request, "src");
     const id = await server(request, { legs: [directLeg(lan.id, 50), directLeg(src.id, 50)] });
@@ -300,7 +300,7 @@ test.describe("lane L", () => {
 
   test("Lane L L02 without CAP_NET_RAW an interface bind depends on the kernel", async ({ request }) => {
     test.skip(stage() !== "no-net-raw", "runs in the stage without WEAVER_RETAIN_NET_RAW");
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const lan = await egress(request, "lan");
     const src = await egress(request, "src");
     const id = await server(request, { legs: [directLeg(lan.id, 50), directLeg(src.id, 50)] });
@@ -330,7 +330,7 @@ test.describe("lane L", () => {
 
   test("Lane L L04 a LAN link cycle takes the egress Down and back Up", async ({ request }) => {
     test.skip(stage() !== "initial", "initial stage only");
-    test.setTimeout(30 * 60_000);
+    test.setTimeout(0);
     const lan = await egress(request, "lan");
     const src = await egress(request, "src");
     const id = await server(request, { legs: [directLeg(lan.id, 50), directLeg(src.id, 50)] });

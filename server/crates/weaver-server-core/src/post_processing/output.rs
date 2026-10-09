@@ -127,16 +127,29 @@ impl Database {
                     let removed = tx.fetch_all("DELETE FROM script_outputs WHERE id IN (SELECT id FROM script_outputs WHERE job_id IS NOT DISTINCT FROM {} AND (job_id IS NOT NULL OR event = {}) ORDER BY seq DESC LIMIT 128 OFFSET {}) RETURNING stored_bytes", &[SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string()), SqlArg::I64(i64::from(limits.script_output_runs_per_job.saturating_sub(1)))]).await?;
                     for row in removed { used -= row.i64("stored_bytes")?; }
                     let stored_bytes = output.len() as i64;
-                    if used + stored_bytes > limits.script_output_ring_bytes as i64 {
-                        for row in tx.fetch_all("SELECT id, stored_bytes FROM script_outputs WHERE event <> 'post_processing' AND stored_bytes > 0 ORDER BY seq LIMIT 128", &[]).await? {
+                    let ring_bytes = i64::try_from(limits.script_output_ring_bytes).unwrap_or(i64::MAX);
+                    // Every kept payload counts against the one budget. Event runs
+                    // give way first; post-processing output is evicted, oldest first,
+                    // only to make room for newer post-processing output. An evicted
+                    // run keeps its result and excerpt.
+                    let evictable = if result.event == ScriptEventLabel::PostProcessing {
+                        "stored_bytes > 0 ORDER BY CASE WHEN event = 'post_processing' THEN 1 ELSE 0 END, seq"
+                    } else {
+                        "event <> 'post_processing' AND stored_bytes > 0 ORDER BY seq"
+                    };
+                    let evict = format!("SELECT id, stored_bytes FROM script_outputs WHERE {evictable} LIMIT 128");
+                    'evict: while stored_bytes <= ring_bytes && used + stored_bytes > ring_bytes {
+                        let rows = tx.fetch_all(&evict, &[]).await?;
+                        if rows.is_empty() { break; }
+                        for row in rows {
                             tx.execute("UPDATE script_outputs SET output = {}, stored_bytes = 0 WHERE id = {}", &[SqlArg::Bytes(Vec::new()), SqlArg::Text(row.text("id")?)]).await?;
                             used -= row.i64("stored_bytes")?;
-                            if used + stored_bytes <= limits.script_output_ring_bytes as i64 { break; }
+                            if used + stored_bytes <= ring_bytes { break 'evict; }
                         }
                     }
-                    // Terminal results are protected by the per-job ring. When those
-                    // alone fill the budget, new event runs retain only their excerpt.
-                    let retain = result.event == ScriptEventLabel::PostProcessing || used + stored_bytes <= limits.script_output_ring_bytes as i64;
+                    // When what may not be evicted fills the budget, the run keeps
+                    // only its excerpt.
+                    let retain = used + stored_bytes <= ring_bytes;
                     if !retain { output.clear(); }
                     let stored_bytes = output.len() as i64;
                     let mut entropy = [0_u8; 16];
@@ -518,6 +531,92 @@ mod tests {
                 .unwrap()
         );
         assert!(db.event_script_results(3).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_budget_bounds_post_processing_output() {
+        let db = Database::open_in_memory().unwrap();
+        for id in 1..=4 {
+            active(&db, id);
+        }
+        let body: Vec<u8> = (0..=255).collect();
+        let compressed = zstd::stream::encode_all(body.as_slice(), 3).unwrap().len() as u64;
+        let limits = EventScriptSettings {
+            script_output_ring_bytes: compressed + compressed / 2,
+            ..Default::default()
+        };
+        let pass = |job_id: u64| {
+            retain_output(
+                db.clone(),
+                Some(job_id),
+                result(ScriptEventLabel::PostProcessing),
+                body.clone(),
+                limits.clone(),
+            )
+        };
+        let first = pass(1).await.unwrap();
+        let event = ScriptEventLabel::Queue(super::super::model::QueueEvent::NzbAdded);
+        // An event run does not displace post-processing output; it keeps only
+        // its excerpt.
+        let queued = retain_output(
+            db.clone(),
+            Some(2),
+            result(event),
+            body.clone(),
+            limits.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(queued.output_id.is_none());
+        assert!(
+            db.script_output_retained(first.output_id.as_deref().unwrap())
+                .unwrap()
+        );
+
+        // A newer pass evicts the oldest pass's output, not its result.
+        let second = pass(3).await.unwrap();
+        assert!(
+            !db.script_output_retained(first.output_id.as_deref().unwrap())
+                .unwrap()
+        );
+        assert!(
+            db.script_output_retained(second.output_id.as_deref().unwrap())
+                .unwrap()
+        );
+        let runs = db
+            .script_runs(
+                ScriptRunFilter {
+                    job_id: Some(1),
+                    ..Default::default()
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].result.output_tail, first.output_tail);
+        assert!(!runs[0].output_retained);
+
+        // Output larger than the whole budget is not kept, and evicts nothing.
+        let tight = EventScriptSettings {
+            script_output_ring_bytes: compressed - 1,
+            ..limits
+        };
+        let oversized = retain_output(
+            db.clone(),
+            Some(4),
+            result(ScriptEventLabel::PostProcessing),
+            body,
+            tight,
+        )
+        .await
+        .unwrap();
+        assert!(oversized.output_id.is_none());
+        assert!(!oversized.output_tail.is_empty());
+        assert!(
+            db.script_output_retained(second.output_id.as_deref().unwrap())
+                .unwrap()
+        );
     }
 
     #[tokio::test]

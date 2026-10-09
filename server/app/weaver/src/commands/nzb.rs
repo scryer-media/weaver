@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -135,39 +135,62 @@ fn report_from_response(body: &serde_json::Value, json: bool) -> Result<String, 
 }
 
 fn analyze_file(path: &Path, json: bool) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let xml = read_nzb(file, MAX_NZB_BYTES)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    render(bytes, json, now)
+    render_xml(&xml, json, now)
 }
 
-/// The compression is read from the bytes, so a renamed file still opens.
-fn decompress(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    let source = std::io::Cursor::new(bytes);
-    let decoded: Box<dyn Read> = if source.get_ref().starts_with(GZIP_MAGIC) {
-        Box::new(flate2::read::GzDecoder::new(source))
-    } else if source.get_ref().starts_with(ZSTD_MAGIC) {
-        Box::new(zstd::stream::read::Decoder::new(source).map_err(|error| error.to_string())?)
+fn too_large(limit: u64) -> String {
+    format!("NZB is larger than {limit} bytes")
+}
+
+/// Reads an NZB as a stream, holding no more than `limit` bytes of the file
+/// or of its decompressed XML. The compression is read from the bytes, so a
+/// renamed file still opens.
+fn read_nzb(source: impl Read, limit: u64) -> Result<Vec<u8>, String> {
+    let mut raw = BufReader::new(source.take(limit + 1));
+    let decoded = decompress(&mut raw, limit);
+    // A cut-off compressed stream fails to decode; the size is the real cause.
+    if raw.get_ref().limit() == 0 {
+        return Err(too_large(limit));
+    }
+    decoded
+}
+
+fn decompress(raw: &mut impl BufRead, limit: u64) -> Result<Vec<u8>, String> {
+    let head = raw.fill_buf().map_err(|error| error.to_string())?;
+    let (gzip, zstd) = (head.starts_with(GZIP_MAGIC), head.starts_with(ZSTD_MAGIC));
+    let decoded: Box<dyn Read + '_> = if gzip {
+        Box::new(flate2::bufread::GzDecoder::new(raw))
+    } else if zstd {
+        Box::new(zstd::stream::read::Decoder::with_buffer(raw).map_err(|error| error.to_string())?)
     } else {
-        Box::new(source)
+        Box::new(raw)
     };
     let mut xml = Vec::new();
     decoded
-        .take(MAX_NZB_BYTES + 1)
+        .take(limit + 1)
         .read_to_end(&mut xml)
         .map_err(|error| error.to_string())?;
-    if xml.len() as u64 > MAX_NZB_BYTES {
-        return Err(format!("NZB is larger than {MAX_NZB_BYTES} bytes"));
+    if xml.len() as u64 > limit {
+        return Err(too_large(limit));
     }
     Ok(xml)
 }
 
+#[cfg(test)]
 fn render(bytes: Vec<u8>, json: bool, now_epoch_secs: u64) -> Result<String, String> {
-    let xml = decompress(bytes)?;
+    let xml = read_nzb(bytes.as_slice(), MAX_NZB_BYTES)?;
+    render_xml(&xml, json, now_epoch_secs)
+}
+
+fn render_xml(xml: &[u8], json: bool, now_epoch_secs: u64) -> Result<String, String> {
     let (nzb, diagnostics) =
-        weaver_nzb::parse_nzb_with_diagnostics(&xml).map_err(|error| error.to_string())?;
+        weaver_nzb::parse_nzb_with_diagnostics(xml).map_err(|error| error.to_string())?;
     let report = weaver_nzb::analysis::analyze(&nzb, &diagnostics, now_epoch_secs)
         .with_weaver_version(env!("CARGO_PKG_VERSION"));
     Ok(if json {
@@ -181,7 +204,7 @@ fn render(bytes: Vec<u8>, json: bool, now_epoch_secs: u64) -> Result<String, Str
 mod tests {
     use std::io::Write as _;
 
-    use super::{fetch_job_report, graphql_endpoint, render, report_from_response};
+    use super::{fetch_job_report, graphql_endpoint, read_nzb, render, report_from_response};
 
     const NOW: u64 = 1_790_000_000;
 
@@ -223,6 +246,46 @@ mod tests {
         let plain = render(sample_nzb(), true, NOW).unwrap();
         assert_eq!(render(gzipped, true, NOW).unwrap(), plain);
         assert!(serde_json::from_str::<serde_json::Value>(&plain).is_ok());
+    }
+
+    #[test]
+    fn an_oversized_nzb_is_refused_while_it_is_read() {
+        const LIMIT: u64 = 1024;
+        let too_large = Err(super::too_large(LIMIT));
+
+        // An endless source ends at the cap instead of being buffered whole.
+        assert_eq!(read_nzb(std::io::repeat(b'<'), LIMIT), too_large);
+
+        let exact = vec![b'<'; LIMIT as usize];
+        assert_eq!(read_nzb(exact.as_slice(), LIMIT), Ok(exact.clone()));
+        let over = vec![b'<'; LIMIT as usize + 1];
+        assert_eq!(read_nzb(over.as_slice(), LIMIT), too_large);
+
+        // A small compressed file whose XML is over the cap.
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&vec![b'<'; 64 * LIMIT as usize]).unwrap();
+        let bomb = encoder.finish().unwrap();
+        assert!((bomb.len() as u64) < LIMIT);
+        assert_eq!(read_nzb(bomb.as_slice(), LIMIT), too_large);
+        let bomb = zstd::encode_all(vec![b'<'; 64 * LIMIT as usize].as_slice(), 19).unwrap();
+        assert!((bomb.len() as u64) < LIMIT);
+        assert_eq!(read_nzb(bomb.as_slice(), LIMIT), too_large);
+
+        // A compressed file that is itself over the cap.
+        let mut state = 0x9e37_79b9_u32;
+        let noise: Vec<u8> = (0..4 * LIMIT)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&noise).unwrap();
+        let large = encoder.finish().unwrap();
+        assert!(large.len() as u64 > LIMIT);
+        assert_eq!(read_nzb(large.as_slice(), LIMIT), too_large);
     }
 
     #[test]

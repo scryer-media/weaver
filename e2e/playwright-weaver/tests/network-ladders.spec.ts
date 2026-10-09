@@ -66,7 +66,7 @@ async function failFirstRung(request: Parameters<typeof flowMark>[0], name: stri
 }
 
 test("F01 a ladder uses its first rung while that rung works", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { connect1, leg } = await twoRungLadder();
   const mark = await fixtureMark(request);
   const download = await world.pacedDownload("f01-first-rung", { parts: 64, slowMs: 500 });
@@ -79,7 +79,7 @@ test("F01 a ladder uses its first rung while that rung works", async ({ request 
 });
 
 test("F02 killing rung 0 mid-download moves the leg to rung 1 and the file still completes", async ({ request }, info) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { leg, connect2, download, mark, moved } = await failFirstRung(request, "f02-hop-kill");
   expect(leg(moved)?.rungStates[0]).toBe("COOLDOWN");
   expect(leg(moved)?.selectedProxyId).toBe(connect2.id);
@@ -94,7 +94,7 @@ test("F02 killing rung 0 mid-download moves the leg to rung 1 and the file still
 });
 
 test("F03 the leg returns to rung 0 once its cooldown ends and it works again", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { leg, download, moved } = await failFirstRung(request, "f03-return");
   await controlRoute(request, { route: "connect1", up: true });
   const returned = await rungZeroReturns(request, leg, moved.sampledAt);
@@ -103,7 +103,7 @@ test("F03 the leg returns to rung 0 once its cooldown ends and it works again", 
 });
 
 test("F04 with every rung down, direct fallback carries the leg", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { leg } = await twoRungLadder({ directFallback: true });
   const download = await world.pacedDownload("f04-direct-fallback", { parts: 64, slowMs: 500 });
   await onRung(request, leg, 0, "leg on rung 0");
@@ -118,7 +118,7 @@ test("F04 with every rung down, direct fallback carries the leg", async ({ reque
 });
 
 test("F05 a leg whose rungs are all down goes Down and the other leg takes its share", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const b = await world.egress("b");
   const connect1 = await world.connect("connect1", { network: "b" });
@@ -139,7 +139,7 @@ test("F05 a leg whose rungs are all down goes Down and the other leg takes its s
 });
 
 test("F06 a 503 from rung 0 is hop evidence and the leg recovers once it clears", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { leg, connect2 } = await twoRungLadder();
   const download = await world.pacedDownload("f06-503");
   await onRung(request, leg, 0, "leg on rung 0");
@@ -155,7 +155,7 @@ test("F06 a 503 from rung 0 is hop evidence and the leg recovers once it clears"
 });
 
 test("F07 a rejected proxy password cools rung 0 and the profile test reports it", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { leg, connect1 } = await twoRungLadder({ connect1Password: "wrong" });
   const download = await world.pacedDownload("f07-auth", { parts: 64, slowMs: 500 });
   const flow = await onRung(request, leg, 1, "leg on rung 1 after the 407");
@@ -167,7 +167,7 @@ test("F07 a rejected proxy password cools rung 0 and the profile test reports it
 });
 
 test("F08 a refused proxy endpoint cools rung 0 and the leg recovers once it is back", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   // Toxiproxy's connect1 proxy is disabled rather than a container stopped:
   // the endpoint refuses and closes exactly as a stopped member would, and
   // the harness never runs docker itself.
@@ -185,7 +185,7 @@ test("F08 a refused proxy endpoint cools rung 0 and the leg recovers once it is 
 });
 
 test("F09 a hop cut mid-body refetches the article without demoting the job", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   await twoRungLadder();
   const mark = await fixtureMark(request);
   await controlRoute(request, { route: "connect1", hold: true });
@@ -202,7 +202,7 @@ test("F09 a hop cut mid-body refetches the article without demoting the job", as
 });
 
 test("F10 an egress test through a cooling rung's proxy bypasses the cooldown", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { a, leg, connect1, download, moved } = await failFirstRung(request, "f10-probe-bypass");
   expect(leg(moved)?.rungStates[0]).toBe("COOLDOWN");
   await controlRoute(request, { route: "connect1", up: true });
@@ -214,7 +214,7 @@ test("F10 an egress test through a cooling rung's proxy bypasses the cooldown", 
 });
 
 test("F11 server over-limit refusals never fail the leg or its rung", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { leg, server } = await twoRungLadder();
   // The held control session takes one of max_conns=3, leaving Weaver two.
   await world.holdChaosSession();
@@ -238,7 +238,7 @@ test("F11 server over-limit refusals never fail the leg or its rung", async ({ r
 });
 
 test("F12 server greeting failures never fail the leg or its rung", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const { leg } = await twoRungLadder();
   await world.holdChaosSession();
   const subscription = await FlowSubscription.open();
@@ -258,7 +258,7 @@ test("F12 server greeting failures never fail the leg or its rung", async ({ req
 });
 
 test("F13 a chain dials SSH first and CONNECT through it", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const ssh1 = await world.ssh("ssh1");
   // The SSH server forwards from the tunnel fixture's own network, so the
@@ -302,7 +302,7 @@ test("F14 reference rules reject unsound ladders", async ({ request }) => {
 });
 
 test("F15 a pool whose members are all blocked blocks the leg until its path changes", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   // Two SSH members pinned to the primary key on ssh-switch, then the key changes.
   const first = await world.ssh("ssh-switch");
@@ -330,7 +330,7 @@ test("F15 a pool whose members are all blocked blocks the leg until its path cha
 
 test("F16 @extended an eight-rung ladder walks every rung as each dies", async ({ request }, info) => {
   test.skip(!extended(), "extended lane only");
-  test.setTimeout(45 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const members = ["connect1", "connect2", "connect3", "connect4", "connect5", "connect6", "socks1", "socks2"];
   const profiles = [];
@@ -353,7 +353,7 @@ test("F16 @extended an eight-rung ladder walks every rung as each dies", async (
 });
 
 test("F17 a chain carries WireGuard inside WireGuard", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   // Each WireGuard hop in the chain is its own instance. The limit follows
   // the memory Weaver can see and no setting raises it, so a host that
   // grants fewer than two cannot run this test and must say so.

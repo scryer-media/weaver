@@ -1155,6 +1155,68 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
 }
 
 #[tokio::test]
+async fn nzbget_history_reports_the_folder_named_after_the_original_title() {
+    let original = "Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP";
+    let metadata = vec![(
+        weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+        original.to_string(),
+    )];
+    let display = weaver_server_core::ingest::derive_release_name(Some(original), None);
+    let folder = weaver_server_core::ingest::completed_folder_name(&display, &metadata);
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        job_id: 110,
+        job_hash: None,
+        name: display.clone(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: Some("tv".into()),
+        output_dir: Some(format!("/downloads/tv/{folder}")),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(serde_json::to_string(&metadata).unwrap()),
+        server_attribution: None,
+    })
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "history", "params": [], "id": "history"}),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let item = payload["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["ID"] == 110)
+        .unwrap();
+    assert_ne!(display, original);
+    for field in ["DestDir", "FinalDir"] {
+        let reported = item[field].as_str().unwrap();
+        assert!(
+            reported.ends_with(&format!("/{original}")),
+            "{field} = {reported}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn nzbget_history_includes_terminal_memory_items_missing_from_db() {
     let job = nzbget_test_job(
         202,
@@ -3897,11 +3959,12 @@ async fn loadextensions_reports_all_declared_kinds_and_event_metadata() {
         .to_string(),
     )
     .unwrap();
+    let key = test_password();
     let app = nzbget_test_router(
         db,
         test_scheduler_handle(),
         test_config(),
-        api_key_cache("extension-key", "admin"),
+        api_key_cache(&key, "admin"),
     );
     let response = app
         .oneshot(
@@ -3909,7 +3972,7 @@ async fn loadextensions_reports_all_declared_kinds_and_event_metadata() {
                 .method("POST")
                 .uri("/jsonrpc")
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, basic_auth("extension-key"))
+                .header(header::AUTHORIZATION, basic_auth(&key))
                 .body(Body::from(
                     serde_json::json!({"method": "loadextensions", "params": [true]}).to_string(),
                 ))

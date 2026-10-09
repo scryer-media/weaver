@@ -254,6 +254,80 @@ async fn destination_claim_skips_a_directory_populated_by_another_process() {
     assert!(std::fs::read_dir(claimed).unwrap().next().is_none());
 }
 
+fn original_title(title: &str) -> Vec<(String, String)> {
+    vec![(
+        crate::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+        title.to_string(),
+    )]
+}
+
+#[tokio::test]
+async fn completed_output_folder_is_named_after_the_original_release_title() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("complete");
+    let cases = [
+        // A season pack keeps its season.
+        (
+            "Copper Meadow",
+            original_title("Copper.Meadow.S06.1080p.WEB.h264-GRP"),
+            "Copper.Meadow.S06.1080p.WEB.h264-GRP",
+        ),
+        // A multi-episode release keeps every episode.
+        (
+            "Copper Meadow — S11E42",
+            original_title("Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP"),
+            "Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP",
+        ),
+        // A movie keeps its year.
+        (
+            "Lantern Field",
+            original_title("Lantern.Field.2019.2160p.BluRay.x265-GRP"),
+            "Lantern.Field.2019.2160p.BluRay.x265-GRP",
+        ),
+        // A path separator cannot escape the category folder, and a trailing
+        // dot is dropped.
+        (
+            "Lantern Field",
+            original_title("../Lantern/Field.2019.1080p-GRP."),
+            "_Lantern_Field.2019.1080p-GRP",
+        ),
+        // No original title: the display name, as before.
+        ("Copper Meadow", Vec::new(), "Copper Meadow"),
+    ];
+
+    for (job, (display, metadata, expected)) in cases.into_iter().enumerate() {
+        let folder = crate::ingest::completed_folder_name(display, &metadata);
+        assert_eq!(folder, expected);
+        let claimed =
+            claim_complete_destination_path(&parent, &folder, JobId(job as u64), &HashSet::new())
+                .await
+                .unwrap();
+        assert_eq!(claimed.parent(), Some(parent.as_path()), "{expected}");
+        assert_eq!(claimed.file_name().unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn a_second_job_with_the_same_release_title_gets_its_own_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("complete");
+    let metadata = original_title("Copper.Meadow.S06.1080p.WEB.h264-GRP");
+    let folder = crate::ingest::completed_folder_name("Copper Meadow", &metadata);
+
+    let first = claim_complete_destination_path(&parent, &folder, JobId(41), &HashSet::new())
+        .await
+        .unwrap();
+    let second = claim_complete_destination_path(&parent, &folder, JobId(42), &HashSet::new())
+        .await
+        .unwrap();
+
+    assert_eq!(first, parent.join("Copper.Meadow.S06.1080p.WEB.h264-GRP"));
+    assert_eq!(
+        second,
+        parent.join("Copper.Meadow.S06.1080p.WEB.h264-GRP.#42")
+    );
+}
+
 #[tokio::test]
 async fn final_move_does_not_overwrite_existing_destination_file() {
     let temp = tempfile::tempdir().unwrap();

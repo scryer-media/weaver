@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { APIRequestContext } from "@playwright/test";
 import { expect, graphql, postProbeArticle, submitProbeNzb, test } from "./helpers";
 import { literal, query, waitRows } from "./support/datastore";
@@ -30,7 +31,7 @@ import {
  * initial stage leaves a run started for the restart.
  */
 
-const token = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+const token = () => `${Date.now().toString(36)}${randomBytes(2).toString("hex")}`;
 
 function note(type: string, description: string): void {
   test.info().annotations.push({ type, description });

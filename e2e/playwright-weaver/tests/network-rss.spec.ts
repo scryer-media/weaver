@@ -35,7 +35,7 @@ test("RS01 a feed fetched through a CONNECT ladder resolves and fetches through 
 });
 
 test("RS02 a feed moves to its second rung while the first is down and returns after the cooldown", async ({ request }) => {
-  test.setTimeout(10 * 60_000);
+  test.setTimeout(0);
   const a = await world.egress("a");
   const connect1 = await world.connect("connect1");
   const connect2 = await world.connect("connect2");

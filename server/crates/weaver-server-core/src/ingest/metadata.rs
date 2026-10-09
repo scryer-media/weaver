@@ -34,9 +34,9 @@ pub fn original_release_title(job_name: &str, metadata: &[(String, String)]) -> 
 }
 
 fn clean_original_title(raw: &str) -> String {
-    raw.trim()
-        .trim_end_matches(".nzb")
-        .trim_end_matches(".NZB")
+    let raw = raw.trim();
+    super::strip_nzb_source_suffix(raw)
+        .unwrap_or(raw)
         .trim()
         .to_string()
 }
