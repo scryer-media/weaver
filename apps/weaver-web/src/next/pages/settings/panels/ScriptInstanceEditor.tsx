@@ -278,6 +278,8 @@ export function ScriptInstanceEditor({
       .filter(Boolean)
       .join(" ");
     const onChange = (next: string) => setInput(index, next);
+    // A choice takes a text field's width, so the inputs' boxes line up whichever kind each is.
+    const width = "w-[268px] max-w-full";
     const field: FieldSpec = {
       id: `input:${input.name}`,
       label,
@@ -287,6 +289,7 @@ export function ScriptInstanceEditor({
         ? {
             kind: "select",
             value: input.secretId ?? "",
+            className: width,
             options: secretOptions(input),
             onChange: (next: string) => {
               if (next === CREATE_SECRET) {
@@ -300,6 +303,7 @@ export function ScriptInstanceEditor({
           ? {
               kind: "select",
               value: input.value,
+              className: width,
               options: (option.select.includes(input.value) ? option.select : [input.value, ...option.select]).map(
                 (entry) => ({ value: entry, label: entry }),
               ),
@@ -322,13 +326,15 @@ export function ScriptInstanceEditor({
         control: (
           <div className="flex min-w-0 items-center gap-2">
             <FieldControlView spec={field} />
-            <span title={t("next.postProcessing.secret")} className="flex flex-none items-center">
+            {/* Named on screen as the new input's box is, rather than by a tooltip alone. */}
+            <label className="flex flex-none cursor-pointer items-center gap-2 text-[12.5px] text-wv-secondary">
               <CheckBox
                 checked={input.secret}
                 onChange={(next) => changeInput(index, (entry) => withSecret(entry, next))}
                 label={t("next.postProcessing.inputIsSecret", { name: input.name })}
               />
-            </span>
+              {t("next.postProcessing.secret")}
+            </label>
             {option ? null : (
               <SecondaryButton
                 className="px-[10px]"

@@ -20,11 +20,17 @@ async function open(query = "") {
   return page;
 }
 /** With `SCRIPTS_SCREENSHOT_DIR` set to a directory, the page as it stands is saved there as `name`.png. */
-async function shot(page, name) {
+async function shot(page, name, { resize = true } = {}) {
   if (!process.env.SCRIPTS_SCREENSHOT_DIR) return;
+  const path = join(process.env.SCRIPTS_SCREENSHOT_DIR, `${name}.png`);
+  // An open menu is taken as it stands: resizing the window would close it.
+  if (!resize) {
+    await page.screenshot({ path });
+    return;
+  }
   // The table and a dialog's body scroll inside the window; a taller one holds the whole of either.
   await page.setViewportSize({ width: 1600, height: 1500 });
-  await page.screenshot({ path: join(process.env.SCRIPTS_SCREENSHOT_DIR, `${name}.png`) });
+  await page.screenshot({ path });
   await page.setViewportSize({ width: 1600, height: 1000 });
 }
 // What the fixture's daemon holds, read the way the panel reads it.
@@ -248,16 +254,15 @@ test("a script nothing is wired to closes the table, with what its header declar
       "Archive", "archive.py", "NZBGet · 0.9", "Post-processing", "Queue", "Schedule",
       "Declared events: None recognised", "Task times: 03:30",
     ]) assert.equal(await unusedRow(page, "archive.py").getByText(line, { exact: true }).count(), 1, line);
-    for (const name of ["Set up from header", "Create instance"]) {
-      assert.equal(await action(unusedRow(page, "archive.py"), name).count(), 1, name);
-    }
+    assert.equal(await action(unusedRow(page, "archive.py"), "Set up from header").count(), 1);
     // A script whose header declares nothing has nothing to be set up from.
     for (const line of ["SABnzbd", "Post-processing"]) {
       assert.equal(await unusedRow(page, "plain.sh").getByText(line, { exact: true }).count(), 1, line);
     }
     assert.equal(await unusedRow(page, "plain.sh").getByText("Declared events:").count(), 0);
     assert.equal(await action(unusedRow(page, "plain.sh"), "Set up from header").count(), 0);
-    assert.equal(await action(unusedRow(page, "plain.sh"), "Create instance").count(), 1);
+    // The row opens a new instance of its script; the top bar's Create is the list's only one.
+    assert.equal(await action(table(page), "Create instance").count(), 0);
     // Neither is an instance, so neither has a switch, an order or a test.
     assert.equal(await unused(page).getByRole("switch").count(), 0);
     for (const name of ["Move up", "Test", "Delete"]) assert.equal(await action(unused(page), name).count(), 0, name);
@@ -297,6 +302,9 @@ test("a directory with no scripts and no instances says so", async () => {
     assert.equal(await page.getByRole("region").count(), 1);
     assert.equal(await rows(table(page)).count(), 0);
     assert.equal(await action(controls(page), "Create instance").isDisabled(), true);
+    // The top bar's Create is the only one, even with nothing listed.
+    assert.equal(await table(page).getByRole("button").count(), 0);
+    await shot(page, "scripts-empty");
   } finally { await page.close(); }
 });
 
@@ -388,7 +396,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
 test("an instance can be started from its script's row, and a queue instance names its event", async () => {
   const page = await open("?scripts");
   try {
-    await action(unusedRow(page, "archive.py"), "Create instance").click();
+    await unusedRow(page, "archive.py").getByText("archive.py", { exact: true }).click();
     const editor = creator(page);
     // The row's script is already chosen.
     await action(editor, "Script").getByText("Archive · archive.py", { exact: true }).waitFor();
@@ -490,6 +498,7 @@ test("a secret input shows the secret it links and never its value, and can link
     // The secret input names the secret it links; nothing can be typed into it.
     await action(editor, "Token").getByText("Notify token", { exact: true }).waitFor();
     await editor.getByText("The service's access token. Linked from Settings · Scripts · Secrets. The script is given its value when it runs; it is never shown here.", { exact: true }).waitFor();
+    await shot(page, "instance-editor-secret-linked");
     await field(editor, "Label").fill("renamed");
     await field(editor, "Name").fill("Notify all");
     await action(editor, "Save").click();
@@ -511,6 +520,7 @@ test("a secret input shows the secret it links and never its value, and can link
     editor = await edit(page, "Notify all");
     await action(editor, "Token").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["No secret", "Notify token", "Spare key", "Create new secret…"]);
+    await shot(page, "instance-editor-secret-linked-picker", { resize: false });
     await page.getByRole("menuitemradio", { name: "Spare key", exact: true }).click();
     await action(editor, "Save").click();
     await editor.waitFor({ state: "detached" });
@@ -522,6 +532,7 @@ test("a secret input shows the secret it links and never its value, and can link
     editor = await edit(page, "Notify all");
     await pick(page, editor, "Token", "No secret");
     await action(editor, "Token").getByText("Choose a secret", { exact: true }).waitFor();
+    await shot(page, "instance-editor-secret-unlinked");
     await action(editor, "Save").click();
     await editor.waitFor({ state: "detached" });
     await status(page, "Notify all saved").waitFor();
@@ -544,6 +555,7 @@ test("a secret input shows the secret it links and never its value, and can link
     await action(created, "Save").click();
     // A name is taken whatever its case, and the daemon's refusal is said inside the dialog.
     await created.getByText("a secret named 'Notify token' already exists", { exact: true }).waitFor();
+    await shot(page, "instance-editor-create-secret");
     await field(created, "Name").fill("Mail token");
     await action(created, "Save").click();
     await created.waitFor({ state: "detached" });
@@ -598,6 +610,7 @@ test("an input the header does not declare can be added, and taken away again", 
     ).waitFor();
     assert.equal(await field(editor, "Legacy").inputValue(), "1");
     await editor.getByText("Not declared by the script's header.", { exact: true }).waitFor();
+    await shot(page, "instance-editor-drift");
     // Only what the header does not ask for can be removed.
     assert.equal(await editor.getByRole("button", { name: /^Remove / }).count(), 1);
     const name = field(editor, "New input name");
@@ -855,6 +868,7 @@ test("a secret is added, renamed and given a new value without its value ever be
     await action(editor, "Save").click();
     await editor.getByText("Type the value to keep.", { exact: true }).waitFor();
     assert.equal(await page.locator("#status").textContent(), "");
+    await shot(page, "secret-editor-create");
     await secretField(editor, "Value").fill("fixture-token-3");
     await action(editor, "Save").click();
     await status(page, "Secret Mail token created").waitFor();
@@ -867,7 +881,7 @@ test("a secret is added, renamed and given a new value without its value ever be
     assert.equal(await field(editor, "Name").inputValue(), "Mail token");
     assert.equal(await secretField(editor, "Value").inputValue(), "");
     assert.equal(await secretField(editor, "Value").getAttribute("placeholder"), "Saved · leave blank to keep");
-    await shot(page, "secret-editor");
+    await shot(page, "secret-editor-edit");
     await field(editor, "Name").fill("Mail key");
     await action(editor, "Save").click();
     await status(page, "Secret Mail key saved").waitFor();
@@ -890,7 +904,7 @@ test("a secret is added, renamed and given a new value without its value ever be
   } finally { await page.close(); }
 });
 
-test("a secret an instance links cannot be deleted, and the refusal names the instance inside its dialog", async () => {
+test("a secret an instance links cannot be deleted, and the refusal names the instance inside the question", async () => {
   const page = await open("?secrets");
   try {
     const confirm = page.getByRole("dialog", { name: "Delete secret", exact: true });
@@ -898,10 +912,20 @@ test("a secret an instance links cannot be deleted, and the refusal names the in
     let editor = secretDialog(page, "Notify token");
     await action(editor, "Delete").click();
     await confirm.getByText("Delete Notify token? An instance that still links it keeps it from being deleted.", { exact: true }).waitFor();
+    assert.equal(await confirm.getByRole("alert").count(), 0);
     await action(confirm, "Delete").click();
-    await editor.getByText("secret 'Notify token' is used by Notify", { exact: true }).waitFor();
-    await confirm.waitFor({ state: "detached" });
+    // Said where it was asked, as an instance's refused delete is; the question stays open.
+    await confirm.getByRole("alert").filter({ hasText: "secret 'Notify token' is used by Notify" }).waitFor();
     assert.equal(await page.locator("#status").textContent(), "");
+    await shot(page, "secret-delete-refused");
+    await action(confirm, "Cancel").click();
+    await confirm.waitFor({ state: "detached" });
+    // Asked again, the question starts without the last answer.
+    await action(editor, "Delete").click();
+    await confirm.getByText("Notify token", { exact: true }).waitFor();
+    assert.equal(await confirm.getByRole("alert").count(), 0);
+    await action(confirm, "Cancel").click();
+    await confirm.waitFor({ state: "detached" });
     await action(editor, "Cancel").click();
     await editor.waitFor({ state: "detached" });
     assert.equal(await secretRow(page, "Notify token").count(), 1);
@@ -921,13 +945,24 @@ test("a secret an instance links cannot be deleted, and the refusal names the in
   } finally { await page.close(); }
 });
 
-test("no secrets says so and offers to add one", async () => {
+test("no secrets says so, and the top bar's Add is the only one", async () => {
   const page = await open("?secrets&empty");
   try {
     await secretsTable(page).getByText("No secrets yet.", { exact: true }).waitFor();
     assert.equal(await rows(secretsTable(page)).count(), 0);
-    await action(secretsTable(page), "Add secret").click();
+    assert.equal(await secretsTable(page).getByRole("button").count(), 0);
+    await shot(page, "secrets-empty");
+    await action(controls(page), "Add secret").click();
     await secretDialog(page, "Add secret").waitFor();
+  } finally { await page.close(); }
+});
+
+test("a secret several instances link names every one of them", async () => {
+  const page = await open("?secrets&shared");
+  try {
+    await secretRow(page, "Notify token").getByText("Notify, Log removal", { exact: true }).waitFor();
+    assert.equal(await secretRow(page, "Spare key").getByText("Not used", { exact: true }).count(), 1);
+    await shot(page, "secrets-table-shared");
   } finally { await page.close(); }
 });
 
@@ -1131,6 +1166,7 @@ test("the runs screen is one table of every run, newest first, with no way to cr
     }
     assert.equal(await page.getByRole("button", { name: /^(Add|Create|New)\b/ }).count(), 0);
     assert.deepEqual((await runRequests(page)).at(-1), { limit: 50, before: null, kind: null });
+    await shot(page, "runs");
   } finally { await page.close(); }
 });
 
@@ -1222,6 +1258,7 @@ test("opening a run shows what it did and fetches its retained output", async ()
     await notify.getByRole("button", { name: "Show excerpt", exact: true }).click();
     await notify.getByText("resolved 2 recipients").waitFor({ state: "detached" });
     await notify.getByText("notified 2 recipients").waitFor();
+    await shot(page, "run-record");
     await shut(notify);
 
     // A failed run says why, and has neither an exit code nor output to fetch. Its instance is gone too.
@@ -1276,5 +1313,6 @@ test("a daemon that recorded no script run says so and offers nothing to add", a
     assert.equal(await runsTable(page).getByRole("button").count(), 0);
     assert.equal(await page.locator("#controls").getByRole("button").count(), 2);
     assert.equal(await page.getByRole("button", { name: /^(Add|Create|New)\b/ }).count(), 0);
+    await shot(page, "runs-empty");
   } finally { await page.close(); }
 });

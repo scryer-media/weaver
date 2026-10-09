@@ -115,8 +115,12 @@ const state = {
       queueEvent: "NZB_ADDED", timeoutSeconds: 90, inputs: [held("Label", "queued"), held("Legacy", "1")],
     }),
     // Its secret was never linked, so it holds no input for it.
+    // With `shared`, it links the same secret as Notify, so that secret has two users.
     instance("5", "Log removal", "notify.py", "QUEUE", {
-      queueEvent: "NZB_DELETED", runOrder: 1, inputs: [held("Label", "removed"), held("Mode", "verbose"), held("Attach", "yes")],
+      queueEvent: "NZB_DELETED", runOrder: 1, inputs: [
+        held("Label", "removed"), held("Mode", "verbose"), held("Attach", "yes"),
+        ...(has("shared") ? [linked("Token", "s1")] : []),
+      ],
     }),
     instance("6", "Nightly report", "nightly.py", "SCHEDULER", { timeoutSeconds: 3600 }),
     instance("7", "Feed intake", "intake.py", "FEED", { blocking: false }),
