@@ -1,10 +1,11 @@
-//! Running a script on request against made-up inputs.
+//! Running a script instance on request against made-up inputs.
 //!
-//! A test run hands the script what a real run of the chosen trigger would:
+//! A test run hands the script what a real run of the instance would:
 //! the same variables and arguments, built from a download that does not exist
 //! and a scratch directory that is removed when the run ends. Commands the
-//! script prints are reported and never applied, and nothing about the run is
-//! stored: it is kept in memory for as long as it takes to read.
+//! script issues, whether it prints them or sends them through the API, are
+//! reported and never applied, and nothing about the run is stored: it is kept
+//! in memory for as long as it takes to read.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -13,17 +14,19 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
+use super::callbacks::{RunAction, RunRequest, RunRequests};
 use super::directives::{Directive, ScriptOutputEvent};
 use super::events::EventContext;
 use super::executor::{execution_refusal, strict_security_enabled};
+use super::instances::InstanceTrigger;
 use super::listing::resolve_script;
 use super::model::{
     PipelineOutcome, QueueEvent, ScriptAdapter, ScriptEventLabel, ScriptName, ScriptStatus,
 };
 use super::runner::{
     CompatibilityFacts, ExecutionDisposition, ExecutionSpec, InterpreterConfig,
-    JobExecutionContext, OutputTap, RunnerError, ScriptExecutionRequest, ScriptExecutionResult,
-    adapter_contract, execute_script_tapped, execute_spec_tapped,
+    JobExecutionContext, OutputTap, RunIdentity, RunnerError, ScriptExecutionRequest,
+    ScriptExecutionResult, adapter_contract, execute_script_tapped, execute_spec_tapped,
 };
 use crate::Database;
 use crate::settings::SharedConfig;
@@ -67,39 +70,28 @@ const TEST_FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </rss>
 "#;
 
-/// Variables a post-processing run is handed that are not made up for the
-/// test: the script's saved options, weaver's own directories, and
-/// per-download parameters.
-const NOT_MADE_UP: [&str; 4] = ["NZBPO_", "NZBOP_", "NZBPR_", "SAB_OPTION_"];
+/// Variables a run is handed that are not made up for the test: the
+/// instance's own inputs, weaver's own directories, per-download parameters,
+/// and what lets the script call weaver back.
+const NOT_MADE_UP: [&str; 7] = [
+    "NZBPO_",
+    "NZBOP_",
+    "NZBPR_",
+    "SAB_OPTION_",
+    "WEAVER_INPUT_",
+    "WEAVER_API_URL",
+    "WEAVER_RUN_TOKEN",
+];
 
-/// What a test run stands in for.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum TestTrigger {
-    PostProcessing,
-    Queue(QueueEvent),
-    Scan,
-    Scheduler,
-    Feed,
-}
-
-impl TestTrigger {
-    fn label(self) -> ScriptEventLabel {
-        match self {
-            Self::PostProcessing => ScriptEventLabel::PostProcessing,
-            Self::Queue(event) => ScriptEventLabel::Queue(event),
-            Self::Scan => ScriptEventLabel::Scan,
-            Self::Scheduler => ScriptEventLabel::Scheduler(0),
-            Self::Feed => ScriptEventLabel::Feed(0),
-        }
+/// What a test run of an instance stands in for.
+fn test_event(trigger: InstanceTrigger) -> ScriptEventLabel {
+    match trigger {
+        InstanceTrigger::PostProcessing => ScriptEventLabel::PostProcessing,
+        InstanceTrigger::Queue(event) => ScriptEventLabel::Queue(event),
+        InstanceTrigger::Scan => ScriptEventLabel::Scan,
+        InstanceTrigger::Schedule => ScriptEventLabel::Scheduler(0),
+        InstanceTrigger::Feed => ScriptEventLabel::Feed(0),
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ScriptTestRequest {
-    pub script: ScriptName,
-    pub trigger: TestTrigger,
-    /// The category the made-up download is filed under, if any.
-    pub category: Option<String>,
 }
 
 /// Why a test run was not started.
@@ -107,15 +99,10 @@ pub struct ScriptTestRequest {
 pub enum ScriptTestError {
     #[error("{0}")]
     Refused(&'static str),
+    #[error("the script instance does not exist")]
+    NotFound,
     #[error("{0}")]
     Unavailable(String),
-    #[error("script '{script}' does not declare {trigger}")]
-    NotDeclared {
-        script: ScriptName,
-        trigger: ScriptEventLabel,
-    },
-    #[error("script configuration is invalid: {0}")]
-    InvalidOptions(String),
     #[error("{RUNNING_TESTS} test runs are already in progress")]
     Busy,
     #[error("could not prepare the test run: {0}")]
@@ -139,14 +126,16 @@ pub struct ScriptTestOutcome {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ScriptTestSnapshot {
     pub id: String,
+    pub instance_id: String,
+    pub instance_name: String,
     pub script: ScriptName,
     pub event: ScriptEventLabel,
     pub adapter: ScriptAdapter,
     pub started_at_epoch_ms: i64,
     /// The run is ended after this long.
     pub timeout_seconds: u64,
-    /// The variables made up for this run, in name order. The script's saved
-    /// options are left out: they are real, and some are secret.
+    /// The variables made up for this run, in name order. The instance's own
+    /// inputs are left out: they are real, and some are secret.
     pub inputs: Vec<(String, String)>,
     /// The arguments made up for this run, in order.
     pub arguments: Vec<String>,
@@ -230,7 +219,6 @@ impl TestRun {
                         match result.disposition {
                             ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
                             ExecutionDisposition::Skipped => ScriptStatus::Skipped,
-                            ExecutionDisposition::Warned => ScriptStatus::Warning,
                             ExecutionDisposition::Failed => ScriptStatus::Failed,
                             ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
                             ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
@@ -298,12 +286,13 @@ enum Execution {
     Event(Box<ExecutionSpec>),
 }
 
-/// Start `request`'s script against made-up inputs and return the run as it
-/// stands. Read it again with [`Database::script_test`].
+/// Run the instance `instance_id` against made-up inputs and return the run
+/// as it stands. Read it again with [`Database::script_test`]. Whether the
+/// instance is turned on makes no difference to a test.
 pub async fn start_script_test(
     db: &Database,
     config: &SharedConfig,
-    request: ScriptTestRequest,
+    instance_id: String,
     supervisor_executable: Option<PathBuf>,
 ) -> Result<ScriptTestSnapshot, ScriptTestError> {
     let directories = {
@@ -315,59 +304,40 @@ pub async fn start_script_test(
         }
     };
     let worker = db.clone();
-    let (run, execution, scratch) = tokio::task::spawn_blocking(move || {
-        prepare(&worker, request, &directories, supervisor_executable)
+    let (run, execution, scratch, requests) = tokio::task::spawn_blocking(move || {
+        prepare(&worker, &instance_id, &directories, supervisor_executable)
     })
     .await
     .map_err(setup)??;
     let snapshot = run.snapshot();
-    tokio::spawn(execute(run, execution, scratch));
+    tokio::spawn(execute(run, execution, scratch, requests));
     Ok(snapshot)
 }
 
 fn prepare(
     db: &Database,
-    request: ScriptTestRequest,
+    instance_id: &str,
     directories: &Directories,
     supervisor_executable: Option<PathBuf>,
-) -> Result<(Arc<TestRun>, Execution, tempfile::TempDir), ScriptTestError> {
+) -> Result<(Arc<TestRun>, Execution, tempfile::TempDir, RunRequests), ScriptTestError> {
     let settings = db.post_processing_settings().map_err(setup)?;
     if let Some(reason) = execution_refusal(&settings, strict_security_enabled()) {
         return Err(ScriptTestError::Refused(reason));
     }
-    let root = db.post_processing_script_directory().map_err(setup)?;
-    let script = resolve_script(&root, &request.script)
-        .map_err(|error| ScriptTestError::Unavailable(error.to_string()))?;
-    let event = request.trigger.label();
-    let declared = script.manifest.kinds().contains(&event.kind())
-        && match request.trigger {
-            TestTrigger::Queue(event) => script.manifest.queue_events().contains(&event),
-            _ => true,
-        };
-    if !declared {
-        return Err(ScriptTestError::NotDeclared {
-            script: request.script,
-            trigger: event,
-        });
-    }
-    let options = db
-        .post_processing_script_options(&request.script)
-        .map_err(|error| error.to_string())
-        .and_then(|supplied| {
-            script
-                .manifest
-                .resolve_options(&supplied)
-                .map_err(|error| error.to_string())
-        })
-        .map_err(ScriptTestError::InvalidOptions)?;
-    let timeout_seconds = db
-        .post_processing_script_lists()
+    let instance = db
+        .script_instance(instance_id)
         .map_err(setup)?
-        .global
-        .entries()
-        .iter()
-        .find(|entry| entry.script == request.script)
-        .and_then(|entry| entry.timeout_seconds)
+        .ok_or(ScriptTestError::NotFound)?;
+    let options = db
+        .script_instance_run_inputs(&instance.id)
+        .map_err(setup)?
+        .ok_or(ScriptTestError::NotFound)?;
+    let root = db.post_processing_script_directory().map_err(setup)?;
+    let script = resolve_script(&root, &instance.script)
+        .map_err(|error| ScriptTestError::Unavailable(error.to_string()))?;
+    let event = test_event(instance.trigger);
+    let timeout_seconds = instance
+        .timeout_seconds
         .unwrap_or(settings.event_scripts.event_script_timeout_seconds);
 
     std::fs::create_dir_all(&directories.data).map_err(setup)?;
@@ -375,17 +345,23 @@ fn prepare(
         .prefix("script-test-")
         .tempdir_in(&directories.data)
         .map_err(setup)?;
-    let category = request
-        .category
-        .map(|category| category.trim().to_string())
-        .filter(|category| !category.is_empty());
+    // An instance kept to some categories is tested as a download in the
+    // first of them.
+    let category = instance.categories.first().cloned();
     let job = simulated_job(scratch.path(), category, directories).map_err(setup)?;
 
     let mut id = [0_u8; 16];
     getrandom::fill(&mut id).map_err(setup)?;
     let id = hex::encode(id);
+    let mut identity = RunIdentity {
+        run_id: id.clone(),
+        ..RunIdentity::of(&instance).map_err(setup)?
+    };
     let adapter = script.manifest.adapter();
     let timeout = Some(Duration::from_secs(timeout_seconds));
+    // The script can call back as it could in a real run. What it asks for
+    // comes here, where none of it is applied.
+    let requests = db.open_script_run(&mut identity, None, &event, timeout, true);
     let termination_grace = Duration::from_secs(settings.termination_grace_seconds);
     let ceiling = settings.event_scripts.script_output_ceiling_bytes;
     let interpreters = InterpreterConfig {
@@ -393,17 +369,17 @@ fn prepare(
         powershell: settings.powershell_interpreter.as_ref().map(PathBuf::from),
         batch: settings.batch_interpreter.as_ref().map(PathBuf::from),
     };
-    let context = match request.trigger {
-        TestTrigger::PostProcessing => None,
-        TestTrigger::Queue(event) => Some(simulated_queue_event(&job, event)),
-        TestTrigger::Scan => Some(simulated_scan(&job, scratch.path()).map_err(setup)?),
-        TestTrigger::Scheduler => Some(jobless(
+    let context = match instance.trigger {
+        InstanceTrigger::PostProcessing => None,
+        InstanceTrigger::Queue(event) => Some(simulated_queue_event(&job, event)),
+        InstanceTrigger::Scan => Some(simulated_scan(&job, scratch.path()).map_err(setup)?),
+        InstanceTrigger::Schedule => Some(jobless(
             &job,
             scratch.path(),
             event.clone(),
             [("NZBSP_TASKID", "0".to_string())],
         )),
-        TestTrigger::Feed => Some(simulated_feed(&job, scratch.path()).map_err(setup)?),
+        InstanceTrigger::Feed => Some(simulated_feed(&job, scratch.path()).map_err(setup)?),
     };
     let (execution, inputs, arguments) = match context {
         None => {
@@ -412,6 +388,7 @@ fn prepare(
                 root: script.root,
                 options,
                 context: job,
+                identity,
                 timeout,
                 termination_grace,
                 interpreters,
@@ -429,18 +406,21 @@ fn prepare(
             )
         }
         Some(context) => {
-            let inputs = context.env.clone().into_iter().collect();
+            let mut env = context.weaver_env();
+            env.extend(context.env);
+            let inputs = env.clone().into_iter().collect();
             let spec = ExecutionSpec {
                 manifest: script.manifest,
                 root: script.root,
                 options,
                 cwd: context.cwd,
-                env: context.env,
+                env,
                 argv: Vec::new(),
                 timeout,
                 termination_grace,
                 kind: context.event,
                 run_id: format!("test:{id}"),
+                identity,
                 facts: context.facts,
                 interpreters,
                 supervisor_executable,
@@ -458,7 +438,9 @@ fn prepare(
         state: Mutex::new(TestState {
             snapshot: ScriptTestSnapshot {
                 id,
-                script: request.script,
+                instance_id: instance.id,
+                instance_name: instance.name,
+                script: instance.script,
                 event,
                 adapter,
                 started_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
@@ -475,10 +457,15 @@ fn prepare(
         }),
     });
     db.script_runtime.tests.admit(run.clone())?;
-    Ok((run, execution, scratch))
+    Ok((run, execution, scratch, requests))
 }
 
-async fn execute(run: Arc<TestRun>, execution: Execution, scratch: tempfile::TempDir) {
+async fn execute(
+    run: Arc<TestRun>,
+    execution: Execution,
+    scratch: tempfile::TempDir,
+    mut requests: RunRequests,
+) {
     let started = Instant::now();
     let cancellation = run.cancel.subscribe();
     let (sender, mut receiver) = mpsc::channel(64);
@@ -487,10 +474,35 @@ async fn execute(run: Arc<TestRun>, execution: Execution, scratch: tempfile::Tem
         Arc::new(move |line: &[u8]| run.append(line))
     };
     let commands = async {
-        while let Some(event) = receiver.recv().await {
-            // The text of a log line is already in the output the tap is handed.
-            if let ScriptOutputEvent::Directive(directive) = event {
-                run.command(command_text(&directive));
+        loop {
+            tokio::select! {
+                event = receiver.recv() => match event {
+                    Some(ScriptOutputEvent::Directive(directive)) => {
+                        run.command(command_text(&directive));
+                    }
+                    // The text of a log line is already in the output the tap
+                    // is handed.
+                    Some(ScriptOutputEvent::Log { .. }) => {}
+                    None => break,
+                },
+                request = requests.next() => {
+                    let RunRequest { action, reply } = request;
+                    let outcome = match action {
+                        RunAction::Command(directive) => {
+                            run.command(command_text(&directive));
+                            Ok(())
+                        }
+                        RunAction::Log { text, .. } => requests.log(&text).map(drop),
+                        RunAction::Fail(reason) => requests.fail(&reason).map(|()| {
+                            run.command(format!(
+                                "FAIL={}",
+                                requests.failure().unwrap_or_default()
+                            ));
+                        }),
+                    };
+                    // The script may have stopped waiting for the answer.
+                    let _ = reply.send(outcome);
+                }
             }
         }
     };
@@ -511,7 +523,14 @@ async fn execute(run: Arc<TestRun>, execution: Execution, scratch: tempfile::Tem
             }
         }
     };
-    let (result, ()) = tokio::join!(execution, commands);
+    let (mut result, ()) = tokio::join!(execution, commands);
+    // Failing is how the run came out, not something done to a download, so
+    // a test shows it as a real run would.
+    if let Ok(result) = &mut result {
+        requests.settle(result);
+    }
+    // The run is over: its token is worth nothing from here on.
+    drop(requests);
     match tokio::task::spawn_blocking(move || scratch.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -593,7 +612,8 @@ fn jobless<const N: usize>(
             .map(|(name, value)| (name.to_string(), value))
             .collect::<BTreeMap<_, _>>(),
         facts: job.compatibility.clone(),
-        scripts: None,
+        instances: None,
+        scratch: None,
     }
 }
 

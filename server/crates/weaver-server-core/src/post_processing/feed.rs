@@ -1,16 +1,17 @@
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::events::{EventContext, has_subscriber, run_event};
-use super::executor::{execution_refusal, strict_security_enabled};
-use super::model::{
-    ScriptEventLabel, ScriptKind, ScriptList, ScriptListEntry, ScriptName, ScriptStatus,
-};
+use super::instances::{InstanceTrigger, ScriptInstance};
+use super::model::{ScriptEventLabel, ScriptStatus};
 use super::runner::CompatibilityFacts;
 use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow};
 
+/// Hand a fetched feed to the instances attached to it and return what they
+/// leave of it.
 pub async fn transform_feed(
     db: &Database,
     config: &SharedConfig,
@@ -18,57 +19,32 @@ pub async fn transform_feed(
     body: Vec<u8>,
     ceiling: u64,
 ) -> Result<Vec<u8>, String> {
-    let scripts = if feed.scripts.is_empty() {
-        None
-    } else {
-        Some(
-            ScriptList::new(
-                feed.scripts
-                    .iter()
-                    .map(|name| {
-                        Ok(ScriptListEntry {
-                            script: ScriptName::new(name.clone())
-                                .map_err(|error| error.to_string())?,
-                            enabled: true,
-                            timeout_seconds: None,
-                            blocking: true,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            )
-            .map_err(|error| error.to_string())?,
-        )
-    };
-    let mut context = EventContext {
-        job_id: None,
-        event: ScriptEventLabel::Feed(u64::from(feed.id)),
-        category: None,
-        cwd: PathBuf::new(),
-        env: BTreeMap::new(),
-        facts: CompatibilityFacts::default(),
-        scripts,
-    };
-    let admission_db = db.clone();
-    let admission_context = context.clone();
-    let has_script = tokio::task::spawn_blocking(move || {
-        let settings = admission_db
-            .post_processing_settings()
-            .map_err(|error| error.to_string())?;
-        if execution_refusal(&settings, strict_security_enabled()).is_none()
-            && let Some(scripts) = &admission_context.scripts
-        {
-            let root = admission_db
-                .post_processing_script_directory()
-                .map_err(|error| error.to_string())?;
-            validate_explicit_feed_scripts(&root, scripts)?;
-        }
-        has_subscriber(&admission_db, &admission_context).map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-    if !has_script {
+    if feed.scripts.is_empty() {
         return Ok(body);
     }
+    let admission_db = db.clone();
+    let attached = feed.scripts.clone();
+    let feed_id = feed.id;
+    let admitted = tokio::task::spawn_blocking(move || {
+        let instances = attached_instances(&admission_db, &attached)?;
+        let context = EventContext {
+            job_id: None,
+            event: ScriptEventLabel::Feed(u64::from(feed_id)),
+            category: None,
+            cwd: PathBuf::new(),
+            env: BTreeMap::new(),
+            facts: CompatibilityFacts::default(),
+            instances: Some(instances),
+            scratch: None,
+        };
+        Ok::<_, crate::StateError>(has_subscriber(&admission_db, &context)?.then_some(context))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    let Some(mut context) = admitted else {
+        return Ok(body);
+    };
     {
         let config = config.read().await;
         context.facts.data_dir = Some(PathBuf::from(&config.data_dir));
@@ -86,13 +62,14 @@ pub async fn transform_feed(
             .prefix("script-feed-")
             .tempdir_in(data_dir)?;
         std::fs::write(scratch.path().join("feed.xml"), body)?;
-        Ok::<_, std::io::Error>(scratch)
+        Ok::<_, std::io::Error>(Arc::new(scratch))
     })
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())?;
     let input = scratch.path().join("feed.xml");
     context.cwd = scratch.path().to_path_buf();
+    context.scratch = Some(scratch.clone());
     context
         .env
         .insert("NZBFP_FEEDID".into(), feed.id.to_string());
@@ -109,12 +86,19 @@ pub async fn transform_feed(
     let results = run_event(db, &mut context, &run_id, None, None)
         .await
         .map_err(|error| error.to_string())?;
-    if results
-        .iter()
-        .any(|result| result.status != ScriptStatus::Succeeded)
-    {
-        return Err("feed script failed (exit 93 is required)".into());
+    if let Some(result) = results.iter().find(|result| {
+        matches!(
+            result.status,
+            ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled
+        )
+    }) {
+        return Err(format!(
+            "feed script {} did not complete: {}",
+            result.label(),
+            result.status.as_str()
+        ));
     }
+    drop(context);
     tokio::task::spawn_blocking(move || {
         let _scratch = scratch;
         let mut body = Vec::new();
@@ -133,50 +117,53 @@ pub async fn transform_feed(
     .map_err(|error| error.to_string())
 }
 
+/// Refuse a feed's attachments unless each is a feed instance, named once.
 pub fn validate_feed_script_selection(
     db: &Database,
-    names: &[String],
+    ids: &[String],
 ) -> Result<(), crate::StateError> {
-    if names.is_empty() {
+    if ids.is_empty() {
         return Ok(());
     }
-    let entries = names
-        .iter()
-        .map(|name| ScriptName::new(name.clone()).map(ScriptListEntry::new))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| crate::StateError::Database(error.to_string()))?;
-    let scripts =
-        ScriptList::new(entries).map_err(|error| crate::StateError::Database(error.to_string()))?;
-    let root = db.post_processing_script_directory()?;
-    validate_explicit_feed_scripts(&root, &scripts).map_err(crate::StateError::Database)
-}
-
-fn validate_explicit_feed_scripts(root: &Path, scripts: &ScriptList) -> Result<(), String> {
-    for entry in scripts.enabled_entries() {
-        let script = super::listing::resolve_script(root, &entry.script)
-            .map_err(|error| error.to_string())?;
-        if !script.manifest.kinds().contains(&ScriptKind::Feed) {
-            return Err(format!(
-                "script '{}' does not support feed events",
-                entry.script
-            ));
+    let instances = db.script_instances()?;
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        let instance = instances
+            .iter()
+            .find(|instance| &instance.id == id)
+            .ok_or_else(|| {
+                crate::StateError::Database(format!("script instance '{id}' does not exist"))
+            })?;
+        if instance.trigger != InstanceTrigger::Feed {
+            return Err(crate::StateError::Database(format!(
+                "'{}' does not run on feeds",
+                instance.name
+            )));
+        }
+        if !seen.insert(id) {
+            return Err(crate::StateError::Database(format!(
+                "'{}' is attached more than once",
+                instance.name
+            )));
         }
     }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_explicit_feed_script_is_not_silently_skipped() {
-        let directory = tempfile::tempdir().unwrap();
-        let scripts = ScriptList::new(vec![ScriptListEntry::new(
-            ScriptName::new("missing.py").unwrap(),
-        )])
-        .unwrap();
-        let error = validate_explicit_feed_scripts(directory.path(), &scripts).unwrap_err();
-        assert!(error.contains("missing.py"));
-    }
+/// The feed instances behind `ids`, in that order. One that has since been
+/// deleted or given another trigger is left out.
+fn attached_instances(
+    db: &Database,
+    ids: &[String],
+) -> Result<Vec<ScriptInstance>, crate::StateError> {
+    let mut instances = db.script_instances()?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| {
+            let position = instances.iter().position(|instance| {
+                &instance.id == id && instance.trigger == InstanceTrigger::Feed
+            })?;
+            Some(instances.swap_remove(position))
+        })
+        .collect())
 }

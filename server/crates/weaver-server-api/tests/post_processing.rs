@@ -1,7 +1,11 @@
 mod common;
 
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
+use serde_json::{Value, json};
 use weaver_server_api::auth::CallerScope;
+
+/// Every field of a saved instance.
+const INSTANCE: &str = "id name script trigger queueEvent inputs { name value secret } categories enabled blocking timeoutSeconds runOrder scriptProblem headerDrift";
 
 /// Write a bare script into the harness's `data_dir/scripts`.
 async fn write_script(harness: &TestHarness, name: &str, body: &str) {
@@ -9,6 +13,37 @@ async fn write_script(harness: &TestHarness, name: &str, body: &str) {
     let scripts = data_dir.join("scripts");
     std::fs::create_dir_all(&scripts).unwrap();
     std::fs::write(scripts.join(name), body).unwrap();
+}
+
+/// Create an instance from the fields of a `ScriptInstanceInput`.
+async fn create_instance(harness: &TestHarness, input: &str) -> Value {
+    let response = harness
+        .execute(&format!(
+            "mutation {{ createScriptInstance(input: {{ {input} }}) {{ {INSTANCE} }} }}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    response_data(&response)["createScriptInstance"].clone()
+}
+
+/// Every saved instance, in run order.
+async fn instances(harness: &TestHarness) -> Vec<Value> {
+    let response = harness
+        .execute(&format!("{{ scriptInstances {{ {INSTANCE} }} }}"))
+        .await;
+    assert_no_errors(&response);
+    response_data(&response)["scriptInstances"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn id(instance: &Value) -> String {
+    instance["id"].as_str().unwrap().to_string()
+}
+
+fn ids(instances: &[Value]) -> Vec<String> {
+    instances.iter().map(id).collect()
 }
 
 #[tokio::test]
@@ -24,7 +59,7 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
 
     let response = harness
         .execute(
-            "{ postProcessingSettings { scriptDirectory executionEnabled concurrency terminationGraceSeconds unacceptableExtensions strictSecurityRefusesExecution lists { global { script } } } }",
+            "{ postProcessingSettings { scriptDirectory executionEnabled concurrency terminationGraceSeconds unacceptableExtensions strictSecurityRefusesExecution globalScriptsRun } }",
         )
         .await;
     assert_no_errors(&response);
@@ -35,11 +70,11 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
     assert_eq!(settings["terminationGraceSeconds"], 10);
     assert_eq!(settings["unacceptableExtensions"], serde_json::json!([]));
     assert_eq!(settings["strictSecurityRefusesExecution"], false);
-    assert_eq!(settings["lists"]["global"].as_array().unwrap().len(), 0);
+    assert_eq!(settings["globalScriptsRun"], "ALWAYS");
 }
 
 #[tokio::test]
-async fn scripts_directory_is_admin_owned_and_clears_assignments_when_changed() {
+async fn scripts_directory_is_admin_owned_and_turns_every_instance_off_when_changed() {
     let harness = TestHarness::new().await;
     let denied = harness
         .execute_as(
@@ -49,36 +84,57 @@ async fn scripts_directory_is_admin_owned_and_clears_assignments_when_changed() 
         .await;
     assert_has_errors(&denied);
 
-    let lists = harness
-        .execute(
-            r#"mutation { setScriptLists(input: { global: [{ script: "notify.sh" }] }) { global { script } } }"#,
-        )
-        .await;
-    assert_no_errors(&lists);
+    write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;
+    let instance = create_instance(
+        &harness,
+        r#"script: "notify.sh", trigger: POST_PROCESSING, inputs: [{ name: "Host", value: "example.invalid" }]"#,
+    )
+    .await;
+    assert_eq!(instance["enabled"], true);
+    assert!(instance["scriptProblem"].is_null());
 
     let root = tempfile::tempdir().unwrap();
     let requested = root.path().join("nested/scripts");
     let requested_gql = serde_json::to_string(&requested).unwrap();
     let response = harness
         .execute(&format!(
-            "mutation {{ setPostProcessingScriptDirectory(directory: {requested_gql}) {{ scriptDirectory lists {{ global {{ script }} }} }} }}"
+            "mutation {{ setPostProcessingScriptDirectory(directory: {requested_gql}) {{ scriptDirectory }} }}"
         ))
         .await;
     assert_no_errors(&response);
-    let settings = &response_data(&response)["setPostProcessingScriptDirectory"];
     let canonical = std::fs::canonicalize(&requested).unwrap();
-    assert_eq!(settings["scriptDirectory"], &*canonical.to_string_lossy());
-    assert!(settings["lists"]["global"].as_array().unwrap().is_empty());
+    assert_eq!(
+        response_data(&response)["setPostProcessingScriptDirectory"]["scriptDirectory"],
+        &*canonical.to_string_lossy()
+    );
+
+    // A name in the new directory is not the script that was wired up, so the
+    // instance is kept as it was saved and turned off.
+    let saved = instances(&harness).await;
+    assert_eq!(ids(&saved), [id(&instance)]);
+    assert_eq!(saved[0]["enabled"], false);
+    assert_eq!(
+        saved[0]["inputs"],
+        json!([{ "name": "Host", "value": "example.invalid", "secret": false }])
+    );
+    assert!(
+        saved[0]["scriptProblem"]
+            .as_str()
+            .unwrap()
+            .contains("no longer in the scripts directory")
+    );
 
     std::fs::write(
         canonical.join("replacement.sh"),
         "#!/bin/sh\necho replacement\n",
     )
     .unwrap();
-    let listing = harness.execute("{ scripts { scripts { name } } }").await;
+    let listing = harness
+        .execute("{ discoveredScripts { scripts { name } } }")
+        .await;
     assert_no_errors(&listing);
     assert_eq!(
-        response_data(&listing)["scripts"]["scripts"][0]["name"],
+        response_data(&listing)["discoveredScripts"]["scripts"][0]["name"],
         "replacement.sh"
     );
 }
@@ -195,6 +251,47 @@ async fn settings_round_trip_preserves_omitted_extensions_and_rejects_invalid_up
 }
 
 #[tokio::test]
+async fn global_scripts_run_is_kept_until_it_is_sent_again() {
+    let harness = TestHarness::new().await;
+    let set = |value: &'static str| {
+        let harness = &harness;
+        async move {
+            let response = harness
+                .execute(&format!(
+                    "mutation {{ setPostProcessingSettings(input: {{
+                        executionEnabled: false
+                        concurrency: 1
+                        terminationGraceSeconds: 10
+                        {value}
+                    }}) {{ globalScriptsRun }} }}"
+                ))
+                .await;
+            assert_no_errors(&response);
+            response_data(&response)["setPostProcessingSettings"]["globalScriptsRun"].clone()
+        }
+    };
+    assert_eq!(
+        set("globalScriptsRun: ONLY_WITHOUT_CATEGORY_SCRIPTS").await,
+        "ONLY_WITHOUT_CATEGORY_SCRIPTS"
+    );
+    assert_eq!(
+        set("").await,
+        "ONLY_WITHOUT_CATEGORY_SCRIPTS",
+        "left out, it stays as it was"
+    );
+    assert_eq!(set("globalScriptsRun: ALWAYS").await, "ALWAYS");
+
+    let persisted = harness
+        .execute("{ postProcessingSettings { globalScriptsRun } }")
+        .await;
+    assert_no_errors(&persisted);
+    assert_eq!(
+        response_data(&persisted)["postProcessingSettings"]["globalScriptsRun"],
+        "ALWAYS"
+    );
+}
+
+#[tokio::test]
 async fn scripts_are_listed_live_from_the_directory_with_their_problems() {
     let harness = TestHarness::new().await;
     write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;
@@ -210,15 +307,20 @@ async fn scripts_are_listed_live_from_the_directory_with_their_problems() {
     std::fs::write(broken.join("manifest.json"), "{ not json").unwrap();
 
     let denied = harness
-        .execute_as("{ scripts { scripts { name } } }", CallerScope::Read)
+        .execute_as(
+            "{ discoveredScripts { scripts { name } } }",
+            CallerScope::Read,
+        )
         .await;
     assert_has_errors(&denied);
 
     let response = harness
-        .execute("{ scripts { scripts { name displayName adapter } problems { name message } } }")
+        .execute(
+            "{ discoveredScripts { scripts { name displayName adapter } problems { name message } } }",
+        )
         .await;
     assert_no_errors(&response);
-    let listing = &response_data(&response)["scripts"];
+    let listing = &response_data(&response)["discoveredScripts"];
     let scripts = listing["scripts"].as_array().unwrap();
     assert_eq!(scripts.len(), 2);
     let by_name = |name: &str| {
@@ -234,49 +336,225 @@ async fn scripts_are_listed_live_from_the_directory_with_their_problems() {
 }
 
 #[tokio::test]
-async fn script_lists_round_trip_with_a_category_override() {
+async fn instances_are_created_read_reordered_and_deleted() {
     let harness = TestHarness::new().await;
-    let response = harness
-        .execute(
-            r#"
-            mutation {
-              setScriptLists(input: {
-                global: [{ script: "notify.sh", enabled: true, timeoutSeconds: 30 }]
-                categories: [{ category: "movies", entries: [{ script: "sort.sh", enabled: false }] }]
-              }) {
-                global { script enabled timeoutSeconds }
-                categories { category entries { script enabled } }
-              }
-            }
-            "#,
+    write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;
+    write_script(&harness, "sort.sh", "#!/bin/sh\necho hi\n").await;
+
+    let denied = harness
+        .execute_as("{ scriptInstances { id } }", CallerScope::Read)
+        .await;
+    assert_has_errors(&denied);
+    let denied = harness
+        .execute_as(
+            r#"mutation { createScriptInstance(input: { script: "notify.sh", trigger: POST_PROCESSING }) { id } }"#,
+            CallerScope::Read,
         )
         .await;
-    assert_no_errors(&response);
-    let lists = &response_data(&response)["setScriptLists"];
-    assert_eq!(lists["global"][0]["script"], "notify.sh");
-    assert_eq!(lists["global"][0]["timeoutSeconds"], 30);
-    assert_eq!(lists["categories"][0]["category"], "movies");
-    assert_eq!(lists["categories"][0]["entries"][0]["enabled"], false);
+    assert_has_errors(&denied);
+    assert!(instances(&harness).await.is_empty());
 
-    let settings = harness
-        .execute(
-            "{ postProcessingSettings { lists { global { script } categories { category } } } }",
-        )
-        .await;
-    assert_no_errors(&settings);
-    let lists = &response_data(&settings)["postProcessingSettings"]["lists"];
-    assert_eq!(lists["global"][0]["script"], "notify.sh");
-    assert_eq!(lists["categories"][0]["category"], "movies");
+    let notify = create_instance(
+        &harness,
+        r#"name: "Tell me", script: "notify.sh", trigger: POST_PROCESSING, timeoutSeconds: 30"#,
+    )
+    .await;
+    assert_eq!(notify["name"], "Tell me");
+    assert_eq!(notify["script"], "notify.sh");
+    assert_eq!(notify["trigger"], "POST_PROCESSING");
+    assert!(notify["queueEvent"].is_null());
+    assert_eq!(notify["timeoutSeconds"], 30);
+    assert_eq!(notify["enabled"], true);
+    assert_eq!(notify["categories"], json!([]));
+    assert_eq!(notify["inputs"], json!([]));
+    assert!(notify["scriptProblem"].is_null());
+    assert_eq!(notify["headerDrift"], false);
 
-    // A script name that could escape the directory is refused outright.
-    let rejected = harness
-        .execute(r#"mutation { setScriptLists(input: { global: [{ script: "../escape" }] }) { global { script } } }"#)
+    let sort = create_instance(
+        &harness,
+        r#"script: "sort.sh", trigger: POST_PROCESSING, categories: ["movies", "Movies", "tv"], enabled: false"#,
+    )
+    .await;
+    assert_eq!(
+        sort["name"], "sort.sh",
+        "an instance without a name takes its script's"
+    );
+    assert_eq!(sort["categories"], json!(["movies", "tv"]));
+    assert_eq!(sort["enabled"], false);
+    assert!(sort["timeoutSeconds"].is_null());
+
+    // The same script can be wired up as often as it is wanted.
+    let added = create_instance(
+        &harness,
+        r#"script: "notify.sh", trigger: QUEUE, queueEvent: NZB_ADDED, categories: ["tv"]"#,
+    )
+    .await;
+    assert_eq!(added["trigger"], "QUEUE");
+    assert_eq!(added["queueEvent"], "NZB_ADDED");
+    assert_eq!(added["categories"], json!(["tv"]));
+
+    let all = instances(&harness).await;
+    assert_eq!(ids(&all), [id(&notify), id(&sort), id(&added)]);
+    assert_eq!(all[1], sort, "what was saved is what is read back");
+
+    let one = harness
+        .execute(&format!(
+            r#"{{ scriptInstance(id: "{}") {{ name }} }}"#,
+            id(&sort)
+        ))
         .await;
-    assert_has_errors(&rejected);
+    assert_no_errors(&one);
+    assert_eq!(response_data(&one)["scriptInstance"]["name"], "sort.sh");
+    let none = harness
+        .execute(r#"{ scriptInstance(id: "nope") { name } }"#)
+        .await;
+    assert_no_errors(&none);
+    assert!(response_data(&none)["scriptInstance"].is_null());
+
+    // One trigger is put in order without moving the others.
+    let reordered = harness
+        .execute(&format!(
+            r#"mutation {{ reorderScriptInstances(trigger: POST_PROCESSING, ids: ["{}"]) {{ id }} }}"#,
+            id(&sort)
+        ))
+        .await;
+    assert_no_errors(&reordered);
+    let order = [id(&sort), id(&notify), id(&added)];
+    assert_eq!(
+        ids(response_data(&reordered)["reorderScriptInstances"]
+            .as_array()
+            .unwrap()),
+        order
+    );
+    assert_eq!(ids(&instances(&harness).await), order);
+
+    for refused in [
+        // An instance of another trigger has no place among them.
+        format!(r#"["{}"]"#, id(&added)),
+        format!(r#"["{0}", "{0}"]"#, id(&sort)),
+        r#"["nope"]"#.to_string(),
+    ] {
+        let response = harness
+            .execute(&format!(
+                "mutation {{ reorderScriptInstances(trigger: POST_PROCESSING, ids: {refused}) {{ id }} }}"
+            ))
+            .await;
+        assert_has_errors(&response);
+    }
+    assert_eq!(ids(&instances(&harness).await), order);
+
+    let delete = format!(
+        r#"mutation {{ deleteScriptInstance(id: "{}") }}"#,
+        id(&notify)
+    );
+    let denied = harness.execute_as(&delete, CallerScope::Read).await;
+    assert_has_errors(&denied);
+    let deleted = harness.execute(&delete).await;
+    assert_no_errors(&deleted);
+    assert_eq!(response_data(&deleted)["deleteScriptInstance"], true);
+    let again = harness.execute(&delete).await;
+    assert_no_errors(&again);
+    assert_eq!(response_data(&again)["deleteScriptInstance"], false);
+    assert_eq!(ids(&instances(&harness).await), [id(&sort), id(&added)]);
 }
 
 #[tokio::test]
-async fn script_options_are_validated_against_the_manifest_and_masked_when_secret() {
+async fn an_instance_that_cannot_be_saved_as_asked_is_refused() {
+    let harness = TestHarness::new().await;
+    write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;
+    for refused in [
+        // A script name that could escape the directory is refused outright.
+        r#"script: "../escape", trigger: POST_PROCESSING"#,
+        // An instance can only be pointed at a script that is there to run.
+        r#"script: "gone.sh", trigger: POST_PROCESSING"#,
+        r#"script: "notify.sh", trigger: QUEUE"#,
+        r#"script: "notify.sh", trigger: SCAN, categories: ["movies"]"#,
+        r#"script: "notify.sh", trigger: FEED, categories: ["movies"]"#,
+        r#"script: "notify.sh", trigger: POST_PROCESSING, categories: [" "]"#,
+        r#"script: "notify.sh", trigger: POST_PROCESSING, timeoutSeconds: 0"#,
+        r#"script: "notify.sh", trigger: POST_PROCESSING, inputs: [{ name: "Host", value: "a" }, { name: "HOST", value: "b" }]"#,
+        r#"script: "notify.sh", trigger: POST_PROCESSING, inputs: [{ name: "", value: "a" }]"#,
+    ] {
+        let response = harness
+            .execute(&format!(
+                "mutation {{ createScriptInstance(input: {{ {refused} }}) {{ id }} }}"
+            ))
+            .await;
+        assert!(
+            !response.errors.is_empty(),
+            "{refused} was saved: {:?}",
+            response.data
+        );
+    }
+    assert!(instances(&harness).await.is_empty());
+
+    let nothing_there = harness
+        .execute(
+            r#"mutation { updateScriptInstance(id: "nope", input: { script: "notify.sh", trigger: POST_PROCESSING }) { id } }"#,
+        )
+        .await;
+    assert_has_errors(&nothing_there);
+    assert!(instances(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_update_replaces_what_is_saved_and_may_keep_naming_a_script_that_has_gone() {
+    let harness = TestHarness::new().await;
+    write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;
+    let created = create_instance(
+        &harness,
+        r#"script: "notify.sh", trigger: POST_PROCESSING, categories: ["movies"], inputs: [{ name: "Host", value: "a" }]"#,
+    )
+    .await;
+
+    let data_dir = std::path::PathBuf::from(harness.config.read().await.data_dir.clone());
+    std::fs::remove_file(data_dir.join("scripts/notify.sh")).unwrap();
+    let saved = instances(&harness).await;
+    assert_eq!(
+        saved[0]["scriptProblem"],
+        "the script is no longer in the scripts directory"
+    );
+    assert_eq!(saved[0]["enabled"], true, "nothing is changed on reading");
+
+    let update = |input: &'static str| {
+        let harness = &harness;
+        let id = id(&created);
+        async move {
+            harness
+                .execute(&format!(
+                    r#"mutation {{ updateScriptInstance(id: "{id}", input: {{ {input} }}) {{ {INSTANCE} }} }}"#
+                ))
+                .await
+        }
+    };
+    let updated = update(
+        r#"name: "Later", script: "notify.sh", trigger: SCAN, enabled: false, blocking: false, timeoutSeconds: 45, inputs: [{ name: "Port", value: "25" }]"#,
+    )
+    .await;
+    assert_no_errors(&updated);
+    let updated = &response_data(&updated)["updateScriptInstance"];
+    assert_eq!(updated["id"], created["id"]);
+    assert_eq!(updated["name"], "Later");
+    assert_eq!(updated["trigger"], "SCAN");
+    assert_eq!(updated["categories"], json!([]));
+    assert_eq!(updated["enabled"], false);
+    assert_eq!(updated["blocking"], false);
+    assert_eq!(updated["timeoutSeconds"], 45);
+    assert_eq!(updated["runOrder"], created["runOrder"]);
+    assert_eq!(
+        updated["inputs"],
+        json!([{ "name": "Port", "value": "25", "secret": false }])
+    );
+    assert_eq!(instances(&harness).await, vec![updated.clone()]);
+
+    // Pointing it at another script needs that script to be there.
+    let moved = update(r#"script: "other.sh", trigger: SCAN"#).await;
+    assert_has_errors(&moved);
+    assert_eq!(instances(&harness).await, vec![updated.clone()]);
+}
+
+#[tokio::test]
+async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     let harness = TestHarness::new().await;
     let data_dir = std::path::PathBuf::from(harness.config.read().await.data_dir.clone());
     let package = data_dir.join("scripts/email");
@@ -309,50 +587,281 @@ async fn script_options_are_validated_against_the_manifest_and_masked_when_secre
     .unwrap();
     std::fs::write(package.join("email.py"), "#!/usr/bin/env python3\n").unwrap();
 
-    let response = harness
+    // The header is offered as a starting point and nothing more.
+    let listing = harness
         .execute(
-            r#"
-            mutation {
-              setScriptOptions(script: "email", options: [
-                { name: "Host", optionType: STRING, value: "smtp.example.invalid" }
-                { name: "Token", optionType: SECRET, value: "hunter2" }
-              ]) {
-                name
-                options { name optionType value defaultValue }
-              }
-            }
-            "#,
+            "{ discoveredScripts { scripts { name options { name optionType defaultValue } preset { triggers { trigger queueEvent } taskTimes inputs { name value secret } } } } }",
         )
         .await;
-    assert_no_errors(&response);
-    let script = &response_data(&response)["setScriptOptions"];
+    assert_no_errors(&listing);
+    let script = &response_data(&listing)["discoveredScripts"]["scripts"][0];
     assert_eq!(script["name"], "email");
     let options = script["options"].as_array().unwrap();
     let host = options.iter().find(|o| o["name"] == "Host").unwrap();
-    assert_eq!(host["value"], "smtp.example.invalid");
     assert_eq!(host["defaultValue"], "mail.example.invalid");
     let token = options.iter().find(|o| o["name"] == "Token").unwrap();
     assert_eq!(token["optionType"], "SECRET");
     assert_eq!(
-        token["value"], "[REDACTED]",
-        "a stored secret must never be echoed back"
+        script["preset"],
+        json!({
+            "triggers": [{ "trigger": "POST_PROCESSING", "queueEvent": null }],
+            "taskTimes": [],
+            "inputs": [
+                { "name": "Host", "value": "mail.example.invalid", "secret": false },
+                { "name": "Token", "value": null, "secret": true }
+            ]
+        })
     );
 
-    // Options the manifest does not declare are refused rather than stored.
-    let rejected = harness
-        .execute(
-            r#"mutation { setScriptOptions(script: "email", options: [
-                { name: "Nope", optionType: STRING, value: "x" }
-            ]) { name } }"#,
+    // What is sent is what is saved, whatever the header declares.
+    let created = create_instance(
+        &harness,
+        r#"script: "email", trigger: POST_PROCESSING, inputs: [
+            { name: "Host", value: "smtp.example.invalid" }
+            { name: "Token", value: "hunter2", secret: true }
+            { name: "Extra", value: "x" }
+        ]"#,
+    )
+    .await;
+    let secret = json!({ "name": "Token", "value": null, "secret": true });
+    assert_eq!(
+        created["inputs"],
+        json!([
+            { "name": "Host", "value": "smtp.example.invalid", "secret": false },
+            secret,
+            { "name": "Extra", "value": "x", "secret": false }
+        ]),
+        "a stored secret must never be echoed back"
+    );
+    assert_eq!(
+        created["headerDrift"], true,
+        "the instance holds an input the header does not declare"
+    );
+    let stored = harness.db.script_instance(&id(&created)).unwrap().unwrap();
+    assert!(
+        stored
+            .inputs
+            .iter()
+            .all(|input| !input.value.contains("hunter2")),
+        "a secret is not carried in what is read from the store"
+    );
+
+    // A secret sent without a value is kept; everything else is replaced.
+    let updated = harness
+        .execute(&format!(
+            r#"mutation {{ updateScriptInstance(id: "{}", input: {{ script: "email", trigger: POST_PROCESSING, inputs: [
+                {{ name: "Token", secret: true }}
+                {{ name: "Extra", value: "y" }}
+            ] }}) {{ inputs {{ name value secret }} headerDrift }} }}"#,
+            id(&created)
+        ))
+        .await;
+    assert_no_errors(&updated);
+    let updated = &response_data(&updated)["updateScriptInstance"];
+    assert_eq!(
+        updated["inputs"],
+        json!([secret, { "name": "Extra", "value": "y", "secret": false }])
+    );
+    assert_eq!(updated["headerDrift"], true);
+
+    // Bringing it back in line with the header keeps what the operator saved
+    // under a name the header still declares and drops the rest.
+    let denied = harness
+        .execute_as(
+            &format!(
+                r#"mutation {{ reapplyScriptHeader(id: "{}") {{ id }} }}"#,
+                id(&created)
+            ),
+            CallerScope::Read,
         )
         .await;
-    assert_has_errors(&rejected);
+    assert_has_errors(&denied);
+    let reapplied = harness
+        .execute(&format!(
+            r#"mutation {{ reapplyScriptHeader(id: "{}") {{ inputs {{ name value secret }} headerDrift }} }}"#,
+            id(&created)
+        ))
+        .await;
+    assert_no_errors(&reapplied);
+    let reapplied = &response_data(&reapplied)["reapplyScriptHeader"];
+    assert_eq!(
+        reapplied["inputs"],
+        json!([
+            { "name": "Host", "value": "mail.example.invalid", "secret": false },
+            secret
+        ])
+    );
+    assert_eq!(reapplied["headerDrift"], false);
 
-    // A script that is not in the directory cannot have options at all.
+    let nothing_there = harness
+        .execute(r#"mutation { reapplyScriptHeader(id: "nope") { id } }"#)
+        .await;
+    assert_has_errors(&nothing_there);
+}
+
+#[tokio::test]
+async fn a_script_is_set_up_from_its_header_once_and_its_schedule_goes_with_it() {
+    let harness = TestHarness::new().await;
+    write_script(
+        &harness,
+        "nightly.sh",
+        "#!/bin/sh\n### NZBGET POST-PROCESSING/SCHEDULER SCRIPT ###\n### TASK TIME: 03:30 ###\nexit 93\n",
+    )
+    .await;
+
+    let listing = harness
+        .execute("{ discoveredScripts { scripts { name preset { triggers { trigger queueEvent } taskTimes } } } }")
+        .await;
+    assert_no_errors(&listing);
+    assert_eq!(
+        response_data(&listing)["discoveredScripts"]["scripts"][0]["preset"],
+        json!({
+            "triggers": [
+                { "trigger": "POST_PROCESSING", "queueEvent": null },
+                { "trigger": "SCHEDULER", "queueEvent": null }
+            ],
+            "taskTimes": ["03:30"]
+        })
+    );
+
+    let set_up = r#"mutation { setUpScriptFromHeader(script: "nightly.sh") { id name script trigger enabled } }"#;
+    let denied = harness.execute_as(set_up, CallerScope::Read).await;
+    assert_has_errors(&denied);
+    let added = harness.execute(set_up).await;
+    assert_no_errors(&added);
+    let added = response_data(&added)["setUpScriptFromHeader"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        added
+            .iter()
+            .map(|instance| instance["trigger"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["POST_PROCESSING", "SCHEDULER"]
+    );
+    assert!(added.iter().all(|instance| instance["enabled"] == true));
+    assert_eq!(ids(&instances(&harness).await), ids(&added));
+    let scheduled = id(&added[1]);
+
+    let schedules = "{ schedules { instanceId time actionType enabled runAtStartup } }";
+    let rules = harness.execute(schedules).await;
+    assert_no_errors(&rules);
+    assert_eq!(
+        response_data(&rules)["schedules"],
+        json!([{
+            "instanceId": scheduled,
+            "time": "03:30",
+            "actionType": "run_script",
+            "enabled": true,
+            "runAtStartup": false
+        }])
+    );
+
+    // The header is not read again for what is already wired up.
+    let again = harness.execute(set_up).await;
+    assert_no_errors(&again);
+    assert_eq!(response_data(&again)["setUpScriptFromHeader"], json!([]));
+    assert_eq!(instances(&harness).await.len(), 2);
+    let rules = harness.execute(schedules).await;
+    assert_eq!(
+        response_data(&rules)["schedules"].as_array().unwrap().len(),
+        1
+    );
+
     let missing = harness
-        .execute(r#"mutation { setScriptOptions(script: "gone.sh", options: []) { name } }"#)
+        .execute(r#"mutation { setUpScriptFromHeader(script: "gone.sh") { id } }"#)
         .await;
     assert_has_errors(&missing);
+
+    // A rule that ran an instance goes when the instance does.
+    let deleted = harness
+        .execute(&format!(
+            r#"mutation {{ deleteScriptInstance(id: "{scheduled}") }}"#
+        ))
+        .await;
+    assert_no_errors(&deleted);
+    let rules = harness.execute(schedules).await;
+    assert_no_errors(&rules);
+    assert_eq!(response_data(&rules)["schedules"], json!([]));
+    assert_eq!(ids(&instances(&harness).await), [id(&added[0])]);
+}
+
+#[tokio::test]
+async fn an_instance_is_waited_for_unless_it_says_otherwise() {
+    let harness = TestHarness::new().await;
+    write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;
+    let waited =
+        create_instance(&harness, r#"script: "notify.sh", trigger: POST_PROCESSING"#).await;
+    assert_eq!(
+        waited["blocking"], true,
+        "an instance is waited for unless it says otherwise"
+    );
+    for trigger in [
+        "POST_PROCESSING",
+        "QUEUE, queueEvent: NZB_DOWNLOADED",
+        "SCAN",
+        "SCHEDULER",
+        "FEED",
+    ] {
+        let detached = create_instance(
+            &harness,
+            &format!(r#"script: "notify.sh", trigger: {trigger}, blocking: false"#),
+        )
+        .await;
+        assert_eq!(detached["blocking"], false, "{trigger}");
+    }
+    let saved = instances(&harness).await;
+    assert_eq!(saved.len(), 6);
+    assert_eq!(saved[0]["blocking"], true);
+    assert!(
+        saved[1..]
+            .iter()
+            .all(|instance| instance["blocking"] == false)
+    );
+}
+
+#[tokio::test]
+async fn a_test_run_needs_scripts_switched_on_and_an_instance_to_run() {
+    let harness = TestHarness::new().await;
+    write_script(&harness, "notify.sh", "#!/bin/sh\necho hi\n").await;
+    let instance = create_instance(&harness, r#"script: "notify.sh", trigger: SCAN"#).await;
+    let test = format!(
+        r#"mutation {{ testScriptInstance(id: "{}") {{ id }} }}"#,
+        id(&instance)
+    );
+
+    let denied = harness.execute_as(&test, CallerScope::Read).await;
+    assert_has_errors(&denied);
+    // Execution is off until an administrator turns it on.
+    let switched_off = harness.execute(&test).await;
+    assert_has_errors(&switched_off);
+
+    let switched_on = harness
+        .execute(
+            r#"mutation { setPostProcessingSettings(input: {
+                executionEnabled: true
+                concurrency: 1
+                terminationGraceSeconds: 10
+            }) { executionEnabled } }"#,
+        )
+        .await;
+    assert_no_errors(&switched_on);
+    let nothing_there = harness
+        .execute(r#"mutation { testScriptInstance(id: "nope") { id } }"#)
+        .await;
+    assert_has_errors(&nothing_there);
+
+    let run = harness
+        .execute(r#"{ scriptTestRun(id: "nope") { id } }"#)
+        .await;
+    assert_no_errors(&run);
+    assert!(response_data(&run)["scriptTestRun"].is_null());
+    let cancelled = harness
+        .execute(r#"mutation { cancelScriptTest(id: "nope") }"#)
+        .await;
+    assert_no_errors(&cancelled);
+    assert_eq!(response_data(&cancelled)["cancelScriptTest"], false);
 }
 
 #[tokio::test]
@@ -400,40 +909,6 @@ async fn results_are_readable_and_control_scope_owns_rerun_and_cancel() {
 }
 
 #[tokio::test]
-async fn an_entry_keeps_whether_it_is_waited_for() {
-    let harness = TestHarness::new().await;
-    let response = harness
-        .execute(
-            r#"
-            mutation {
-              setScriptLists(input: {
-                global: [{ script: "notify.sh" }, { script: "ping.sh", blocking: false }]
-              }) {
-                global { script blocking }
-              }
-            }
-            "#,
-        )
-        .await;
-    assert_no_errors(&response);
-    let global = &response_data(&response)["setScriptLists"]["global"];
-    assert_eq!(
-        global[0]["blocking"], true,
-        "an entry is waited for unless it says otherwise"
-    );
-    assert_eq!(global[1]["blocking"], false);
-
-    let settings = harness
-        .execute("{ postProcessingSettings { lists { global { script blocking } } } }")
-        .await;
-    assert_no_errors(&settings);
-    let global = &response_data(&settings)["postProcessingSettings"]["lists"]["global"];
-    assert_eq!(global[0]["blocking"], true);
-    assert_eq!(global[1]["script"], "ping.sh");
-    assert_eq!(global[1]["blocking"], false);
-}
-
-#[tokio::test]
 async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     use weaver_server_core::post_processing::model::{
         ScriptAdapter, ScriptEventLabel, ScriptName, ScriptResult, ScriptStatus,
@@ -442,16 +917,23 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
 
     let harness = TestHarness::new().await;
     let recorded = [
-        (ScriptEventLabel::Scheduler(1), "nightly.sh", false),
-        (ScriptEventLabel::Scan, "scan.sh", false),
-        (ScriptEventLabel::Scheduler(2), "hourly.sh", true),
+        (ScriptEventLabel::Scheduler(1), "nightly.sh", false, None),
+        (ScriptEventLabel::Scan, "scan.sh", false, None),
+        (
+            ScriptEventLabel::Scheduler(2),
+            "hourly.sh",
+            true,
+            Some(("instance-1", "Every hour")),
+        ),
     ];
-    for (event, script, background) in recorded {
+    for (event, script, background, instance) in recorded {
         retain_output(
             harness.db.clone(),
             None,
             ScriptResult {
                 script: ScriptName::new(script).unwrap(),
+                instance_id: instance.map(|(id, _)| id.to_string()),
+                instance_name: instance.map(|(_, name)| name.to_string()),
                 event,
                 output_id: None,
                 background,
@@ -471,7 +953,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
         .unwrap();
     }
 
-    let fields = "runs { id jobId jobName script event kind background adapter status exitCode durationMs outputTail outputTruncated outputRetained errorMessage finishedAtEpochMs } nextBefore";
+    let fields = "runs { id jobId jobName script instanceId instanceName event kind background adapter status exitCode durationMs outputTail outputTruncated outputRetained errorMessage finishedAtEpochMs } nextBefore";
     let first = harness
         .execute_as(
             &format!("{{ scriptRuns(limit: 2) {{ {fields} }} }}"),
@@ -483,6 +965,8 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     let runs = first["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0]["script"], "hourly.sh");
+    assert_eq!(runs[0]["instanceId"], "instance-1");
+    assert_eq!(runs[0]["instanceName"], "Every hour");
     assert_eq!(runs[0]["event"], "scheduler:2");
     assert_eq!(runs[0]["kind"], "SCHEDULER");
     assert_eq!(runs[0]["background"], true);
@@ -493,6 +977,8 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     assert!(runs[0]["jobId"].is_null());
     assert!(runs[0]["jobName"].is_null());
     assert_eq!(runs[1]["script"], "scan.sh");
+    assert!(runs[1]["instanceId"].is_null());
+    assert!(runs[1]["instanceName"].is_null());
     assert_eq!(runs[1]["kind"], "SCAN");
     assert_eq!(runs[1]["background"], false);
 

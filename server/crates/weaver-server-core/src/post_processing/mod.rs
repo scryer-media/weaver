@@ -1,16 +1,19 @@
-//! Post-processing scripts: files in an operator-configured directory, an
-//! ordered list per job, executed as a bounded step of job finalization.
+//! Scripts: files in an operator-configured directory, wired up as saved
+//! instances that each run one script on one trigger.
 
+pub mod callbacks;
 pub mod directives;
 pub mod effects;
 pub mod events;
 pub mod executor;
 pub mod feed;
 pub mod hooks;
+pub mod instances;
 pub mod listing;
 pub mod manifest;
 pub mod model;
 pub mod output;
+pub mod preset;
 pub mod runner;
 pub mod scan;
 pub mod scheduler;

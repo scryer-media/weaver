@@ -8,9 +8,9 @@ use super::model::{
 };
 use super::runner::{
     CompatibilityFacts, ExecutionDisposition, InterpreterConfig, JobExecutionContext,
-    MAX_SCRIPT_OUTPUT_BYTES, NzbgetScriptStatus, ScriptExecutionRequest, adapter_contract_for_test,
-    adapter_disposition_for_test, bounded_output_for_test, cancellation_grace_for_test,
-    redact_bytes_for_test,
+    MAX_SCRIPT_OUTPUT_BYTES, NzbgetScriptStatus, RunIdentity, ScriptExecutionRequest,
+    adapter_contract_for_test, bounded_output_for_test, cancellation_grace_for_test,
+    exit_disposition_for_test, redact_bytes_for_test,
 };
 
 fn manifest(adapter: ScriptAdapter) -> ScriptManifest {
@@ -52,6 +52,15 @@ fn request(adapter: ScriptAdapter) -> ScriptExecutionRequest {
             par_status: 2,
             unpack_status: 2,
             compatibility: CompatibilityFacts::default(),
+        },
+        identity: RunIdentity {
+            run_id: "run-1".into(),
+            instance_id: "instance-1".into(),
+            instance_name: "Example instance".into(),
+            trigger: "post_processing".into(),
+            api_url: None,
+            token: None,
+            output: Default::default(),
         },
         timeout: Some(Duration::from_secs(60)),
         termination_grace: Duration::from_secs(10),
@@ -144,7 +153,7 @@ fn sab_pipeline_status_follows_the_failing_stage() {
 }
 
 #[test]
-fn nzbget_adapter_supplies_nzbpp_nzbpo_and_nzbop_variables_with_no_positional_args() {
+fn nzbget_variables_reach_a_script_alongside_the_positional_arguments() {
     let mut request = request(ScriptAdapter::Nzbget);
     request.options = vec![ResolvedOption::new(
         OptionName::new("Server.Timeout").unwrap(),
@@ -163,7 +172,10 @@ fn nzbget_adapter_supplies_nzbpp_nzbpo_and_nzbop_variables_with_no_positional_ar
     };
     let (args, env) = contract(&request);
 
-    assert!(args.is_empty(), "NZBGet scripts read the environment only");
+    // Every script is handed both conventions, so one written for either
+    // program finds what it reads.
+    assert_eq!(args.len(), 8);
+    assert_eq!(env.get("SAB_NZO_ID").unwrap(), "42");
     assert_eq!(env.get("NZBPP_NZBID").unwrap(), "42");
     assert_eq!(env.get("NZBPP_NZBNAME").unwrap(), "Example Job");
     assert_eq!(env.get("NZBPP_DIRECTORY").unwrap(), "/complete/job");
@@ -248,46 +260,72 @@ fn secret_options_reach_the_script_verbatim() {
 }
 
 #[test]
-fn exit_codes_map_onto_each_ecosystem_contract() {
-    use ExecutionDisposition::{Failed, Skipped, Succeeded, Warned};
-    // SABnzbd: zero succeeds, anything else is a warning on the job.
+fn an_exit_code_reads_the_same_for_every_script() {
+    use ExecutionDisposition::{Failed, Skipped, Succeeded};
+    // Zero, and the two codes NZBGet scripts report success with.
+    for code in [0, 92, 93] {
+        assert_eq!(exit_disposition_for_test(Some(code)), Succeeded, "{code}");
+    }
+    // The script decided it had nothing to do.
+    assert_eq!(exit_disposition_for_test(Some(95)), Skipped);
+    for code in [1, 2, 94, 127, -1] {
+        assert_eq!(exit_disposition_for_test(Some(code)), Failed, "{code}");
+    }
+    // Ended by a signal.
+    assert_eq!(exit_disposition_for_test(None), Failed);
+}
+
+#[test]
+fn a_run_is_told_which_instance_it_is_and_given_its_inputs() {
+    let mut request = request(ScriptAdapter::Sabnzbd);
+    request.options = vec![
+        ResolvedOption::new(
+            OptionName::new("ApiKey").unwrap(),
+            OptionValue::String("value".into()),
+        ),
+        ResolvedOption::new(
+            OptionName::new("Server.Timeout").unwrap(),
+            OptionValue::String("30".into()),
+        ),
+    ];
+    request.context.compatibility = CompatibilityFacts {
+        data_dir: Some(PathBuf::from("/data")),
+        complete_dir: Some(PathBuf::from("/data/complete")),
+        ..CompatibilityFacts::default()
+    };
+    let (_, env) = contract(&request);
+
+    assert_eq!(env.get("WEAVER_RUN_ID").unwrap(), "run-1");
+    assert_eq!(env.get("WEAVER_INSTANCE_ID").unwrap(), "instance-1");
+    assert_eq!(env.get("WEAVER_INSTANCE_NAME").unwrap(), "Example instance");
+    assert_eq!(env.get("WEAVER_TRIGGER").unwrap(), "post_processing");
     assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Sabnzbd, Some(0)),
-        Succeeded
+        env.get("WEAVER_VERSION").unwrap(),
+        env!("CARGO_PKG_VERSION")
     );
-    assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Sabnzbd, Some(1)),
-        Warned
-    );
-    assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Sabnzbd, None),
-        Warned
-    );
-    // NZBGet: 92 par-check request is acknowledged, 93 success, 94 error, 95 none.
-    assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(92)),
-        Succeeded
-    );
-    assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(93)),
-        Succeeded
-    );
-    assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(94)),
-        Failed
-    );
-    assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(95)),
-        Skipped
-    );
-    assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Nzbget, Some(0)),
-        Failed
-    );
-    assert_eq!(
-        adapter_disposition_for_test(ScriptAdapter::Nzbget, None),
-        Failed
-    );
+    assert_eq!(env.get("WEAVER_DATA_DIR").unwrap(), "/data");
+    assert_eq!(env.get("WEAVER_COMPLETE_DIR").unwrap(), "/data/complete");
+    assert_eq!(env.get("WEAVER_JOB_ID").unwrap(), "42");
+    assert_eq!(env.get("WEAVER_JOB_NAME").unwrap(), "Example Job");
+    assert_eq!(env.get("WEAVER_CATEGORY").unwrap(), "movies");
+    assert_eq!(env.get("WEAVER_DIRECTORY").unwrap(), "/complete/job");
+    assert_eq!(env.get("WEAVER_FINAL_DIRECTORY").unwrap(), "/complete/job");
+    assert_eq!(env.get("WEAVER_STATUS").unwrap(), "FAILURE");
+    // An input is sent under all three spellings.
+    assert_eq!(env.get("WEAVER_INPUT_APIKEY").unwrap(), "value");
+    assert_eq!(env.get("WEAVER_INPUT_SERVER_TIMEOUT").unwrap(), "30");
+    assert_eq!(env.get("SAB_OPTION_APIKEY").unwrap(), "value");
+    assert_eq!(env.get("NZBPO_ApiKey").unwrap(), "value");
+    assert_eq!(env.get("NZBPO_Server.Timeout").unwrap(), "30");
+    // A run that was given no way to call back is not told of one.
+    assert!(!env.contains_key("WEAVER_API_URL"));
+    assert!(!env.contains_key("WEAVER_RUN_TOKEN"));
+
+    request.identity.api_url = Some("http://127.0.0.1:6789".into());
+    request.identity.token = Some("run-token".into());
+    let (_, env) = contract(&request);
+    assert_eq!(env.get("WEAVER_API_URL").unwrap(), "http://127.0.0.1:6789");
+    assert_eq!(env.get("WEAVER_RUN_TOKEN").unwrap(), "run-token");
 }
 
 #[test]

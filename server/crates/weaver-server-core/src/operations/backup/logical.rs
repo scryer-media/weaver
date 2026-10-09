@@ -15,7 +15,8 @@ use super::catalog::{
     BACKUP_TABLE_CATALOG, BackupTableClassification, catalog_tables, export_query,
     is_engine_internal_table, is_optional_catalog_table, quote_identifier,
 };
-use crate::persistence::sql_runtime::StoreDatastore;
+use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
+use crate::schema_migrations::script_instances_v55;
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
 
@@ -881,7 +882,13 @@ async fn import_sqlite(
                 "restored database has {violations} foreign-key violations"
             )));
         }
-        validate_sqlite_counts(&mut conn, &restored).await
+        validate_sqlite_counts(&mut conn, &restored).await?;
+        move_older_script_wiring(
+            &mut SqlConn::Sqlite(&mut conn),
+            source_schema_version,
+            expected,
+        )
+        .await
     }
     .await;
     match result {
@@ -964,7 +971,29 @@ async fn import_postgres(
     }
     validate_postgres_counts(&mut tx, &restored).await?;
     repair_postgres_sequences(&mut tx).await?;
+    move_older_script_wiring(
+        &mut SqlConn::Postgres(&mut tx),
+        source_schema_version,
+        expected,
+    )
+    .await?;
     tx.commit().await.map_err(db_err)
+}
+
+/// A bundle written before there were script instances carries the wiring
+/// they replaced. No migration runs over a restore, so the step that moves
+/// that wiring across on an upgrade is run here instead.
+async fn move_older_script_wiring(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+    expected: &BTreeMap<String, TablePartMetadata>,
+) -> Result<(), StateError> {
+    if source_schema_version >= script_instances_v55::SCHEMA_VERSION
+        || expected.contains_key(script_instances_v55::INSTANCES_TABLE)
+    {
+        return Ok(());
+    }
+    script_instances_v55::move_script_wiring_to_instances(conn).await
 }
 
 const EGRESS_CATALOG_SCHEMA_VERSION: i64 = 53;

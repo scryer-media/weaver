@@ -342,6 +342,13 @@ pub(crate) async fn run(
             .into());
         }
     };
+    // Scripts run on this host and call back on the address that was actually
+    // bound. An address that means "every interface" is not one to connect
+    // to, so loopback stands in for it.
+    match listener.local_addr() {
+        Ok(bound) => db.set_script_api_url(script_api_url(bound, &base_url)),
+        Err(error) => warn!(%error, "could not read the bound address; scripts cannot call back"),
+    }
     let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())?;
 
     // The in-application upgrade. The installation is classified once, here,
@@ -660,6 +667,50 @@ pub(crate) async fn run(
         // This exit code is the whole of the request to relaunch the app.
         ServeStop::BundleRelaunch => {
             std::process::exit(crate::bundle_relaunch::BUNDLE_RELAUNCH_EXIT_CODE)
+        }
+    }
+}
+
+/// The GraphQL endpoint as a script on this host reaches it, given the address
+/// the server bound and the path it is served under.
+fn script_api_url(bound: SocketAddr, base_url: &str) -> String {
+    let host = match bound.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
+        ip => ip,
+    };
+    format!(
+        "http://{}{base_url}/graphql",
+        SocketAddr::new(host, bound.port())
+    )
+}
+
+#[cfg(test)]
+mod script_api_url_tests {
+    use super::script_api_url;
+
+    #[test]
+    fn scripts_are_sent_to_an_address_they_can_connect_to() {
+        for (bound, base_url, expected) in [
+            ("127.0.0.1:6789", "", "http://127.0.0.1:6789/graphql"),
+            ("0.0.0.0:6789", "", "http://127.0.0.1:6789/graphql"),
+            (
+                "192.0.2.7:8080",
+                "/weaver",
+                "http://192.0.2.7:8080/weaver/graphql",
+            ),
+            ("[::]:6789", "", "http://[::1]:6789/graphql"),
+            (
+                "[2001:db8::7]:6789",
+                "/dl",
+                "http://[2001:db8::7]:6789/dl/graphql",
+            ),
+        ] {
+            assert_eq!(
+                script_api_url(bound.parse().unwrap(), base_url),
+                expected,
+                "{bound}"
+            );
         }
     }
 }

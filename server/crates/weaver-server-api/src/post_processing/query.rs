@@ -3,6 +3,17 @@ use weaver_server_core::post_processing::executor::strict_security_enabled;
 use weaver_server_core::post_processing::listing::list_scripts;
 use weaver_server_core::post_processing::output::ScriptRunFilter;
 
+/// The scripts directory as it is now. A directory that cannot be read is not
+/// an error here: it is the reason every instance reports for being unable to
+/// run.
+pub(crate) fn directory_view(db: &Database) -> ScriptDirectoryView {
+    ScriptDirectoryView::new(
+        db.post_processing_script_directory()
+            .map_err(|error| error.to_string())
+            .and_then(|directory| list_scripts(&directory).map_err(|error| error.to_string())),
+    )
+}
+
 const SCRIPT_RUNS_PAGE: i32 = 50;
 const SCRIPT_RUNS_PAGE_MAX: i32 = 200;
 
@@ -17,10 +28,9 @@ impl PostProcessingQuery {
         ctx: &Context<'_>,
     ) -> Result<PostProcessingSettingsGql> {
         let db = ctx.data::<Database>()?.clone();
-        let (settings, lists, script_directory) = tokio::task::spawn_blocking(move || {
+        let (settings, script_directory) = tokio::task::spawn_blocking(move || {
             Ok::<_, weaver_server_core::StateError>((
                 db.post_processing_settings()?,
-                db.post_processing_script_lists()?,
                 db.post_processing_script_directory()?,
             ))
         })
@@ -29,18 +39,55 @@ impl PostProcessingQuery {
         .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         Ok(PostProcessingSettingsGql::from_settings(
             settings,
-            lists,
             script_directory.to_string_lossy(),
             strict_security_enabled(),
         ))
     }
 
-    /// Live listing of the configured scripts directory, plus stored option values.
+    /// Every saved instance, in run order.
+    #[graphql(guard = "AdminGuard")]
+    async fn script_instances(&self, ctx: &Context<'_>) -> Result<Vec<ScriptInstanceGql>> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            let directory = directory_view(&db);
+            Ok::<_, weaver_server_core::StateError>(
+                db.script_instances()?
+                    .into_iter()
+                    .map(|instance| directory.instance(instance))
+                    .collect(),
+            )
+        })
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        .map_err(|error| async_graphql::Error::new(error.to_string()))
+    }
+
+    /// One saved instance, or null when there is none by that id.
+    #[graphql(guard = "AdminGuard")]
+    async fn script_instance(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> Result<Option<ScriptInstanceGql>> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            Ok::<_, weaver_server_core::StateError>(
+                db.script_instance(&id)?
+                    .map(|instance| directory_view(&db).instance(instance)),
+            )
+        })
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        .map_err(|error| async_graphql::Error::new(error.to_string()))
+    }
+
+    /// Live listing of the scripts directory, each script with the preset its
+    /// header offers.
     ///
     /// Nothing is cached: the directory is the source of truth, so a script
     /// added a second ago is listed and one deleted a second ago is not.
     #[graphql(guard = "AdminGuard")]
-    async fn scripts(&self, ctx: &Context<'_>) -> Result<ScriptListingGql> {
+    async fn discovered_scripts(&self, ctx: &Context<'_>) -> Result<ScriptListingGql> {
         let db = ctx.data::<Database>()?.clone();
         tokio::task::spawn_blocking(move || {
             let script_directory = db
@@ -48,15 +95,8 @@ impl PostProcessingQuery {
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?;
             let listing = list_scripts(&script_directory)
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-            let mut scripts = Vec::with_capacity(listing.scripts.len());
-            for script in &listing.scripts {
-                let stored = db
-                    .post_processing_script_options(&script.name)
-                    .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-                scripts.push(ScriptGql::new(script, &stored));
-            }
             Ok(ScriptListingGql {
-                scripts,
+                scripts: listing.scripts.iter().map(ScriptGql::new).collect(),
                 problems: listing.problems.into_iter().map(Into::into).collect(),
             })
         })
@@ -143,6 +183,17 @@ impl PostProcessingQuery {
         id: String,
     ) -> Result<Option<ScriptTestRunGql>> {
         Ok(ctx.data::<Database>()?.script_test(&id).map(Into::into))
+    }
+
+    /// The run the caller is. Only for a running script that calls with the
+    /// token its run was handed as `WEAVER_RUN_TOKEN`; an error for anyone
+    /// else, and once that run has ended.
+    async fn script_run(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::post_processing::script_run::LiveScriptRunGql> {
+        use crate::post_processing::script_run::{LiveScriptRunGql, calling_run};
+        Ok(LiveScriptRunGql(calling_run(ctx)?))
     }
 
     #[graphql(guard = "ReadGuard")]

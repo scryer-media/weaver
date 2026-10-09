@@ -800,15 +800,10 @@ async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts()
         .unwrap();
     pipeline
         .db
-        .save_post_processing_script_lists(&crate::post_processing::model::ScriptLists {
-            global: crate::post_processing::model::ScriptList::new(vec![
-                crate::post_processing::model::ScriptListEntry::new(
-                    crate::post_processing::model::ScriptName::new("sentinel.sh").unwrap(),
-                ),
-            ])
-            .unwrap(),
-            ..Default::default()
-        })
+        .create_script_instance(crate::post_processing::instances::ScriptInstanceDraft::new(
+            crate::post_processing::model::ScriptName::new("sentinel.sh").unwrap(),
+            crate::post_processing::instances::InstanceTrigger::PostProcessing,
+        ))
         .unwrap();
 
     let working_dir = intermediate_dir.join("rejected-before-publication");

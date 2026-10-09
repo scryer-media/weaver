@@ -832,9 +832,6 @@ struct AppendRequest {
 async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let request = parse_append_params(params).map_err(|error| append_refused("", error))?;
     let requested_name = request.filename.clone().unwrap_or_default();
-    let script_override = resolve_nzbget_script_override(ctx, &request)
-        .await
-        .map_err(|error| append_refused(&requested_name, error))?;
     let (nzb_bytes, fetched_filename) = if is_http_url(&request.content_or_url) {
         match fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await {
             Ok(fetched) => fetched,
@@ -929,13 +926,6 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
             metadata.push((name.clone(), value.clone()));
         }
     }
-    if let Some(scripts) = script_override {
-        metadata.push((
-            weaver_server_core::post_processing::settings::JOB_SCRIPT_OVERRIDE_METADATA_KEY
-                .to_string(),
-            scripts,
-        ));
-    }
     if is_http_url(&request.content_or_url) {
         metadata.push((
             weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
@@ -1006,77 +996,6 @@ async fn raise_url_completed(
     {
         tracing::warn!(%error, "could not raise URL script event");
     }
-}
-
-/// Turn NZBGet's per-job `<ScriptName>:` NZB parameters into weaver's ordered
-/// script override, recorded in the job's metadata.
-///
-/// NZBGet names a script by its file name (or a manifest package's `name`), so
-/// both are accepted. Returning `Some("")` is meaningful: the client listed
-/// scripts and disabled all of them, which must beat the configured list.
-async fn resolve_nzbget_script_override(
-    ctx: &NzbgetFacadeContext,
-    request: &AppendRequest,
-) -> Result<Option<String>, RpcError> {
-    let script_flags = request
-        .parameters
-        .iter()
-        .filter_map(|(name, value)| name.strip_suffix(':').map(|name| (name, value)))
-        .collect::<Vec<_>>();
-    if script_flags.is_empty() {
-        return Ok(None);
-    }
-    let db = ctx.db.clone();
-    let listing = tokio::task::spawn_blocking(move || {
-        let script_directory = db
-            .post_processing_script_directory()
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        weaver_server_core::post_processing::listing::list_scripts(&script_directory)
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))?;
-
-    script_override_from_listing(&listing, &script_flags).map_err(RpcError::invalid_parameter)
-}
-
-/// Pure half of the override resolution, so the naming rules are testable
-/// without a facade context.
-fn script_override_from_listing(
-    listing: &weaver_server_core::post_processing::listing::ScriptListing,
-    script_flags: &[(&str, &String)],
-) -> Result<Option<String>, String> {
-    let mut recognized = false;
-    let mut selected = Vec::new();
-    for (name, value) in script_flags {
-        let enabled = matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "yes" | "on" | "1"
-        );
-        let script = listing.scripts.iter().find(|script| {
-            script.name.as_str() == *name
-                || script
-                    .manifest
-                    .compatibility_name()
-                    .is_some_and(|compatibility| compatibility.as_str() == *name)
-        });
-        let Some(script) = script else {
-            if enabled {
-                return Err(format!(
-                    "append failed: post-processing script '{name}' was not found"
-                ));
-            }
-            continue;
-        };
-        recognized = true;
-        if enabled {
-            selected.push(script.name.as_str().to_string());
-        }
-    }
-    if !recognized {
-        return Ok(None);
-    }
-    Ok(Some(selected.join(",")))
 }
 
 /// Logs an append the facade refused before it reached submission. The
@@ -1284,55 +1203,6 @@ mod append_rejection_tests {
         assert_eq!(
             current.parameters,
             vec![("First:".to_string(), "1".to_string())]
-        );
-    }
-
-    #[test]
-    fn nzbget_append_script_flags_select_scripts_by_file_or_manifest_name() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let package = data_dir.path().join("scripts/email");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(
-            package.join("manifest.json"),
-            include_str!(
-                "../../../../crates/weaver-server-core/src/post_processing/fixtures/nzbget-v2-post-processing-manifest.json"
-            ),
-        )
-        .unwrap();
-        std::fs::write(package.join("email.py"), "#!/usr/bin/env python3\n").unwrap();
-        std::fs::write(
-            data_dir.path().join("scripts/notify.sh"),
-            "#!/bin/sh\necho hi\n",
-        )
-        .unwrap();
-        let listing = weaver_server_core::post_processing::listing::list_scripts(
-            &data_dir.path().join("scripts"),
-        )
-        .unwrap();
-
-        // The manifest's `name` is what NZBGet clients send.
-        let enabled = "yes".to_string();
-        assert_eq!(
-            script_override_from_listing(&listing, &[("email", &enabled)]).unwrap(),
-            Some("email".to_string())
-        );
-        // A bare script is named by its file name.
-        assert_eq!(
-            script_override_from_listing(&listing, &[("notify.sh", &enabled)]).unwrap(),
-            Some("notify.sh".to_string())
-        );
-        // Disabling every recognized script is an explicit "run nothing".
-        let disabled = "no".to_string();
-        assert_eq!(
-            script_override_from_listing(&listing, &[("email", &disabled)]).unwrap(),
-            Some(String::new())
-        );
-        // Enabling a script that is not there is an error the client must see.
-        assert!(script_override_from_listing(&listing, &[("missing", &enabled)]).is_err());
-        // Disabling one that is not there says nothing about the job's list.
-        assert_eq!(
-            script_override_from_listing(&listing, &[("missing", &disabled)]).unwrap(),
-            None
         );
     }
 }
@@ -1848,24 +1718,12 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             .iter()
             .map(|script| {
                 json!({
-                    "Name": script.script.as_str(),
+                    "Name": script.label(),
                     "Status": nzbget_script_status(script.status),
                 })
             })
             .collect::<Vec<_>>();
-        let script_status = if scripts
-            .iter()
-            .any(|script| nzbget_script_status(script.status) == "FAILURE")
-        {
-            "FAILURE"
-        } else if scripts
-            .iter()
-            .any(|script| nzbget_script_status(script.status) == "SUCCESS")
-        {
-            "SUCCESS"
-        } else {
-            "NONE"
-        };
+        let script_status = nzbget_script_rollup(scripts);
         if let Some(object) = item.as_object_mut() {
             object.insert("ScriptStatus".to_string(), json!(script_status));
             object.insert("ScriptStatuses".to_string(), json!(statuses));
@@ -1993,7 +1851,9 @@ fn history_statuses(cancelled: bool, failed: bool) -> HistoryStatuses {
         par: "SUCCESS",
         unpack: "SUCCESS",
         mv: "SUCCESS",
-        script: "SUCCESS",
+        // NZBGet reports NONE when no script ran; history() overrides it from
+        // the job's stored script results.
+        script: "NONE",
         delete: "NONE",
         status: "SUCCESS/ALL",
     }
@@ -2101,13 +1961,6 @@ fn nzbget_history_queue_item(item: &QueueItem, timings: HistoryTimings) -> Value
 }
 
 async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let db = ctx.db.clone();
-    let script_dir = tokio::task::spawn_blocking(move || db.post_processing_script_directory())
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("config failed: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("config failed: {error}")))?
-        .to_string_lossy()
-        .into_owned();
     let config = ctx.config.read().await;
     let main_dir = config.data_dir.clone();
     let dest_dir = config.complete_dir();
@@ -2115,7 +1968,6 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         config_entry("KeepHistory", "7"),
         config_entry("MainDir", &main_dir),
         config_entry("DestDir", &dest_dir),
-        config_entry("ScriptDir", &script_dir),
         config_entry("AppendCategoryDir", "yes"),
     ];
 
@@ -2147,66 +1999,13 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             .collect::<Vec<_>>()
     };
     let categories = nzbget_config_categories(raw_categories);
-    let category_names = categories
-        .iter()
-        .map(|(name, _, _)| name.clone())
-        .collect::<Vec<_>>();
-    let db = ctx.db.clone();
-    let (category_default_scripts, global_scripts, event_interval) =
-        tokio::task::spawn_blocking(move || {
-            let settings = db.post_processing_settings()?;
-            let lists = db.post_processing_script_lists()?;
-            let global = lists
-                .global
-                .enabled_entries()
-                .map(|entry| entry.script.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut defaults = HashMap::new();
-            if settings.execution_enabled {
-                for category in category_names {
-                    let scripts = lists
-                        .resolve(Some(&category))
-                        .enabled_entries()
-                        .map(|entry| entry.script.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    defaults.insert(category, scripts);
-                }
-            }
-            Ok::<_, weaver_server_core::StateError>((
-                defaults,
-                global,
-                settings.event_scripts.file_downloaded_event_interval,
-            ))
-        })
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("config unavailable: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("config unavailable: {error}")))?;
-
-    entries.push(config_entry("Extensions", &global_scripts));
-    entries.push(config_entry("ScriptOrder", &global_scripts));
-    entries.push(config_entry("EventInterval", &event_interval.to_string()));
+    // Script entries are left out: Sonarr and Radarr never read them.
     for (index, (name, dest_dir, aliases)) in categories.iter().enumerate() {
         let prefix = format!("Category{}.", index + 1);
         entries.push(config_entry(&format!("{prefix}Name"), name));
         entries.push(config_entry(&format!("{prefix}DestDir"), dest_dir));
         entries.push(config_entry(&format!("{prefix}Unpack"), "yes"));
-        entries.push(config_entry(
-            &format!("{prefix}DefScript"),
-            category_default_scripts
-                .get(name)
-                .map(String::as_str)
-                .unwrap_or_default(),
-        ));
         entries.push(config_entry(&format!("{prefix}Aliases"), aliases));
-        entries.push(config_entry(
-            &format!("{prefix}Extensions"),
-            category_default_scripts
-                .get(name)
-                .map(String::as_str)
-                .unwrap_or_default(),
-        ));
     }
 
     // Expose weaver's RSS feeds as sequential NZBGet FeedN entries (Feed1..N).
@@ -3495,6 +3294,30 @@ fn nzbget_script_status(
         | ScriptStatus::TimedOut
         | ScriptStatus::Cancelled => "FAILURE",
     }
+}
+
+/// The job-level ScriptStatus that Sonarr and Radarr act on. A FAILURE makes
+/// them reject the download, so only blocking post-processing runs count:
+/// a fire-and-forget or event script cannot fail a good download.
+fn nzbget_script_rollup(
+    scripts: &[weaver_server_core::post_processing::model::ScriptResult],
+) -> &'static str {
+    use weaver_server_core::post_processing::model::{ScriptEventLabel, ScriptStatus};
+    let mut rollup = "NONE";
+    for script in scripts
+        .iter()
+        .filter(|script| script.event == ScriptEventLabel::PostProcessing && !script.background)
+    {
+        match script.status {
+            ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled => {
+                return "FAILURE";
+            }
+            ScriptStatus::Succeeded | ScriptStatus::Skipped | ScriptStatus::Warning => {
+                rollup = "SUCCESS";
+            }
+        }
+    }
+    rollup
 }
 
 fn nzbget_group_status(item: &QueueItem) -> &'static str {

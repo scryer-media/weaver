@@ -12,14 +12,16 @@ use weaver_server_core::post_processing::effects::apply_job_directive;
 use weaver_server_core::post_processing::events::{
     EventContext, drain_queue, run_event, wait_for_event,
 };
+use weaver_server_core::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
 use weaver_server_core::post_processing::listing::resolve_script;
 use weaver_server_core::post_processing::model::{
-    OptionName, OptionValue, PipelineOutcome, PostProcessingSettings, QueueEvent, ResolvedOption,
-    ScriptEventLabel, ScriptList, ScriptListEntry, ScriptLists, ScriptName, ScriptStatus,
+    PipelineOutcome, PostProcessingSettings, QueueEvent, ScriptEventLabel, ScriptKind, ScriptName,
+    ScriptStatus,
 };
+use weaver_server_core::post_processing::output::ScriptRunFilter;
 use weaver_server_core::post_processing::runner::{
     CompatibilityFacts, ExecutionDisposition, ExecutionSpec, InterpreterConfig,
-    JobExecutionContext, execute_spec,
+    JobExecutionContext, RunIdentity, execute_spec,
 };
 use weaver_server_core::{Database, JobId};
 
@@ -43,13 +45,21 @@ fn script(db: &Database, name: &str, body: &str) -> ScriptName {
     ScriptName::new(name).unwrap()
 }
 
-fn select(db: &Database, scripts: &[ScriptName]) {
-    db.save_post_processing_script_lists(&ScriptLists {
-        global: ScriptList::new(scripts.iter().cloned().map(ScriptListEntry::new).collect())
-            .unwrap(),
-        ..Default::default()
-    })
-    .unwrap();
+const DOWNLOADED: InstanceTrigger = InstanceTrigger::Queue(QueueEvent::NzbDownloaded);
+
+/// An instance of `script` that `trigger` starts.
+fn on(trigger: InstanceTrigger, script: &ScriptName) -> ScriptInstanceDraft {
+    ScriptInstanceDraft::new(script.clone(), trigger)
+}
+
+/// Replaces the saved instances with `drafts`, in that order.
+fn select(db: &Database, drafts: Vec<ScriptInstanceDraft>) {
+    for instance in db.script_instances().unwrap() {
+        assert!(db.delete_script_instance(&instance.id).unwrap());
+    }
+    for draft in drafts {
+        db.create_script_instance(draft).unwrap();
+    }
 }
 
 fn job(db: &Database, directory: &Path) -> JobExecutionContext {
@@ -104,7 +114,8 @@ fn jobless(directory: &Path, event: ScriptEventLabel, env: &[(&str, String)]) ->
             .map(|(key, value)| ((*key).into(), value.clone()))
             .collect(),
         facts: Default::default(),
-        scripts: None,
+        instances: None,
+        scratch: None,
     }
 }
 
@@ -138,21 +149,6 @@ async fn wait_at_gate(gate: PathBuf) {
         .unwrap();
 }
 
-fn not_waited_for(script: ScriptName) -> ScriptListEntry {
-    ScriptListEntry {
-        blocking: false,
-        ..ScriptListEntry::new(script)
-    }
-}
-
-fn select_entries(db: &Database, entries: Vec<ScriptListEntry>) {
-    db.save_post_processing_script_lists(&ScriptLists {
-        global: ScriptList::new(entries).unwrap(),
-        ..Default::default()
-    })
-    .unwrap();
-}
-
 #[tokio::test]
 async fn scan_distinguishes_supervisor_launch_failure_from_script_exit_127() {
     let (db, data) = setup();
@@ -169,7 +165,7 @@ async fn scan_distinguishes_supervisor_launch_failure_from_script_exit_127() {
             .into_owned(),
     );
     db.save_post_processing_settings(&settings).unwrap();
-    select(&db, &[missing_interpreter]);
+    select(&db, vec![on(InstanceTrigger::Scan, &missing_interpreter)]);
     let mut event = jobless(data.path(), ScriptEventLabel::Scan, &[]);
     let failed = run_event(&db, &mut event, "scan-launch-failed", None, supervisor())
         .await
@@ -190,14 +186,22 @@ async fn scan_distinguishes_supervisor_launch_failure_from_script_exit_127() {
         "exit127.sh",
         "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nprintf 'script ran\\n'\nexit 127\n",
     );
-    select(&db, &[completed_script]);
+    select(&db, vec![on(InstanceTrigger::Scan, &completed_script)]);
     let completed = run_event(&db, &mut event, "scan-exit-127", None, supervisor())
         .await
         .unwrap();
     assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].status, ScriptStatus::Succeeded);
+    // The script ran and chose that code itself, which is a failure of its
+    // own and not one of launching it.
+    assert_eq!(completed[0].status, ScriptStatus::Failed);
     assert_eq!(completed[0].exit_code, Some(127));
     assert_eq!(completed[0].output_tail, "script ran\n");
+    assert!(
+        !completed[0]
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("did not confirm script launch"))
+    );
 }
 
 #[tokio::test]
@@ -214,17 +218,21 @@ async fn queue_parameters_stream_to_persistence_and_the_next_script() {
         "second.sh",
         "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '[NZB] NZBPR_Second=%s/%s\\n' \"$NZBPR_FIRST\" \"$NZBPR_SEED\"\nexit 0\n",
     );
-    select(&db, &[first, second]);
+    select(&db, vec![on(DOWNLOADED, &first), on(DOWNLOADED, &second)]);
     let mut event = EventContext::from_job(&context, QueueEvent::NzbDownloaded);
     let results = run_event(&db, &mut event, "queue-test", None, supervisor())
         .await
         .unwrap();
-    assert_eq!(results.len(), 2);
-    assert!(
+    // What the first script asked for is kept and reaches the second, though
+    // the first went on to fail.
+    assert_eq!(
         results
             .iter()
-            .all(|result| result.status == ScriptStatus::Succeeded)
+            .map(|result| result.status)
+            .collect::<Vec<_>>(),
+        [ScriptStatus::Failed, ScriptStatus::Succeeded]
     );
+    assert!(results.iter().all(|result| result.instance_id.is_some()));
     assert_eq!(
         db.job_script_effects(42).unwrap().parameters["Second"],
         "from-queue/input"
@@ -234,53 +242,34 @@ async fn queue_parameters_stream_to_persistence_and_the_next_script() {
 }
 
 #[tokio::test]
-async fn invalid_queue_script_options_record_failure_and_release_downloaded_barrier() {
+async fn an_instance_whose_script_is_gone_is_recorded_and_releases_the_downloaded_barrier() {
     let (db, data) = setup();
     let context = job(&db, data.path());
-    let invalid = script(
-        &db,
-        "invalid.sh",
-        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '[NZB] NZBPR_Invalid=executed\\n'\nexit 0\n",
-    );
+    let gone = ScriptName::new("gone.sh").unwrap();
     let next = script(
         &db,
         "next.sh",
         "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '[NZB] NZBPR_Next=executed\\n'\nexit 0\n",
     );
-    db.save_post_processing_script_options(
-        &invalid,
-        &[ResolvedOption::new(
-            OptionName::new("RemovedOption").unwrap(),
-            OptionValue::String("old configuration".into()),
-        )],
-    )
-    .unwrap();
-    select(&db, &[invalid.clone(), next.clone()]);
+    select(&db, vec![on(DOWNLOADED, &gone), on(DOWNLOADED, &next)]);
     let mut event = EventContext::from_job(&context, QueueEvent::NzbDownloaded);
-    let results = run_event(&db, &mut event, "invalid-queue-options", None, supervisor())
+    let results = run_event(&db, &mut event, "missing-queue-script", None, supervisor())
         .await
         .unwrap();
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0].script, invalid);
-    assert_eq!(results[0].status, ScriptStatus::Failed);
+    assert_eq!(results[0].script, gone);
+    assert_eq!(results[0].status, ScriptStatus::Warning);
     assert_eq!(results[0].exit_code, None);
-    assert!(
-        results[0]
-            .error_message
-            .as_deref()
-            .unwrap()
-            .contains("script configuration is invalid")
-    );
+    assert!(results[0].error_message.is_some());
     assert_eq!(results[1].script, next);
     assert_eq!(results[1].status, ScriptStatus::Succeeded);
     let effects = db.job_script_effects(42).unwrap();
-    assert!(!effects.parameters.contains_key("Invalid"));
     assert_eq!(effects.parameters["Next"], "executed");
     assert!(!effects.marked_bad);
 
-    // A configuration failure is a completed queue run, so native completion
-    // can continue after the durable downloaded barrier.
-    select(&db, &[invalid]);
+    // An instance that could not run is still a completed queue run, so
+    // native completion can continue after the durable downloaded barrier.
+    select(&db, vec![on(DOWNLOADED, &gone)]);
     let run_id = db.enqueue_script_event(&event, 1).unwrap().unwrap();
     drain_queue(db.clone()).await.unwrap();
     wait_for_event(&db, &run_id).await.unwrap();
@@ -290,7 +279,7 @@ async fn invalid_queue_script_options_record_failure_and_release_downloaded_barr
     assert_eq!(
         retained
             .iter()
-            .filter(|result| result.status == ScriptStatus::Failed)
+            .filter(|result| result.status == ScriptStatus::Warning)
             .count(),
         2
     );
@@ -317,6 +306,15 @@ async fn cancellation_keeps_redacted_directives_emitted_before_the_kill() {
         termination_grace: Duration::from_millis(1),
         kind: ScriptEventLabel::Queue(QueueEvent::NzbDownloaded),
         run_id: "cancel-test".into(),
+        identity: RunIdentity {
+            run_id: "cancel-test".into(),
+            instance_id: "instance".into(),
+            instance_name: "stream".into(),
+            trigger: DOWNLOADED.to_string(),
+            api_url: None,
+            token: None,
+            output: Default::default(),
+        },
         facts: context.compatibility.clone(),
         interpreters: InterpreterConfig::default(),
         supervisor_executable: supervisor(),
@@ -347,7 +345,7 @@ async fn cancellation_keeps_redacted_directives_emitted_before_the_kill() {
 }
 
 #[tokio::test]
-async fn scan_rewrites_input_and_category_reselects_the_remaining_scripts() {
+async fn scan_rewrites_input_and_the_next_script_sees_the_category_it_chose() {
     let (db, data) = setup();
     let path = data.path().join("input.nzb");
     fs::write(&path, "original").unwrap();
@@ -361,15 +359,13 @@ async fn scan_rewrites_input_and_category_reselects_the_remaining_scripts() {
         "category.sh",
         "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nprintf '[NZB] NZBPR_Category=%s\\n' \"$NZBNP_CATEGORY\"\nexit 0\n",
     );
-    let mut lists = ScriptLists {
-        global: ScriptList::new(vec![ScriptListEntry::new(first)]).unwrap(),
-        ..Default::default()
-    };
-    lists.categories.insert(
-        "movies".into(),
-        ScriptList::new(vec![ScriptListEntry::new(second)]).unwrap(),
+    select(
+        &db,
+        vec![
+            on(InstanceTrigger::Scan, &first),
+            on(InstanceTrigger::Scan, &second),
+        ],
     );
-    db.save_post_processing_script_lists(&lists).unwrap();
     let mut context = jobless(
         data.path(),
         ScriptEventLabel::Scan,
@@ -401,7 +397,7 @@ async fn scan_names_and_categories_reach_the_existing_filesystem_guards() {
         "names.sh",
         "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nprintf '[NZB] NZBNAME=../bad/name\\tpart\\n[NZB] CATEGORY=../escape\\n'\nexit 0\n",
     );
-    select(&db, &[scan]);
+    select(&db, vec![on(InstanceTrigger::Scan, &scan)]);
     let mut context = jobless(
         data.path(),
         ScriptEventLabel::Scan,
@@ -445,7 +441,13 @@ async fn deleted_scan_input_skips_later_scripts() {
         "never.sh",
         "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nprintf unexpected > unexpected\n",
     );
-    select(&db, &[first, second]);
+    select(
+        &db,
+        vec![
+            on(InstanceTrigger::Scan, &first),
+            on(InstanceTrigger::Scan, &second),
+        ],
+    );
     let mut context = jobless(
         data.path(),
         ScriptEventLabel::Scan,
@@ -463,21 +465,27 @@ async fn deleted_scan_input_skips_later_scripts() {
 }
 
 #[tokio::test]
-async fn feed_requires_93_and_still_runs_remaining_entries() {
+async fn a_feed_script_that_fails_does_not_stop_the_ones_after_it() {
     let (db, data) = setup();
     let path = data.path().join("feed.xml");
     fs::write(&path, "original").unwrap();
     let first = script(
         &db,
         "failure.sh",
-        "#!/bin/sh\n### NZBGET FEED SCRIPT ###\nexit 0\n",
+        "#!/bin/sh\n### NZBGET FEED SCRIPT ###\nexit 1\n",
     );
     let second = script(
         &db,
         "rewrite.sh",
         "#!/bin/sh\n### NZBGET FEED SCRIPT ###\nprintf rewritten > \"$NZBFP_FILENAME\"\nexit 93\n",
     );
-    select(&db, &[first, second]);
+    select(
+        &db,
+        vec![
+            on(InstanceTrigger::Feed, &first),
+            on(InstanceTrigger::Feed, &second),
+        ],
+    );
     let mut context = jobless(
         data.path(),
         ScriptEventLabel::Feed(7),
@@ -563,11 +571,11 @@ async fn a_queue_script_nothing_waits_for_does_not_hold_its_event() {
         "waited.sh",
         "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n",
     );
-    select_entries(
+    select(
         &db,
         vec![
-            not_waited_for(detached.clone()),
-            ScriptListEntry::new(waited.clone()),
+            on(DOWNLOADED, &detached).fire_and_forget(),
+            on(DOWNLOADED, &waited),
         ],
     );
     let mut event = EventContext::from_job(&context, QueueEvent::NzbDownloaded);
@@ -600,26 +608,53 @@ async fn a_queue_script_nothing_waits_for_does_not_hold_its_event() {
 }
 
 #[tokio::test]
-async fn a_scan_script_is_waited_for_whatever_its_entry_says() {
+async fn a_scan_script_nothing_waits_for_does_not_hold_the_scan() {
     let (db, data) = setup();
+    let gate = gate(data.path(), "gate");
     let path = data.path().join("input.nzb");
     fs::write(&path, "original").unwrap();
     let scan = script(
         &db,
         "scan.sh",
-        "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nprintf rewritten > \"$NZBNP_FILENAME\"\nexit 0\n",
+        &format!(
+            "#!/bin/sh\n### NZBGET SCAN SCRIPT ###\nread line < '{}'\nprintf rewritten > \"$NZBNP_FILENAME\"\nexit 0\n",
+            gate.display()
+        ),
     );
-    select_entries(&db, vec![not_waited_for(scan)]);
+    select(
+        &db,
+        vec![on(InstanceTrigger::Scan, &scan).fire_and_forget()],
+    );
     let mut context = jobless(
         data.path(),
         ScriptEventLabel::Scan,
         &[("NZBNP_FILENAME", path.to_string_lossy().into_owned())],
     );
-    let results = run_event(&db, &mut context, "scan-not-detached", None, supervisor())
+
+    // The script cannot end until its gate opens, so a scan that returns
+    // before then did not wait for it, and it has changed nothing yet.
+    let results = run_event(&db, &mut context, "scan-detached", None, supervisor())
         .await
         .unwrap();
-    assert_eq!(results.len(), 1);
-    assert!(!results[0].background);
+    assert!(results.is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+
+    open_gate(gate).await;
+    db.background_scripts_settled().await;
+    let recorded = db
+        .script_runs(
+            ScriptRunFilter {
+                kind: Some(ScriptKind::Scan),
+                ..Default::default()
+            },
+            None,
+            8,
+        )
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].result.script, scan);
+    assert!(recorded[0].result.background);
+    assert_eq!(recorded[0].result.status, ScriptStatus::Succeeded);
     assert_eq!(fs::read_to_string(path).unwrap(), "rewritten");
 }
 
@@ -646,11 +681,11 @@ async fn a_scheduled_script_nothing_waits_for_leaves_the_waited_scripts_their_tu
         "nightly.sh",
         "#!/bin/sh\n### NZBGET SCHEDULER SCRIPT ###\nprintf 'nightly\\n'\nexit 0\n",
     );
-    select_entries(
+    select(
         &db,
         vec![
-            ScriptListEntry::new(holder),
-            not_waited_for(nightly.clone()),
+            on(InstanceTrigger::Scan, &holder),
+            on(InstanceTrigger::Schedule, &nightly).fire_and_forget(),
         ],
     );
     let scan = {

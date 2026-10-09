@@ -77,5 +77,6 @@ fn caller_kind(identity: &CallerIdentity) -> &'static str {
         CallerIdentity::Local(_) => "local",
         CallerIdentity::Jwt(_) => "login",
         CallerIdentity::ApiKey(_) => "api_key",
+        CallerIdentity::ScriptRun(_) => "script_run",
     }
 }

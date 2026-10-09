@@ -556,3 +556,25 @@ kind = "sql"
 file = "migrations/0054_job_support_facts/schema.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 55
+description = "script instances, their inputs, categories and feed attachments"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0055_script_instances/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0055_script_instances/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_script_wiring_to_instances_v55"
+scope = "upgrade_only"

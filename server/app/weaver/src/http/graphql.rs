@@ -171,19 +171,25 @@ pub(super) async fn graphql_handler(
     req: GraphQLRequest,
 ) -> Result<GraphQLResponse, StatusCode> {
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-    let resolved = super::auth::resolve_caller(
-        &request_auth.db,
-        &request_auth.auth_cache,
-        &request_auth.api_key_cache,
-        request_auth.session_token.0.as_str(),
-        &request_auth.security,
-        super::auth::BrowserSessionPolicy::TrustedPeer(peer),
-        &headers,
-    )
-    .await?;
+    let resolved = match super::auth::resolve_script_run(&request_auth.db, &headers).await {
+        Some(resolved) => resolved,
+        None => {
+            super::auth::resolve_caller(
+                &request_auth.db,
+                &request_auth.auth_cache,
+                &request_auth.api_key_cache,
+                request_auth.session_token.0.as_str(),
+                &request_auth.security,
+                super::auth::BrowserSessionPolicy::TrustedPeer(peer),
+                &headers,
+            )
+            .await?
+        }
+    };
     if !matches!(
         resolved.identity,
         weaver_server_api::auth::CallerIdentity::ApiKey(_)
+            | weaver_server_api::auth::CallerIdentity::ScriptRun(_)
     ) {
         super::auth::validate_browser_csrf(&request_auth.db, &request_auth.security, &headers)
             .await?;

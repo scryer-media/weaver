@@ -465,6 +465,33 @@ pub(super) async fn resolve_caller(
     Err(StatusCode::UNAUTHORIZED)
 }
 
+/// A running script calling back with the token its run was handed. `None`
+/// when the request carries no such token or the run it names has ended, in
+/// which case the request is whatever its other credentials make it.
+///
+/// Only the GraphQL endpoint asks this: the token is no credential anywhere
+/// else, and it is never kept past the request it came with.
+pub(super) async fn resolve_script_run(
+    db: &Database,
+    headers: &HeaderMap,
+) -> Option<ResolvedCaller> {
+    let token = explicit_api_key(headers).ok()??;
+    // Checked before anything is read, so that an API key costs nothing here.
+    if !jwt::service::is_signed_token_shape(&token) {
+        return None;
+    }
+    let db = db.clone();
+    let run = tokio::task::spawn_blocking(move || db.script_run_for_token(&token))
+        .await
+        .ok()??;
+    Some(ResolvedCaller {
+        // Scripts are the operator's own programs, already running as this
+        // server does: the token is not held to less than an admin key.
+        scope: CallerScope::Admin,
+        identity: CallerIdentity::ScriptRun(run.run_id),
+    })
+}
+
 /// Resolve the caller scope with an explicit browser-session policy.
 pub(super) async fn resolve_scope(
     db: &Database,
@@ -1778,6 +1805,104 @@ mod tests {
             .await;
             assert!(matches!(result, Err(StatusCode::UNAUTHORIZED)));
         }
+    }
+
+    #[tokio::test]
+    async fn a_script_is_a_caller_only_while_its_own_run_goes_on() {
+        use weaver_server_core::post_processing::model::ScriptEventLabel;
+        use weaver_server_core::post_processing::runner::RunIdentity;
+
+        fn bearer(value: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {value}").parse().unwrap(),
+            );
+            headers
+        }
+        fn run_of(instance: &str) -> RunIdentity {
+            RunIdentity {
+                run_id: "run-1".into(),
+                instance_id: instance.into(),
+                ..Default::default()
+            }
+        }
+
+        let db = Database::open_in_memory().unwrap();
+        let event = ScriptEventLabel::PostProcessing;
+
+        // A run that starts before the server is listening is handed nothing
+        // to call back with.
+        let mut early = run_of("instance-1");
+        drop(db.open_script_run(&mut early, Some(7), &event, None, false));
+        assert_eq!((early.api_url, early.token), (None, None));
+
+        db.set_script_api_url("http://127.0.0.1:6789/graphql");
+        let mut identity = run_of("instance-1");
+        let requests = db.open_script_run(&mut identity, Some(7), &event, None, false);
+        assert_eq!(
+            identity.api_url.as_deref(),
+            Some("http://127.0.0.1:6789/graphql")
+        );
+        let token = identity.token.clone().unwrap();
+
+        // With its token a script is its run, and may do what an
+        // administrator's key may.
+        let mut by_key_header = HeaderMap::new();
+        by_key_header.insert("x-api-key", token.parse().unwrap());
+        for headers in [bearer(&token), by_key_header] {
+            let caller = resolve_script_run(&db, &headers).await.unwrap();
+            assert!(matches!(caller.scope, CallerScope::Admin));
+            assert!(matches!(caller.identity, CallerIdentity::ScriptRun(run) if run == "run-1"));
+        }
+
+        // Nothing else is taken for one: no credential at all, an API key, a
+        // login token signed with the same secret, or a token changed after
+        // it was signed.
+        let secret = db.get_or_create_jwt_signing_secret().unwrap();
+        let login = jwt::create_jwt("admin", &secret, JWT_TTL_SECS);
+        db.insert_api_key("admin", &hash_api_key("an-admin-key"), "admin")
+            .unwrap();
+        let mut tampered = token.clone();
+        tampered.push('A');
+        assert!(resolve_script_run(&db, &HeaderMap::new()).await.is_none());
+        for other in ["an-admin-key", login.as_str(), tampered.as_str()] {
+            assert!(
+                resolve_script_run(&db, &bearer(other)).await.is_none(),
+                "{other}"
+            );
+        }
+
+        // Only the endpoint that expects a script takes the token. Everywhere
+        // else it is a key nobody issued.
+        let security = RuntimeSecurityConfig::default();
+        security.apply_stored_access_policy_revision(None, None, false);
+        let elsewhere = resolve_caller(
+            &db,
+            &LoginAuthCache::default(),
+            &ApiKeyCache::default(),
+            "shared-token",
+            &security,
+            BrowserSessionPolicy::TrustedPeer(Some("127.0.0.1:54321".parse().unwrap())),
+            &bearer(&token),
+        )
+        .await;
+        assert!(matches!(elsewhere, Err(StatusCode::UNAUTHORIZED)));
+
+        // The token ends with the run, whatever date it carries.
+        drop(requests);
+        assert!(resolve_script_run(&db, &bearer(&token)).await.is_none());
+
+        // And a later run does not bring it back, even one that happens to
+        // have the same id.
+        let mut later = run_of("instance-2");
+        let _later = db.open_script_run(&mut later, Some(7), &event, None, false);
+        assert!(resolve_script_run(&db, &bearer(&token)).await.is_none());
+        assert!(
+            resolve_script_run(&db, &bearer(later.token.as_deref().unwrap()))
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -1226,10 +1226,9 @@ impl Pipeline {
             return;
         };
         let category = state.spec.category.clone();
-        let metadata = state.spec.metadata.clone();
         let admission = match self
             .terminal_post_processing_executor
-            .admit_job_scripts(category.as_deref(), &metadata)
+            .admit_job_scripts(category.as_deref())
         {
             Ok(Some(admission)) => admission,
             Ok(None) => {

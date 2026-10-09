@@ -7,13 +7,15 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use weaver_server_core::Database;
+use weaver_server_core::post_processing::instances::{
+    InstanceTrigger, ScriptInstance, ScriptInstanceDraft,
+};
 use weaver_server_core::post_processing::model::{
-    OptionName, OptionValue, PostProcessingSettings, QueueEvent, ResolvedOption, ScriptAdapter,
-    ScriptEventLabel, ScriptName, ScriptStatus, SecretOptionValue,
+    PostProcessingSettings, QueueEvent, ScriptAdapter, ScriptEventLabel, ScriptName, ScriptStatus,
 };
 use weaver_server_core::post_processing::output::ScriptRunFilter;
 use weaver_server_core::post_processing::test_run::{
-    ScriptTestError, ScriptTestRequest, ScriptTestSnapshot, TestTrigger, start_script_test,
+    ScriptTestError, ScriptTestSnapshot, start_script_test,
 };
 use weaver_server_core::settings::{Config, SharedConfig};
 
@@ -84,19 +86,22 @@ fn gate(directory: &Path, name: &str) -> PathBuf {
     path
 }
 
+/// A saved instance of `script` that `trigger` starts.
+fn instance(fixture: &Fixture, script: &ScriptName, trigger: InstanceTrigger) -> ScriptInstance {
+    fixture
+        .db
+        .create_script_instance(ScriptInstanceDraft::new(script.clone(), trigger))
+        .unwrap()
+}
+
 async fn start(
     fixture: &Fixture,
-    script: &ScriptName,
-    trigger: TestTrigger,
+    instance: &ScriptInstance,
 ) -> Result<ScriptTestSnapshot, ScriptTestError> {
     start_script_test(
         &fixture.db,
         &fixture.config,
-        ScriptTestRequest {
-            script: script.clone(),
-            trigger,
-            category: None,
-        },
+        instance.id.clone(),
         supervisor(),
     )
     .await
@@ -111,13 +116,19 @@ async fn ended(fixture: &Fixture, id: &str) -> ScriptTestSnapshot {
         .expect("the test run is kept")
 }
 
-async fn run_to_end(
+async fn run_to_end(fixture: &Fixture, instance: &ScriptInstance) -> ScriptTestSnapshot {
+    let started = start(fixture, instance).await.unwrap();
+    ended(fixture, &started.id).await
+}
+
+/// Test a new instance of `script` on `trigger` and return the run once it
+/// has ended.
+async fn test_on(
     fixture: &Fixture,
     script: &ScriptName,
-    trigger: TestTrigger,
+    trigger: InstanceTrigger,
 ) -> ScriptTestSnapshot {
-    let started = start(fixture, script, trigger).await.unwrap();
-    ended(fixture, &started.id).await
+    run_to_end(fixture, &instance(fixture, script, trigger)).await
 }
 
 fn status(run: &ScriptTestSnapshot) -> ScriptStatus {
@@ -156,9 +167,17 @@ async fn a_post_processing_test_hands_over_a_made_up_download_and_leaves_nothing
          exit 93\n",
     );
 
-    let started = start(&fixture, &script, TestTrigger::PostProcessing)
-        .await
+    let tidy = fixture
+        .db
+        .create_script_instance(
+            ScriptInstanceDraft::new(script.clone(), InstanceTrigger::PostProcessing)
+                .named("Tidy up"),
+        )
         .unwrap();
+
+    let started = start(&fixture, &tidy).await.unwrap();
+    assert_eq!(started.instance_id, tidy.id);
+    assert_eq!(started.instance_name, "Tidy up");
     assert_eq!(started.script, script);
     assert_eq!(started.event, ScriptEventLabel::PostProcessing);
     assert_eq!(started.adapter, ScriptAdapter::Nzbget);
@@ -216,7 +235,7 @@ async fn a_script_without_a_header_is_tested_with_its_positional_arguments() {
         "#!/bin/sh\nprintf 'directory=%s name=%s status=%s\\n' \"$1\" \"$3\" \"$7\"\nexit 0\n",
     );
 
-    let run = run_to_end(&fixture, &script, TestTrigger::PostProcessing).await;
+    let run = test_on(&fixture, &script, InstanceTrigger::PostProcessing).await;
 
     assert_eq!(run.adapter, ScriptAdapter::Sabnzbd);
     assert_eq!(status(&run), ScriptStatus::Succeeded);
@@ -232,7 +251,7 @@ async fn a_script_without_a_header_is_tested_with_its_positional_arguments() {
 }
 
 #[tokio::test]
-async fn saved_options_reach_the_script_and_stay_out_of_what_a_test_reports() {
+async fn saved_inputs_reach_the_script_and_stay_out_of_what_a_test_reports() {
     let fixture = fixture(true);
     let root = fixture.db.post_processing_script_directory().unwrap();
     let package = root.join("email");
@@ -286,18 +305,16 @@ async fn saved_options_reach_the_script_and_stay_out_of_what_a_test_reports() {
     .unwrap();
     fs::set_permissions(package.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
     let script = ScriptName::new("email").unwrap();
-    fixture
+    let email = fixture
         .db
-        .save_post_processing_script_options(
-            &script,
-            &[ResolvedOption::new(
-                OptionName::new("Token").unwrap(),
-                OptionValue::Secret(SecretOptionValue::from_admin_input("hunter2")),
-            )],
+        .create_script_instance(
+            ScriptInstanceDraft::new(script, InstanceTrigger::PostProcessing)
+                .input("Host", "mail.example.invalid")
+                .secret_input("Token", "hunter2"),
         )
         .unwrap();
 
-    let run = run_to_end(&fixture, &script, TestTrigger::PostProcessing).await;
+    let run = run_to_end(&fixture, &email).await;
 
     assert_eq!(status(&run), ScriptStatus::Succeeded);
     assert!(run.log.contains("token delivered"));
@@ -309,7 +326,9 @@ async fn saved_options_reach_the_script_and_stay_out_of_what_a_test_reports() {
     assert!(!run.inputs.is_empty());
     for (name, value) in &run.inputs {
         assert!(
-            !name.starts_with("NZBPO_") && !name.starts_with("NZBOP_"),
+            ["NZBPO_", "NZBOP_", "SAB_OPTION_", "WEAVER_INPUT_"]
+                .iter()
+                .all(|prefix| !name.starts_with(prefix)),
             "{name} was not made up for the test"
         );
         assert!(!value.contains("hunter2"));
@@ -329,9 +348,8 @@ async fn a_running_test_shows_its_output_and_ends_when_cancelled() {
         ),
     );
 
-    let started = start(&fixture, &script, TestTrigger::PostProcessing)
-        .await
-        .unwrap();
+    let slow = instance(&fixture, &script, InstanceTrigger::PostProcessing);
+    let started = start(&fixture, &slow).await.unwrap();
     let running = fixture
         .db
         .script_test_when(&started.id, |run| run.log.contains("before the gate"))
@@ -369,10 +387,10 @@ async fn each_trigger_is_tested_with_the_variables_a_real_one_carries() {
          exit 93\n",
     );
 
-    let deleted = run_to_end(
+    let deleted = test_on(
         &fixture,
         &script,
-        TestTrigger::Queue(QueueEvent::NzbDeleted),
+        InstanceTrigger::Queue(QueueEvent::NzbDeleted),
     )
     .await;
     assert_eq!(
@@ -399,17 +417,22 @@ async fn each_trigger_is_tested_with_the_variables_a_real_one_carries() {
             .contains("Command CATEGORY is not allowed for queue:NZB_DELETED")
     );
 
-    let marked = run_to_end(&fixture, &script, TestTrigger::Queue(QueueEvent::NzbMarked)).await;
+    let marked = test_on(
+        &fixture,
+        &script,
+        InstanceTrigger::Queue(QueueEvent::NzbMarked),
+    )
+    .await;
     assert!(
         marked
             .log
             .contains("event=NZB_MARKED delete=NONE mark=BAD url=NONE")
     );
 
-    let fetched = run_to_end(
+    let fetched = test_on(
         &fixture,
         &script,
-        TestTrigger::Queue(QueueEvent::UrlCompleted),
+        InstanceTrigger::Queue(QueueEvent::UrlCompleted),
     )
     .await;
     assert!(
@@ -422,7 +445,7 @@ async fn each_trigger_is_tested_with_the_variables_a_real_one_carries() {
         Some("https://example.invalid/Weaver.Test.Download.nzb")
     );
 
-    let scan = run_to_end(&fixture, &script, TestTrigger::Scan).await;
+    let scan = test_on(&fixture, &script, InstanceTrigger::Scan).await;
     assert_eq!(scan.event, ScriptEventLabel::Scan);
     assert_eq!(status(&scan), ScriptStatus::Succeeded);
     assert!(scan.log.contains("scan segments=1"));
@@ -432,13 +455,22 @@ async fn each_trigger_is_tested_with_the_variables_a_real_one_carries() {
         Some("Weaver.Test.Download.nzb")
     );
 
-    let scheduled = run_to_end(&fixture, &script, TestTrigger::Scheduler).await;
+    let scheduled = test_on(&fixture, &script, InstanceTrigger::Schedule).await;
     assert_eq!(scheduled.event, ScriptEventLabel::Scheduler(0));
     assert_eq!(status(&scheduled), ScriptStatus::Succeeded);
     assert!(scheduled.log.contains("task=0 feed=\n"));
-    assert_eq!(scheduled.inputs, [("NZBSP_TASKID".into(), "0".into())]);
+    // A scheduled run is about no download, so little is made up for it.
+    assert_eq!(
+        scheduled
+            .inputs
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["NZBSP_TASKID", "WEAVER_CATEGORY", "WEAVER_DIRECTORY"]
+    );
+    assert_eq!(input(&scheduled, "NZBSP_TASKID"), Some("0"));
 
-    let feed = run_to_end(&fixture, &script, TestTrigger::Feed).await;
+    let feed = test_on(&fixture, &script, InstanceTrigger::Feed).await;
     assert_eq!(feed.event, ScriptEventLabel::Feed(0));
     assert_eq!(status(&feed), ScriptStatus::Succeeded);
     assert!(feed.log.contains("task= feed=0\n"));
@@ -455,18 +487,26 @@ async fn each_trigger_is_tested_with_the_variables_a_real_one_carries() {
 }
 
 #[tokio::test]
-async fn a_feed_script_that_does_not_report_success_fails_its_test() {
+async fn a_feed_script_is_read_by_the_exit_codes_every_script_is() {
     let fixture = fixture(true);
-    let script = script(
+    let plain = script(
         &fixture,
         "feed.sh",
         "#!/bin/sh\n### NZBGET FEED SCRIPT ###\nexit 0\n",
     );
+    let failing = script(
+        &fixture,
+        "failing.sh",
+        "#!/bin/sh\n### NZBGET FEED SCRIPT ###\nexit 1\n",
+    );
 
-    let run = run_to_end(&fixture, &script, TestTrigger::Feed).await;
-
-    assert_eq!(status(&run), ScriptStatus::Failed);
+    let run = test_on(&fixture, &plain, InstanceTrigger::Feed).await;
+    assert_eq!(status(&run), ScriptStatus::Succeeded);
     assert_eq!(run.outcome.unwrap().exit_code, Some(0));
+
+    let run = test_on(&fixture, &failing, InstanceTrigger::Feed).await;
+    assert_eq!(status(&run), ScriptStatus::Failed);
+    assert_eq!(run.outcome.unwrap().exit_code, Some(1));
 }
 
 #[tokio::test]
@@ -474,7 +514,8 @@ async fn a_test_is_refused_while_scripts_may_not_run() {
     let fixture = fixture(false);
     let script = script(&fixture, "plain.sh", "#!/bin/sh\nexit 0\n");
 
-    let refused = start(&fixture, &script, TestTrigger::PostProcessing).await;
+    let plain = instance(&fixture, &script, InstanceTrigger::PostProcessing);
+    let refused = start(&fixture, &plain).await;
 
     assert!(
         matches!(refused, Err(ScriptTestError::Refused(_))),
@@ -484,43 +525,67 @@ async fn a_test_is_refused_while_scripts_may_not_run() {
 }
 
 #[tokio::test]
-async fn a_test_is_refused_for_a_trigger_the_script_does_not_declare() {
+async fn an_instance_is_tested_on_its_trigger_whatever_its_script_declares() {
     let fixture = fixture(true);
     let plain = script(&fixture, "plain.sh", "#!/bin/sh\nexit 0\n");
     let added = script(
         &fixture,
         "added.sh",
-        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\n### QUEUE EVENTS: NZB_ADDED ###\nexit 0\n",
+        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\n### QUEUE EVENTS: NZB_ADDED ###\nprintf 'event=%s\\n' \"$NZBNA_EVENT\"\nexit 0\n",
     );
 
-    let scan = start(&fixture, &plain, TestTrigger::Scan).await;
-    assert!(
-        matches!(scan, Err(ScriptTestError::NotDeclared { .. })),
-        "{scan:?}"
-    );
-    let post_processing = start(&fixture, &added, TestTrigger::PostProcessing).await;
-    assert!(
-        matches!(post_processing, Err(ScriptTestError::NotDeclared { .. })),
-        "{post_processing:?}"
-    );
-    let deleted = start(&fixture, &added, TestTrigger::Queue(QueueEvent::NzbDeleted)).await;
-    assert_eq!(
-        deleted.unwrap_err().to_string(),
-        "script 'added.sh' does not declare queue:NZB_DELETED"
-    );
-    let missing = start(
+    let scan = test_on(&fixture, &plain, InstanceTrigger::Scan).await;
+    assert_eq!(scan.event, ScriptEventLabel::Scan);
+    assert_eq!(status(&scan), ScriptStatus::Succeeded);
+
+    let post_processing = test_on(&fixture, &added, InstanceTrigger::PostProcessing).await;
+    assert_eq!(post_processing.event, ScriptEventLabel::PostProcessing);
+    assert_eq!(status(&post_processing), ScriptStatus::Succeeded);
+
+    let deleted = test_on(
         &fixture,
-        &ScriptName::new("missing.sh").unwrap(),
-        TestTrigger::PostProcessing,
+        &added,
+        InstanceTrigger::Queue(QueueEvent::NzbDeleted),
     )
     .await;
+    assert_eq!(status(&deleted), ScriptStatus::Succeeded);
+    assert!(deleted.log.contains("event=NZB_DELETED"));
+
+    // An instance that is turned off can still be tested.
+    let off = fixture
+        .db
+        .create_script_instance(
+            ScriptInstanceDraft::new(added, InstanceTrigger::Queue(QueueEvent::NzbAdded))
+                .disabled(),
+        )
+        .unwrap();
+    let declared = run_to_end(&fixture, &off).await;
+    assert_eq!(status(&declared), ScriptStatus::Succeeded);
+    assert!(declared.log.contains("event=NZB_ADDED"));
+    assert_eq!(scratch_directories(&fixture), Vec::<PathBuf>::new());
+}
+
+#[tokio::test]
+async fn a_test_needs_an_instance_whose_script_is_there() {
+    let fixture = fixture(true);
+    let gone = instance(
+        &fixture,
+        &ScriptName::new("missing.sh").unwrap(),
+        InstanceTrigger::PostProcessing,
+    );
+
+    let missing = start(&fixture, &gone).await;
     assert!(
         matches!(missing, Err(ScriptTestError::Unavailable(_))),
         "{missing:?}"
     );
 
-    let declared = run_to_end(&fixture, &added, TestTrigger::Queue(QueueEvent::NzbAdded)).await;
-    assert_eq!(status(&declared), ScriptStatus::Succeeded);
+    assert!(fixture.db.delete_script_instance(&gone.id).unwrap());
+    let deleted = start(&fixture, &gone).await;
+    assert!(
+        matches!(deleted, Err(ScriptTestError::NotFound)),
+        "{deleted:?}"
+    );
     assert_eq!(scratch_directories(&fixture), Vec::<PathBuf>::new());
 }
 
@@ -534,16 +599,12 @@ async fn one_test_more_than_may_run_at_once_is_refused() {
         &format!("#!/bin/sh\nread line < '{}'\nexit 0\n", gate.display()),
     );
 
+    let slow = instance(&fixture, &script, InstanceTrigger::PostProcessing);
     let mut running = Vec::new();
     for _ in 0..4 {
-        running.push(
-            start(&fixture, &script, TestTrigger::PostProcessing)
-                .await
-                .unwrap()
-                .id,
-        );
+        running.push(start(&fixture, &slow).await.unwrap().id);
     }
-    let refused = start(&fixture, &script, TestTrigger::PostProcessing).await;
+    let refused = start(&fixture, &slow).await;
     assert!(matches!(refused, Err(ScriptTestError::Busy)), "{refused:?}");
     assert_eq!(
         scratch_directories(&fixture).len(),
@@ -557,10 +618,7 @@ async fn one_test_more_than_may_run_at_once_is_refused() {
         ScriptStatus::Cancelled
     );
     // The place the cancelled run held is free again.
-    let next = start(&fixture, &script, TestTrigger::PostProcessing)
-        .await
-        .unwrap()
-        .id;
+    let next = start(&fixture, &slow).await.unwrap().id;
     running.push(next);
 
     for id in &running[1..] {
@@ -577,19 +635,14 @@ async fn only_the_last_few_ended_tests_are_kept() {
     let fixture = fixture(true);
     let script = script(&fixture, "plain.sh", "#!/bin/sh\nexit 0\n");
 
+    let plain = instance(&fixture, &script, InstanceTrigger::PostProcessing);
     let mut runs = Vec::new();
     for _ in 0..17 {
-        runs.push(
-            run_to_end(&fixture, &script, TestTrigger::PostProcessing)
-                .await
-                .id,
-        );
+        runs.push(run_to_end(&fixture, &plain).await.id);
     }
     // Room is made as a run is admitted: with seventeen ended runs kept, the
     // next one pushes the oldest out.
-    let last = run_to_end(&fixture, &script, TestTrigger::PostProcessing)
-        .await
-        .id;
+    let last = run_to_end(&fixture, &plain).await.id;
 
     assert_eq!(fixture.db.script_test(&runs[0]), None);
     assert!(fixture.db.script_test(&runs[2]).is_some());

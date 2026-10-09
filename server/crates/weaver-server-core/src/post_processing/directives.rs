@@ -18,6 +18,69 @@ pub enum Directive {
     DupeMode(DupeMode),
 }
 
+impl Directive {
+    /// The command's name as a script writes it after `[NZB]`.
+    pub fn command(&self) -> &'static str {
+        match self {
+            Self::Parameter { .. } => "NZBPR",
+            Self::Directory(_) => "DIRECTORY",
+            Self::FinalDirectory(_) => "FINALDIR",
+            Self::MarkBad => "MARK",
+            Self::Name(_) => "NZBNAME",
+            Self::Category(_) => "CATEGORY",
+            Self::Priority(_) => "PRIORITY",
+            Self::Top(_) => "TOP",
+            Self::Paused(_) => "PAUSED",
+            Self::DupeKey(_) => "DUPEKEY",
+            Self::DupeScore(_) => "DUPESCORE",
+            Self::DupeMode(_) => "DUPEMODE",
+        }
+    }
+
+    /// Whether a script run for `event` may issue this command, however it
+    /// sends it.
+    pub fn allowed_for(&self, event: &ScriptEventLabel) -> bool {
+        match event {
+            ScriptEventLabel::PostProcessing => matches!(
+                self,
+                Self::Parameter { .. }
+                    | Self::Directory(_)
+                    | Self::FinalDirectory(_)
+                    | Self::MarkBad
+            ),
+            ScriptEventLabel::Queue(queue) => {
+                matches!(self, Self::Parameter { .. } | Self::MarkBad)
+                    || (*queue == QueueEvent::NzbDownloaded && matches!(self, Self::Directory(_)))
+            }
+            ScriptEventLabel::Scan => !matches!(
+                self,
+                Self::Directory(_) | Self::FinalDirectory(_) | Self::MarkBad
+            ),
+            ScriptEventLabel::Scheduler(_) | ScriptEventLabel::Feed(_) => false,
+        }
+    }
+
+    /// Whether this command could have been written on one `[NZB]` line. A
+    /// command that reaches weaver any other way is held to the same grammar.
+    pub fn well_formed(&self) -> bool {
+        let one_line = |value: &str| !value.contains(['\0', '\n', '\r']);
+        match self {
+            Self::Parameter { name, value } => valid_parameter_name(name) && one_line(value),
+            Self::Directory(value)
+            | Self::FinalDirectory(value)
+            | Self::Name(value)
+            | Self::Category(value)
+            | Self::DupeKey(value) => one_line(value),
+            Self::MarkBad
+            | Self::Priority(_)
+            | Self::Top(_)
+            | Self::Paused(_)
+            | Self::DupeScore(_)
+            | Self::DupeMode(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DupeMode {
     Score,
@@ -162,26 +225,7 @@ pub fn parse_line(event: &ScriptEventLabel, line: &str) -> (String, Option<Scrip
                 _ => return invalid(),
             }
         };
-        let allowed = match event {
-            ScriptEventLabel::PostProcessing => matches!(
-                directive,
-                Directive::Parameter { .. }
-                    | Directive::Directory(_)
-                    | Directive::FinalDirectory(_)
-                    | Directive::MarkBad
-            ),
-            ScriptEventLabel::Queue(queue) => {
-                matches!(directive, Directive::Parameter { .. } | Directive::MarkBad)
-                    || (*queue == QueueEvent::NzbDownloaded
-                        && matches!(directive, Directive::Directory(_)))
-            }
-            ScriptEventLabel::Scan => !matches!(
-                directive,
-                Directive::Directory(_) | Directive::FinalDirectory(_) | Directive::MarkBad
-            ),
-            ScriptEventLabel::Scheduler(_) | ScriptEventLabel::Feed(_) => false,
-        };
-        return if allowed {
+        return if directive.allowed_for(event) {
             (String::new(), Some(ScriptOutputEvent::Directive(directive)))
         } else {
             let text = format!("Command {key} is not allowed for {event}");
@@ -246,6 +290,43 @@ mod tests {
                     "{event}: {command}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_command_is_held_to_one_line_however_it_arrives() {
+        for well_formed in [
+            Directive::Parameter {
+                name: "token".into(),
+                value: "any value".into(),
+            },
+            Directive::Directory("/complete/with spaces".into()),
+            Directive::Category(String::new()),
+            Directive::MarkBad,
+            Directive::Priority(-100),
+        ] {
+            assert!(well_formed.well_formed(), "{well_formed:?}");
+        }
+        for malformed in [
+            Directive::Parameter {
+                name: String::new(),
+                value: "x".into(),
+            },
+            Directive::Parameter {
+                name: "weaver.internal".into(),
+                value: "x".into(),
+            },
+            Directive::Parameter {
+                name: "token".into(),
+                value: "two\nlines".into(),
+            },
+            Directive::Directory("/complete\n[NZB] MARK=BAD".into()),
+            Directive::FinalDirectory("nul\0".into()),
+            Directive::Name("carriage\rreturn".into()),
+            Directive::Category("a\nb".into()),
+            Directive::DupeKey("a\nb".into()),
+        ] {
+            assert!(!malformed.well_formed(), "{malformed:?}");
         }
     }
 

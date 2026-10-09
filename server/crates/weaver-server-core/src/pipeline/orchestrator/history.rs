@@ -353,6 +353,7 @@ impl Pipeline {
 
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.queue_scripts_completed.remove(&job_id);
+        self.added_script_holds.remove(&job_id);
         self.jobs.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
         self.posted_name_disagreement_logged.remove(&job_id);

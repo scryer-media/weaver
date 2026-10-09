@@ -126,6 +126,14 @@ pub(crate) enum SqlTx<'db> {
     Postgres(Transaction<'db, Postgres>),
 }
 
+/// One borrowed connection of either engine, for code that runs inside a
+/// transaction it does not own: a migration step, or the reconciliation at
+/// the end of a restore.
+pub(crate) enum SqlConn<'c> {
+    Sqlite(&'c mut sqlx::SqliteConnection),
+    Postgres(&'c mut sqlx::PgConnection),
+}
+
 pub(crate) fn max_rows_for_engine(engine: SqlEngine, binds_per_row: usize) -> usize {
     let bind_limit = match engine {
         SqlEngine::Sqlite => SQLITE_BATCH_BIND_LIMIT,
@@ -578,6 +586,54 @@ impl<'db> SqlTx<'db> {
         match self {
             SqlTx::Sqlite(tx) => tx.commit().await.map_err(db_err),
             SqlTx::Postgres(tx) => tx.commit().await.map_err(pg_db_err),
+        }
+    }
+}
+
+impl SqlConn<'_> {
+    pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
+        match self {
+            SqlConn::Sqlite(conn) => {
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args)
+                    .execute(&mut **conn)
+                    .await
+                    .map(|done| done.rows_affected())
+                    .map_err(db_err)
+            }
+            SqlConn::Postgres(conn) => {
+                let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
+                bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args)
+                    .execute(&mut **conn)
+                    .await
+                    .map(|done| done.rows_affected())
+                    .map_err(pg_db_err)
+            }
+        }
+    }
+
+    pub(crate) async fn fetch_all(
+        &mut self,
+        template: &str,
+        args: &[SqlArg],
+    ) -> SqlResult<Vec<SqlRow>> {
+        match self {
+            SqlConn::Sqlite(conn) => {
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map(|rows| rows.into_iter().map(SqlRow::Sqlite).collect())
+                    .map_err(db_err)
+            }
+            SqlConn::Postgres(conn) => {
+                let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
+                bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
+                    .map_err(pg_db_err)
+            }
         }
     }
 }

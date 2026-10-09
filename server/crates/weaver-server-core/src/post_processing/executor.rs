@@ -1,4 +1,4 @@
-//! Bounded, sequential execution of a job's script list.
+//! Bounded, sequential execution of a job's post-processing instances.
 //!
 //! This is the whole scheduler: a semaphore sized by the concurrency setting
 //! admits jobs, and each admitted job runs its scripts one after another. The
@@ -13,16 +13,16 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
+use super::instances::ScriptInstance;
 use super::listing::{self, ListingError};
 use super::model::{
-    PostProcessingSummary, ScriptAdapter, ScriptList, ScriptListEntry, ScriptLists, ScriptResult,
-    ScriptStatus, merge_post_processing_summary,
+    PostProcessingSummary, ScriptAdapter, ScriptEventLabel, ScriptResult, ScriptStatus,
+    merge_post_processing_summary,
 };
 use super::runner::{
     DEFAULT_TIMEOUT, ExecutionDisposition, InterpreterConfig, JobExecutionContext,
-    NzbgetScriptStatus, ScriptExecutionRequest, execute_script_observed,
+    NzbgetScriptStatus, RunIdentity, ScriptExecutionRequest, execute_script_observed,
 };
-use super::settings::ScriptOptionsSnapshot;
 use crate::persistence::{Database, StateError};
 
 const MAX_CONCURRENCY: usize = 8;
@@ -133,17 +133,17 @@ pub struct JobPostProcessingReport {
     pub results: Vec<ScriptResult>,
 }
 
-/// All name-based configuration captured when a job enters post-processing.
+/// The scripts root and the instances captured when a job enters
+/// post-processing. An instance's inputs are read when its turn comes.
 #[derive(Clone)]
 pub struct PostProcessingJobAdmission {
     scripts_directory: PathBuf,
-    scripts: ScriptList,
-    options: ScriptOptionsSnapshot,
+    scripts: Vec<ScriptInstance>,
 }
 
 impl PostProcessingJobAdmission {
     pub fn has_enabled_entries(&self) -> bool {
-        self.scripts.enabled_entries().next().is_some()
+        self.scripts.iter().any(|instance| instance.enabled)
     }
 }
 
@@ -168,7 +168,7 @@ enum Attempt {
     /// The script ran. Its result and output are already kept.
     Ran(ScriptResult),
     /// The script is not a post-processing script.
-    WrongKind(ScriptResult),
+
     /// The script could not be started.
     NotStarted(ScriptResult),
 }
@@ -267,40 +267,28 @@ impl PostProcessingExecutor {
         Ok(interrupted)
     }
 
-    /// Resolve the list a job should run, without executing anything.
+    /// The instances a job in `category` should run, without executing
+    /// anything.
     pub fn resolve_job_scripts(
         &self,
         category: Option<&str>,
-        job_metadata: &[(String, String)],
-    ) -> Result<ScriptList, StateError> {
-        let lists = self.db.post_processing_script_lists()?;
-        Ok(resolve_script_list(
-            &lists,
-            category,
-            super::settings::job_script_override(job_metadata),
-        ))
+    ) -> Result<Vec<ScriptInstance>, StateError> {
+        self.db
+            .script_instances_for(&ScriptEventLabel::PostProcessing, category)
     }
 
-    /// Atomically capture the root and resolved list for a newly admitted job.
+    /// Capture the root and the instances for a newly admitted job.
     pub fn admit_job_scripts(
         &self,
         category: Option<&str>,
-        job_metadata: &[(String, String)],
     ) -> Result<Option<PostProcessingJobAdmission>, StateError> {
-        let (settings, lists, script_directory, options) =
-            self.db.post_processing_script_admission()?;
+        let (settings, script_directory) = self.db.post_processing_script_admission()?;
         if !settings.execution_enabled {
             return Ok(None);
         }
-        let scripts = resolve_script_list(
-            &lists,
-            category,
-            super::settings::job_script_override(job_metadata),
-        );
         Ok(Some(PostProcessingJobAdmission {
             scripts_directory: script_directory,
-            scripts,
-            options,
+            scripts: self.resolve_job_scripts(category)?,
         }))
     }
 
@@ -312,7 +300,7 @@ impl PostProcessingExecutor {
     pub async fn execute_job(
         &self,
         job_id: u64,
-        scripts: ScriptList,
+        scripts: Vec<ScriptInstance>,
         context: JobExecutionContext,
         cancellation: Option<watch::Receiver<bool>>,
         started: Option<oneshot::Sender<()>>,
@@ -333,18 +321,16 @@ impl PostProcessingExecutor {
         &self,
         scripts_directory: PathBuf,
         job_id: u64,
-        scripts: ScriptList,
+        scripts: Vec<ScriptInstance>,
         context: JobExecutionContext,
         cancellation: Option<watch::Receiver<bool>>,
         started: Option<oneshot::Sender<()>>,
     ) -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
-        let options = self.db.post_processing_script_options_snapshot()?;
         self.execute_admitted_job(
             job_id,
             PostProcessingJobAdmission {
                 scripts_directory,
                 scripts,
-                options,
             },
             context,
             cancellation,
@@ -373,7 +359,8 @@ impl PostProcessingExecutor {
         }
         let entries = admission
             .scripts
-            .enabled_entries()
+            .iter()
+            .filter(|instance| instance.enabled)
             .cloned()
             .collect::<Vec<_>>();
         if entries.is_empty() {
@@ -499,9 +486,7 @@ impl PostProcessingExecutor {
                     )
                     .await
                 {
-                    Attempt::Ran(result)
-                    | Attempt::WrongKind(result)
-                    | Attempt::NotStarted(result) => result,
+                    Attempt::Ran(result) | Attempt::NotStarted(result) => result,
                 }
             };
             record_script_metrics(&result);
@@ -547,7 +532,7 @@ impl PostProcessingExecutor {
     fn start_background(
         &self,
         admission: &PostProcessingJobAdmission,
-        entry: &ScriptListEntry,
+        entry: &ScriptInstance,
         context: &JobExecutionContext,
         interpreters: &InterpreterConfig,
         termination_grace: Duration,
@@ -582,7 +567,6 @@ impl PostProcessingExecutor {
                 // The pass is over by the time this is known, so the list of
                 // the job's runs is the only place left to say so.
                 Attempt::NotStarted(result) => executor.keep_unstarted(job_id, result).await,
-                Attempt::WrongKind(_) => return,
             };
             record_script_metrics(&result);
             executor.publish_script_events(job_id, &result);
@@ -612,7 +596,7 @@ impl PostProcessingExecutor {
     async fn attempt(
         &self,
         admission: &PostProcessingJobAdmission,
-        entry: &ScriptListEntry,
+        entry: &ScriptInstance,
         context: &mut JobExecutionContext,
         interpreters: &InterpreterConfig,
         termination_grace: Duration,
@@ -630,32 +614,25 @@ impl PostProcessingExecutor {
                 return not_started(unavailable_result(entry, started, &error));
             }
         };
-        if !script
-            .manifest
-            .kinds()
-            .contains(&super::model::ScriptKind::PostProcessing)
-        {
-            let mut result = failed_result(
-                entry,
-                script.manifest.adapter(),
-                started,
-                "script does not declare post-processing".to_string(),
-            );
-            result.status = ScriptStatus::Skipped;
-            return Attempt::WrongKind(result);
-        }
         let adapter = script.manifest.adapter();
-        let supplied = match self
-            .db
-            .resolve_post_processing_script_options(&admission.options, &entry.script)
-        {
-            Ok(options) => options,
+        // What the instance holds is what the script is given: nothing is
+        // checked against the script's own declarations.
+        let options = match self.db.script_instance_run_inputs(&entry.id) {
+            Ok(Some(options)) => options,
+            Ok(None) => {
+                return not_started(failed_result(
+                    entry,
+                    adapter,
+                    started,
+                    "the script instance no longer exists".to_string(),
+                ));
+            }
             Err(error) => {
                 return not_started(failed_result(entry, adapter, started, error.to_string()));
             }
         };
-        let options = match script.manifest.resolve_options(&supplied) {
-            Ok(options) => options,
+        let mut identity = match RunIdentity::of(entry) {
+            Ok(identity) => identity,
             Err(error) => {
                 return not_started(failed_result(entry, adapter, started, error.to_string()));
             }
@@ -679,17 +656,26 @@ impl PostProcessingExecutor {
         {
             return not_started(failed_result(entry, adapter, started, error.to_string()));
         }
+        let timeout = entry
+            .timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_TIMEOUT);
+        // The run is live, and its token good, until this is dropped when the
+        // attempt is over.
+        let mut requests = self.db.open_script_run(
+            &mut identity,
+            Some(context.job_id),
+            &ScriptEventLabel::PostProcessing,
+            Some(timeout),
+            false,
+        );
         let request = ScriptExecutionRequest {
             manifest: script.manifest,
             root: script.root,
             options,
             context: context.clone(),
-            timeout: Some(
-                entry
-                    .timeout_seconds
-                    .map(Duration::from_secs)
-                    .unwrap_or(DEFAULT_TIMEOUT),
-            ),
+            identity,
+            timeout: Some(timeout),
             termination_grace,
             interpreters: interpreters.clone(),
             supervisor_executable: self.supervisor_executable.clone(),
@@ -702,12 +688,16 @@ impl PostProcessingExecutor {
                 Some(sender),
                 settings.event_scripts.script_output_ceiling_bytes
             ),
-            self.consume_script_events(context, receiver),
+            self.consume_script_events(context, receiver, &mut requests),
         );
         match execution {
-            Ok(result) => {
+            Ok(mut result) => {
+                requests.settle(&mut result);
+                drop(requests);
                 let record = ScriptResult {
                     script: entry.script.clone(),
+                    instance_id: Some(entry.id.clone()),
+                    instance_name: Some(entry.name.clone()),
                     event: Default::default(),
                     output_id: None,
                     background,
@@ -715,7 +705,6 @@ impl PostProcessingExecutor {
                     status: match result.disposition {
                         ExecutionDisposition::Succeeded => ScriptStatus::Succeeded,
                         ExecutionDisposition::Skipped => ScriptStatus::Skipped,
-                        ExecutionDisposition::Warned => ScriptStatus::Warning,
                         ExecutionDisposition::Failed => ScriptStatus::Failed,
                         ExecutionDisposition::TimedOut => ScriptStatus::TimedOut,
                         ExecutionDisposition::Cancelled => ScriptStatus::Cancelled,
@@ -765,11 +754,15 @@ impl PostProcessingExecutor {
         self.record_job_event(job_id, SCRIPT_EVENT_KIND, &message);
     }
 
+    /// Take what the script prints and what it asks for through the API until
+    /// it has ended. Both are applied here, one at a time.
     async fn consume_script_events(
         &self,
         context: &mut JobExecutionContext,
         mut receiver: tokio::sync::mpsc::Receiver<super::directives::ScriptOutputEvent>,
+        requests: &mut super::callbacks::RunRequests,
     ) {
+        use super::callbacks::{RunAction, RunRequest};
         use super::directives::{ScriptLogLevel, ScriptOutputEvent};
         let mut buffer = String::new();
         let mut severity = ScriptLogLevel::Debug;
@@ -780,17 +773,9 @@ impl PostProcessingExecutor {
             tokio::select! {
                 event = receiver.recv() => match event {
                     Some(ScriptOutputEvent::Directive(directive)) => {
-                        let db = self.db.clone();
-                        let mut next_context = context.clone();
-                        let applied = tokio::task::spawn_blocking(move || {
-                            super::effects::apply_job_directive(&db, &mut next_context, directive)?;
-                            Ok::<_, String>(next_context)
-                        }).await.map_err(|error| error.to_string()).and_then(std::convert::identity);
-                        if let Err(error) = &applied {
+                        if let Err(error) = self.apply_to_job(context, directive).await {
                             severity = severity.max(ScriptLogLevel::Warning);
                             super::events::append_log(&mut buffer, &format!("Invalid command: {error}"));
-                        } else if let Ok(next_context) = applied {
-                            *context = next_context;
                         }
                     }
                     Some(ScriptOutputEvent::Log { level, text }) => {
@@ -799,6 +784,19 @@ impl PostProcessingExecutor {
                     }
                     None => break,
                 },
+                request = requests.next() => {
+                    let RunRequest { action, reply } = request;
+                    let outcome = match action {
+                        RunAction::Command(directive) => self.apply_to_job(context, directive).await,
+                        RunAction::Log { level, text } => requests.log(&text).map(|text| {
+                            severity = severity.max(level);
+                            super::events::append_log(&mut buffer, &format!("{level:?}: {text}"));
+                        }),
+                        RunAction::Fail(reason) => requests.fail(&reason),
+                    };
+                    // The script may have stopped waiting for the answer.
+                    let _ = reply.send(outcome);
+                }
                 _ = interval.tick(), if !buffer.is_empty() => {
                     super::events::record_log_batch(&self.db, context.job_id, std::mem::take(&mut buffer), severity).await;
                     severity = ScriptLogLevel::Debug;
@@ -811,6 +809,25 @@ impl PostProcessingExecutor {
         }
     }
 
+    /// Apply one command to the download. The context is left as it was when
+    /// the command is refused.
+    async fn apply_to_job(
+        &self,
+        context: &mut JobExecutionContext,
+        directive: super::directives::Directive,
+    ) -> Result<(), String> {
+        let db = self.db.clone();
+        let mut next_context = context.clone();
+        *context = tokio::task::spawn_blocking(move || {
+            super::effects::apply_job_directive(&db, &mut next_context, directive)?;
+            Ok::<_, String>(next_context)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(std::convert::identity)?;
+        Ok(())
+    }
+
     fn record_job_event(&self, job_id: u64, kind: &str, message: &str) {
         if let Err(error) = self
             .db
@@ -819,18 +836,6 @@ impl PostProcessingExecutor {
             tracing::warn!(job_id, error = %error, "could not append a post-processing job event");
         }
     }
-}
-
-/// Category override, global default, or a submission-time override from a facade.
-pub fn resolve_script_list(
-    lists: &ScriptLists,
-    category: Option<&str>,
-    job_override: Option<Vec<ScriptListEntry>>,
-) -> ScriptList {
-    if let Some(entries) = job_override {
-        return ScriptList::new(entries).unwrap_or_default();
-    }
-    lists.resolve(category).clone()
 }
 
 /// Why execution is refused, or `None` when it may proceed.
@@ -851,7 +856,7 @@ pub fn strict_security_enabled() -> bool {
 }
 
 fn unavailable_result(
-    entry: &ScriptListEntry,
+    entry: &ScriptInstance,
     started: Instant,
     error: &ListingError,
 ) -> ScriptResult {
@@ -859,6 +864,8 @@ fn unavailable_result(
     // warning and an event, which is what both oracles do with a missing script.
     ScriptResult {
         script: entry.script.clone(),
+        instance_id: Some(entry.id.clone()),
+        instance_name: Some(entry.name.clone()),
         event: Default::default(),
         adapter: ScriptAdapter::Sabnzbd,
         output_id: None,
@@ -874,13 +881,15 @@ fn unavailable_result(
 }
 
 fn failed_result(
-    entry: &ScriptListEntry,
+    entry: &ScriptInstance,
     adapter: ScriptAdapter,
     started: Instant,
     message: String,
 ) -> ScriptResult {
     ScriptResult {
         script: entry.script.clone(),
+        instance_id: Some(entry.id.clone()),
+        instance_name: Some(entry.name.clone()),
         event: Default::default(),
         adapter,
         status: ScriptStatus::Failed,

@@ -24,19 +24,24 @@ impl Database {
         let args = rss_feed_args(feed, metadata, encrypted_password);
         let routing = routing.cloned();
         let consumer = crate::proxies::Consumer::Rss(feed.id);
+        let (feed_id, scripts) = (feed.id, feed.scripts.clone());
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
                 let args = args.clone(); let routing = routing.clone();
+                let scripts = scripts.clone();
                 Box::pin(async move {
+            // The `scripts` column is what feeds held before instances. It is
+            // no longer read; attachments are rows of their own.
             tx.execute(
                 "INSERT INTO rss_feeds
                     (id, name, url, enabled, poll_interval_secs, username, password, default_category,
                      default_metadata, etag, last_modified, last_polled_at, last_success_at, last_error,
                      consecutive_failures, scripts)
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '[]')",
                 &args,
             )
             .await?;
+            crate::post_processing::instances::set_feed_scripts_tx(tx, feed_id, &scripts).await?;
             crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref()).await?;
             Ok(())
                 })
@@ -64,21 +69,25 @@ impl Database {
         args.push(id);
         let routing = routing.cloned();
         let consumer = crate::proxies::Consumer::Rss(feed.id);
+        let (feed_id, scripts) = (feed.id, feed.scripts.clone());
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
                 let args = args.clone();
                 let routing = routing.clone();
+                let scripts = scripts.clone();
                 Box::pin(async move {
                     tx.execute(
                         "UPDATE rss_feeds
                     SET name = {}, url = {}, enabled = {}, poll_interval_secs = {}, username = {},
                         password = {}, default_category = {}, default_metadata = {}, etag = {},
                         last_modified = {}, last_polled_at = {}, last_success_at = {},
-                        last_error = {}, consecutive_failures = {}, scripts = {}
+                        last_error = {}, consecutive_failures = {}
                   WHERE id = {}",
                         &args,
                     )
                     .await?;
+                    crate::post_processing::instances::set_feed_scripts_tx(tx, feed_id, &scripts)
+                        .await?;
                     crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
                         .await?;
                     Ok(())
@@ -100,6 +109,11 @@ impl Database {
                             &[SqlArg::I64(i64::from(id))],
                         )
                         .await?;
+                    tx.execute(
+                        "DELETE FROM feed_scripts WHERE feed_id = {}",
+                        &[SqlArg::I64(i64::from(id))],
+                    )
+                    .await?;
                     tx.execute(
                         "DELETE FROM proxy_routes WHERE consumer = {}",
                         &[SqlArg::Text(crate::proxies::Consumer::Rss(id).key())],
@@ -314,7 +328,6 @@ fn rss_feed_args(
         SqlArg::OptI64(feed.last_success_at),
         SqlArg::OptText(feed.last_error.clone()),
         SqlArg::I64(i64::from(feed.consecutive_failures)),
-        SqlArg::Text(serde_json::to_string(&feed.scripts).expect("script names serialize")),
     ]
 }
 

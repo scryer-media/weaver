@@ -13,15 +13,17 @@ use std::time::{Duration, Instant};
 
 use weaver_server_core::persistence::Database;
 use weaver_server_core::post_processing::executor::PostProcessingExecutor;
+use weaver_server_core::post_processing::instances::{
+    InstanceTrigger, ScriptInstance, ScriptInstanceDraft,
+};
 use weaver_server_core::post_processing::listing::resolve_script;
 use weaver_server_core::post_processing::model::{
     OptionName, OptionValue, PipelineOutcome, PostProcessingSettings, PostProcessingSummary,
-    ResolvedOption, ScriptAdapter, ScriptList, ScriptListEntry, ScriptLists, ScriptName,
-    ScriptStatus, SecretOptionValue,
+    ResolvedOption, ScriptAdapter, ScriptName, ScriptStatus, SecretOptionValue,
 };
 use weaver_server_core::post_processing::runner::{
     ExecutionDisposition, InterpreterConfig, JobExecutionContext, MAX_SCRIPT_OUTPUT_BYTES,
-    ScriptExecutionRequest, execute_script,
+    RunIdentity, ScriptExecutionRequest, execute_script,
 };
 
 fn supervisor() -> PathBuf {
@@ -75,6 +77,15 @@ fn request(
             OptionValue::Secret(SecretOptionValue::from_admin_input("super-secret-value")),
         )],
         context: context(42, working_directory),
+        identity: RunIdentity {
+            run_id: "run-1".into(),
+            instance_id: "instance-1".into(),
+            instance_name: script.as_str().into(),
+            trigger: InstanceTrigger::PostProcessing.to_string(),
+            api_url: None,
+            token: None,
+            output: Default::default(),
+        },
         timeout,
         termination_grace: Duration::from_millis(100),
         interpreters: InterpreterConfig::default(),
@@ -96,12 +107,20 @@ fn enable_execution(db: &Database) {
     .unwrap();
 }
 
-fn set_global_list(db: &Database, entries: Vec<ScriptListEntry>) {
-    db.save_post_processing_script_lists(&ScriptLists {
-        global: ScriptList::new(entries).unwrap(),
-        ..ScriptLists::default()
-    })
-    .unwrap();
+/// A post-processing instance of `script`, not yet saved.
+fn draft(script: &ScriptName) -> ScriptInstanceDraft {
+    ScriptInstanceDraft::new(script.clone(), InstanceTrigger::PostProcessing)
+}
+
+/// A saved post-processing instance of `script` that the pass waits for.
+fn instance(db: &Database, script: &ScriptName) -> ScriptInstance {
+    db.create_script_instance(draft(script)).unwrap()
+}
+
+/// A saved post-processing instance of `script` that nothing waits for.
+fn not_waited_for(db: &Database, script: &ScriptName) -> ScriptInstance {
+    db.create_script_instance(draft(script).fire_and_forget())
+        .unwrap()
 }
 
 /// A pipe a test script stops at, so the test decides when the script goes on.
@@ -130,13 +149,6 @@ async fn wait_at_gate(gate: PathBuf) {
         .unwrap();
 }
 
-fn not_waited_for(script: ScriptName) -> ScriptListEntry {
-    ScriptListEntry {
-        blocking: false,
-        ..ScriptListEntry::new(script)
-    }
-}
-
 /// A finished job for script runs to be recorded against.
 fn finished_job(db: &Database, job_id: u64, working_directory: &Path) {
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
@@ -163,7 +175,7 @@ fn finished_job(db: &Database, job_id: u64, working_directory: &Path) {
 }
 
 #[tokio::test]
-async fn event_only_scripts_are_listed_but_never_executed_as_terminal_scripts() {
+async fn an_instance_runs_its_script_whatever_the_script_says_it_is_for() {
     use weaver_server_core::post_processing::listing::list_scripts;
     use weaver_server_core::post_processing::model::{ScriptEventLabel, ScriptKind};
 
@@ -172,7 +184,7 @@ async fn event_only_scripts_are_listed_but_never_executed_as_terminal_scripts() 
     fs::create_dir(&working).unwrap();
     let db = Database::open_in_memory().unwrap();
     enable_execution(&db);
-    let mut entries = Vec::new();
+    let mut instances = Vec::new();
     for kind in [
         ScriptKind::Queue,
         ScriptKind::Scan,
@@ -184,39 +196,41 @@ async fn event_only_scripts_are_listed_but_never_executed_as_terminal_scripts() 
             data.path(),
             &name,
             &format!(
-                "#!/bin/sh\n### NZBGET {} SCRIPT ###\nprintf ran > unexpected\nexit 94\n",
+                "#!/bin/sh\n### NZBGET {} SCRIPT ###\nprintf '{}\\n' >> ran.txt\nexit 93\n",
+                kind.as_str(),
                 kind.as_str()
             ),
         );
-        entries.push(ScriptListEntry::new(script));
+        instances.push(instance(&db, &script));
     }
     let listing = list_scripts(&data.path().join("scripts")).unwrap();
     assert_eq!(listing.scripts.len(), 4);
     assert!(listing.problems.is_empty());
     let report = executor(&db, data.path())
-        .execute_job(
-            901,
-            ScriptList::new(entries).unwrap(),
-            context(901, working.clone()),
-            None,
-            None,
-        )
+        .execute_job(901, instances, context(901, working.clone()), None, None)
         .await
         .unwrap();
+    assert_eq!(report.summary, PostProcessingSummary::Succeeded);
     assert_eq!(report.results.len(), 4);
     assert!(
         report
             .results
             .iter()
-            .all(|result| result.status == ScriptStatus::Skipped
-                && result.exit_code.is_none()
+            .all(|result| result.status == ScriptStatus::Succeeded
+                && result.exit_code == Some(93)
                 && result.event == ScriptEventLabel::PostProcessing)
     );
-    assert!(!working.join("unexpected").exists());
+    assert_eq!(
+        fs::read_to_string(working.join("ran.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
 }
 
 #[tokio::test]
-async fn combined_legacy_kinds_keep_the_terminal_post_processing_contract() {
+async fn a_script_is_told_how_the_scripts_before_it_ended() {
     let data = tempfile::tempdir().unwrap();
     let working = data.path().join("work");
     fs::create_dir(&working).unwrap();
@@ -227,28 +241,29 @@ async fn combined_legacy_kinds_keep_the_terminal_post_processing_contract() {
         "combined.sh",
         "#!/bin/sh\n### NZBGET POST-PROCESSING/QUEUE SCRIPT ###\nprintf '%s/%s' \"$NZBPP_TOTALSTATUS\" \"$NZBPP_SCRIPTSTATUS\"\nexit 93\n",
     );
-    let queue = write_script(
+    let failing = write_script(
         data.path(),
-        "queue.sh",
-        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 94\n",
+        "failing.sh",
+        "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\nexit 94\n",
     );
-    let report = executor(&db, data.path())
-        .execute_job(
-            902,
-            ScriptList::new(vec![
-                ScriptListEntry::new(queue),
-                ScriptListEntry::new(script),
-            ])
+    // The same script may be wired more than once.
+    let instances = vec![
+        instance(&db, &script),
+        instance(&db, &failing),
+        db.create_script_instance(draft(&script).named("Again"))
             .unwrap(),
-            context(902, working),
-            None,
-            None,
-        )
+    ];
+    let report = executor(&db, data.path())
+        .execute_job(902, instances, context(902, working), None, None)
         .await
         .unwrap();
-    assert_eq!(report.results[0].status, ScriptStatus::Skipped);
-    assert_eq!(report.results[1].status, ScriptStatus::Succeeded);
-    assert_eq!(report.results[1].output_tail, "SUCCESS/NONE");
+    assert_eq!(report.summary, PostProcessingSummary::Failed);
+    assert_eq!(report.results[0].status, ScriptStatus::Succeeded);
+    assert_eq!(report.results[0].output_tail, "SUCCESS/NONE");
+    assert_eq!(report.results[1].status, ScriptStatus::Failed);
+    assert_eq!(report.results[2].status, ScriptStatus::Succeeded);
+    assert_eq!(report.results[2].output_tail, "SUCCESS/FAILURE");
+    assert_eq!(report.results[2].instance_name.as_deref(), Some("Again"));
 }
 
 #[tokio::test]
@@ -300,15 +315,17 @@ printf 'stderr-line\n' >&2
 }
 
 #[tokio::test]
-async fn nzbget_exit_codes_are_honoured_end_to_end() {
+async fn exit_codes_are_honoured_end_to_end() {
     let data = tempfile::tempdir().unwrap();
     let working_directory = data.path().join("work");
     fs::create_dir_all(&working_directory).unwrap();
 
     for (exit, expected) in [
+        (0, ExecutionDisposition::Succeeded),
         (93, ExecutionDisposition::Succeeded),
         (94, ExecutionDisposition::Failed),
         (95, ExecutionDisposition::Skipped),
+        (7, ExecutionDisposition::Failed),
     ] {
         let script = write_script(
             data.path(),
@@ -414,7 +431,7 @@ printf 'FINAL-LINE\n'
 }
 
 #[tokio::test]
-async fn the_executor_runs_a_list_in_order_and_rolls_the_worst_outcome_up() {
+async fn the_executor_runs_instances_in_order_and_rolls_the_worst_outcome_up() {
     let data = tempfile::tempdir().unwrap();
     let working_directory = data.path().join("work");
     let final_directory = data.path().join("complete");
@@ -438,12 +455,11 @@ async fn the_executor_runs_a_list_in_order_and_rolls_the_worst_outcome_up() {
         "third.sh",
         "#!/bin/sh\nprintf 'third\\n' >> \"$SAB_COMPLETE_DIR/order.txt\"\n",
     );
-    let list = ScriptList::new(vec![
-        ScriptListEntry::new(first),
-        ScriptListEntry::new(second),
-        ScriptListEntry::new(third.clone()),
-    ])
-    .unwrap();
+    let list = vec![
+        instance(&db, &first),
+        instance(&db, &second),
+        instance(&db, &third),
+    ];
 
     let mut job_context = context(101, working_directory.clone());
     job_context.final_directory = final_directory.clone();
@@ -455,7 +471,7 @@ async fn the_executor_runs_a_list_in_order_and_rolls_the_worst_outcome_up() {
     assert_eq!(
         fs::read_to_string(final_directory.join("order.txt")).unwrap(),
         "first\nsecond\nthird\n",
-        "scripts run sequentially in list order"
+        "scripts run sequentially in run order"
     );
     assert_eq!(
         fs::read_to_string(final_directory.join("cwd.txt")).unwrap(),
@@ -469,12 +485,12 @@ async fn the_executor_runs_a_list_in_order_and_rolls_the_worst_outcome_up() {
         !working_directory.join("order.txt").exists(),
         "scripts do not write post-processing output into the staging directory"
     );
-    // A nonzero SABnzbd exit is a warning, and one warning degrades the rollup
-    // without stopping the rest of the list.
-    assert_eq!(report.summary, PostProcessingSummary::Warning);
+    // A script that fails takes the rollup with it without stopping the
+    // scripts after it.
+    assert_eq!(report.summary, PostProcessingSummary::Failed);
     assert_eq!(report.results.len(), 3);
     assert_eq!(report.results[0].status, ScriptStatus::Succeeded);
-    assert_eq!(report.results[1].status, ScriptStatus::Warning);
+    assert_eq!(report.results[1].status, ScriptStatus::Failed);
     assert_eq!(report.results[1].exit_code, Some(7));
     assert_eq!(report.results[2].status, ScriptStatus::Succeeded);
     assert_eq!(report.results[2].adapter, ScriptAdapter::Sabnzbd);
@@ -482,7 +498,7 @@ async fn the_executor_runs_a_list_in_order_and_rolls_the_worst_outcome_up() {
 }
 
 #[tokio::test]
-async fn a_disabled_script_is_kept_in_the_list_but_never_executed() {
+async fn a_disabled_instance_is_never_executed() {
     let data = tempfile::tempdir().unwrap();
     let working_directory = data.path().join("work");
     fs::create_dir_all(&working_directory).unwrap();
@@ -494,13 +510,10 @@ async fn a_disabled_script_is_kept_in_the_list_but_never_executed() {
         "skipped.sh",
         "#!/bin/sh\nprintf 'ran\\n' > \"$SAB_COMPLETE_DIR/skipped.txt\"\n",
     );
-    let list = ScriptList::new(vec![ScriptListEntry {
-        script: skipped,
-        enabled: false,
-        timeout_seconds: None,
-        blocking: true,
-    }])
-    .unwrap();
+    let list = vec![
+        db.create_script_instance(draft(&skipped).disabled())
+            .unwrap(),
+    ];
 
     let report = executor(&db, data.path())
         .execute_job(
@@ -530,7 +543,7 @@ async fn execution_is_refused_while_the_master_switch_is_off() {
         "never.sh",
         "#!/bin/sh\nprintf 'ran\\n' > \"$SAB_COMPLETE_DIR/never.txt\"\n",
     );
-    let list = ScriptList::new(vec![ScriptListEntry::new(script)]).unwrap();
+    let list = vec![instance(&db, &script)];
 
     let report = executor(&db, data.path())
         .execute_job(
@@ -561,11 +574,7 @@ async fn cancelling_a_job_stops_the_run_and_records_the_cancellation() {
         "later.sh",
         "#!/bin/sh\nprintf 'ran\\n' > \"$SAB_COMPLETE_DIR/later.txt\"\n",
     );
-    let list = ScriptList::new(vec![
-        ScriptListEntry::new(slow),
-        ScriptListEntry::new(later),
-    ])
-    .unwrap();
+    let list = vec![instance(&db, &slow), instance(&db, &later)];
 
     let executor = executor(&db, data.path());
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -591,7 +600,7 @@ async fn cancelling_a_job_stops_the_run_and_records_the_cancellation() {
     assert_eq!(
         report.results.len(),
         1,
-        "the list stops at the cancellation"
+        "the pass stops at the cancellation"
     );
     assert_eq!(report.results[0].status, ScriptStatus::Cancelled);
     assert!(!working_directory.join("later.txt").exists());
@@ -606,10 +615,7 @@ async fn a_missing_script_warns_instead_of_failing_the_job() {
     let db = Database::open_in_memory().unwrap();
     enable_execution(&db);
 
-    let list = ScriptList::new(vec![ScriptListEntry::new(
-        ScriptName::new("renamed.sh").unwrap(),
-    )])
-    .unwrap();
+    let list = vec![instance(&db, &ScriptName::new("renamed.sh").unwrap())];
     let report = executor(&db, data.path())
         .execute_job(105, list, context(105, working_directory), None, None)
         .await
@@ -662,8 +668,7 @@ async fn results_are_persisted_on_the_job_and_a_rerun_replaces_them() {
         "counter.sh",
         "#!/bin/sh\nprintf 'x' >> \"$SAB_COMPLETE_DIR/runs.txt\"\n",
     );
-    let list = ScriptList::new(vec![ScriptListEntry::new(script.clone())]).unwrap();
-    set_global_list(&db, vec![ScriptListEntry::new(script)]);
+    let list = vec![instance(&db, &script)];
     let executor = executor(&db, data.path());
 
     executor
@@ -680,9 +685,9 @@ async fn results_are_persisted_on_the_job_and_a_rerun_replaces_them() {
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].status, ScriptStatus::Succeeded);
 
-    // A rerun executes the job's list again against the retained output.
-    let resolved = executor.resolve_job_scripts(None, &[]).unwrap();
-    assert_eq!(resolved.entries().len(), 1);
+    // A rerun executes the job's instances again against the retained output.
+    let resolved = executor.resolve_job_scripts(None).unwrap();
+    assert_eq!(resolved, list);
     executor
         .execute_job(
             106,
@@ -704,7 +709,7 @@ async fn results_are_persisted_on_the_job_and_a_rerun_replaces_them() {
 }
 
 #[tokio::test]
-async fn stored_options_are_validated_against_the_manifest_and_delivered_as_nzbpo() {
+async fn an_instance_gives_its_script_the_inputs_it_holds_and_nothing_else() {
     let data = tempfile::tempdir().unwrap();
     let working_directory = data.path().join("work");
     fs::create_dir_all(&working_directory).unwrap();
@@ -754,22 +759,28 @@ async fn stored_options_are_validated_against_the_manifest_and_delivered_as_nzbp
     .unwrap();
     fs::write(
         package.join("run.sh"),
-        "#!/bin/sh\nprintf 'HOST=%s TOKEN=%s\\n' \"$NZBPO_Host\" \"$NZBPO_Token\" > \"$NZBPP_DIRECTORY/env.txt\"\nexit 93\n",
+        "#!/bin/sh\nprintf 'HOST=%s TOKEN=%s PORT=%s/%s/%s\\n' \"${NZBPO_Host-unset}\" \"$NZBPO_Token\" \"$NZBPO_Port\" \"$SAB_OPTION_PORT\" \"$WEAVER_INPUT_PORT\" > \"$NZBPP_DIRECTORY/env.txt\"\nexit 93\n",
     )
     .unwrap();
     fs::set_permissions(package.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
 
+    // The script declares `Host` with a default and knows nothing of `Port`.
     let script = ScriptName::new("email").unwrap();
-    db.save_post_processing_script_options(
-        &script,
-        &[ResolvedOption::new(
-            OptionName::new("Token").unwrap(),
-            OptionValue::Secret(SecretOptionValue::from_admin_input("hunter2")),
-        )],
-    )
-    .unwrap();
+    let saved = db
+        .create_script_instance(
+            draft(&script)
+                .secret_input("Token", "hunter2")
+                .input("Port", "587"),
+        )
+        .unwrap();
+    assert!(
+        saved
+            .inputs
+            .iter()
+            .all(|input| !input.secret || input.value.is_empty())
+    );
 
-    let list = ScriptList::new(vec![ScriptListEntry::new(script)]).unwrap();
+    let list = vec![saved];
     let report = executor(&db, data.path())
         .execute_job(
             107,
@@ -783,9 +794,11 @@ async fn stored_options_are_validated_against_the_manifest_and_delivered_as_nzbp
 
     assert_eq!(report.summary, PostProcessingSummary::Succeeded);
     let env = fs::read_to_string(working_directory.join("env.txt")).unwrap();
-    // The manifest default fills in, and the stored secret is decrypted for the
+    // What was saved is what the script is given, under every naming: a
+    // default the script declares is not filled in, an input it does not
+    // declare is passed on, and the stored secret is decrypted for the
     // process only.
-    assert_eq!(env.trim(), "HOST=mail.example.invalid TOKEN=hunter2");
+    assert_eq!(env.trim(), "HOST=unset TOKEN=hunter2 PORT=587/587/587");
 }
 
 #[tokio::test]
@@ -864,11 +877,8 @@ async fn changing_the_scripts_directory_pins_admitted_work_and_updates_future_jo
     let executor = executor(&db, data.path());
     let admitted = executor.clone();
     let first_context = context(701, first_working_directory.clone());
-    let admitted_list = ScriptList::new(vec![
-        ScriptListEntry::new(first),
-        ScriptListEntry::new(second.clone()),
-    ])
-    .unwrap();
+    let second = instance(&db, &second);
+    let admitted_list = vec![instance(&db, &first), second.clone()];
 
     let admitted_root = executor.script_directory();
     executor.set_script_directory(new_root);
@@ -903,7 +913,7 @@ async fn changing_the_scripts_directory_pins_admitted_work_and_updates_future_jo
     assert_eq!(
         fs::read_to_string(first_working_directory.join("order.txt")).unwrap(),
         "first\nold-second\n",
-        "the already admitted list must continue resolving from its original root"
+        "already admitted work must continue resolving from its original root"
     );
 
     let second_working_directory = data.path().join("second-work");
@@ -911,7 +921,7 @@ async fn changing_the_scripts_directory_pins_admitted_work_and_updates_future_jo
     executor
         .execute_job(
             702,
-            ScriptList::new(vec![ScriptListEntry::new(second)]).unwrap(),
+            vec![second],
             context(702, second_working_directory.clone()),
             None,
             None,
@@ -941,15 +951,11 @@ async fn a_script_nothing_waits_for_has_no_part_in_the_pass() {
         "#!/bin/sh\nread line < \"$SAB_COMPLETE_DIR/gate\"\nprintf 'detached\\n'\nexit 7\n",
     );
     let waited = write_script(data.path(), "waited.sh", "#!/bin/sh\nprintf 'waited\\n'\n");
-    let list = ScriptList::new(vec![
-        not_waited_for(detached.clone()),
-        ScriptListEntry::new(waited.clone()),
-    ])
-    .unwrap();
+    let list = vec![not_waited_for(&db, &detached), instance(&db, &waited)];
 
     // The first script cannot end until its gate opens, so a pass that
     // returns before then did not wait for it. Its exit status would have
-    // made the pass a warning had it counted.
+    // failed the pass had it counted.
     let report = executor(&db, data.path())
         .execute_job(
             110,
@@ -972,7 +978,7 @@ async fn a_script_nothing_waits_for_has_no_part_in_the_pass() {
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].script, detached);
     assert!(recorded[0].background);
-    assert_eq!(recorded[0].status, ScriptStatus::Warning);
+    assert_eq!(recorded[0].status, ScriptStatus::Failed);
     assert_eq!(recorded[0].exit_code, Some(7));
     assert_eq!(recorded[0].output_tail, "detached\n");
     let pass = db.job_post_processing_results(110).unwrap();
@@ -981,7 +987,7 @@ async fn a_script_nothing_waits_for_has_no_part_in_the_pass() {
 }
 
 #[tokio::test]
-async fn a_list_with_nothing_to_wait_for_does_not_queue_behind_another_job() {
+async fn a_pass_with_nothing_to_wait_for_does_not_queue_behind_another_job() {
     let data = tempfile::tempdir().unwrap();
     let working_directory = data.path().join("work");
     fs::create_dir_all(&working_directory).unwrap();
@@ -1002,7 +1008,7 @@ async fn a_list_with_nothing_to_wait_for_does_not_queue_behind_another_job() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let holding = {
         let executor = executor.clone();
-        let list = ScriptList::new(vec![ScriptListEntry::new(holder)]).unwrap();
+        let list = vec![instance(&db, &holder)];
         let context = context(111, working_directory.clone());
         tokio::spawn(async move {
             executor
@@ -1013,11 +1019,7 @@ async fn a_list_with_nothing_to_wait_for_does_not_queue_behind_another_job() {
     started_rx.await.unwrap();
 
     let missing = ScriptName::new("renamed.sh").unwrap();
-    let list = ScriptList::new(vec![
-        not_waited_for(missing.clone()),
-        not_waited_for(quick.clone()),
-    ])
-    .unwrap();
+    let list = vec![not_waited_for(&db, &missing), not_waited_for(&db, &quick)];
     let report = executor
         .execute_job(
             112,
@@ -1078,7 +1080,7 @@ async fn cancelling_a_job_stops_a_script_nothing_waits_for() {
         "#!/bin/sh\nprintf 'up\\n' > \"$SAB_COMPLETE_DIR/started\"\nread line < \"$SAB_COMPLETE_DIR/never\"\n",
     );
     let executor = executor(&db, data.path());
-    let list = ScriptList::new(vec![not_waited_for(detached.clone())]).unwrap();
+    let list = vec![not_waited_for(&db, &detached)];
     executor
         .execute_job(
             113,

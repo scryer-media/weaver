@@ -1,11 +1,16 @@
 use async_graphql::{Enum, InputObject, MaybeUndefined, SimpleObject};
-use weaver_server_core::post_processing::listing::{DiscoveredScript, ScriptProblem};
+use weaver_server_core::post_processing::instances::{
+    InstanceInputDraft, InstanceTrigger, ScriptInstance, ScriptInstanceDraft,
+};
+use weaver_server_core::post_processing::listing::{
+    DiscoveredScript, ScriptListing, ScriptProblem,
+};
 use weaver_server_core::post_processing::model::{
-    OptionName, OptionValue, PostProcessingSettings, ResolvedOption, ScriptAdapter, ScriptList,
-    ScriptListEntry, ScriptLists, ScriptName, ScriptOption, ScriptOptionType, ScriptResult,
-    ScriptSelectValue, SecretOptionValue,
+    GlobalScriptsRun, OptionValue, PostProcessingSettings, ScriptAdapter, ScriptName, ScriptOption,
+    ScriptOptionType, ScriptResult, ScriptSelectValue,
 };
 use weaver_server_core::post_processing::output::ScriptRun;
+use weaver_server_core::post_processing::preset::ScriptPreset;
 use weaver_server_core::post_processing::test_run::ScriptTestSnapshot;
 
 /// Placeholder shown instead of a stored secret. Secrets leave the process only
@@ -31,14 +36,42 @@ pub struct PostProcessingSettingsGql {
     pub unacceptable_extensions: Vec<String>,
     /// True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
     pub strict_security_refuses_execution: bool,
-    /// Global default list plus every per-category override.
-    pub lists: ScriptListsGql,
+    /// Whether instances for every category also run for a category that has
+    /// instances of its own.
+    pub global_scripts_run: GlobalScriptsRunGql,
+}
+
+/// When instances that are not narrowed to a category run.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
+#[graphql(name = "GlobalScriptsRun")]
+pub enum GlobalScriptsRunGql {
+    /// For every download, ahead of the ones for its category.
+    Always,
+    /// Only for a download whose category has no instances of its own.
+    OnlyWithoutCategoryScripts,
+}
+
+impl From<GlobalScriptsRun> for GlobalScriptsRunGql {
+    fn from(value: GlobalScriptsRun) -> Self {
+        match value {
+            GlobalScriptsRun::Always => Self::Always,
+            GlobalScriptsRun::OnlyWithoutCategoryScripts => Self::OnlyWithoutCategoryScripts,
+        }
+    }
+}
+
+impl From<GlobalScriptsRunGql> for GlobalScriptsRun {
+    fn from(value: GlobalScriptsRunGql) -> Self {
+        match value {
+            GlobalScriptsRunGql::Always => Self::Always,
+            GlobalScriptsRunGql::OnlyWithoutCategoryScripts => Self::OnlyWithoutCategoryScripts,
+        }
+    }
 }
 
 impl PostProcessingSettingsGql {
     pub fn from_settings(
         value: PostProcessingSettings,
-        lists: ScriptLists,
         script_directory: impl Into<String>,
         strict_security: bool,
     ) -> Self {
@@ -59,7 +92,7 @@ impl PostProcessingSettingsGql {
             batch_interpreter: value.batch_interpreter,
             unacceptable_extensions: value.unacceptable_extensions,
             strict_security_refuses_execution: strict_security,
-            lists: lists.into(),
+            global_scripts_run: value.global_scripts_run.into(),
         }
     }
 }
@@ -82,6 +115,8 @@ pub struct PostProcessingSettingsInput {
     /// Omission preserves the existing policy; a supplied empty list disables
     /// it. `null` is deliberately distinguishable and refused by the mutation.
     pub unacceptable_extensions: MaybeUndefined<Vec<String>>,
+    /// Omission keeps the present choice.
+    pub global_scripts_run: Option<GlobalScriptsRunGql>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
@@ -131,8 +166,6 @@ pub struct ScriptOptionGql {
     pub required: bool,
     /// Manifest default, already masked when the option is secret.
     pub default_value: Option<String>,
-    /// Operator-supplied value, masked when the option is secret.
-    pub value: Option<String>,
 }
 
 fn select_text(value: &ScriptSelectValue) -> String {
@@ -152,11 +185,7 @@ pub fn option_value_text(value: &OptionValue) -> String {
     }
 }
 
-fn script_option_gql(declaration: &ScriptOption, stored: &[ResolvedOption]) -> ScriptOptionGql {
-    let value = stored
-        .iter()
-        .find(|option| option.name() == declaration.name())
-        .map(|option| option_value_text(option.value()));
+fn script_option_gql(declaration: &ScriptOption) -> ScriptOptionGql {
     ScriptOptionGql {
         name: declaration.name().as_str().to_string(),
         section: declaration.section().map(str::to_string),
@@ -166,7 +195,6 @@ fn script_option_gql(declaration: &ScriptOption, stored: &[ResolvedOption]) -> S
         select: declaration.select().iter().map(select_text).collect(),
         required: declaration.required(),
         default_value: declaration.default().map(option_value_text),
-        value,
     }
 }
 
@@ -179,12 +207,16 @@ pub struct ScriptGql {
     pub queue_events: Vec<QueueEventGql>,
     pub task_times: Vec<String>,
     pub version: Option<String>,
+    /// What the header declares about each input, for drawing a form.
     pub options: Vec<ScriptOptionGql>,
+    /// What the header offers as a starting point for an instance.
+    pub preset: ScriptPresetGql,
 }
 
 impl ScriptGql {
-    pub fn new(script: &DiscoveredScript, stored_options: &[ResolvedOption]) -> Self {
+    pub fn new(script: &DiscoveredScript) -> Self {
         Self {
+            preset: ScriptPreset::of(&script.manifest).into(),
             name: script.name.as_str().to_string(),
             display_name: script.manifest.display_name().to_string(),
             adapter: script.manifest.adapter().into(),
@@ -213,7 +245,7 @@ impl ScriptGql {
                 .manifest
                 .options()
                 .iter()
-                .map(|declaration| script_option_gql(declaration, stored_options))
+                .map(script_option_gql)
                 .collect(),
         }
     }
@@ -242,150 +274,231 @@ pub struct ScriptListingGql {
     pub problems: Vec<ScriptProblemGql>,
 }
 
+/// One input: its name, and its value unless it is a secret.
 #[derive(Debug, Clone, SimpleObject)]
-pub struct ScriptListEntryGql {
-    pub script: String,
-    pub enabled: bool,
-    pub timeout_seconds: Option<u64>,
-    /// Whether the script is waited for. One that is not is started and left
-    /// to finish on its own, and its result changes nothing.
-    pub blocking: bool,
+#[graphql(name = "ScriptInstanceValue")]
+pub struct ScriptInstanceValueGql {
+    pub name: String,
+    /// Null for a secret, which is never read back out.
+    pub value: Option<String>,
+    pub secret: bool,
 }
 
-impl From<&ScriptListEntry> for ScriptListEntryGql {
-    fn from(value: &ScriptListEntry) -> Self {
+/// A trigger a script's header declares.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptPresetTrigger")]
+pub struct ScriptPresetTriggerGql {
+    pub trigger: ScriptKindGql,
+    /// Set when `trigger` is `QUEUE`.
+    pub queue_event: Option<QueueEventGql>,
+}
+
+/// What a script's header offers as a starting point. It fills a form and
+/// nothing more: a saved instance never follows the header.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptPreset")]
+pub struct ScriptPresetGql {
+    /// One per instance the header asks for.
+    pub triggers: Vec<ScriptPresetTriggerGql>,
+    /// When a schedule instance is meant to run.
+    pub task_times: Vec<String>,
+    /// Every declared input at its default. A secret has no value.
+    pub inputs: Vec<ScriptInstanceValueGql>,
+}
+
+fn trigger_parts(trigger: InstanceTrigger) -> (ScriptKindGql, Option<QueueEventGql>) {
+    let event = match trigger {
+        InstanceTrigger::Queue(event) => Some(event.into()),
+        _ => None,
+    };
+    (trigger.kind().into(), event)
+}
+
+impl From<ScriptPreset> for ScriptPresetGql {
+    fn from(value: ScriptPreset) -> Self {
         Self {
-            script: value.script.as_str().to_string(),
-            enabled: value.enabled,
-            timeout_seconds: value.timeout_seconds,
-            blocking: value.blocking,
-        }
-    }
-}
-
-#[derive(Debug, Clone, SimpleObject)]
-pub struct ScriptCategoryListGql {
-    pub category: String,
-    pub entries: Vec<ScriptListEntryGql>,
-}
-
-#[derive(Debug, Clone, SimpleObject)]
-pub struct ScriptListsGql {
-    pub global: Vec<ScriptListEntryGql>,
-    pub categories: Vec<ScriptCategoryListGql>,
-}
-
-impl From<ScriptLists> for ScriptListsGql {
-    fn from(value: ScriptLists) -> Self {
-        Self {
-            global: value.global.entries().iter().map(Into::into).collect(),
-            categories: value
-                .categories
-                .iter()
-                .map(|(category, list)| ScriptCategoryListGql {
-                    category: category.clone(),
-                    entries: list.entries().iter().map(Into::into).collect(),
+            triggers: value
+                .triggers
+                .into_iter()
+                .map(|trigger| {
+                    let (trigger, queue_event) = trigger_parts(trigger);
+                    ScriptPresetTriggerGql {
+                        trigger,
+                        queue_event,
+                    }
+                })
+                .collect(),
+            task_times: value.task_times.iter().map(ToString::to_string).collect(),
+            inputs: value
+                .inputs
+                .into_iter()
+                .map(|input| ScriptInstanceValueGql {
+                    name: input.name,
+                    value: input.value.filter(|_| !input.secret),
+                    secret: input.secret,
                 })
                 .collect(),
         }
     }
 }
 
-#[derive(Debug, Clone, InputObject)]
-pub struct ScriptListEntryInput {
+/// A script wired to one trigger, with the inputs and run policy saved for it.
+/// What is saved here is what runs.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptInstance")]
+pub struct ScriptInstanceGql {
+    pub id: String,
+    pub name: String,
     pub script: String,
-    #[graphql(default = true)]
+    pub trigger: ScriptKindGql,
+    /// Set when `trigger` is `QUEUE`.
+    pub queue_event: Option<QueueEventGql>,
+    pub inputs: Vec<ScriptInstanceValueGql>,
+    /// Empty runs for every category. Only post-processing and queue instances
+    /// can be narrowed.
+    pub categories: Vec<String>,
     pub enabled: bool,
-    pub timeout_seconds: Option<u64>,
-    /// Whether the script is waited for. One that is not is started and left
-    /// to finish on its own, and its result changes nothing.
-    #[graphql(default = true)]
+    /// Whether whatever raised the trigger waits for the script. One that is
+    /// not waited for is started and left to finish on its own, and its result
+    /// changes nothing.
     pub blocking: bool,
+    /// Null runs under the default timeout of its trigger.
+    pub timeout_seconds: Option<u64>,
+    pub run_order: i64,
+    /// Why the script cannot run as things stand, such as its file having gone
+    /// from the scripts directory. Null when it can.
+    pub script_problem: Option<String>,
+    /// The script's header no longer declares the inputs this instance holds.
+    pub header_drift: bool,
 }
 
-#[derive(Debug, Clone, InputObject)]
-pub struct ScriptCategoryListInput {
-    pub category: String,
-    pub entries: Vec<ScriptListEntryInput>,
+/// The scripts directory as it is now, for judging saved instances against.
+pub(crate) struct ScriptDirectoryView {
+    listing: Result<ScriptListing, String>,
 }
 
-#[derive(Debug, Clone, InputObject)]
-pub struct ScriptListsInput {
-    #[graphql(default)]
-    pub global: Vec<ScriptListEntryInput>,
-    #[graphql(default)]
-    pub categories: Vec<ScriptCategoryListInput>,
-}
+impl ScriptDirectoryView {
+    pub(crate) fn new(listing: Result<ScriptListing, String>) -> Self {
+        Self { listing }
+    }
 
-fn script_list(entries: Vec<ScriptListEntryInput>) -> Result<ScriptList, String> {
-    let entries = entries
-        .into_iter()
-        .map(|entry| {
-            Ok(ScriptListEntry {
-                script: ScriptName::new(entry.script).map_err(|error| error.to_string())?,
-                enabled: entry.enabled,
-                timeout_seconds: entry.timeout_seconds,
-                blocking: entry.blocking,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    ScriptList::new(entries).map_err(|error| error.to_string())
-}
-
-impl ScriptListsInput {
-    pub(crate) fn into_domain(self) -> Result<ScriptLists, String> {
-        let mut categories = std::collections::BTreeMap::new();
-        for entry in self.categories {
-            let category = entry.category.trim().to_string();
-            if category.is_empty() {
-                return Err("category name cannot be empty".to_string());
-            }
-            if categories
-                .insert(category, script_list(entry.entries)?)
-                .is_some()
+    pub(crate) fn instance(&self, instance: ScriptInstance) -> ScriptInstanceGql {
+        let (script_problem, header_drift) = match &self.listing {
+            Err(error) => (Some(error.clone()), false),
+            Ok(listing) => match listing
+                .scripts
+                .iter()
+                .find(|script| script.name == instance.script)
             {
-                return Err("category appears more than once".to_string());
-            }
+                Some(script) => (
+                    None,
+                    ScriptPreset::of(&script.manifest).drifted_from(&instance),
+                ),
+                None => (
+                    Some(
+                        listing
+                            .problems
+                            .iter()
+                            .find(|problem| problem.name == instance.script.as_str())
+                            .map(|problem| problem.message.clone())
+                            .unwrap_or_else(|| {
+                                "the script is no longer in the scripts directory".to_string()
+                            }),
+                    ),
+                    false,
+                ),
+            },
+        };
+        let (trigger, queue_event) = trigger_parts(instance.trigger);
+        ScriptInstanceGql {
+            id: instance.id,
+            name: instance.name,
+            script: instance.script.as_str().to_string(),
+            trigger,
+            queue_event,
+            inputs: instance
+                .inputs
+                .into_iter()
+                .map(|input| ScriptInstanceValueGql {
+                    name: input.name.as_str().to_string(),
+                    value: (!input.secret).then_some(input.value),
+                    secret: input.secret,
+                })
+                .collect(),
+            categories: instance.categories,
+            enabled: instance.enabled,
+            blocking: instance.blocking,
+            timeout_seconds: instance.timeout_seconds,
+            run_order: instance.run_order,
+            script_problem,
+            header_drift,
         }
-        Ok(ScriptLists {
-            global: script_list(self.global)?,
-            categories,
-        })
     }
 }
 
 #[derive(Debug, Clone, InputObject)]
-pub struct ScriptOptionInput {
+#[graphql(name = "ScriptInstanceValueInput")]
+pub struct ScriptInstanceValueInput {
     pub name: String,
-    pub option_type: ScriptOptionTypeGql,
-    pub value: String,
+    /// Null on a secret keeps the value already saved under this name.
+    pub value: Option<String>,
+    #[graphql(default)]
+    pub secret: bool,
 }
 
-impl ScriptOptionInput {
-    pub(crate) fn into_domain(self) -> Result<ResolvedOption, String> {
-        let name = OptionName::new(self.name).map_err(|error| error.to_string())?;
-        let value = match self.option_type {
-            ScriptOptionTypeGql::String => OptionValue::String(self.value),
-            ScriptOptionTypeGql::Integer => OptionValue::Integer(
-                self.value
-                    .parse()
-                    .map_err(|_| "invalid integer option value".to_string())?,
+#[derive(Debug, Clone, InputObject)]
+#[graphql(name = "ScriptInstanceInput")]
+pub struct ScriptInstanceInput {
+    /// Empty takes the script's name.
+    #[graphql(default)]
+    pub name: String,
+    pub script: String,
+    pub trigger: ScriptKindGql,
+    /// Required when `trigger` is `QUEUE`, ignored otherwise.
+    pub queue_event: Option<QueueEventGql>,
+    #[graphql(default)]
+    pub inputs: Vec<ScriptInstanceValueInput>,
+    /// Empty runs for every category.
+    #[graphql(default)]
+    pub categories: Vec<String>,
+    #[graphql(default = true)]
+    pub enabled: bool,
+    #[graphql(default = true)]
+    pub blocking: bool,
+    pub timeout_seconds: Option<u64>,
+}
+
+impl ScriptInstanceInput {
+    pub(crate) fn into_draft(self) -> Result<ScriptInstanceDraft, String> {
+        let trigger = match self.trigger {
+            ScriptKindGql::PostProcessing => InstanceTrigger::PostProcessing,
+            ScriptKindGql::Queue => InstanceTrigger::Queue(
+                self.queue_event
+                    .ok_or("a queue instance needs the event it runs on")?
+                    .into(),
             ),
-            ScriptOptionTypeGql::Number => OptionValue::Number(
-                self.value
-                    .parse()
-                    .map_err(|_| "invalid numeric option value".to_string())?,
-            ),
-            ScriptOptionTypeGql::Boolean => OptionValue::Boolean(
-                self.value
-                    .parse()
-                    .map_err(|_| "invalid boolean option value".to_string())?,
-            ),
-            ScriptOptionTypeGql::Secret => {
-                OptionValue::Secret(SecretOptionValue::from_admin_input(self.value))
-            }
+            ScriptKindGql::Scan => InstanceTrigger::Scan,
+            ScriptKindGql::Scheduler => InstanceTrigger::Schedule,
+            ScriptKindGql::Feed => InstanceTrigger::Feed,
         };
-        Ok(ResolvedOption::new(name, value))
+        Ok(ScriptInstanceDraft {
+            name: self.name,
+            script: ScriptName::new(self.script).map_err(|error| error.to_string())?,
+            trigger,
+            inputs: self
+                .inputs
+                .into_iter()
+                .map(|input| InstanceInputDraft {
+                    name: input.name,
+                    value: input.value,
+                    secret: input.secret,
+                })
+                .collect(),
+            categories: self.categories,
+            enabled: self.enabled,
+            blocking: self.blocking,
+            timeout_seconds: self.timeout_seconds,
+        })
     }
 }
 
@@ -418,6 +531,10 @@ pub struct ScriptResultGql {
     pub output_id: Option<String>,
     pub output_retained: bool,
     pub script: String,
+    /// The instance that ran, when the run came from one.
+    pub instance_id: Option<String>,
+    /// The instance's name as it was when it ran.
+    pub instance_name: Option<String>,
     pub event: String,
     /// The run was started without anything waiting for it.
     pub background: bool,
@@ -437,6 +554,8 @@ impl From<ScriptResult> for ScriptResultGql {
             output_id: value.output_id,
             output_retained: false,
             script: value.script.as_str().to_string(),
+            instance_id: value.instance_id,
+            instance_name: value.instance_name,
             event: value.event.to_string(),
             background: value.background,
             adapter: value.adapter.into(),
@@ -471,6 +590,10 @@ pub struct ScriptRunGql {
     /// Known once the job has reached history.
     pub job_name: Option<String>,
     pub script: String,
+    /// The instance that ran, when the run came from one.
+    pub instance_id: Option<String>,
+    /// The instance's name as it was when it ran.
+    pub instance_name: Option<String>,
     pub event: String,
     pub kind: ScriptKindGql,
     /// The run was started without anything waiting for it.
@@ -494,6 +617,8 @@ impl From<ScriptRun> for ScriptRunGql {
             job_id: value.job_id,
             job_name: value.job_name,
             script: result.script.as_str().to_string(),
+            instance_id: result.instance_id,
+            instance_name: result.instance_name,
             kind: result.event.kind().into(),
             event: result.event.to_string(),
             background: result.background,
@@ -593,11 +718,13 @@ pub struct ScriptTestInputGql {
     pub value: String,
 }
 
-/// A script run against made-up inputs, as it stands.
+/// An instance run against made-up inputs, as it stands.
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(name = "ScriptTestRun")]
 pub struct ScriptTestRunGql {
     pub id: String,
+    pub instance_id: String,
+    pub instance_name: String,
     pub script: String,
     pub event: String,
     pub kind: ScriptKindGql,
@@ -614,8 +741,8 @@ pub struct ScriptTestRunGql {
     /// What the script has printed so far, or all of it once the run has ended.
     pub log: String,
     pub log_truncated: bool,
-    /// The variables made up for this run, in name order. The script's saved
-    /// options are left out.
+    /// The variables made up for this run, in name order. The instance's own
+    /// inputs are left out.
     pub inputs: Vec<ScriptTestInputGql>,
     /// The arguments made up for this run, in order.
     pub arguments: Vec<String>,
@@ -629,6 +756,8 @@ impl From<ScriptTestSnapshot> for ScriptTestRunGql {
         let outcome = value.outcome;
         Self {
             id: value.id,
+            instance_id: value.instance_id,
+            instance_name: value.instance_name,
             script: value.script.as_str().to_string(),
             kind: value.event.kind().into(),
             event: value.event.to_string(),

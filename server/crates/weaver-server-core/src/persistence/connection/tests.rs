@@ -3000,36 +3000,67 @@ async fn postgres_post_processing_roundtrip_when_configured() {
     assert_eq!(db.post_processing_settings().unwrap(), settings);
 
     let script = crate::post_processing::model::ScriptName::new("notify.sh").unwrap();
-    let mut lists = crate::post_processing::model::ScriptLists {
-        global: crate::post_processing::model::ScriptList::new(vec![
-            crate::post_processing::model::ScriptListEntry::new(script.clone()),
-        ])
-        .unwrap(),
-        ..Default::default()
-    };
-    lists.categories.insert(
-        "movies".into(),
-        crate::post_processing::model::ScriptList::new(vec![]).unwrap(),
-    );
-    db.save_post_processing_script_lists(&lists).unwrap();
-    assert_eq!(db.post_processing_script_lists().unwrap(), lists);
-
-    let options = vec![crate::post_processing::model::ResolvedOption::new(
-        crate::post_processing::model::OptionName::new("Token").unwrap(),
-        crate::post_processing::model::OptionValue::Secret(
-            crate::post_processing::model::SecretOptionValue::from_admin_input("hunter2"),
-        ),
-    )];
-    db.save_post_processing_script_options(&script, &options)
+    let instance = db
+        .create_script_instance(
+            crate::post_processing::instances::ScriptInstanceDraft::new(
+                script.clone(),
+                crate::post_processing::instances::InstanceTrigger::Queue(
+                    crate::post_processing::model::QueueEvent::NzbAdded,
+                ),
+            )
+            .named("Notify")
+            .input("Server", "example.test")
+            .secret_input("Token", "hunter2")
+            .category("movies")
+            .fire_and_forget()
+            .timeout(90),
+        )
         .unwrap();
-    let raw = db
-        .get_setting("post_processing.script_options.v1")
+    assert_eq!(
+        db.script_instances().unwrap(),
+        std::slice::from_ref(&instance)
+    );
+    // A secret is never handed back with the instance.
+    assert_eq!(
+        instance
+            .inputs
+            .iter()
+            .map(|input| (input.name.as_str(), input.value.as_str(), input.secret))
+            .collect::<Vec<_>>(),
+        [("Server", "example.test", false), ("Token", "", true)]
+    );
+    let run_inputs = db
+        .script_instance_run_inputs(&instance.id)
         .unwrap()
         .unwrap();
-    assert!(!raw.contains("hunter2"));
-    let loaded = db.post_processing_script_options(&script).unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert!(loaded[0].value().is_secret());
+    assert_eq!(run_inputs.len(), 2);
+    assert!(run_inputs[1].value().is_secret());
+    let feed_instance = db
+        .create_script_instance(crate::post_processing::instances::ScriptInstanceDraft::new(
+            script.clone(),
+            crate::post_processing::instances::InstanceTrigger::Feed,
+        ))
+        .unwrap();
+    db.set_feed_script_instances(7, std::slice::from_ref(&feed_instance.id))
+        .unwrap();
+    assert_eq!(
+        db.feed_script_instance_ids(7).unwrap(),
+        std::slice::from_ref(&feed_instance.id)
+    );
+    db.reorder_script_instances(&[feed_instance.id.clone(), instance.id.clone()])
+        .unwrap();
+    assert_eq!(
+        db.script_instances()
+            .unwrap()
+            .iter()
+            .map(|saved| saved.id.clone())
+            .collect::<Vec<_>>(),
+        [feed_instance.id.clone(), instance.id.clone()]
+    );
+    assert!(db.delete_script_instance(&feed_instance.id).unwrap());
+    assert!(db.feed_script_instance_ids(7).unwrap().is_empty());
+    assert!(db.delete_script_instance(&instance.id).unwrap());
+    assert!(db.script_instances().unwrap().is_empty());
 
     let job_id = 4242;
     db.insert_job_history(&crate::history::JobHistoryRow {
@@ -3055,6 +3086,8 @@ async fn postgres_post_processing_roundtrip_when_configured() {
     .unwrap();
     let results = vec![crate::post_processing::model::ScriptResult {
         script,
+        instance_id: Some("instance".into()),
+        instance_name: Some("Notify".into()),
         event: Default::default(),
         adapter: crate::post_processing::model::ScriptAdapter::Nzbget,
         status: crate::post_processing::model::ScriptStatus::Succeeded,

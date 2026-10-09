@@ -430,4 +430,7 @@ pub enum CallerIdentity {
     Local([u8; 32]),
     Jwt([u8; 32]),
     ApiKey([u8; 32]),
+    /// A running script, named by its run. It is a caller only for as long as
+    /// that run lasts.
+    ScriptRun(String),
 }

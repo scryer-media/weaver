@@ -25,8 +25,11 @@ pub struct ScheduleEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduleAction {
+    /// Run a script instance. A row saved before there were instances has no
+    /// id here until it is moved over, and runs nothing.
     RunScript {
-        script: String,
+        #[serde(default)]
+        instance_id: String,
         #[serde(default)]
         run_at_startup: bool,
     },
