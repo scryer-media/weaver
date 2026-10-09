@@ -427,6 +427,56 @@ fn secrets_are_created_renamed_rotated_and_deleted_only_when_unused() {
 }
 
 #[test]
+fn linking_a_deleted_secrets_stale_id_is_refused_as_invalid() {
+    let db = Database::open_in_memory().unwrap();
+    let gone = db.create_secret("Gone", "x").unwrap();
+    db.delete_secret(&gone.id).unwrap();
+
+    let error = db
+        .create_script_instance(
+            draft("a.sh", InstanceTrigger::PostProcessing).secret_input("Token", &gone.id),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ScriptInstanceError::Invalid("a linked secret does not exist")
+        ),
+        "{error:?}"
+    );
+    assert!(db.script_instances().unwrap().is_empty());
+
+    let kept = db.create_secret("Kept", "y").unwrap();
+    let saved = db
+        .create_script_instance(
+            draft("a.sh", InstanceTrigger::PostProcessing).secret_input("Token", &kept.id),
+        )
+        .unwrap();
+    let error = db
+        .update_script_instance(
+            &saved.id,
+            draft("a.sh", InstanceTrigger::PostProcessing).secret_input("Token", &gone.id),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ScriptInstanceError::Invalid("a linked secret does not exist")
+        ),
+        "{error:?}"
+    );
+    // The refused update left the saved link as it was.
+    let after = db.script_instance(&saved.id).unwrap().unwrap();
+    assert_eq!(
+        after.inputs[0]
+            .secret
+            .as_ref()
+            .map(|secret| secret.id.as_str()),
+        Some(kept.id.as_str())
+    );
+}
+
+#[test]
 fn an_instance_that_could_not_run_as_written_is_refused() {
     let db = Database::open_in_memory().unwrap();
     let pp = InstanceTrigger::PostProcessing;

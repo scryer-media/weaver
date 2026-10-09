@@ -1103,6 +1103,7 @@ export const nextDe: LocaleDictionary = {
   "next.postProcessing.secret": "Geheim",
   "next.postProcessing.secretLinkHelp": "Verknüpft aus Einstellungen · Skripte · Geheimnisse. Das Skript erhält den Wert beim Ausführen; hier wird er nie angezeigt.",
   "next.postProcessing.chooseSecret": "Geheimnis wählen",
+  "next.postProcessing.noSecret": "Kein Geheimnis",
   "next.postProcessing.createSecret": "Neues Geheimnis erstellen…",
   "next.postProcessing.inputIsSecret": "{{name}} ist geheim",
   "next.postProcessing.undeclaredInput": "Im Header des Skripts nicht deklariert.",

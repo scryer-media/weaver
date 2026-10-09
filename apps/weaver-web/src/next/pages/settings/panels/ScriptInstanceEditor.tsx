@@ -25,6 +25,7 @@ import {
   triggerTitle,
   unwiredTriggers,
   withScript,
+  withLinkedSecret,
   withSecret,
   type DiscoveredScript,
   type InstanceForm,
@@ -245,12 +246,17 @@ export function ScriptInstanceEditor({
   };
   const setInput = (index: number, value: string) => changeInput(index, (entry) => ({ ...entry, value }));
   const linkSecret = (index: number, secretId: string | null) =>
-    changeInput(index, (entry) => ({ ...entry, secretId }));
+    changeInput(index, (entry) => withLinkedSecret(entry, secretId));
 
+  // The first entry clears the link: a prompt while nothing is linked, and
+  // "No secret" once something is.
   const secretOptions = (input: InstanceInputForm) => {
     const known = input.secretId === null || secrets.some((entry) => entry.id === input.secretId);
     return [
-      ...(input.secretId === null ? [{ value: "", label: t("next.postProcessing.chooseSecret") }] : []),
+      {
+        value: "",
+        label: t(input.secretId === null ? "next.postProcessing.chooseSecret" : "next.postProcessing.noSecret"),
+      },
       ...secrets.map((entry) => ({ value: entry.id, label: entry.name })),
       ...(known ? [] : [{ value: input.secretId!, label: linked.get(input.secretId!)?.name ?? input.secretId! }]),
       { value: CREATE_SECRET, label: t("next.postProcessing.createSecret") },

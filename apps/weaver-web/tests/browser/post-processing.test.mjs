@@ -507,16 +507,28 @@ test("a secret input shows the secret it links and never its value, and can link
     } } }]);
     assert.deepEqual(held.instances[0].inputs[1], { name: "Token", value: "", secretId: "s1" });
 
-    // A linked input offers the other secrets and a new one, but not going back to none.
+    // A linked input offers no secret first, then the other secrets and a new one.
     editor = await edit(page, "Notify all");
     await action(editor, "Token").click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Notify token", "Spare key", "Create new secret…"]);
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["No secret", "Notify token", "Spare key", "Create new secret…"]);
     await page.getByRole("menuitemradio", { name: "Spare key", exact: true }).click();
     await action(editor, "Save").click();
     await editor.waitFor({ state: "detached" });
     await status(page, "Notify all saved").waitFor();
     held = await daemon(page);
     assert.deepEqual(held.requests.at(-1).variables.input.inputs[1], { name: "Token", secretId: "s2" });
+
+    // Choosing no secret unlinks it: the slot stays, and nothing is sent for it.
+    editor = await edit(page, "Notify all");
+    await pick(page, editor, "Token", "No secret");
+    await action(editor, "Token").getByText("Choose a secret", { exact: true }).waitFor();
+    await action(editor, "Save").click();
+    await editor.waitFor({ state: "detached" });
+    await status(page, "Notify all saved").waitFor();
+    held = await daemon(page);
+    assert.deepEqual(held.requests.at(-1).variables.input.inputs, [
+      { name: "Label", value: "renamed" }, { name: "Mode", value: "quiet" }, { name: "Attach", value: "no" },
+    ]);
 
     // A secret the instance never linked is offered unchosen, and one can be created on the spot.
     editor = await edit(page, "Log removal");

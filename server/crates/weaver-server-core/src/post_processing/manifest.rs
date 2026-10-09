@@ -114,15 +114,68 @@ pub fn apply_bare_script_declarations(manifest: ScriptManifest, script: &str) ->
     apply_declarations(manifest, kinds, queue_events, task_times)
 }
 
-/// Words that mark a header option as a credential. A hint for the form, not
-/// a lock: the operator may still save the input as plain text.
-const SECRET_NAME_HINTS: [&str; 6] = ["key", "token", "password", "pass", "secret", "apikey"];
+/// Words that mark a header option as a credential when one of them is a
+/// whole word of the option's name. A hint for the form, not a lock: the
+/// operator may still save the input as plain text.
+const SECRET_NAME_HINTS: [&str; 7] = [
+    "key",
+    "apikey",
+    "token",
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+];
+/// `pass` names a credential only as the last word of the name (`SmtpPass`,
+/// `DB_PASS`); leading, as in `PassThrough`, it means something else.
+const TRAILING_SECRET_NAME_HINT: &str = "pass";
 const MAX_HEADER_OPTIONS: usize = 256;
+
+/// The words of an option name, lowercased: split on `_`, `-`, `.` and
+/// whitespace, on lower-to-upper case changes, before the last capital of an
+/// acronym run (`APIKey` is `api` and `key`), and between letters and digits.
+fn option_name_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let characters: Vec<char> = name.chars().collect();
+    for (index, &character) in characters.iter().enumerate() {
+        if !character.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if let Some(&previous) = index.checked_sub(1).and_then(|at| characters.get(at)) {
+            let next = characters.get(index + 1).copied();
+            let boundary = (previous.is_lowercase() && character.is_uppercase())
+                || (previous.is_alphabetic() && character.is_numeric())
+                || (previous.is_numeric() && character.is_alphabetic())
+                || (previous.is_uppercase()
+                    && character.is_uppercase()
+                    && next.is_some_and(char::is_lowercase));
+            if boundary && !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        }
+        current.extend(character.to_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
 
 /// Whether an option's name says it holds a credential.
 pub fn option_name_suggests_secret(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    SECRET_NAME_HINTS.iter().any(|hint| name.contains(hint))
+    let words = option_name_words(name);
+    let is_hint = |word: &str| SECRET_NAME_HINTS.contains(&word);
+    words.iter().any(|word| is_hint(word))
+        || words
+            .windows(2)
+            .any(|pair| is_hint(&format!("{}{}", pair[0], pair[1])))
+        || words
+            .last()
+            .is_some_and(|word| word == TRAILING_SECRET_NAME_HINT)
 }
 
 /// The options a bare NZBGet script declares in its header: the `#Name=value`

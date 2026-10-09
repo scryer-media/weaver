@@ -1103,6 +1103,7 @@ export const nextJa: LocaleDictionary = {
   "next.postProcessing.secret": "シークレット",
   "next.postProcessing.secretLinkHelp": "設定 · スクリプト · シークレットから参照します。スクリプトの実行時に値が渡されますが、ここに表示されることはありません。",
   "next.postProcessing.chooseSecret": "シークレットを選択",
+  "next.postProcessing.noSecret": "シークレットなし",
   "next.postProcessing.createSecret": "新しいシークレットを作成…",
   "next.postProcessing.inputIsSecret": "{{name}} はシークレット",
   "next.postProcessing.undeclaredInput": "スクリプトのヘッダーでは宣言されていません。",

@@ -1,4 +1,5 @@
 use super::*;
+use crate::auth::graphql_error;
 use weaver_server_core::post_processing::executor::strict_security_enabled;
 use weaver_server_core::post_processing::listing::list_scripts;
 use weaver_server_core::post_processing::output::ScriptRunFilter;
@@ -88,9 +89,9 @@ impl PostProcessingQuery {
         let db = ctx.data::<Database>()?.clone();
         tokio::task::spawn_blocking(move || db.secrets())
             .await
-            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
             .map(|secrets| secrets.into_iter().map(Into::into).collect())
-            .map_err(|error| async_graphql::Error::new(error.to_string()))
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
 
     /// Live listing of the scripts directory, each script with the preset its

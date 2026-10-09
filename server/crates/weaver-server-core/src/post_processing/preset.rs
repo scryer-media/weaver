@@ -120,31 +120,33 @@ impl ScriptPreset {
     /// default, and nothing the header no longer declares.
     ///
     /// A secret slot keeps the secret it is linked to. One with no link yet
-    /// is left out until the operator picks a secret for it. An input that
-    /// changed between secret and plain starts again from the header, because
-    /// a stored secret is never turned back into plain text.
+    /// is left out until the operator picks a secret for it. A plain value
+    /// saved for an input the header now calls secret is kept as it is, so the
+    /// run still gets it and the drift stays visible. An input that went from
+    /// secret to plain starts again from the header's default, because a
+    /// stored secret is never turned back into plain text.
     pub fn reapplied_to(&self, instance: &ScriptInstance) -> ScriptInstanceDraft {
         let mut draft = ScriptInstanceDraft::from_instance(instance);
         draft.inputs = self
             .inputs
             .iter()
             .filter_map(|declared| {
-                let saved = instance.inputs.iter().find(|input| {
-                    input.name.as_str().eq_ignore_ascii_case(&declared.name)
-                        && input.is_secret() == declared.secret
-                });
+                let saved = instance
+                    .inputs
+                    .iter()
+                    .find(|input| input.name.as_str().eq_ignore_ascii_case(&declared.name));
                 match (saved, declared.secret) {
-                    (Some(saved), true) => saved
-                        .secret
-                        .as_ref()
-                        .map(|secret| InstanceInputDraft::secret(&declared.name, &secret.id)),
+                    (Some(saved), true) => match saved.secret.as_ref() {
+                        Some(secret) => {
+                            Some(InstanceInputDraft::secret(&declared.name, &secret.id))
+                        }
+                        None => Some(InstanceInputDraft::plain(&declared.name, &saved.value)),
+                    },
                     (None, true) => None,
-                    (Some(saved), false) => {
+                    (Some(saved), false) if !saved.is_secret() => {
                         Some(InstanceInputDraft::plain(&declared.name, &saved.value))
                     }
-                    (None, false) => {
-                        Some(InstanceInputDraft::plain(&declared.name, &declared.value))
-                    }
+                    (_, false) => Some(InstanceInputDraft::plain(&declared.name, &declared.value)),
                 }
             })
             .collect();
@@ -402,9 +404,39 @@ mod tests {
                 // Was a secret, is plain now: starts again from the header,
                 // and the secret's value is never what fills it.
                 InstanceInputDraft::plain("Mode", "fast"),
-                // A secret slot with no link yet, and one whose saved value was
-                // plain, are left for the operator to link.
+                // A secret slot with no link yet is left for the operator to
+                // link; one whose saved value was plain keeps that value.
+                InstanceInputDraft::plain("ApiKey", "typed in clear"),
             ]
+        );
+    }
+
+    #[test]
+    fn reapplying_keeps_a_plain_value_the_header_now_calls_secret_and_still_shows_drift() {
+        let header = preset(vec![declared("ApiKey", None, true)]);
+        let before = instance(vec![saved("apikey", "typed in clear", false)]);
+        let inputs = header.reapplied_to(&before).inputs;
+        assert_eq!(
+            inputs,
+            [InstanceInputDraft::plain("ApiKey", "typed in clear")]
+        );
+
+        // Saved back, the input is still plain where the header wants a
+        // secret, so the drift stays visible until the operator links one.
+        let after = instance(vec![saved("ApiKey", "typed in clear", false)]);
+        assert!(header.drifted_from(&after));
+
+        // A linked secret is never turned into a plain value, whichever way
+        // the header classifies the option.
+        let linked = instance(vec![saved("ApiKey", "stored", true)]);
+        assert_eq!(
+            header.reapplied_to(&linked).inputs,
+            [InstanceInputDraft::secret("ApiKey", "stored")]
+        );
+        let now_plain = preset(vec![declared("ApiKey", Some("default"), false)]);
+        assert_eq!(
+            now_plain.reapplied_to(&linked).inputs,
+            [InstanceInputDraft::plain("ApiKey", "default")]
         );
     }
 

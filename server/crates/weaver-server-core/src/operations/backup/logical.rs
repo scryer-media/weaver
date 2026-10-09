@@ -2031,6 +2031,71 @@ mod logical_reader_tests {
     }
 
     #[test]
+    fn a_restore_replaces_linked_secrets_already_on_the_target() {
+        use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+        use crate::post_processing::model::{OptionValue, ScriptName};
+
+        let draft = |script: &str| {
+            ScriptInstanceDraft::new(
+                ScriptName::new(script).unwrap(),
+                InstanceTrigger::PostProcessing,
+            )
+        };
+        let source = Database::open_in_memory().unwrap();
+        let token = source.create_secret("Mail token", "from-bundle").unwrap();
+        let bundled = source
+            .create_script_instance(draft("notify.sh").secret_input("Token", &token.id))
+            .unwrap();
+        let archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+
+        // The target links secrets of its own, one of them under a name that
+        // differs from the bundle's only by case.
+        let mut target = Database::open_in_memory().unwrap();
+        target.set_encryption_key(source.encryption_key().unwrap().clone());
+        let clash = target.create_secret("MAIL TOKEN", "on-target").unwrap();
+        let other = target.create_secret("Other", "on-target").unwrap();
+        let local = target
+            .create_script_instance(
+                draft("local.sh")
+                    .secret_input("Token", &clash.id)
+                    .secret_input("Other", &other.id),
+            )
+            .unwrap();
+        assert_ne!(clash.id, token.id);
+
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap();
+
+        let restored = target.secrets().unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|secret| (
+                    secret.id.as_str(),
+                    secret.name.as_str(),
+                    secret
+                        .used_by
+                        .iter()
+                        .map(|usage| usage.instance_id.as_str())
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            [(token.id.as_str(), "Mail token", vec![bundled.id.as_str()])]
+        );
+        assert_eq!(
+            target.script_instances().unwrap(),
+            std::slice::from_ref(&bundled)
+        );
+        assert!(target.script_instance(&local.id).unwrap().is_none());
+        assert!(matches!(
+            target.script_instance_run_inputs(&bundled.id).unwrap().unwrap()[0].value(),
+            OptionValue::Secret(value) if value.expose_for_execution() == "from-bundle"
+        ));
+    }
+
+    #[test]
     fn bounded_line_reader_rejects_before_buffering_an_oversized_row() {
         let mut reader = BufReader::new(std::io::Cursor::new(vec![b'x'; 9]));
         let mut line = Vec::new();

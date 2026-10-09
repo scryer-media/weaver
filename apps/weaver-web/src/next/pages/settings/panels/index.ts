@@ -102,14 +102,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     Component: ScriptConfigurationPanel,
   },
   {
-    slug: "scripts/secrets",
-    group: "scripts",
-    label: "next.settings.panel.secrets",
-    note: "next.settings.panel.secretsNote",
-    icon: "postProcessing",
-    Component: SecretsPanel,
-  },
-  {
     slug: "scripts/list",
     group: "scripts",
     label: "next.settings.panel.scripts",
@@ -117,6 +109,14 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     tag: "beta",
     icon: "postProcessing",
     Component: ScriptListPanel,
+  },
+  {
+    slug: "scripts/secrets",
+    group: "scripts",
+    label: "next.settings.panel.secrets",
+    note: "next.settings.panel.secretsNote",
+    icon: "postProcessing",
+    Component: SecretsPanel,
   },
   {
     slug: "scripts/runs",
