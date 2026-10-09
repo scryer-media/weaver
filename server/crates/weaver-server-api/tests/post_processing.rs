@@ -151,12 +151,14 @@ async fn settings_round_trip_preserves_omitted_extensions_and_rejects_invalid_up
                 concurrency: 2
                 terminationGraceSeconds: 15
                 pythonInterpreter: "/usr/bin/python3"
+                goInterpreter: "/usr/local/go/bin/go"
                 unacceptableExtensions: ["EXE", "r??"]
               }) {
                 executionEnabled
                 concurrency
                 terminationGraceSeconds
                 pythonInterpreter
+                goInterpreter
                 unacceptableExtensions
               }
             }
@@ -169,6 +171,7 @@ async fn settings_round_trip_preserves_omitted_extensions_and_rejects_invalid_up
     assert_eq!(settings["concurrency"], 2);
     assert_eq!(settings["terminationGraceSeconds"], 15);
     assert_eq!(settings["pythonInterpreter"], "/usr/bin/python3");
+    assert_eq!(settings["goInterpreter"], "/usr/local/go/bin/go");
     assert_eq!(
         settings["unacceptableExtensions"],
         serde_json::json!(["exe", "r??"])

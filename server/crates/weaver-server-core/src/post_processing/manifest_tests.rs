@@ -1,6 +1,6 @@
 use super::manifest::{
-    ManifestError, bare_script_options, detect_bare_script_adapter, option_name_suggests_secret,
-    parse_nzbget_manifest,
+    ManifestError, bare_script_options, detect_bare_script_adapter, go_script_header,
+    option_name_suggests_secret, parse_nzbget_manifest,
 };
 use super::model::{OptionValue, ScriptAdapter, ScriptOptionType, ScriptSelectValue};
 
@@ -361,6 +361,61 @@ fn bare_script_detection_stops_when_executable_content_begins() {
         detect_bare_script_adapter("#!/bin/sh"),
         ScriptAdapter::Sabnzbd
     );
+}
+
+#[test]
+fn a_go_script_declares_the_legacy_header_in_its_leading_line_comments() {
+    let script = "\u{feff}//go:build ignore\r\n\
+        \r\n\
+        // ### NZBGET QUEUE/SCHEDULER SCRIPT ###\r\n\
+        //### QUEUE EVENTS: NZB_ADDED\r\n\
+        // ### TASK TIME: 03:15\r\n\
+        //\r\n\
+        // Prose that is not part of the header.\r\n\
+        // ### OPTIONS ###\r\n\
+        // # Where to report.\r\n\
+        // #Server=localhost\r\n\
+        //#ApiToken=\r\n\
+        // ### NZBGET QUEUE/SCHEDULER SCRIPT ###\r\n\
+        \r\n\
+        package main\r\n\
+        \r\n\
+        // #Ignored=after the code began\r\n";
+    let header = go_script_header(script);
+    assert_eq!(
+        header,
+        "\n\n### NZBGET QUEUE/SCHEDULER SCRIPT ###\n### QUEUE EVENTS: NZB_ADDED\n\
+         ### TASK TIME: 03:15\n\n\n### OPTIONS ###\n# Where to report.\n#Server=localhost\n\
+         #ApiToken=\n### NZBGET QUEUE/SCHEDULER SCRIPT ###\n\n"
+    );
+    assert_eq!(detect_bare_script_adapter(&header), ScriptAdapter::Nzbget);
+    let options = bare_script_options(&header);
+    let shape = options
+        .iter()
+        .map(|option| (option.name().as_str(), option.option_type()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shape,
+        [
+            ("Server", ScriptOptionType::String),
+            ("ApiToken", ScriptOptionType::Secret),
+        ]
+    );
+    assert_eq!(options[0].description(), ["Where to report."]);
+
+    // Without the header it is a SABnzbd script like any other, and a header
+    // below the first line of code is not one.
+    for plain in [
+        "// Reports a finished download.\npackage main\n",
+        "package main\n\n// ### NZBGET QUEUE SCRIPT ###\n",
+        "/*\n### NZBGET QUEUE SCRIPT ###\n*/\npackage main\n",
+    ] {
+        assert_eq!(
+            detect_bare_script_adapter(&go_script_header(plain)),
+            ScriptAdapter::Sabnzbd,
+            "{plain}"
+        );
+    }
 }
 
 #[test]

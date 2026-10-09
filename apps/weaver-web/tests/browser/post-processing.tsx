@@ -92,7 +92,8 @@ const state = {
     eventScriptConcurrency: 1, eventScriptTimeoutSeconds: 300, fileDownloadedEventInterval: 0,
     scriptOutputRunsPerJob: 32, scriptOutputFailedRunsPerJob: 8, terminationGraceSeconds: 10,
     pythonInterpreter: null as string | null, powershellInterpreter: null as string | null,
-    batchInterpreter: null as string | null, unacceptableExtensions: ["exe", "scr"],
+    batchInterpreter: null as string | null, goInterpreter: null as string | null,
+    unacceptableExtensions: ["exe", "scr"],
     strictSecurityRefusesExecution: false,
   },
   scripts: {
