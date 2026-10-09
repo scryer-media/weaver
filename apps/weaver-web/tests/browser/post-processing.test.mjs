@@ -23,7 +23,23 @@ const stored = (page) => page.evaluate(() => fetch("/graphql", {
   method: "POST", body: JSON.stringify({ operationName: "PostProcessingSettings", variables: {} }),
 }).then((response) => response.json()).then((payload) => payload.data.postProcessingSettings));
 
-test("event script limits are a section of the panel and save with the rest of it", async () => {
+test("configuration and scripts are two screens that share nothing but the settings behind them", async () => {
+  const region = (page, name) => page.getByRole("region", { name, exact: true });
+  const configuration = ["Execution", "Event scripts and output retention", "Interpreters", "Scripts directory"];
+  const scripts = ["Run list", "Discovered scripts", "Scripts that could not be read"];
+  for (const [query, shown, absent] of [["", configuration, scripts], ["?scripts", scripts, configuration]]) {
+    const page = await open(query);
+    try {
+      for (const name of shown) await region(page, name).waitFor();
+      assert.equal(await page.getByRole("region").count(), shown.length);
+      for (const name of absent) assert.equal(await region(page, name).count(), 0);
+      // Which downloads a run list is for is chosen only where the run list is.
+      assert.equal(await page.locator("#controls").getByRole("button").count(), query === "" ? 0 : 1);
+    } finally { await page.close(); }
+  }
+});
+
+test("event script limits are a section of the configuration and save with the rest of it", async () => {
   const page = await open();
   try {
     const events = page.getByRole("region", { name: "Event scripts and output retention", exact: true });
@@ -31,9 +47,13 @@ test("event script limits are a section of the panel and save with the rest of i
     const limit = (name) => events.getByRole("spinbutton", { name, exact: true });
     for (const [name, value] of [
       ["Concurrent event scripts", "1"], ["Default event timeout", "300"], ["File event interval", "0"],
-      ["Captured output per run", "1048576"], ["Retained runs per job", "32"],
-      ["Compressed output budget", "67108864"], ["Compressed output cap per run", "2097152"],
+      ["Captured output per run", "1024"], ["Retained runs per job", "32"],
+      ["Compressed output budget", "64"], ["Compressed output cap per run", "2048"],
     ]) assert.equal(await limit(name).inputValue(), value);
+    // A size is read in the unit beside it and stored in bytes.
+    for (const [name, unit] of [["Captured output per run", "KB"], ["Compressed output budget", "MB"], ["Compressed output cap per run", "KB"]]) {
+      await events.locator("label").filter({ has: page.getByRole("spinbutton", { name, exact: true }) }).getByText(unit, { exact: true }).waitFor();
+    }
     // The execution limit keeps a name of its own beside the event one.
     assert.equal(await page.getByRole("spinbutton", { name: "Concurrent scripts", exact: true }).count(), 1);
     const save = page.getByRole("button", { name: "Save changes", exact: true });
@@ -43,16 +63,39 @@ test("event script limits are a section of the panel and save with the rest of i
     await limit("File event interval").blur();
     await limit("Concurrent event scripts").fill("12");
     await limit("Concurrent event scripts").blur();
+    await limit("Compressed output budget").fill("128");
+    await limit("Compressed output budget").blur();
     await save.click();
     await page.getByRole("contentinfo").getByText("Saved", { exact: true }).waitFor();
     const settings = await stored(page);
     assert.equal(settings.fileDownloadedEventInterval, -1);
     assert.equal(settings.eventScriptConcurrency, 8);
+    assert.equal(settings.scriptOutputRingBytes, 128 * 1024 * 1024);
     assert.equal(await limit("Concurrent event scripts").inputValue(), "8");
   } finally { await page.close(); }
 });
 
-test("the panel search reaches an event script limit", async () => {
+test("a size its unit only rounds is stored as it was unless its field is changed", async () => {
+  const page = await open("?uneven");
+  try {
+    const events = page.getByRole("region", { name: "Event scripts and output retention", exact: true });
+    const limit = (name) => events.getByRole("spinbutton", { name, exact: true });
+    await limit("Compressed output cap per run").waitFor();
+    assert.equal(await limit("Compressed output cap per run").inputValue(), "2048");
+    // Leaving the field commits what it shows, which is not what is stored.
+    await limit("Compressed output cap per run").focus();
+    await limit("Compressed output cap per run").blur();
+    await limit("Retained runs per job").fill("16");
+    await limit("Retained runs per job").blur();
+    await page.getByRole("button", { name: "Save changes", exact: true }).click();
+    await page.getByRole("contentinfo").getByText("Saved", { exact: true }).waitFor();
+    const settings = await stored(page);
+    assert.equal(settings.scriptOutputRunsPerJob, 16);
+    assert.equal(settings.scriptOutputRunCapBytes, 2097000);
+  } finally { await page.close(); }
+});
+
+test("the settings search reaches an event script limit", async () => {
   const page = await open("?search=retained");
   try {
     const events = page.getByRole("region", { name: "Event scripts and output retention", exact: true });
@@ -65,7 +108,7 @@ test("the panel search reaches an event script limit", async () => {
 const runSwitch = (runList, script) => runList.getByRole("switch", { name: `Run ${script}`, exact: true });
 
 test("a run list row carries its timeout, its switch and its order controls", async () => {
-  const page = await open();
+  const page = await open("?scripts");
   try {
     const runList = page.getByRole("region", { name: "Run list", exact: true });
     await runList.getByRole("switch").first().and(runSwitch(runList, "notify.py")).waitFor();
@@ -83,7 +126,7 @@ test("a run list row carries its timeout, its switch and its order controls", as
 });
 
 test("a run list control shows its edit at once and saves it", async () => {
-  // The panel saves a run-list edit behind what it shows, so each edit gets a
+  // The screen saves a run-list edit behind what it shows, so each edit gets a
   // page of its own: no earlier save or refetch is in flight when it is made.
   for (const [edit, saved] of [
     [async (runList) => {
@@ -104,7 +147,7 @@ test("a run list control shows its edit at once and saves it", async () => {
       await runSwitch(runList, "retired.py").waitFor({ state: "detached" });
     }, (list) => assert.deepEqual(list.map((entry) => entry.script), ["notify.py", "cleanup.sh"])],
   ]) {
-    const page = await open();
+    const page = await open("?scripts");
     try {
       const runList = page.getByRole("region", { name: "Run list", exact: true });
       await runSwitch(runList, "notify.py").waitFor();
@@ -116,7 +159,7 @@ test("a run list control shows its edit at once and saves it", async () => {
 });
 
 test("discovered scripts name their kinds, declared events and task times", async () => {
-  const page = await open();
+  const page = await open("?scripts");
   try {
     const discovered = page.getByRole("region", { name: "Discovered scripts", exact: true });
     const entry = (name) => discovered.getByRole("button").filter({ has: page.getByText(name, { exact: true }) });

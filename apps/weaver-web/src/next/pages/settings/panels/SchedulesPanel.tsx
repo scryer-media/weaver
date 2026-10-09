@@ -164,7 +164,7 @@ export function SchedulesPanel() {
         offeredProfiles[0] ??
         null;
 
-  const open = (schedule: Schedule | null, actionType = NEW_SCHEDULE.actionType) => {
+  const open = (schedule: Schedule | null) => {
     setError(null);
     // A script's own task times are the script's to change, not the panel's.
     setStatus(schedule?.implicit ? t("next.schedules.manifestReadOnly") : null);
@@ -185,7 +185,7 @@ export function SchedulesPanel() {
             hardwareProfile: schedule.hardwareProfile,
             options: optionsFromSchedule(schedule),
           }
-        : { ...NEW_SCHEDULE, actionType },
+        : NEW_SCHEDULE,
     );
     setEditingId(schedule ? schedule.id : "new");
   };
@@ -251,11 +251,44 @@ export function SchedulesPanel() {
     void reexecute({ requestPolicy: "network-only" });
   };
 
-  const blocks: SettingsBlock[] = SCHEDULE_TRACKS.map((track) => ({
+  const row = (schedule: Schedule) => ({
+    id: schedule.id,
+    searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.implicit ? t("next.schedules.manifest") : ""} ${schedule.label ?? ""}`,
+    cells: [
+      <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
+        {scheduleTimeLabel(schedule)}
+      </Cell>,
+      <Cell key="days" mono className="text-wv-secondary">
+        {daysLabel(t, schedule.days)}
+      </Cell>,
+      <div key="action" className="flex min-w-0 items-center gap-[10px]">
+        <Cell title={actionLabel(t, schedule, targets)}>{actionLabel(t, schedule, targets)}</Cell>
+        {/* A rule a script's manifest declares: listed here, changed in the script. */}
+        {schedule.implicit ? <Tag>{t("next.schedules.manifest")}</Tag> : null}
+      </div>,
+      <Cell key="label" className="text-wv-muted">
+        {schedule.label || "—"}
+      </Cell>,
+      <span key="enabled" onClick={(event) => event.stopPropagation()}>
+        <Toggle
+          size="table"
+          checked={schedule.enabled}
+          disabled={schedule.implicit}
+          label={t("next.schedules.enabledAria", { time: schedule.time })}
+          onChange={(next) => void toggle(schedule, next)}
+        />
+      </span>,
+    ],
+  });
+
+  // One list of every rule. Rules that replace one another sit together under
+  // their group's heading, because a rule holds until the next one in its group.
+  const blocks: SettingsBlock[] = [
+    {
       kind: "table",
-      id: `schedules-${track.value}`,
-      title: t(track.label),
-      note: t(track.value === "ONE_SHOT" ? "next.schedules.oneShotNote" : "next.schedules.trackNote"),
+      id: "schedules",
+      title: t("next.settings.panel.schedules"),
+      note: t("next.schedules.trackNote"),
       columns: "96px minmax(0, 0.8fr) minmax(0, 1.6fr) minmax(0, 1fr) 44px",
       headers: [
         t("next.schedules.time"),
@@ -264,44 +297,23 @@ export function SchedulesPanel() {
         t("next.schedules.label"),
         "",
       ],
-      empty: t("next.schedules.trackEmpty"),
-      emptyAction: { label: t("next.schedules.add"), onClick: () => open(null, track.action) },
+      empty: t("next.schedules.empty"),
       onRowClick: (id) => {
         const schedule = schedules.find((entry) => entry.id === id);
         if (schedule) {
           open(schedule);
         }
       },
-      rows: schedules.filter((schedule) => schedule.track === track.value).map((schedule) => ({
-        id: schedule.id,
-        searchText: `${scheduleTimeLabel(schedule)} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.implicit ? t("next.schedules.manifest") : ""} ${schedule.label ?? ""}`,
-        cells: [
-          <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
-            {scheduleTimeLabel(schedule)}
-          </Cell>,
-          <Cell key="days" mono className="text-wv-secondary">
-            {daysLabel(t, schedule.days)}
-          </Cell>,
-          <div key="action" className="flex min-w-0 items-center gap-[10px]">
-            <Cell title={actionLabel(t, schedule, targets)}>{actionLabel(t, schedule, targets)}</Cell>
-            {/* A rule a script's manifest declares: listed here, changed in the script. */}
-            {schedule.implicit ? <Tag>{t("next.schedules.manifest")}</Tag> : null}
-          </div>,
-          <Cell key="label" className="text-wv-muted">
-            {schedule.label || "—"}
-          </Cell>,
-          <span key="enabled" onClick={(event) => event.stopPropagation()}>
-            <Toggle
-              size="table"
-              checked={schedule.enabled}
-              disabled={schedule.implicit}
-              label={t("next.schedules.enabledAria", { time: schedule.time })}
-              onChange={(next) => void toggle(schedule, next)}
-            />
-          </span>,
-        ],
+      rows: [],
+      groups: SCHEDULE_TRACKS.map((track) => ({
+        id: track.value,
+        title: t(track.label),
+        // The one group whose rules do not hold says so in place of the list's note.
+        note: track.value === "ONE_SHOT" ? t("next.schedules.oneShotNote") : undefined,
+        rows: schedules.filter((schedule) => schedule.track === track.value).map(row),
       })),
-  }));
+    },
+  ];
 
   const optionFields = {
     t,

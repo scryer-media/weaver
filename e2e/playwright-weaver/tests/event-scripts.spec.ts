@@ -839,9 +839,10 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
   const feed = writeFixtureScript(`${tag}-feed`, { kinds: ["FEED"], exitCode: 93 });
   const restore = await useScripts(request, { global: [queue, scheduler, scan, feed].map(script => ({ script })) });
   try {
-    await page.goto("/settings/post-processing");
+    await page.goto("/settings/scripts/configuration");
     await expect(page.getByRole("textbox", { name: "Scripts directory", exact: true })).toHaveValue(WEAVER_SCRIPTS_DIR);
     await expect(page.getByRole("region", { name: "Event scripts and output retention", exact: true })).toBeVisible();
+    await page.goto("/settings/scripts/list");
     // A discovered script's row; its name cell carries the script's file name.
     const entry = (name: string) =>
       page.getByRole("region", { name: "Discovered scripts", exact: true })

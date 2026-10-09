@@ -28,13 +28,16 @@ import {
 } from "../framework";
 
 /**
- * Post-processing: the scripts weaver runs when a download finishes.
+ * Scripts: what weaver runs on a download and on the events around it.
  *
- * Three things live here that save in three different ways, which is the
- * daemon's own shape rather than a choice: the execution settings are a draft
- * behind the top bar's Save, the scripts directory is destructive enough to
- * ask first, and the run list writes the moment it is reordered.
+ * Two screens read the same settings. Configuration holds what applies to every
+ * script: the execution settings, a draft behind the top bar's Save, and the
+ * scripts directory, destructive enough to ask first. Scripts holds the run
+ * list, which writes the moment it is edited, and the scripts the directory
+ * holds, each opening its own options.
  */
+
+type ScriptsSection = "configuration" | "list";
 
 const GLOBAL = "__global__";
 const MASKED_SECRET = "[REDACTED]";
@@ -155,7 +158,17 @@ function splitExtensions(value: string): string[] {
     .filter(Boolean);
 }
 
-export function PostProcessingPanel() {
+/** What applies to every script: whether and how they run, and where they are read from. */
+export function ScriptConfigurationPanel() {
+  return <ScriptsPanel section="configuration" />;
+}
+
+/** The scripts that run, in order, and the ones the directory holds. */
+export function ScriptListPanel() {
+  return <ScriptsPanel section="list" />;
+}
+
+function ScriptsPanel({ section }: { section: ScriptsSection }) {
   const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<PostProcessingData>({
     query: POST_PROCESSING_SETTINGS_QUERY,
@@ -409,7 +422,7 @@ export function PostProcessingPanel() {
       ? t("next.postProcessing.runsForEvery")
       : t("next.postProcessing.runsForCategory", { name: scope });
 
-  const blocks: (SettingsBlock | null)[] = [
+  const configuration: SettingsBlock[] = [
     {
       kind: "section",
       id: "execution",
@@ -555,6 +568,9 @@ export function PostProcessingPanel() {
         },
       ],
     },
+  ];
+
+  const list: (SettingsBlock | null)[] = [
     {
       kind: "table",
       id: "run-list",
@@ -732,6 +748,25 @@ export function PostProcessingPanel() {
       : null,
   ];
 
+  if (section === "configuration") {
+    return (
+      <>
+        <SettingsBlocks blocks={configuration} loading={fetching && !data} />
+
+        <ConfirmDialog
+          open={confirmDirectory}
+          title={t("next.postProcessing.changeDirTitle")}
+          note={scriptDirectory}
+          busy={directoryState.fetching}
+          confirmLabel={t("next.postProcessing.changeDirConfirm")}
+          body={t("next.postProcessing.changeDirBody")}
+          onConfirm={applyDirectory}
+          onDismiss={() => setConfirmDirectory(false)}
+        />
+      </>
+    );
+  }
+
   return (
     <>
       <PanelControls>
@@ -747,18 +782,7 @@ export function PostProcessingPanel() {
         />
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
-
-      <ConfirmDialog
-        open={confirmDirectory}
-        title={t("next.postProcessing.changeDirTitle")}
-        note={scriptDirectory}
-        busy={directoryState.fetching}
-        confirmLabel={t("next.postProcessing.changeDirConfirm")}
-        body={t("next.postProcessing.changeDirBody")}
-        onConfirm={applyDirectory}
-        onDismiss={() => setConfirmDirectory(false)}
-      />
+      <SettingsBlocks blocks={list} loading={fetching && !data} />
 
       <RecordEditor
         open={selected !== null}

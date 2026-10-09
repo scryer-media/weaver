@@ -172,9 +172,8 @@ test("category create, edit, persistence, and delete are browser-owned", async (
 
 test("schedule rules support create, toggle, edit, and delete", async ({ cleanPage: page }) => {
   await page.goto("/settings/schedules");
-  for (const group of ["Downloads", "Watch folder", "Speed limit", "Hardware profile"]) {
-    await expect(page.getByRole("region", { name: group, exact: true })).toBeVisible();
-  }
+  // The list heads only the groups that hold a rule, so the list itself is what loads.
+  await expect(page.getByRole("region", { name: "Schedules", exact: true })).toBeVisible();
   const removeSchedule = async (label: string) => {
     await tableRow(page, "Downloads", label).click();
     await page

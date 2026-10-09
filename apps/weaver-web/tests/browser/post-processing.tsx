@@ -6,7 +6,7 @@ import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { nextEn } from "@/next/i18n/en";
 import { JobScriptResults } from "@/next/components/JobScriptResults";
-import { PostProcessingPanel } from "@/next/pages/settings/panels/PostProcessingPanel";
+import { ScriptConfigurationPanel, ScriptListPanel } from "@/next/pages/settings/panels/PostProcessingPanel";
 import { SettingsShellProvider, type PanelFlags } from "@/next/pages/settings/framework";
 import "@/next/fonts.css";
 import "@/next/theme.css";
@@ -37,7 +37,8 @@ const state = {
     scriptDirectory: "/fixture/scripts", executionEnabled: true, concurrency: 2,
     eventScriptConcurrency: 1, eventScriptTimeoutSeconds: 300, fileDownloadedEventInterval: 0,
     scriptOutputCeilingBytes: 1048576, scriptOutputRunsPerJob: 32, scriptOutputRingBytes: 67108864,
-    scriptOutputRunCapBytes: 2097152, terminationGraceSeconds: 10,
+    // A size set through the API need not be a whole number of the unit its field shows.
+    scriptOutputRunCapBytes: location.search.includes("uneven") ? 2097000 : 2097152, terminationGraceSeconds: 10,
     pythonInterpreter: null as string | null, powershellInterpreter: null as string | null,
     batchInterpreter: null as string | null, unacceptableExtensions: ["exe", "scr"],
     strictSecurityRefusesExecution: false,
@@ -99,6 +100,9 @@ window.fetch = async (request, init) => {
   return Response.json(graphql(body.operationName, body.variables));
 };
 const dictionary = { ...en, ...nextEn };
+// The screen under test: a job's script runs, the script list, or the configuration.
+const screen = location.search.includes("job") ? <JobScriptResults jobId={1} />
+  : location.search.includes("scripts") ? <ScriptListPanel /> : <ScriptConfigurationPanel />;
 // The shell's status bar, reduced to the line a panel publishes into it.
 const status = document.getElementById("status")!;
 const actions = { current: null as { save: () => void; revert: () => void } | null };
@@ -109,4 +113,4 @@ const shell = {
   setFlags: (flags: PanelFlags) => { status.textContent = flags.status ?? ""; save.disabled = !flags.dirty || flags.busy; },
   controlsHost: document.getElementById("controls"),
 };
-createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{location.search.includes("job") ? <JobScriptResults jobId={1} /> : <PostProcessingPanel />}</main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

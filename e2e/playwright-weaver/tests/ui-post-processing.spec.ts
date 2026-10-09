@@ -33,6 +33,10 @@ function operationResponse(page: Page, operation: string) {
   );
 }
 
+// Scripts is two screens: what applies to every script, and the scripts that run.
+const SCRIPT_CONFIGURATION = "/settings/scripts/configuration";
+const SCRIPT_LIST = "/settings/scripts/list";
+
 async function waitForScriptListSave(page: Page, action: () => Promise<void>): Promise<void> {
   const response = operationResponse(page, "SetScriptLists");
   await action();
@@ -75,7 +79,7 @@ test("post-processing settings, the live script list, and real script execution 
   removePostProcessingScripts();
   seedPostProcessingScripts();
 
-  await page.goto("/settings/post-processing");
+  await page.goto(SCRIPT_CONFIGURATION);
 
   // 1. The master switch is off until an operator turns it on.
   const executionToggle = page.getByRole("switch", { name: "Run scripts", exact: true });
@@ -94,6 +98,7 @@ test("post-processing settings, the live script list, and real script execution 
   await saveSettings(page);
 
   // 2. Scripts are listed live from the directory, with unreadable ones surfaced.
+  await page.goto(SCRIPT_LIST);
   const problems = page.getByRole("region", { name: "Scripts that could not be read", exact: true });
   await expect(problems).toContainText(POST_PROCESSING_BROKEN_PACKAGE);
   await expect(
@@ -132,16 +137,17 @@ test("post-processing settings, the live script list, and real script execution 
   );
 
   await page.reload();
-  await expect(executionToggle).toBeChecked();
-  await expect(concurrency).toHaveValue("2");
-  await expect(grace).toHaveValue("5");
-  await expect(extensions).toHaveValue("exe, r??");
   await discoveredScript(page, POST_PROCESSING_NZBGET_DISPLAY_NAME).click();
   await expect(options.getByRole("textbox", { name: "Label", exact: true })).toHaveValue("e2e-label");
   await expect(options.getByLabel("Token", { exact: true })).toHaveValue("[REDACTED]");
   await expect(page.getByRole("main")).not.toContainText(POST_PROCESSING_SECRET);
   await options.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(options).toBeHidden();
+  await page.goto(SCRIPT_CONFIGURATION);
+  await expect(executionToggle).toBeChecked();
+  await expect(concurrency).toHaveValue("2");
+  await expect(grace).toHaveValue("5");
+  await expect(extensions).toHaveValue("exe, r??");
 
   // 5. A real job runs the list in order and records one result per script.
   const job = await runJobThroughPostProcessing(request, "weaver-e2e-post-processing");
@@ -203,7 +209,7 @@ test("a disabled entry stays in the list without running", async ({
   removePostProcessingScripts();
   seedPostProcessingScripts();
 
-  await page.goto("/settings/post-processing");
+  await page.goto(SCRIPT_CONFIGURATION);
   const executionToggle = page.getByRole("switch", { name: "Run scripts", exact: true });
   await expect(executionToggle).toBeVisible();
   if (!(await executionToggle.isChecked())) {
@@ -211,6 +217,9 @@ test("a disabled entry stays in the list without running", async ({
     await saveSettings(page);
   }
 
+  await page.goto(SCRIPT_LIST);
+  // The run list is read with the directory's scripts, so a seeded one is what loads.
+  await expect(discoveredScript(page, POST_PROCESSING_NOTIFY_SCRIPT)).toBeVisible();
   const runList = page.getByRole("region", { name: "Run list", exact: true });
   const notifyEntry = runList.getByRole("switch", { name: `Run ${POST_PROCESSING_NOTIFY_SCRIPT}`, exact: true });
   if ((await notifyEntry.count()) === 0) {
@@ -237,7 +246,7 @@ test("a disabled entry stays in the list without running", async ({
 
 test("queue barrier, marked-bad history and event result groups are visible", async ({ cleanPage: page, request }) => {
   seedEventScript();
-  await page.goto("/settings/post-processing");
+  await page.goto(SCRIPT_CONFIGURATION);
   const executionToggle = page.getByRole("switch", { name: "Run scripts", exact: true });
   await expect(executionToggle).toBeVisible();
   if (!(await executionToggle.isChecked())) {
@@ -245,6 +254,9 @@ test("queue barrier, marked-bad history and event result groups are visible", as
     await saveSettings(page);
   }
   await expect(executionToggle).toBeChecked();
+  await page.goto(SCRIPT_LIST);
+  // The run list is read with the directory's scripts, so the seeded one is what loads.
+  await expect(discoveredScript(page, EVENT_SCRIPT)).toBeVisible();
   const runList = page.getByRole("region", { name: "Run list", exact: true });
   for (const script of [POST_PROCESSING_NOTIFY_SCRIPT, POST_PROCESSING_FAILING_SCRIPT, POST_PROCESSING_NZBGET_PACKAGE]) {
     const entry = runList.getByRole("switch", { name: `Run ${script}`, exact: true });
