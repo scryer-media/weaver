@@ -3122,7 +3122,9 @@ impl Pipeline {
                         reason = %reason,
                         "deferring completion until archive topology is available"
                     );
-                    self.schedule_job_completion_check(job_id);
+                    // The pending download or extraction re-arms completion
+                    // when it changes the topology. Re-queuing ourselves here
+                    // can monopolize the actor before that work is serviced.
                     return;
                 }
                 // Downloads, placement and recovery have settled above. With

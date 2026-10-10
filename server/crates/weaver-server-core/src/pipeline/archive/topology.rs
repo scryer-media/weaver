@@ -2855,11 +2855,11 @@ impl Pipeline {
                     // a description that already has every part it needs.
                     if let Some(topology) = state.assembly.archive_topology_for_mut(&set_name)
                         && !topology.volume_map.contains_key(&filename)
-                        && !topology
-                            .volume_map
-                            .values()
-                            .any(|listed| *listed == completing_number)
                     {
+                        // A placement rename changes the readable path without
+                        // changing its part index. Retain the new name even if
+                        // an old alias already names that index; the reader
+                        // checks every extant candidate for agreement.
                         topology
                             .volume_map
                             .insert(filename.clone(), completing_number);
