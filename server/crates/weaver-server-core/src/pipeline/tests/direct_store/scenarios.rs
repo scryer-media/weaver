@@ -622,7 +622,7 @@ fn header_encrypted_store_set(
             // A distinct IV per header, as a real writer emits.
             let mut iv = [0u8; 16];
             let seal = |index: u8, iv: &mut [u8; 16], header: &[u8]| {
-                iv.fill(0x40u8.wrapping_add(index).wrapping_add(volume as u8 * 8));
+                iv.fill(0x40u8.wrapping_add(index).wrapping_add((volume as u8).wrapping_mul(8)));
                 seal_test_rar_header(&header_key, iv, header)
             };
 

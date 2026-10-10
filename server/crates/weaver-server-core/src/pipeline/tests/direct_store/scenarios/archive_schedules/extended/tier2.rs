@@ -246,11 +246,13 @@ impl<C: Cell> Family<C> {
                 .sampled(profile, per, rotation)
                 .into_iter()
                 .enumerate()
-                .filter(|(k, _)| {
+                .filter_map(|(k, (_, schedule))| {
+                    // The run names cases by family index so the printed
+                    // number is the one the replay switch takes.
                     let index = unit.start + k;
-                    range.contains(&index) && replay.as_ref().is_none_or(|replay| replay.contains(&index))
+                    (range.contains(&index) && replay.as_ref().is_none_or(|replay| replay.contains(&index)))
+                        .then_some((index, schedule))
                 })
-                .map(|(_, case)| case)
                 .collect();
             if !cases.is_empty() {
                 run_cell(cell, profile, cases).await;

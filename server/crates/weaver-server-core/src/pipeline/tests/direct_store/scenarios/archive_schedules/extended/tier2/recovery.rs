@@ -229,7 +229,7 @@ pub(in super::super) fn par2_set(
     options.recovery_amount = RecoveryAmount::Count(recovery as u32);
     match volumes {
         Par2Volumes::One => {
-            options.volume_count = Some(u32::from(recovery > 0));
+            options.volume_count = (recovery > 0).then_some(1);
         }
         Par2Volumes::Exponent => options.volume_scheme = VolumeScheme::Variable,
         Par2Volumes::Uniform => {
