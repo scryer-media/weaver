@@ -1187,24 +1187,17 @@ impl Pipeline {
         // completed-file restore, which keeps no placements; a duplicate of
         // its article placed later must not shrink the file to that one range.
         let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
-        let mut held_unplaced = false;
-        for segment in 0..file.total_segments() {
-            if !file.has_segment(segment) {
+        let held_unplaced = (0..file.total_segments()).any(|segment| {
+            file.has_segment(segment)
+                && file.placement_of(segment).is_none()
+                && file.reconstructed_placement_of(segment).is_none()
+        });
+        // The persisted decoded prefix survives a restart without per-article
+        // placements. Offer it as candidate bytes, still verified by PAR3.
+        for (offset, end) in file.protected_write_ranges() {
+            if end <= offset {
                 continue;
             }
-            let Some((offset, len)) = file
-                .placement_of(segment)
-                .or_else(|| file.reconstructed_placement_of(segment))
-            else {
-                held_unplaced = true;
-                continue;
-            };
-            if len == 0 {
-                continue;
-            }
-            let end = offset
-                .checked_add(u64::from(len))
-                .ok_or(budget::host_limit("PAR3 source offsets"))?;
             if let Some(last) = ranges.last_mut()
                 && last.end == offset
             {
@@ -1263,16 +1256,16 @@ impl Pipeline {
                 }
                 ranges.push(range);
             }
-            ranges.sort_unstable_by_key(|range| range.start);
-            ranges.dedup_by(|right, left| {
-                if right.start <= left.end {
-                    left.end = left.end.max(right.end);
-                    true
-                } else {
-                    false
-                }
-            });
         }
+        ranges.sort_unstable_by_key(|range| range.start);
+        ranges.dedup_by(|right, left| {
+            if right.start <= left.end {
+                left.end = left.end.max(right.end);
+                true
+            } else {
+                false
+            }
+        });
         // Completed-file restore deliberately omits article placements. Its
         // disk image remains a candidate, with its actual length read by the
         // worker and every protected byte verified afresh. Never apply this
