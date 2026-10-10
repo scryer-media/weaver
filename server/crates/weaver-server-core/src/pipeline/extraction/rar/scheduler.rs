@@ -39,7 +39,13 @@ impl Pipeline {
             return true;
         }
         let lower = error.to_ascii_lowercase();
-        lower.contains("checksum") || lower.contains("crc mismatch")
+        lower.contains("checksum")
+            || lower.contains("crc mismatch")
+            || lower.contains("crcmismatch")
+            || lower.contains("no crc-valid start header")
+            || lower.contains("truncated header at offset")
+            || lower.contains("not a rar archive (bad signature)")
+            || lower.contains("failed to fill whole buffer")
     }
 
     /// Refusals raised while *opening* the archive, about its structure rather
