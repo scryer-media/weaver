@@ -279,7 +279,7 @@ func TestWeaverReleasePhasesHaveIndependentOwnership(t *testing.T) {
 		t.Fatalf("create Weaver release phases: %v", err)
 	}
 
-	const wantPhaseCount = 37
+	const wantPhaseCount = 39
 	if len(phases) != wantPhaseCount {
 		t.Fatalf("release phase count = %d, want %d", len(phases), wantPhaseCount)
 	}
