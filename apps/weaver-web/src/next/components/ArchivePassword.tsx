@@ -1,28 +1,55 @@
 import { useState } from "react";
 import { useQuery } from "urql";
+import { VALIDATED_ARCHIVE_PASSWORD_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { cn } from "@/lib/utils";
+import { RecordEditor } from "./RecordEditor";
 
+/**
+ * The password that opened a job's archive, masked until asked for. The
+ * daemon only hands it over on request, so nothing is fetched while it is
+ * hidden.
+ */
 export function ArchivePassword({ id }: { id: number }) {
   const t = useTranslate();
   const [visible, setVisible] = useState(false);
   const [{ data, fetching, error }] = useQuery<{ validatedArchivePassword: string | null }>({
-    query: `query ValidatedArchivePassword($id: Int!) { validatedArchivePassword(id: $id) }`,
+    query: VALIDATED_ARCHIVE_PASSWORD_QUERY,
     variables: { id },
     pause: !visible,
     requestPolicy: "network-only",
   });
+  const shown = fetching
+    ? t("next.common.loading")
+    : error
+      ? t("next.archivePasswords.loadFailed")
+      : (data?.validatedArchivePassword ?? "—");
   return (
-    <span className="flex items-center gap-2 text-[12px]" onClick={(event) => event.stopPropagation()}>
-      <span className="font-wv-mono">{visible ? (fetching ? "…" : error ? t("next.archivePasswords.loadFailed") : data?.validatedArchivePassword ?? "—") : "••••••••"}</span>
-      <button type="button" className="text-wv-accent" onClick={() => setVisible(!visible)}>
+    <span className="inline-flex min-w-0 items-baseline gap-3">
+      <span className={cn("min-w-0 break-all", visible && error && "text-wv-error-text")}>
+        {visible ? shown : "••••••••"}
+      </span>
+      <button
+        type="button"
+        onClick={() => setVisible(!visible)}
+        className="flex-none cursor-pointer font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-muted uppercase hover:text-wv-fg"
+      >
         {t(visible ? "next.archivePasswords.hide" : "next.archivePasswords.show")}
       </button>
     </span>
   );
 }
 
-export function ArchivePasswordDialog({ title, busy, onConfirm, onDismiss }: {
+/**
+ * Redownload or reprocess with a password to try first. Left blank, the job
+ * falls back to the passwords its NZB and the settings name.
+ */
+export function ArchivePasswordDialog({
+  title,
+  busy,
+  onConfirm,
+  onDismiss,
+}: {
   title: string;
   busy: boolean;
   onConfirm: (password: string | undefined) => void;
@@ -30,10 +57,34 @@ export function ArchivePasswordDialog({ title, busy, onConfirm, onDismiss }: {
 }) {
   const t = useTranslate();
   const [password, setPassword] = useState("");
-  return <ConfirmDialog open title={title} busy={busy} destructive={false}
-    confirmLabel={title} onDismiss={onDismiss} onConfirm={() => onConfirm(password || undefined)}
-    body={<label className="block">{t("next.archivePasswords.password")} <span className="text-wv-dim">({t("next.common.optional")})</span>
-      <input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)}
-        className="mt-2 w-full rounded border border-wv-control bg-wv-input p-2" />
-    </label>} />;
+  return (
+    <RecordEditor
+      open
+      title={title}
+      busy={busy}
+      width={440}
+      saveLabel={title}
+      onSave={() => onConfirm(password || undefined)}
+      onDismiss={onDismiss}
+      sections={[
+        {
+          id: "password",
+          title: t("next.archivePasswords.title"),
+          fields: [
+            {
+              id: "password",
+              label: t("next.archivePasswords.password"),
+              control: {
+                kind: "text",
+                type: "password",
+                secret: true,
+                value: password,
+                onChange: setPassword,
+              },
+            },
+          ],
+        },
+      ]}
+    />
+  );
 }

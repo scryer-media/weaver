@@ -2,15 +2,6 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Chinese strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextZh: LocaleDictionary = {
-  "next.archivePasswords.title": "压缩包密码",
-  "next.archivePasswords.list": "密码（每行一个）",
-  "next.archivePasswords.file": "密码文件",
-  "next.archivePasswords.saved": "密码已保存",
-  "next.archivePasswords.clear": "清除密码",
-  "next.archivePasswords.password": "压缩包密码",
-  "next.archivePasswords.show": "显示",
-  "next.archivePasswords.hide": "隐藏",
-  "next.archivePasswords.loadFailed": "无法加载密码",
   // Shell
   "next.nav.downloads": "下载",
   "next.nav.history": "历史",
@@ -677,6 +668,15 @@ export const nextZh: LocaleDictionary = {
   "next.general.seconds": "秒",
   "next.general.srrdb": "SRRDB 发布查询",
   "next.general.srrdbHelp": "对于混淆的归档成员,只将其 CRC32 校验和发送到公共 SRRDB 索引,以恢复发布名称。",
+  "next.archivePasswords.title": "压缩包密码",
+  "next.archivePasswords.list": "密码（每行一个）",
+  "next.archivePasswords.cleared": "保存时移除",
+  "next.archivePasswords.keep": "保留",
+  "next.archivePasswords.file": "密码文件",
+  "next.archivePasswords.password": "压缩包密码",
+  "next.archivePasswords.show": "显示",
+  "next.archivePasswords.hide": "隐藏",
+  "next.archivePasswords.loadFailed": "无法加载密码",
   "next.general.storage": "存储",
   "next.general.storageNote": "服务写入的路径",
   "next.general.dataDirHelp": "在服务启动时确定;数据库和默认文件夹都在这里。",

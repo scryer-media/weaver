@@ -2,15 +2,6 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Italian strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextIt: LocaleDictionary = {
-  "next.archivePasswords.title": "Password degli archivi",
-  "next.archivePasswords.list": "Password (una per riga)",
-  "next.archivePasswords.file": "File delle password",
-  "next.archivePasswords.saved": "Password salvate",
-  "next.archivePasswords.clear": "Cancella password",
-  "next.archivePasswords.password": "Password dell’archivio",
-  "next.archivePasswords.show": "Mostra",
-  "next.archivePasswords.hide": "Nascondi",
-  "next.archivePasswords.loadFailed": "Impossibile caricare la password",
   // Shell
   "next.nav.downloads": "Download",
   "next.nav.history": "Cronologia",
@@ -677,6 +668,15 @@ export const nextIt: LocaleDictionary = {
   "next.general.seconds": "secondi",
   "next.general.srrdb": "Ricerca release su SRRDB",
   "next.general.srrdbHelp": "Per i membri di archivio offuscati, inviare solo il loro checksum CRC32 all'indice pubblico SRRDB per recuperare il nome della release.",
+  "next.archivePasswords.title": "Password degli archivi",
+  "next.archivePasswords.list": "Password (una per riga)",
+  "next.archivePasswords.cleared": "Rimosso al salvataggio",
+  "next.archivePasswords.keep": "Mantieni",
+  "next.archivePasswords.file": "File delle password",
+  "next.archivePasswords.password": "Password dell’archivio",
+  "next.archivePasswords.show": "Mostra",
+  "next.archivePasswords.hide": "Nascondi",
+  "next.archivePasswords.loadFailed": "Impossibile caricare la password",
   "next.general.storage": "Archiviazione",
   "next.general.storageNote": "percorsi in cui scrive il servizio",
   "next.general.dataDirHelp": "Impostata all'avvio del servizio; qui si trovano il database e le cartelle predefinite.",

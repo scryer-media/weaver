@@ -9,15 +9,6 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
  * carries exactly these keys; `tests/next-i18n.test.ts` holds them to it.
  */
 export const nextEn: LocaleDictionary = {
-  "next.archivePasswords.title": "Archive passwords",
-  "next.archivePasswords.list": "Passwords (one per line)",
-  "next.archivePasswords.file": "Password file",
-  "next.archivePasswords.saved": "Passwords saved",
-  "next.archivePasswords.clear": "Clear passwords",
-  "next.archivePasswords.password": "Archive password",
-  "next.archivePasswords.show": "Show",
-  "next.archivePasswords.hide": "Hide",
-  "next.archivePasswords.loadFailed": "Could not load password",
   // Shell
   "next.nav.downloads": "Downloads",
   "next.nav.history": "History",
@@ -684,6 +675,15 @@ export const nextEn: LocaleDictionary = {
   "next.general.seconds": "seconds",
   "next.general.srrdb": "SRRDB release lookup",
   "next.general.srrdbHelp": "For obfuscated archive members, send only their CRC32 checksum to the public SRRDB index to recover a release name.",
+  "next.archivePasswords.title": "Archive passwords",
+  "next.archivePasswords.list": "Passwords (one per line)",
+  "next.archivePasswords.cleared": "Removed on save",
+  "next.archivePasswords.keep": "Keep",
+  "next.archivePasswords.file": "Password file",
+  "next.archivePasswords.password": "Archive password",
+  "next.archivePasswords.show": "Show",
+  "next.archivePasswords.hide": "Hide",
+  "next.archivePasswords.loadFailed": "Could not load password",
   "next.general.storage": "Storage",
   "next.general.storageNote": "paths the daemon writes to",
   "next.general.dataDirHelp": "Set when the daemon starts; the database and the default folders live here.",

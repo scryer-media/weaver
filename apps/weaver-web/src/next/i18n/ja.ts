@@ -2,15 +2,6 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Japanese strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextJa: LocaleDictionary = {
-  "next.archivePasswords.title": "アーカイブのパスワード",
-  "next.archivePasswords.list": "パスワード（1行に1つ）",
-  "next.archivePasswords.file": "パスワードファイル",
-  "next.archivePasswords.saved": "パスワード保存済み",
-  "next.archivePasswords.clear": "パスワードを削除",
-  "next.archivePasswords.password": "アーカイブのパスワード",
-  "next.archivePasswords.show": "表示",
-  "next.archivePasswords.hide": "非表示",
-  "next.archivePasswords.loadFailed": "パスワードを読み込めませんでした",
   // Shell
   "next.nav.downloads": "ダウンロード",
   "next.nav.history": "履歴",
@@ -677,6 +668,15 @@ export const nextJa: LocaleDictionary = {
   "next.general.seconds": "秒",
   "next.general.srrdb": "SRRDB リリース検索",
   "next.general.srrdbHelp": "難読化されたアーカイブメンバーについて、CRC32 チェックサムだけを公開 SRRDB インデックスに送り、リリース名を復元します。",
+  "next.archivePasswords.title": "アーカイブのパスワード",
+  "next.archivePasswords.list": "パスワード（1行に1つ）",
+  "next.archivePasswords.cleared": "保存時に削除されます",
+  "next.archivePasswords.keep": "保持",
+  "next.archivePasswords.file": "パスワードファイル",
+  "next.archivePasswords.password": "アーカイブのパスワード",
+  "next.archivePasswords.show": "表示",
+  "next.archivePasswords.hide": "非表示",
+  "next.archivePasswords.loadFailed": "パスワードを読み込めませんでした",
   "next.general.storage": "ストレージ",
   "next.general.storageNote": "サービスが書き込むパス",
   "next.general.dataDirHelp": "サービスの起動時に決まります。データベースと既定のフォルダーはここにあります。",
