@@ -573,6 +573,7 @@ par3_smokes! {
     sidecar_cauchy_rar5 Sidecar Cauchy With 1024 One One Present Rar5;
     sidecar_fft_sevenz_two_entries Sidecar Fft Exact 512 Two One Present SevenZip;
     sidecar_two_sets_index_absent Sidecar Cauchy With 4096 One Two Absent Rar5;
+    sidecar_fft_two_sets_present Sidecar Fft With 4096 One Two Present Rar5;
     sidecar_index_damaged_short Sidecar Fft OneShort 1024 One One Damaged SevenZip;
     embedded_cauchy Embedded Cauchy With 1024 One One Present SevenZip;
     embedded_fft_two_sets Embedded Fft Exact 512 Two Two Present SevenZip;

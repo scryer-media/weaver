@@ -2668,6 +2668,9 @@ impl Coordinator {
                 job.errors.retain(
                     |_, error| !matches!(error, EngineError::SourceChanged(changed) if *changed == source),
                 );
+                if matches!(job.donor_error, Some(EngineError::SourceChanged(changed)) if changed == source) {
+                    job.donor_error = None;
+                }
             }
             (WorkKey::Source(source), Err(error)) => {
                 if pressure.is_some() {

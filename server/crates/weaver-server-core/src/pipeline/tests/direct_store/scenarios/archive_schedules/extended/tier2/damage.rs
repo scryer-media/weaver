@@ -402,32 +402,14 @@ impl Cell for DamageCell {
         }
     }
 
-    fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-        open_defect(self, profile)
+    fn defect(self, _profile: ExtractionProfile) -> Option<Defect> {
+        None
     }
 
     fn par2(self) -> bool {
         matches!(self.recovery, Recovery::Par2(_))
     }
 }
-
-/// The defects each cell and profile is held open for.
-fn open_defect(cell: DamageCell, profile: ExtractionProfile) -> Option<Defect> {
-    if cell.recovery == Recovery::Par3
-        && cell.container == Container::SevenZip
-        && cell.location == Location::SliceStraddle
-        && cell.kind == Damage::Truncated
-        && profile == ExtractionProfile::DirectStore
-    {
-        return Some(Defect::Diverges(PAR3_SOURCE_CHANGED_AFTER_DEMOTION));
-    }
-    None
-}
-
-/// A demotion refetch re-publishes a PAR3 source whose retained assessment is
-/// Ready, and the job fails instead of re-assessing it.
-const PAR3_SOURCE_CHANGED_AFTER_DEMOTION: &str =
-    "PAR3: after a demotion refetch the job fails with \"PAR3 source changed\" instead of re-assessing";
 
 macro_rules! damage_smokes {
     ($($name:ident $kind:ident $location:ident $pattern:ident $recovery:expr, $container:ident;)+) => {
@@ -451,6 +433,7 @@ macro_rules! damage_smokes {
 }
 
 damage_smokes! {
+    crc_wrong_mid_volume_par3 CrcWrong MidVolume MostOfOne Recovery::Par3, Rar5;
     no_checksum_middle_head_par2 NoChecksum MiddleVolumeHead Hundred Recovery::Par2(Margin::With), SevenZip;
     truncated_index_exact Truncated RecoveryIndex MostOfOne Recovery::Par2(Margin::Exact), Rar5;
     recomputed_mid_volume_par2 Recomputed MidVolume Two Recovery::Par2(Margin::With), Rar5;

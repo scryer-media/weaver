@@ -19,6 +19,27 @@ async fn next(coordinator: &mut Coordinator) -> WorkDone {
     coordinator.recv().await.unwrap()
 }
 
+#[tokio::test]
+async fn fresh_source_publication_clears_only_its_stale_assessment_error() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    for (error, remains) in [
+        (EngineError::SourceChanged(SourceId(0)), false),
+        (EngineError::SourceChanged(SourceId(1)), true),
+        (EngineError::InvalidState("unrelated assessment failure"), true),
+    ] {
+        let job = JobId(1);
+        let mut coordinator = Coordinator::default();
+        coordinator.enqueue(job, SourceId(0), path.clone()).unwrap();
+        coordinator.jobs.get_mut(&job).unwrap().donor_error = Some(error);
+        coordinator.dispatch().unwrap();
+        let done = next(&mut coordinator).await;
+        assert!(done.result.is_ok());
+        assert_eq!(coordinator.settle(done), Some(job));
+        assert_eq!(coordinator.error(job).is_some(), remains);
+    }
+}
+
 /// Repair keeps every core but one when no profile caps it, a profile's cap
 /// only ever lowers that, and neither ever reaches zero.
 #[test]
