@@ -422,3 +422,95 @@ async fn restart_between_final_move_and_first_script_resumes_scripts_on_delivere
         format!("{}\n", destination.display())
     );
 }
+
+// A job with queue scripts but no post-processing instance still passes
+// through the terminal pass, which waits for the job's own queue events
+// before it leaves the queue. Without a queue script it completes at once.
+#[tokio::test]
+async fn queue_scripts_hold_a_job_without_post_processing_instances() {
+    for with_queue_script in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+        let scripts = temp.path().join("scripts");
+        tokio::fs::create_dir_all(&scripts).await.unwrap();
+        let script = scripts.join("queue.sh");
+        tokio::fs::write(&script, "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pipeline
+            .db
+            .replace_post_processing_script_directory(&scripts)
+            .unwrap();
+        pipeline
+            .db
+            .save_post_processing_settings(&PostProcessingSettings {
+                execution_enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        if with_queue_script {
+            pipeline
+                .db
+                .create_script_instance(ScriptInstanceDraft::new(
+                    ScriptName::new("queue.sh").unwrap(),
+                    InstanceTrigger::Queue(
+                        crate::post_processing::model::QueueEvent::FileDownloaded,
+                    ),
+                ))
+                .unwrap();
+        }
+        pipeline.terminal_post_processing_executor =
+            PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone());
+
+        let job_id = JobId(10081);
+        let spec = minimal_job_state(job_id, "Queue Scripts Only", PathBuf::new()).spec;
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        tokio::fs::write(working_dir.join("payload.mkv"), b"payload")
+            .await
+            .unwrap();
+        pipeline.start_move_to_complete(job_id).await.unwrap();
+        settle_inflight_moves(&mut pipeline).await;
+
+        if !with_queue_script {
+            assert!(!pipeline.jobs.contains_key(&job_id));
+            let finished = pipeline
+                .finished_jobs
+                .iter()
+                .find(|job| job.job_id == job_id)
+                .unwrap();
+            assert_eq!(finished.status, JobStatus::Complete);
+            continue;
+        }
+        assert_eq!(
+            pipeline.jobs[&job_id].status,
+            JobStatus::QueuedPostProcessing
+        );
+        let done = loop {
+            match pipeline
+                .terminal_post_processing_done_rx
+                .recv()
+                .await
+                .unwrap()
+            {
+                TerminalPostProcessingEvent::Done(done) => break done,
+                TerminalPostProcessingEvent::Started(started) => {
+                    pipeline.handle_terminal_post_processing_started(started);
+                }
+                _ => panic!("unexpected terminal post-processing event"),
+            }
+        };
+        assert_eq!(done.job_id, job_id);
+        assert_eq!(
+            done.result.as_ref().unwrap().summary,
+            PostProcessingSummary::NotRun
+        );
+        pipeline.handle_terminal_post_processing_done(done);
+        let finished = pipeline
+            .finished_jobs
+            .iter()
+            .find(|job| job.job_id == job_id)
+            .unwrap();
+        assert_eq!(finished.status, JobStatus::Complete);
+    }
+}

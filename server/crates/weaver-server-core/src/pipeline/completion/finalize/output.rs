@@ -1259,7 +1259,11 @@ impl Pipeline {
                 return;
             }
         };
-        if !admission.has_enabled_entries() {
+        // With no post-processing instance the job may still have queue
+        // events of its own queued or running; the terminal pass waits for
+        // those before the job leaves the queue, so it is skipped only when
+        // no queue script can be involved.
+        if !admission.has_enabled_entries() && !self.queue_events_may_hold_job(job_id) {
             match primary_failure {
                 Some(failure) => {
                     self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
@@ -1283,6 +1287,17 @@ impl Pipeline {
             primary_failure,
             None,
         );
+    }
+
+    // Whether a queue script could have an event of this job queued or
+    // running. The hint is worked out afresh when a settings or instance save
+    // dropped it, so an unknown hint never sends a job without queue scripts
+    // through the terminal pass.
+    fn queue_events_may_hold_job(&self, job_id: JobId) -> bool {
+        if let Err(error) = crate::post_processing::events::refresh_admission_hint(&self.db) {
+            warn!(job_id = job_id.0, %error, "could not read the queue script settings");
+        }
+        self.db.queue_barrier_possible(job_id.0)
     }
 
     fn launch_terminal_post_processing_run(
