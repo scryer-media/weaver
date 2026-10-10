@@ -1406,21 +1406,8 @@ pub(super) mod sets {
             None
         }
 
-        fn failed_finalization_limit(self) -> usize {
-            self.set_count()
-        }
-
         fn par2(self) -> bool {
             matches!(self.recovery, Recovery::Par2(_))
-        }
-    }
-
-    impl SetsCell {
-        fn set_count(self) -> usize {
-            match self.layout {
-                Layout::TwoSets | Layout::TwoSetsFurniture | Layout::Sample => 2,
-                _ => 1,
-            }
         }
     }
 

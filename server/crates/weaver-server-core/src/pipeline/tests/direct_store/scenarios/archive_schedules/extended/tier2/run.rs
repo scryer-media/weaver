@@ -518,7 +518,7 @@ impl Ran {
     /// Holds the run to its verdict and to the invariants every run keeps:
     /// it settles, a complete job published exactly the source bytes and
     /// nothing unexpected, a failed job is named and published none of them.
-    pub(in super::super) fn assert(&self, post: &Post, profile: ExtractionProfile, verdict: Verdict, failed_finalization_limit: usize, context: &str) {
+    pub(in super::super) fn assert(&self, post: &Post, profile: ExtractionProfile, verdict: Verdict, context: &str) {
         let trace = &self.trace;
         match &self.status {
             Some(JobStatus::Complete) => {
@@ -555,7 +555,7 @@ impl Ran {
                     "{context}: failed where it must complete: {error}: {trace:?}"
                 );
                 assert!(!error.trim().is_empty(), "{context}: an unnamed failure: {trace:?}");
-                assert!(self.finalized <= failed_finalization_limit, "{context}: a failed job finalized too many sets: {trace:?}");
+                assert_eq!(self.finalized, 0, "{context}: a failed job finalized a set: {trace:?}");
                 let leaked: Vec<_> = post
                     .expected
                     .iter()
