@@ -432,8 +432,8 @@ impl Cell for Par2Cell {
         }
     }
 
-    fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-        open_defect(self, profile)
+    fn defect(self, _profile: ExtractionProfile) -> Option<Defect> {
+        None
     }
 
     fn par2(self) -> bool {
@@ -441,28 +441,33 @@ impl Cell for Par2Cell {
     }
 }
 
-/// The defects each cell and profile is held open for. Every one blocks a
-/// release: these are PAR2 rows.
-fn open_defect(cell: Par2Cell, profile: ExtractionProfile) -> Option<Defect> {
-    if cell.container == Container::Rar5EncryptedHeaders
-        && profile == ExtractionProfile::DirectStore
-        && cell.margin != Margin::OneShort
-    {
-        return Some(Defect::Diverges(
-            ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES,
-        ));
-    }
-    None
-}
-
-/// A header-encrypted direct set repaired in place keeps its clean volumes
-/// virtual; extraction then finds no volume on disk and fails the job.
-const ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES: &str = "encrypted headers: after an in-place PAR2 repair of a direct set, extraction fails with no on-disk RAR volumes";
-
 macro_rules! par2_smokes {
     ($($name:ident $slice:literal $redundancy:ident $margin:ident $band:ident $alignment:ident $pattern:ident $structure:ident $container:ident;)+) => {
         mod par2_realism_smoke {
             use super::*;
+            #[tokio::test]
+            async fn repaired_encrypted_restart_finishes_member_edges() {
+                run_cell(
+                    Par2Cell {
+                        slice: 5240,
+                        redundancy: Redundancy::Ten,
+                        margin: Margin::With,
+                        band: Band::Hundreds,
+                        alignment: Alignment::Aligned,
+                        pattern: Pattern::MemberAbsent,
+                        structure: Structure::Plain,
+                        container: Container::Rar5EncryptedHeaders,
+                        creator: 2,
+                    },
+                    ExtractionProfile::DirectStore,
+                    vec![(941437, (vec![(0, 0), (0, 1), (0, 1)], Interruption::Combined {
+                        mask: 12,
+                        index_first: false,
+                        action: BoundaryAction::Restart,
+                        at: 1,
+                    }))],
+                ).await;
+            }
             #[tokio::test]
             async fn index_absent_restart_fetches_remaining_recovery() {
                 run_cell(

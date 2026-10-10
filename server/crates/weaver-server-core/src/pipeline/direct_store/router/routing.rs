@@ -2104,7 +2104,12 @@ impl DirectSetRouter {
                         // whose CBC predecessor has not arrived cannot be
                         // routed, and this drain runs over every staged volume
                         // on every article the set receives.
-                        if self.encrypted_slice_is_blocked(member_index, logical_offset, len) {
+                        // A repair's lead-in may lack the predecessor of its
+                        // aligned middle while its edge block is already
+                        // decryptable. Let those edges drain independently.
+                        if !self.repair_draining
+                            && self.encrypted_slice_is_blocked(member_index, logical_offset, len)
+                        {
                             cursor = cursor.saturating_add(len);
                             continue;
                         }
