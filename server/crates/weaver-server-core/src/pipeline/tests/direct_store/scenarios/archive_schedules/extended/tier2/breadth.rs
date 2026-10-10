@@ -247,7 +247,7 @@ pub(super) mod lies {
         cells
     }
 
-    /// 162 cells under three profiles, 617 of the combined cases each.
+    // 162 cells under three profiles, 617 of the combined cases each.
     breadth_family!(LieCell, cells(), Pool::Combined, 617, 299_862, 162);
 
     /// The set rewritten to tell the lie, in every file that describes.
@@ -449,7 +449,7 @@ pub(super) mod nesting {
         cells
     }
 
-    /// 128 cells under three profiles, 781 of the combined cases each.
+    // 128 cells under three profiles, 781 of the combined cases each.
     breadth_family!(NestCell, cells(), Pool::Combined, 781, 299_904, 128);
 
     impl NestCell {
@@ -680,7 +680,7 @@ pub(super) mod scale {
         cells
     }
 
-    /// 100 cells under three profiles, 1,000 of the combined cases each.
+    // 100 cells under three profiles, 1,000 of the combined cases each.
     breadth_family!(ScaleCell, cells(), Pool::Combined, 1_000, 300_000, 100);
 
     impl ScaleCell {
@@ -832,7 +832,7 @@ pub(super) mod password {
         cells
     }
 
-    /// 72 cells under three profiles, 925 of the combined cases each.
+    // 72 cells under three profiles, 925 of the combined cases each.
     breadth_family!(PasswordCell, cells(), Pool::Combined, 925, 199_800, 72);
 
     impl PasswordCell {
@@ -1006,7 +1006,7 @@ pub(super) mod wire {
         cells
     }
 
-    /// 80 cells under three profiles, 833 of the combined cases each.
+    // 80 cells under three profiles, 833 of the combined cases each.
     breadth_family!(WireCell, cells(), Pool::Combined, 833, 199_920, 80);
 
     impl Cell for WireCell {
@@ -1164,7 +1164,7 @@ pub(super) mod naming {
         cells
     }
 
-    /// 96 cells under three profiles, 694 of the combined cases each.
+    // 96 cells under three profiles, 694 of the combined cases each.
     breadth_family!(NameCell, cells(), Pool::Combined, 694, 199_872, 96);
 
     fn rename(naming: Naming, name: &str) -> String {
@@ -1348,7 +1348,7 @@ pub(super) mod sets {
         cells
     }
 
-    /// 120 cells under three profiles, 555 of the combined cases each.
+    // 120 cells under three profiles, 555 of the combined cases each.
     breadth_family!(SetsCell, cells(), Pool::Combined, 555, 199_800, 120);
 
     impl SetsCell {
