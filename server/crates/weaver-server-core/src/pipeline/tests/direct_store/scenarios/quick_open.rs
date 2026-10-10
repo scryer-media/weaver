@@ -813,6 +813,68 @@ async fn demotion_materialization_gate_is_scoped_to_its_bound_par2_set() {
 }
 
 #[tokio::test]
+async fn a_direct_volume_whose_prefix_lands_after_the_par2_index_takes_its_described_name() {
+    // Each volume's first article is shorter than the 16 KiB PAR2 content
+    // window, so no volume can be named by content when the index loads
+    // between the first and second articles. Each is named only once its
+    // own second article completes the window, and it must be named then.
+    let member_name = "Silver.Horizon.S01E31.mkv";
+    let payload: Vec<u8> = (0..80_000u32).map(|index| (index % 199) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 4);
+    assert!(
+        volumes
+            .iter()
+            .all(|(_, bytes)| bytes.len() / 2 < crate::pipeline::PAR2_HASH_16K_BYTES),
+        "a first article must not reach the content window on its own"
+    );
+    let alias = "a31f592e0b874d3ea8c44161b77f3049";
+    let described: Vec<(String, Vec<u8>)> = volumes
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| (format!("{alias}.part{}.rar", index + 1), bytes.clone()))
+        .collect();
+    let par2 = par2_index_over_volumes(&described);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41059);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let (spec, index_file) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for file_index in 0..volumes.len() as u32 {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, 0).await;
+    }
+    deliver_par2_index(&mut pipeline, job_id, index_file, &par2).await;
+    assert!(
+        pipeline.direct_store.sets_for(job_id).len() == 1,
+        "the set must be routed directly, or nothing here is a direct volume"
+    );
+    // The last volume stays open, so the job never reaches the completion
+    // gate's verification, which settles identities on its own. A restart in
+    // that window keeps only what the completed volumes recorded.
+    for file_index in 0..volumes.len() as u32 - 1 {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, 1).await;
+    }
+
+    for (file_index, (name, _)) in described.iter().enumerate().take(volumes.len() - 1) {
+        let identity = pipeline
+            .effective_file_identity(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: file_index as u32,
+                },
+            )
+            .expect("every volume has an identity");
+        assert_eq!(
+            identity.canonical_filename.as_deref(),
+            Some(name.as_str()),
+            "volume {file_index} must take the name PAR2 describes for its content"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_par2_bearing_direct_job_completes_byte_identically_and_never_writes_a_volume() {
     // An earlier shape refused this job at admission
     // (`direct_store.refused.par2_present`) because every PAR2 path read the

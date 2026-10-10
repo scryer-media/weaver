@@ -1148,6 +1148,13 @@ impl Pipeline {
             self.identity_viability_sweep(job_id).await;
         }
 
+        // PAR2 names a volume only by its content, and a volume whose first
+        // 16 KiB arrived after the PAR2 index loaded had nothing to be named
+        // by when the index applied its identities. The conventional
+        // file-complete seam retries them for the same reason, so a direct
+        // volume does too before its set can finalize.
+        self.retry_par2_authoritative_identity(job_id).await;
+
         self.finalize_ready_direct_sets(job_id).await;
         self.check_job_completion(job_id).await;
     }
