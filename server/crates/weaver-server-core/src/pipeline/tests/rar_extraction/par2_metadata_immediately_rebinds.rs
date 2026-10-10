@@ -3851,3 +3851,119 @@ fn terminal_archive_structure_classification_matches_only_open_time_refusals() {
         );
     }
 }
+
+// Parts posted under one another's names, as a rotation: the bytes PAR2
+// describes as part 1 sit under the name of part 2, and so on round the
+// cycle. A fourth part arrived under an opaque alias and extraction has
+// already consumed it. Before input cleanup every part must carry the name
+// PAR2 describes for its bytes, and the cycle must settle without one part
+// overwriting another.
+#[tokio::test]
+async fn input_identity_settle_lands_every_part_on_its_described_name() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30181);
+    let described: Vec<(String, Vec<u8>)> = (1..=4u32)
+        .map(|part| {
+            let bytes = (0..4096u32)
+                .map(|index| ((index * 7 + part * 31) % 251) as u8)
+                .collect();
+            (format!("archive.part{part}.rar"), bytes)
+        })
+        .collect();
+    let mut posted: Vec<(String, Vec<u8>)> = (0..3)
+        .map(|index| {
+            (
+                described[(index + 1) % 3].0.clone(),
+                described[index].1.clone(),
+            )
+        })
+        .collect();
+    let alias = "51273aad56a8b904e96928935278a627.104".to_string();
+    posted.push((alias.clone(), described[3].1.clone()));
+
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Rotated Parts", &posted),
+    )
+    .await;
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    for (index, (filename, bytes)) in posted.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, filename, bytes).await;
+    }
+    for (index, (filename, bytes)) in posted.iter().enumerate() {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: index as u32,
+        };
+        pipeline
+            .file_prefix_16k
+            .insert(file_id, bytes[..bytes.len().min(16 * 1024)].to_vec());
+        let mut identity = pipeline.effective_file_identity(job_id, file_id).unwrap();
+        identity.current_filename = filename.clone();
+        identity.canonical_filename = Some(format!("{filename}.duplicate1"));
+        identity.classification = Some(crate::jobs::assembly::DetectedArchiveIdentity {
+            kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+            set_name: "archive".to_string(),
+            volume_index: Some(index as u32),
+        });
+        identity.classification_source = crate::jobs::record::FileIdentitySource::Par2;
+        pipeline.set_file_identity(job_id, identity).unwrap();
+    }
+    std::fs::remove_file(working_dir.join(&alias)).unwrap();
+    pipeline
+        .eagerly_deleted
+        .entry(job_id)
+        .or_default()
+        .insert(alias.clone());
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&described),
+        &[],
+    );
+
+    let leftovers = pipeline.settle_par2_input_identities_before_cleanup(job_id);
+
+    for (index, (name, bytes)) in described.iter().enumerate() {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: index as u32,
+        };
+        let identity = pipeline.effective_file_identity(job_id, file_id).unwrap();
+        assert_eq!(&identity.current_filename, name, "file {index}");
+        assert_eq!(
+            identity.canonical_filename.as_ref(),
+            Some(name),
+            "file {index}"
+        );
+        assert_eq!(
+            identity.classification_source,
+            crate::jobs::record::FileIdentitySource::Par2
+        );
+        if index < 3 {
+            assert_eq!(
+                &std::fs::read(working_dir.join(name)).unwrap(),
+                bytes,
+                "{name}"
+            );
+        }
+    }
+    assert!(!working_dir.join("archive.part4.rar").exists());
+    assert!(leftovers.contains(&alias));
+    let parked: Vec<_> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| name.starts_with(".weaver-identity-settle"))
+        .collect();
+    assert!(parked.is_empty(), "{parked:?}");
+
+    // Settled is settled: a second pass moves nothing.
+    assert!(
+        pipeline
+            .settle_par2_input_identities_before_cleanup(job_id)
+            .is_empty()
+    );
+}

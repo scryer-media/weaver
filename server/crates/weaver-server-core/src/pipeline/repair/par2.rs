@@ -1072,6 +1072,212 @@ impl Pipeline {
         }
     }
 
+    // Give every archive input PAR2 has identified the name PAR2 describes
+    // for it, once extraction is finished with the inputs and before they
+    // are cleaned up. During the download pass a rename can be refused for
+    // good reasons: a chase is still reading the part under its posted alias,
+    // or the described name is held by another part that has yet to move off
+    // it, so the rebind records a duplicate name instead. Neither reason
+    // survives extraction, and the job must not reach COMPLETE with its
+    // identities still naming the alias. Moves run in two phases through
+    // private staging names so a swap or a longer cycle of misnamed parts
+    // settles without one part overwriting another. A part extraction has
+    // already consumed has no bytes to move; its record takes the described
+    // name directly. Returns names that may still hold input bytes after
+    // the settle, for the caller's cleanup.
+    pub(crate) fn settle_par2_input_identities_before_cleanup(
+        &mut self,
+        job_id: JobId,
+    ) -> Vec<String> {
+        let Some(par2_set) = self.par2_set(job_id).cloned() else {
+            return Vec::new();
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        let working_dir = state.working_dir.clone();
+        let staging_dir = state.staging_dir.clone();
+        let identities: Vec<(NzbFileId, ActiveFileIdentity)> = state
+            .assembly
+            .files()
+            .filter(|file| {
+                matches!(
+                    self.classified_role_for_file(job_id, file),
+                    weaver_model::files::FileRole::RarVolume { .. }
+                        | weaver_model::files::FileRole::SevenZipArchive
+                        | weaver_model::files::FileRole::SevenZipSplit { .. }
+                )
+            })
+            .filter_map(|file| {
+                self.effective_file_identity(job_id, file.file_id())
+                    .map(|identity| (file.file_id(), identity))
+            })
+            .collect();
+        let all_current: HashMap<String, NzbFileId> = state
+            .assembly
+            .files()
+            .filter_map(|file| {
+                self.effective_file_identity(job_id, file.file_id())
+                    .map(|identity| (identity.current_filename, file.file_id()))
+            })
+            .collect();
+
+        let mut by_description = HashMap::<par2_rs::FileId, Vec<NzbFileId>>::new();
+        for (file_id, identity) in &identities {
+            if identity.classification_source != FileIdentitySource::Par2 {
+                continue;
+            }
+            let description = self
+                .content_bound_par2_file_id(*file_id, &par2_set)
+                .or_else(|| {
+                    let canonical = identity.canonical_filename.as_ref()?;
+                    let matches: Vec<_> = par2_set
+                        .files
+                        .iter()
+                        .filter(|(_, desc)| {
+                            sanitize_download_filename(&desc.filename) == *canonical
+                        })
+                        .map(|(id, _)| *id)
+                        .collect();
+                    unique_par2_binding_candidate(&matches)
+                });
+            if let Some(description) = description {
+                by_description
+                    .entry(description)
+                    .or_default()
+                    .push(*file_id);
+            }
+        }
+
+        let mut moves = Vec::<(NzbFileId, ActiveFileIdentity, String)>::new();
+        let mut targets = HashSet::<String>::new();
+        for (description_id, file_ids) in &by_description {
+            let [file_id] = file_ids.as_slice() else {
+                continue;
+            };
+            let Some(desc) = par2_set.files.get(description_id) else {
+                continue;
+            };
+            let target = sanitize_download_filename(&desc.filename);
+            if Self::canonical_archive_identity_from_filename(&target).is_none() {
+                continue;
+            }
+            let Some((_, identity)) = identities.iter().find(|(id, _)| id == file_id) else {
+                continue;
+            };
+            if identity.current_filename == target || !targets.insert(target.clone()) {
+                continue;
+            }
+            moves.push((*file_id, identity.clone(), target));
+        }
+        if moves.is_empty() {
+            return Vec::new();
+        }
+
+        // A described name held by a file that is not itself moving stays
+        // with that file.
+        let vacating: HashSet<String> = moves
+            .iter()
+            .map(|(_, identity, _)| identity.current_filename.clone())
+            .collect();
+        let in_staging = |name: &str| {
+            staging_dir
+                .as_ref()
+                .is_some_and(|dir| dir.join(name).exists())
+        };
+        let moves: Vec<_> = moves
+            .into_iter()
+            .filter(|(file_id, identity, target)| {
+                let held_by_other = all_current
+                    .get(target)
+                    .is_some_and(|holder| holder != file_id && !vacating.contains(target));
+                // Bytes still under the alias never land on a name another
+                // file's bytes occupy. A part extraction has consumed has no
+                // bytes to land, and a copy that recovery verified under the
+                // described name is the same described file.
+                let on_disk_unowned = working_dir.join(target).exists()
+                    && !vacating.contains(target)
+                    && working_dir.join(&identity.current_filename).exists();
+                !held_by_other
+                    && !on_disk_unowned
+                    && !in_staging(&identity.current_filename)
+                    && !in_staging(target)
+            })
+            .collect();
+
+        // Phase one: lift every part that still has bytes off its name.
+        let mut leftovers = Vec::new();
+        let mut lifted = Vec::<(NzbFileId, ActiveFileIdentity, String, Option<String>)>::new();
+        for (file_id, identity, target) in moves {
+            let old_path = working_dir.join(&identity.current_filename);
+            if !old_path.exists() {
+                lifted.push((file_id, identity, target, None));
+                continue;
+            }
+            let parked = format!(".weaver-identity-settle.{}.{}", file_id.file_index, target);
+            match runtime_fs::rename_no_overwrite(&old_path, &working_dir.join(&parked)) {
+                Ok(()) => lifted.push((file_id, identity, target, Some(parked))),
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    from = %identity.current_filename,
+                    to = %target,
+                    error = %error,
+                    "could not settle PAR2 file identity before cleanup"
+                ),
+            }
+        }
+
+        // Phase two: land each lifted part on its described name and record it.
+        let mut settled = 0usize;
+        for (_, identity, target, parked) in lifted {
+            if let Some(parked) = parked.as_ref() {
+                if let Err(error) = runtime_fs::rename_no_overwrite(
+                    &working_dir.join(parked),
+                    &working_dir.join(&target),
+                ) {
+                    warn!(
+                        job_id = job_id.0,
+                        from = %identity.current_filename,
+                        to = %target,
+                        error = %error,
+                        "could not settle PAR2 file identity before cleanup"
+                    );
+                    leftovers.push(parked.clone());
+                    continue;
+                }
+            }
+            let old_current = identity.current_filename.clone();
+            let mut settled_identity = identity;
+            settled_identity.current_filename = target.clone();
+            settled_identity.canonical_filename = Some(target.clone());
+            if let Some(classification) = Self::canonical_archive_identity_from_filename(&target) {
+                settled_identity.classification = Some(classification);
+            }
+            if let Err(error) = self.set_file_identity(job_id, settled_identity) {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "could not record settled PAR2 file identity"
+                );
+                continue;
+            }
+            if let Some(deleted) = self.eagerly_deleted.get_mut(&job_id)
+                && deleted.contains(&old_current)
+            {
+                deleted.insert(target.clone());
+            }
+            leftovers.push(old_current);
+            settled += 1;
+        }
+        if settled > 0 {
+            info!(
+                job_id = job_id.0,
+                settled, "settled PAR2 file identities before input cleanup"
+            );
+        }
+        leftovers
+    }
+
     pub(crate) fn par2_runtime(&self, job_id: JobId) -> Option<&crate::pipeline::Par2RuntimeState> {
         self.par2_runtime.get(&job_id)
     }

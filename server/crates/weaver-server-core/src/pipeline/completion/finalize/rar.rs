@@ -1332,6 +1332,7 @@ impl Pipeline {
             return;
         }
 
+        let settle_leftovers = self.settle_par2_input_identities_before_cleanup(job_id);
         let cleanup_files: HashSet<String> = {
             let state = self.jobs.get(&job_id).unwrap();
             let mut cleanup_files: HashSet<String> = state
@@ -1366,6 +1367,7 @@ impl Pipeline {
             }
             cleanup_files.extend(self.par2_spent_input_names(job_id));
             cleanup_files.extend(self.finalized_direct_volume_filenames(job_id));
+            cleanup_files.extend(settle_leftovers);
             cleanup_files
         };
 
