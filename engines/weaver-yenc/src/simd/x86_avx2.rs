@@ -2,11 +2,11 @@ use super::*;
 
 /// Maintenance contract: this Rust kernel and the intrinsic path selected by
 /// `WEAVER_YENC_RAW_ASM=0` are the tunable source of truth behind the frozen
-/// `asm!` kernels. For future tuning or bug fixes, change this implementation,
+/// `asm!` kernel. For future tuning or bug fixes, change this implementation,
 /// validate and measure it through the `=0` escape hatch, and only then update
-/// `avx2_raw_kernel_oracle` and `avx2_raw_span_setrue_asm` from the winning
-/// emission. The oracle differential suite detects semantic drift between the
-/// Rust and assembly implementations.
+/// `avx2_raw_kernel_oracle` (both instantiations) from the winning emission.
+/// The oracle differential suite detects semantic drift between the Rust and
+/// assembly implementations.
 ///
 /// Faithful port of rapidyenc `do_decode_avx2` (decoder_avx2_base.h), the
 /// `isRaw=true, searchEnd=false` instantiation — the realshape decode path.
@@ -30,14 +30,12 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     use std::arch::x86_64::*;
     const WIDTH: usize = 64;
 
-    // The SEARCH_END=false span runs the oracle-model asm kernel
-    // (aligned single-cursor loop transliterated from rapidyenc's own emission
-    // on the measurement host — see avx2_raw_kernel_oracle). Isolated function
-    // so the generic body below stays byte-identical for SEARCH_END=true and
-    // non-asm builds.
-    #[cfg(weaver_yenc_raw_asm)]
-    if !SEARCH_END {
-        return avx2_raw_kernel_oracle(input, output, state, mode);
+    // Both instantiations run the oracle-model asm kernel (aligned
+    // single-cursor loop transliterated from rapidyenc's own emission on the
+    // measurement host — see avx2_raw_kernel_oracle); the body below is the
+    // `WEAVER_YENC_RAW_ASM=0` build's kernel.
+    if cfg!(weaver_yenc_raw_asm) {
+        return avx2_raw_kernel_oracle::<SEARCH_END>(input, output, state, mode, input.len());
     }
 
     let mut src = 0usize;
@@ -172,37 +170,7 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
         let span = (simd_limit / WIDTH) * WIDTH;
         let sp = input.as_ptr().add(span);
         let mut i: isize = -(span as isize);
-        // The SEARCH_END=true span runs the frozen-roll asm kernel; on a
-        // terminator hit it exits with the window unconsumed (i != 0) and the
-        // pre-merge mask, feeding the same no-backtrack break glue the Rust
-        // loop used. The Rust loop below remains the =0 escape hatch and the
-        // tunable source of truth (see the maintenance contract above).
-        #[cfg(weaver_yenc_raw_asm)]
-        let mut asm_ran = false;
-        #[cfg(weaver_yenc_raw_asm)]
-        if SEARCH_END && i != 0 {
-            let mut break_mask = 0u64;
-            avx2_raw_span_setrue_asm(
-                input.as_ptr(),
-                &mut i,
-                &mut out,
-                &mut esc_first,
-                &mut break_mask,
-                min_mask,
-                yenc_offset,
-            );
-            if i != 0 {
-                state.state =
-                    x86_break_state(input, (span as isize + i) as usize, break_mask, esc_first);
-                broke = true;
-            }
-            asm_ran = true;
-        }
-        #[cfg(weaver_yenc_raw_asm)]
-        let run_rust_span = !asm_ran;
-        #[cfg(not(weaver_yenc_raw_asm))]
-        let run_rust_span = true;
-        while run_rust_span && i != 0 {
+        while i != 0 {
             let a = _mm256_loadu_si256(sp.offset(i) as *const __m256i);
             let b = _mm256_loadu_si256(sp.offset(i + 32) as *const __m256i);
 
@@ -535,16 +503,32 @@ pub(super) unsafe fn decode_kernel_avx2(
     // same length as the raw path, so short inputs keep today's routing exactly.
     let mut head_src = 0usize;
     let mut head_dst = 0usize;
-    if search_end
-        && dot_unstuffing
-        && input.len() > WIDTH * 2
-        && x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)?
-    {
-        return Ok(KernelOutcome {
-            consumed: head_src,
-            written: head_dst,
-            end: state.end.into(),
-        });
+    if search_end && dot_unstuffing && input.len() > WIDTH * 2 {
+        // Head-align the span to a 64-byte boundary with the scalar machine
+        // (at most 63 steps), as the SE=false oracle kernel and rapidyenc's own
+        // driver do, so no window load splits a cache line. The entry shapes
+        // the flat loop cannot see are re-resolved after every step.
+        loop {
+            if x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)? {
+                return Ok(KernelOutcome {
+                    consumed: head_src,
+                    written: head_dst,
+                    end: state.end.into(),
+                });
+            }
+            if (input.as_ptr() as usize + head_src).is_multiple_of(WIDTH)
+                || !decode_scalar_step(input, &mut head_src, output, &mut head_dst, state, mode)?
+            {
+                break;
+            }
+        }
+        if state.end != DecodeEnd::None || head_src >= input.len() {
+            return Ok(KernelOutcome {
+                consumed: head_src,
+                written: head_dst,
+                end: state.end.into(),
+            });
+        }
     }
 
     // Hot path: faithful rapidyenc do_decode_avx2 port (raw dot-unstuffing),
@@ -813,6 +797,73 @@ pub(super) unsafe fn decode_kernel_avx2(
     })
 }
 
+/// Raw end-searching decode of `input` that stops at `limit` instead of the
+/// end of `input`, for a caller that folds the CRC behind each stretch while
+/// the output is still in cache.
+///
+/// The bytes after `limit` stay visible: the SIMD span keeps its lookahead
+/// reserve inside `input`, so an end probe in the last window sees exactly
+/// what an unbounded call would, and the span ends on `limit` itself when
+/// `limit` is 64-byte aligned with the reserve still ahead of it. That skips
+/// the scalar tail an unbounded call on the stretch alone would pay. The
+/// decode can run past `limit` only to finish an escape or reach an end
+/// marker. `None` when the asm kernel is not built in.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub(super) unsafe fn decode_raw_bounded_avx2(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    limit: usize,
+) -> Option<Result<KernelOutcome, YencError>> {
+    if !cfg!(weaver_yenc_raw_asm) {
+        return None;
+    }
+    let mode = DecodeStepMode {
+        dot_unstuffing: true,
+        preserve_pending: true,
+        search_end: true,
+    };
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    // The oracle enters in None/Eq/Cr/CrLf only; a stretch that ended inside
+    // a dot or line-start escape sequence finishes it with the scalar machine.
+    let head = (|| {
+        while !matches!(
+            state.state,
+            DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
+        ) {
+            if src >= limit
+                || x86_search_end_head(input, output, state, mode, &mut src, &mut dst)?
+                || !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(src >= limit)
+    })();
+    Some(match head {
+        Err(err) => Err(err),
+        Ok(true) => Ok(KernelOutcome {
+            consumed: src,
+            written: dst,
+            end: state.end.into(),
+        }),
+        Ok(false) => x86_fold_head(
+            avx2_raw_kernel_oracle::<true>(
+                &input[src..],
+                &mut output[dst..],
+                state,
+                mode,
+                limit - src,
+            ),
+            src,
+            dst,
+        ),
+    })
+}
+
 /// 2×2-lane LUT compaction + store for one 64-byte window, in the oracle's
 /// exact addressing shape (rapidyenc `decoder_avx2_base.h:556-600`, the
 /// `PLATFORM_AMD64` arm). Byte-for-byte identical output to the previous
@@ -915,40 +966,29 @@ static AVX2_ESC_IDX_B: Align32 = Align32([
 #[cfg(target_arch = "x86_64")]
 static AVX2_ESC_BIT_LANES: u64 = 0x8040_2010_0804_0201;
 
-/// Single-byte broadcast sources for the SE=true asm kernel's in-block
-/// constant rematerialization (mirroring its source emission's rodata
-/// broadcasts) plus the 32-byte specials LUT for restoring the table
-/// register after the dot-arm uses it as scratch.
-#[cfg(target_arch = "x86_64")]
-static YB_DOT: u8 = 0x2e;
-#[cfg(target_arch = "x86_64")]
-static YB_EQ: u8 = 0x3d;
+/// Broadcast sources for the end-search probes' needle rematerialization in
+/// the asm kernel, which has no spare vector register to pin them.
 #[cfg(target_arch = "x86_64")]
 static YB_CR: u8 = 0x0d;
 #[cfg(target_arch = "x86_64")]
 static YB_LF: u8 = 0x0a;
 #[cfg(target_arch = "x86_64")]
-static YB_SUB42: u8 = 0xd6;
-#[cfg(target_arch = "x86_64")]
-static YB_ESC: u8 = 0x96;
-#[cfg(target_arch = "x86_64")]
 static YB_Y: u8 = 0x79;
 #[cfg(target_arch = "x86_64")]
 static YW_EQY: u16 = 0x793d;
-/// The specials LUT rows as bytes (index by min(byte, '.')): '.'->'.',
-/// '\n'->'\n', '\r'->'\r', '='->'=' — everything else maps to 0xff (no
-/// match). Identical per 16-byte lane; matches `special_lut` in the
-/// kernels.
-#[cfg(target_arch = "x86_64")]
-static AVX2_SPECIAL_LUT: Align32 = Align32([
-    0x2e, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0a, 0xff, 0xff, 0x0d, 0x3d, 0xff,
-    0x2e, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0a, 0xff, 0xff, 0x0d, 0x3d, 0xff,
-]);
 
-/// The whole `SEARCH_END = false` kernel in the oracle's own
-/// shape — a transliteration of rapidyenc's compiled `do_decode_avx2`
-/// (`isRaw=true, searchEnd=false`) as emitted by GCC. The differential suite
-/// verifies byte-for-byte parity with the reference implementation.
+/// The whole raw kernel in the oracle's own shape — a transliteration of
+/// rapidyenc's compiled `do_decode_avx2` (`isRaw=true`) as emitted by GCC,
+/// for both `searchEnd` instantiations. The differential suite verifies
+/// byte-for-byte parity with the reference implementation.
+///
+/// `SEARCH_END = true` adds the oracle's end probes and nothing else: the
+/// non-dot arm tests `\r\n=y` (`=y` at +2/+3 first, the CR/LF pair only on
+/// a hit, in an out-of-line block), and the dot arm builds `\r\n.\r\n` /
+/// `\r\n.=y` / `\r\n=y` from the pre-merge needle masks before the dot
+/// merge. A hit leaves the window unconsumed and hands the pre-merge mask
+/// and pre-window `escFirst` to [`x86_break_state`], so the scalar epilogue
+/// resumes at the window head with no backtrack.
 ///
 /// The oracle's structure, faithfully kept:
 /// - the input cursor is HEAD-ALIGNED to 64 bytes by a scalar prelude (in
@@ -980,17 +1020,18 @@ static AVX2_SPECIAL_LUT: Align32 = Align32([
 /// Safety: the caller guarantees the raw-path contract (`dot_unstuffing`,
 /// entry state in {None,Eq,Cr,CrLf}); the scalar prelude/epilogue share the
 /// kernel's usual bounds; the span keeps the 67-byte tail reserve, and the
-/// deepest lookahead reads `c + 2 + 31 < span end + reserve`. Flags are
+/// deepest lookahead reads `c + 4 + 31 < span end + reserve`. Flags are
 /// clobbered; the block reads input + LUT and writes output; no stack use.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(not(weaver_yenc_raw_asm), allow(dead_code))]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn avx2_raw_kernel_oracle(
+unsafe fn avx2_raw_kernel_oracle<const SEARCH_END: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
     mode: DecodeStepMode,
+    limit: usize,
 ) -> Result<KernelOutcome, YencError> {
     use std::arch::x86_64::*;
     const WIDTH: usize = 64;
@@ -999,8 +1040,20 @@ unsafe fn avx2_raw_kernel_oracle(
     let mut dst = 0usize;
 
     // Head-align the input cursor to a 64-byte boundary with the scalar
-    // machine — the oracle's own prelude. At most 63 steps.
-    while src < input.len() && (input.as_ptr() as usize + src) & (WIDTH - 1) != 0 {
+    // machine — the oracle's own prelude. At most 63 steps. The end search
+    // also resolves, before every step, the line-start entry shapes whose
+    // `\r\n` sits behind the span and which the window probe cannot see.
+    loop {
+        if SEARCH_END && x86_search_end_head(input, output, state, mode, &mut src, &mut dst)? {
+            return Ok(KernelOutcome {
+                consumed: src,
+                written: dst,
+                end: state.end.into(),
+            });
+        }
+        if src >= limit || (input.as_ptr() as usize + src) & (WIDTH - 1) == 0 {
+            break;
+        }
         if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
             return Ok(KernelOutcome {
                 consumed: src,
@@ -1011,7 +1064,10 @@ unsafe fn avx2_raw_kernel_oracle(
     }
 
     let tail = WIDTH - 1 + 4;
-    let simd_limit = input.len().saturating_sub(tail);
+    // The span keeps its lookahead reserve inside `input` even when `limit`
+    // stops it early, so a bounded call probes the bytes past `limit` exactly
+    // as an unbounded one does.
+    let simd_limit = input.len().saturating_sub(tail).min(limit);
     let span = (simd_limit.saturating_sub(src) / WIDTH) * WIDTH;
 
     if span > 0 {
@@ -1122,259 +1178,385 @@ unsafe fn avx2_raw_kernel_oracle(
         let c_v = c0;
         let mut out_v = output.as_mut_ptr().add(dst);
         let mut ef_v = esc_first;
+        let c_out: *const u8;
+        let mask_out: u64;
 
-        core::arch::asm!(
-            "jmp 20f",
-            // ---- specials (backward target of the head): `=` masks -------
-            ".p2align 4",
-            "21:",
-            "vpcmpeqb {s0}, {hi}, {eqn}",
-            "vpcmpeqb {s2}, {lo}, {eqn}",
-            "vpmovmskb {t1:e}, {s0}",
-            "vpmovmskb {meq:e}, {s2}",
-            "shl {t1}, 32",
-            "or {meq}, {t1}",
-            "cmp {mask}, {meq}",
-            "jne 23f",
-            // ---- join: escape select (oracle 6c1b8) ----------------------
-            "22:",
-            "lea {t1}, [{ef} + {meq}*2]",
-            "test {mask}, {t1}",
-            "jnz 26f",
-            // weaver's measured edge the oracle lacks (+11.7% on CRLF-heavy
-            // content, r2 trade pricing): when the window itself carries no
-            // `=` (meq == 0), skip the whole escape select — `yov` already
-            // holds the carried-escape byte-0 offset, so the plain adds are
-            // exact even when an escape straddled in. (The eq_shift1==0 form
-            // of this gate failed the differential net; the meq==0 form
-            // passes it and fires on strictly more windows.)
-            "test {meq}, {meq}",
-            "jz 28f",
-            "vinserti128 {s0}, {eqn}, {s2:x}, 1",
-            "mov {ef}, {meq}",
-            "vpalignr {s2}, {s2}, {s0}, 15",
-            "vpcmpeqb {s0}, {eqn}, ymmword ptr [{c} - 1]",
-            "shr {ef}, 63",
-            "vpblendvb {s2}, {yov}, {eof}, {s2}",
-            "vpaddb {s2}, {lo}, {s2}",
-            "vpblendvb {s0}, {s42}, {eof}, {s0}",
-            "vpaddb {s0}, {hi}, {s0}",
-            // ---- store (falls into the head; oracle 6c1f3) ---------------
-            "24:",
-            "mov {meq:e}, {mask:e}",
-            "vmovd {yov:x}, {ef:e}",
-            "add {c}, 64",
-            "and {meq:e}, 0x7fff",
-            "vpsllw {yov:x}, {yov:x}, 6",
-            "shl {meq:e}, 4",
-            "vmovdqu {s1:x}, xmmword ptr [{tab} + {meq}]",
-            "mov {meq}, {mask}",
-            "vpxor {yov}, {yov}, {s42}",
-            "shr {meq}, 12",
-            "and {meq:e}, 0x7fff0",
-            "vinserti128 {s1}, {s1}, xmmword ptr [{tab} + {meq}], 1",
-            "popcnt {t1:x}, {mask:x}",
-            "movzx {t1:e}, {t1:x}",
-            "vpshufb {s1}, {s2}, {s1}",
-            "vmovdqu xmmword ptr [{out}], {s1:x}",
-            "sub {out}, {t1}",
-            "mov {meq:e}, {mask:e}",
-            "xor {meq:x}, {meq:x}",
-            "vextracti128 xmmword ptr [{out} + 16], {s1}, 1",
-            "popcnt {meq:e}, {meq:e}",
-            "sub {out}, {meq}",
-            "mov {meq}, {mask}",
-            "shr {meq}, 28",
-            "mov {t1}, {meq}",
-            "and {meq:e}, 0xffff0",
-            "and {t1:e}, 0x7fff0",
-            "popcnt {meq:e}, {meq:e}",
-            "vmovdqu {s1:x}, xmmword ptr [{tab} + {t1}]",
-            "mov {t1}, {mask}",
-            "shr {mask}, 48",
-            "shr {t1}, 44",
-            "popcnt {mask:e}, {mask:e}",
-            "and {t1:e}, 0x7fff0",
-            "vinserti128 {s1}, {s1}, xmmword ptr [{tab} + {t1}], 1",
-            "vpshufb {s1}, {s0}, {s1}",
-            "vmovdqu xmmword ptr [{out} + 32], {s1:x}",
-            "sub {out}, {meq}",
-            "vextracti128 xmmword ptr [{out} + 48], {s1}, 1",
-            "sub {out}, {mask}",
-            "mov {mask}, {ne}",
-            "add {out}, 64",
-            "add {mask}, {c}",
-            "jz 30f",
-            // ---- loop head: aligned lane loads, one specials probe -------
-            "20:",
-            "vmovdqa {hi}, ymmword ptr [{c}]",
-            "vmovdqa {lo}, ymmword ptr [{c} - 32]",
-            "vpminub {s1}, {hi}, {dot}",
-            "vpminub {s0}, {mmv}, {lo}",
-            "vpshufb {s1}, {lut}, {s1}",
-            "vpshufb {s0}, {lut}, {s0}",
-            "vpcmpeqb {s1}, {s1}, {hi}",
-            "vpcmpeqb {s0}, {s0}, {lo}",
-            "vpmovmskb {meq:e}, {s1}",
-            "vpmovmskb {mask:e}, {s0}",
-            "shl {meq}, 32",
-            "or {mask}, {meq}",
-            "jnz 21b",
-            // clean window: the head's fallthrough. First iteration decodes
-            // with the carried `yov` (straddled-escape byte 0) and resets the
-            // carry, then falls into the pipelined clean streak.
-            "vpaddb {s1}, {yov}, {lo}",
-            "vpaddb {s0}, {hi}, {s42}",
-            "vmovdqa {yov}, {s42}",
-            "xor {ef:e}, {ef:e}",
-            "jmp 42f",
-            // ---- pipelined clean streak: decode N, then load N+1 BEFORE
-            // storing N (the July 2-window result: breaking the serial
-            // load->store->load chain is worth ~+15% on pure-clean content;
-            // here it costs the heavy path nothing — specials exit to 21).
-            // In-streak invariants: ef == 0, yov == sub42, mmv == dot (a
-            // pending dot forces the specials path, so a clean window can
-            // never carry one).
-            ".p2align 4",
-            "41:",
-            "vpaddb {s1}, {lo}, {s42}",
-            "vpaddb {s0}, {hi}, {s42}",
-            "42:",
-            // speculative next-window loads: the span keeps a 67-byte tail
-            // reserve, so reading one window past the last is in bounds.
-            "vmovdqa {hi}, ymmword ptr [{c} + 64]",
-            "vmovdqa {lo}, ymmword ptr [{c} + 32]",
-            "vmovdqu ymmword ptr [{out}], {s1}",
-            "vmovdqu ymmword ptr [{out} + 32], {s0}",
-            "add {c}, 64",
-            "add {out}, 64",
-            "mov {mask}, {ne}",
-            "add {mask}, {c}",
-            "jz 30f",
-            "vpminub {s1}, {hi}, {dot}",
-            "vpminub {s0}, {mmv}, {lo}",
-            "vpshufb {s1}, {lut}, {s1}",
-            "vpshufb {s0}, {lut}, {s0}",
-            "vpcmpeqb {s1}, {s1}, {hi}",
-            "vpcmpeqb {s0}, {s0}, {lo}",
-            "vpmovmskb {meq:e}, {s1}",
-            "vpmovmskb {mask:e}, {s0}",
-            "shl {meq}, 32",
-            "or {mask}, {meq}",
-            "jz 41b",
-            "jmp 21b",
-            // ---- CR/LF present: remat CR, `.`-at-+2 probe (oracle 6c358) -
-            ".p2align 4",
-            "23:",
-            "mov {t1:e}, 0x0d0d0d0d",
-            "vmovd {s0:x}, {t1:e}",
-            "vpbroadcastd {s0}, {s0:x}",
-            "vpcmpeqb {s1}, {dot}, ymmword ptr [{c} - 30]",
-            "vpcmpeqb {mmv}, {lo}, {s0}",
-            "vpcmpeqb {s3}, {hi}, {s0}",
-            "vpand {s1}, {s1}, {mmv}",
-            "vpcmpeqb {mmv}, {dot}, ymmword ptr [{c} + 2]",
-            "vpand {mmv}, {s3}, {mmv}",
-            "vpor {s4}, {s1}, {mmv}",
-            "vpmovmskb {t1:e}, {s4}",
-            "test {t1:e}, {t1:e}",
-            "jnz 25f",
-            "vmovdqa {mmv}, {dot}",
-            "jmp 22b",
-            // ---- stuffed dot: merge `\r\n.`, clamp min_mask (6c428) ------
-            "25:",
-            "mov {t1:e}, 0x0a0a0a0a",
-            "vmovdqa {s4}, ymmword ptr [{c} - 32]",
-            "vmovdqa {s5}, ymmword ptr [{c}]",
-            "vmovd {s3:x}, {t1:e}",
-            "vpbroadcastd {s3}, {s3:x}",
-            "vpcmpeqb {s5}, {s5}, {s0}",
-            "vpcmpeqb {s4}, {s4}, {s0}",
-            "vpcmpeqb {s0}, {s3}, ymmword ptr [{c} + 1]",
-            "vpand {s5}, {s5}, {s0}",
-            "vpcmpeqb {s3}, {s3}, ymmword ptr [{c} - 31]",
-            "vpand {s4}, {s4}, {s1}",
-            "vpand {mmv}, {mmv}, {s5}",
-            "vpand {s4}, {s4}, {s3}",
-            "vpmovmskb {t2:e}, {mmv}",
-            "vpmovmskb {t1:e}, {s4}",
-            "shl {t2}, 34",
-            "shl {t1}, 2",
-            "or {t1}, {t2}",
-            "or {mask}, {t1}",
-            "vextracti128 {s0:x}, {mmv}, 1",
-            "vpsrldq {s0:x}, {s0:x}, 14",
-            "vpsubusb {mmv}, {dot}, {s0}",
-            "jmp 22b",
-            // ---- escaped == 0: plain adds (weaver's shortcut) ------------
-            "28:",
-            "vpaddb {s2}, {lo}, {yov}",
-            "vpaddb {s0}, {hi}, {s42}",
-            "xor {ef:e}, {ef:e}",
-            "jmp 24b",
-            // ---- consecutive-`=` collision (oracle 6c498) ----------------
-            "26:",
-            "not {t1}",
-            "and {t1}, {meq}",
-            "mov {t2}, {t1}",
-            "movabs {t1}, 0x5555555555555555",
-            "and {t2}, {t1}",
-            "add {t2}, {meq}",
-            "xor {t1}, {t2}",
-            "and {meq}, {t1}",
-            "lea {t1}, [{meq} + {meq}]",
-            "vmovq {s0:x}, {t1}",
-            "or {ef}, {t1}",
-            "vpbroadcastq {s0}, {s0:x}",
-            "not {ef}",
-            "vpshufb {s2}, {s0}, ymmword ptr [rip + {ia}]",
-            "and {mask}, {ef}",
-            "mov {ef}, {meq}",
-            "vpshufb {s0}, {s0}, ymmword ptr [rip + {ib}]",
-            "vpbroadcastq {s3}, qword ptr [rip + {bl}]",
-            "shr {ef}, 63",
-            "vpand {s2}, {s2}, {s3}",
-            "vpand {s0}, {s0}, {s3}",
-            "vpcmpeqb {s2}, {s2}, {s3}",
-            "vpblendvb {s2}, {yov}, {eof}, {s2}",
-            "vpaddb {s2}, {lo}, {s2}",
-            "vpcmpeqb {s0}, {s0}, {s3}",
-            "vpblendvb {s0}, {s42}, {eof}, {s0}",
-            "vpaddb {s0}, {hi}, {s0}",
-            "jmp 24b",
-            "30:",
-            c = inout(reg) c_v => _,
-            ne = in(reg) negend,
-            out = inout(reg) out_v,
-            ef = inout(reg) ef_v,
-            tab = in(reg) table,
-            mask = out(reg) _,
-            meq = out(reg) _,
-            t1 = out(reg) _,
-            t2 = out(reg) _,
-            lut = in(ymm_reg) special_lut,
-            dot = in(ymm_reg) dot,
-            s42 = in(ymm_reg) sub42,
-            eqn = in(ymm_reg) eq_needle,
-            eof = in(ymm_reg) esc_off,
-            yov = inout(ymm_reg) yenc_offset => _,
-            mmv = inout(ymm_reg) min_mask => _,
-            hi = out(ymm_reg) _,
-            lo = out(ymm_reg) _,
-            s0 = out(ymm_reg) _,
-            s1 = out(ymm_reg) _,
-            s2 = out(ymm_reg) _,
-            s3 = out(ymm_reg) _,
-            s4 = out(ymm_reg) _,
-            s5 = out(ymm_reg) _,
-            ia = sym AVX2_ESC_IDX_A,
-            ib = sym AVX2_ESC_IDX_B,
-            bl = sym AVX2_ESC_BIT_LANES,
-            options(nostack),
-        );
+        // One template for both instantiations: the end search adds its
+        // terminator probes to the two CR/LF arms (`nondot`, `dotarm`) and
+        // their rare out-of-line block (`outline`), plus the operands those
+        // use.
+        macro_rules! oracle_span {
+            ([$($nondot:literal),*], [$($dotarm:literal),*], [$($outline:literal),*], $($extra:tt)*) => {
+                core::arch::asm!(
+                "jmp 20f",
+                // ---- specials (backward target of the head): `=` masks -------
+                ".p2align 4",
+                "21:",
+                "vpcmpeqb {s0}, {hi}, {eqn}",
+                "vpcmpeqb {s2}, {lo}, {eqn}",
+                "vpmovmskb {t1:e}, {s0}",
+                "vpmovmskb {meq:e}, {s2}",
+                "shl {t1}, 32",
+                "or {meq}, {t1}",
+                "cmp {mask}, {meq}",
+                "jne 23f",
+                // ---- join: escape select (oracle 6c1b8) ----------------------
+                "22:",
+                "lea {t1}, [{ef} + {meq}*2]",
+                "test {mask}, {t1}",
+                "jnz 26f",
+                // weaver's measured edge the oracle lacks (+11.7% on CRLF-heavy
+                // content, r2 trade pricing): when the window itself carries no
+                // `=` (meq == 0), skip the whole escape select — `yov` already
+                // holds the carried-escape byte-0 offset, so the plain adds are
+                // exact even when an escape straddled in. (The eq_shift1==0 form
+                // of this gate failed the differential net; the meq==0 form
+                // passes it and fires on strictly more windows.)
+                "test {meq}, {meq}",
+                "jz 28f",
+                "vinserti128 {s0}, {eqn}, {s2:x}, 1",
+                "mov {ef}, {meq}",
+                "vpalignr {s2}, {s2}, {s0}, 15",
+                "vpcmpeqb {s0}, {eqn}, ymmword ptr [{c} - 1]",
+                "shr {ef}, 63",
+                "vpblendvb {s2}, {yov}, {eof}, {s2}",
+                "vpaddb {s2}, {lo}, {s2}",
+                "vpblendvb {s0}, {s42}, {eof}, {s0}",
+                "vpaddb {s0}, {hi}, {s0}",
+                // ---- store (falls into the head; oracle 6c1f3) ---------------
+                "24:",
+                "mov {meq:e}, {mask:e}",
+                "vmovd {yov:x}, {ef:e}",
+                "add {c}, 64",
+                "and {meq:e}, 0x7fff",
+                "vpsllw {yov:x}, {yov:x}, 6",
+                "shl {meq:e}, 4",
+                "vmovdqu {s1:x}, xmmword ptr [{tab} + {meq}]",
+                "mov {meq}, {mask}",
+                "vpxor {yov}, {yov}, {s42}",
+                "shr {meq}, 12",
+                "and {meq:e}, 0x7fff0",
+                "vinserti128 {s1}, {s1}, xmmword ptr [{tab} + {meq}], 1",
+                "popcnt {t1:x}, {mask:x}",
+                "movzx {t1:e}, {t1:x}",
+                "vpshufb {s1}, {s2}, {s1}",
+                "vmovdqu xmmword ptr [{out}], {s1:x}",
+                "sub {out}, {t1}",
+                "mov {meq:e}, {mask:e}",
+                "xor {meq:x}, {meq:x}",
+                "vextracti128 xmmword ptr [{out} + 16], {s1}, 1",
+                "popcnt {meq:e}, {meq:e}",
+                "sub {out}, {meq}",
+                "mov {meq}, {mask}",
+                "shr {meq}, 28",
+                "mov {t1}, {meq}",
+                "and {meq:e}, 0xffff0",
+                "and {t1:e}, 0x7fff0",
+                "popcnt {meq:e}, {meq:e}",
+                "vmovdqu {s1:x}, xmmword ptr [{tab} + {t1}]",
+                "mov {t1}, {mask}",
+                "shr {mask}, 48",
+                "shr {t1}, 44",
+                "popcnt {mask:e}, {mask:e}",
+                "and {t1:e}, 0x7fff0",
+                "vinserti128 {s1}, {s1}, xmmword ptr [{tab} + {t1}], 1",
+                "vpshufb {s1}, {s0}, {s1}",
+                "vmovdqu xmmword ptr [{out} + 32], {s1:x}",
+                "sub {out}, {meq}",
+                "vextracti128 xmmword ptr [{out} + 48], {s1}, 1",
+                "sub {out}, {mask}",
+                "mov {mask}, {ne}",
+                "add {out}, 64",
+                "add {mask}, {c}",
+                "jz 30f",
+                // ---- loop head: aligned lane loads, one specials probe -------
+                "20:",
+                "vmovdqa {hi}, ymmword ptr [{c}]",
+                "vmovdqa {lo}, ymmword ptr [{c} - 32]",
+                "vpminub {s1}, {hi}, {dot}",
+                "vpminub {s0}, {mmv}, {lo}",
+                "vpshufb {s1}, {lut}, {s1}",
+                "vpshufb {s0}, {lut}, {s0}",
+                "vpcmpeqb {s1}, {s1}, {hi}",
+                "vpcmpeqb {s0}, {s0}, {lo}",
+                "vpmovmskb {meq:e}, {s1}",
+                "vpmovmskb {mask:e}, {s0}",
+                "shl {meq}, 32",
+                "or {mask}, {meq}",
+                "jnz 21b",
+                // clean window: the head's fallthrough. First iteration decodes
+                // with the carried `yov` (straddled-escape byte 0) and resets the
+                // carry, then falls into the pipelined clean streak.
+                "vpaddb {s1}, {yov}, {lo}",
+                "vpaddb {s0}, {hi}, {s42}",
+                "vmovdqa {yov}, {s42}",
+                "xor {ef:e}, {ef:e}",
+                "jmp 42f",
+                // ---- pipelined clean streak: decode N, then load N+1 BEFORE
+                // storing N (the July 2-window result: breaking the serial
+                // load->store->load chain is worth ~+15% on pure-clean content;
+                // here it costs the heavy path nothing — specials exit to 21).
+                // In-streak invariants: ef == 0, yov == sub42, mmv == dot (a
+                // pending dot forces the specials path, so a clean window can
+                // never carry one).
+                ".p2align 4",
+                "41:",
+                "vpaddb {s1}, {lo}, {s42}",
+                "vpaddb {s0}, {hi}, {s42}",
+                "42:",
+                // speculative next-window loads: the span keeps a 67-byte tail
+                // reserve, so reading one window past the last is in bounds.
+                "vmovdqa {hi}, ymmword ptr [{c} + 64]",
+                "vmovdqa {lo}, ymmword ptr [{c} + 32]",
+                "vmovdqu ymmword ptr [{out}], {s1}",
+                "vmovdqu ymmword ptr [{out} + 32], {s0}",
+                "add {c}, 64",
+                "add {out}, 64",
+                "mov {mask}, {ne}",
+                "add {mask}, {c}",
+                "jz 30f",
+                "vpminub {s1}, {hi}, {dot}",
+                "vpminub {s0}, {mmv}, {lo}",
+                "vpshufb {s1}, {lut}, {s1}",
+                "vpshufb {s0}, {lut}, {s0}",
+                "vpcmpeqb {s1}, {s1}, {hi}",
+                "vpcmpeqb {s0}, {s0}, {lo}",
+                "vpmovmskb {meq:e}, {s1}",
+                "vpmovmskb {mask:e}, {s0}",
+                "shl {meq}, 32",
+                "or {mask}, {meq}",
+                "jz 41b",
+                "jmp 21b",
+                // ---- CR/LF present: remat CR, `.`-at-+2 probe (oracle 6c358) -
+                ".p2align 4",
+                "23:",
+                "mov {t1:e}, 0x0d0d0d0d",
+                "vmovd {s0:x}, {t1:e}",
+                "vpbroadcastd {s0}, {s0:x}",
+                "vpcmpeqb {s1}, {dot}, ymmword ptr [{c} - 30]",
+                "vpcmpeqb {mmv}, {lo}, {s0}",
+                "vpcmpeqb {s3}, {hi}, {s0}",
+                "vpand {s1}, {s1}, {mmv}",
+                "vpcmpeqb {mmv}, {dot}, ymmword ptr [{c} + 2]",
+                "vpand {mmv}, {s3}, {mmv}",
+                "vpor {s4}, {s1}, {mmv}",
+                "vpmovmskb {t1:e}, {s4}",
+                "test {t1:e}, {t1:e}",
+                "jnz 25f",
+                $($nondot,)*
+                "vmovdqa {mmv}, {dot}",
+                "jmp 22b",
+                // ---- stuffed dot: merge `\r\n.`, clamp min_mask (6c428) ------
+                "25:",
+                "mov {t1:e}, 0x0a0a0a0a",
+                "vmovdqa {s4}, ymmword ptr [{c} - 32]",
+                "vmovdqa {s5}, ymmword ptr [{c}]",
+                "vmovd {s3:x}, {t1:e}",
+                "vpbroadcastd {s3}, {s3:x}",
+                "vpcmpeqb {s5}, {s5}, {s0}",
+                "vpcmpeqb {s4}, {s4}, {s0}",
+                "vpcmpeqb {s0}, {s3}, ymmword ptr [{c} + 1]",
+                "vpand {s5}, {s5}, {s0}",
+                "vpcmpeqb {s3}, {s3}, ymmword ptr [{c} - 31]",
+                "vpand {s4}, {s4}, {s1}",
+                "vpand {mmv}, {mmv}, {s5}",
+                "vpand {s4}, {s4}, {s3}",
+                $($dotarm,)*
+                "vpmovmskb {t2:e}, {mmv}",
+                "vpmovmskb {t1:e}, {s4}",
+                "shl {t2}, 34",
+                "shl {t1}, 2",
+                "or {t1}, {t2}",
+                "or {mask}, {t1}",
+                "vextracti128 {s0:x}, {mmv}, 1",
+                "vpsrldq {s0:x}, {s0:x}, 14",
+                "vpsubusb {mmv}, {dot}, {s0}",
+                "jmp 22b",
+                // ---- escaped == 0: plain adds (weaver's shortcut) ------------
+                "28:",
+                "vpaddb {s2}, {lo}, {yov}",
+                "vpaddb {s0}, {hi}, {s42}",
+                "xor {ef:e}, {ef:e}",
+                "jmp 24b",
+                // ---- consecutive-`=` collision (oracle 6c498) ----------------
+                "26:",
+                "not {t1}",
+                "and {t1}, {meq}",
+                "mov {t2}, {t1}",
+                "movabs {t1}, 0x5555555555555555",
+                "and {t2}, {t1}",
+                "add {t2}, {meq}",
+                "xor {t1}, {t2}",
+                "and {meq}, {t1}",
+                "lea {t1}, [{meq} + {meq}]",
+                "vmovq {s0:x}, {t1}",
+                "or {ef}, {t1}",
+                "vpbroadcastq {s0}, {s0:x}",
+                "not {ef}",
+                "vpshufb {s2}, {s0}, ymmword ptr [rip + {ia}]",
+                "and {mask}, {ef}",
+                "mov {ef}, {meq}",
+                "vpshufb {s0}, {s0}, ymmword ptr [rip + {ib}]",
+                "vpbroadcastq {s3}, qword ptr [rip + {bl}]",
+                "shr {ef}, 63",
+                "vpand {s2}, {s2}, {s3}",
+                "vpand {s0}, {s0}, {s3}",
+                "vpcmpeqb {s2}, {s2}, {s3}",
+                "vpblendvb {s2}, {yov}, {eof}, {s2}",
+                "vpaddb {s2}, {lo}, {s2}",
+                "vpcmpeqb {s0}, {s0}, {s3}",
+                "vpblendvb {s0}, {s42}, {eof}, {s0}",
+                "vpaddb {s0}, {hi}, {s0}",
+                "jmp 24b",
+                $($outline,)*
+                "30:",
+                c = inout(reg) c_v => c_out,
+                ne = in(reg) negend,
+                out = inout(reg) out_v,
+                ef = inout(reg) ef_v,
+                tab = in(reg) table,
+                mask = out(reg) mask_out,
+                meq = out(reg) _,
+                t1 = out(reg) _,
+                t2 = out(reg) _,
+                lut = in(ymm_reg) special_lut,
+                dot = in(ymm_reg) dot,
+                s42 = in(ymm_reg) sub42,
+                eqn = in(ymm_reg) eq_needle,
+                eof = in(ymm_reg) esc_off,
+                yov = inout(ymm_reg) yenc_offset => _,
+                mmv = inout(ymm_reg) min_mask => _,
+                hi = out(ymm_reg) _,
+                lo = out(ymm_reg) _,
+                s0 = out(ymm_reg) _,
+                s1 = out(ymm_reg) _,
+                s2 = out(ymm_reg) _,
+                s3 = out(ymm_reg) _,
+                s4 = out(ymm_reg) _,
+                s5 = out(ymm_reg) _,
+                ia = sym AVX2_ESC_IDX_A,
+                ib = sym AVX2_ESC_IDX_B,
+                bl = sym AVX2_ESC_BIT_LANES,
+                    $($extra)*
+                    options(nostack),
+                )
+            };
+        }
+        if SEARCH_END {
+            oracle_span!(
+                [
+                    // `\r\n=y` is the only end reachable without a stuffed
+                    // dot (rapidyenc decoder_avx2_base.h, the `partialEndFound`
+                    // arm): `=` at +2 and `y` at +3 first, the CR/LF anchor
+                    // only on a candidate. {s0} still holds the CR needle.
+                    "vpcmpeqb {s1}, {eqn}, ymmword ptr [{c} - 30]",
+                    "vpcmpeqb {s4}, {eqn}, ymmword ptr [{c} + 2]",
+                    "vpbroadcastb {s5}, byte ptr [rip + {y_b}]",
+                    "vpcmpeqb {s3}, {s5}, ymmword ptr [{c} - 29]",
+                    "vpand {s1}, {s1}, {s3}",
+                    "vpcmpeqb {s3}, {s5}, ymmword ptr [{c} + 3]",
+                    "vpand {s4}, {s4}, {s3}",
+                    "vpor {s3}, {s1}, {s4}",
+                    "vptest {s3}, {s3}",
+                    "jnz 50f",
+                    "51:"
+                ],
+                [
+                    // Stuffed dot present: `\r\n.\r\n`, `\r\n.=y` and
+                    // `\r\n=y`, before the dot merge so a hit exits with the
+                    // pre-merge mask. Live: {s4} = `\r\n.` (A), {mmv} =
+                    // `\r\n.` (B), {s5} = `\r\n` (B), {s3} = LF at +1 (A).
+                    "vpbroadcastb {s0}, byte ptr [rip + {cr_b}]",
+                    "vpcmpeqb {s1}, {s0}, {lo}",
+                    "vpand {s3}, {s3}, {s1}",
+                    "vpcmpeqb {s1}, {eqn}, ymmword ptr [{c} - 30]",
+                    "vpbroadcastb {s6}, byte ptr [rip + {y_b}]",
+                    "vpcmpeqb {s6}, {s6}, ymmword ptr [{c} - 29]",
+                    "vpand {s1}, {s1}, {s6}",
+                    "vpand {s3}, {s3}, {s1}",
+                    "vpsrlw {s1}, {s1}, 8",
+                    "vpbroadcastw {s6}, word ptr [rip + {eqy_w}]",
+                    "vpcmpeqw {s6}, {s6}, ymmword ptr [{c} - 28]",
+                    "vpsllw {s6}, {s6}, 8",
+                    "vpor {s1}, {s1}, {s6}",
+                    "vpcmpeqb {s6}, {s0}, ymmword ptr [{c} - 29]",
+                    "vpbroadcastb {s0}, byte ptr [rip + {lf_b}]",
+                    "vpcmpeqb {s0}, {s0}, ymmword ptr [{c} - 28]",
+                    "vpand {s6}, {s6}, {s0}",
+                    "vpor {s1}, {s1}, {s6}",
+                    "vpand {s1}, {s1}, {s4}",
+                    "vpor {s3}, {s3}, {s1}",
+                    "vpcmpeqb {s1}, {eqn}, ymmword ptr [{c} + 2]",
+                    "vpbroadcastb {s6}, byte ptr [rip + {y_b}]",
+                    "vpcmpeqb {s6}, {s6}, ymmword ptr [{c} + 3]",
+                    "vpand {s1}, {s1}, {s6}",
+                    "vpand {s5}, {s5}, {s1}",
+                    "vpor {s3}, {s3}, {s5}",
+                    "vpsrlw {s1}, {s1}, 8",
+                    "vpbroadcastw {s6}, word ptr [rip + {eqy_w}]",
+                    "vpcmpeqw {s6}, {s6}, ymmword ptr [{c} + 4]",
+                    "vpsllw {s6}, {s6}, 8",
+                    "vpor {s1}, {s1}, {s6}",
+                    "vpbroadcastb {s6}, byte ptr [rip + {lf_b}]",
+                    "vpcmpeqb {s5}, {s6}, ymmword ptr [{c} + 4]",
+                    "vpbroadcastb {s6}, byte ptr [rip + {cr_b}]",
+                    "vpcmpeqb {s6}, {s6}, ymmword ptr [{c} + 3]",
+                    "vpand {s6}, {s6}, {s5}",
+                    "vpor {s1}, {s1}, {s6}",
+                    "vpand {s1}, {s1}, {mmv}",
+                    "vpor {s3}, {s3}, {s1}",
+                    "vptest {s3}, {s3}",
+                    "jnz 30f"
+                ],
+                [
+                    // `=y` candidate without a stuffed dot: anchor on CR at
+                    // +0 and LF at +1. A hit leaves the window unconsumed.
+                    "50:",
+                    "vpbroadcastb {s5}, byte ptr [rip + {lf_b}]",
+                    "vpcmpeqb {s3}, {s5}, ymmword ptr [{c} - 31]",
+                    "vpand {s1}, {s1}, {s3}",
+                    "vpcmpeqb {s3}, {s0}, {lo}",
+                    "vpand {s1}, {s1}, {s3}",
+                    "vpcmpeqb {s3}, {s5}, ymmword ptr [{c} + 1]",
+                    "vpand {s4}, {s4}, {s3}",
+                    "vpcmpeqb {s3}, {s0}, {hi}",
+                    "vpand {s4}, {s4}, {s3}",
+                    "vpor {s1}, {s1}, {s4}",
+                    "vptest {s1}, {s1}",
+                    "jz 51b",
+                    "jmp 30f"
+                ],
+                s6 = out(ymm_reg) _,
+                cr_b = sym YB_CR,
+                lf_b = sym YB_LF,
+                y_b = sym YB_Y,
+                eqy_w = sym YW_EQY,
+            );
+        } else {
+            oracle_span!([], [], [],);
+        }
 
         esc_first = ef_v;
         dst = out_v.offset_from(output.as_mut_ptr()) as usize;
+        // The span ends with the cursor one half-window past the last window;
+        // an end-search hit leaves it on the unconsumed window instead, with
+        // the pre-merge specials mask and the pre-window escape carry — the
+        // no-backtrack exit rule's inputs.
+        let stopped = c_out.offset_from(input.as_ptr()) as usize - 32;
+        if SEARCH_END && stopped != src + span {
+            src = stopped;
+            state.state = x86_break_state(input, src, mask_out, esc_first);
+            while src < input.len() {
+                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                    break;
+                }
+            }
+            return Ok(KernelOutcome {
+                consumed: src,
+                written: dst,
+                end: state.end.into(),
+            });
+        }
         src += span;
 
         // Exit state from the trailing bytes — identical to the generic
@@ -1401,7 +1583,7 @@ unsafe fn avx2_raw_kernel_oracle(
         };
     }
 
-    while src < input.len() {
+    while src < limit {
         if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }
@@ -1412,391 +1594,6 @@ unsafe fn avx2_raw_kernel_oracle(
         written: dst,
         end: state.end.into(),
     })
-}
-
-/// The `SEARCH_END = true` span loop as one `asm!` block, transliterated from
-/// Weaver's emitted loop after validating it on Alder Lake and Zen 2. Unlike
-/// the SE=false kernel, this is Weaver's fused search-end path. Freezing the
-/// register allocation avoids the performance variance previously observed
-/// when LLVM regenerated the loop.
-///
-/// Deviations from the source emission, each strictly smaller:
-/// - its two ymm stack spills around the dot arm (`yenc_offset`, `eq_va`)
-///   become rematerializations (3 ops from `esc_first` / 1 compare from
-///   the lane) — `options(nostack)` requires it and remat is cheaper;
-/// - its two loop-invariant stack reloads (the `sub42` xor-base and the
-///   alignr fill) come from the pinned `{s42}`/`{eqn}` registers;
-/// - its rodata constant-restore storms are mirrored via this module's
-///   `sym` statics (byte-broadcast sources + the 32-byte specials LUT).
-///
-/// Break protocol (the terminator probe hit an end candidate): the block
-/// exits with `i != 0` (the window UNCONSUMED), `{mask}` holding the
-/// pre-merge specials mask and `{ef}` the pre-window carry — exactly the
-/// values the existing Rust `x86_break_state` glue consumes. `i == 0`
-/// means the span ran to completion.
-///
-/// Safety: same contract as the Rust span loop it replaces (the caller's
-/// span keeps the 67-byte tail reserve; the deepest view reads
-/// `c24 + 0`, i.e. `window + 68 - 32`… all views are the Rust loop's own
-/// offsets). Flags clobbered; reads input + LUT, writes output; no stack.
-#[cfg(target_arch = "x86_64")]
-#[cfg_attr(not(weaver_yenc_raw_asm), allow(dead_code))]
-#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn avx2_raw_span_setrue_asm(
-    input_base: *const u8,
-    i: &mut isize,
-    out: &mut *mut u8,
-    esc_first: &mut u64,
-    break_mask: &mut u64,
-    min_mask: std::arch::x86_64::__m256i,
-    yenc_offset: std::arch::x86_64::__m256i,
-) {
-    use std::arch::x86_64::*;
-
-    let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
-    let dot = _mm256_set1_epi8(b'.' as i8);
-    let eq_needle = _mm256_set1_epi8(b'=' as i8);
-    let cr = _mm256_set1_epi8(b'\r' as i8);
-    let special_lut = _mm256_load_si256(AVX2_SPECIAL_LUT.0.as_ptr() as *const __m256i);
-    let table = compact_table_16().as_ptr() as *const u8;
-
-    let c24 = input_base.add(0x24);
-    let mut i_v = *i;
-    let mut out_v = *out;
-    let mut ef_v = *esc_first;
-    let mut mask_v: u64;
-
-    core::arch::asm!(
-        "jmp 20f",
-        // ---- escaped == 0: plain adds (falls into the store) ------------
-        ".p2align 4",
-        "18:",
-        "vpaddb {s6}, {yov}, {la}",
-        "vpaddb {la}, {s42}, {lb}",
-        "xor {esc:e}, {esc:e}",
-        // ---- store: skip via andn into the ef reg, yov rebuild ----------
-        "19:",
-        "andn {ef}, {esc}, {mask}",
-        "vmovd {s0:x}, {efn:e}",
-        "vpsllw {s0:x}, {s0:x}, 6",
-        "vpxor {yov}, {s0}, {s42}",
-        "mov {mask:e}, {ef:e}",
-        "shl {mask:e}, 4",
-        "and {mask:e}, 0x7fff0",
-        "vmovdqu {s0:x}, xmmword ptr [{tab} + {mask}]",
-        "mov {mask:e}, {ef:e}",
-        "shr {mask:e}, 12",
-        "and {mask:e}, 0x7fff0",
-        "vinserti128 {s0}, {s0}, xmmword ptr [{tab} + {mask}], 1",
-        "vpshufb {s0}, {s6}, {s0}",
-        "vmovdqu xmmword ptr [{out}], {s0:x}",
-        "movzx {mask:e}, {ef:x}",
-        "popcnt {mask:e}, {mask:e}",
-        "sub {out}, {mask}",
-        "vextracti128 xmmword ptr [{out} + 16], {s0}, 1",
-        "mov {mask:e}, {ef:e}",
-        "and {mask:e}, 0xffff0000",
-        "popcnt {mask:e}, {mask:e}",
-        "sub {out}, {mask}",
-        "mov {mask}, {ef}",
-        "shr {mask}, 28",
-        "mov {esc:e}, {mask:e}",
-        "and {esc:e}, 0x7fff0",
-        "vmovdqu {s0:x}, xmmword ptr [{tab} + {esc}]",
-        "mov {esc}, {ef}",
-        "shr {esc}, 44",
-        "and {esc:e}, 0x7fff0",
-        "vinserti128 {s0}, {s0}, xmmword ptr [{tab} + {esc}], 1",
-        "vpshufb {s0}, {la}, {s0}",
-        "vmovdqu xmmword ptr [{out} + 32], {s0:x}",
-        "and {mask:e}, 0xffff0",
-        "popcnt {mask:e}, {mask:e}",
-        "sub {out}, {mask}",
-        "vextracti128 xmmword ptr [{out} + 48], {s0}, 1",
-        "shr {ef}, 48",
-        "popcnt {ef:e}, {ef:e}",
-        "sub {out}, {ef}",
-        "mov {ef}, {efn}",
-        "add {out}, 64",
-        "add {c}, 64",
-        "add {i}, 64",
-        "jz 30f",
-        // ---- loop head --------------------------------------------------
-        "20:",
-        "vmovdqu {la}, ymmword ptr [{c} - 36]",
-        "vmovdqu {lb}, ymmword ptr [{c} - 4]",
-        "vpminub {s6}, {mmv}, {la}",
-        "vpshufb {s6}, {lut}, {s6}",
-        "vpminub {s7}, {dot}, {lb}",
-        "vpshufb {s7}, {lut}, {s7}",
-        "vpcmpeqb {s7}, {s7}, {lb}",
-        "vpmovmskb {mask:e}, {s7}",
-        "shl {mask}, 32",
-        "vpcmpeqb {s6}, {s6}, {la}",
-        "vpmovmskb {esc:e}, {s6}",
-        "or {mask}, {esc}",
-        "jz 29f",
-        // ---- specials: eq masks ----------------------------------------
-        "vpcmpeqb {eqa}, {eqn}, {la}",
-        "vpcmpeqb {s6}, {eqn}, {lb}",
-        "vpmovmskb {efn:e}, {s6}",
-        "mov {t}, {efn}",
-        "shl {t}, 32",
-        "vpmovmskb {meq:e}, {eqa}",
-        "or {meq}, {t}",
-        "cmp {mask}, {meq}",
-        "jne 23f",
-        // eq-only: reset min_mask, collision test, fall into the join
-        "vmovdqa {mmv}, {dot}",
-        "lea {esc}, [{ef} + {meq}*2]",
-        "test {meq}, {esc}",
-        "jnz 27f",
-        // ---- join -------------------------------------------------------
-        "22:",
-        "shr {efn:e}, 31",
-        "test {esc}, {esc}",
-        "jz 18b",
-        // isolated escapes
-        "vinserti128 {s0}, {eqn}, {eqa:x}, 1",
-        "vpalignr {s0}, {eqa}, {s0}, 15",
-        "vpcmpeqb {s1}, {eqn}, ymmword ptr [{c} - 5]",
-        "vpbroadcastb {s7}, byte ptr [rip + {esc_b}]",
-        "vpblendvb {s0}, {yov}, {s7}, {s0}",
-        "vpaddb {s6}, {s0}, {la}",
-        "vpblendvb {s0}, {s42}, {s7}, {s1}",
-        "vpaddb {la}, {s0}, {lb}",
-        "jmp 19b",
-        // ---- clean window ----------------------------------------------
-        ".p2align 4",
-        "29:",
-        "vpaddb {s0}, {yov}, {la}",
-        "vmovdqu ymmword ptr [{out}], {s0}",
-        "vpaddb {s0}, {s42}, {lb}",
-        "vmovdqu ymmword ptr [{out} + 32], {s0}",
-        "vmovdqa {yov}, {s42}",
-        "xor {ef:e}, {ef:e}",
-        "add {out}, 64",
-        "add {c}, 64",
-        "add {i}, 64",
-        "jnz 20b",
-        "jmp 30f",
-        // ---- CR/LF present ---------------------------------------------
-        "23:",
-        "vmovdqu {s12}, ymmword ptr [{c} - 34]",
-        "vmovdqu {s7}, ymmword ptr [{c} - 2]",
-        "vmovdqa {s0}, {eqn}",
-        "vpcmpeqb {eqn}, {crv}, {la}",
-        "vpcmpeqb {s6}, {dot}, {s12}",
-        "vpand {s6}, {s6}, {eqn}",
-        "vpcmpeqb {mmv}, {crv}, {lb}",
-        "vmovdqa {s2}, {crv}",
-        "vpcmpeqb {crv}, {dot}, {s7}",
-        "vpand {crv}, {crv}, {mmv}",
-        "vpor {s42}, {s6}, {crv}",
-        "vpmovmskb {t:e}, {s42}",
-        "vpcmpeqb {s7}, {s0}, {s7}",
-        "vpcmpeqb {s12}, {s0}, {s12}",
-        "test {t:e}, {t:e}",
-        "je 28f",
-        // ---- stuffed dot + full terminator probe ------------------------
-        "25:",
-        "vmovdqu {s42}, ymmword ptr [{c} - 33]",
-        "vmovdqu {dot}, ymmword ptr [{c} - 32]",
-        "vmovdqu {s1}, ymmword ptr [{c} - 1]",
-        "vmovdqu {yov}, ymmword ptr [{c}]",
-        "vpcmpeqb {lut}, {s2}, {s42}",
-        "vpcmpeqb {s2}, {s2}, {s1}",
-        "vpbroadcastb {eqa}, byte ptr [rip + {lf_b}]",
-        "vpcmpeqb {s0}, {dot}, {eqa}",
-        "vpand {s0}, {s0}, {lut}",
-        "vpcmpeqb {lut}, {yov}, {eqa}",
-        "vpand {s2}, {s2}, {lut}",
-        "vpbroadcastb {eqa}, byte ptr [rip + {y_b}]",
-        "vpcmpeqb {lut}, {s42}, {eqa}",
-        "vpand {lut}, {lut}, {s12}",
-        "vpcmpeqb {s1}, {s1}, {eqa}",
-        "vpand {s1}, {s1}, {s7}",
-        "vpbroadcastb {s7}, byte ptr [rip + {lf_b}]",
-        "vpcmpeqb {s7}, {s7}, ymmword ptr [{c} - 35]",
-        "vpand {s42}, {s7}, {eqn}",
-        "vpbroadcastw {eqa}, word ptr [rip + {eqy_w}]",
-        "vpcmpeqw {dot}, {dot}, {eqa}",
-        "vpsllw {dot}, {dot}, 8",
-        "vpor {s0}, {s0}, {dot}",
-        "vpsrlw {dot}, {lut}, 8",
-        "vpor {s0}, {s0}, {dot}",
-        "vpand {dot}, {s42}, {s6}",
-        "vpand {s0}, {s0}, {dot}",
-        "vpcmpeqw {dot}, {yov}, {eqa}",
-        "vpsllw {dot}, {dot}, 8",
-        "vpor {s2}, {s2}, {dot}",
-        "vpsrlw {dot}, {s1}, 8",
-        "vpor {s2}, {s2}, {dot}",
-        "vpand {lut}, {lut}, {s42}",
-        "vpbroadcastb {dot}, byte ptr [rip + {lf_b}]",
-        "vpcmpeqb {s12}, {dot}, ymmword ptr [{c} - 3]",
-        "vpand {dot}, {s12}, {mmv}",
-        "vpand {s1}, {s1}, {dot}",
-        "vpor {s1}, {s1}, {lut}",
-        "vpor {s0}, {s0}, {s1}",
-        "vpand {eqn}, {dot}, {crv}",
-        "vpand {s1}, {s2}, {eqn}",
-        "vpor {s0}, {s0}, {s1}",
-        "vpmovmskb {t:e}, {s0}",
-        "test {t:e}, {t:e}",
-        "jnz 60f",
-        "vpand {s0}, {s7}, {s6}",
-        "vpmovmskb {esc:e}, {s0}",
-        "vpand {s0}, {s12}, {crv}",
-        "vpmovmskb {t:e}, {s0}",
-        "shl {t}, 34",
-        "lea {esc}, [{t} + {esc}*4]",
-        "or {mask}, {esc}",
-        "vextracti128 {s0:x}, {eqn}, 1",
-        "vpsrldq {s0:x}, {s0:x}, 14",
-        "vpbroadcastb {dot}, byte ptr [rip + {dot_b}]",
-        "vpsubusb {mmv}, {dot}, {s0}",
-        // constant restore (the roll's storm, via statics) + remats
-        "vmovdqa {lut}, ymmword ptr [rip + {lut_s}]",
-        "vpbroadcastb {s42}, byte ptr [rip + {sub_b}]",
-        "vpbroadcastb {eqn}, byte ptr [rip + {eq_b}]",
-        "vpbroadcastb {crv}, byte ptr [rip + {cr_b}]",
-        "vmovd {yov:x}, {ef:e}",
-        "vpsllw {yov:x}, {yov:x}, 6",
-        "vpxor {yov}, {yov}, {s42}",
-        "vpcmpeqb {eqa}, {eqn}, {la}",
-        "lea {esc}, [{ef} + {meq}*2]",
-        "test {meq}, {esc}",
-        "jnz 27f",
-        "jmp 22b",
-        // ---- CRLF but no stuffed dot: bare =y probe ---------------------
-        "28:",
-        "vpbroadcastb {s1}, byte ptr [rip + {y_b}]",
-        "vpcmpeqb {s0}, {s1}, ymmword ptr [{c} - 33]",
-        "vpand {s6}, {s0}, {s12}",
-        "vpcmpeqb {s0}, {s1}, ymmword ptr [{c} - 1]",
-        "vpand {s7}, {s0}, {s7}",
-        "vpor {s0}, {s7}, {s6}",
-        "vpmovmskb {t:e}, {s0}",
-        "test {t:e}, {t:e}",
-        "je 41f",
-        "vpbroadcastb {s1}, byte ptr [rip + {lf_b}]",
-        "vpcmpeqb {s0}, {s1}, ymmword ptr [{c} - 35]",
-        "vpand {s0}, {s0}, {eqn}",
-        "vpand {s0}, {s0}, {s6}",
-        "vpcmpeqb {s1}, {s1}, ymmword ptr [{c} - 3]",
-        "vpand {s1}, {s1}, {mmv}",
-        "vpand {s1}, {s1}, {s7}",
-        "vpor {s0}, {s0}, {s1}",
-        "vpmovmskb {t:e}, {s0}",
-        "vmovdqa {mmv}, {dot}",
-        "vpbroadcastb {s42}, byte ptr [rip + {sub_b}]",
-        "vpbroadcastb {eqn}, byte ptr [rip + {eq_b}]",
-        "vpbroadcastb {crv}, byte ptr [rip + {cr_b}]",
-        "vmovdqa {lut}, ymmword ptr [rip + {lut_s}]",
-        "vmovd {yov:x}, {ef:e}",
-        "vpsllw {yov:x}, {yov:x}, 6",
-        "vpxor {yov}, {yov}, {s42}",
-        "vpcmpeqb {eqa}, {eqn}, {la}",
-        "test {t:e}, {t:e}",
-        "jnz 60f",
-        "lea {esc}, [{ef} + {meq}*2]",
-        "test {meq}, {esc}",
-        "je 22b",
-        "jmp 27f",
-        "41:",
-        "vmovdqa {mmv}, {dot}",
-        "vpbroadcastb {s42}, byte ptr [rip + {sub_b}]",
-        "vpbroadcastb {eqn}, byte ptr [rip + {eq_b}]",
-        "vpbroadcastb {crv}, byte ptr [rip + {cr_b}]",
-        "vmovdqa {lut}, ymmword ptr [rip + {lut_s}]",
-        "vmovd {yov:x}, {ef:e}",
-        "vpsllw {yov:x}, {yov:x}, 6",
-        "vpxor {yov}, {yov}, {s42}",
-        "vpcmpeqb {eqa}, {eqn}, {la}",
-        "lea {esc}, [{ef} + {meq}*2]",
-        "test {meq}, {esc}",
-        "jnz 27f",
-        "jmp 22b",
-        // ---- consecutive-`=` collision ---------------------------------
-        "27:",
-        "mov {efn}, {meq}",
-        "and {efn}, {fives}",
-        "andn {efn}, {esc}, {efn}",
-        "add {efn}, {meq}",
-        "xor {efn}, {fives}",
-        "and {meq}, {efn}",
-        "lea {esc}, [{meq} + {meq}]",
-        "mov {efn}, {meq}",
-        "shr {efn}, 63",
-        "add {esc}, {ef}",
-        "jz 18b",
-        "vmovq {s0:x}, {esc}",
-        "vpermq {s0}, {s0}, 0x44",
-        "vpshufb {s1}, {s0}, ymmword ptr [rip + {ia}]",
-        "vpbroadcastq {s2}, qword ptr [rip + {bl}]",
-        "vpshufb {s0}, {s0}, ymmword ptr [rip + {ib}]",
-        "vpand {s1}, {s1}, {s2}",
-        "vpand {s0}, {s0}, {s2}",
-        "vpcmpeqb {s1}, {s1}, {s2}",
-        "vpbroadcastb {s7}, byte ptr [rip + {esc_b}]",
-        "vpblendvb {s1}, {s42}, {s7}, {s1}",
-        "vpaddb {s6}, {s1}, {la}",
-        "vpcmpeqb {s0}, {s0}, {s2}",
-        "vpblendvb {s0}, {s42}, {s7}, {s0}",
-        "vpaddb {la}, {s0}, {lb}",
-        "jmp 19b",
-        // ---- terminator hit: break with the window unconsumed ----------
-        "60:",
-        "30:",
-        c = inout(reg) c24 => _,
-        i = inout(reg) i_v,
-        out = inout(reg) out_v,
-        ef = inout(reg) ef_v,
-        efn = out(reg) _,
-        tab = in(reg) table,
-        fives = in(reg) 0x5555_5555_5555_5555u64,
-        mask = out(reg) mask_v,
-        meq = out(reg) _,
-        esc = out(reg) _,
-        t = out(reg) _,
-        lut = inout(ymm_reg) special_lut => _,
-        dot = inout(ymm_reg) dot => _,
-        s42 = inout(ymm_reg) sub42 => _,
-        eqn = inout(ymm_reg) eq_needle => _,
-        crv = inout(ymm_reg) cr => _,
-        mmv = inout(ymm_reg) min_mask => _,
-        yov = inout(ymm_reg) yenc_offset => _,
-        eqa = out(ymm_reg) _,
-        la = out(ymm_reg) _,
-        lb = out(ymm_reg) _,
-        s0 = out(ymm_reg) _,
-        s1 = out(ymm_reg) _,
-        s2 = out(ymm_reg) _,
-        s6 = out(ymm_reg) _,
-        s7 = out(ymm_reg) _,
-        s12 = out(ymm_reg) _,
-        ia = sym AVX2_ESC_IDX_A,
-        ib = sym AVX2_ESC_IDX_B,
-        bl = sym AVX2_ESC_BIT_LANES,
-        lut_s = sym AVX2_SPECIAL_LUT,
-        dot_b = sym YB_DOT,
-        eq_b = sym YB_EQ,
-        cr_b = sym YB_CR,
-        lf_b = sym YB_LF,
-        sub_b = sym YB_SUB42,
-        esc_b = sym YB_ESC,
-        y_b = sym YB_Y,
-        eqy_w = sym YW_EQY,
-        options(nostack),
-    );
-
-    *i = i_v;
-    *out = out_v;
-    *esc_first = ef_v;
-    *break_mask = mask_v;
 }
 
 #[cfg(target_arch = "x86_64")]
