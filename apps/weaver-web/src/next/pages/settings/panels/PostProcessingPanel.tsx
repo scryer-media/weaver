@@ -1,76 +1,65 @@
-import { useMemo, useRef, useState } from "react";
-import { useMutation, useQuery } from "urql";
+import { useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
+import { useMutation, useQuery, type CombinedError } from "urql";
+import { eventScriptDefaults, eventScriptOptions, eventScriptSection, type EventScriptOptions } from "@/next/components/EventScriptSettings";
 import {
+  DELETE_SCRIPT_INSTANCE_MUTATION,
+  DISCOVERED_SCRIPTS_QUERY,
   POST_PROCESSING_SETTINGS_QUERY,
+  REAPPLY_SCRIPT_HEADER_MUTATION,
+  REORDER_SCRIPT_INSTANCES_MUTATION,
+  SCRIPT_INSTANCES_QUERY,
   SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION,
   SET_POST_PROCESSING_SETTINGS_MUTATION,
-  SET_SCRIPT_LISTS_MUTATION,
-  SET_SCRIPT_OPTIONS_MUTATION,
+  SET_UP_SCRIPT_FROM_HEADER_MUTATION,
+  UPDATE_SCRIPT_INSTANCE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { RecordEditor } from "../../../components/RecordEditor";
-import { NumberField, SecondaryButton, Select, Toggle } from "../../../components/controls";
-import { Icon } from "../../../components/icons";
+import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/controls";
+import { Icon, type IconName } from "../../../components/icons";
 import { Cell } from "../../../components/rows";
+import { EM_DASH } from "../../../data/format";
 import { WV } from "../../../data/palette";
+import {
+  categoryScoped,
+  formatTimeout,
+  groupInstances,
+  inputFromInstance,
+  reorderedIds,
+  triggerTitle,
+  type DiscoveredScript,
+  type InstanceGroup,
+  type ScriptInstance,
+} from "../../../data/script-instances";
 import { PathField } from "../../../features/DirectoryBrowserDialog";
+import { countLabel } from "../../../i18n/labels";
 import {
   PanelControls,
   SettingsBlocks,
   useDraft,
   usePanelState,
-  type FieldSpec,
+  usePanelStatus,
   type SettingsBlock,
+  type SettingsTableRowModel,
 } from "../framework";
+import { ScriptInstanceEditor, type InstanceEditorTarget } from "./ScriptInstanceEditor";
+import { ScriptTestDialog } from "./ScriptTestDialog";
 
 /**
- * Post-processing: the scripts weaver runs when a download finishes.
+ * Scripts: what weaver runs on a download and on the events around it.
  *
- * Three things live here that save in three different ways, which is the
- * daemon's own shape rather than a choice: the execution settings are a draft
- * behind the top bar's Save, the scripts directory is destructive enough to
- * ask first, and the run list writes the moment it is reordered.
+ * Configuration holds what applies to every script: the execution settings, a
+ * draft behind the top bar's Save, and the scripts directory, destructive
+ * enough to ask first. Jobs holds the instances, which are what runs: a
+ * script wired to one trigger, with the inputs and run policy saved for it. A
+ * script's header only offers a starting point for one, in its editor.
  */
 
-const GLOBAL = "__global__";
-const MASKED_SECRET = "[REDACTED]";
+/** When the instances that are not narrowed to a category run. */
+type GlobalScriptsRun = "ALWAYS" | "ONLY_WITHOUT_CATEGORY_SCRIPTS";
 
-type OptionType = "STRING" | "INTEGER" | "NUMBER" | "BOOLEAN" | "SECRET";
-
-interface ScriptOption {
-  name: string;
-  section?: string | null;
-  optionType: OptionType;
-  displayName?: string | null;
-  description: string[];
-  select: string[];
-  required: boolean;
-  defaultValue?: string | null;
-  value?: string | null;
-}
-
-interface Script {
-  name: string;
-  displayName: string;
-  adapter: "SABNZBD" | "NZBGET";
-  version?: string | null;
-  options: ScriptOption[];
-}
-
-interface ListEntry {
-  script: string;
-  enabled: boolean;
-  timeoutSeconds?: number | null;
-}
-
-interface ScriptLists {
-  global: ListEntry[];
-  categories: { category: string; entries: ListEntry[] }[];
-}
-
-interface PostProcessingSettings {
+interface PostProcessingSettings extends EventScriptOptions {
   scriptDirectory: string;
   executionEnabled: boolean;
   concurrency: number;
@@ -78,72 +67,39 @@ interface PostProcessingSettings {
   pythonInterpreter?: string | null;
   powershellInterpreter?: string | null;
   batchInterpreter?: string | null;
+  goInterpreter?: string | null;
   unacceptableExtensions: string[];
   strictSecurityRefusesExecution: boolean;
-  lists: ScriptLists;
+  globalScriptsRun: GlobalScriptsRun;
 }
 
-interface PostProcessingData {
-  postProcessingSettings: PostProcessingSettings;
-  scripts: { scripts: Script[]; problems: { name: string; message: string }[] };
-  categories: { id: number; name: string }[];
-}
-
-interface ExecutionForm {
+interface ExecutionForm extends EventScriptOptions {
   executionEnabled: boolean;
+  globalScriptsRun: GlobalScriptsRun;
   concurrency: number;
   terminationGraceSeconds: number;
   pythonInterpreter: string;
   powershellInterpreter: string;
   batchInterpreter: string;
+  goInterpreter: string;
   unacceptableExtensions: string;
 }
 
-/** The daemon runs between one and eight scripts at once. */
-const CONCURRENCY_MAX = 8;
-
-const EMPTY_LISTS: ScriptLists = { global: [], categories: [] };
+/** The daemon runs between 1 and 128 scripts at once. */
+const CONCURRENCY_MAX = 128;
 
 const DEFAULTS: ExecutionForm = {
+  ...eventScriptDefaults,
   executionEnabled: false,
-  concurrency: 1,
+  globalScriptsRun: "ALWAYS",
+  concurrency: 32,
   terminationGraceSeconds: 10,
   pythonInterpreter: "",
   powershellInterpreter: "",
   batchInterpreter: "",
+  goInterpreter: "",
   unacceptableExtensions: "",
 };
-
-/** The entries that run for one scope, in the order they will run. */
-function listFor(lists: ScriptLists, scope: string): ListEntry[] {
-  return scope === GLOBAL
-    ? lists.global
-    : (lists.categories.find((entry) => entry.category === scope)?.entries ?? []);
-}
-
-function withList(lists: ScriptLists, scope: string, entries: ListEntry[]): ScriptLists {
-  if (scope === GLOBAL) {
-    return { ...lists, global: entries };
-  }
-  const categories = lists.categories.filter((entry) => entry.category !== scope);
-  if (entries.length > 0) {
-    categories.push({ category: scope, entries });
-  }
-  categories.sort((left, right) => left.category.localeCompare(right.category));
-  return { ...lists, categories };
-}
-
-function moved<T>(items: readonly T[], from: number, to: number): T[] {
-  if (to < 0 || to >= items.length) {
-    return [...items];
-  }
-  const next = [...items];
-  const [entry] = next.splice(from, 1);
-  if (entry !== undefined) {
-    next.splice(to, 0, entry);
-  }
-  return next;
-}
 
 function splitExtensions(value: string): string[] {
   return value
@@ -152,9 +108,16 @@ function splitExtensions(value: string): string[] {
     .filter(Boolean);
 }
 
-export function PostProcessingPanel() {
+function errorText(error: CombinedError): string {
+  return error.graphQLErrors[0]?.message ?? error.message;
+}
+
+/* ------------------------------------------------------------ configuration */
+
+/** What applies to every script: whether and how they run, and where they are read from. */
+export function ScriptConfigurationPanel() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<PostProcessingData>({
+  const [{ data, fetching }, reexecute] = useQuery<{ postProcessingSettings: PostProcessingSettings }>({
     query: POST_PROCESSING_SETTINGS_QUERY,
     requestPolicy: "cache-and-network",
   });
@@ -162,40 +125,27 @@ export function PostProcessingPanel() {
   const [directoryState, saveDirectory] = useMutation(
     SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION,
   );
-  const [, saveLists] = useMutation(SET_SCRIPT_LISTS_MUTATION);
-  const [, saveOptions] = useMutation(SET_SCRIPT_OPTIONS_MUTATION);
 
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [scope, setScope] = useState<string>(GLOBAL);
   const [directory, setDirectory] = useState<string | null>(null);
   const [confirmDirectory, setConfirmDirectory] = useState(false);
-  const [optionsScript, setOptionsScript] = useState<string | null>(null);
-  const [optionValues, setOptionValues] = useState<Record<string, string>>({});
-  const [optionsError, setOptionsError] = useState<string | null>(null);
-  const [optionsBusy, setOptionsBusy] = useState(false);
-  const [localLists, setLocalLists] = useState<{ base: ScriptLists | undefined; value: ScriptLists } | null>(null);
-  const [listSaves, setListSaves] = useState(0);
-  const listQueue = useRef<Promise<void>>(Promise.resolve());
 
   const settings = data?.postProcessingSettings;
-  const scripts = useMemo(() => data?.scripts?.scripts ?? [], [data?.scripts?.scripts]);
-  const problems = data?.scripts?.problems ?? [];
-  const categories = useMemo(
-    () => [...(data?.categories ?? [])].sort((left, right) => left.name.localeCompare(right.name)),
-    [data?.categories],
-  );
 
   const source = useMemo<ExecutionForm>(
     () =>
       settings
         ? {
             executionEnabled: settings.executionEnabled,
+            globalScriptsRun: settings.globalScriptsRun,
+            ...eventScriptOptions(settings),
             concurrency: settings.concurrency,
             terminationGraceSeconds: settings.terminationGraceSeconds,
             pythonInterpreter: settings.pythonInterpreter ?? "",
             powershellInterpreter: settings.powershellInterpreter ?? "",
             batchInterpreter: settings.batchInterpreter ?? "",
+            goInterpreter: settings.goInterpreter ?? "",
             unacceptableExtensions: settings.unacceptableExtensions.join(", "),
           }
         : DEFAULTS,
@@ -222,17 +172,20 @@ export function PostProcessingPanel() {
       setError(null);
       void saveSettings({
         input: {
+          ...eventScriptOptions(values),
           executionEnabled: values.executionEnabled,
+          globalScriptsRun: values.globalScriptsRun,
           concurrency: Math.min(CONCURRENCY_MAX, Math.max(1, Math.round(values.concurrency || 1))),
           terminationGraceSeconds: Math.max(0, Math.round(values.terminationGraceSeconds || 0)),
           pythonInterpreter: values.pythonInterpreter.trim() || null,
           powershellInterpreter: values.powershellInterpreter.trim() || null,
           batchInterpreter: values.batchInterpreter.trim() || null,
+          goInterpreter: values.goInterpreter.trim() || null,
           unacceptableExtensions: splitExtensions(values.unacceptableExtensions),
         },
       }).then((result) => {
         if (result.error) {
-          setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+          setError(errorText(result.error));
           return;
         }
         draft.markSaved();
@@ -243,168 +196,22 @@ export function PostProcessingPanel() {
   });
 
   const scriptDirectory = directory ?? settings?.scriptDirectory ?? "";
-  // Run-list edits apply locally at once and save one after another, so a
-  // second edit made before the first lands builds on the first rather than on
-  // the list the daemon last reported. The local copy stands until a refetch
-  // replaces the list it was built on.
-  const serverLists = settings?.lists;
-  const lists =
-    localLists && (listSaves > 0 || localLists.base === serverLists)
-      ? localLists.value
-      : (serverLists ?? EMPTY_LISTS);
-  const entries = listFor(lists, scope);
-  const listed = new Set(entries.map((entry) => entry.script));
-  const available = scripts.filter((script) => !listed.has(script.name));
-  const byName = useMemo(
-    () => new Map(scripts.map((script) => [script.name, script])),
-    [scripts],
-  );
-  const selected = optionsScript ? (byName.get(optionsScript) ?? null) : null;
-
-  const persistLists = (next: ScriptLists) => {
-    setError(null);
-    setLocalLists({ base: serverLists, value: next });
-    setListSaves((count) => count + 1);
-    const input = {
-      global: next.global.map((entry) => ({
-        script: entry.script,
-        enabled: entry.enabled,
-        timeoutSeconds: entry.timeoutSeconds ?? null,
-      })),
-      categories: next.categories.map((category) => ({
-        category: category.category,
-        entries: category.entries.map((entry) => ({
-          script: entry.script,
-          enabled: entry.enabled,
-          timeoutSeconds: entry.timeoutSeconds ?? null,
-        })),
-      })),
-    };
-    listQueue.current = listQueue.current.then(async () => {
-      const result = await saveLists({ input });
-      if (result.error) {
-        setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
-      } else {
-        setStatus(t("next.postProcessing.runListSaved"));
-      }
-      setListSaves((count) => count - 1);
-      void reexecute({ requestPolicy: "network-only" });
-    });
-  };
-
-  const patchEntries = (next: ListEntry[]) => persistLists(withList(lists, scope, next));
 
   const applyDirectory = () => {
     setConfirmDirectory(false);
     setError(null);
     void saveDirectory({ directory: scriptDirectory.trim() }).then((result) => {
       if (result.error) {
-        setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+        setError(errorText(result.error));
         return;
       }
       setDirectory(null);
-      setScope(GLOBAL);
       setStatus(t("next.postProcessing.directorySaved"));
       void reexecute({ requestPolicy: "network-only" });
     });
   };
 
-  const openOptions = (script: Script) => {
-    setOptionsError(null);
-    setOptionValues(
-      Object.fromEntries(
-        script.options.map((option) => [option.name, option.value ?? option.defaultValue ?? ""]),
-      ),
-    );
-    setOptionsScript(script.name);
-  };
-
-  const persistOptions = async () => {
-    if (!selected) {
-      return;
-    }
-    setOptionsBusy(true);
-    const result = await saveOptions({
-      script: selected.name,
-      options: selected.options
-        // A masked secret means "keep what is stored", so it is never sent back.
-        .filter(
-          (option) =>
-            !(option.optionType === "SECRET" && optionValues[option.name] === MASKED_SECRET),
-        )
-        .map((option) => ({
-          name: option.name,
-          optionType: option.optionType,
-          value: optionValues[option.name] ?? "",
-        })),
-    });
-    setOptionsBusy(false);
-    if (result.error) {
-      setOptionsError(result.error.graphQLErrors[0]?.message ?? result.error.message);
-      return;
-    }
-    setOptionsScript(null);
-    setStatus(t("next.postProcessing.optionsSaved", { name: selected.displayName }));
-    void reexecute({ requestPolicy: "network-only" });
-  };
-
-  const optionField = (option: ScriptOption): FieldSpec => {
-    const label = option.displayName || option.name;
-    const value = optionValues[option.name] ?? "";
-    const onChange = (next: string) =>
-      setOptionValues((current) => ({ ...current, [option.name]: next }));
-    const help = [
-      ...option.description,
-      option.required ? t("next.postProcessing.required") : "",
-      option.defaultValue ? t("next.postProcessing.defaultValue", { value: option.defaultValue }) : "",
-    ]
-      .filter(Boolean)
-      .join(" ");
-
-    if (option.select.length > 0) {
-      return {
-        id: option.name,
-        label,
-        help: help || undefined,
-        control: {
-          kind: "select",
-          value,
-          options: option.select.map((entry) => ({ value: entry, label: entry })),
-          onChange,
-        },
-      };
-    }
-    if (option.optionType === "BOOLEAN") {
-      return {
-        id: option.name,
-        label,
-        help: help || undefined,
-        control: {
-          kind: "toggle",
-          value: value === "true",
-          onChange: (next: boolean) => onChange(next ? "true" : "false"),
-        },
-      };
-    }
-    return {
-      id: option.name,
-      label,
-      help: help || undefined,
-      control: {
-        kind: "text",
-        type: option.optionType === "SECRET" ? "password" : "text",
-        value,
-        onChange,
-      },
-    };
-  };
-
-  const scopeNote =
-    scope === GLOBAL
-      ? t("next.postProcessing.runsForEvery")
-      : t("next.postProcessing.runsForCategory", { name: scope });
-
-  const blocks: (SettingsBlock | null)[] = [
+  const blocks: SettingsBlock[] = [
     {
       kind: "section",
       id: "execution",
@@ -419,6 +226,24 @@ export function PostProcessingPanel() {
             kind: "toggle",
             value: values.executionEnabled,
             onChange: (next) => patch({ executionEnabled: next }),
+          },
+        },
+        {
+          id: "globalScriptsRun",
+          label: t("next.postProcessing.globalScriptsRun"),
+          help: t("next.postProcessing.globalScriptsRunHelp"),
+          control: {
+            kind: "select",
+            value: values.globalScriptsRun,
+            className: "w-[340px] max-w-full",
+            options: [
+              { value: "ALWAYS", label: t("next.postProcessing.globalAlways") },
+              {
+                value: "ONLY_WITHOUT_CATEGORY_SCRIPTS",
+                label: t("next.postProcessing.globalOnlyWithout"),
+              },
+            ],
+            onChange: (next) => patch({ globalScriptsRun: next as GlobalScriptsRun }),
           },
         },
         {
@@ -471,6 +296,7 @@ export function PostProcessingPanel() {
         },
       ],
     },
+    eventScriptSection(t, values, patch, source),
     {
       kind: "section",
       id: "interpreters",
@@ -508,6 +334,17 @@ export function PostProcessingPanel() {
             value: values.batchInterpreter,
             placeholder: "cmd.exe",
             onChange: (next) => patch({ batchInterpreter: next }),
+          },
+        },
+        {
+          id: "goInterpreter",
+          label: "Go",
+          keywords: values.goInterpreter,
+          control: {
+            kind: "text",
+            value: values.goInterpreter,
+            placeholder: "/usr/local/go/bin/go",
+            onChange: (next) => patch({ goInterpreter: next }),
           },
         },
       ],
@@ -549,194 +386,10 @@ export function PostProcessingPanel() {
         },
       ],
     },
-    {
-      kind: "table",
-      id: "run-list",
-      title: t("next.postProcessing.runList"),
-      note: scopeNote,
-      columns: "44px minmax(0, 1fr) 120px 92px 150px",
-      headers: [
-        t("next.postProcessing.order"),
-        t("next.postProcessing.script"),
-        t("next.postProcessing.timeout"),
-        t("next.postProcessing.enabled"),
-        "",
-      ],
-      empty:
-        scripts.length === 0
-          ? t("next.postProcessing.noScripts")
-          : t("next.postProcessing.nothingRuns"),
-      footer:
-        available.length > 0 ? (
-          <Select
-            label={t("next.postProcessing.addScriptLabel")}
-            value=""
-            className="min-w-0 sm:min-w-[240px]"
-            options={[
-              { value: "", label: t("next.postProcessing.addScript") },
-              ...available.map((script) => ({ value: script.name, label: script.displayName })),
-            ]}
-            onChange={(next) => {
-              if (next) {
-                patchEntries([...entries, { script: next, enabled: true, timeoutSeconds: null }]);
-              }
-            }}
-          />
-        ) : undefined,
-      rows: entries.map((entry, index) => {
-        const script = byName.get(entry.script);
-        return {
-          id: entry.script,
-          searchText: `${entry.script} ${script?.displayName ?? ""}`,
-          cells: [
-            <Cell key="order" mono className="text-wv-faint">
-              {index + 1}
-            </Cell>,
-            <span key="script" className="flex min-w-0 items-center gap-[10px]">
-              <Square color={script ? (entry.enabled ? WV.accent : WV.inert) : WV.error} />
-              <span className="min-w-0 truncate" title={entry.script}>
-                {script?.displayName ?? entry.script}
-              </span>
-              {script ? null : (
-                <span className="flex-none font-wv-mono text-[11px] text-wv-error-text">
-                  {t("next.postProcessing.missing")}
-                </span>
-              )}
-            </span>,
-            <NumberField
-              key="timeout"
-              label={t("next.postProcessing.timeoutFor", { name: entry.script })}
-              value={entry.timeoutSeconds ?? 0}
-              min={0}
-              max={86400}
-              className="h-7 w-[92px]"
-              onChange={(next) => {
-                const updated = [...entries];
-                updated[index] = { ...entry, timeoutSeconds: next > 0 ? next : null };
-                patchEntries(updated);
-              }}
-            />,
-            <Toggle
-              key="enabled"
-              size="table"
-              label={t("next.postProcessing.runScript", { name: entry.script })}
-              checked={entry.enabled}
-              onChange={(next) => {
-                const updated = [...entries];
-                updated[index] = { ...entry, enabled: next };
-                patchEntries(updated);
-              }}
-            />,
-            <span key="order-controls" className="flex items-center gap-[6px]">
-              <SecondaryButton
-                className="h-7 px-2"
-                title={t("next.postProcessing.moveUp")}
-                disabled={index === 0}
-                onClick={() => patchEntries(moved(entries, index, index - 1))}
-              >
-                <Icon name="moveUp" size={13} />
-              </SecondaryButton>
-              <SecondaryButton
-                className="h-7 px-2"
-                title={t("next.postProcessing.moveDown")}
-                disabled={index === entries.length - 1}
-                onClick={() => patchEntries(moved(entries, index, index + 1))}
-              >
-                <Icon name="moveDown" size={13} />
-              </SecondaryButton>
-              <SecondaryButton
-                icon="remove"
-                className="h-7 px-2"
-                onClick={() =>
-                  patchEntries(entries.filter((candidate) => candidate.script !== entry.script))
-                }
-              >
-                {t("next.common.remove")}
-              </SecondaryButton>
-            </span>,
-          ],
-        };
-      }),
-    },
-    {
-      kind: "table",
-      id: "scripts",
-      title: t("next.postProcessing.discovered"),
-      note: scriptDirectory || undefined,
-      columns: "minmax(0, 1fr) 110px 110px 110px",
-      headers: [
-        t("next.postProcessing.script"),
-        t("next.postProcessing.adapter"),
-        t("next.postProcessing.version"),
-        t("next.postProcessing.options"),
-      ],
-      empty: t("next.postProcessing.discoveredEmpty"),
-      onRowClick: (id) => {
-        const script = byName.get(id);
-        if (script) {
-          openOptions(script);
-        }
-      },
-      rows: scripts.map((script) => ({
-        id: script.name,
-        searchText: `${script.name} ${script.displayName} ${script.adapter}`,
-        cells: [
-          <Cell key="name" className="text-wv-fg" title={script.name}>
-            {script.displayName}
-          </Cell>,
-          <Cell key="adapter" mono className="text-wv-secondary">
-            {script.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet"}
-          </Cell>,
-          <Cell key="version" mono className="text-wv-muted">
-            {script.version || "—"}
-          </Cell>,
-          <Cell key="options" mono className="text-wv-muted">
-            {script.options.length === 0 ? t("next.job.none") : script.options.length}
-          </Cell>,
-        ],
-      })),
-    },
-    problems.length > 0
-      ? {
-          kind: "custom",
-          id: "problems",
-          title: t("next.postProcessing.problems"),
-          note: `${problems.length}`,
-          searchText: problems.map((problem) => `${problem.name} ${problem.message}`).join(" "),
-          body: (
-            <div className="flex flex-col">
-              {problems.map((problem) => (
-                <div
-                  key={problem.name}
-                  className="flex flex-wrap items-baseline gap-x-5 gap-y-1 border-b border-wv-hairline px-4 sm:px-6 py-3"
-                >
-                  <span className="font-wv-mono text-[12.5px] text-wv-fg">{problem.name}</span>
-                  <span className="min-w-0 flex-1 text-[12.5px] text-wv-error-text">
-                    {problem.message}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ),
-        }
-      : null,
   ];
 
   return (
     <>
-      <PanelControls>
-        <Select
-          label={t("next.postProcessing.scopeSelect")}
-          value={scope}
-          className="min-w-0 sm:min-w-[180px]"
-          options={[
-            { value: GLOBAL, label: t("next.postProcessing.everyDownload") },
-            ...categories.map((category) => ({ value: category.name, label: category.name })),
-          ]}
-          onChange={setScope}
-        />
-      </PanelControls>
-
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <ConfirmDialog
@@ -749,33 +402,418 @@ export function PostProcessingPanel() {
         onConfirm={applyDirectory}
         onDismiss={() => setConfirmDirectory(false)}
       />
+    </>
+  );
+}
 
-      <RecordEditor
-        open={selected !== null}
-        title={selected?.displayName ?? t("next.postProcessing.script")}
-        note={selected?.name}
-        width={620}
-        error={optionsError}
-        busy={optionsBusy}
-        saveLabel={t("next.postProcessing.saveOptions")}
-        saveDisabled={(selected?.options.length ?? 0) === 0}
-        sections={
-          selected
-            ? [{ id: "options", title: t("next.postProcessing.options"), fields: selected.options.map(optionField) }]
-            : []
+/* ------------------------------------------------------------------ scripts */
+
+interface InstancesData {
+  postProcessingSettings: { scriptDirectory: string; globalScriptsRun: GlobalScriptsRun };
+  scriptInstances: ScriptInstance[];
+  categories: { id: number; name: string }[];
+}
+
+interface DiscoveredData {
+  discoveredScripts: {
+    scripts: DiscoveredScript[];
+    problems: { name: string; message: string }[];
+  };
+}
+
+/** What a confirmation is asked for: both change what is saved in an instance for good. */
+interface PendingConfirm {
+  kind: "delete" | "reapply";
+  instance: ScriptInstance;
+}
+
+const NO_INSTANCES: ScriptInstance[] = [];
+const NO_SCRIPTS: DiscoveredScript[] = [];
+
+/** One icon-only action at the end of a row; its title is its name. */
+function RowAction({
+  icon,
+  title,
+  disabled = false,
+  onClick,
+}: {
+  icon: IconName;
+  title: string;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <SecondaryButton className="h-7 px-2" title={title} disabled={disabled} onClick={onClick}>
+      <Icon name={icon} size={13} />
+    </SecondaryButton>
+  );
+}
+
+/**
+ * The instances that run, by what starts them. The scripts themselves are not
+ * listed here: one is chosen in the editor of a new instance.
+ */
+export function ScriptListPanel() {
+  const t = useTranslate();
+  const [{ data, fetching, error: instancesError }, reloadInstances] = useQuery<InstancesData>({
+    query: SCRIPT_INSTANCES_QUERY,
+    requestPolicy: "cache-and-network",
+  });
+  const [{ data: discovered, error: scriptsError }, reloadScripts] = useQuery<DiscoveredData>({
+    query: DISCOVERED_SCRIPTS_QUERY,
+    requestPolicy: "cache-and-network",
+  });
+  const [, updateInstance] = useMutation(UPDATE_SCRIPT_INSTANCE_MUTATION);
+  const [, deleteInstance] = useMutation(DELETE_SCRIPT_INSTANCE_MUTATION);
+  const [, reorderInstances] = useMutation<{ reorderScriptInstances: ScriptInstance[] }>(
+    REORDER_SCRIPT_INSTANCES_MUTATION,
+  );
+  const [, setUpFromHeader] = useMutation<{ setUpScriptFromHeader: ScriptInstance[] }>(
+    SET_UP_SCRIPT_FROM_HEADER_MUTATION,
+  );
+  const [, reapplyHeader] = useMutation(REAPPLY_SCRIPT_HEADER_MUTATION);
+
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [working, setWorking] = useState(false);
+  const [editor, setEditor] = useState<{ key: number; target: InstanceEditorTarget } | null>(null);
+  const [confirm, setConfirm] = useState<PendingConfirm | null>(null);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [testing, setTesting] = useState<ScriptInstance | null>(null);
+  // The order the daemon answered a reorder with stands in until the list is
+  // read again, so a second move builds on the first rather than on the order
+  // last fetched.
+  const [reordered, setReordered] = useState<{ base: ScriptInstance[] | undefined; value: ScriptInstance[] } | null>(
+    null,
+  );
+
+  const fetched = data?.scriptInstances;
+  // The list as last read, for an answer that lands after a newer read than the one it was asked under.
+  const fetchedRef = useRef(fetched);
+  fetchedRef.current = fetched;
+  const instances = reordered && reordered.base === fetched ? reordered.value : (fetched ?? NO_INSTANCES);
+  const scripts = discovered?.discoveredScripts.scripts ?? NO_SCRIPTS;
+  const problems = discovered?.discoveredScripts.problems ?? [];
+  const categories = useMemo(
+    () => (data?.categories ?? []).map((category) => category.name).sort((left, right) => left.localeCompare(right)),
+    [data?.categories],
+  );
+  const groups = useMemo(() => groupInstances(instances), [instances]);
+
+  const queryError = instancesError ?? scriptsError;
+  const shownError = error ?? (queryError ? errorText(queryError) : null);
+  usePanelStatus(shownError ?? status, shownError !== null);
+
+  const refetchInstances = () => void reloadInstances({ requestPolicy: "network-only" });
+
+  const openEditor = (target: InstanceEditorTarget) => {
+    setError(null);
+    setStatus(null);
+    setEditor((current) => ({ key: (current?.key ?? 0) + 1, target }));
+  };
+
+  const toggle = async (instance: ScriptInstance, enabled: boolean) => {
+    setStatus(null);
+    const result = await updateInstance({ id: instance.id, input: inputFromInstance(instance, { enabled }) });
+    setError(result.error ? errorText(result.error) : null);
+    refetchInstances();
+  };
+
+  const move = async (instance: ScriptInstance, direction: -1 | 1) => {
+    const order = reorderedIds(instances, instance.id, direction);
+    if (!order) {
+      return;
+    }
+    setWorking(true);
+    setStatus(null);
+    const result = await reorderInstances(order);
+    setWorking(false);
+    if (result.error) {
+      setError(errorText(result.error));
+    } else {
+      setError(null);
+      if (result.data) {
+        setReordered({ base: fetchedRef.current, value: result.data.reorderScriptInstances });
+      }
+    }
+    refetchInstances();
+  };
+
+  /** Resolves to what went wrong, or null once the instances exist. */
+  const setUp = async (script: DiscoveredScript): Promise<string | null> => {
+    setWorking(true);
+    setStatus(null);
+    setError(null);
+    const result = await setUpFromHeader({ script: script.name });
+    setWorking(false);
+    if (result.error) {
+      return errorText(result.error);
+    }
+    setStatus(
+      countLabel(t, "next.postProcessing.setUpDone", result.data?.setUpScriptFromHeader.length ?? 0, {
+        name: script.displayName,
+      }),
+    );
+    refetchInstances();
+    return null;
+  };
+
+  const ask = (pending: PendingConfirm) => {
+    setConfirmError(null);
+    setConfirm(pending);
+  };
+
+  const confirmed = async () => {
+    if (!confirm) {
+      return;
+    }
+    setConfirmBusy(true);
+    const result =
+      confirm.kind === "delete"
+        ? await deleteInstance({ id: confirm.instance.id })
+        : await reapplyHeader({ id: confirm.instance.id });
+    setConfirmBusy(false);
+    if (result.error) {
+      setConfirmError(errorText(result.error));
+      return;
+    }
+    setError(null);
+    setStatus(
+      t(confirm.kind === "delete" ? "next.postProcessing.instanceDeleted" : "next.postProcessing.reapplied", {
+        name: confirm.instance.name,
+      }),
+    );
+    setConfirm(null);
+    setEditor(null);
+    refetchInstances();
+  };
+
+  // A control inside a row acts for itself; the row under it must not open as well.
+  const own = {
+    onClick: (event: MouseEvent) => event.stopPropagation(),
+    onKeyDown: (event: KeyboardEvent) => event.stopPropagation(),
+  };
+
+  const instanceRow = (group: InstanceGroup, instance: ScriptInstance, index: number): SettingsTableRowModel => {
+    const scoped = categoryScoped(instance.trigger);
+    const everyCategory = t("next.postProcessing.everyCategory");
+    const categoryText = instance.categories.join(", ");
+    return {
+      id: `i:${instance.id}`,
+      searchText: `${instance.name} ${instance.script} ${categoryText} ${instance.scriptProblem ?? ""}`,
+      cells: [
+        <div key="name" className="flex min-w-0 flex-col gap-1">
+          <span className="flex min-w-0 items-center gap-[10px]">
+            <Square color={instance.scriptProblem ? WV.error : instance.enabled ? WV.accent : WV.inert} />
+            <span className="min-w-0 truncate text-[13px]" title={instance.name}>
+              {instance.name}
+            </span>
+          </span>
+          {instance.scriptProblem ? (
+            <span className="pl-[17px] text-[11.5px] leading-[1.4] text-wv-error-text">{instance.scriptProblem}</span>
+          ) : null}
+          {instance.headerDrift ? (
+            <span className="pl-[17px] text-[11.5px] leading-[1.4] text-wv-warn">
+              {t("next.postProcessing.headerDrift")}
+            </span>
+          ) : null}
+        </div>,
+        <Cell key="script" mono className="text-wv-secondary" title={instance.script}>
+          {instance.script}
+        </Cell>,
+        scoped ? (
+          <Cell
+            key="categories"
+            className={instance.categories.length > 0 ? "text-[12.5px] text-wv-secondary" : "text-[12.5px] text-wv-muted"}
+            title={categoryText || everyCategory}
+          >
+            {categoryText || everyCategory}
+          </Cell>
+        ) : (
+          <Cell key="categories" mono className="text-wv-faint">
+            {EM_DASH}
+          </Cell>
+        ),
+        <Cell key="runMode" className="text-[12.5px] text-wv-secondary">
+          {t(instance.blocking ? "next.postProcessing.blocking" : "next.postProcessing.fireAndForget")}
+        </Cell>,
+        <Cell key="timeout" mono className="text-wv-muted">
+          {instance.timeoutSeconds === null
+            ? t("next.postProcessing.timeoutDefault")
+            : formatTimeout(instance.timeoutSeconds)}
+        </Cell>,
+        <span key="enabled" {...own}>
+          <Toggle
+            size="table"
+            checked={instance.enabled}
+            label={t("next.postProcessing.enabledFor", { name: instance.name })}
+            onChange={(next) => void toggle(instance, next)}
+          />
+        </span>,
+        <span key="actions" className="ml-auto flex items-center gap-1" {...own}>
+          {instance.headerDrift ? (
+            <RowAction
+              icon="reset"
+              title={t("next.postProcessing.reapply")}
+              onClick={() => ask({ kind: "reapply", instance })}
+            />
+          ) : null}
+          <RowAction
+            icon="moveUp"
+            title={t("next.postProcessing.moveUp")}
+            disabled={working || index === 0}
+            onClick={() => void move(instance, -1)}
+          />
+          <RowAction
+            icon="moveDown"
+            title={t("next.postProcessing.moveDown")}
+            disabled={working || index === group.instances.length - 1}
+            onClick={() => void move(instance, 1)}
+          />
+          <RowAction
+            icon="test"
+            title={t("next.postProcessing.test")}
+            onClick={() => {
+              setError(null);
+              setStatus(null);
+              setTesting(instance);
+            }}
+          />
+          <RowAction
+            icon="remove"
+            title={t("action.delete")}
+            onClick={() => ask({ kind: "delete", instance })}
+          />
+        </span>,
+      ],
+    };
+  };
+
+  const groupNote = (group: InstanceGroup): string | undefined =>
+    group.trigger === "FEED" ? t("next.postProcessing.feedGroupNote") : undefined;
+
+  const blocks: SettingsBlock[] = [
+    {
+      kind: "table",
+      id: "instances",
+      title: t("next.postProcessing.instances"),
+      // Which of the two holds is a setting, so the note says the one in force.
+      note: t(
+        data?.postProcessingSettings.globalScriptsRun === "ONLY_WITHOUT_CATEGORY_SCRIPTS"
+          ? "next.postProcessing.instancesNoteOnlyWithout"
+          : "next.postProcessing.instancesNote",
+      ),
+      columns: "minmax(150px, 1.3fr) minmax(100px, 1fr) minmax(84px, 0.9fr) 136px 76px 72px 172px",
+      headers: [
+        t("next.postProcessing.instanceName"),
+        t("next.postProcessing.script"),
+        t("next.postProcessing.categories"),
+        t("next.postProcessing.runMode"),
+        t("next.postProcessing.timeout"),
+        t("next.postProcessing.enabled"),
+        "",
+      ],
+      empty: t("next.postProcessing.noInstances"),
+      emptyAction: { label: t("next.postProcessing.createInstance"), onClick: () => openEditor({ mode: "new" }) },
+      onRowClick: (id) => {
+        const instance = instances.find((entry) => `i:${entry.id}` === id);
+        if (instance) {
+          openEditor({ mode: "edit", instance });
         }
-        onSave={() => void persistOptions()}
-        onDismiss={() => {
-          setOptionsError(null);
-          setOptionsScript(null);
-        }}
-      >
-        {selected && selected.options.length === 0 ? (
-          <div className="flex-none px-4 sm:px-6 py-5 text-[13px] text-wv-muted">
-            {t("next.postProcessing.noOptions", { name: selected.displayName })}
-          </div>
-        ) : null}
-      </RecordEditor>
+      },
+      rows: [],
+      groups: groups.map((group) => ({
+        id: group.id,
+        title: triggerTitle(t, group.trigger, group.queueEvent),
+        note: groupNote(group),
+        rows: group.instances.map((instance, index) => instanceRow(group, instance, index)),
+      })),
+    },
+  ];
+
+  const confirmBody = (text: string) => (
+    <>
+      {text}
+      {confirmError ? (
+        <span role="alert" className="mt-3 block text-[12.5px] text-wv-error-text">
+          {confirmError}
+        </span>
+      ) : null}
+    </>
+  );
+
+  return (
+    <>
+      <PanelControls>
+        <SecondaryButton
+          icon="refresh"
+          onClick={() => {
+            refetchInstances();
+            void reloadScripts({ requestPolicy: "network-only" });
+          }}
+        >
+          {t("action.refresh")}
+        </SecondaryButton>
+        <PrimaryButton icon="add" onClick={() => openEditor({ mode: "new" })}>
+          {t("next.postProcessing.createInstance")}
+        </PrimaryButton>
+      </PanelControls>
+
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
+
+      {editor ? (
+        <ScriptInstanceEditor
+          key={editor.key}
+          target={editor.target}
+          scripts={scripts}
+          problems={problems}
+          instances={instances}
+          categories={categories}
+          onSaved={(saved, problem) => {
+            setEditor(null);
+            setError(problem ?? null);
+            setStatus(saved);
+            refetchInstances();
+          }}
+          onDismiss={() => setEditor(null)}
+          onDelete={(instance) => ask({ kind: "delete", instance })}
+          onReapply={(instance) => ask({ kind: "reapply", instance })}
+          onSetUp={async (script) => {
+            const problem = await setUp(script);
+            if (problem === null) {
+              setEditor(null);
+            }
+            return problem;
+          }}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={confirm?.kind === "delete"}
+        title={t("next.postProcessing.deleteTitle")}
+        note={confirm?.instance.name}
+        busy={confirmBusy}
+        confirmLabel={t("action.delete")}
+        body={confirmBody(t("next.postProcessing.deleteBody"))}
+        onConfirm={() => void confirmed()}
+        onDismiss={() => setConfirm(null)}
+      />
+      <ConfirmDialog
+        open={confirm?.kind === "reapply"}
+        title={t("next.postProcessing.reapply")}
+        note={confirm?.instance.name}
+        busy={confirmBusy}
+        destructive={false}
+        confirmLabel={t("next.postProcessing.reapply")}
+        body={confirmBody(t("next.postProcessing.reapplyBody"))}
+        onConfirm={() => void confirmed()}
+        onDismiss={() => setConfirm(null)}
+      />
+
+      {testing ? (
+        <ScriptTestDialog key={testing.id} instance={testing} onClose={() => setTesting(null)} />
+      ) : null}
     </>
   );
 }

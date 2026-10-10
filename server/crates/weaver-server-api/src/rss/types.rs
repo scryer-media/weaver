@@ -83,6 +83,9 @@ pub struct RssRuleInput {
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(complex)]
 pub struct RssFeed {
+    /// The feed script jobs that rewrite this feed, in the order they run.
+    #[graphql(name = "scriptInstanceIds")]
+    pub scripts: Vec<String>,
     pub id: u32,
     pub name: String,
     pub url: String,
@@ -105,6 +108,7 @@ impl RssFeed {
     pub fn from_row(feed: &weaver_server_core::RssFeedRow, rules: Vec<RssRule>) -> Self {
         Self {
             id: feed.id,
+            scripts: feed.scripts.clone(),
             name: feed.name.clone(),
             url: feed.url.clone(),
             enabled: feed.enabled,
@@ -133,7 +137,12 @@ impl RssFeed {
 
 #[derive(Debug, InputObject)]
 pub struct RssFeedInput {
+    /// The feed script jobs that rewrite this feed, in the order they
+    /// run. Omission keeps the ones already attached.
+    #[graphql(name = "scriptInstanceIds")]
+    pub scripts: Option<Vec<String>>,
     pub routing: Option<crate::proxies::RoutingPolicyInput>,
+    pub route: Option<crate::networking::RouteInput>,
     pub name: String,
     pub url: String,
     #[graphql(default = true)]

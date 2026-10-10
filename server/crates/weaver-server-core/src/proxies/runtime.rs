@@ -25,10 +25,10 @@ fn bridge_credentials() -> Result<(String, String), String> {
     Ok(("weaver".into(), hex::encode(secret)))
 }
 
-struct Observer {
-    db: Database,
-    id: u32,
-    revision: u64,
+pub(super) struct Observer {
+    pub(super) db: Database,
+    pub(super) id: u32,
+    pub(super) revision: u64,
 }
 impl TunnelObserver for Observer {
     fn tunnel_dial_failed(&self, _: &str, _: &str) {}
@@ -106,6 +106,15 @@ struct Cooldown {
     until: Instant,
     probing: bool,
 }
+// Whether a policy change touches what a legacy route is built from. Its
+// legs and failover live in the network runtime, which applies them to the
+// live route in place: a reweight moves connections between legs, a changed
+// path revokes that leg alone. Rebuilding the legacy route for them would
+// revoke every socket it tracks for a change that was meant to keep them.
+fn legacy_policy_changed(current: &RoutingPolicy, next: &RoutingPolicy) -> bool {
+    current.proxy_ids != next.proxy_ids || current.allow_direct != next.allow_direct
+}
+
 pub struct ConsumerRoute {
     pub policy: RoutingPolicy,
     pub hops: Vec<Option<Arc<ProxyHop>>>,
@@ -162,7 +171,7 @@ impl ConsumerRoute {
         self.cooldowns.lock().expect("route cooldown").insert(
             id,
             Cooldown {
-                until: Instant::now() + Duration::from_secs(30),
+                until: Instant::now() + weaver_nntp::plan_timing::timing().route_cooldown,
                 probing: false,
             },
         );
@@ -390,6 +399,7 @@ impl TunnelProvider for Ladder {
 }
 
 pub struct ProxyRuntime {
+    pub network: Arc<NetworkRuntime>,
     db: Database,
     handle: tokio::runtime::Handle,
     profiles: RwLock<HashMap<u32, Arc<ProxyHop>>>,
@@ -403,6 +413,7 @@ pub struct ProxyRuntime {
 impl ProxyRuntime {
     #[cfg(test)]
     pub(crate) fn install_http3_fixture(&self, id: u32, provider: Arc<dyn TunnelProvider>) {
+        self.network.install_fixture(id, provider.clone());
         assert!(self.routes.lock().unwrap().is_empty());
         let mut profiles = self.profiles.write().unwrap();
         let profile = profiles.get(&id).unwrap().profile.clone();
@@ -422,12 +433,18 @@ impl ProxyRuntime {
         id: u32,
     ) -> Result<Arc<weaver_nntp::revocation::SocketRegistry>, String> {
         Ok(self
-            .route(Consumer::Server(id), Duration::from_secs(30))?
+            .route(
+                Consumer::Server(id),
+                crate::servers::connectivity::SERVER_CONNECT_TIMEOUT,
+            )?
             .sockets
             .clone())
     }
     pub fn nntp_bridge(&self, id: u32) -> Result<Option<Arc<Bridge>>, String> {
-        let route = self.route(Consumer::Server(id), Duration::from_secs(30))?;
+        let route = self.route(
+            Consumer::Server(id),
+            crate::servers::connectivity::SERVER_CONNECT_TIMEOUT,
+        )?;
         if route.policy.is_direct() {
             Ok(None)
         } else {
@@ -435,6 +452,15 @@ impl ProxyRuntime {
         }
     }
     pub fn new(db: Database, handle: tokio::runtime::Handle) -> Result<Arc<Self>, String> {
+        Self::with_quota_policy(db, handle, None)
+    }
+    // A runtime whose egresses are metered by the long-lived download
+    // policies, so every egress quota is enforced.
+    pub fn with_quota_policy(
+        db: Database,
+        handle: tokio::runtime::Handle,
+        quota_policy: Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>,
+    ) -> Result<Arc<Self>, String> {
         let profiles = db
             .list_proxy_profiles()
             .map_err(|e| e.to_string())?
@@ -448,6 +474,7 @@ impl ProxyRuntime {
             .collect();
         let consumers = Self::load_consumers(&db).map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {
+            network: NetworkRuntime::with_quota_policy(db.clone(), handle.clone(), quota_policy)?,
             db,
             handle,
             profiles: RwLock::new(profiles),
@@ -459,7 +486,7 @@ impl ProxyRuntime {
             stopped: AtomicBool::new(false),
         }))
     }
-    fn load_consumers(
+    pub(super) fn load_consumers(
         db: &Database,
     ) -> Result<std::collections::HashSet<String>, crate::StateError> {
         Ok(db
@@ -607,7 +634,10 @@ impl ProxyRuntime {
                         .iter()
                         .filter(|(key, route)| {
                             !consumers.contains(*key)
-                                || route.policy != policies.get(*key).cloned().unwrap_or_default()
+                                || legacy_policy_changed(
+                                    &route.policy,
+                                    &policies.get(*key).cloned().unwrap_or_default(),
+                                )
                                 || route.policy.proxy_ids.iter().zip(&route.hops).any(
                                     |(id, prior)| match (prior, profiles.get(id)) {
                                         (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
@@ -637,9 +667,11 @@ impl ProxyRuntime {
         for hop in stale_profiles {
             hop.provider.shutdown().await;
         }
+        self.network.reload().await?;
         Ok(())
     }
     pub async fn stop_all(&self) {
+        self.network.shutdown().await;
         self.stopped.store(true, Ordering::Release);
         let routes = std::mem::take(&mut *self.routes.lock().expect("proxy routes"));
         for (_, route) in routes {

@@ -1,4 +1,4 @@
-//! Verified installation images and bounded direct-store readback work.
+// Verified installation images and bounded direct-store readback work.
 
 use super::*;
 use crate::pipeline::direct_store::repair::{RepairedSpan, read_repaired_range};
@@ -89,9 +89,9 @@ pub(super) struct Target {
     pub volume: u32,
     pub output: usize,
     pub cipher: bool,
-    /// Edges are planned when this target comes up, not before the first
-    /// stripe: an earlier target's image has to be routed before this
-    /// volume's part has a place in its member.
+    // Edges are planned when this target comes up, not before the first
+    // stripe: an earlier target's image has to be routed before this
+    // volume's part has a place in its member.
     pub deferred: bool,
     pub edges: Vec<CipherEdge>,
 }
@@ -165,7 +165,7 @@ pub(super) struct Installation {
     pub settling_set: Option<usize>,
     pub pending_gap: Option<GapRead>,
     pub edge_reads: Vec<EdgeRead>,
-    /// Edge reads still admitted under the reservation.
+    // Edge reads still admitted under the reservation.
     pub edge_budget: usize,
     pub preflight_failed: bool,
     pub _edge_reservation: Option<assessment::ViewReservation>,
@@ -397,8 +397,8 @@ impl Pipeline {
         }
     }
 
-    /// Plans the cipher neighbours one replacement image needs, bound to the
-    /// verified output or retained source that holds each.
+    // Plans the cipher neighbours one replacement image needs, bound to the
+    // verified output or retained source that holds each.
     fn plan_par3_edges(
         &self,
         job_id: JobId,
@@ -872,6 +872,7 @@ mod tests {
             completion: work::RepairCompletion {
                 result: Ok(Default::default()),
                 embedded_replacement: false,
+                embedded_source: None,
                 outputs: Ok(vec![
                     VerifiedOutput::capture(path, STRIPE_BYTES + 17, options).unwrap(),
                 ]),

@@ -171,19 +171,25 @@ pub(super) async fn graphql_handler(
     req: GraphQLRequest,
 ) -> Result<GraphQLResponse, StatusCode> {
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-    let resolved = super::auth::resolve_caller(
-        &request_auth.db,
-        &request_auth.auth_cache,
-        &request_auth.api_key_cache,
-        request_auth.session_token.0.as_str(),
-        &request_auth.security,
-        super::auth::BrowserSessionPolicy::TrustedPeer(peer),
-        &headers,
-    )
-    .await?;
+    let resolved = match super::auth::resolve_script_run(&request_auth.db, &headers).await {
+        Some(resolved) => resolved,
+        None => {
+            super::auth::resolve_caller(
+                &request_auth.db,
+                &request_auth.auth_cache,
+                &request_auth.api_key_cache,
+                request_auth.session_token.0.as_str(),
+                &request_auth.security,
+                super::auth::BrowserSessionPolicy::TrustedPeer(peer),
+                &headers,
+            )
+            .await?
+        }
+    };
     if !matches!(
         resolved.identity,
         weaver_server_api::auth::CallerIdentity::ApiKey(_)
+            | weaver_server_api::auth::CallerIdentity::ScriptRun(_)
     ) {
         super::auth::validate_browser_csrf(&request_auth.db, &request_auth.security, &headers)
             .await?;
@@ -196,11 +202,11 @@ pub(super) async fn graphql_handler(
     Ok(schema.execute(request).await.into())
 }
 
-/// Whether the page that opened this socket is this application.
-///
-/// Browsers always send `Origin` on a socket upgrade and page scripts cannot
-/// forge it; a request without one is a machine client, which carries its own
-/// credential rather than riding on a browser's cookies.
+// Whether the page that opened this socket is this application.
+//
+// Browsers always send `Origin` on a socket upgrade and page scripts cannot
+// forge it; a request without one is a machine client, which carries its own
+// credential rather than riding on a browser's cookies.
 fn upgrade_origin_allowed(
     auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
@@ -233,8 +239,8 @@ fn upgrade_origin_allowed(
     allowed
 }
 
-/// Everything that can take a credential away, subscribed before the upgrade
-/// is authenticated so no change can slip between the check and the watch.
+// Everything that can take a credential away, subscribed before the upgrade
+// is authenticated so no change can slip between the check and the watch.
 struct RevocationWatch {
     login: watch::Receiver<()>,
     api_keys: watch::Receiver<()>,

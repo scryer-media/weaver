@@ -10,6 +10,60 @@ use tokio::{
     sync::Notify,
 };
 
+#[test]
+fn connection_outcome_notifies_each_stage_once() {
+    let outcome = ConnectionOutcome::default();
+    let failures = Arc::new(AtomicUsize::new(0));
+    let closes = Arc::new(AtomicUsize::new(0));
+    for _ in 0..3 {
+        let failures = failures.clone();
+        let closes = closes.clone();
+        outcome.on_failure(move || {
+            failures.fetch_add(1, Ordering::SeqCst);
+        });
+        outcome.on_close(move || {
+            closes.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    outcome.failed();
+    outcome.failed();
+    assert_eq!(failures.load(Ordering::SeqCst), 3);
+    assert_eq!(closes.load(Ordering::SeqCst), 0);
+    outcome.closed();
+    outcome.closed();
+    drop(outcome);
+    assert_eq!(closes.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn dropping_a_connection_releases_counts_without_booking_failure() {
+    let outcome = ConnectionOutcome::default();
+    let closes = Arc::new(AtomicUsize::new(0));
+    let count = closes.clone();
+    outcome.on_failure(|| panic!("normal closure is not failure evidence"));
+    outcome.on_close(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    drop(outcome);
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn outcome_callbacks_can_report_closure_without_lock_reentrancy() {
+    let outcome = Arc::new(ConnectionOutcome::default());
+    let weak = Arc::downgrade(&outcome);
+    outcome.on_failure(move || {
+        weak.upgrade().unwrap().closed();
+    });
+    outcome.failed();
+    let count = Arc::new(AtomicUsize::new(0));
+    let closes = count.clone();
+    outcome.on_close(move || {
+        closes.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
 #[derive(Default)]
 struct Fixture {
     calls: AtomicUsize,

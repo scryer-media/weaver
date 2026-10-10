@@ -23,17 +23,19 @@ export interface LiveConnectionState {
 }
 
 export interface DownloadBlockState {
-  kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "ISP_CAP" | "SERVER_QUOTA";
-  capEnabled: boolean;
-  period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
+  kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "EGRESS_QUOTA" | "SERVER_QUOTA";
+  /** The egress whose download quota is holding downloads, while one is. */
+  egressId?: number | null;
+  egressName?: string | null;
   usedBytes: number;
   limitBytes: number;
   remainingBytes: number;
-  reservedBytes: number;
   windowStartsAtEpochMs?: number | null;
   windowEndsAtEpochMs?: number | null;
   timezoneName: string;
   scheduledSpeedLimit: number;
+  /** Why a schedule rule is holding new downloads, while one is. */
+  scheduleHoldReason?: string | null;
 }
 
 export interface LiveData {
@@ -53,12 +55,11 @@ interface LiveJobsStore {
 const EMPTY_JOBS: JobData[] = [];
 const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   kind: "NONE",
-  capEnabled: false,
-  period: null,
+  egressId: null,
+  egressName: null,
   usedBytes: 0,
   limitBytes: 0,
   remainingBytes: 0,
-  reservedBytes: 0,
   windowStartsAtEpochMs: null,
   windowEndsAtEpochMs: null,
   timezoneName: "",

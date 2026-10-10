@@ -27,6 +27,8 @@ impl RssRuleAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RssFeedRow {
+    // Ids of the feed instances attached to this feed, in the order they run.
+    pub scripts: Vec<String>,
     pub id: u32,
     pub name: String,
     pub url: String,

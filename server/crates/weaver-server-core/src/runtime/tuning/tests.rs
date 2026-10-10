@@ -48,7 +48,7 @@ fn hdd_profile(cores: usize) -> SystemProfile {
     }
 }
 
-/// Standard test connection limit (mimics a typical config).
+// Standard test connection limit (mimics a typical config).
 const TEST_CONNECTIONS: usize = 20;
 
 #[test]
@@ -150,8 +150,8 @@ fn fast_storage_extractions_follow_the_cpus_the_process_may_use() {
     assert_eq!(tuner.max_concurrent_extractions(), 3);
 }
 
-/// The profile caps how many extractions run at once on fast storage; the
-/// widest one keeps the cores-between-2-and-6 rule exactly.
+// The profile caps how many extractions run at once on fast storage; the
+// widest one keeps the cores-between-2-and-6 rule exactly.
 #[test]
 fn each_profile_caps_concurrent_extractions() {
     use crate::runtime::hardware_profile::HardwareProfile;

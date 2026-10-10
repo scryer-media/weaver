@@ -1,73 +1,87 @@
-//! Naming policy for the files a finished job delivers.
-//!
-//! [`crate::deobfuscate`] answers "is this *posted* file's name meaningless",
-//! which is what the PAR2 rename pass needs. This module answers a different
-//! question at the other end of the pipeline: once the archives are open and
-//! their members sit in the delivery directory, is the payload still wearing a
-//! randomized name that no downstream tool can match?
-//!
-//! The two verdicts are tuned in opposite directions on purpose. The posted-file
-//! verdict is precision-tuned — a wrong `true` there sends the pipeline hunting
-//! for a rename source that does not exist. The delivery verdict is
-//! recall-tuned and **defaults to obfuscated**: the only action it can take is
-//! renaming a file to the job's own name, and a job that reached delivery under
-//! a meaningful name is a better label than a name we could not vouch for. The
-//! refusal gate the caller applies — never rename when the target name is
-//! itself unreadable — is what keeps that default from doing harm.
-//!
-//! Everything here is pure. The caller owns the filesystem, the target-name
-//! decision, and the ordering of the renames it is handed.
+// Naming policy for the files a finished job delivers.
+//
+// [`crate::deobfuscate`] answers "is this *posted* file's name meaningless",
+// which is what the PAR2 rename pass needs. This module answers a different
+// question at the other end of the pipeline: once the archives are open and
+// their members sit in the delivery directory, is the payload still wearing a
+// randomized name that no downstream tool can match?
+//
+// The two verdicts are tuned in opposite directions on purpose. The posted-file
+// verdict is precision-tuned — a wrong `true` there sends the pipeline hunting
+// for a rename source that does not exist. The delivery verdict is
+// recall-tuned and **defaults to obfuscated**: the only action it can take is
+// renaming a file to the job's own name, and a job that reached delivery under
+// a meaningful name is a better label than a name we could not vouch for. The
+// refusal gate the caller applies — never rename when the target name is
+// itself unreadable — is what keeps that default from doing harm.
+//
+// Everything here is pure. The caller owns the filesystem, the target-name
+// decision, and the ordering of the renames it is handed.
 
 use crate::deobfuscate::{contains_protected_media_structure, is_obfuscated};
 
-/// A file that the finished job is about to hand to the user.
+// A file that the finished job is about to hand to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeliveredFile<'a> {
-    /// Path relative to the delivery root, `/`-separated. Top-level files are
-    /// a bare filename.
+    // Path relative to the delivery root, `/`-separated. Top-level files are
+    // a bare filename.
     pub relative_path: &'a str,
     pub bytes: u64,
 }
 
-/// One rename to apply, both paths relative to the delivery root.
-///
-/// `from` and `to` always share a parent directory: the pass renames payload
-/// in place and never reshapes the delivery's layout.
+// One rename to apply, both paths relative to the delivery root.
+//
+// `from` and `to` always share a parent directory: the pass renames payload
+// in place and never reshapes the delivery's layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedRename {
     pub from: String,
     pub to: String,
 }
 
-/// A delivered file below this size is never worth naming a release after, no
-/// matter how randomized its name looks.
+// A delivered file below this size is never worth naming a release after, no
+// matter how randomized its name looks.
 pub const MIN_CANDIDATE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// How far the biggest file must outweigh the runner-up before it can be called
-/// *the* payload. A delivery whose two largest files are comparable is a set
-/// (episodes, discs, parts), and renaming one of them after the job would lie
-/// about the other.
+// How far the biggest file must outweigh the runner-up before it can be called
+// *the* payload. A delivery whose two largest files are comparable is a set
+// (episodes, discs, parts), and renaming one of them after the job would lie
+// about the other.
 const CANDIDATE_DOMINANCE_FACTOR: u64 = 3;
 
-/// Extensions that never carry a release name even when they are the biggest
-/// file present: disc-structure parts, whose names are load-bearing for the
-/// players that read them, and archive parts, which the PAR2 rename pass owns.
+// Extensions that never carry a release name even when they are the biggest
+// file present: disc-structure parts, whose names are load-bearing for the
+// players that read them, and archive parts, which the PAR2 rename pass owns.
 const EXCLUDED_CANDIDATE_EXTENSIONS: &[&str] = &[
     "vob", "m2ts", "mts", "cpi", "clpi", "mpl", "mpls", "bdm", "bdmv", "rar", "par2",
 ];
 
-/// Separators that make a name readable to a human. `-` is deliberately absent:
-/// it appears inside hashes often enough that counting it as a readability
-/// signal would clear names that are not readable at all.
+// Executables and script launchers. A job is never named after one, whatever
+// the unwanted extension policy says: the floor holds even when the operator
+// turned that policy off.
+pub const EXECUTABLE_EXTENSIONS: &[&str] = &[
+    "exe", "bat", "cmd", "com", "scr", "msi", "vbs", "ps1", "lnk", "js",
+];
+
+// Separators that make a name readable to a human. `-` is deliberately absent:
+// it appears inside hashes often enough that counting it as a readability
+// signal would clear names that are not readable at all.
 const READABILITY_SEPARATORS: [char; 3] = [' ', '.', '_'];
 
-/// Picks the delivered file whose name the job should be renamed after, or
-/// `None` when the delivery should be left alone.
-///
-/// Returns an index into `files`. A `Some` answer means every gate passed *and*
-/// the name was judged obfuscated — the caller still owes the target-name
-/// refusal gate before it touches the disk.
-pub fn select_rename_candidate(files: &[DeliveredFile<'_>]) -> Option<usize> {
+// Picks the delivered file whose name the job should be renamed after, or
+// `None` when the delivery should be left alone.
+//
+// Returns an index into `files`. A `Some` answer means every gate passed *and*
+// the name was judged obfuscated — the caller still owes the target-name
+// refusal gate before it touches the disk.
+//
+// `is_unwanted` is the operator's unwanted extension policy, asked about the
+// candidate's bare filename. A candidate it refuses, or one carrying an
+// [`EXECUTABLE_EXTENSIONS`] extension, leaves the delivery with its own names.
+pub fn select_rename_candidate(
+    files: &[DeliveredFile<'_>],
+    is_unwanted: impl Fn(&str) -> bool,
+) -> Option<usize> {
     // A disc rip is a structure, not a payload with helpers. Its biggest file
     // would pass every size gate and renaming it would break the disc.
     if files
@@ -108,6 +122,10 @@ pub fn select_rename_candidate(files: &[DeliveredFile<'_>]) -> Option<usize> {
         return None;
     }
 
+    if is_unwanted(name) || has_executable_extension(name) {
+        return None;
+    }
+
     if !looks_obfuscated_for_delivery(name) {
         return None;
     }
@@ -115,17 +133,17 @@ pub fn select_rename_candidate(files: &[DeliveredFile<'_>]) -> Option<usize> {
     Some(biggest)
 }
 
-/// Returns `true` when a delivered file's name should be replaced.
-///
-/// Structured as two allow-lists around a default. The obfuscated patterns are
-/// checked first because a hash wrapped in real-looking tags would otherwise
-/// read as clean; the clean patterns then rescue anything that carries the
-/// shape of a human-written name; everything left over is treated as
-/// obfuscated.
-///
-/// `name` is a bare filename, not a path. Its final extension is judged
-/// separately from the stem so that `.mkv` does not contribute lowercase
-/// letters to the readability counts.
+// Returns `true` when a delivered file's name should be replaced.
+//
+// Structured as two allow-lists around a default. The obfuscated patterns are
+// checked first because a hash wrapped in real-looking tags would otherwise
+// read as clean; the clean patterns then rescue anything that carries the
+// shape of a human-written name; everything left over is treated as
+// obfuscated.
+//
+// `name` is a bare filename, not a path. Its final extension is judged
+// separately from the stem so that `.mkv` does not contribute lowercase
+// letters to the readability counts.
 pub fn looks_obfuscated_for_delivery(name: &str) -> bool {
     let stem = strip_final_extension(name);
     if stem.is_empty() {
@@ -189,15 +207,15 @@ pub fn looks_obfuscated_for_delivery(name: &str) -> bool {
     true
 }
 
-/// Plans the renames that give `candidate` the name `target_stem`, plus the
-/// same-stem helpers that must follow it.
-///
-/// `target_stem` is used verbatim: the caller is responsible for making it a
-/// legal path component. `files[candidate]` keeps its own extension, and every
-/// other file whose name begins with the candidate's stem keeps everything
-/// after it — that is what carries `-sample` and `.eng.srt` across.
-///
-/// Returns an empty plan when the candidate would not actually change name.
+// Plans the renames that give `candidate` the name `target_stem`, plus the
+// same-stem helpers that must follow it.
+//
+// `target_stem` is used verbatim: the caller is responsible for making it a
+// legal path component. `files[candidate]` keeps its own extension, and every
+// other file whose name begins with the candidate's stem keeps everything
+// after it — that is what carries `-sample` and `.eng.srt` across.
+//
+// Returns an empty plan when the candidate would not actually change name.
 pub fn plan_renames(
     files: &[DeliveredFile<'_>],
     candidate: usize,
@@ -246,6 +264,10 @@ pub fn plan_renames(
         let Some(suffix) = name.strip_prefix(old_stem) else {
             continue;
         };
+        // An executable never takes the job's name, even as a helper.
+        if has_executable_extension(name) {
+            continue;
+        }
         // Only a suffix that starts a new token belongs to this stem.
         // Without this, `Show.mkv` would claim `Showreel.mkv`.
         if !suffix.is_empty() && !suffix.starts_with(['.', '-', '_', ' ']) {
@@ -265,6 +287,14 @@ pub fn plan_renames(
     }
 
     plan
+}
+
+fn has_executable_extension(name: &str) -> bool {
+    extension_of(name).is_some_and(|ext| {
+        EXECUTABLE_EXTENSIONS
+            .iter()
+            .any(|executable| ext.eq_ignore_ascii_case(executable))
+    })
 }
 
 fn allocate_free_stem(
@@ -311,8 +341,8 @@ fn file_name_of(relative_path: &str) -> &str {
         .map_or(relative_path, |slash| &relative_path[slash + 1..])
 }
 
-/// Splits off a trailing `.ext` only when it looks like one: short, and made of
-/// alphanumerics. `archive.part01` keeps its whole name; `payload.mkv` does not.
+// Splits off a trailing `.ext` only when it looks like one: short, and made of
+// alphanumerics. `archive.part01` keeps its whole name; `payload.mkv` does not.
 fn strip_final_extension(name: &str) -> &str {
     match extension_of(name) {
         Some(ext) => &name[..name.len() - ext.len() - 1],
@@ -367,6 +397,10 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
+
+    fn no_policy(_: &str) -> bool {
+        false
+    }
 
     fn file(relative_path: &str, bytes: u64) -> DeliveredFile<'_> {
         DeliveredFile {
@@ -434,13 +468,13 @@ mod tests {
             file("Yb5drZSkNi20UCMkb.mkv", 900 * MIB),
             file("Yb5drZSkNi20UCMkb.nfo", 4096),
         ];
-        assert_eq!(select_rename_candidate(&files), Some(0));
+        assert_eq!(select_rename_candidate(&files, no_policy), Some(0));
     }
 
     #[test]
     fn a_lone_obfuscated_file_is_selected() {
         let files = [file("Yb5drZSkNi20UCMkb.mkv", 900 * MIB)];
-        assert_eq!(select_rename_candidate(&files), Some(0));
+        assert_eq!(select_rename_candidate(&files, no_policy), Some(0));
     }
 
     #[test]
@@ -450,26 +484,26 @@ mod tests {
             file("Yb5drZSkNi20UCMkb.mkv", 900 * MIB),
             file("Kf2ptQWmXe81ZBnrd.mkv", 800 * MIB),
         ];
-        assert_eq!(select_rename_candidate(&files), None);
+        assert_eq!(select_rename_candidate(&files, no_policy), None);
     }
 
     #[test]
     fn small_files_are_never_candidates() {
         let files = [file("Yb5drZSkNi20UCMkb.mkv", 9 * MIB)];
-        assert_eq!(select_rename_candidate(&files), None);
+        assert_eq!(select_rename_candidate(&files, no_policy), None);
     }
 
     #[test]
     fn readable_payload_is_left_alone() {
         let files = [file("Silver.Horizon.2024.1080p.mkv", 900 * MIB)];
-        assert_eq!(select_rename_candidate(&files), None);
+        assert_eq!(select_rename_candidate(&files, no_policy), None);
     }
 
     #[test]
     fn excluded_extensions_are_never_candidates() {
         for name in ["Yb5drZSkNi20UCMkb.vob", "Yb5drZSkNi20UCMkb.rar"] {
             let files = [file(name, 900 * MIB)];
-            assert_eq!(select_rename_candidate(&files), None, "{name}");
+            assert_eq!(select_rename_candidate(&files, no_policy), None, "{name}");
         }
     }
 
@@ -479,13 +513,72 @@ mod tests {
             file("VIDEO_TS/VTS_01_1.VOB", 900 * MIB),
             file("Yb5drZSkNi20UCMkb.mkv", 400 * MIB),
         ];
-        assert_eq!(select_rename_candidate(&files), None);
+        assert_eq!(select_rename_candidate(&files, no_policy), None);
 
         let bluray = [
             file("BDMV/STREAM/00000.m2ts", 900 * MIB),
             file("Yb5drZSkNi20UCMkb.mkv", 400 * MIB),
         ];
-        assert_eq!(select_rename_candidate(&bluray), None);
+        assert_eq!(select_rename_candidate(&bluray, no_policy), None);
+    }
+
+    #[test]
+    fn an_executable_is_never_a_candidate_even_without_a_policy() {
+        for extension in EXECUTABLE_EXTENSIONS {
+            for name in [
+                format!("Yb5drZSkNi20UCMkb.{extension}"),
+                format!("Yb5drZSkNi20UCMkb.{}", extension.to_ascii_uppercase()),
+            ] {
+                let files = [file(&name, 1400 * MIB), file("Yb5drZSkNi20UCMkb.nfo", 4096)];
+                assert_eq!(select_rename_candidate(&files, no_policy), None, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_same_stem_executable_keeps_its_name_even_without_a_policy() {
+        for extension in EXECUTABLE_EXTENSIONS {
+            for executable in [
+                format!("Yb5drZSkNi20UCMkb.{extension}"),
+                format!("Yb5drZSkNi20UCMkb.{}", extension.to_ascii_uppercase()),
+            ] {
+                let files = [
+                    file("Yb5drZSkNi20UCMkb.mkv", 1400 * MIB),
+                    file(&executable, 4096),
+                ];
+                assert_eq!(
+                    select_rename_candidate(&files, no_policy),
+                    Some(0),
+                    "{executable}"
+                );
+                let plan = plan_renames(&files, 0, "Silver Horizon 2024");
+                assert_eq!(
+                    plan,
+                    vec![PlannedRename {
+                        from: "Yb5drZSkNi20UCMkb.mkv".into(),
+                        to: "Silver Horizon 2024.mkv".into(),
+                    }],
+                    "{executable}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_the_policy_refuses_is_never_a_candidate() {
+        let files = [
+            file("feature/Yb5drZSkNi20UCMkb.iso", 900 * MIB),
+            file("feature/Yb5drZSkNi20UCMkb.nfo", 4096),
+        ];
+        let iso_policy = |name: &str| name.to_ascii_lowercase().ends_with(".iso");
+        assert_eq!(select_rename_candidate(&files, iso_policy), None);
+        // The policy is asked about the bare filename, and only refuses what
+        // it names.
+        assert_eq!(
+            select_rename_candidate(&files, |name: &str| name.contains('/')),
+            Some(0)
+        );
+        assert_eq!(select_rename_candidate(&files, no_policy), Some(0));
     }
 
     // ── plan_renames ────────────────────────────────────────────────────

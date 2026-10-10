@@ -233,3 +233,15 @@ fn nzb_to_submission_spec_uses_nzb_meta_when_explicit_is_placeholder() {
 
     assert_eq!(spec.password.as_deref(), Some("nzb-secret"));
 }
+
+#[test]
+fn a_submitted_name_without_a_source_suffix_still_names_the_job() {
+    let nzb = Nzb {
+        meta: Default::default(),
+        files: vec![],
+    };
+    let spec = nzb_to_submission_spec(&nzb, Some("renamed-by-scan"), None, None, vec![]);
+    assert_eq!(spec.name, "renamed-by-scan");
+    let spec = nzb_to_submission_spec(&nzb, Some("renamed-by-scan.nzb"), None, None, vec![]);
+    assert_eq!(spec.name, "renamed-by-scan");
+}

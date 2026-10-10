@@ -45,37 +45,37 @@ const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_LANE_CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
-/// How often one job may report that a dispatch pass found it ineligible.
-///
-/// A dispatch wake costs a pass, and passes come in bursts: a job in a phase
-/// that dispatches nothing — extracting, repairing, moving — is re-visited by
-/// every one of them. Unthrottled that is hundreds of identical lines a second
-/// for as long as the phase lasts, written synchronously on the pipeline actor
-/// thread, which is the same thread the stall itself needs to get work moving.
+// How often one job may report that a dispatch pass found it ineligible.
+//
+// A dispatch wake costs a pass, and passes come in bursts: a job in a phase
+// that dispatches nothing — extracting, repairing, moving — is re-visited by
+// every one of them. Unthrottled that is hundreds of identical lines a second
+// for as long as the phase lasts, written synchronously on the pipeline actor
+// thread, which is the same thread the stall itself needs to get work moving.
 const DISPATCH_INELIGIBLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
-/// How often a dispatch pass re-asks for its first server ranking while the
-/// health lock is held by a lane worker, and how long it waits between asks.
-/// The critical sections behind that lock are microseconds long, so the whole
-/// budget is well under a millisecond and nearly every ask after the first
-/// lands.
+// How often a dispatch pass re-asks for its first server ranking while the
+// health lock is held by a lane worker, and how long it waits between asks.
+// The critical sections behind that lock are microseconds long, so the whole
+// budget is well under a millisecond and nearly every ask after the first
+// lands.
 const PASS_RANKING_CONTENTION_RETRIES: usize = 8;
 const PASS_RANKING_CONTENTION_PAUSE: Duration = Duration::from_micros(50);
 
-/// How many jobs may hold a throttle window at once.
-///
-/// Nothing is asked to tidy up after a job that leaves, so the map bounds
-/// itself: expired windows go first, and if every window is still live the
-/// whole map goes. Losing a window costs one extra log line, nothing more.
+// How many jobs may hold a throttle window at once.
+//
+// Nothing is asked to tidy up after a job that leaves, so the map bounds
+// itself: expired windows go first, and if every window is still live the
+// whole map goes. Losing a window costs one extra log line, nothing more.
 const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
 
-/// One log-rate window per job.
-///
-/// These throttles used to share a single instant across the worker, so the
-/// one job failing in a loop spent the window and every other job's *first*
-/// line was dropped along with it — silently, which also left the real rate
-/// unreadable from the log. Each job gets its own window here, and whatever a
-/// closed window swallowed is counted and reported by the next line that gets
-/// through it.
+// One log-rate window per job.
+//
+// These throttles used to share a single instant across the worker, so the
+// one job failing in a loop spent the window and every other job's *first*
+// line was dropped along with it — silently, which also left the real rate
+// unreadable from the log. Each job gets its own window here, and whatever a
+// closed window swallowed is counted and reported by the next line that gets
+// through it.
 #[derive(Debug)]
 pub(crate) struct KeyedLogThrottle<K> {
     windows: HashMap<K, JobLogWindow>,
@@ -89,7 +89,7 @@ impl<K> Default for KeyedLogThrottle<K> {
     }
 }
 
-/// The per-job window every job-scoped throttle uses.
+// The per-job window every job-scoped throttle uses.
 pub(crate) type JobLogThrottle = KeyedLogThrottle<JobId>;
 
 #[derive(Debug, Clone, Copy)]
@@ -99,8 +99,8 @@ struct JobLogWindow {
 }
 
 impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
-    /// Whether this key may log now, and how many of its emissions the closed
-    /// window swallowed since the last one that got through.
+    // Whether this key may log now, and how many of its emissions the closed
+    // window swallowed since the last one that got through.
     pub(crate) fn admit(&mut self, job_id: K, interval: Duration) -> Option<u64> {
         self.admit_at(job_id, interval, Instant::now())
     }
@@ -148,9 +148,9 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
     }
 }
 
-/// How long the servers must stay below their connection cap, with work
-/// queued, before that is reported. Short enough to catch a lane that never
-/// opens, long enough that ordinary refill gaps between batches say nothing.
+// How long the servers must stay below their connection cap, with work
+// queued, before that is reported. Short enough to catch a lane that never
+// opens, long enough that ordinary refill gaps between batches say nothing.
 const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
 const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -158,10 +158,10 @@ const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How many retries inside one stall-log window, with nothing downloaded in
-/// the same window, read as a retry storm rather than as ordinary churn. A
-/// healthy pipeline retries a handful of articles per window and finishes
-/// others alongside them; a thousand retries and no completion is a loop.
+// How many retries inside one stall-log window, with nothing downloaded in
+// the same window, read as a retry storm rather than as ordinary churn. A
+// healthy pipeline retries a handful of articles per window and finishes
+// others alongside them; a thousand retries and no completion is a loop.
 const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -169,25 +169,25 @@ pub(crate) struct DownloadPressure {
     pub(in crate::pipeline) state: DownloadPressureState,
     reason: DownloadPressureReason,
     decode_backlog_bytes: u64,
-    /// Resident bytes control shared write pressure.
+    // Resident bytes control shared write pressure.
     write_buffered_bytes: u64,
-    /// Known UU files may dispatch only their cursor-closing work while capped.
+    // Known UU files may dispatch only their cursor-closing work while capped.
     uu_spool_admission_capped: bool,
     decode_hard_limit_bytes: u64,
     write_hard_limit_bytes: u64,
 }
 
 impl Pipeline {
-    /// The job every handout comes from while it can serve the asking
-    /// server: the first eligible job in dispatch order.
+    // The job every handout comes from while it can serve the asking
+    // server: the first eligible job in dispatch order.
     pub(in crate::pipeline) fn current_hot_job(&self) -> Option<JobId> {
         self.download_scheduler_eligible_jobs().first().copied()
     }
 
-    /// The servers a dispatch pass hands leases to, best first. A pass's
-    /// first ranking is worth a short wait when the health lock is busy: the
-    /// only fallback is the idle connections, and a pass that starts with
-    /// none of those would otherwise send nothing at all.
+    // The servers a dispatch pass hands leases to, best first. A pass's
+    // first ranking is worth a short wait when the health lock is busy: the
+    // only fallback is the idle connections, and a pass that starts with
+    // none of those would otherwise send nothing at all.
     fn rank_servers_for_pass(&self, first_of_pass: bool) -> Option<Vec<usize>> {
         let attempts = if first_of_pass {
             PASS_RANKING_CONTENTION_RETRIES
@@ -205,17 +205,17 @@ impl Pipeline {
         None
     }
 
-    /// Order the servers one dispatch attempt may ask, in place.
-    ///
-    /// Idle-first, but only inside a priority group. The pool's ranking
-    /// already puts the higher group first, and a lower group may take
-    /// ordinary work only once the higher one is out of seats — a preference
-    /// order, unlike backfill, which is a reservation and so stays last
-    /// whatever group it is in. Sorting on idleness alone promoted whichever
-    /// server happened to be holding a cached lane over the whole group above
-    /// it, so a job retrying hard on a low-priority server quietly handed it
-    /// everyone else's work. The sort is stable, so the pool's own ranking
-    /// survives inside each group.
+    // Order the servers one dispatch attempt may ask, in place.
+    //
+    // Idle-first, but only inside a priority group. The pool's ranking
+    // already puts the higher group first, and a lower group may take
+    // ordinary work only once the higher one is out of seats — a preference
+    // order, unlike backfill, which is a reservation and so stays last
+    // whatever group it is in. Sorting on idleness alone promoted whichever
+    // server happened to be holding a cached lane over the whole group above
+    // it, so a job retrying hard on a low-priority server quietly handed it
+    // everyone else's work. The sort is stable, so the pool's own ranking
+    // survives inside each group.
     pub(in crate::pipeline) fn order_dispatch_candidates(
         servers: &mut [usize],
         groups: &[u32],
@@ -231,20 +231,20 @@ impl Pipeline {
         });
     }
 
-    /// Start one more connection: choose the server, ask the scheduler what
-    /// that server should fetch, lease it and hand it to a worker.
-    ///
-    /// The server comes first because the scheduler's answer is per server:
-    /// the hot job may have nothing left that server A may fetch while server
-    /// B could still carry it. Servers are tried in the pool's own ranking,
-    /// and within one priority group those where an idle worker already
-    /// holds a connection come ahead of the rest. A server is only asked
-    /// while it can still seat the lease:
-    /// an idle connection or a free permit beyond what this pass has already
-    /// sent it. Without that, a pass that opens several lanes would send two
-    /// dials at a server with one free permit, and the second would sit in
-    /// the pool's contention loop instead of fetching. The seat count is the
-    /// one the pass started with, not a fresh reading — see the retain below.
+    // Start one more connection: choose the server, ask the scheduler what
+    // that server should fetch, lease it and hand it to a worker.
+    //
+    // The server comes first because the scheduler's answer is per server:
+    // the hot job may have nothing left that server A may fetch while server
+    // B could still carry it. Servers are tried in the pool's own ranking,
+    // and within one priority group those where an idle worker already
+    // holds a connection come ahead of the rest. A server is only asked
+    // while it can still seat the lease:
+    // an idle connection or a free permit beyond what this pass has already
+    // sent it. Without that, a pass that opens several lanes would send two
+    // dials at a server with one free permit, and the second would sit in
+    // the pool's contention loop instead of fetching. The seat count is the
+    // one the pass started with, not a fresh reading — see the retain below.
     fn dispatch_one_download_lane(
         &mut self,
         pressure: DownloadPressure,
@@ -355,21 +355,21 @@ impl Pipeline {
         DispatchAttempt::NoWork
     }
 
-    /// Open the connections a barred job is about to need, while it is barred.
-    ///
-    /// A job whose first wave is held behind a barrier — the PAR2 index
-    /// bootstrap is the standing case — may only lease the barrier's own work,
-    /// so dispatch cuts one batch and stops. Nothing in the barrier requires
-    /// the *connections* to wait: without this, the moment the grid publishes
-    /// and payload leases go out, each lane pays a TCP, TLS, greeting and
-    /// authentication exchange before its first BODY, one after another, on a
-    /// job that has been waiting on exactly those bytes.
-    ///
-    /// A warm lane is idle, not active: it is counted in no connection gauge,
-    /// and if the barrier never lifts it parks with the rest of the pool. The
-    /// dial is asked for after the lease has been handed to a worker, and each
-    /// warm runs on its own worker thread, so nothing already leased waits on
-    /// one.
+    // Open the connections a barred job is about to need, while it is barred.
+    //
+    // A job whose first wave is held behind a barrier — the PAR2 index
+    // bootstrap is the standing case — may only lease the barrier's own work,
+    // so dispatch cuts one batch and stops. Nothing in the barrier requires
+    // the *connections* to wait: without this, the moment the grid publishes
+    // and payload leases go out, each lane pays a TCP, TLS, greeting and
+    // authentication exchange before its first BODY, one after another, on a
+    // job that has been waiting on exactly those bytes.
+    //
+    // A warm lane is idle, not active: it is counted in no connection gauge,
+    // and if the barrier never lifts it parks with the rest of the pool. The
+    // dial is asked for after the lease has been handed to a worker, and each
+    // warm runs on its own worker thread, so nothing already leased waits on
+    // one.
     fn warm_idle_download_lanes_for_barrier(&mut self, job_id: JobId) {
         let capacity = self
             .effective_download_connection_capacity(self.tuner.params().max_concurrent_downloads);
@@ -477,24 +477,31 @@ impl Pipeline {
         }
     }
 
-    /// Fill idle connections from the global article scheduler.
-    ///
-    /// After the whole-link gates (pause, rate limiter, NNTP handover, ISP
-    /// bandwidth cap, byte pressure), each connection asks the one global
-    /// "what should this server fetch next?" in turn: articles come from the
-    /// hot job, and from exactly one spill job only when the hot job has
-    /// nothing that server may fetch. Completion-critical work (PAR2
-    /// completion reads, the direct-store identity probe wave) is drained
-    /// ahead of ordinary bytes within the chosen job only, never across jobs.
-    /// There are no per-server leases and no lane caps; soft byte pressure
-    /// limits the pass to a single article from the hot job.
+    // Fill idle connections from the global article scheduler.
+    //
+    // After the whole-link gates (pause, rate limiter, NNTP handover,
+    // download quota, byte pressure), each connection asks the one global
+    // "what should this server fetch next?" in turn: articles come from the
+    // hot job, and from exactly one spill job only when the hot job has
+    // nothing that server may fetch. Completion-critical work (PAR2
+    // completion reads, the direct-store identity probe wave) is drained
+    // ahead of ordinary bytes within the chosen job only, never across jobs.
+    // There are no per-server leases and no lane caps; soft byte pressure
+    // limits the pass to a single article from the hot job.
     pub(crate) fn dispatch_downloads(&mut self) {
         let now = Instant::now();
         self.download_dispatch_wake = false;
+        // Every early return below except an operator pause is a gate that
+        // can lift with no event to announce it, so the pass is retried on
+        // the idle tick until one gets as far as the eligible jobs.
+        self.download_dispatch_retry = !self.global_paused;
         // Lanes already connected and waiting in the actor are answered
         // before any dial: an established socket outranks a new one.
         self.service_held_download_refills();
-        if self.global_paused || self.rate_limiter.should_wait() {
+        if self.global_paused
+            || self.shared_state.schedule_replay_paused()
+            || self.rate_limiter.should_wait()
+        {
             if self.active_downloads == 0 {
                 debug!(
                     global_paused = self.global_paused,
@@ -505,17 +512,6 @@ impl Pipeline {
             return;
         }
         if self.nntp_handoff_draining {
-            return;
-        }
-        if let Err(error) = self.refresh_bandwidth_cap_window() {
-            error!(error = %error, "failed to refresh ISP bandwidth cap state");
-            return;
-        }
-        if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
-            self.update_queue_metrics();
-            if self.active_downloads == 0 {
-                debug!("dispatch blocked: bandwidth cap exhausted");
-            }
             return;
         }
         let pressure = self.refresh_download_pressure();
@@ -562,6 +558,10 @@ impl Pipeline {
         let tuner_max = params.max_concurrent_downloads;
         let max = self.effective_download_connection_capacity(tuner_max);
         let eligible = self.download_scheduler_eligible_jobs();
+        // Eligibility changes only through job state, which every path that
+        // changes it follows with a turn of its own; work that is eligible
+        // but could not be placed is retried on the tick.
+        self.download_dispatch_retry = !eligible.is_empty();
         if eligible.is_empty() && self.active_downloads == 0 {
             let mut drained_parked_recovery_jobs = Vec::new();
             // Collected rather than logged in place: the warning is throttled
@@ -614,6 +614,16 @@ impl Pipeline {
                             parked_recovery_only,
                             status_allows_dispatch,
                             "dispatch idle: download pipeline draining"
+                        );
+                    } else if self.held_for_added_scripts(*jid) {
+                        // Held on purpose until the scripts that block on its
+                        // arrival have run; their end releases it.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            "dispatch idle: waiting for scripts that run when a job is added"
                         );
                     } else if matches!(
                         s.status,
@@ -765,8 +775,8 @@ mod job_log_throttle_tests {
 
     const WINDOW: Duration = Duration::from_secs(60);
 
-    /// A job failing in a loop must not spend another job's first line, and
-    /// what its own window swallowed must be readable from the next line.
+    // A job failing in a loop must not spend another job's first line, and
+    // what its own window swallowed must be readable from the next line.
     #[test]
     fn a_noisy_job_does_not_throttle_a_quiet_one() {
         let mut throttle = JobLogThrottle::default();
@@ -805,8 +815,8 @@ mod job_log_throttle_tests {
         );
     }
 
-    /// The map is bounded, so a long-lived worker cannot accumulate a window
-    /// for every job it has ever seen.
+    // The map is bounded, so a long-lived worker cannot accumulate a window
+    // for every job it has ever seen.
     #[test]
     fn the_throttle_bounds_the_jobs_it_remembers() {
         let mut throttle = JobLogThrottle::default();

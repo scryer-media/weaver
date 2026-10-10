@@ -4,14 +4,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 
-/// Definitely newer than any version this project will ship from this branch.
+// Definitely newer than any version this project will ship from this branch.
 const FUTURE_VERSION: &str = "99.0.0";
-/// Definitely older than the running build.
+// Definitely older than the running build.
 const ANCIENT_VERSION: &str = "0.0.1";
 
-/// Scripted [`ReleaseFetcher`]: hands back queued outcomes in order, repeating
-/// the last one once the script is exhausted, and records what it was called
-/// with. No socket is ever opened.
+// Scripted [`ReleaseFetcher`]: hands back queued outcomes in order, repeating
+// the last one once the script is exhausted, and records what it was called
+// with. No socket is ever opened.
 struct ScriptedFetcher {
     outcomes: Mutex<VecDeque<Result<FetchOutcome, String>>>,
     last: Mutex<Result<FetchOutcome, String>>,
@@ -414,11 +414,11 @@ async fn a_release_no_longer_newer_than_the_build_clears_update_available() {
 // origin, never to cumulative relative sleeps — so a wide or narrow jitter draw
 // cannot flip the result.
 
-/// Margin used to step just inside or just past a bound.
+// Margin used to step just inside or just past a bound.
 const MARGIN: Duration = Duration::from_secs(2);
 
-/// Earliest and latest instant at which check `n` (1-based) can fire, given a
-/// steady-state gap of `gap` between checks.
+// Earliest and latest instant at which check `n` (1-based) can fire, given a
+// steady-state gap of `gap` between checks.
 fn check_window(n: u32, gap: Duration) -> (Duration, Duration) {
     let earliest = STARTUP_DELAY + gap * (n - 1);
     let latest = STARTUP_DELAY + STARTUP_JITTER + gap * (n - 1);

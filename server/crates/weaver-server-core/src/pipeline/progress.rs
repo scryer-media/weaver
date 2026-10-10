@@ -9,15 +9,15 @@ const PHASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) struct JobPhaseRuntime {
     pub(super) counters: Arc<PhaseCounters>,
     pub(super) started_at_epoch_ms: f64,
-    /// The same estimator the global speed gauge uses, advanced on the same
-    /// 100 ms tick, so a row's rate is comparable to the nav counter.
+    // The same estimator the global speed gauge uses, advanced on the same
+    // 100 ms tick, so a row's rate is comparable to the nav counter.
     pub(super) rate: RateSeries,
     pub(super) first_sample_at: Option<Instant>,
 }
 
-/// The metric stage label for a user-visible job phase. Verification and
-/// post-processing are not phases, so they arm their timers from their own
-/// start/finish points.
+// The metric stage label for a user-visible job phase. Verification and
+// post-processing are not phases, so they arm their timers from their own
+// start/finish points.
 const fn stage_kind_for_phase(phase: JobPhase) -> crate::operations::instrumentation::JobStageKind {
     use crate::operations::instrumentation::JobStageKind;
     match phase {
@@ -60,6 +60,9 @@ impl Pipeline {
             first_sample_at: None,
         };
         self.phase_progress.insert(key, runtime);
+        if phase != JobPhase::Downloading {
+            self.post_download_phases += 1;
+        }
         self.phase_publish_state.remove(&job_id);
         // Stage timing rides the phase lifecycle, which is per job per phase —
         // a handful of events over a job's whole life, never a per-segment
@@ -71,9 +74,11 @@ impl Pipeline {
 
     pub(crate) fn phase_end(&mut self, job_id: JobId, phase: JobPhase) {
         self.note_stage_finished(job_id, stage_kind_for_phase(phase));
-        if self.phase_progress.remove(&(job_id, phase)).is_some()
-            && let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id)
-        {
+        let removed = self.phase_progress.remove(&(job_id, phase)).is_some();
+        if removed && phase != JobPhase::Downloading {
+            self.post_download_phases = self.post_download_phases.saturating_sub(1);
+        }
+        if removed && let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id) {
             phases.retain(|progress| progress.phase != phase);
             if phases.is_empty() {
                 self.phase_progress_snapshots.remove(&job_id);
@@ -81,12 +86,12 @@ impl Pipeline {
         }
     }
 
-    /// Arm the wall-clock timer for one job stage.
-    ///
-    /// Low-frequency by construction: a job enters each stage a handful of
-    /// times. Re-arming an already-armed stage is ignored so a stage that is
-    /// re-entered (a repair pass returning to extraction, say) reports the span
-    /// of its first entry rather than restarting the clock mid-stage.
+    // Arm the wall-clock timer for one job stage.
+    //
+    // Low-frequency by construction: a job enters each stage a handful of
+    // times. Re-arming an already-armed stage is ignored so a stage that is
+    // re-entered (a repair pass returning to extraction, say) reports the span
+    // of its first entry rather than restarting the clock mid-stage.
     pub(crate) fn note_stage_started(
         &mut self,
         job_id: JobId,
@@ -97,9 +102,9 @@ impl Pipeline {
             .or_insert_with(Instant::now);
     }
 
-    /// Observe one job stage's wall duration, if it was armed.
-    ///
-    /// Low-frequency: see [`Self::note_stage_started`].
+    // Observe one job stage's wall duration, if it was armed.
+    //
+    // Low-frequency: see [`Self::note_stage_started`].
     pub(crate) fn note_stage_finished(
         &mut self,
         job_id: JobId,
@@ -112,8 +117,8 @@ impl Pipeline {
         }
     }
 
-    /// Drop any stage timers still armed for a job that is going away, so the
-    /// map cannot outlive the jobs it describes.
+    // Drop any stage timers still armed for a job that is going away, so the
+    // map cannot outlive the jobs it describes.
     pub(crate) fn discard_stage_timers(&mut self, job_id: JobId) {
         self.job_stage_started_at.retain(|(id, _), _| *id != job_id);
     }
@@ -147,20 +152,20 @@ impl Pipeline {
         }
     }
 
-    /// Credit one landed article's wire bytes to its job's download rate, and
-    /// to the server that served it.
-    ///
-    /// Called on the completion path right beside the global `bytes_downloaded`
-    /// counter it must stay in lockstep with: one map lookup, no lock, no
-    /// allocation. A job that has already been removed simply drops the credit.
-    ///
-    /// `source_server_idx` is the runtime index of the serving server, already
-    /// in hand at every call site. Naming it costs one vector index, and the
-    /// per-job ledger costs a walk of a handful of entries, so attribution
-    /// rides along on the lookup this function already performs. An article
-    /// whose server cannot be named is credited to the job's bytes and left
-    /// out of the ledger: an uncounted article is recoverable from the totals,
-    /// a misattributed one is not.
+    // Credit one landed article's wire bytes to its job's download rate, and
+    // to the server that served it.
+    //
+    // Called on the completion path right beside the global `bytes_downloaded`
+    // counter it must stay in lockstep with: one map lookup, no lock, no
+    // allocation. A job that has already been removed simply drops the credit.
+    //
+    // `source_server_idx` is the runtime index of the serving server, already
+    // in hand at every call site. Naming it costs one vector index, and the
+    // per-job ledger costs a walk of a handful of entries, so attribution
+    // rides along on the lookup this function already performs. An article
+    // whose server cannot be named is credited to the job's bytes and left
+    // out of the ledger: an uncounted article is recoverable from the totals,
+    // a misattributed one is not.
     pub(crate) fn note_job_wire_bytes(
         &mut self,
         segment_id: SegmentId,
@@ -184,7 +189,17 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_phase_progress_runtime(&mut self, job_id: JobId) {
-        self.phase_progress.retain(|(jid, _), _| *jid != job_id);
+        let mut removed_post_download = 0;
+        self.phase_progress.retain(|(jid, phase), _| {
+            let keep = *jid != job_id;
+            if !keep && *phase != JobPhase::Downloading {
+                removed_post_download += 1;
+            }
+            keep
+        });
+        self.post_download_phases = self
+            .post_download_phases
+            .saturating_sub(removed_post_download);
         self.phase_progress_snapshots.remove(&job_id);
         self.phase_publish_state.remove(&job_id);
     }
@@ -284,8 +299,13 @@ impl Pipeline {
             phases.sort_by_key(|progress| progress.phase);
         }
 
+        // Nothing to show before or after means the published rows already
+        // carry no phase progress; republishing them would change nothing.
+        let shows_progress = !by_job.is_empty() || !self.phase_progress_snapshots.is_empty();
         self.phase_progress_snapshots = by_job;
-        self.publish_snapshot();
+        if shows_progress {
+            self.publish_snapshot();
+        }
         self.emit_phase_progress_update_events(now);
     }
 

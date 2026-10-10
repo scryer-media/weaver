@@ -1,4 +1,5 @@
 use super::*;
+mod passwords;
 mod zip64;
 use std::collections::HashMap;
 use std::fs;
@@ -16,6 +17,85 @@ use zip::write::SimpleFileOptions;
 use lzma_rust2::{XzOptions, XzWriter, XzWriterMt};
 
 static XZ_MT_DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn sevenz_member_requires_declared_length_and_crc() {
+    let payload = b"verified member";
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(payload);
+    let checksum = u64::from(crc.finalize());
+    for has_crc in [false, true] {
+        for size in [payload.len() - 1, payload.len(), payload.len() + 1] {
+            for stored_crc in [checksum, checksum ^ 1] {
+                let entry = sevenz_turbo::ArchiveEntry {
+                    name: "member.bin".into(),
+                    size: size as u64,
+                    has_crc,
+                    crc: stored_crc,
+                    ..Default::default()
+                };
+                let mut output = Vec::new();
+                let result =
+                    copy_verified_7z_member(&entry, &mut Cursor::new(payload), &mut output);
+                let valid = size == payload.len() && (!has_crc || stored_crc == checksum);
+                assert_eq!(
+                    result.is_ok(),
+                    valid,
+                    "size={size}, crc={stored_crc}, has_crc={has_crc}"
+                );
+                if valid {
+                    assert_eq!(result.unwrap(), payload.len() as u64);
+                    assert_eq!(output, payload);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sevenz_reposts_require_equivalent_bytes_and_container_bounds() {
+    let dir = TempDir::new().unwrap();
+    let first = dir.path().join("archive.7z.001");
+    let second = dir.path().join("archive.7z.002");
+    let copy = dir.path().join("archive.7z.0002");
+    let mut header = vec![0u8; 64];
+    header[..6].copy_from_slice(&[b'7', b'z', 0xbc, 0xaf, 0x27, 0x1c]);
+    header[12..20].copy_from_slice(&64u64.to_le_bytes());
+    header[20..28].copy_from_slice(&16u64.to_le_bytes());
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(&header[12..32]);
+    header[8..12].copy_from_slice(&crc.finalize().to_le_bytes());
+    fs::write(&first, &header).unwrap();
+    fs::write(&second, [7u8; 48]).unwrap();
+    for duplicate in [vec![7u8; 48], vec![7u8; 47], vec![8u8; 48]] {
+        fs::write(&copy, &duplicate).unwrap();
+        for reverse in [false, true] {
+            let mut parts = vec![(0, first.clone()), (1, second.clone()), (1, copy.clone())];
+            if reverse {
+                parts.reverse();
+            }
+            let selected = verified_sevenz_part_paths(&parts);
+            assert_eq!(selected.is_ok(), duplicate != vec![8u8; 48]);
+            assert!(copy.exists(), "selection must retain the other candidate");
+            if let Ok(selected) = selected {
+                assert_eq!(selected.len(), 2);
+                assert_eq!(fs::read(&selected[1]).unwrap(), vec![7u8; 48]);
+            }
+        }
+    }
+    assert!(verified_sevenz_part_paths(&[(1, first.clone()), (0, second.clone())]).is_err());
+    assert!(verified_sevenz_part_paths(&[(0, first.clone()), (2, second.clone())]).is_err());
+    let mut enveloped = vec![7u8; 48];
+    enveloped.extend_from_slice(par3_rs::MAGIC);
+    fs::write(&second, &enveloped).unwrap();
+    assert!(verified_sevenz_part_paths(&[(0, first.clone()), (1, second.clone())]).is_ok());
+    enveloped[48] ^= 1;
+    fs::write(&second, &enveloped).unwrap();
+    assert!(verified_sevenz_part_paths(&[(0, first.clone()), (1, second.clone())]).is_err());
+    header[12] ^= 1;
+    fs::write(&first, header).unwrap();
+    assert!(verified_sevenz_part_paths(&[(0, first), (1, second)]).is_err());
+}
 
 fn lock_xz_mt_decoder_test() -> MutexGuard<'static, ()> {
     let guard = XZ_MT_DECODER_TEST_LOCK
@@ -153,12 +233,21 @@ fn extract_with_weaver_zip_result(
         archive_path,
         &root,
         &budget,
-        password,
+        &password
+            .into_iter()
+            .map(|value| {
+                crate::jobs::ArchivePasswordCandidate::new(
+                    crate::jobs::ArchivePasswordSource::Explicit,
+                    value.to_string(),
+                )
+            })
+            .collect::<Vec<_>>(),
         &event_tx,
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
         None,
     )
+    .map(|(members, _)| members)
 }
 
 fn extract_with_weaver_zip_result_with_phase(
@@ -173,12 +262,21 @@ fn extract_with_weaver_zip_result_with_phase(
         archive_path,
         &root,
         &budget,
-        password,
+        &password
+            .into_iter()
+            .map(|value| {
+                crate::jobs::ArchivePasswordCandidate::new(
+                    crate::jobs::ArchivePasswordSource::Explicit,
+                    value.to_string(),
+                )
+            })
+            .collect::<Vec<_>>(),
         &event_tx,
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
         Some(Arc::clone(&phase_counters)),
-    );
+    )
+    .map(|(members, _)| members);
     (result, phase_counters)
 }
 
@@ -647,11 +745,11 @@ fn multi_block_xz_extracts_with_the_filesystem_decoder() {
     assert_eq!(fs::read(output_dir.join("payload.bin")).unwrap(), payload);
 }
 
-/// The simple-archive task and the xz decoder must not both admit the same
-/// footprint. The decoder measures and reserves what it will hold; a
-/// ceiling-sized permit held over it leaves a job whose ceiling is the xz
-/// limit with nothing for the decoder to reserve, and the decoder then waits
-/// for room only the permit above it could release.
+// The simple-archive task and the xz decoder must not both admit the same
+// footprint. The decoder measures and reserves what it will hold; a
+// ceiling-sized permit held over it leaves a job whose ceiling is the xz
+// limit with nothing for the decoder to reserve, and the decoder then waits
+// for room only the permit above it could release.
 #[test]
 fn xz_extraction_admits_its_decoder_footprint_once() {
     let _test_guard = lock_xz_mt_decoder_test();
@@ -713,9 +811,9 @@ fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
     assert_eq!(output, payload);
 }
 
-/// The parallel decoder is only taken when the job's memory budget can hold
-/// one worker; a budget one byte short of that goes to the sequential decoder,
-/// whose dictionary is bounded by the block it decodes and still fits.
+// The parallel decoder is only taken when the job's memory budget can hold
+// one worker; a budget one byte short of that goes to the sequential decoder,
+// whose dictionary is bounded by the block it decodes and still fits.
 #[test]
 fn filesystem_xz_decoder_falls_back_to_sequential_when_a_worker_does_not_fit() {
     let _test_guard = lock_xz_mt_decoder_test();
@@ -744,8 +842,8 @@ fn filesystem_xz_decoder_falls_back_to_sequential_when_a_worker_does_not_fit() {
     assert_eq!(output, payload);
 }
 
-/// A budget that holds exactly one worker gets the parallel decoder with its
-/// thread count trimmed to one, not the sequential fallback.
+// A budget that holds exactly one worker gets the parallel decoder with its
+// thread count trimmed to one, not the sequential fallback.
 #[test]
 fn filesystem_xz_decoder_trims_its_threads_to_the_memory_budget() {
     let _test_guard = lock_xz_mt_decoder_test();
@@ -805,10 +903,10 @@ fn zip64_archive_from_7z_is_readable() {
     assert!(out_dir.join("entry_69999.txt").exists());
 }
 
-/// A 7z archive carrying the metadata 7-Zip records and the extractor used to
-/// ignore: per-entry times on a directory, a file and an empty file, and an
-/// anti-item — an update archive's deletion marker for a path that must not
-/// exist after extraction.
+// A 7z archive carrying the metadata 7-Zip records and the extractor used to
+// ignore: per-entry times on a directory, a file and an empty file, and an
+// anti-item — an update archive's deletion marker for a path that must not
+// exist after extraction.
 fn sevenz_archive_with_times_and_anti_item(
     directory_time: std::time::SystemTime,
     file_time: std::time::SystemTime,
@@ -921,8 +1019,8 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
     assert_eq!(directory.modified().unwrap(), directory_time);
 }
 
-/// A 7z archive whose one LZMA2 block declares a `dictionary`-byte
-/// dictionary, holding `members` in order.
+// A 7z archive whose one LZMA2 block declares a `dictionary`-byte
+// dictionary, holding `members` in order.
 fn sevenz_archive_with_dictionary(dictionary: u32, members: &[(&str, &[u8])]) -> Vec<u8> {
     use sevenz_turbo::encoder_options::Lzma2Options;
     use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
@@ -1018,10 +1116,10 @@ fn conventional_7z_measured_dictionary_may_exceed_profile_allowance() {
     assert_eq!(budget.memory_reserved_bytes(), 0);
 }
 
-/// Listing an archive allocates the end header and, for an encoded one, its
-/// decoders and what it decodes to, all of which the listing's reader limits.
-/// The conventional metadata pass reserves that and no more, so it does not
-/// wait for every other decoder in the process to finish.
+// Listing an archive allocates the end header and, for an encoded one, its
+// decoders and what it decodes to, all of which the listing's reader limits.
+// The conventional metadata pass reserves that and no more, so it does not
+// wait for every other decoder in the process to finish.
 #[test]
 fn conventional_7z_metadata_pass_reserves_what_its_reader_is_limited_to() {
     const MIB: u64 = 1024 * 1024;
@@ -1068,10 +1166,10 @@ fn conventional_7z_metadata_pass_reserves_what_its_reader_is_limited_to() {
     assert_eq!(limits.max_end_header_bytes, 512 * MIB);
 }
 
-/// A listing is not held behind decoders it has no need of: with most of the
-/// process limit reserved by another extraction, it lists and extracts in the
-/// room that is left. Reserved up to the ceiling, it waited for that
-/// extraction to finish, and this test would not return.
+// A listing is not held behind decoders it has no need of: with most of the
+// process limit reserved by another extraction, it lists and extracts in the
+// room that is left. Reserved up to the ceiling, it waited for that
+// extraction to finish, and this test would not return.
 #[test]
 fn conventional_7z_extraction_runs_beside_another_extractions_decoder() {
     use crate::pipeline::extraction::ProcessMemoryBudget;
@@ -1124,9 +1222,9 @@ fn conventional_7z_extraction_runs_beside_another_extractions_decoder() {
     assert_eq!(pool.reserved_bytes(), 0);
 }
 
-/// Another job's retained state is released only when that job ends, so a
-/// listing takes what is left beside it instead of waiting for room the
-/// state leaves no space for, and holds its reader to what it was granted.
+// Another job's retained state is released only when that job ends, so a
+// listing takes what is left beside it instead of waiting for room the
+// state leaves no space for, and holds its reader to what it was granted.
 #[test]
 fn conventional_7z_listing_shrinks_beside_another_jobs_retained_state() {
     use crate::pipeline::extraction::ProcessMemoryBudget;
@@ -1203,9 +1301,9 @@ fn conventional_7z_listing_shrinks_beside_another_jobs_retained_state() {
     assert_eq!(pool.reserved_bytes(), 0);
 }
 
-/// A chase parked on its download keeps its decoder through any number of
-/// conventional extractions that fit beside it: none of them waits, so none
-/// of them asks it to yield.
+// A chase parked on its download keeps its decoder through any number of
+// conventional extractions that fit beside it: none of them waits, so none
+// of them asks it to yield.
 #[test]
 fn conventional_7z_extractions_leave_a_parked_chase_its_decoder() {
     use crate::pipeline::direct_unpack::coverage::SetCoverage;
@@ -1284,9 +1382,9 @@ fn conventional_7z_extractions_leave_a_parked_chase_its_decoder() {
     assert_eq!(pool.reserved_bytes(), 0);
 }
 
-/// An encoded header whose coders need more than a listing allows them is
-/// listed again admitted up to the ceiling, which is what the job's own
-/// limits let that decode allocate, and the archive is read all the same.
+// An encoded header whose coders need more than a listing allows them is
+// listed again admitted up to the ceiling, which is what the job's own
+// limits let that decode allocate, and the archive is read all the same.
 #[test]
 fn conventional_7z_listing_goes_up_to_the_ceiling_for_a_header_it_cannot_decode() {
     const MIB: u64 = 1024 * 1024;
@@ -1364,9 +1462,9 @@ fn conventional_7z_listing_goes_up_to_the_ceiling_for_a_header_it_cannot_decode(
     ));
 }
 
-/// The dictionary an archive declares is allocated on the archive's say-so.
-/// One the job's memory ceiling cannot hold is refused when the archive is
-/// opened, before a decoder exists and before anything is created on disk.
+// The dictionary an archive declares is allocated on the archive's say-so.
+// One the job's memory ceiling cannot hold is refused when the archive is
+// opened, before a decoder exists and before anything is created on disk.
 #[test]
 fn conventional_7z_extraction_refuses_a_dictionary_the_memory_ceiling_cannot_hold() {
     let temp = TempDir::new().unwrap();
@@ -1398,9 +1496,9 @@ fn conventional_7z_extraction_refuses_a_dictionary_the_memory_ceiling_cannot_hol
     );
 }
 
-/// The conventional path decodes with as many threads as it is given, and a
-/// thread count wider than the archive has runs to give it changes nothing
-/// about the output.
+// The conventional path decodes with as many threads as it is given, and a
+// thread count wider than the archive has runs to give it changes nothing
+// about the output.
 #[test]
 fn conventional_7z_extraction_decodes_with_the_threads_it_is_given() {
     let temp = TempDir::new().unwrap();
@@ -1447,10 +1545,10 @@ fn conventional_7z_extraction_decodes_with_the_threads_it_is_given() {
     );
 }
 
-/// A conventional decode whose thread room does not fit the ceiling takes
-/// what fits beside the process's retained state instead of waiting for all
-/// of it: another queued job's scheduling state is held for that job's whole
-/// life, so waiting for it to clear would wait for as long as the job exists.
+// A conventional decode whose thread room does not fit the ceiling takes
+// what fits beside the process's retained state instead of waiting for all
+// of it: another queued job's scheduling state is held for that job's whole
+// life, so waiting for it to clear would wait for as long as the job exists.
 #[test]
 fn conventional_7z_extraction_admits_beside_a_peer_job_retained_state() {
     use crate::pipeline::extraction::ProcessMemoryBudget;
@@ -1520,9 +1618,9 @@ fn conventional_7z_extraction_admits_beside_a_peer_job_retained_state() {
     assert_eq!(pool.reserved_bytes(), 0);
 }
 
-/// The conventional path reserves what the archive's decoders need plus room
-/// for each of its threads past the first, not the whole ceiling, so it does
-/// not hold every other extraction in the process behind it.
+// The conventional path reserves what the archive's decoders need plus room
+// for each of its threads past the first, not the whole ceiling, so it does
+// not hold every other extraction in the process behind it.
 #[test]
 fn conventional_7z_decode_reservation_is_sized_from_the_archive_and_its_threads() {
     let archive = sevenz_archive_with_dictionary(
@@ -1579,11 +1677,11 @@ fn conventional_7z_decode_reservation_is_sized_from_the_archive_and_its_threads(
     );
 }
 
-/// A 7z block whose bytes are wrong is worded for the scheduler to keep for
-/// the recovery data; a method this build cannot decode, a password problem,
-/// and a read that failed for any reason but malformed or short bytes keep the
-/// ordinary wording, which ends the job. The I/O cases are rendered the way
-/// the decoder renders them, from the reader's own error.
+// A 7z block whose bytes are wrong is worded for the scheduler to keep for
+// the recovery data; a method this build cannot decode, a password problem,
+// and a read that failed for any reason but malformed or short bytes keep the
+// ordinary wording, which ends the job. The I/O cases are rendered the way
+// the decoder renders them, from the reader's own error.
 #[test]
 fn sevenz_extraction_error_marks_only_data_errors() {
     use sevenz_turbo::BlockErrorKind;
@@ -1637,8 +1735,8 @@ fn sevenz_extraction_error_marks_only_data_errors() {
     }
 }
 
-/// `bytes` of word salad: compressible enough that decoding it takes real
-/// time per byte, varied enough that no two runs are alike.
+// `bytes` of word salad: compressible enough that decoding it takes real
+// time per byte, varied enough that no two runs are alike.
 fn word_salad(bytes: usize, seed: u64) -> Vec<u8> {
     const WORDS: [&str; 12] = [
         "silver",
@@ -1668,10 +1766,10 @@ fn word_salad(bytes: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-/// A 7z archive whose one LZMA2 block was written by the multi-threaded
-/// encoder in independent `chunk`-byte pieces, each starting with a
-/// dictionary reset: the shape `7zz -mmt=on` writes, and the only one a
-/// decoder can widen on.
+// A 7z archive whose one LZMA2 block was written by the multi-threaded
+// encoder in independent `chunk`-byte pieces, each starting with a
+// dictionary reset: the shape `7zz -mmt=on` writes, and the only one a
+// decoder can widen on.
 fn sevenz_multi_run_archive(chunk: u64, members: &[(&str, &[u8])]) -> Vec<u8> {
     use sevenz_turbo::encoder_options::Lzma2Options;
     use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
@@ -1691,15 +1789,15 @@ fn sevenz_multi_run_archive(chunk: u64, members: &[(&str, &[u8])]) -> Vec<u8> {
     writer.finish().expect("finish").into_inner()
 }
 
-/// `next_header_size` from a 7z signature header: what a chase declares as
-/// its end header.
+// `next_header_size` from a 7z signature header: what a chase declares as
+// its end header.
 fn sevenz_end_header_bytes(archive: &[u8]) -> u64 {
     u64::from_le_bytes(archive[20..28].try_into().unwrap())
 }
 
-/// One thread while the decoder is at the frontier, one more per complete
-/// run waiting behind it, never past the ceiling, and back to one once the
-/// backlog is gone.
+// One thread while the decoder is at the frontier, one more per complete
+// run waiting behind it, never past the ceiling, and back to one once the
+// backlog is gone.
 #[test]
 fn chase_decode_threads_follow_the_backlog_under_the_ceiling() {
     assert_eq!(chase_decode_thread_target(0, 8), 1);
@@ -1717,8 +1815,8 @@ fn chase_decode_threads_follow_the_backlog_under_the_ceiling() {
     assert_eq!(chase_decode_thread_target(usize::MAX, 16), 16);
 }
 
-/// A chase's decode reservation is its decoders, end header and allowance:
-/// nothing up front for widening, which it pays for a thread at a time.
+// A chase's decode reservation is its decoders, end header and allowance:
+// nothing up front for widening, which it pays for a thread at a time.
 #[test]
 fn chase_decode_reservation_holds_no_widening_room() {
     let archive = sevenz_archive_with_dictionary(
@@ -1752,10 +1850,10 @@ fn chase_decode_reservation_holds_no_widening_room() {
     );
 }
 
-/// Thirty chases starting together on small-dictionary archives fit the
-/// process limit side by side. Had each reserved its widening room up front,
-/// the last of them would have waited, and every parked chase would have
-/// yielded to it.
+// Thirty chases starting together on small-dictionary archives fit the
+// process limit side by side. Had each reserved its widening room up front,
+// the last of them would have waited, and every parked chase would have
+// yielded to it.
 #[test]
 fn thirty_chases_fit_where_up_front_widening_room_would_not() {
     let archive = sevenz_archive_with_dictionary(
@@ -1789,9 +1887,9 @@ fn thirty_chases_fit_where_up_front_widening_room_would_not() {
     );
 }
 
-/// Widening room is taken a thread at a time from free memory and stops at
-/// the first thread there is none for. Narrowing keeps it, because the
-/// decoder's workers outlive a narrowing; it goes back with the decode.
+// Widening room is taken a thread at a time from free memory and stops at
+// the first thread there is none for. Narrowing keeps it, because the
+// decoder's workers outlive a narrowing; it goes back with the decode.
 #[test]
 fn widening_room_widens_only_as_far_as_free_memory_allows() {
     let temp = TempDir::new().unwrap();
@@ -1835,11 +1933,11 @@ fn widening_room_widens_only_as_far_as_free_memory_allows() {
     );
 }
 
-/// An adaptive decode starts on one thread and widens while complete runs
-/// wait behind it. Fed a whole multi-run block at once — every run already
-/// downloaded, which is the backlog a chase finds after a park — the governor
-/// sees runs waiting and widens as far as the memory it can take without
-/// waiting pays for; the bytes come out identical either way.
+// An adaptive decode starts on one thread and widens while complete runs
+// wait behind it. Fed a whole multi-run block at once — every run already
+// downloaded, which is the backlog a chase finds after a park — the governor
+// sees runs waiting and widens as far as the memory it can take without
+// waiting pays for; the bytes come out identical either way.
 #[test]
 fn chase_decode_widens_on_a_backlog_of_complete_runs() {
     let temp = TempDir::new().unwrap();
@@ -1910,9 +2008,9 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
     drop(root);
 }
 
-/// The chase's own path through `extract_7z_stream`: a per-pass reservation
-/// sized from the archive, widening paid for as it goes, and the output
-/// identical to a conventional decode.
+// The chase's own path through `extract_7z_stream`: a per-pass reservation
+// sized from the archive, widening paid for as it goes, and the output
+// identical to a conventional decode.
 #[test]
 fn chase_7z_extraction_decodes_a_multi_run_block_adaptively() {
     let temp = TempDir::new().unwrap();
@@ -2029,9 +2127,9 @@ fn chase_mirror_settles_installed_bytes_exactly_once() {
     assert_eq!(phase_bytes(&phase), (700, 700));
 }
 
-/// A zstd frame says in its header how large a window its decoder will hold.
-/// Reading it is the difference between a reservation that can be granted
-/// and one that can only be granted when the whole process is idle.
+// A zstd frame says in its header how large a window its decoder will hold.
+// Reading it is the difference between a reservation that can be granted
+// and one that can only be granted when the whole process is idle.
 #[test]
 fn zstd_window_is_read_from_the_frame_header() {
     // Frame header descriptor 0x00: no content size, not single-segment, no
@@ -2068,10 +2166,10 @@ fn zstd_window_is_read_from_the_frame_header() {
     assert!(zstd_frame_window_bytes(&[0x28, 0xB5, 0x2F, 0xFD, 0b0000_1000, 0]).is_err());
 }
 
-/// A real frame's reservation has to be small enough to be granted while the
-/// rest of the process is working. The old sizing asked for the entire
-/// allowance, which registers as a waiter and makes every running direct
-/// unpack yield its decoder before this one can even start.
+// A real frame's reservation has to be small enough to be granted while the
+// rest of the process is working. The old sizing asked for the entire
+// allowance, which registers as a waiter and makes every running direct
+// unpack yield its decoder before this one can even start.
 #[test]
 fn a_zstd_reservation_is_a_fraction_of_the_process_allowance() {
     let temp = TempDir::new().unwrap();
@@ -2106,9 +2204,9 @@ fn a_zstd_reservation_is_a_fraction_of_the_process_allowance() {
     );
 }
 
-/// A frame whose window is larger than the whole allowance cannot be decoded
-/// here, and says so instead of parking forever on a reservation nothing can
-/// grant.
+// A frame whose window is larger than the whole allowance cannot be decoded
+// here, and says so instead of parking forever on a reservation nothing can
+// grant.
 #[test]
 fn a_zstd_window_above_the_limit_is_refused() {
     // Exponent 21, mantissa 0: a 2 GiB window (the base is 1 KiB shifted by

@@ -10,6 +10,13 @@ import {
   test,
   updateConfiguredServer,
 } from "./helpers";
+import {
+  SYSTEM_EGRESS_ID,
+  SYSTEM_EGRESS_NAME,
+  egressQuota,
+  setSystemEgressQuota,
+  systemEgressQuotaUsage,
+} from "./support/network-flow";
 
 type QuotaSnapshot = {
   enabled: boolean;
@@ -27,12 +34,11 @@ type QuotaSnapshot = {
 
 type DownloadBlockSnapshot = {
   kind: string;
-  capEnabled: boolean;
-  period: string | null;
+  egressId: number | null;
+  egressName: string | null;
   usedBytes: number;
   limitBytes: number;
   remainingBytes: number;
-  reservedBytes: number;
   windowStartsAtEpochMs: number | null;
   windowEndsAtEpochMs: number | null;
   timezoneName: string;
@@ -49,15 +55,16 @@ type QuotaInput = {
 };
 
 const stage = process.env.E2E_WEAVER_QUOTA_STAGE ?? "initial";
-const ispLimit = 256 * 1024;
+const egressLimit = 256 * 1024;
+const egressLabel = { egress_id: String(SYSTEM_EGRESS_ID) };
 const dailyServerLimit = 768 * 1024;
 const initialProbeArticleBytes = 64 * 1024;
-const initialProbeArticleCount = ispLimit / initialProbeArticleBytes;
+const initialProbeArticleCount = egressLimit / initialProbeArticleBytes;
 const schedulePauseLabel = "e2e quota scheduled pause";
 const scheduleLimitLabel = "e2e quota scheduled speed";
 const scheduledLimit = 4 * 1024 * 1024;
 
-test(`ISP and per-server quota behavior: ${stage}`, async ({ request }) => {
+test(`System egress and per-server quota behavior: ${stage}`, async ({ request }) => {
   expect(
     process.env.E2E_WEAVER_CLOCK_FILE,
     "release harness must mount the deterministic Weaver clock",
@@ -76,7 +83,7 @@ test(`ISP and per-server quota behavior: ${stage}`, async ({ request }) => {
 
 async function exerciseInitialAccounting(request: APIRequestContext): Promise<void> {
   setClock("2032-01-01T12:00:00Z");
-  await configureIspCap(request, true, ispLimit);
+  await configureSystemEgressQuota(request, true, egressLimit);
   const primary = await configureServerQuota(
     request,
     "nntp",
@@ -116,18 +123,18 @@ async function exerciseInitialAccounting(request: APIRequestContext): Promise<vo
   let body = "";
   await expect
     .poll(async () => {
-      const [serverQuota, block, metricBody] = await Promise.all([
+      const [serverQuota, egressUsage, metricBody] = await Promise.all([
         readServerQuota(request, primary.id),
-        readDownloadBlock(request),
+        systemEgressQuotaUsage(request),
         metrics(request),
       ]);
       body = metricBody;
       return serverQuota.reservedBytes > 0
-        && block.reservedBytes > 0
+        && egressUsage.reservedBytes > 0
         && (metricValue(body, "weaver_server_download_quota_reserved_bytes", {
           server_id: String(primary.id),
         }) ?? 0) > 0
-        && (metricValue(body, "weaver_bandwidth_cap_reserved_bytes") ?? 0) > 0;
+        && (metricValue(body, "weaver_egress_download_quota_reserved_bytes", egressLabel) ?? 0) > 0;
     }, { timeout: 15_000, intervals: [100, 250, 500] })
     .toBe(true);
 
@@ -136,43 +143,51 @@ async function exerciseInitialAccounting(request: APIRequestContext): Promise<vo
       server_id: String(primary.id),
     }) ?? 0,
   ).toBeGreaterThan(0);
-  expect(metricValue(body, "weaver_bandwidth_cap_reserved_bytes") ?? 0).toBeGreaterThan(0);
+  expect(
+    metricValue(body, "weaver_egress_download_quota_reserved_bytes", egressLabel) ?? 0,
+  ).toBeGreaterThan(0);
 
   await expect
     .poll(async () => {
-      const [serverQuota, block] = await Promise.all([
+      const [serverQuota, block, egressUsage] = await Promise.all([
         readServerQuota(request, primary.id),
         readDownloadBlock(request),
+        systemEgressQuotaUsage(request),
       ]);
-      return block.kind === "ISP_CAP"
+      return block.kind === "EGRESS_QUOTA"
         && block.usedBytes > 0
-        && block.reservedBytes === 0
+        && egressUsage.reservedBytes === 0
         && serverQuota.usedBytes > 0
         && serverQuota.reservedBytes === 0;
     }, { timeout: 30_000, intervals: [250, 500, 1_000] })
     .toBe(true);
-  const [serverQuota, block] = await Promise.all([
+  const [serverQuota, block, egress] = await Promise.all([
     readServerQuota(request, primary.id),
     readDownloadBlock(request),
+    egressQuota(request, SYSTEM_EGRESS_ID),
   ]);
   expect(serverQuota.usedBytes).toBeGreaterThan(0);
   expect(serverQuota.reservedBytes).toBe(0);
   expect(serverQuota.remainingBytes).toBe(dailyServerLimit - serverQuota.usedBytes);
   expect(serverQuota.blocked).toBe(false);
   expect(block).toMatchObject({
-    kind: "ISP_CAP",
-    capEnabled: true,
-    period: "DAILY",
-    limitBytes: ispLimit,
-    reservedBytes: 0,
+    kind: "EGRESS_QUOTA",
+    egressId: SYSTEM_EGRESS_ID,
+    egressName: SYSTEM_EGRESS_NAME,
+    limitBytes: egressLimit,
   });
   // Conservative pre-reservation parks the next article once the remaining
-  // allowance is smaller than its estimate, so the cap trips with used at or
+  // allowance is smaller than its estimate, so the quota trips with used at or
   // below the limit — never above it.
   expect(block.usedBytes).toBeGreaterThan(0);
-  expect(block.usedBytes).toBeLessThanOrEqual(ispLimit);
-  expect(block.remainingBytes).toBe(ispLimit - block.usedBytes);
+  expect(block.usedBytes).toBeLessThanOrEqual(egressLimit);
+  expect(block.remainingBytes).toBe(egressLimit - block.usedBytes);
   expect(block.remainingBytes).toBeLessThan(initialProbeArticleBytes);
+  expect(egress.downloadQuotaUsage).toMatchObject({
+    usedBytes: block.usedBytes,
+    reservedBytes: 0,
+    remainingBytes: block.remainingBytes,
+  });
 
   body = await metrics(request);
   expect(
@@ -185,12 +200,14 @@ async function exerciseInitialAccounting(request: APIRequestContext): Promise<vo
       server_id: String(primary.id),
     }),
   ).toBe(serverQuota.remainingBytes);
-  expect(metricValue(body, "weaver_bandwidth_cap_used_bytes")).toBe(block.usedBytes);
-  expect(metricValue(body, "weaver_bandwidth_cap_remaining_bytes")).toBe(
+  expect(metricValue(body, "weaver_egress_download_quota_used_bytes", egressLabel)).toBe(
+    block.usedBytes,
+  );
+  expect(metricValue(body, "weaver_egress_download_quota_remaining_bytes", egressLabel)).toBe(
     block.remainingBytes,
   );
   expect(
-    metricValue(body, "weaver_pipeline_download_gate", { reason: "isp_cap" }),
+    metricValue(body, "weaver_pipeline_download_gate", { reason: "egress_quota" }),
   ).toBe(1);
 }
 
@@ -198,9 +215,6 @@ async function verifyRestartPersistenceAndDailyReset(
   request: APIRequestContext,
 ): Promise<void> {
   const data = await graphql<{
-    settings: {
-      ispBandwidthCap: { enabled: boolean; period: string; limitBytes: number };
-    };
     servers: Array<{
       id: number;
       host: string;
@@ -210,7 +224,6 @@ async function verifyRestartPersistenceAndDailyReset(
   }>(
     request,
     `query WeaverE2EQuotaRestartState {
-      settings { ispBandwidthCap { enabled period limitBytes } }
       servers {
         id host maxDownloadSpeed
         downloadQuota {
@@ -220,10 +233,10 @@ async function verifyRestartPersistenceAndDailyReset(
       }
     }`,
   );
-  expect(data.settings.ispBandwidthCap).toEqual({
+  expect((await egressQuota(request, SYSTEM_EGRESS_ID)).downloadQuota).toEqual({
     enabled: true,
     period: "DAILY",
-    limitBytes: ispLimit,
+    limitBytes: egressLimit,
   });
   const primary = data.servers.find(({ host }) => host === "nntp");
   expect(primary).toBeTruthy();
@@ -236,7 +249,7 @@ async function verifyRestartPersistenceAndDailyReset(
   });
   expect(primary!.downloadQuota.usedBytes).toBeGreaterThan(0);
 
-  // The parked-on-cap presentation is runtime state: after a restart it
+  // The parked-on-quota presentation is runtime state: after a restart it
   // re-arms on the first dispatch attempt that fails reservation, so poll
   // instead of asserting immediately.
   await expect
@@ -244,17 +257,17 @@ async function verifyRestartPersistenceAndDailyReset(
       timeout: 30_000,
       intervals: [250, 500, 1_000],
     })
-    .toBe("ISP_CAP");
+    .toBe("EGRESS_QUOTA");
   const persistedBlock = await readDownloadBlock(request);
   expect(persistedBlock).toMatchObject({
-    kind: "ISP_CAP",
-    capEnabled: true,
-    period: "DAILY",
-    limitBytes: ispLimit,
-    reservedBytes: 0,
+    kind: "EGRESS_QUOTA",
+    egressId: SYSTEM_EGRESS_ID,
+    egressName: SYSTEM_EGRESS_NAME,
+    limitBytes: egressLimit,
   });
+  expect((await systemEgressQuotaUsage(request)).reservedBytes).toBe(0);
   expect(persistedBlock.usedBytes).toBeGreaterThan(0);
-  expect(persistedBlock.usedBytes).toBeLessThanOrEqual(ispLimit);
+  expect(persistedBlock.usedBytes).toBeLessThanOrEqual(egressLimit);
   expect(persistedBlock.remainingBytes).toBeLessThan(initialProbeArticleBytes);
   const persistedWindowEnd = persistedBlock.windowEndsAtEpochMs;
   const persistedServerWindowEnd = primary!.downloadQuota.windowEndsAtEpochMs;
@@ -262,7 +275,7 @@ async function verifyRestartPersistenceAndDailyReset(
   expect(persistedServerWindowEnd).not.toBeNull();
 
   let body = await metrics(request);
-  expect(metricValue(body, "weaver_bandwidth_cap_used_bytes")).toBe(
+  expect(metricValue(body, "weaver_egress_download_quota_used_bytes", egressLabel)).toBe(
     persistedBlock.usedBytes,
   );
   expect(
@@ -271,7 +284,7 @@ async function verifyRestartPersistenceAndDailyReset(
     }),
   ).toBe(primary!.downloadQuota.usedBytes);
 
-  // The initial stage saturates the cap, which parks the remaining article(s)
+  // The initial stage saturates the quota, which parks the remaining article(s)
   // rather than failing them. Cancel the outstanding job so the daily-window
   // rollover is observed in isolation: otherwise the parked work correctly
   // resumes the instant the new window opens and re-accrues usage, which is
@@ -280,17 +293,19 @@ async function verifyRestartPersistenceAndDailyReset(
   setClock("2032-01-02T00:00:05Z");
   await expect
     .poll(async () => {
-      const [quotaState, block] = await Promise.all([
+      const [quotaState, egressUsage, block] = await Promise.all([
         readServerQuota(request, primary!.id),
+        systemEgressQuotaUsage(request),
         readDownloadBlock(request),
       ]);
       return {
         serverUsed: quotaState.usedBytes,
         serverReserved: quotaState.reservedBytes,
         serverRemaining: quotaState.remainingBytes,
-        ispUsed: block.usedBytes,
-        ispReserved: block.reservedBytes,
-        ispRemaining: block.remainingBytes,
+        egressUsed: egressUsage.usedBytes,
+        egressReserved: egressUsage.reservedBytes,
+        egressRemaining: egressUsage.remainingBytes,
+        egressBlocked: egressUsage.blocked,
         kind: block.kind,
       };
     }, { timeout: 15_000, intervals: [100, 250, 500] })
@@ -298,24 +313,28 @@ async function verifyRestartPersistenceAndDailyReset(
       serverUsed: 0,
       serverReserved: 0,
       serverRemaining: dailyServerLimit,
-      ispUsed: 0,
-      ispReserved: 0,
-      ispRemaining: ispLimit,
+      egressUsed: 0,
+      egressReserved: 0,
+      egressRemaining: egressLimit,
+      egressBlocked: false,
       kind: "NONE",
     });
-  const [resetQuota, resetBlock] = await Promise.all([
+  const [resetQuota, resetEgressUsage] = await Promise.all([
     readServerQuota(request, primary!.id),
-    readDownloadBlock(request),
+    systemEgressQuotaUsage(request),
   ]);
   expect(resetQuota.windowStartsAtEpochMs).toBeGreaterThanOrEqual(
     persistedServerWindowEnd!,
   );
-  expect(resetBlock.windowStartsAtEpochMs).toBeGreaterThanOrEqual(persistedWindowEnd!);
+  expect(resetEgressUsage.windowStartsAtEpochMs).toBeGreaterThanOrEqual(persistedWindowEnd!);
 
   body = await metrics(request);
-  expect(metricValue(body, "weaver_bandwidth_cap_used_bytes")).toBe(0);
-  expect(metricValue(body, "weaver_bandwidth_cap_reserved_bytes")).toBe(0);
-  expect(metricValue(body, "weaver_bandwidth_cap_remaining_bytes")).toBe(ispLimit);
+  expect(metricValue(body, "weaver_egress_download_quota_used_bytes", egressLabel)).toBe(0);
+  expect(metricValue(body, "weaver_egress_download_quota_reserved_bytes", egressLabel)).toBe(0);
+  expect(metricValue(body, "weaver_egress_download_quota_remaining_bytes", egressLabel)).toBe(
+    egressLimit,
+  );
+  expect(metricValue(body, "weaver_egress_download_quota_blocked", egressLabel)).toBe(0);
   expect(
     metricValue(body, "weaver_server_download_quota_used_bytes", {
       server_id: String(primary!.id),
@@ -339,8 +358,8 @@ async function exerciseManualResetAndPeriodWindows(
       intervals: [100, 250, 500],
     })
     .toBeGreaterThan(0);
-  const ispUsedBeforeReset = (await readDownloadBlock(request)).usedBytes;
-  expect(ispUsedBeforeReset).toBeGreaterThan(0);
+  const egressUsedBeforeReset = (await systemEgressQuotaUsage(request)).usedBytes;
+  expect(egressUsedBeforeReset).toBeGreaterThan(0);
   const lifetimeBeforeReset = (await readServerQuota(request, primary.id)).lifetimeBytes;
   const reset = await resetServerQuota(request, primary.id);
   expect(reset).toMatchObject({
@@ -350,7 +369,7 @@ async function exerciseManualResetAndPeriodWindows(
     blocked: false,
   });
   expect(reset.lifetimeBytes).toBe(lifetimeBeforeReset);
-  expect((await readDownloadBlock(request)).usedBytes).toBe(ispUsedBeforeReset);
+  expect((await systemEgressQuotaUsage(request)).usedBytes).toBe(egressUsedBeforeReset);
   let body = await metrics(request);
   expect(
     metricValue(body, "weaver_server_download_quota_used_bytes", {
@@ -358,13 +377,13 @@ async function exerciseManualResetAndPeriodWindows(
     }),
   ).toBe(0);
 
-  await configureIspCap(request, false, 0);
+  await configureSystemEgressQuota(request, false, 0);
   await expect
     .poll(async () => await readDownloadBlock(request), {
       timeout: 10_000,
       intervals: [100, 250, 500],
     })
-    .toMatchObject({ kind: "NONE", capEnabled: false });
+    .toMatchObject({ kind: "NONE", egressId: null, egressName: null });
 
   setClock("2032-01-02T12:00:00Z");
   await configureServerQuota(request, "nntp", quota("ONE_TIME", 256 * 1024), {
@@ -408,7 +427,7 @@ async function exerciseManualResetAndPeriodWindows(
   );
 
   body = await metrics(request);
-  expect(metricValue(body, "weaver_bandwidth_cap_enabled")).toBe(0);
+  expect(metricValue(body, "weaver_egress_download_quota_enabled", egressLabel)).toBe(0);
   expect(
     metricValue(body, "weaver_server_download_quota_enabled", {
       server_id: String(primary.id),
@@ -726,40 +745,12 @@ function setClock(instant: string): void {
   fs.renameSync(pending, clockFile);
 }
 
-async function configureIspCap(
+async function configureSystemEgressQuota(
   request: APIRequestContext,
   enabled: boolean,
   limitBytes: number,
 ): Promise<void> {
-  const data = await graphql<{
-    updateSettings: {
-      ispBandwidthCap: { enabled: boolean; period: string; limitBytes: number };
-    };
-  }>(
-    request,
-    `mutation WeaverE2EIspCap($input: GeneralSettingsInput!) {
-      updateSettings(input: $input) {
-        ispBandwidthCap { enabled period limitBytes }
-      }
-    }`,
-    {
-      input: {
-        ispBandwidthCap: {
-          enabled,
-          period: "DAILY",
-          limitBytes,
-          resetTimeMinutesLocal: 0,
-          weeklyResetWeekday: "MON",
-          monthlyResetDay: 1,
-        },
-      },
-    },
-  );
-  expect(data.updateSettings.ispBandwidthCap).toEqual({
-    enabled,
-    period: "DAILY",
-    limitBytes,
-  });
+  await setSystemEgressQuota(request, { enabled, period: "DAILY", limitBytes });
 }
 
 async function configureServerQuota(
@@ -804,7 +795,7 @@ async function readDownloadBlock(
     `query WeaverE2EDownloadBlock {
       globalQueueState {
         downloadBlock {
-          kind capEnabled period usedBytes limitBytes remainingBytes reservedBytes
+          kind egressId egressName usedBytes limitBytes remainingBytes
           windowStartsAtEpochMs windowEndsAtEpochMs timezoneName scheduledSpeedLimit
         }
       }

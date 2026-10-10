@@ -1,11 +1,11 @@
 use super::*;
 
-/// Mirrors the pipeline's `note_write_buffered` / `release_write_buffered`
-/// pairing: the caller charges the global write backlog for every insert, and
-/// the only ways bytes come back off it are the buffer handing the chunk back
-/// or the buffer's own `buffered_bytes`/`buffered_len` at job teardown
-/// (`clear_job_write_backlog`). Anything the buffer swallows silently is a
-/// permanent leak in that counter.
+// Mirrors the pipeline's `note_write_buffered` / `release_write_buffered`
+// pairing: the caller charges the global write backlog for every insert, and
+// the only ways bytes come back off it are the buffer handing the chunk back
+// or the buffer's own `buffered_bytes`/`buffered_len` at job teardown
+// (`clear_job_write_backlog`). Anything the buffer swallows silently is a
+// permanent leak in that counter.
 #[derive(Default)]
 struct BacklogLedger {
     outstanding_bytes: usize,
@@ -39,8 +39,8 @@ impl BacklogLedger {
     }
 }
 
-/// Insert through the ledger the way the decode worker does: charge the
-/// backlog, then release whatever the drain hands back.
+// Insert through the ledger the way the decode worker does: charge the
+// backlog, then release whatever the drain hands back.
 fn insert_and_drain(
     buf: &mut WriteReorderBuffer<Vec<u8>>,
     ledger: &mut BacklogLedger,
@@ -589,10 +589,10 @@ fn a_fresh_file_still_starts_at_zero() {
     assert_eq!(buf.drain_ready_with_contiguous_end().1, 100);
 }
 
-/// A duplicate that arrives after its file completed meets a fresh buffer
-/// whose cursor is back at zero. Told it is a duplicate, the buffer hands it
-/// straight back for an idempotent rewrite instead of parking it above a
-/// cursor no neighbour will ever advance.
+// A duplicate that arrives after its file completed meets a fresh buffer
+// whose cursor is back at zero. Told it is a duplicate, the buffer hands it
+// straight back for an idempotent rewrite instead of parking it above a
+// cursor no neighbour will ever advance.
 #[test]
 fn a_known_duplicate_never_waits_on_the_cursor() {
     let mut buf = WriteReorderBuffer::new(4);

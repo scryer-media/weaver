@@ -63,13 +63,13 @@ pub struct BackupManifest {
     pub part_checksums: BTreeMap<String, String>,
     pub source_paths: BackupSourcePaths,
     pub encrypted: bool,
-    /// Extension packages a pre-0.9 bundle carried, parsed only so a restore can
-    /// say how many it ignored.
-    ///
-    /// Post-processing scripts are files in the scripts directory with no
-    /// digest and no managed install location, so there is nothing left to
-    /// restore these into. Never written: new bundles omit the field entirely,
-    /// and an older Weaver reading one defaults it back to empty.
+    // Extension packages a pre-0.9 bundle carried, parsed only so a restore can
+    // say how many it ignored.
+    //
+    // Post-processing scripts are files in the scripts directory with no
+    // digest and no managed install location, so there is nothing left to
+    // restore these into. Never written: new bundles omit the field entirely,
+    // and an older Weaver reading one defaults it back to empty.
     #[serde(default, rename = "managed_packages", skip_serializing)]
     pub legacy_managed_packages: Vec<serde_json::Value>,
     #[serde(default)]
@@ -77,8 +77,8 @@ pub struct BackupManifest {
 }
 
 impl BackupManifest {
-    /// The warning a restore surfaces when the bundle carried extension
-    /// packages, or `None` when it did not.
+    // The warning a restore surfaces when the bundle carried extension
+    // packages, or `None` when it did not.
     pub(crate) fn legacy_package_warning(&self) -> Option<String> {
         let count = self.legacy_managed_packages.len();
         (count > 0).then(|| {
@@ -135,12 +135,12 @@ pub struct RestoreReport {
 pub struct BackupArtifact {
     pub filename: String,
     pub path: PathBuf,
-    pub(crate) _temp_dir: tempfile::TempDir,
+    pub(super) temporary_directory: Option<tempfile::TempDir>,
 }
 
 impl BackupArtifact {
-    pub fn into_parts(self) -> (String, PathBuf, tempfile::TempDir) {
-        (self.filename, self.path, self._temp_dir)
+    pub fn into_parts(self) -> (String, PathBuf, Option<tempfile::TempDir>) {
+        (self.filename, self.path, self.temporary_directory)
     }
 }
 

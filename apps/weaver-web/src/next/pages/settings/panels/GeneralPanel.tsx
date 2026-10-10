@@ -1,9 +1,11 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
+  ARCHIVE_PASSWORD_SETTINGS_QUERY,
   HARDWARE_PROFILE_QUERY,
   SET_HARDWARE_PROFILE_MUTATION,
   SETTINGS_QUERY,
+  UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION,
   UPDATE_SETTINGS_MUTATION,
 } from "@/graphql/queries";
 import { useLanguageSettings, useTranslate } from "@/lib/context/translate-context";
@@ -13,8 +15,8 @@ import {
   normalizeDuplicatePolicy,
   type DuplicateAction,
   type DuplicatePolicy,
-} from "@/features/duplicates/duplicate-policy";
-import { useUpdateCheck } from "@/features/updates/use-update-check";
+} from "@/next/features/duplicates/duplicate-policy";
+import { useUpdateCheck } from "@/next/features/updates/use-update-check";
 import { Leaf, Rocket, Scale } from "lucide-react";
 import {
   initialProfile,
@@ -24,7 +26,7 @@ import {
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
-import { SecondaryButton, Select } from "../../../components/controls";
+import { SecondaryButton, Select, TextArea } from "../../../components/controls";
 import {
   SettingsBlocks,
   useDraft,
@@ -50,6 +52,16 @@ interface GeneralSettings {
   propagationDelaySecs: number;
   enableSrrdbLookup: boolean;
   duplicatePolicy: DuplicatePolicy;
+  /** Whether the daemon holds a password list; the list itself never comes back. */
+  hasArchivePasswords: boolean;
+  /** A replacement list, blank to keep what is stored, null to remove it on save. */
+  archivePasswords: string | null;
+  archivePasswordFile: string;
+}
+
+interface ArchivePasswordSettings {
+  hasPasswords: boolean;
+  passwordFile: string | null;
 }
 
 const DUPLICATE_ACTION_LABEL: Record<DuplicateAction, string> = {
@@ -101,16 +113,27 @@ export function GeneralPanel() {
     query: HARDWARE_PROFILE_QUERY,
   });
   const profileSettings = profileData?.hardwareProfile ?? null;
+  const [{ data: archiveData }, reexecuteArchive] = useQuery<{
+    archivePasswordSettings: ArchivePasswordSettings;
+  }>({ query: ARCHIVE_PASSWORD_SETTINGS_QUERY });
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
+  const [archiveState, updateArchivePasswords] = useMutation(UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const source = useMemo<GeneralSettings | null>(() => {
     const settings = data?.settings;
-    return settings
-      ? { ...settings, duplicatePolicy: normalizeDuplicatePolicy(settings.duplicatePolicy) }
+    const archive = archiveData?.archivePasswordSettings;
+    return settings && archive
+      ? {
+          ...settings,
+          duplicatePolicy: normalizeDuplicatePolicy(settings.duplicatePolicy),
+          hasArchivePasswords: archive.hasPasswords,
+          archivePasswords: "",
+          archivePasswordFile: archive.passwordFile ?? "",
+        }
       : null;
-  }, [data?.settings]);
+  }, [data?.settings, archiveData?.archivePasswordSettings]);
 
   const draft = useDraft(source, () => {
     setStatus(null);
@@ -120,7 +143,7 @@ export function GeneralPanel() {
 
   usePanelState({
     dirty: draft.dirty,
-    busy: updateState.fetching,
+    busy: updateState.fetching || archiveState.fetching,
     status: error ?? status,
     failed: error !== null,
     revert: () => {
@@ -128,28 +151,50 @@ export function GeneralPanel() {
       draft.revert();
     },
     save: () => {
-      if (!values) {
+      if (!values || !source) {
         return;
       }
       setError(null);
-      void updateSettings({
-        input: {
-          intermediateDir: values.intermediateDir.trim() || null,
-          completeDir: values.completeDir.trim() || null,
-          cleanupAfterExtract: values.cleanupAfterExtract,
-          maxRetries: values.maxRetries,
-          propagationDelaySecs: values.propagationDelaySecs,
-          enableSrrdbLookup: values.enableSrrdbLookup,
-          duplicatePolicy: values.duplicatePolicy,
-        },
-      }).then((result) => {
-        if (result.error || !result.data?.updateSettings) {
-          setError(result.error?.message ?? t("next.settings.saveFailed"));
+      // The password list only travels when it changed: blank keeps what is
+      // stored, and the daemon never echoes it back to compare against.
+      const archiveChanged =
+        values.archivePasswords !== "" ||
+        values.archivePasswordFile.trim() !== source.archivePasswordFile;
+      void Promise.all([
+        updateSettings({
+          input: {
+            intermediateDir: values.intermediateDir.trim() || null,
+            completeDir: values.completeDir.trim() || null,
+            cleanupAfterExtract: values.cleanupAfterExtract,
+            maxRetries: values.maxRetries,
+            propagationDelaySecs: values.propagationDelaySecs,
+            enableSrrdbLookup: values.enableSrrdbLookup,
+            duplicatePolicy: values.duplicatePolicy,
+          },
+        }),
+        archiveChanged
+          ? updateArchivePasswords({
+              ...(values.archivePasswords === ""
+                ? {}
+                : { passwords: values.archivePasswords === null ? [] : values.archivePasswords.split(/\r?\n/) }),
+              passwordFile: values.archivePasswordFile.trim() || null,
+            })
+          : null,
+      ]).then(([general, archive]) => {
+        if (general.error || !general.data?.updateSettings) {
+          setError(general.error?.message ?? t("next.settings.saveFailed"));
+          return;
+        }
+        if (archive && (archive.error || !archive.data?.updateArchivePasswordSettings)) {
+          setError(archive.error?.message ?? t("next.settings.saveFailed"));
           return;
         }
         draft.markSaved();
         setStatus(t("next.settings.saved"));
         void reexecute({ requestPolicy: "network-only" });
+        if (archive) {
+          void reexecuteArchive({ requestPolicy: "network-only" });
+        }
       });
     },
   });
@@ -230,6 +275,62 @@ export function GeneralPanel() {
                 kind: "toggle",
                 value: values.enableSrrdbLookup,
                 onChange: (next) => draft.set({ enableSrrdbLookup: next }),
+              },
+            },
+          ],
+        }
+      : null,
+    values
+      ? {
+          kind: "section",
+          id: "archivePasswords",
+          title: t("next.archivePasswords.title"),
+          fields: [
+            {
+              id: "archivePasswords",
+              label: t("next.archivePasswords.list"),
+              keywords: "archive password rar 7z zip encrypted",
+              control: {
+                kind: "custom",
+                control: (
+                  <div className="flex items-start justify-end gap-2">
+                    <TextArea
+                      label={t("next.archivePasswords.list")}
+                      value={values.archivePasswords ?? ""}
+                      rows={3}
+                      secret
+                      placeholder={
+                        values.archivePasswords === null
+                          ? t("next.archivePasswords.cleared")
+                          : values.hasArchivePasswords
+                            ? "••••••••"
+                            : undefined
+                      }
+                      className="w-[190px] max-w-full"
+                      onChange={(next) => draft.set({ archivePasswords: next })}
+                    />
+                    {values.hasArchivePasswords ? (
+                      <SecondaryButton
+                        onClick={() =>
+                          draft.set({ archivePasswords: values.archivePasswords === null ? "" : null })
+                        }
+                      >
+                        {t(values.archivePasswords === null ? "next.archivePasswords.keep" : "next.common.clear")}
+                      </SecondaryButton>
+                    ) : null}
+                  </div>
+                ),
+              },
+            },
+            {
+              id: "archivePasswordFile",
+              label: t("next.archivePasswords.file"),
+              keywords: `${values.archivePasswordFile} archive password file`,
+              control: {
+                kind: "text",
+                value: values.archivePasswordFile,
+                placeholder: `${values.dataDir}/archive-passwords.txt`,
+                onChange: (next) => draft.set({ archivePasswordFile: next }),
               },
             },
           ],

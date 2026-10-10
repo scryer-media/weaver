@@ -44,13 +44,22 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
         .layer(Extension(auth_cache))
 }
 
-/// The password these tests authenticate with, assembled at runtime instead of
-/// written as a literal.
-///
-/// Test-only credential, and deterministic — every caller below gets the same
-/// bytes. It is built rather than spelled so no password literal flows into a
-/// hashing or login sink, which is what a secret scanner reads as a hard-coded
-/// credential.
+// Password checks share one two-permit budget for the whole process, and a
+// login that finds it busy is refused with 429 rather than queued. Tests that
+// post a password take turns here so a neighbour's Argon2 work can never be
+// the reason one of them is refused.
+async fn login_turn() -> tokio::sync::MutexGuard<'static, ()> {
+    static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    TURN.lock().await
+}
+
+// The password these tests authenticate with, assembled at runtime instead of
+// written as a literal.
+//
+// Test-only credential, and deterministic — every caller below gets the same
+// bytes. It is built rather than spelled so no password literal flows into a
+// hashing or login sink, which is what a secret scanner reads as a hard-coded
+// credential.
 fn test_password() -> String {
     String::from_utf8(vec![
         b'h',
@@ -69,8 +78,8 @@ fn test_password() -> String {
     .expect("the test credential is ASCII by construction")
 }
 
-/// A `/api/login` request body carrying a runtime-built credential, so the
-/// password never appears as a literal in a login payload either.
+// A `/api/login` request body carrying a runtime-built credential, so the
+// password never appears as a literal in a login payload either.
 fn login_body(username: &str, password: &str) -> Body {
     Body::from(serde_json::json!({ "username": username, "password": password }).to_string())
 }
@@ -180,7 +189,6 @@ fn test_config() -> SharedConfig {
         retry: None,
         max_download_speed: None,
         cleanup_after_extract: None,
-        isp_bandwidth_cap: None,
         propagation_delay_secs: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -657,8 +665,8 @@ async fn listgroups_ids(app: Router) -> Vec<u64> {
         .collect()
 }
 
-/// `/api/auth/status` is unauthenticated, so it describes the deployment only
-/// to a browser that is about to run the first-run wizard.
+// `/api/auth/status` is unauthenticated, so it describes the deployment only
+// to a browser that is about to run the first-run wizard.
 fn auth_status_test_router(
     db: Database,
     auth_cache: LoginAuthCache,
@@ -702,15 +710,15 @@ async fn auth_status_payload(app: Router) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
-/// One parsed exposition sample.
+// One parsed exposition sample.
 struct ParsedSample {
     name: String,
     labels: Vec<(String, String)>,
 }
 
-/// Metric names that break today's naming rules and are kept anyway, because
-/// removing them would break existing dashboards. The list is derived from the
-/// catalogue's own deprecation markers, so it cannot drift from the exporter.
+// Metric names that break today's naming rules and are kept anyway, because
+// removing them would break existing dashboards. The list is derived from the
+// catalogue's own deprecation markers, so it cannot drift from the exporter.
 fn deprecated_metric_names() -> std::collections::BTreeSet<&'static str> {
     metrics::catalog::metric_catalog()
         .iter()
@@ -719,12 +727,12 @@ fn deprecated_metric_names() -> std::collections::BTreeSet<&'static str> {
         .collect()
 }
 
-/// Split a sample line into its metric name, label set, and value.
-///
-/// This is deliberately a hand parser rather than a `contains` check: the bug
-/// it replaces (a literal `\n` in a HELP line swallowing the TYPE line and the
-/// first sample) produced output that still *contained* every expected
-/// substring while being unparseable by Prometheus.
+// Split a sample line into its metric name, label set, and value.
+//
+// This is deliberately a hand parser rather than a `contains` check: the bug
+// it replaces (a literal `\n` in a HELP line swallowing the TYPE line and the
+// first sample) produced output that still *contained* every expected
+// substring while being unparseable by Prometheus.
 fn parse_prometheus_sample(line: &str) -> Result<ParsedSample, String> {
     let mut chars = line.char_indices().peekable();
     let mut name_end = 0;
@@ -829,10 +837,10 @@ fn parse_prometheus_sample(line: &str) -> Result<ParsedSample, String> {
     Ok(ParsedSample { name, labels })
 }
 
-/// Structural gate every render test runs. Replaces the old
-/// `(length, hash)` golden, which pinned bugs in place instead of catching
-/// them: a broken HELP line changed the hash exactly as much as a legitimate
-/// new metric did, so the fix and the regression were indistinguishable.
+// Structural gate every render test runs. Replaces the old
+// `(length, hash)` golden, which pinned bugs in place instead of catching
+// them: a broken HELP line changed the hash exactly as much as a legitimate
+// new metric did, so the fix and the regression were indistinguishable.
 fn assert_valid_prometheus_exposition(rendered: &str) {
     let deprecated = deprecated_metric_names();
     println!(
@@ -1075,8 +1083,6 @@ fn sample_post_processing_metrics()
     weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot {
         queue_depth: 1,
         active_attempts: 2,
-        duration_count: 3,
-        duration_sum_millis: 4_500,
         succeeded: 5,
         failed: 6,
         skipped: 7,
@@ -1084,6 +1090,216 @@ fn sample_post_processing_metrics()
         cancelled: 9,
         interrupted: 10,
         truncated: 11,
+    }
+}
+
+// One script that has run under every kind, adapter, waited flag and status,
+// so each label set the families carry is present in the render.
+fn sample_script_runs() -> weaver_server_core::post_processing::run_metrics::ScriptRunMetricsSnapshot
+{
+    use weaver_server_core::operations::HistogramSnapshot;
+    use weaver_server_core::post_processing::run_metrics::{
+        ADAPTERS, RetentionAction, RunKind, RunStatus, SCRIPT_RUN_DURATION_BOUNDS, SUMMARIES,
+        ScriptMetrics, ScriptRunCount, ScriptRunDuration, ScriptRunMetricsSnapshot,
+    };
+    let per_kind =
+        |base: u64| -> Vec<(RunKind, u64)> { RunKind::ALL.into_iter().zip(base..).collect() };
+    let mut runs = Vec::new();
+    let mut durations = Vec::new();
+    for kind in RunKind::ALL {
+        for waited in [true, false] {
+            for adapter in ADAPTERS {
+                for status in RunStatus::ALL {
+                    runs.push(ScriptRunCount {
+                        kind,
+                        adapter,
+                        waited,
+                        status,
+                        runs: 1,
+                    });
+                }
+            }
+            for status in RunStatus::ALL {
+                let mut counts = vec![0; SCRIPT_RUN_DURATION_BOUNDS.len() + 1];
+                counts[2] = 2;
+                durations.push(ScriptRunDuration {
+                    kind,
+                    waited,
+                    status,
+                    duration: HistogramSnapshot {
+                        bounds: SCRIPT_RUN_DURATION_BOUNDS,
+                        counts,
+                        sum: 1.5,
+                        count: 2,
+                    },
+                });
+            }
+        }
+    }
+    ScriptRunMetricsSnapshot {
+        started: per_kind(10),
+        running: per_kind(1),
+        waiting: per_kind(2),
+        slot_waits: per_kind(20),
+        refusals: per_kind(3),
+        job_summaries: SUMMARIES.into_iter().zip(1..).collect(),
+        interrupted_recovered: 2,
+        retained: RetentionAction::ALL.into_iter().zip(5..).collect(),
+        concurrency_limit: Some(32),
+        queue_event_backlog: Some(4),
+        slots_in_use: Some(3),
+        slots_waiting: Some(5),
+        scripts: vec![ScriptMetrics {
+            script: "Notify".into(),
+            runs,
+            durations,
+            nonzero_exits: 3,
+            last_exit_code: Some(2),
+            last_duration_ms: Some(1_250),
+            last_finished_epoch_ms: Some(1_700_000_000_500),
+            last_status: Some(RunStatus::Failed),
+            output_bytes: 4_096,
+            stored_bytes: 1_024,
+            truncations: 1,
+            pruned: 6,
+        }],
+    }
+}
+
+fn sample_schedules() -> weaver_server_core::bandwidth::schedule_metrics::ScheduleMetricsSnapshot {
+    use weaver_server_core::bandwidth::schedule_metrics::{
+        ActionKind, ActionOutcome, Evaluator, HoldReason, ReplayReason, RuleMetrics,
+        ScheduleMetricsSnapshot,
+    };
+    ScheduleMetricsSnapshot {
+        evaluations: 120,
+        actions: ActionKind::ALL
+            .into_iter()
+            .flat_map(|action| {
+                action.tracks().iter().flat_map(move |track| {
+                    ActionOutcome::ALL
+                        .into_iter()
+                        .map(move |outcome| (action, *track, outcome, 1))
+                })
+            })
+            .collect(),
+        one_shot_fires: ActionKind::ALL
+            .into_iter()
+            .filter(|action| action.is_one_shot())
+            .map(|action| (action, 1))
+            .collect(),
+        replays: ReplayReason::ALL.into_iter().map(|r| (r, 1)).collect(),
+        clock_jumps: Evaluator::ALL.into_iter().map(|e| (e, 1)).collect(),
+        hold: Some(HoldReason::ActionFailed),
+        rules_by_action: ActionKind::ALL.into_iter().map(|a| (a, 1, 1)).collect(),
+        rules: vec![RuleMetrics {
+            id: "night-limit".into(),
+            action: ActionKind::ALL[0],
+            enabled: true,
+            fires: ActionOutcome::ALL.into_iter().zip(4..).collect(),
+            last_fire_epoch_ms: Some(1_700_000_060_000),
+            last_outcome: Some(ActionOutcome::Applied),
+        }],
+    }
+}
+
+fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetricsSnapshot {
+    use weaver_server_core::proxies::network_metrics::{
+        EgressHealthLabel, EgressMetrics, LegDialResult, LegMetrics, LegStateLabel,
+        NetworkMetricsSnapshot, PROXY_KINDS, PoolMemberMetrics, PoolMetrics, RungStateLabel,
+    };
+    NetworkMetricsSnapshot {
+        legs: vec![
+            LegMetrics {
+                consumer: "server:7".into(),
+                position: 0,
+                egress_id: 2,
+                live: true,
+                state: LegStateLabel::Probing,
+                state_since_epoch_ms: 1_700_000_030_000,
+                target: 8,
+                open: 6,
+                opening: 1,
+                bytes_per_second: 5_000_000,
+                rung: Some(1),
+                rungs: RungStateLabel::ALL.to_vec(),
+            },
+            LegMetrics {
+                consumer: "server:7".into(),
+                position: 1,
+                egress_id: 0,
+                live: false,
+                state: LegStateLabel::Down,
+                state_since_epoch_ms: 1_700_000_000_000,
+                target: 0,
+                open: 0,
+                opening: 0,
+                bytes_per_second: 0,
+                rung: None,
+                rungs: Vec::new(),
+            },
+        ],
+        egresses: vec![EgressMetrics {
+            egress_id: 2,
+            enabled: true,
+            health: EgressHealthLabel::Up,
+            health_since_epoch_ms: 1_700_000_010_000,
+            dials: LegDialResult::ALL.map(|result| (result, 3)),
+            cooldowns: 2,
+        }],
+        pools: vec![PoolMetrics {
+            pool_id: 4,
+            egress_id: 2,
+            races_won: 9,
+            races_failed: 1,
+            members: vec![
+                PoolMemberMetrics {
+                    member_id: 11,
+                    open: 3,
+                    opening: 1,
+                    blocked: false,
+                    warmed: true,
+                    session_handshake_seconds: Some(0.25),
+                },
+                PoolMemberMetrics {
+                    member_id: 12,
+                    open: 0,
+                    opening: 0,
+                    blocked: true,
+                    warmed: false,
+                    session_handshake_seconds: None,
+                },
+            ],
+        }],
+        proxies: PROXY_KINDS
+            .into_iter()
+            .flat_map(|kind| [(kind, true, 1), (kind, false, 0)])
+            .collect(),
+    }
+}
+
+fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::TunnelMetricsSnapshot {
+    use weaver_server_core::proxies::network_metrics::tunnel::{
+        DialResult, RUNGS, Resolver, TunnelKind, TunnelMetricsSnapshot,
+    };
+    TunnelMetricsSnapshot {
+        streams: TunnelKind::ALL
+            .into_iter()
+            .flat_map(|kind| {
+                DialResult::ALL
+                    .into_iter()
+                    .map(move |result| (kind, result, 1))
+            })
+            .collect(),
+        session_prepares: TunnelKind::SESSIONS
+            .into_iter()
+            .map(|k| (k, 5, 1))
+            .collect(),
+        session_retirements: TunnelKind::SESSIONS.into_iter().map(|k| (k, 2)).collect(),
+        resolutions: Resolver::ALL.into_iter().map(|r| (r, 10, 2)).collect(),
+        rung_cooldowns: vec![1; RUNGS],
+        rung_fallbacks: vec![2; RUNGS],
+        revocations: 3,
     }
 }
 
@@ -1148,20 +1364,20 @@ fn sample_server_health() -> metrics::ServerHealthInfo {
 fn manual_pause_block() -> DownloadBlockState {
     DownloadBlockState {
         kind: DownloadBlockKind::ManualPause,
-        cap_enabled: false,
-        period: None,
+        egress_id: None,
+        egress_name: None,
         used_bytes: 0,
         limit_bytes: 0,
         remaining_bytes: 0,
-        reserved_bytes: 0,
         window_starts_at_epoch_ms: None,
         window_ends_at_epoch_ms: None,
         timezone_name: "MDT".into(),
         scheduled_speed_limit: 4_096,
+        schedule_hold_reason: None,
     }
 }
 
-/// Every distinct value of `label` that `family` emitted, in rendered order.
+// Every distinct value of `label` that `family` emitted, in rendered order.
 fn rendered_label_values(rendered: &str, family: &str, label: &str) -> Vec<String> {
     let mut values = Vec::new();
     for line in rendered.lines() {
@@ -1218,12 +1434,12 @@ fn sample_transfer_snapshot() -> weaver_nntp::transfer::ServerTransferSnapshot {
     }
 }
 
-/// Bounds shared by the collection-side fixtures below. The exact values do not
-/// matter to the exporter — it renders whatever bounds the snapshot carries —
-/// but a two-bound histogram keeps the expected `le` lines readable.
+// Bounds shared by the collection-side fixtures below. The exact values do not
+// matter to the exporter — it renders whatever bounds the snapshot carries —
+// but a two-bound histogram keeps the expected `le` lines readable.
 const TEST_BOUNDS: &[f64] = &[0.1, 1.0];
 
-/// A histogram with per-bucket counts 2/3/1, i.e. cumulative 2/5/6.
+// A histogram with per-bucket counts 2/3/1, i.e. cumulative 2/5/6.
 fn sample_histogram() -> instr::HistogramSnapshot {
     instr::HistogramSnapshot {
         bounds: TEST_BOUNDS,
@@ -1363,9 +1579,9 @@ fn sample_http_metrics() -> instr::HttpMetricsSnapshot {
     }
 }
 
-/// Every collection-side input, so callers can populate a render without
-/// restating the fixtures. Held as a struct because the render input borrows
-/// each of them.
+// Every collection-side input, so callers can populate a render without
+// restating the fixtures. Held as a struct because the render input borrows
+// each of them.
 struct CollectionFixtures {
     server_metrics: Vec<instr::ServerMetricsSnapshot>,
     job_lifecycle: instr::JobLifecycleMetricsSnapshot,
@@ -1399,8 +1615,8 @@ impl CollectionFixtures {
         }
     }
 
-    /// The fixtures must outlive the render input, which is why they live in
-    /// one struct rather than as a pile of temporaries at each call site.
+    // The fixtures must outlive the render input, which is why they live in
+    // one struct rather than as a pile of temporaries at each call site.
     fn apply<'a>(&'a self, input: &mut metrics::PrometheusRenderInput<'a>) {
         input.server_metrics = &self.server_metrics;
         input.job_lifecycle = Some(&self.job_lifecycle);
@@ -1413,8 +1629,8 @@ impl CollectionFixtures {
     }
 }
 
-/// Build the most complete render the exporter can produce, so the catalogue
-/// comparison sees every family.
+// Build the most complete render the exporter can produce, so the catalogue
+// comparison sees every family.
 fn fully_populated_render() -> String {
     let snapshot = populated_metrics_snapshot();
     let block = manual_pause_block();
@@ -1425,16 +1641,25 @@ fn fully_populated_render() -> String {
     let lifecycle = [("promoted", 2u64)];
     let rejections = [("unsafe_path", 1u64), ("ratio", 2u64)];
     let post_processing = sample_post_processing_metrics();
+    let script_runs = sample_script_runs();
+    let schedules = sample_schedules();
+    let network = sample_network();
+    let tunnel = sample_tunnel();
     let collection = CollectionFixtures::new();
 
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
     input.jobs = &jobs;
     input.server_health = &server_health;
     input.server_transfers = &transfers;
+    input.egress_transfers = &transfers;
     input.duplicate_admission = &duplicates;
     input.semantic_duplicate_lifecycle = &lifecycle;
     input.extraction_rejections = &rejections;
     input.post_processing = Some(&post_processing);
+    input.script_runs = Some(&script_runs);
+    input.schedules = Some(&schedules);
+    input.network = Some(&network);
+    input.tunnel = Some(&tunnel);
     input.runtime_generation = 3;
     input.start_time_seconds = 1_700_000_000.0;
     collection.apply(&mut input);
@@ -1471,3 +1696,102 @@ mod nzbget_version_uses_jsonrpc;
 mod renders_prometheus_metrics_for;
 mod restart_handler_tests;
 mod setup_handler_tests;
+
+#[tokio::test]
+async fn stored_backup_create_challenges_only_expired_administrators() {
+    let db = Database::open_in_memory().unwrap();
+    let config = test_config();
+    let handle = test_scheduler_handle();
+    let rss = weaver_server_api::RssService::new(handle.clone(), config.clone(), db.clone());
+    let service = weaver_server_api::BackupService::new(
+        handle,
+        config,
+        db.clone(),
+        rss,
+        std::env::temp_dir(),
+    );
+    let security = Arc::new(weaver_server_core::security::RuntimeSecurityConfig::default());
+    security.apply_stored_access_policy_revision(None, None, false);
+    let request_auth = RequestAuthContext {
+        db: db.clone(),
+        auth_cache: LoginAuthCache::default(),
+        api_key_cache: ApiKeyCache::default(),
+        session_token: SessionToken(Arc::new("fixture-process-token".to_string())),
+        security,
+    };
+    let router = Router::new()
+        .route("/api/backup/create", post(backup::backup_create_handler))
+        .layer(Extension(service))
+        .layer(Extension(request_auth));
+    let request = |authorization: Option<&str>, cookie: Option<&str>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/backup/create")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(authorization) = authorization {
+            builder = builder.header(header::AUTHORIZATION, authorization);
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder
+            .body(Body::from(r#"{"password":"fixture archive key"}"#))
+            .unwrap()
+    };
+    let unauthenticated = router.clone().oneshot(request(None, None)).await.unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        to_bytes(unauthenticated.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    db.insert_api_key(
+        "fixture-readonly",
+        &hash_api_key("fixture-readonly-key"),
+        "readonly",
+    )
+    .unwrap();
+    let readonly = router
+        .clone()
+        .oneshot(request(Some("Bearer fixture-readonly-key"), None))
+        .await
+        .unwrap();
+    assert_eq!(readonly.status(), StatusCode::FORBIDDEN);
+    assert!(
+        to_bytes(readonly.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let browser_token = "fixture-expired-admin";
+    let token_hash = hash_api_key(browser_token)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    db.create_browser_session(&weaver_server_core::auth::BrowserSession {
+        token_hash,
+        csrf_verifier: "fixture-csrf".to_string(),
+        origin: "http://localhost".to_string(),
+        client_ip: None,
+        remembered: false,
+        created_at: now - 3_600,
+        expires_at: now + 3_600,
+        revoked_at: None,
+    })
+    .unwrap();
+    let expired = router
+        .oneshot(request(None, Some("weaver_session=fixture-expired-admin")))
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::PRECONDITION_REQUIRED);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(expired.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["code"], "REAUTH_REQUIRED");
+}

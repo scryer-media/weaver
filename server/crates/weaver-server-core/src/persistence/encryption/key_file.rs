@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use super::keystore::KeyStore;
 
-/// File-based key store. Stores the encryption master key as a plain text file
-/// with restrictive permissions (0600 on Unix). Available on all platforms.
+// File-based key store. Stores the encryption master key as a plain text file
+// with restrictive permissions (0600 on Unix). Available on all platforms.
 pub struct KeyFile {
     path: PathBuf,
 }

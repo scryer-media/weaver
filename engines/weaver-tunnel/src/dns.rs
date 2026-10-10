@@ -1,4 +1,4 @@
-//! Bounded DNS-over-TCP through a selected proxy. Never uses the host resolver.
+// Bounded DNS-over-TCP through a selected proxy. Never uses the host resolver.
 use crate::{TunnelError, TunnelProvider};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -9,7 +9,7 @@ fn invalid() -> TunnelError {
 }
 static NEXT_ID: AtomicU16 = AtomicU16::new(1);
 
-/// Ceiling on one address-family query, dial and CNAME walk included.
+// Ceiling on one address-family query, dial and CNAME walk included.
 const FAMILY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub async fn resolve(
@@ -20,6 +20,16 @@ pub async fn resolve(
     if let Ok(ip) = host.parse() {
         return Ok(vec![ip]);
     }
+    let resolved = resolve_name(provider, servers, host).await;
+    crate::metrics::record_resolution(crate::metrics::Resolver::Routed, resolved.is_ok());
+    resolved
+}
+
+async fn resolve_name(
+    provider: &dyn TunnelProvider,
+    servers: &[IpAddr],
+    host: &str,
+) -> Result<Vec<IpAddr>, TunnelError> {
     if servers.is_empty() {
         return Err(TunnelError::Configuration(
             "this proxy needs a routed DNS server for hostname resolution".into(),

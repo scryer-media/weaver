@@ -1,5 +1,5 @@
-//! PAR3 reads the posted image of a direct volume, including encrypted members.
-//! Snapshot checks run on blocking workers and include every backing file.
+// PAR3 reads the posted image of a direct volume, including encrypted members.
+// Snapshot checks run on blocking workers and include every backing file.
 
 use super::*;
 use crate::pipeline::direct_store::provider::{
@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, Weak};
 
-/// Idle readers retain each publication's cipher frontier under shared budgets.
+// Idle readers retain each publication's cipher frontier under shared budgets.
 #[derive(Default)]
 pub(in crate::pipeline) struct ReaderCache {
     inner: Mutex<IdleReaders>,
@@ -28,7 +28,7 @@ struct IdleReaders {
 
 const MAX_IDLE_READERS: usize = 16;
 
-/// Whether an idle reader's budget could satisfy the request that failed.
+// Whether an idle reader's budget could satisfy the request that failed.
 fn reclaimable(error: &io::Error) -> bool {
     budget::pressure_source(error).is_some()
         || error.get_ref().is_some_and(|inner| {
@@ -39,7 +39,7 @@ fn reclaimable(error: &io::Error) -> bool {
 }
 
 impl ReaderCache {
-    /// Cumulative reader reuses and evictions, read once per work handback.
+    // Cumulative reader reuses and evictions, read once per work handback.
     pub(super) fn counters(&self) -> (u64, u64) {
         (
             self.hits.load(Ordering::Relaxed),

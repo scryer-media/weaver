@@ -1,60 +1,60 @@
-//! Continuation of the `impl Pipeline` block from `direct_store/wiring.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `direct_store/wiring.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 
 impl Pipeline {
-    /// Forgets a job's tolerated-extraction ticket and any parked result. The
-    /// detached worker keeps running to its end; its done message then finds
-    /// no taker and is discarded by the fence.
+    // Forgets a job's tolerated-extraction ticket and any parked result. The
+    // detached worker keeps running to its end; its done message then finds
+    // no taker and is discarded by the fence.
     pub(crate) fn forget_direct_tolerated_work(&mut self, job_id: JobId) {
         self.direct_tolerated_in_flight.remove(&job_id);
         self.direct_tolerated_results.remove(&job_id);
     }
 
-    /// Abandons direct output for a set and hands its volumes back (the
-    /// **archive-group demotion**, the transition that ends direct mode).
-    ///
-    /// Two shapes, and the first one is tried first:
-    ///
-    /// 1. **Reconstruction.** Every volume is rebuilt byte-exactly from the
-    ///    envelope plus the member extents, its covered runs are verified against
-    ///    the yEnc part-CRC composition, and only then are legacy floors and
-    ///    completed-file rows persisted, the coverage row retired, and the
-    ///    partials and envelopes deleted. Verified bytes are never refetched —
-    ///    a volume the demotion caught mid-download comes back to the
-    ///    conventional path with the prefix it had already received already
-    ///    covered, so only the articles that never arrived are scheduled.
-    ///    A run the sweep cannot vouch for costs that run's articles and
-    ///    nothing else: not the rest of its volume, and not its siblings.
-    /// 2. **Refetch** — the conservative form, and by now only for the two
-    ///    refusals that are properties of the whole set and are raised before
-    ///    a byte is swept: a set with no layout at all, and an encrypted set
-    ///    whose posted bytes the overlay cannot reproduce. Neither leaves a
-    ///    single range anything could vouch for, so the routed bytes are thrown
-    ///    away and every article comes back off the wire. Everything that used
-    ///    to reach here — a deleted envelope, a truncated partial, a covered
-    ///    run whose CRC32 disagrees — is now handled inside the sweep, range by
-    ///    range.
-    ///
-    /// Ordering is normative. Unlike *repair* over checkpoint-covered output —
-    /// which deletes the checkpoint row **first**, because it is about to
-    /// overwrite the very bytes the row claims — demotion retires the row as
-    /// part of reconciliation, after the legacy state that replaces it is
-    /// durable. Retiring first would leave a window where neither the direct
-    /// coverage nor the legacy floors describe what is on disk.
-    ///
-    /// **This call does not wait for shape 1.** It marks the set demoted,
-    /// clears the state a demotion invalidates, and hands the sweep to a
-    /// detached worker as a ticket; the reconciliation — floors, rows,
-    /// retirement, deletion, the completion replay — runs in
-    /// [`Self::handle_direct_demotion_done`], on the pipeline task, in exactly
-    /// the order above. Everything that must not observe the job in between is
-    /// held off by the ticket: the completion check refuses to judge a job with
-    /// one outstanding, and the PAR2 gate waits on the materializations this
-    /// call has already begun. Shape 2 has no sweep to detach and finishes
-    /// inline.
+    // Abandons direct output for a set and hands its volumes back (the
+    // **archive-group demotion**, the transition that ends direct mode).
+    //
+    // Two shapes, and the first one is tried first:
+    //
+    // 1. **Reconstruction.** Every volume is rebuilt byte-exactly from the
+    //    envelope plus the member extents, its covered runs are verified against
+    //    the yEnc part-CRC composition, and only then are legacy floors and
+    //    completed-file rows persisted, the coverage row retired, and the
+    //    partials and envelopes deleted. Verified bytes are never refetched —
+    //    a volume the demotion caught mid-download comes back to the
+    //    conventional path with the prefix it had already received already
+    //    covered, so only the articles that never arrived are scheduled.
+    //    A run the sweep cannot vouch for costs that run's articles and
+    //    nothing else: not the rest of its volume, and not its siblings.
+    // 2. **Refetch** — the conservative form, and by now only for the two
+    //    refusals that are properties of the whole set and are raised before
+    //    a byte is swept: a set with no layout at all, and an encrypted set
+    //    whose posted bytes the overlay cannot reproduce. Neither leaves a
+    //    single range anything could vouch for, so the routed bytes are thrown
+    //    away and every article comes back off the wire. Everything that used
+    //    to reach here — a deleted envelope, a truncated partial, a covered
+    //    run whose CRC32 disagrees — is now handled inside the sweep, range by
+    //    range.
+    //
+    // Ordering is normative. Unlike *repair* over checkpoint-covered output —
+    // which deletes the checkpoint row **first**, because it is about to
+    // overwrite the very bytes the row claims — demotion retires the row as
+    // part of reconciliation, after the legacy state that replaces it is
+    // durable. Retiring first would leave a window where neither the direct
+    // coverage nor the legacy floors describe what is on disk.
+    //
+    // **This call does not wait for shape 1.** It marks the set demoted,
+    // clears the state a demotion invalidates, and hands the sweep to a
+    // detached worker as a ticket; the reconciliation — floors, rows,
+    // retirement, deletion, the completion replay — runs in
+    // [`Self::handle_direct_demotion_done`], on the pipeline task, in exactly
+    // the order above. Everything that must not observe the job in between is
+    // held off by the ticket: the completion check refuses to judge a job with
+    // one outstanding, and the PAR2 gate waits on the materializations this
+    // call has already begun. Shape 2 has no sweep to detach and finishes
+    // inline.
     pub(in crate::pipeline) async fn demote_direct_set(
         &mut self,
         job_id: JobId,
@@ -77,15 +77,15 @@ impl Pipeline {
             .await;
     }
 
-    /// [`Self::demote_direct_set`] with the routed articles the caller is
-    /// handing to the conventional path itself.
-    ///
-    /// The set's own outstanding placements go first. A flight's writes are
-    /// joined before anything else — the sweep deletes the destinations they
-    /// target — and every article behind the set, written or not, joins the
-    /// handoffs: none of them was committed, so the sweep must leave their
-    /// ranges alone and the requeue must not fetch them, and they rejoin the
-    /// conventional path here once the demotion is under way.
+    // [`Self::demote_direct_set`] with the routed articles the caller is
+    // handing to the conventional path itself.
+    //
+    // The set's own outstanding placements go first. A flight's writes are
+    // joined before anything else — the sweep deletes the destinations they
+    // target — and every article behind the set, written or not, joins the
+    // handoffs: none of them was committed, so the sweep must leave their
+    // ranges alone and the requeue must not fetch them, and they rejoin the
+    // conventional path here once the demotion is under way.
     pub(super) async fn demote_direct_set_with_handoffs(
         &mut self,
         job_id: JobId,
@@ -276,6 +276,7 @@ impl Pipeline {
             live_sets,
             "direct-store set demoted"
         );
+        self.note_demotion_support_fact(job_id, reason.metric());
 
         match self.prepare_demoted_set_sweep(job_id, set_index, &set_name, reason) {
             Ok(prepared) => {
@@ -306,10 +307,10 @@ impl Pipeline {
         }
     }
 
-    /// The tail of a demotion, once the set's volumes are files on disk.
-    ///
-    /// Reached from the refetch fallback immediately, and from the detached
-    /// sweep's ticket when it lands.
+    // The tail of a demotion, once the set's volumes are files on disk.
+    //
+    // Reached from the refetch fallback immediately, and from the detached
+    // sweep's ticket when it lands.
     pub(super) async fn finish_demoted_set_handback(
         &mut self,
         job_id: JobId,
@@ -341,17 +342,17 @@ impl Pipeline {
         self.release_retained_direct_volumes(job_id).await;
     }
 
-    /// The read-only half of the reconstruction path: everything the sweep and
-    /// its reconciliation need, snapshotted off the set and the job without
-    /// touching either.
-    ///
-    /// `Err` is reserved for the two refusals that are properties of the whole
-    /// set and can be raised before a byte is swept — no layout, and an
-    /// encrypted set whose posted bytes the overlay cannot reproduce. A run
-    /// that fails *during* the sweep is reported inside
-    /// [`ReconstructionSummary`] and costs only the articles its own bytes
-    /// back: the volume keeps everything the sweep verified, and its siblings
-    /// are untouched.
+    // The read-only half of the reconstruction path: everything the sweep and
+    // its reconciliation need, snapshotted off the set and the job without
+    // touching either.
+    //
+    // `Err` is reserved for the two refusals that are properties of the whole
+    // set and can be raised before a byte is swept — no layout, and an
+    // encrypted set whose posted bytes the overlay cannot reproduce. A run
+    // that fails *during* the sweep is reported inside
+    // [`ReconstructionSummary`] and costs only the articles its own bytes
+    // back: the volume keeps everything the sweep verified, and its siblings
+    // are untouched.
     pub(super) fn prepare_demoted_set_sweep(
         &mut self,
         job_id: JobId,
@@ -547,21 +548,21 @@ impl Pipeline {
         })
     }
 
-    /// Hands a prepared sweep to a detached worker and takes a ticket for it.
-    ///
-    /// The sweep itself is bounded only by the size of the archive, so it runs
-    /// nowhere near the pipeline task: the demotion returns as soon as the
-    /// ticket is recorded, and the job's other articles keep flowing.
-    ///
-    /// **The sweep owns the volume files while it runs.** An article of this
-    /// set that decodes during that window takes the conventional write path —
-    /// its bytes land in the volume file, its segment commits — and the
-    /// reconciliation then resets and requeues it along with everything else
-    /// the sweep did not vouch for. That is one wasted fetch per article that
-    /// happened to be in flight at the demotion instant, and it is deliberate:
-    /// the sweep is the only writer that knows what the rebuilt image contains,
-    /// down to removing a volume file outright when it could vouch for nothing
-    /// in it, so nothing else may claim a range of it.
+    // Hands a prepared sweep to a detached worker and takes a ticket for it.
+    //
+    // The sweep itself is bounded only by the size of the archive, so it runs
+    // nowhere near the pipeline task: the demotion returns as soon as the
+    // ticket is recorded, and the job's other articles keep flowing.
+    //
+    // **The sweep owns the volume files while it runs.** An article of this
+    // set that decodes during that window takes the conventional write path —
+    // its bytes land in the volume file, its segment commits — and the
+    // reconciliation then resets and requeues it along with everything else
+    // the sweep did not vouch for. That is one wasted fetch per article that
+    // happened to be in flight at the demotion instant, and it is deliberate:
+    // the sweep is the only writer that knows what the rebuilt image contains,
+    // down to removing a volume file outright when it could vouch for nothing
+    // in it, so nothing else may claim a range of it.
     pub(super) fn submit_demoted_set_sweep(
         &mut self,
         job_id: JobId,
@@ -657,15 +658,15 @@ impl Pipeline {
         });
     }
 
-    /// One message from the demotion sweep, on the pipeline task.
-    ///
-    /// A volume's outcome hands that volume back at once — its floor and rows,
-    /// its requeue, its parked writes — and releases it to dispatch while the
-    /// sweep goes on with its siblings. The finish applies what is one-per-set:
-    /// the coverage row's retirement, the routed outputs' deletion, and the
-    /// completion replay the demotion could not reach while the sweep was
-    /// outstanding. A message whose job was torn down, or whose set demoted
-    /// again behind it, is discarded by the fence.
+    // One message from the demotion sweep, on the pipeline task.
+    //
+    // A volume's outcome hands that volume back at once — its floor and rows,
+    // its requeue, its parked writes — and releases it to dispatch while the
+    // sweep goes on with its siblings. The finish applies what is one-per-set:
+    // the coverage row's retirement, the routed outputs' deletion, and the
+    // completion replay the demotion could not reach while the sweep was
+    // outstanding. A message whose job was torn down, or whose set demoted
+    // again behind it, is discarded by the fence.
     pub(in crate::pipeline) async fn handle_direct_demotion_done(
         &mut self,
         done: DirectDemotionWorkDone,
@@ -701,12 +702,12 @@ impl Pipeline {
         }
     }
 
-    /// Hands the ticket's next target back to the conventional path with the
-    /// outcome the sweep reported for it, and releases the volume to dispatch.
-    ///
-    /// The release comes first, deliberately: the requeue below writes the
-    /// articles that were parked for this volume, and the write seam refuses a
-    /// file the sweep still owns.
+    // Hands the ticket's next target back to the conventional path with the
+    // outcome the sweep reported for it, and releases the volume to dispatch.
+    //
+    // The release comes first, deliberately: the requeue below writes the
+    // articles that were parked for this volume, and the write seam refuses a
+    // file the sweep still owns.
     async fn hand_back_next_reconstructed_volume(
         &mut self,
         job_id: JobId,
@@ -789,9 +790,9 @@ impl Pipeline {
         self.relieve_handed_back_write_backlog(&[file_id]).await;
     }
 
-    /// The set-wide tail of a sweep: whatever volumes the sweep never reported
-    /// are handed back as having kept nothing, then the coverage row retires,
-    /// the routed outputs go, and the completion seam is re-entered.
+    // The set-wide tail of a sweep: whatever volumes the sweep never reported
+    // are handed back as having kept nothing, then the coverage row retires,
+    // the routed outputs go, and the completion seam is re-entered.
     async fn finish_demoted_set_reconstruction(
         &mut self,
         job_id: JobId,
@@ -908,23 +909,23 @@ impl Pipeline {
         self.schedule_job_completion_check(job_id);
     }
 
-    /// Forgets a job's outstanding demotion sweeps. The detached workers keep
-    /// running to their end; their done messages then find no ticket and are
-    /// discarded by the fence.
+    // Forgets a job's outstanding demotion sweeps. The detached workers keep
+    // running to their end; their done messages then find no ticket and are
+    // discarded by the fence.
     pub(crate) fn forget_direct_demotion_work(&mut self, job_id: JobId) {
         self.direct_demotion_in_flight.remove(&job_id);
     }
 
-    /// The durable half of one volume's reconstruction, on the pipeline task.
-    ///
-    /// Mutates durable state in this order: the legacy floor or completed-file
-    /// row, awaited, then the assembly and the queue. The set's coverage row
-    /// stays until the finish — it is one row for the set — which leaves a
-    /// window where a volume has a conventional floor under a live row; the
-    /// restore refuses such a row outright, so a crash in the window costs the
-    /// set's unfinished volumes a refetch and never trusts two images of one
-    /// volume at once. A volume whose swept bytes no floor can record retires
-    /// the row itself, since the restore would have nothing to refuse it on.
+    // The durable half of one volume's reconstruction, on the pipeline task.
+    //
+    // Mutates durable state in this order: the legacy floor or completed-file
+    // row, awaited, then the assembly and the queue. The set's coverage row
+    // stays until the finish — it is one row for the set — which leaves a
+    // window where a volume has a conventional floor under a live row; the
+    // restore refuses such a row outright, so a crash in the window costs the
+    // set's unfinished volumes a refetch and never trusts two images of one
+    // volume at once. A volume whose swept bytes no floor can record retires
+    // the row itself, since the restore would have nothing to refuse it on.
     pub(super) async fn hand_back_reconstructed_volume(
         &mut self,
         job_id: JobId,
@@ -1056,16 +1057,16 @@ impl Pipeline {
         handback
     }
 
-    /// The last-resort demotion: retire routed storage and requeue every
-    /// article whose bytes went into the routed storage this is about to
-    /// delete.
-    ///
-    /// Whole-set on purpose, and only reachable for the two refusals that are
-    /// whole-set facts — no layout was ever learned, or the re-encrypting
-    /// overlay cannot reproduce the posted bytes. Neither leaves a range any
-    /// composition could vouch for, so there is nothing per-volume or per-range
-    /// to salvage. Every other failure is a property of one run and is handled
-    /// inside the sweep, which keeps the runs around it.
+    // The last-resort demotion: retire routed storage and requeue every
+    // article whose bytes went into the routed storage this is about to
+    // delete.
+    //
+    // Whole-set on purpose, and only reachable for the two refusals that are
+    // whole-set facts — no layout was ever learned, or the re-encrypting
+    // overlay cannot reproduce the posted bytes. Neither leaves a range any
+    // composition could vouch for, so there is nothing per-volume or per-range
+    // to salvage. Every other failure is a property of one run and is handled
+    // inside the sweep, which keeps the runs around it.
     pub(super) async fn refetch_demoted_set(&mut self, job_id: JobId, set_index: usize) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -1087,16 +1088,16 @@ impl Pipeline {
         self.refetch_direct_volumes(job_id, &volumes).await;
     }
 
-    /// Deletes a set's partial members, envelope files and holds, RAM and
-    /// scratch.
-    ///
-    /// A sparse half-written output would masquerade as finished work, and the
-    /// envelopes and the scratch are scratch by construction. The holds go
-    /// with them rather than with the job: a demoted set routes nothing
-    /// again, and both callers are past the last read of them — the refetch
-    /// never reads them, and a reconstruction calls this only once its sweep
-    /// has finished — so keeping them would only charge every other live set
-    /// for bytes no one will read.
+    // Deletes a set's partial members, envelope files and holds, RAM and
+    // scratch.
+    //
+    // A sparse half-written output would masquerade as finished work, and the
+    // envelopes and the scratch are scratch by construction. The holds go
+    // with them rather than with the job: a demoted set routes nothing
+    // again, and both callers are past the last read of them — the refetch
+    // never reads them, and a reconstruction calls this only once its sweep
+    // has finished — so keeping them would only charge every other live set
+    // for bytes no one will read.
     pub(super) async fn delete_direct_outputs(&mut self, job_id: JobId, set_index: usize) {
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
             set.router.discard_holds();
@@ -1122,21 +1123,21 @@ impl Pipeline {
         }
     }
 
-    /// Hands a reconstructed set back to the conventional path, keeping the
-    /// articles that are now genuinely on disk.
-    ///
-    /// Unlike the full-refetch fallback, `keep` names, per NZB file, the
-    /// articles whose decoded extents the sweep rebuilt. Those stay committed
-    /// in the assembly and are never fetched again. Everything else that the
-    /// direct path had committed comes back exactly as the refetch path would
-    /// have brought it back. The decode seam still owns its current article and
-    /// carries it directly into conventional assembly.
-    ///
-    /// A file with nothing kept takes the full refetch treatment, including
-    /// `mark_file_incomplete`: there is no reconstructed state to protect.
-    ///
-    /// `volume_files` names the `(volume_index, file_index)` pairs to hand
-    /// back: one volume per call from the streaming sweep.
+    // Hands a reconstructed set back to the conventional path, keeping the
+    // articles that are now genuinely on disk.
+    //
+    // Unlike the full-refetch fallback, `keep` names, per NZB file, the
+    // articles whose decoded extents the sweep rebuilt. Those stay committed
+    // in the assembly and are never fetched again. Everything else that the
+    // direct path had committed comes back exactly as the refetch path would
+    // have brought it back. The decode seam still owns its current article and
+    // carries it directly into conventional assembly.
+    //
+    // A file with nothing kept takes the full refetch treatment, including
+    // `mark_file_incomplete`: there is no reconstructed state to protect.
+    //
+    // `volume_files` names the `(volume_index, file_index)` pairs to hand
+    // back: one volume per call from the streaming sweep.
     pub(super) async fn requeue_after_reconstruction(
         &mut self,
         job_id: JobId,
@@ -1393,16 +1394,16 @@ impl Pipeline {
         }
     }
 
-    /// Hands a demoted set's source volumes back to the conventional path.
-    ///
-    /// Requeues **only what nothing else owns**: the articles whose bytes were
-    /// routed into direct destinations that have just been deleted. A segment
-    /// still sitting in a queue, still in flight, waiting on a scheduled retry,
-    /// or held by the decode seam is left alone; each reaches the conventional
-    /// path through its existing owner.
-    ///
-    /// The job's byte counter is *adjusted*, never zeroed: it is job-wide, and
-    /// the other files' contribution to it has nothing to do with this set.
+    // Hands a demoted set's source volumes back to the conventional path.
+    //
+    // Requeues **only what nothing else owns**: the articles whose bytes were
+    // routed into direct destinations that have just been deleted. A segment
+    // still sitting in a queue, still in flight, waiting on a scheduled retry,
+    // or held by the decode seam is left alone; each reaches the conventional
+    // path through its existing owner.
+    //
+    // The job's byte counter is *adjusted*, never zeroed: it is job-wide, and
+    // the other files' contribution to it has nothing to do with this set.
     pub(super) async fn refetch_direct_volumes(&mut self, job_id: JobId, file_indices: &[u32]) {
         // Snapshotted before the job borrow: a segment whose retry is already
         // scheduled re-enters the queue on its own.
@@ -1489,10 +1490,10 @@ impl Pipeline {
     }
 }
 
-/// What one volume's handback contributed to the ticket's account.
+// What one volume's handback contributed to the ticket's account.
 #[derive(Default)]
 pub(super) struct VolumeHandback {
-    /// The sweep rebuilt a verified contiguous prefix of this volume.
+    // The sweep rebuilt a verified contiguous prefix of this volume.
     pub(super) materialized: bool,
     pub(super) retained_bytes: u64,
     pub(super) refetched_bytes: u64,

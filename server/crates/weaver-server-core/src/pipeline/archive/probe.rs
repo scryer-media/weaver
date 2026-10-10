@@ -5,7 +5,7 @@ use crate::jobs::assembly::{
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::pipeline::Pipeline;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
 use weaver_model::files::FileRole;
@@ -196,6 +196,7 @@ impl Pipeline {
         }
         self.classify_completed_file(job_id, file_id, allow_probe)
             .await;
+        self.group_header_first_sevenz(job_id);
 
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -214,6 +215,9 @@ impl Pipeline {
                 // see any gate the volume's recovery verdicts raise.
                 self.publish_completed_part_to_chase(job_id, file_id);
                 self.try_update_archive_topology(job_id, file_id).await;
+                // After it: grouping reads the facts the topology update just
+                // registered for this volume.
+                self.group_nameless_rar_volumes(job_id).await;
             }
             FileRole::SevenZipArchive
             | FileRole::SevenZipSplit { .. }
@@ -335,26 +339,26 @@ impl Pipeline {
         }
     }
 
-    /// Whether this archive file is a source volume of a finalized **7z**
-    /// direct set — one that has already put its members where the extractor
-    /// would have put them.
-    ///
-    /// A direct set never enters the archive topology: its volumes are never
-    /// written, so nothing ever probes one, and the completion hook that is
-    /// the topology's only writer returns early for them. Once the set has
-    /// finalized there is also nothing left to extract — the members are at
-    /// their destinations and the set is already in `extracted_archives`. So
-    /// counting its volumes as archives still waiting for a topology would
-    /// leave the job blocked on a description that will never be built, of
-    /// work that is already done.
-    ///
-    /// **RAR sets are excluded deliberately, in both states.** A job whose
-    /// archives are all RAR never reaches this readiness check at all — the
-    /// completion gate sends it to the RAR check instead — so a RAR direct set
-    /// has never needed the clause; and a mixed job's RAR sets reach it on a
-    /// path that has been answering for them since before there was a 7z
-    /// layout. Narrowing to the format that needs it is what keeps this from
-    /// being a change to how a RAR set completes.
+    // Whether this archive file is a source volume of a finalized **7z**
+    // direct set — one that has already put its members where the extractor
+    // would have put them.
+    //
+    // A direct set never enters the archive topology: its volumes are never
+    // written, so nothing ever probes one, and the completion hook that is
+    // the topology's only writer returns early for them. Once the set has
+    // finalized there is also nothing left to extract — the members are at
+    // their destinations and the set is already in `extracted_archives`. So
+    // counting its volumes as archives still waiting for a topology would
+    // leave the job blocked on a description that will never be built, of
+    // work that is already done.
+    //
+    // **RAR sets are excluded deliberately, in both states.** A job whose
+    // archives are all RAR never reaches this readiness check at all — the
+    // completion gate sends it to the RAR check instead — so a RAR direct set
+    // has never needed the clause; and a mixed job's RAR sets reach it on a
+    // path that has been answering for them since before there was a 7z
+    // layout. Narrowing to the format that needs it is what keeps this from
+    // being a change to how a RAR set completes.
     pub(in crate::pipeline) fn direct_set_already_installed(
         &self,
         job_id: JobId,
@@ -457,6 +461,102 @@ impl Pipeline {
                 reason: "no archive sets are complete yet".into(),
             }
         }
+    }
+
+    fn group_header_first_sevenz(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let mut heads = Vec::new();
+        let mut numbered = BTreeMap::<String, BTreeMap<u32, u64>>::new();
+        let mut occupied = HashSet::new();
+        for file in state.assembly.files() {
+            let Some(set) = self.classified_archive_set_name_for_file(job_id, file) else {
+                continue;
+            };
+            match self.classified_role_for_file(job_id, file) {
+                FileRole::SevenZipSplit { number } => {
+                    let Some(length) = self.file_declared_size.get(&file.file_id()).copied() else {
+                        continue;
+                    };
+                    if number == 0 {
+                        occupied.insert(set.clone());
+                    }
+                    if numbered
+                        .entry(set.clone())
+                        .or_default()
+                        .insert(number, length)
+                        .is_some()
+                    {
+                        occupied.insert(set);
+                    }
+                }
+                FileRole::SevenZipArchive => {
+                    occupied.insert(set.clone());
+                    let Some(prefix) = self.file_prefix_16k.get(&file.file_id()) else {
+                        continue;
+                    };
+                    let length = self.file_declared_size.get(&file.file_id()).copied();
+                    if crate::pipeline::direct_store::sniff::sniff_sevenz_prefix(prefix, length)
+                        == crate::pipeline::direct_store::sniff::SevenZipSniff::FirstPart
+                        && matches!(file.declared_role(), FileRole::Unknown)
+                    {
+                        let total = 32u64
+                            .checked_add(u64::from_le_bytes(prefix[12..20].try_into().unwrap()))
+                            .and_then(|n| {
+                                n.checked_add(u64::from_le_bytes(
+                                    prefix[20..28].try_into().unwrap(),
+                                ))
+                            });
+                        if let Some(total) = total {
+                            heads.push((file.file_id(), set, length.unwrap(), total));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Header evidence identifies part zero; the remaining order must be
+        // explicit. More than one compatible first part or numbered set is
+        // ambiguous and stays unbound.
+        if heads.len() != 1 {
+            return;
+        }
+        let (first, old_set, chunk, total) = heads.pop().unwrap();
+        let count = total.div_ceil(chunk);
+        let matches: Vec<_> = numbered
+            .into_iter()
+            .filter(|(set, parts)| {
+                !occupied.contains(set)
+                    && parts.len() as u64 + 1 == count
+                    && parts.keys().copied().map(u64::from).eq(1..count)
+                    && parts.iter().all(|(index, length)| {
+                        *length == chunk.min(total - u64::from(*index) * chunk)
+                    })
+            })
+            .collect();
+        let [(set_name, _)] = matches.as_slice() else {
+            return;
+        };
+        let set_name = set_name.clone();
+        if let Err(error) = self.set_detected_archive_identity(
+            job_id,
+            first,
+            DetectedArchiveIdentity {
+                kind: PersistedDetectedArchiveKind::SevenZipSplit,
+                set_name: set_name.clone(),
+                volume_index: Some(0),
+            },
+        ) {
+            tracing::warn!(job_id = job_id.0, %error, "failed to bind 7z first part by its header");
+            return;
+        }
+        self.invalidate_reclassified_chase(job_id, &old_set);
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.assembly.remove_archive_topology(&old_set);
+            state.assembly.remove_archive_topology(&set_name);
+        }
+        self.try_update_7z_topology(job_id, first);
     }
 
     async fn classify_completed_file(
@@ -647,9 +747,15 @@ impl Pipeline {
         tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::open(&path)
                 .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-            let mut signature = [0u8; 6];
-            match file.read_exact(&mut signature) {
-                Ok(()) => Ok(signature == SEVEN_Z_SIGNATURE),
+            let mut header = [0u8; 32];
+            match file.read_exact(&mut header) {
+                Ok(()) => {
+                    let mut crc = weaver_yenc::crc::Crc32::new();
+                    crc.update(&header[12..]);
+                    Ok(header[..6] == SEVEN_Z_SIGNATURE
+                        && header[6] == 0
+                        && crc.finalize() == u32::from_le_bytes(header[8..12].try_into().unwrap()))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
                 Err(error) => Err(format!("failed to read {}: {error}", path.display())),
             }
@@ -687,12 +793,19 @@ impl Pipeline {
         }
 
         numbered_files.sort_by_key(|(suffix, filename, _)| (*suffix, filename.clone()));
-        let expected_volume_count = numbered_files.len() as u32;
+        let origin = numbered_files.first()?.0;
+        let expected_volume_count = numbered_files
+            .last()?
+            .0
+            .checked_sub(origin)?
+            .checked_add(1)?;
         let mut volume_map = HashMap::new();
         let mut complete_volumes = HashSet::new();
 
-        for (index, (_, filename, is_complete)) in numbered_files.into_iter().enumerate() {
-            let normalized_number = index as u32;
+        for (suffix, filename, is_complete) in numbered_files {
+            // Preserve holes and duplicate claims. Ranking the observed files
+            // erased missing parts and concatenated reposts as extra volumes.
+            let normalized_number = suffix.checked_sub(origin)?;
             volume_map.insert(filename, normalized_number);
             if is_complete {
                 complete_volumes.insert(normalized_number);
@@ -746,6 +859,579 @@ impl Pipeline {
         }
 
         Ok(())
+    }
+}
+
+// One complete RAR volume whose place in its set only its headers can give:
+// its filename says nothing about the set (no `.rar`/`.partNN.rar`/`.rNN`
+// shape and no numeric suffix, typical of a posting whose every volume
+// carries its own obfuscated hex name), or its set's names contradict what
+// the headers say.
+struct NamelessRarVolume {
+    file_id: NzbFileId,
+    filename: String,
+    classification: DetectedArchiveIdentity,
+    facts: unrar_rs::RarVolumeFacts,
+    // Whether the registry holds these facts under this volume's name. A
+    // volume another took the key of is placed again even where its
+    // identity already says the right thing.
+    registered: bool,
+}
+
+impl NamelessRarVolume {
+    fn ordered_members(&self) -> Vec<&unrar_rs::RarVolumeMemberFacts> {
+        let mut members: Vec<_> = self.facts.members.iter().collect();
+        members.sort_by_key(|member| member.order);
+        members
+    }
+
+    // The member this volume opens on, when it continues one begun earlier.
+    fn continued_member(&self) -> Option<&unrar_rs::RarVolumeMemberFacts> {
+        self.ordered_members()
+            .first()
+            .copied()
+            .filter(|member| member.split_before)
+    }
+
+    // The member this volume ends on, when it carries on into the next one.
+    fn continuing_member(&self) -> Option<&unrar_rs::RarVolumeMemberFacts> {
+        self.ordered_members()
+            .last()
+            .copied()
+            .filter(|member| member.split_after)
+    }
+
+    // Whether the headers say this is a set's first volume: part of a
+    // multi-volume set, stating no number other than 0, and opening on a
+    // member of its own rather than the tail of an earlier one.
+    fn opens_set(&self) -> bool {
+        self.facts.is_volume
+            && matches!(self.facts.volume_number, None | Some(0))
+            && self
+                .ordered_members()
+                .first()
+                .is_some_and(|member| !member.split_before)
+    }
+
+    // Whether this volume can follow `previous` at index `index`, judged only
+    // by what both volumes' headers state.
+    fn follows(&self, previous: &NamelessRarVolume, index: u32) -> bool {
+        if self.facts.format != previous.facts.format
+            || self.facts.is_encrypted != previous.facts.is_encrypted
+            || self
+                .facts
+                .volume_number
+                .is_some_and(|stated| stated != index)
+        {
+            return false;
+        }
+        match (previous.continuing_member(), self.continued_member()) {
+            (Some(tail), Some(head)) => {
+                head.name == tail.name
+                    && match (head.unpacked_size, tail.unpacked_size) {
+                        (Some(head_size), Some(tail_size)) => head_size == tail_size,
+                        _ => true,
+                    }
+            }
+            // A boundary that falls between two members links only on a
+            // stated number; nothing else in the headers ties the volumes.
+            (None, None) => self.facts.volume_number == Some(index),
+            _ => false,
+        }
+    }
+}
+
+// Why a volume with these headers is not a set's first volume, in words an
+// operator can check against the files.
+fn not_first_volume_reason(facts: &unrar_rs::RarVolumeFacts) -> String {
+    if let Some(stated) = facts.volume_number.filter(|stated| *stated != 0) {
+        return format!("header states volume {stated}");
+    }
+    let first = facts.members.iter().min_by_key(|member| member.order);
+    match first {
+        Some(member) if member.split_before => format!(
+            "opens mid-member, continuing '{}' from an earlier volume",
+            member.name
+        ),
+        Some(_) => "states no volume number and opens on a member of its own, \
+                    but was not placed in this set as its first volume"
+            .to_string(),
+        None => "headers name no member to place it by".to_string(),
+    }
+}
+
+impl Pipeline {
+    // The complete RAR volumes of a job whose place only their headers can
+    // give, each with the header facts registered for it: volumes whose
+    // names carry no set identity at all, and every volume of a set whose
+    // names placed a volume at index 0 that its own headers say is not a
+    // first volume (a misnumbered `.001`, a swapped `.rar`/`.r00`).
+    //
+    // Facts come from the registry, and from the file itself for a volume
+    // the registry lost: two volumes whose names give them one key leave
+    // only the later one registered.
+    async fn header_placed_rar_volumes(&self, job_id: JobId) -> Vec<NamelessRarVolume> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        let named_firsts: HashSet<String> = state
+            .assembly
+            .files()
+            .filter_map(|file| {
+                let filename = self.current_filename_for_file(job_id, file);
+                let identity = Self::canonical_archive_identity_from_filename(&filename)?;
+                (identity.kind == PersistedDetectedArchiveKind::Rar
+                    && identity.volume_index == Some(0))
+                .then_some(identity.set_name)
+            })
+            .collect();
+        let mut found = Vec::new();
+        for file in state.assembly.files().filter(|file| file.is_complete()) {
+            let Some(identity) = self.effective_file_identity(job_id, file.file_id()) else {
+                continue;
+            };
+            if identity.classification_source == FileIdentitySource::Par3 {
+                continue;
+            }
+            let Some(classification) = identity.classification else {
+                continue;
+            };
+            if classification.kind != PersistedDetectedArchiveKind::Rar {
+                continue;
+            }
+            found.push((file.file_id(), identity.current_filename, classification));
+        }
+        let mut nameless = Vec::new();
+        let mut named = Vec::new();
+        for (file_id, filename, classification) in found {
+            let (facts, registered) =
+                match self.registered_rar_facts_for_filename(job_id, &filename) {
+                    Some(facts) => (facts, true),
+                    None => {
+                        let Some(path) = self.resolve_job_input_path(job_id, &filename) else {
+                            continue;
+                        };
+                        let passwords = self
+                            .archive_password_candidates_for_set(job_id, &classification.set_name);
+                        match Self::parse_rar_volume_facts_from_path(path, passwords).await {
+                            Ok(facts) => (facts, false),
+                            Err(_) => continue,
+                        }
+                    }
+                };
+            let has_name = Self::canonical_archive_identity_from_filename(&filename).is_some()
+                || numeric_suffix_set_key(&filename).is_some();
+            let volume = NamelessRarVolume {
+                file_id,
+                filename,
+                classification,
+                facts,
+                registered,
+            };
+            if has_name {
+                named.push(volume);
+            } else {
+                nameless.push(volume);
+            }
+        }
+        // A set whose name-given volume 0 the headers rule out as a first
+        // volume: it continues a member, or states another number.
+        let contradicted: HashSet<String> = named
+            .iter()
+            .filter(|volume| {
+                volume.classification.volume_index.unwrap_or(0) == 0
+                    && volume.facts.is_volume
+                    && !volume.opens_set()
+            })
+            .map(|volume| volume.classification.set_name.clone())
+            .collect();
+        nameless.extend(named.into_iter().filter(|volume| {
+            contradicted.contains(&volume.classification.set_name)
+                || !named_firsts.contains(&volume.classification.set_name)
+        }));
+        nameless
+    }
+
+    fn registered_rar_facts_for_filename(
+        &self,
+        job_id: JobId,
+        filename: &str,
+    ) -> Option<unrar_rs::RarVolumeFacts> {
+        self.rar_sets
+            .iter()
+            .filter(|((set_job_id, _), _)| *set_job_id == job_id)
+            .find_map(|(_, state)| {
+                state
+                    .volume_files
+                    .iter()
+                    .find(|(_, registered)| registered.as_str() == filename)
+                    .and_then(|(volume, _)| state.facts.get(volume).cloned())
+            })
+    }
+
+    // Chains of nameless volumes, each starting at a first volume and
+    // following the volume whose headers continue it. A link is taken only
+    // when exactly one volume can be next; an ambiguous or missing link ends
+    // the chain there, and the volumes past it stay where they were.
+    fn chain_nameless_rar_volumes(
+        volumes: &[NamelessRarVolume],
+        representatives: &[usize],
+    ) -> Vec<Vec<(usize, u32)>> {
+        let mut assigned = vec![false; volumes.len()];
+        let mut openers: Vec<usize> = (0..volumes.len())
+            .filter(|index| representatives[*index] == *index && volumes[*index].opens_set())
+            .collect();
+        openers.sort_by(|left, right| volumes[*left].filename.cmp(&volumes[*right].filename));
+        for opener in &openers {
+            assigned[*opener] = true;
+        }
+
+        let mut chains = Vec::new();
+        for opener in openers {
+            let mut chain = vec![(opener, 0u32)];
+            let mut current = opener;
+            let mut current_index = 0u32;
+            while volumes[current].facts.more_volumes {
+                let next_index = current_index + 1;
+                let candidates: Vec<usize> = (0..volumes.len())
+                    .filter(|candidate| {
+                        representatives[*candidate] == *candidate
+                            && !assigned[*candidate]
+                            && volumes[*candidate].follows(&volumes[current], next_index)
+                    })
+                    .collect();
+                let stated: Vec<usize> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| volumes[*candidate].facts.volume_number == Some(next_index))
+                    .collect();
+                let next = match (stated.as_slice(), candidates.as_slice()) {
+                    ([only], _) => *only,
+                    ([], [only]) => *only,
+                    _ => break,
+                };
+                assigned[next] = true;
+                chain.push((next, next_index));
+                current = next;
+                current_index = next_index;
+            }
+            let copies: Vec<_> = chain
+                .iter()
+                .flat_map(|(representative, index)| {
+                    representatives
+                        .iter()
+                        .enumerate()
+                        .filter(move |(candidate, rep)| {
+                            candidate != *rep && **rep == *representative
+                        })
+                        .map(move |(candidate, _)| (candidate, *index))
+                })
+                .collect();
+            chain.extend(copies);
+            chains.push(chain);
+        }
+        chains
+    }
+
+    // Group a job's nameless RAR volumes into sets by what their headers say.
+    //
+    // A filename that is only an obfuscated hex string puts every volume in
+    // a set of its own, named after itself, and every set but the first then
+    // has no volume 0 to open from. The headers do carry the set's shape: a
+    // first volume opens on a member of its own, and each later one opens on
+    // the tail of the member its predecessor ended on (and, for RAR5 and
+    // numbered RAR4, states its number). Each chain becomes one set, named
+    // after its first volume's set so the name never moves once that volume
+    // has landed.
+    //
+    // A PAR2 binding that gave a volume a real archive name has already
+    // taken it out of this group; only names that still say nothing are
+    // placed here, along with every volume of a set whose names put at index
+    // 0 a volume its own headers say is not first. A name's suffix is a fast
+    // path, never a verdict the headers cannot overrule. Volumes no chain
+    // reaches are left as they are, and a set that still has no first volume
+    // waits for one through the ordinary missing-volume path.
+    pub(crate) async fn group_nameless_rar_volumes(&mut self, job_id: JobId) {
+        let volumes = self.header_placed_rar_volumes(job_id).await;
+        if volumes.is_empty() {
+            return;
+        }
+
+        // A matching checksum is only a cheap candidate filter. Compare the
+        // files byte-for-byte before treating two posted copies as one link.
+        let mut paths = Vec::new();
+        for (index, volume) in volumes.iter().enumerate() {
+            let checksum = self
+                .par2_runtime
+                .get(&job_id)
+                .and_then(|runtime| runtime.completed_checksums.get(&volume.file_id))
+                .map(|checksum| checksum.crc32);
+            if let Some(path) = self.resolve_job_input_path(job_id, &volume.filename) {
+                paths.push((index, path, checksum));
+            }
+        }
+        // Preserve a live representative when a byte-identical repost arrives
+        // later. A lexically earlier copy must not rename an established set.
+        paths.sort_by_key(|(index, _, _)| {
+            let volume = &volumes[*index];
+            let established = self
+                .rar_sets
+                .get(&(job_id, volume.classification.set_name.clone()))
+                .is_some_and(|set| set.plan.is_some());
+            (
+                !self.rar_set_is_busy(job_id, &volume.classification.set_name),
+                !established,
+                !volume.registered,
+                volume.filename.clone(),
+            )
+        });
+        let volume_count = volumes.len();
+        let representatives = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut candidates = BTreeMap::<u64, Vec<_>>::new();
+            for (index, path, checksum) in paths {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    candidates
+                        .entry(metadata.len())
+                        .or_default()
+                        .push((index, path, checksum));
+                }
+            }
+            let equal =
+                |left: &std::path::Path, right: &std::path::Path| -> std::io::Result<bool> {
+                    let mut left = std::fs::File::open(left)?;
+                    let mut right = std::fs::File::open(right)?;
+                    let length = left.metadata()?.len();
+                    if right.metadata()?.len() != length {
+                        return Ok(false);
+                    }
+                    let mut a = vec![0u8; 64 * 1024];
+                    let mut b = vec![0u8; a.len()];
+                    let mut remaining = length;
+                    while remaining != 0 {
+                        let n = remaining.min(a.len() as u64) as usize;
+                        left.read_exact(&mut a[..n])?;
+                        right.read_exact(&mut b[..n])?;
+                        if a[..n] != b[..n] {
+                            return Ok(false);
+                        }
+                        remaining -= n as u64;
+                    }
+                    Ok(true)
+                };
+            let mut representatives: Vec<_> = (0..volume_count).collect();
+            for group in candidates.values().filter(|group| group.len() > 1) {
+                for (position, (index, path, checksum)) in group.iter().enumerate().skip(1) {
+                    for (prior, previous, previous_checksum) in &group[..position] {
+                        if matches!((checksum, previous_checksum), (Some(a), Some(b)) if a != b) {
+                            continue;
+                        }
+                        if equal(path, previous).unwrap_or(false) {
+                            representatives[*index] = representatives[*prior];
+                            break;
+                        }
+                    }
+                }
+            }
+            representatives
+        })
+        .await
+        .unwrap_or_else(|_| (0..volume_count).collect());
+
+        let mut rebinds: Vec<(usize, DetectedArchiveIdentity, bool)> = Vec::new();
+        for chain in Self::chain_nameless_rar_volumes(&volumes, &representatives) {
+            let set_name = volumes[chain[0].0].classification.set_name.clone();
+            for (volume, index) in chain {
+                let wanted = DetectedArchiveIdentity {
+                    kind: PersistedDetectedArchiveKind::Rar,
+                    set_name: set_name.clone(),
+                    volume_index: Some(index),
+                };
+                let current = &volumes[volume].classification;
+                let registered_equivalent = volumes.iter().enumerate().any(|(other, candidate)| {
+                    representatives[other] == representatives[volume]
+                        && candidate.registered
+                        && candidate.classification.set_name == wanted.set_name
+                        && candidate.classification.volume_index.unwrap_or(0) == index
+                });
+                if current.set_name != wanted.set_name
+                    || current.volume_index.unwrap_or(0) != index
+                    || !registered_equivalent
+                {
+                    let alias = registered_equivalent && representatives[volume] != volume;
+                    rebinds.push((volume, wanted, alias));
+                }
+            }
+        }
+
+        // Every identity moves before any registration is redone: a volume
+        // taking index 0 from another in the same set must not land on a key
+        // that volume still holds.
+        let mut touched_by_set: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+        let mut moved = Vec::new();
+        for (volume, wanted, alias) in rebinds {
+            let volume = &volumes[volume];
+            let old_set = volume.classification.set_name.clone();
+            // A proven byte-identical alias changes no extraction input. It
+            // may join an active set without replacing its registered reader;
+            // otherwise the copy remains an orphan waiting for a first volume.
+            if self.rar_set_is_busy(job_id, &old_set)
+                || (!alias && self.rar_set_is_busy(job_id, &wanted.set_name))
+            {
+                continue;
+            }
+            tracing::info!(
+                job_id = job_id.0,
+                filename = %volume.filename,
+                from_set = %old_set,
+                from_volume = ?volume.classification.volume_index,
+                to_set = %wanted.set_name,
+                to_volume = ?wanted.volume_index,
+                "placing RAR volume by its headers"
+            );
+            if let Err(error) = self.set_detected_archive_identity(job_id, volume.file_id, wanted) {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    filename = %volume.filename,
+                    error = %error,
+                    "failed to persist header-derived RAR set placement"
+                );
+                continue;
+            }
+            touched_by_set
+                .entry(old_set)
+                .or_default()
+                .insert(volume.filename.clone());
+            if !alias {
+                moved.push(volume.file_id);
+            }
+        }
+        for (old_set, touched) in &touched_by_set {
+            self.invalidate_archive_set_for_identity_rebind(job_id, old_set, touched);
+        }
+        for file_id in moved {
+            self.try_update_archive_topology(job_id, file_id).await;
+        }
+        for old_set in touched_by_set.keys() {
+            let _ = self.clear_archive_set_if_unreferenced_and_idle(job_id, old_set);
+        }
+    }
+
+    fn rar_set_is_busy(&self, job_id: JobId, set_name: &str) -> bool {
+        self.rar_sets
+            .get(&(job_id, set_name.to_string()))
+            .is_some_and(|state| state.active_workers > 0 || !state.in_flight_members.is_empty())
+            || self
+                .inflight_extractions
+                .get(&job_id)
+                .is_some_and(|sets| sets.contains(set_name))
+    }
+
+    // Report an interior numbered hole only after recovery has placed its
+    // outputs. A repaired part on disk can fill a hole the NZB never listed.
+    pub(crate) fn missing_numbered_archive_part(&self, job_id: JobId) -> Option<String> {
+        let state = self.jobs.get(&job_id)?;
+        let mut groups: BTreeMap<String, BTreeMap<u32, (String, usize, usize)>> = BTreeMap::new();
+        for file in state.assembly.files() {
+            if self.direct_set_already_installed(job_id, file)
+                || self.recovery_superseded_source(job_id, file.file_id())
+                || !matches!(
+                    self.classified_role_for_file(job_id, file),
+                    FileRole::RarVolume { .. } | FileRole::SevenZipSplit { .. }
+                )
+            {
+                continue;
+            }
+            let name = self
+                .effective_file_identity(job_id, file.file_id())
+                .and_then(|identity| identity.canonical_filename)
+                .unwrap_or_else(|| self.current_filename_for_file(job_id, file));
+            let lower = name.to_ascii_lowercase();
+            let end = if lower.ends_with(".rar") && lower.contains(".part") {
+                name.len() - 4
+            } else {
+                name.len()
+            };
+            let start = name[..end]
+                .rfind(|c: char| !c.is_ascii_digit())
+                .map_or(0, |at| at + 1);
+            if start == end || start == 0 {
+                continue;
+            }
+            // Digits at the end of an obfuscated stem are not a volume tail.
+            // Only explicit .NNN or .partNN.rar spelling establishes a gap.
+            if (end == name.len() && name.as_bytes()[start - 1] != b'.')
+                || (end != name.len() && !lower[..start].ends_with(".part"))
+            {
+                continue;
+            }
+            let Ok(number) = name[start..end].parse::<u32>() else {
+                continue;
+            };
+            let key = format!("{}{}", &lower[..start], &lower[end..]);
+            groups
+                .entry(key)
+                .or_default()
+                .insert(number, (name, start, end));
+        }
+        for parts in groups.values() {
+            let mut previous: Option<u32> = None;
+            for (&number, (name, start, end)) in parts {
+                if let Some(missing) = previous.and_then(|value| value.checked_add(1))
+                    && missing < number
+                {
+                    for missing in missing..number {
+                        let width = end - start;
+                        let missing_name =
+                            format!("{}{:0width$}{}", &name[..*start], missing, &name[*end..]);
+                        if !state.working_dir.join(&missing_name).is_file() {
+                            return Some(format!("missing archive part '{missing_name}'"));
+                        }
+                    }
+                }
+                previous = Some(number);
+            }
+        }
+        None
+    }
+
+    // For every RAR set of the job that has never had a first volume, which
+    // volumes were seen and why none of them is volume 0.
+    pub(crate) fn missing_first_rar_volume_report(&self, job_id: JobId) -> Option<String> {
+        let mut sets: Vec<&String> = self
+            .rar_sets
+            .keys()
+            .filter(|(set_job_id, set_name)| {
+                *set_job_id == job_id && self.rar_set_lacks_first_volume(job_id, set_name)
+            })
+            .map(|(_, set_name)| set_name)
+            .collect();
+        if sets.is_empty() {
+            return None;
+        }
+        sets.sort();
+        let mut seen = Vec::new();
+        for set_name in &sets {
+            let Some(state) = self.rar_sets.get(&(job_id, (*set_name).clone())) else {
+                continue;
+            };
+            for (volume, facts) in &state.facts {
+                let filename = state
+                    .volume_files
+                    .get(volume)
+                    .map(String::as_str)
+                    .unwrap_or("<unnamed>");
+                seen.push(format!(
+                    "'{filename}' (set '{set_name}') {}",
+                    not_first_volume_reason(facts)
+                ));
+            }
+        }
+        Some(format!(
+            "no first RAR volume (volume 0) was found for {} set(s); volumes seen: {}",
+            sets.len(),
+            seen.join(", ")
+        ))
     }
 }
 

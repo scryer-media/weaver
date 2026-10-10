@@ -1,22 +1,22 @@
-//! Renaming the members a finished job delivers.
-//!
-//! The PAR2 rename pass fixes *posted* filenames, which is enough when the
-//! obfuscation stops at the archive volumes. It does nothing for a post whose
-//! in-archive member name is randomized too: the job folder ends up correctly
-//! named and the payload inside it does not, which is exactly the shape no
-//! downstream importer can match.
-//!
-//! This pass runs once, at the output seam, over the delivery directory after
-//! every entry has landed in it. That placement is deliberate. A job's payload
-//! arrives by two different routes — extraction writes members into the working
-//! root, direct-store commits them into the staging root — and the two are only
-//! ever one set after the final move unions them. Candidate selection asks
-//! "which file dominates this delivery", a question neither root can answer
-//! alone. Renaming here is still a same-directory rename, and it completes
-//! before the move reports done, so post-processing, history and the completion
-//! event all observe the final names.
-//!
-//! The pass never fails a job. Every step degrades to "leave the name alone".
+// Renaming the members a finished job delivers.
+//
+// The PAR2 rename pass fixes *posted* filenames, which is enough when the
+// obfuscation stops at the archive volumes. It does nothing for a post whose
+// in-archive member name is randomized too: the job folder ends up correctly
+// named and the payload inside it does not, which is exactly the shape no
+// downstream importer can match.
+//
+// This pass runs once, at the output seam, over the delivery directory after
+// every entry has landed in it. That placement is deliberate. A job's payload
+// arrives by two different routes — extraction writes members into the working
+// root, direct-store commits them into the staging root — and the two are only
+// ever one set after the final move unions them. Candidate selection asks
+// "which file dominates this delivery", a question neither root can answer
+// alone. Renaming here is still a same-directory rename, and it completes
+// before the move reports done, so post-processing, history and the completion
+// event all observe the final names.
+//
+// The pass never fails a job. Every step degrades to "leave the name alone".
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,51 +28,56 @@ use weaver_nzb::delivery_rename::{DeliveredFile, PlannedRename};
 
 use crate::jobs::ids::JobId;
 use crate::jobs::working_dir::OUTPUT_DIR_MARKER;
+use crate::post_processing::model::PostProcessingSettings;
 
-/// Public release index, queried by the CRC32 of a file inside the archives.
+// Public release index, queried by the CRC32 of a file inside the archives.
 pub(super) const SRRDB_API_BASE: &str = "https://api.srrdb.com/v1";
 
-/// One attempt, bounded. A release name is a nicety; completion waiting on a
-/// third party is not acceptable at any duration a user would notice.
+// One attempt, bounded. A release name is a nicety; completion waiting on a
+// third party is not acceptable at any duration a user would notice.
 const SRRDB_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Upper bound on decoded SRRDB response bytes. Live archive-CRC responses are
-/// normally only a few KiB; one MiB leaves substantial headroom while refusing
-/// an unexpectedly large third-party payload.
+// Upper bound on decoded SRRDB response bytes. Live archive-CRC responses are
+// normally only a few KiB; one MiB leaves substantial headroom while refusing
+// an unexpectedly large third-party payload.
 const MAX_SRRDB_RESPONSE_BYTES: usize = 1024 * 1024;
 
-/// Bounds on the delivery walk. A delivery is a handful of files in practice;
-/// these exist so a pathological tree cannot turn a cosmetic pass into work.
+// Bounds on the delivery walk. A delivery is a handful of files in practice;
+// these exist so a pathological tree cannot turn a cosmetic pass into work.
 const MAX_SCAN_DEPTH: u32 = 8;
 const MAX_SCAN_FILES: usize = 10_000;
 
-/// Everything the pass needs, resolved on the pipeline task before the move
-/// worker is spawned. The worker owns no handles to pipeline state.
+// Everything the pass needs, resolved on the pipeline task before the move
+// worker is spawned. The worker owns no handles to pipeline state.
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveryNamingPlan {
-    /// The job's display name — the fallback rename target, and the name the
-    /// refusal gate judges.
+    // The job's display name — the fallback rename target, and the name the
+    // refusal gate judges.
     pub(crate) job_display_name: String,
-    /// `Some` only when the operator opted into the outbound lookup.
+    // `Some` only when the operator opted into the outbound lookup.
     pub(crate) srrdb: Option<SrrdbInputs>,
 }
 
-/// The CRC32s the archives' headers stated for their members, keyed by the
-/// normalized, lowercased delivery-relative path. Both delivery routes learn
-/// these from the same headers, so the map covers extraction and direct-store
-/// alike without collapsing members in different directories.
+// The CRC32s the archives' headers stated for their members, keyed by the
+// normalized, lowercased delivery-relative path. Both delivery routes learn
+// these from the same headers, so the map covers extraction and direct-store
+// alike without collapsing members in different directories.
 #[derive(Debug, Clone)]
 pub(crate) struct SrrdbInputs {
     pub(crate) base_url: String,
     pub(crate) crc32_by_member_path: HashMap<String, u32>,
 }
 
-/// Renames the delivery's payload when it still wears an obfuscated name.
-/// Returns how many files were renamed.
+// Renames the delivery's payload when it still wears an obfuscated name.
+// Returns how many files were renamed.
+//
+// `policy` is the unwanted extension policy the delivery was scanned under.
+// A payload it refuses, or an executable, is never named after the job.
 pub(super) async fn rename_obfuscated_members(
     job_id: JobId,
     root: &Path,
     plan: &DeliveryNamingPlan,
+    policy: &PostProcessingSettings,
 ) -> u32 {
     let files = {
         let root = root.to_path_buf();
@@ -99,7 +104,9 @@ pub(super) async fn rename_obfuscated_members(
             bytes: *bytes,
         })
         .collect();
-    let Some(candidate) = weaver_nzb::select_rename_candidate(&entries) else {
+    let Some(candidate) = weaver_nzb::select_rename_candidate(&entries, |name| {
+        policy.unacceptable_extension_match(name).is_some()
+    }) else {
         return 0;
     };
     let candidate_path = entries[candidate].relative_path;
@@ -128,14 +135,14 @@ pub(super) async fn rename_obfuscated_members(
     }
 }
 
-/// Walks the ladder that decides what the payload should be called: the srrdb
-/// release name when the operator enabled the lookup and it answered
-/// unambiguously, the job's own display name otherwise.
-///
-/// `None` means the pass refuses itself. That happens when the name it would
-/// write is no more readable than the one already on disk — renaming one
-/// unreadable name to another helps nobody and destroys the only handle an
-/// operator has for correlating the file with its post.
+// Walks the ladder that decides what the payload should be called: the srrdb
+// release name when the operator enabled the lookup and it answered
+// unambiguously, the job's own display name otherwise.
+//
+// `None` means the pass refuses itself. That happens when the name it would
+// write is no more readable than the one already on disk — renaming one
+// unreadable name to another helps nobody and destroys the only handle an
+// operator has for correlating the file with its post.
 async fn resolve_target_name(
     job_id: JobId,
     candidate_path: &str,
@@ -203,8 +210,8 @@ async fn srrdb_target(job_id: JobId, candidate_path: &str, inputs: &SrrdbInputs)
     Some(sanitized)
 }
 
-/// Builds the search URL. The only job-derived value that leaves the process is
-/// the checksum, rendered as the eight lowercase hex digits the index expects.
+// Builds the search URL. The only job-derived value that leaves the process is
+// the checksum, rendered as the eight lowercase hex digits the index expects.
 pub(super) fn srrdb_search_url(base_url: &str, crc32: u32) -> String {
     format!(
         "{}/search/archive-crc:{crc32:08x}",
@@ -212,10 +219,10 @@ pub(super) fn srrdb_search_url(base_url: &str, crc32: u32) -> String {
     )
 }
 
-/// Reads a release name out of a search response, and only when the index
-/// pointed at exactly one release. Zero results is a miss; several are an
-/// ambiguity we have no way to break, and guessing would rename the payload
-/// after the wrong release.
+// Reads a release name out of a search response, and only when the index
+// pointed at exactly one release. Zero results is a miss; several are an
+// ambiguity we have no way to break, and guessing would rename the payload
+// after the wrong release.
 #[cfg(test)]
 pub(super) fn parse_srrdb_release(body: &str) -> Option<String> {
     parse_srrdb_release_reader(body.as_bytes())
@@ -378,10 +385,10 @@ async fn fetch_srrdb_release(base_url: &str, crc32: u32) -> Option<String> {
     parse_task.await.ok().flatten()
 }
 
-/// Collects the delivery's regular files as root-relative, `/`-separated paths.
-///
-/// Symlinks are recorded neither as files nor as directories to descend: this
-/// pass renames payload, and a link is not payload.
+// Collects the delivery's regular files as root-relative, `/`-separated paths.
+//
+// Symlinks are recorded neither as files nor as directories to descend: this
+// pass renames payload, and a link is not payload.
 fn scan_delivery(root: &Path) -> Vec<(String, u64)> {
     let mut files = Vec::new();
     let mut stack = vec![(root.to_path_buf(), String::new(), 0u32)];
@@ -616,8 +623,13 @@ mod tests {
         write_file(root.path(), "Yb5drZSkNi20UCMkb-sample.mkv", 2 * MIB);
         write_file(root.path(), "Yb5drZSkNi20UCMkb.dut.srt", 4096);
 
-        let renamed =
-            rename_obfuscated_members(JobId(1), root.path(), &plan("Silver Horizon 2024")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(1),
+            root.path(),
+            &plan("Silver Horizon 2024"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 3);
         assert_eq!(
@@ -635,8 +647,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_file(root.path(), "Silver.Horizon.2024.1080p.mkv", 64 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(2), root.path(), &plan("Quiet Harbour")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(2),
+            root.path(),
+            &plan("Quiet Harbour"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
         assert_eq!(
@@ -654,6 +671,7 @@ mod tests {
             JobId(3),
             root.path(),
             &plan("2c0837e5fa42c8cfb5d5e583168a2af4"),
+            &PostProcessingSettings::default(),
         )
         .await;
 
@@ -670,8 +688,13 @@ mod tests {
         write_file(root.path(), "VIDEO_TS/VTS_01_1.VOB", 64 * MIB);
         write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 32 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(4), root.path(), &plan("Silver Horizon")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(4),
+            root.path(),
+            &plan("Silver Horizon"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
         assert_eq!(
@@ -695,6 +718,7 @@ mod tests {
             JobId(5),
             root.path(),
             &plan_with_srrdb("Silver Horizon 2024", "Yb5drZSkNi20UCMkb.mkv", 0x1234_5678),
+            &PostProcessingSettings::default(),
         )
         .await;
 
@@ -705,9 +729,9 @@ mod tests {
         );
     }
 
-    /// The whole rung, against a canned index bound to loopback: nothing leaves
-    /// the machine, and the assertion covers what the request carried as well as
-    /// what the answer did to the name.
+    // The whole rung, against a canned index bound to loopback: nothing leaves
+    // the machine, and the assertion covers what the request carried as well as
+    // what the answer did to the name.
     #[tokio::test]
     async fn a_release_index_hit_outranks_the_job_name() {
         use std::sync::Arc as StdArc;
@@ -756,7 +780,13 @@ mod tests {
         );
         plan.srrdb.as_mut().unwrap().base_url = base_url;
 
-        let renamed = rename_obfuscated_members(JobId(8), root.path(), &plan).await;
+        let renamed = rename_obfuscated_members(
+            JobId(8),
+            root.path(),
+            &plan,
+            &PostProcessingSettings::default(),
+        )
+        .await;
         served.abort();
 
         assert_eq!(
@@ -781,10 +811,55 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 64 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(6), root.path(), &plan("Yb5drZSkNi20UCMkb")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(6),
+            root.path(),
+            &plan("Yb5drZSkNi20UCMkb"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
+    }
+
+    #[tokio::test]
+    async fn an_executable_payload_keeps_its_name_with_the_policy_off() {
+        let root = tempfile::tempdir().unwrap();
+        write_file(root.path(), "Yb5drZSkNi20UCMkb.exe", 64 * MIB);
+        let policy_off = PostProcessingSettings {
+            unacceptable_extensions: Vec::new(),
+            ..PostProcessingSettings::default()
+        };
+
+        let renamed =
+            rename_obfuscated_members(JobId(9), root.path(), &plan("Silver Horizon"), &policy_off)
+                .await;
+
+        assert_eq!(renamed, 0);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Yb5drZSkNi20UCMkb.exe".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payload_the_policy_refuses_keeps_its_name() {
+        let root = tempfile::tempdir().unwrap();
+        write_file(root.path(), "Yb5drZSkNi20UCMkb.iso", 64 * MIB);
+        let policy = PostProcessingSettings {
+            unacceptable_extensions: vec!["iso".into()],
+            ..PostProcessingSettings::default()
+        };
+
+        let renamed =
+            rename_obfuscated_members(JobId(10), root.path(), &plan("Silver Horizon"), &policy)
+                .await;
+
+        assert_eq!(renamed, 0);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Yb5drZSkNi20UCMkb.iso".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -794,8 +869,13 @@ mod tests {
         write_file(root.path(), OUTPUT_DIR_MARKER, 32);
         write_file(root.path(), ".hidden-scratch", 512);
 
-        let renamed =
-            rename_obfuscated_members(JobId(7), root.path(), &plan("Silver Horizon")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(7),
+            root.path(),
+            &plan("Silver Horizon"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 1);
         assert!(root.path().join(OUTPUT_DIR_MARKER).is_file());

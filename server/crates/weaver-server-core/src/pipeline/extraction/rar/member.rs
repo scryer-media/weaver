@@ -19,14 +19,14 @@ pub(crate) struct RarExtractionContext<'a> {
     pub(crate) phase_attempt: Option<Arc<PhaseAttemptCounters>>,
 }
 
-/// Times one archive-member extraction end to end, closing on whichever path
-/// the extraction leaves by — including the early guardrail rejections.
-///
-/// A member is thousands of articles' worth of work, so unlike the decode task
-/// this wall clock is nowhere near a per-segment path: it is the same class of
-/// low-frequency event as a verification or a repair. `cpu_scope` above still
-/// reports thread CPU time for the profiler; this reports the wall time the
-/// operator's `weaver_pipeline_extract_member_duration_seconds` needs.
+// Times one archive-member extraction end to end, closing on whichever path
+// the extraction leaves by — including the early guardrail rejections.
+//
+// A member is thousands of articles' worth of work, so unlike the decode task
+// this wall clock is nowhere near a per-segment path: it is the same class of
+// low-frequency event as a verification or a repair. `cpu_scope` above still
+// reports thread CPU time for the profiler; this reports the wall time the
+// operator's `weaver_pipeline_extract_member_duration_seconds` needs.
 struct MemberExtractionTimer {
     metrics: Arc<PipelineMetrics>,
     started: std::time::Instant,
@@ -84,15 +84,15 @@ impl Drop for PhaseAttemptRollbackGuard {
 }
 
 const RAR_MAX_DICT_ENV: &str = "WEAVER_RAR_MAX_DICT_BYTES";
-/// Use a conservative fallback only when the host's effective memory cannot
-/// be detected.
+// Use a conservative fallback only when the host's effective memory cannot
+// be detected.
 const RAR_MAX_DICT_FALLBACK_BYTES: u64 = 256 * 1024 * 1024;
-/// Match UnRAR's default while still respecting the process and per-job caps.
+// Match UnRAR's default while still respecting the process and per-job caps.
 const RAR_MAX_DICT_DEFAULT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-/// unrar's own compatibility ceiling for declared dictionary sizes.
+// unrar's own compatibility ceiling for declared dictionary sizes.
 const RAR_MAX_DICT_CEILING_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-/// UnRAR widens every non-store LZ window below this value before allocating
-/// the decoder, including RAR4 members with a smaller declared value.
+// UnRAR widens every non-store LZ window below this value before allocating
+// the decoder, including RAR4 members with a smaller declared value.
 const RAR_MIN_LZ_WINDOW_BYTES: u64 = 0x40000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,16 +190,16 @@ fn resolve_rar_dictionary_limit(
     }
 }
 
-/// Take the member at `index` from `archive`, to be extracted under `options`.
-///
-/// unrar-rs 0.9 moved the extraction settings onto the archive: an
-/// [`unrar_rs::Entry`] extracts under the archive's own `verify` and
-/// `restore_owners`, and a password given to the entry overrides the
-/// archive's. Weaver still carries an [`unrar_rs::ExtractOptions`] through its
-/// extraction contexts, so this applies one to the archive before the handle
-/// is taken. The result is exactly what the pre-0.9 calls did with the same
-/// value: those resolved the password as the options' or else the archive's,
-/// which is the override the entry applies.
+// Take the member at `index` from `archive`, to be extracted under `options`.
+//
+// unrar-rs 0.9 moved the extraction settings onto the archive: an
+// [`unrar_rs::Entry`] extracts under the archive's own `verify` and
+// `restore_owners`, and a password given to the entry overrides the
+// archive's. Weaver still carries an [`unrar_rs::ExtractOptions`] through its
+// extraction contexts, so this applies one to the archive before the handle
+// is taken. The result is exactly what the pre-0.9 calls did with the same
+// value: those resolved the password as the options' or else the archive's,
+// which is the override the entry applies.
 pub(crate) fn rar_entry<'a>(
     archive: &'a mut unrar_rs::RarArchive,
     index: usize,
@@ -210,11 +210,11 @@ pub(crate) fn rar_entry<'a>(
     Ok(with_rar_options_password(entry, options))
 }
 
-/// [`rar_entry`] for a member whose volumes come from `provider` rather than
-/// from those attached to the archive.
-///
-/// Volumes are addressed in the set's own numbering: a member whose first
-/// segment lives in volume 3 asks the provider for volume 3.
+// [`rar_entry`] for a member whose volumes come from `provider` rather than
+// from those attached to the archive.
+//
+// Volumes are addressed in the set's own numbering: a member whose first
+// segment lives in volume 3 asks the provider for volume 3.
 pub(crate) fn rar_entry_via<'a>(
     archive: &'a mut unrar_rs::RarArchive,
     index: usize,
@@ -379,10 +379,10 @@ pub(crate) struct RarExtractionOpenSelection {
     pub(crate) decoder_memory_bytes: u64,
 }
 
-/// Rejects any path that would escape the directory it is joined onto: absolute
-/// paths, `..`, root and prefix components, Windows drive letters, embedded NUL,
-/// and the empty path. Shared with the direct-store coverage snapshot through
-/// `pipeline::extraction`'s re-export — one validator, one stance.
+// Rejects any path that would escape the directory it is joined onto: absolute
+// paths, `..`, root and prefix components, Windows drive letters, embedded NUL,
+// and the empty path. Shared with the direct-store coverage snapshot through
+// `pipeline::extraction`'s re-export — one validator, one stance.
 pub(crate) fn validate_sanitized_rar_member_path(member_name: &str) -> Result<PathBuf, String> {
     if member_name.contains('\0') {
         return Err(format!("unsafe RAR member path: {member_name}"));
@@ -1096,7 +1096,9 @@ impl Pipeline {
             None => {
                 let first_path = volume_paths.get(&0).ok_or_else(|| {
                     crate::pipeline::RarPasswordAttemptError::Fatal(format!(
-                        "RAR set '{set_name}' cannot be opened without volume 0"
+                        "RAR set '{set_name}' {}; volumes present: {:?}",
+                        crate::pipeline::archive::topology::MISSING_FIRST_RAR_VOLUME_ERROR_MARKER,
+                        volume_paths.keys().collect::<Vec<_>>()
                     ))
                 })?;
                 Self::open_rar_volume_zero_with_password(
@@ -1653,19 +1655,19 @@ mod tests {
         assert!(!temp.path().join("oversized.bin.partial").exists());
     }
 
-    /// The solid branch of the password probe, over a real solid archive.
-    ///
-    /// That branch swapped a hand-rolled `extract_member_solid_chunked` sink
-    /// factory for `skip_member_solid`, and had no coverage before: every
-    /// password fixture in this crate is a non-solid `store` archive, so the
-    /// existing probe tests exercise the streaming branch instead. This pins
-    /// that a legitimate solid member decodes and verifies clean through the
-    /// new call.
-    ///
-    /// Not covered, for want of a fixture: wrong-password rejection on a
-    /// *solid encrypted* archive. `tests/fixtures/rar5` has solid archives and
-    /// encrypted archives, but none that is both, and one would have to be
-    /// produced with real RAR tooling rather than synthesised.
+    // The solid branch of the password probe, over a real solid archive.
+    //
+    // That branch swapped a hand-rolled `extract_member_solid_chunked` sink
+    // factory for `skip_member_solid`, and had no coverage before: every
+    // password fixture in this crate is a non-solid `store` archive, so the
+    // existing probe tests exercise the streaming branch instead. This pins
+    // that a legitimate solid member decodes and verifies clean through the
+    // new call.
+    //
+    // Not covered, for want of a fixture: wrong-password rejection on a
+    // *solid encrypted* archive. `tests/fixtures/rar5` has solid archives and
+    // encrypted archives, but none that is both, and one would have to be
+    // produced with real RAR tooling rather than synthesised.
     #[test]
     fn solid_password_probe_accepts_a_verifying_member() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2002,8 +2004,8 @@ mod tests {
         bytes
     }
 
-    /// Deterministic filler that no run-length or all-same-byte shortcut can
-    /// reproduce, so a byte-identity assertion over it actually pins the copy.
+    // Deterministic filler that no run-length or all-same-byte shortcut can
+    // reproduce, so a byte-identity assertion over it actually pins the copy.
     fn build_extraction_filler(len: usize) -> Vec<u8> {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         (0..len)
@@ -2016,9 +2018,9 @@ mod tests {
             .collect()
     }
 
-    /// A non-solid RAR5 `store` member split across volumes, the shape the
-    /// chunked streaming path handles: the whole-file checksum rides the last
-    /// volume's header and every volume carries its own slice of the payload.
+    // A non-solid RAR5 `store` member split across volumes, the shape the
+    // chunked streaming path handles: the whole-file checksum rides the last
+    // volume's header and every volume carries its own slice of the payload.
     fn build_store_multivolume_rar_set(
         filename: &str,
         volume_payloads: &[Vec<u8>],
@@ -2064,11 +2066,11 @@ mod tests {
             .collect()
     }
 
-    /// A member larger than one copy chunk must reach the file unchanged.
-    ///
-    /// The chunked path hands down spans of up to 4 MiB and the output buffer
-    /// sits below that, so the large spans bypass the buffer and the short tail
-    /// is coalesced. Both routes have to produce the same bytes.
+    // A member larger than one copy chunk must reach the file unchanged.
+    //
+    // The chunked path hands down spans of up to 4 MiB and the output buffer
+    // sits below that, so the large spans bypass the buffer and the short tail
+    // is coalesced. Both routes have to produce the same bytes.
     #[test]
     fn multi_megabyte_store_member_extracts_byte_identical_through_the_chunked_path() {
         let temp = tempfile::tempdir().unwrap();

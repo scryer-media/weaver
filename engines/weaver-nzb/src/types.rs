@@ -1,23 +1,36 @@
 use serde::{Deserialize, Serialize};
 use weaver_model::files::FileRole;
 
-/// A parsed NZB document representing a complete download job.
+// A parsed NZB document representing a complete download job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Nzb {
     pub meta: NzbMeta,
     pub files: Vec<NzbFile>,
 }
 
-/// NZB metadata from the `<head>` section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// NZB metadata from the `<head>` section.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct NzbMeta {
     pub title: Option<String>,
     pub password: Option<String>,
-    /// Arbitrary key-value pairs from `<meta>` elements (excluding title/password).
+    #[serde(default)]
+    pub passwords: Vec<String>,
+    // Arbitrary key-value pairs from `<meta>` elements (excluding title/password).
     pub tags: Vec<(String, String)>,
 }
 
-/// A single file in the NZB (one `<file>` element).
+impl std::fmt::Debug for NzbMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NzbMeta")
+            .field("title", &self.title)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password_count", &self.passwords.len())
+            .field("tags", &self.tags)
+            .finish()
+    }
+}
+
+// A single file in the NZB (one `<file>` element).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NzbFile {
     pub poster: String,
@@ -27,27 +40,27 @@ pub struct NzbFile {
     pub segments: Vec<NzbSegment>,
 }
 
-/// A single segment/article within a file.
+// A single segment/article within a file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NzbSegment {
-    /// 1-based segment number.
+    // 1-based segment number.
     pub number: u32,
-    /// Expected size in bytes.
+    // Expected size in bytes.
     pub bytes: u32,
-    /// Message-ID without angle brackets.
+    // Message-ID without angle brackets.
     pub message_id: String,
 }
 
 impl NzbFile {
-    /// Extract filename from the subject line.
-    ///
-    /// Usenet subjects follow patterns like:
-    ///   `"Some Post Title - [01/10] - \"filename.rar\" yEnc (1/5)"`
-    ///   `"[PRiVATE] Some.Title - \"file.part01.rar\" yEnc (1/50)"`
-    ///   `"filename.nfo (1/1)"`
-    ///
-    /// The filename is typically in double quotes. Falls back to the last word
-    /// before a yEnc marker or parenthesized part number.
+    // Extract filename from the subject line.
+    //
+    // Usenet subjects follow patterns like:
+    //   `"Some Post Title - [01/10] - \"filename.rar\" yEnc (1/5)"`
+    //   `"[PRiVATE] Some.Title - \"file.part01.rar\" yEnc (1/50)"`
+    //   `"filename.nfo (1/1)"`
+    //
+    // The filename is typically in double quotes. Falls back to the last word
+    // before a yEnc marker or parenthesized part number.
     pub fn filename(&self) -> Option<&str> {
         let subject = &self.subject;
 
@@ -87,20 +100,20 @@ impl NzbFile {
         None
     }
 
-    /// Enhanced filename extraction using three parsing strategies.
-    ///
-    /// Returns `(filename, confidence)` where confidence is:
-    /// - 1.0: from quoted string
-    /// - 0.8: from PRiVATE format
-    /// - 0.5: heuristic fallback
-    ///
-    /// Use this over [`filename()`] when you need the confidence level
-    /// or PRiVATE format support.
+    // Enhanced filename extraction using three parsing strategies.
+    //
+    // Returns `(filename, confidence)` where confidence is:
+    // - 1.0: from quoted string
+    // - 0.8: from PRiVATE format
+    // - 0.5: heuristic fallback
+    //
+    // Use this over [`filename()`] when you need the confidence level
+    // or PRiVATE format support.
     pub fn extract_filename(&self) -> Option<(String, f32)> {
         crate::deobfuscate::extract_filename(&self.subject)
     }
 
-    /// Returns `true` if the extracted filename appears to be obfuscated.
+    // Returns `true` if the extracted filename appears to be obfuscated.
     pub fn is_obfuscated(&self) -> bool {
         match self.filename() {
             Some(name) => crate::deobfuscate::is_obfuscated(name),
@@ -108,12 +121,12 @@ impl NzbFile {
         }
     }
 
-    /// Total expected bytes across all segments.
+    // Total expected bytes across all segments.
     pub fn total_bytes(&self) -> u64 {
         self.segments.iter().map(|s| u64::from(s.bytes)).sum()
     }
 
-    /// Infer file role from the filename.
+    // Infer file role from the filename.
     pub fn role(&self) -> FileRole {
         match self.filename() {
             Some(name) => FileRole::from_filename(name),
@@ -122,7 +135,7 @@ impl NzbFile {
     }
 }
 
-/// Strip a trailing ` (N/N)` pattern from a string.
+// Strip a trailing ` (N/N)` pattern from a string.
 fn trim_trailing_part_info(s: &str) -> &str {
     let s = s.trim_end();
     if let Some(open) = s.rfind('(') {

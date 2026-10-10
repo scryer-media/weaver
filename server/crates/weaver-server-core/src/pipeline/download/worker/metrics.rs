@@ -1,9 +1,9 @@
 use super::*;
 
-/// Record checkpoint geometry after an article has finished decoding. This is
-/// intentionally a completion-side probe: disabled profiling does one cached
-/// enable check and the decoder's cut loop stays free of locks, clocks, and
-/// metric allocations.
+// Record checkpoint geometry after an article has finished decoding. This is
+// intentionally a completion-side probe: disabled profiling does one cached
+// enable check and the decoder's cut loop stays free of locks, clocks, and
+// metric allocations.
 fn record_checkpoint_observability(result: &weaver_yenc::DecodeResult) {
     if !crate::runtime::perf_probe::enabled() {
         return;
@@ -141,12 +141,12 @@ impl Pipeline {
         }
     }
 
-    /// Reports a pipeline that is retrying hard and finishing nothing.
-    ///
-    /// The liveness stall above only speaks when nothing is in flight, so a
-    /// loop that keeps a lane busy re-fetching the same articles is invisible
-    /// to it: connections are up, downloads are active, and the only sign is
-    /// a retry counter climbing without a download counter to match.
+    // Reports a pipeline that is retrying hard and finishing nothing.
+    //
+    // The liveness stall above only speaks when nothing is in flight, so a
+    // loop that keeps a lane busy re-fetching the same articles is invisible
+    // to it: connections are up, downloads are active, and the only sign is
+    // a retry counter climbing without a download counter to match.
     pub(in crate::pipeline::download::worker) fn log_download_retry_storm(&mut self, now: Instant) {
         let retried = self.metrics.segments_retried.load(Ordering::Relaxed);
         let downloaded = self.metrics.segments_downloaded.load(Ordering::Relaxed);
@@ -178,21 +178,21 @@ impl Pipeline {
         );
     }
 
-    /// Reports lanes that are not being filled: work is queued, dispatch is
-    /// running, and yet a server has been carrying fewer connections than it is
-    /// configured for throughout the window.
-    ///
-    /// The liveness stall above only fires when there are **no** active
-    /// downloads at all, so the shape that hides here is the partial one — a
-    /// job running on two of its eight lanes because the other six fail to
-    /// open, which is indistinguishable from a slow server in every metric the
-    /// job exposes.
-    ///
-    /// Lanes sit below their cap for many ordinary reasons — a bandwidth cap,
-    /// byte pressure, a hot job whose spillover is blocked, the tail of a job
-    /// with fewer articles left than lanes — so an underfill alone says
-    /// nothing. It is reported only when a lane actually failed to open inside
-    /// the window, which is the one cause this line exists to name.
+    // Reports lanes that are not being filled: work is queued, dispatch is
+    // running, and yet a server has been carrying fewer connections than it is
+    // configured for throughout the window.
+    //
+    // The liveness stall above only fires when there are **no** active
+    // downloads at all, so the shape that hides here is the partial one — a
+    // job running on two of its eight lanes because the other six fail to
+    // open, which is indistinguishable from a slow server in every metric the
+    // job exposes.
+    //
+    // Lanes sit below their cap for many ordinary reasons — a download quota,
+    // byte pressure, a hot job whose spillover is blocked, the tail of a job
+    // with fewer articles left than lanes — so an underfill alone says
+    // nothing. It is reported only when a lane actually failed to open inside
+    // the window, which is the one cause this line exists to name.
     pub(in crate::pipeline) fn log_download_lanes_under_cap(
         &mut self,
         now: Instant,
@@ -246,7 +246,7 @@ impl Pipeline {
         );
     }
 
-    /// Update shared atomic queue depth metrics from per-job queues.
+    // Update shared atomic queue depth metrics from per-job queues.
     pub(crate) fn update_queue_metrics(&self) {
         let (total, recovery) = self.jobs.values().fold((0usize, 0usize), |(t, r), s| {
             (
@@ -263,9 +263,9 @@ impl Pipeline {
         self.publish_active_stage_metrics();
     }
 
-    /// Payload delivered and the wall time it took, with deliberate throttle
-    /// waits already excluded by the lane. Zero for anything but a decoded
-    /// article, so a failure cannot look like free bytes.
+    // Payload delivered and the wall time it took, with deliberate throttle
+    // waits already excluded by the lane. Zero for anything but a decoded
+    // article, so a failure cannot look like free bytes.
     pub(in crate::pipeline::download) fn decoded_trace_throughput_sample(
         trace: &weaver_nntp::client::DecodedBodyTrace,
     ) -> (u64, Duration) {

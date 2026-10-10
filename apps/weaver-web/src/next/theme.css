@@ -1,15 +1,15 @@
 /*
- * Design tokens for the Next UI.
+ * The web app's stylesheet: Tailwind, then the design tokens.
  *
- * The redesign is a self-contained palette: it shares no colour, radius or
- * typeface with the classic interface, so every token here is namespaced `wv-`
- * and every utility that uses one reads `bg-wv-chrome`, `text-wv-faint` and so
- * on. Tailwind generates those utilities from the `@theme` block below; nothing
- * in this file leaks into the classic tree, which never sets `data-ui`.
+ * Every token here is namespaced `wv-` and every utility that uses one reads
+ * `bg-wv-chrome`, `text-wv-faint` and so on. Tailwind generates those
+ * utilities from the `@theme` block below.
  *
  * Two rules the whole system depends on: the radius is 0 everywhere, and the
  * only shadow in the system belongs to floating menus.
  */
+
+@import "tailwindcss";
 
 @theme {
   /* Surfaces. */
@@ -98,7 +98,7 @@
    * Values a machine produced keep their own token, so markup still says
    * which text is a value, but they are set in the same face as the body.
    */
-  --font-wv-title: "Sora Variable", "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-wv-title: "Sora Variable", ui-sans-serif, system-ui, sans-serif;
   --font-wv-ui: "Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
   --font-wv-mono: var(--font-wv-ui);
 
@@ -111,13 +111,22 @@
   --wv-accent-hover: #52c4ad;
 }
 
+/* A bare `border` utility draws the interface's line colour, not the text's. */
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-wv-line-strong);
+  }
+}
+
 /*
- * Scoped reset. `globals.css` paints a gradient body, forces the classic sans
- * on every element and hands headings a display face; none of that belongs to
- * this UI, and the selectors below are specific enough to win without `!important`.
+ * The page itself: one dark ground, one face for everything but titles.
  */
-html[data-ui="next"],
-html[data-ui="next"] body {
+html,
+body {
   background: var(--color-wv-app);
   background-image: none;
   color: var(--color-wv-fg);
@@ -129,57 +138,51 @@ html[data-ui="next"] body {
   font-variant-numeric: tabular-nums;
 }
 
-html[data-ui="next"] *,
-html[data-ui="next"] h1,
-html[data-ui="next"] h2,
-html[data-ui="next"] h3,
-html[data-ui="next"] h4,
-html[data-ui="next"] h5,
-html[data-ui="next"] h6 {
+* {
   font-family: var(--font-wv-ui);
 }
 
-html[data-ui="next"] .font-wv-mono,
-html[data-ui="next"] .font-wv-mono * {
+html .font-wv-mono,
+html .font-wv-mono * {
   font-family: var(--font-wv-mono);
 }
 
-html[data-ui="next"] .font-wv-title,
-html[data-ui="next"] .font-wv-title * {
+html .font-wv-title,
+html .font-wv-title * {
   font-family: var(--font-wv-title);
 }
 
-html[data-ui="next"] input::placeholder {
+html input::placeholder {
   color: var(--color-wv-disabled);
 }
 
 /* Range inputs are native: the accent drives the filled track and the thumb. */
-html[data-ui="next"] input[type="range"] {
+html input[type="range"] {
   accent-color: var(--wv-accent);
 }
 
-/* Square, unobtrusive scrollbars — the classic pill thumb reads as foreign here. */
-html[data-ui="next"] * {
+/* Square, unobtrusive scrollbars. */
+html * {
   scrollbar-color: #3a3b41 transparent;
   scrollbar-width: thin;
 }
 
-html[data-ui="next"] ::-webkit-scrollbar {
+html ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 
-html[data-ui="next"] ::-webkit-scrollbar-thumb {
+html ::-webkit-scrollbar-thumb {
   background: #3a3b41;
   border: 3px solid var(--color-wv-app);
   border-radius: 0;
 }
 
-html[data-ui="next"] ::-webkit-scrollbar-thumb:hover {
+html ::-webkit-scrollbar-thumb:hover {
   background: #55575f;
 }
 
-html[data-ui="next"] ::-webkit-scrollbar-track {
+html ::-webkit-scrollbar-track {
   background: transparent;
 }
 
@@ -195,24 +198,24 @@ html[data-ui="next"] ::-webkit-scrollbar-track {
  * and `lg` and skip the rest. A caller that passes a single template gets it
  * at every width, which is what most grids still want.
  */
-html[data-ui="next"] .wv-cols {
+html .wv-cols {
   grid-template-columns: var(--wv-cols);
 }
 
 @media (min-width: 40rem) {
-  html[data-ui="next"] .wv-cols {
+  html .wv-cols {
     grid-template-columns: var(--wv-cols-sm, var(--wv-cols));
   }
 }
 
 @media (min-width: 64rem) {
-  html[data-ui="next"] .wv-cols {
+  html .wv-cols {
     grid-template-columns: var(--wv-cols-lg, var(--wv-cols-sm, var(--wv-cols)));
   }
 }
 
 @media (min-width: 80rem) {
-  html[data-ui="next"] .wv-cols {
+  html .wv-cols {
     grid-template-columns: var(
       --wv-cols-xl,
       var(--wv-cols-lg, var(--wv-cols-sm, var(--wv-cols)))
@@ -227,12 +230,12 @@ html[data-ui="next"] .wv-cols {
  * the row; the selector is specific enough to beat the thin-scrollbar default
  * set above.
  */
-html[data-ui="next"] .wv-xscroll {
+html .wv-xscroll {
   overflow-x: auto;
   scrollbar-width: none;
 }
 
-html[data-ui="next"] .wv-xscroll::-webkit-scrollbar {
+html .wv-xscroll::-webkit-scrollbar {
   display: none;
 }
 
@@ -242,12 +245,12 @@ html[data-ui="next"] .wv-xscroll::-webkit-scrollbar {
  * menus keep the system's only shadow. With reduced motion the ring holds
  * still a few pixels out, and keyboard focus swaps it for the focus ring.
  */
-html[data-ui="next"] .wv-ping {
+html .wv-ping {
   outline: 2px solid transparent;
   animation: wv-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
 }
 
-html[data-ui="next"] .wv-ping:focus-visible {
+html .wv-ping:focus-visible {
   animation: none;
   outline-color: var(--color-wv-strong);
   outline-offset: 3px;
@@ -265,7 +268,7 @@ html[data-ui="next"] .wv-ping:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  html[data-ui="next"] .wv-ping {
+  html .wv-ping {
     animation: none;
     outline-color: var(--wv-accent);
     outline-offset: 3px;
@@ -280,20 +283,20 @@ html[data-ui="next"] .wv-ping:focus-visible {
  * first paint. The mark in the lockup stays hidden until the flying one lands
  * on it, and with reduced motion the page skips the welcome and shows at once.
  */
-html[data-ui="next"] .wv-setup-intro-mark {
+html .wv-setup-intro-mark {
   animation: wv-setup-intro-mark 1.2s both;
   will-change: transform, opacity;
 }
 
-html[data-ui="next"] .wv-setup-intro [data-brand-part="mark"] {
+html .wv-setup-intro [data-brand-part="mark"] {
   opacity: 0;
 }
 
-html[data-ui="next"] .wv-setup-intro [data-brand-part="wordmark"] {
+html .wv-setup-intro [data-brand-part="wordmark"] {
   animation: wv-setup-intro-fade 0.27s ease-out 0.93s both;
 }
 
-html[data-ui="next"] .wv-setup-intro .wv-setup-intro-form {
+html .wv-setup-intro .wv-setup-intro-form {
   animation: wv-setup-intro-rise 0.33s cubic-bezier(0.2, 0.7, 0.2, 1) 0.96s both;
 }
 
@@ -336,4 +339,18 @@ html[data-ui="next"] .wv-setup-intro .wv-setup-intro-form {
     opacity: 1;
     transform: none;
   }
+}
+
+/* The loading mark's delayed entrance: a load that finishes first never shows it. */
+@keyframes weaver-loading-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@utility animate-loading-reveal {
+  animation: weaver-loading-reveal 200ms ease-out 400ms both;
 }

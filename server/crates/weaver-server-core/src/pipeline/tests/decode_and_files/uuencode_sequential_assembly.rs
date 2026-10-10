@@ -1,14 +1,14 @@
-//! uuencode sequential assembly
-//! PAR2 binding by content (obfuscation)
+// uuencode sequential assembly
+// PAR2 binding by content (obfuscation)
 
 use super::*;
 
-/// Give the UU spool a known free-space reading so a spill is judged on it.
-///
-/// The pipeline reads spool headroom from the background storage sampler, and
-/// until that sampler's first probe lands the reading is unknown. A spill with
-/// no reading is refused and the part requeued, so a test that expects a part
-/// to spill must not race the sampler: it seeds the reading it wants instead.
+// Give the UU spool a known free-space reading so a spill is judged on it.
+//
+// The pipeline reads spool headroom from the background storage sampler, and
+// until that sampler's first probe lands the reading is unknown. A spill with
+// no reading is refused and the part requeued, so a test that expects a part
+// to spill must not race the sampler: it seeds the reading it wants instead.
 fn seed_uu_spool_headroom(pipeline: &mut Pipeline) {
     pipeline.uu_spool_available_bytes_for_test =
         Some(Some(pipeline.uu_spool_min_free_bytes + 64 * 1024 * 1024));
@@ -1980,13 +1980,13 @@ async fn the_prefix_capture_takes_only_an_offset_zero_anchored_run() {
         file_index: 0,
     };
 
-    // Segment 1 lands first: it starts past offset 0, so nothing is captured.
+    // Segment 2 lands first: it starts past offset 0, so nothing is captured.
     submit_decoded_segment(
         &mut pipeline,
         file_id,
-        1,
-        parts[0].len() as u64,
-        &parts[1],
+        2,
+        (parts[0].len() + parts[1].len()) as u64,
+        &parts[2],
         "obf.bin",
         None,
     )
@@ -2004,29 +2004,29 @@ async fn the_prefix_capture_takes_only_an_offset_zero_anchored_run() {
     assert_eq!(
         pipeline.file_prefix_16k.get(&file_id).map(Vec::len),
         Some(parts[0].len()),
-        "the run starts at zero"
+        "the run starts at zero and cannot cross the missing middle article"
     );
 
-    // Segment 2 extends it; the hole segment 1 left is never closed, because
-    // the capture only ever grows from its own end.
+    // Segment 1 closes the hole. The parked segment 2 now extends the same
+    // unbroken run; arrival order must not discard those verified bytes.
     submit_decoded_segment(
         &mut pipeline,
         file_id,
-        2,
-        (parts[0].len() + parts[1].len()) as u64,
-        &parts[2],
+        1,
+        parts[0].len() as u64,
+        &parts[1],
         "obf.bin",
         None,
     )
     .await;
     assert_eq!(
         pipeline.file_prefix_16k.get(&file_id).map(Vec::len),
-        Some(parts[0].len()),
-        "and a later span past the hole cannot extend it either"
+        Some(parts.iter().map(Vec::len).sum()),
+        "the captured run includes the parked article only after its hole closes"
     );
     assert_eq!(
         pipeline.file_prefix_16k.get(&file_id).map(Vec::as_slice),
-        Some(parts[0].as_slice()),
+        Some(parts.concat().as_slice()),
         "what was captured is exactly the file's own first bytes"
     );
 }

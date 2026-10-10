@@ -1,4 +1,72 @@
-use super::{derive_release_name, strip_nzb_source_suffix};
+use super::{completed_folder_name, derive_release_name, strip_nzb_source_suffix};
+use crate::ingest::append_original_title_metadata;
+
+// The display name and completed folder a submission under `filename` gets.
+fn display_and_folder(filename: Option<&str>, meta_title: Option<&str>) -> (String, String) {
+    let title = filename.map(|value| strip_nzb_source_suffix(value).unwrap_or(value));
+    let metadata = append_original_title_metadata(Vec::new(), title, meta_title);
+    let display = derive_release_name(title, meta_title);
+    let folder = completed_folder_name(&display, &metadata);
+    (display, folder)
+}
+
+#[test]
+fn completed_folder_keeps_a_season_packs_full_title() {
+    assert_eq!(
+        display_and_folder(Some("Copper.Meadow.S06.1080p.WEB.h264-GRP.nzb"), None),
+        (
+            "Copper Meadow".to_string(),
+            "Copper.Meadow.S06.1080p.WEB.h264-GRP".to_string()
+        )
+    );
+}
+
+#[test]
+fn completed_folder_keeps_every_episode_of_a_multi_episode_release() {
+    assert_eq!(
+        display_and_folder(
+            Some("Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP.nzb.xz"),
+            None
+        ),
+        (
+            "Copper Meadow — S11E42".to_string(),
+            "Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP".to_string()
+        )
+    );
+}
+
+#[test]
+fn completed_folder_keeps_a_movies_year() {
+    assert_eq!(
+        display_and_folder(Some("Lantern.Field.2019.2160p.BluRay.x265-GRP.nzb"), None),
+        (
+            "Lantern Field".to_string(),
+            "Lantern.Field.2019.2160p.BluRay.x265-GRP".to_string()
+        )
+    );
+}
+
+#[test]
+fn completed_folder_from_the_meta_title_drops_only_what_a_filesystem_cannot_hold() {
+    let (_, folder) =
+        display_and_folder(None, Some(" ..Lantern/Field\\2019:Cut\u{7}.1080p-GRP. . "));
+    assert_eq!(folder, "Lantern_Field_2019_Cut.1080p-GRP");
+}
+
+#[test]
+fn completed_folder_without_an_original_title_keeps_the_display_name() {
+    assert_eq!(completed_folder_name("Copper Meadow", &[]), "Copper Meadow");
+    assert_eq!(completed_folder_name("CON", &[]), "_CON");
+    // A title with nothing a folder can be named after counts as none.
+    let metadata = vec![(
+        crate::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+        " . . ".to_string(),
+    )];
+    assert_eq!(
+        completed_folder_name("Copper Meadow", &metadata),
+        "Copper Meadow"
+    );
+}
 
 #[test]
 fn prefers_parsed_release_title() {

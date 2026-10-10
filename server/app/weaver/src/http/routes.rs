@@ -18,8 +18,8 @@ pub(super) enum HostRejection {
     BadRequest,
 }
 
-/// The single authority the `Host` header names, if it carries one. More than
-/// one header, or one that is not an authority, is a malformed request.
+// The single authority the `Host` header names, if it carries one. More than
+// one header, or one that is not an authority, is a malformed request.
 pub(super) fn host_header_authority(
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<HttpAuthority>, HostRejection> {
@@ -70,6 +70,35 @@ async fn enforce_http_host(security: &RuntimeSecurityConfig, req: Request, next:
             (StatusCode::BAD_REQUEST, "invalid Host header").into_response()
         }
     }
+}
+
+fn build_backup_routes(backup_request_limit: usize) -> Router {
+    let uploads = Router::new()
+        .route("/inspect", post(super::backup::backup_inspect_handler))
+        .route("/restore", post(super::backup::backup_restore_handler))
+        .route_layer(RequestBodyLimitLayer::new(backup_request_limit));
+    Router::new()
+        .route(
+            "/api/backup/status",
+            get(super::backup::backup_status_handler),
+        )
+        .route(
+            "/api/backup/export",
+            post(super::backup::backup_export_handler),
+        )
+        .route(
+            "/api/backup/create",
+            post(super::backup::backup_create_handler),
+        )
+        .route(
+            "/api/backup/download/{filename}",
+            get(super::backup::backup_download_handler),
+        )
+        .route(
+            "/api/backup/{filename}",
+            axum::routing::delete(super::backup::backup_delete_handler),
+        )
+        .nest("/api/backup", uploads)
 }
 
 pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
@@ -145,11 +174,6 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         scheduled_resume,
         disk_space.reader(weaver_server_core::operations::StorageRoot::Complete),
     );
-    let backup_upload_routes = Router::new()
-        .route("/inspect", post(super::backup::backup_inspect_handler))
-        .route("/restore", post(super::backup::backup_restore_handler))
-        .route_layer(RequestBodyLimitLayer::new(backup_request_limit));
-
     let nzbget_rpc_routes = build_nzbget_rpc_routes(nzbget_context);
 
     let inner = Router::new()
@@ -173,15 +197,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             get(super::jobs::job_output_file_download_get_handler)
                 .post(super::jobs::job_output_file_download_handler),
         )
-        .route(
-            "/api/backup/status",
-            get(super::backup::backup_status_handler),
-        )
-        .route(
-            "/api/backup/export",
-            post(super::backup::backup_export_handler),
-        )
-        .nest("/api/backup", backup_upload_routes)
+        .merge(build_backup_routes(backup_request_limit))
         .route("/api/system/restart", post(super::system::restart_handler))
         .route(
             "/api/system/diagnostics",
@@ -261,9 +277,9 @@ pub(super) fn with_http_host_validation(router: Router, security: RuntimeSecurit
     }))
 }
 
-/// Browser protections every response carries, including refusals: the UI is
-/// never framed, content types are never sniffed, and paths under a base URL
-/// never leak to other sites through `Referer`.
+// Browser protections every response carries, including refusals: the UI is
+// never framed, content types are never sniffed, and paths under a base URL
+// never leak to other sites through `Referer`.
 pub(super) fn with_response_hardening(router: Router) -> Router {
     router.layer(middleware::from_fn(|req: Request, next: Next| async move {
         let mut response = next.run(req).await;
@@ -335,6 +351,52 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn backup_routes_resolve_static_nested_and_filename_paths() {
+        for prefix in ["", "/weaver"] {
+            let routes = build_backup_routes(1024);
+            let app = if prefix.is_empty() {
+                routes
+            } else {
+                Router::new().nest(prefix, routes)
+            }
+            .route_layer(middleware::from_fn(
+                |path: axum::extract::MatchedPath, _request: Request<Body>, _next: Next| async move {
+                    path.as_str().to_owned()
+                },
+            ));
+            for (method, path, matched) in [
+                (Method::GET, "status", "status"),
+                (Method::POST, "export", "export"),
+                (Method::POST, "create", "create"),
+                (Method::POST, "inspect", "inspect"),
+                (Method::POST, "restore", "restore"),
+                (Method::GET, "download/archive.enc", "download/{filename}"),
+                (Method::DELETE, "archive.enc", "{filename}"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(format!("{prefix}/api/backup/{path}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    body.as_ref(),
+                    format!("{prefix}/api/backup/{matched}").as_bytes()
+                );
+            }
+        }
+    }
 
     fn guarded_router(security: RuntimeSecurityConfig, hits: Arc<AtomicUsize>) -> Router {
         let router = Router::new().fallback(move || {

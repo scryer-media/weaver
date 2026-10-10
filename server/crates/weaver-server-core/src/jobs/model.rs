@@ -12,30 +12,30 @@ use crate::jobs::server_attribution::JobServerAttribution;
 use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
 use weaver_model::files::FileRole;
 
-/// Why a payload file left the delivery accounting entirely.
-///
-/// A discard is not damage. The file's bytes are neither delivered nor missing
-/// from the delivery — they were never part of it, because the settlement
-/// established that nothing was ever going to be assembled from them and that
-/// nothing depended on them. Health measures what the user received against
-/// what the job set out to deliver, so a discard leaves both sides of that
-/// fraction rather than counting against it.
+// Why a payload file left the delivery accounting entirely.
+//
+// A discard is not damage. The file's bytes are neither delivered nor missing
+// from the delivery — they were never part of it, because the settlement
+// established that nothing was ever going to be assembled from them and that
+// nothing depended on them. Health measures what the user received against
+// what the job set out to deliver, so a discard leaves both sides of that
+// fraction rather than counting against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalDiscardKind {
-    /// A repost that collided with this job's message ids. Every article the
-    /// servers hold under them belongs to a different, coherent file, so the
-    /// file this NZB declared could not have arrived from any server.
+    // A repost that collided with this job's message ids. Every article the
+    // servers hold under them belongs to a different, coherent file, so the
+    // file this NZB declared could not have arrived from any server.
     UnfetchableDuplicate,
-    /// A posted file whose bytes the recovery set already folded into an output
-    /// the verdict vouched for: a split part a join consumed, or the damaged
-    /// copy of a file the repair rebuilt. A spent input, not an outstanding
-    /// file.
+    // A posted file whose bytes the recovery set already folded into an output
+    // the verdict vouched for: a split part a join consumed, or the damaged
+    // copy of a file the repair rebuilt. A spent input, not an outstanding
+    // file.
     RepairLeftover,
-    /// Recovery capacity the job never needed. Recovery volumes have never
-    /// counted toward health, so nothing has to move them out of an accounting
-    /// they were never in; the variant exists so a surface that reports
-    /// discards can name one when it has to.
+    // Recovery capacity the job never needed. Recovery volumes have never
+    // counted toward health, so nothing has to move them out of an accounting
+    // they were never in; the variant exists so a surface that reports
+    // discards can name one when it has to.
     UnneededRecoveryVolume,
 }
 
@@ -49,19 +49,19 @@ impl TerminalDiscardKind {
     }
 }
 
-/// One file the settlement dropped, and what dropping it cost.
-///
-/// Structured on purpose: this is the record a UI renders as "discarded
-/// unfetchable duplicate, 1.09 GB", and a sentence assembled here would only
-/// have to be taken apart again by whoever displays it.
+// One file the settlement dropped, and what dropping it cost.
+//
+// Structured on purpose: this is the record a UI renders as "discarded
+// unfetchable duplicate, 1.09 GB", and a sentence assembled here would only
+// have to be taken apart again by whoever displays it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalDiscard {
-    /// The NZB file index, which is the file's identity for this job.
+    // The NZB file index, which is the file's identity for this job.
     pub file_index: u32,
     pub filename: String,
     pub kind: TerminalDiscardKind,
-    /// Declared bytes that left both the health denominator and the failed-byte
-    /// ledger.
+    // Declared bytes that left both the health denominator and the failed-byte
+    // ledger.
     pub bytes: u64,
 }
 
@@ -70,6 +70,8 @@ pub enum ArchivePasswordSource {
     Explicit,
     NzbMeta,
     FilenameConvention,
+    Settings,
+    PasswordFile,
 }
 
 impl ArchivePasswordSource {
@@ -78,6 +80,8 @@ impl ArchivePasswordSource {
             Self::Explicit => "explicit",
             Self::NzbMeta => "nzb_meta",
             Self::FilenameConvention => "filename_convention",
+            Self::Settings => "settings",
+            Self::PasswordFile => "password_file",
         }
     }
 }
@@ -111,28 +115,28 @@ impl std::fmt::Debug for ArchivePasswordCandidate {
     }
 }
 
-/// A job definition submitted to the scheduler.
-/// Contains everything needed to create and run a download job.
+// A job definition submitted to the scheduler.
+// Contains everything needed to create and run a download job.
 #[derive(Clone)]
 pub struct JobSpec {
-    /// Human-readable name for the job.
+    // Human-readable name for the job.
     pub name: String,
-    /// Password for encrypted archives (from NZB meta or filename {{password}} convention).
+    // Password for encrypted archives (from NZB meta or filename {{password}} convention).
     pub password: Option<String>,
-    /// Files to download, each with their segments.
+    // Files to download, each with their segments.
     pub files: Vec<FileSpec>,
-    /// Total expected bytes across all files.
+    // Total expected bytes across all files.
     pub total_bytes: u64,
-    /// Optional category (e.g. "tv", "movies") for organizing downloads.
+    // Optional category (e.g. "tv", "movies") for organizing downloads.
     pub category: Option<String>,
-    /// Arbitrary key-value metadata attached by the submitting client.
+    // Arbitrary key-value metadata attached by the submitting client.
     pub metadata: Vec<(String, String)>,
 }
 
 impl JobSpec {
-    /// Conservative admission estimate for the spec, queue entries, assembly
-    /// indexes, and their cloned strings. Count placements even when message
-    /// IDs repeat: each placement still owns scheduling and output state.
+    // Conservative admission estimate for the spec, queue entries, assembly
+    // indexes, and their cloned strings. Count placements even when message
+    // IDs repeat: each placement still owns scheduling and output state.
     pub(crate) fn scheduling_memory_estimate(&self) -> u64 {
         let per_file = (8 * std::mem::size_of::<crate::jobs::assembly::FileAssembly>()
             + 4 * std::mem::size_of::<FileSpec>()) as u64;
@@ -154,7 +158,7 @@ impl JobSpec {
         })
     }
 
-    /// Total bytes of PAR2 recovery files in this spec.
+    // Total bytes of PAR2 recovery files in this spec.
     pub fn par2_bytes(&self) -> u64 {
         self.files
             .iter()
@@ -164,8 +168,8 @@ impl JobSpec {
             .sum()
     }
 
-    /// Number of PAR2 recovery volumes (excludes the tiny always-fetched
-    /// index files).
+    // Number of PAR2 recovery volumes (excludes the tiny always-fetched
+    // index files).
     pub fn par2_volume_count(&self) -> usize {
         self.files
             .iter()
@@ -200,8 +204,8 @@ impl<T> FieldUpdate<T> {
 pub struct JobUpdate {
     pub category: FieldUpdate<String>,
     pub metadata: FieldUpdate<Vec<(String, String)>>,
-    /// Archive/unpack password override. `Clear` removes a password even when
-    /// the NZB itself carries one; the override persists across restarts.
+    // Archive/unpack password override. `Clear` removes a password even when
+    // the NZB itself carries one; the override persists across restarts.
     pub password: FieldUpdate<String>,
 }
 
@@ -231,61 +235,61 @@ impl JobUpdate {
     }
 }
 
-/// Specification for a single file within a job.
+// Specification for a single file within a job.
 #[derive(Clone)]
 pub struct FileSpec {
-    /// Filename (extracted from NZB subject).
+    // Filename (extracted from NZB subject).
     pub filename: String,
-    /// Inferred file role.
+    // Inferred file role.
     pub role: FileRole,
-    /// Newsgroups to try.
+    // Newsgroups to try.
     pub groups: Vec<String>,
-    /// Unix epoch seconds from the NZB `<file date="…">` attribute; `None`
-    /// when absent or unparseable. Drives per-server retention skipping.
+    // Unix epoch seconds from the NZB `<file date="…">` attribute; `None`
+    // when absent or unparseable. Drives per-server retention skipping.
     pub posted_at_epoch: Option<u64>,
-    /// Segments (articles) that make up this file.
+    // Segments (articles) that make up this file.
     pub segments: Vec<SegmentSpec>,
 }
 
-/// Specification for a single segment to download.
+// Specification for a single segment to download.
 #[derive(Clone)]
 pub struct SegmentSpec {
-    /// Dense 0-indexed position used for all internal indexing.
+    // Dense 0-indexed position used for all internal indexing.
     pub ordinal: u32,
-    /// Raw 1-indexed NZB article number preserved for diagnostics.
+    // Raw 1-indexed NZB article number preserved for diagnostics.
     pub article_number: u32,
-    /// Expected decoded size in bytes.
+    // Expected decoded size in bytes.
     pub bytes: u32,
-    /// NNTP message-id (without angle brackets).
+    // NNTP message-id (without angle brackets).
     pub message_id: String,
 }
 
-/// Status of a job in the scheduler.
+// Status of a job in the scheduler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStatus {
+    AwaitingQueueScripts,
     Queued,
     Downloading,
-    /// Health probe in progress — checking article availability.
+    // Health probe in progress — checking article availability.
     Checking,
     Verifying,
     QueuedRepair,
     Repairing,
     QueuedExtract,
     Extracting,
-    /// Moving extracted files to the final destination directory.
+    // Moving extracted files to the final destination directory.
     Moving,
     QueuedPostProcessing,
     PostProcessing,
     Complete,
-    Failed {
-        error: String,
-    },
+    Failed { error: String },
     Paused,
 }
 
 impl JobStatus {
     pub fn persisted_status(&self) -> &'static str {
         match self {
+            Self::AwaitingQueueScripts => "awaiting_queue_scripts",
             Self::Queued => "queued",
             Self::Downloading => "downloading",
             Self::Checking => "checking",
@@ -308,7 +312,7 @@ impl JobStatus {
 pub enum DownloadState {
     Queued,
     Downloading,
-    /// Health probe in progress — checking article availability.
+    // Health probe in progress — checking article availability.
     Checking,
     Complete,
     Failed,
@@ -339,6 +343,7 @@ impl DownloadState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PostState {
+    AwaitingQueueScripts,
     Idle,
     QueuedRepair,
     Repairing,
@@ -357,6 +362,7 @@ pub enum PostState {
 impl PostState {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AwaitingQueueScripts => "awaiting_queue_scripts",
             Self::Idle => "idle",
             Self::QueuedRepair => "queued_repair",
             Self::Repairing => "repairing",
@@ -375,6 +381,7 @@ impl PostState {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "awaiting_queue_scripts" => Some(Self::AwaitingQueueScripts),
             "idle" => Some(Self::Idle),
             "queued_repair" => Some(Self::QueuedRepair),
             "repairing" => Some(Self::Repairing),
@@ -439,6 +446,7 @@ pub fn derive_legacy_job_status(
     }
 
     match post_state {
+        PostState::AwaitingQueueScripts => JobStatus::AwaitingQueueScripts,
         PostState::Finalizing => JobStatus::Moving,
         PostState::QueuedPostProcessing => JobStatus::QueuedPostProcessing,
         PostState::PostProcessing => JobStatus::PostProcessing,
@@ -462,6 +470,7 @@ pub fn derive_legacy_job_status(
 
 pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobStatus {
     match status {
+        "awaiting_queue_scripts" => JobStatus::AwaitingQueueScripts,
         "queued" => JobStatus::Queued,
         "downloading" => JobStatus::Downloading,
         "checking" => JobStatus::Checking,
@@ -491,6 +500,11 @@ pub fn runtime_lanes_from_status_snapshot(
     status: &JobStatus,
 ) -> (DownloadState, PostState, RunState) {
     match status {
+        JobStatus::AwaitingQueueScripts => (
+            DownloadState::Complete,
+            PostState::AwaitingQueueScripts,
+            RunState::Active,
+        ),
         JobStatus::Queued => (DownloadState::Queued, PostState::Idle, RunState::Active),
         JobStatus::Downloading => (
             DownloadState::Downloading,
@@ -548,15 +562,15 @@ pub fn runtime_lanes_from_status_snapshot(
     }
 }
 
-/// Why a job's health failure is being held back rather than acted on.
+// Why a job's health failure is being held back rather than acted on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthDeferralKind {
-    /// A loaded recovery set may still cover the damage.
+    // A loaded recovery set may still cover the damage.
     Par2Recovery,
-    /// A probe round is still running and may yet revise the estimate.
+    // A probe round is still running and may yet revise the estimate.
     ProbeConfirmation,
-    /// The first-article sample still has articles outstanding and can still
-    /// rule the post dead, which is the diagnosis the failure should carry.
+    // The first-article sample still has articles outstanding and can still
+    // rule the post dead, which is the diagnosis the failure should carry.
     FirstArticleSample,
 }
 
@@ -570,169 +584,172 @@ impl HealthDeferralKind {
     }
 }
 
-/// A spell of deferring a job's health failure, and how long it ran for.
-///
-/// The condition holds for as long as a damaged job keeps booking terminal
-/// segments, so a line per deferral is a line per failed segment — on a badly
-/// damaged release, hundreds of thousands of them. The spell announces itself
-/// once when it starts and once when it ends, carrying the count it swallowed
-/// in between.
+// A spell of deferring a job's health failure, and how long it ran for.
+//
+// The condition holds for as long as a damaged job keeps booking terminal
+// segments, so a line per deferral is a line per failed segment — on a badly
+// damaged release, hundreds of thousands of them. The spell announces itself
+// once when it starts and once when it ends, carrying the count it swallowed
+// in between.
 #[derive(Debug, Clone, Default)]
 pub struct HealthDeferral {
     pub kind: Option<HealthDeferralKind>,
     pub deferrals: u64,
 }
 
-/// Fingerprints of the periodic checkpoint lines a job has already announced.
-///
-/// The completion checkpoint is re-entered on a timer for as long as a job is
-/// waiting, and a waiting job re-enters it with the same answer every time.
-/// Holding the last announced content lets the announcement follow the state
-/// rather than the timer: a line whose fingerprint is unchanged has nothing to
-/// add and drops to the diagnostic level. They live in the job's state, so a
-/// job leaving the pipeline takes them with it.
+// Fingerprints of the periodic checkpoint lines a job has already announced.
+//
+// The completion checkpoint is re-entered on a timer for as long as a job is
+// waiting, and a waiting job re-enters it with the same answer every time.
+// Holding the last announced content lets the announcement follow the state
+// rather than the timer: a line whose fingerprint is unchanged has nothing to
+// add and drops to the diagnostic level. They live in the job's state, so a
+// job leaving the pipeline takes them with it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AnnouncedCheckpoints {
-    /// The RAR completion checkpoint's whole payload, bar its timestamp.
+    // The RAR completion checkpoint's whole payload, bar its timestamp.
     pub rar_completion: Option<u64>,
-    /// Which demoted direct-store file is holding PAR2 settlement up, and why.
+    // Which demoted direct-store file is holding PAR2 settlement up, and why.
     pub demoted_materialization: Option<u64>,
 }
 
-/// Internal state for a running job.
+// Internal state for a running job.
 pub struct JobState {
     pub job_id: JobId,
     pub job_hash: [u8; 32],
     pub spec: JobSpec,
-    /// Runtime status used by the pipeline choreography. The lane fields below
-    /// are compatibility projections and must not drive core lifecycle logic.
+    // Runtime status used by the pipeline choreography. The lane fields below
+    // are compatibility projections and must not drive core lifecycle logic.
     pub status: JobStatus,
     pub download_state: DownloadState,
     pub post_state: PostState,
     pub run_state: RunState,
     pub assembly: JobAssembly,
-    /// Number of nested archive extraction passes already performed.
+    // Number of nested archive extraction passes already performed.
     pub extraction_depth: u32,
     pub created_at: std::time::Instant,
-    /// Wall-clock creation time (Unix epoch milliseconds).
+    // Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
-    /// When this job most recently entered the bounded repair queue.
+    // When this job most recently entered the bounded repair queue.
     pub queued_repair_at_epoch_ms: Option<f64>,
-    /// When this job most recently entered the bounded extraction queue.
+    // When this job most recently entered the bounded extraction queue.
     pub queued_extract_at_epoch_ms: Option<f64>,
-    /// Safe status to restore when a paused job is resumed.
+    // Safe status to restore when a paused job is resumed.
     pub paused_resume_status: Option<JobStatus>,
-    /// Compatibility lane targets retained for v0.2.9-era persisted rows.
+    // Compatibility lane targets retained for v0.2.9-era persisted rows.
     pub paused_resume_download_state: Option<DownloadState>,
     pub paused_resume_post_state: Option<PostState>,
-    /// Last terminal error associated with this job.
+    // Last terminal error associated with this job.
     pub failure_error: Option<String>,
-    /// Per-job working directory (subdirectory under intermediate_dir).
-    /// All download/decode/verify/repair/extract I/O happens here.
+    // Per-job working directory (subdirectory under intermediate_dir).
+    // All download/decode/verify/repair/extract I/O happens here.
     pub working_dir: PathBuf,
-    /// Bytes downloaded for this specific job.
+    // Bytes downloaded for this specific job.
     pub downloaded_bytes: u64,
-    /// Encoded bytes received off the wire for this job, credited when an
-    /// article lands and before it is decoded. Includes retries and articles
-    /// that failed to decode, so it is never a progress measure: it feeds only
-    /// the download-phase rate, which must integrate the same bytes as the
-    /// global speed gauge so a queue row and the nav counter agree.
+    // Encoded bytes received off the wire for this job, credited when an
+    // article lands and before it is decoded. Includes retries and articles
+    // that failed to decode, so it is never a progress measure: it feeds only
+    // the download-phase rate, which must integrate the same bytes as the
+    // global speed gauge so a queue row and the nav counter agree.
     pub downloaded_wire_bytes: u64,
-    /// Which servers served this job's articles, counted as they land.
-    ///
-    /// Reporting only: nothing in the scheduling or failover path reads it.
-    /// An article whose server cannot be named is left uncounted, so this
-    /// understates rather than misattributes.
+    // Which servers served this job's articles, counted as they land.
+    //
+    // Reporting only: nothing in the scheduling or failover path reads it.
+    // An article whose server cannot be named is left uncounted, so this
+    // understates rather than misattributes.
     pub server_attribution: JobServerAttribution,
-    /// Conservative restored progress floor from persisted file-write checkpoints.
-    /// This is only used for reporting after restart and must not affect scheduling.
+    // The job's first direct-store demotion and its article gaps, kept for
+    // the support report. Reporting only, and fixed in size.
+    pub support_facts: crate::jobs::support_facts::JobSupportFacts,
+    // Conservative restored progress floor from persisted file-write checkpoints.
+    // This is only used for reporting after restart and must not affect scheduling.
     pub restored_download_floor_bytes: u64,
-    /// Bytes from segments that are permanently lost (430 / max retries
-    /// exhausted). See [`JobState::probe_projected_failed_bytes`] for the
-    /// estimate that is deliberately kept out of it.
-    ///
-    /// Derived state: the sum of the *declared* sizes of the segments holding a
-    /// terminal state. Only the pipeline's single terminal-state transition
-    /// moves it, and nothing may add to it directly.
+    // Bytes from segments that are permanently lost (430 / max retries
+    // exhausted). See [`JobState::probe_projected_failed_bytes`] for the
+    // estimate that is deliberately kept out of it.
+    //
+    // Derived state: the sum of the *declared* sizes of the segments holding a
+    // terminal state. Only the pipeline's single terminal-state transition
+    // moves it, and nothing may add to it directly.
     pub failed_bytes: u64,
-    /// What the last conclusive health-probe round estimated was already dead,
-    /// extrapolated from its sample across the whole payload.
-    ///
-    /// Deliberately not folded into `failed_bytes`: it is an estimate over a
-    /// sample rather than a per-segment fact, and mixing the two is what once
-    /// let a job book more failed bytes than the job contained. Only the health
-    /// policy reads it, and only to fail a dead release early.
+    // What the last conclusive health-probe round estimated was already dead,
+    // extrapolated from its sample across the whole payload.
+    //
+    // Deliberately not folded into `failed_bytes`: it is an estimate over a
+    // sample rather than a per-segment fact, and mixing the two is what once
+    // let a job book more failed bytes than the job contained. Only the health
+    // policy reads it, and only to fail a dead release early.
     pub probe_projected_failed_bytes: u64,
-    /// Total bytes of PAR2 recovery files, cached from spec at job creation.
+    // Total bytes of PAR2 recovery files, cached from spec at job creation.
     pub par2_bytes: u64,
-    /// Whether health probes have been dispatched for this job.
+    // Whether health probes have been dispatched for this job.
     pub health_probing: bool,
-    /// The health-failure deferral currently in force, if any, and how many
-    /// times it has deferred since it began.
+    // The health-failure deferral currently in force, if any, and how many
+    // times it has deferred since it began.
     pub health_deferral: HealthDeferral,
-    /// What the recurring checkpoint lines last announced for this job, so a
-    /// repeat with nothing new to say is not announced again.
+    // What the recurring checkpoint lines last announced for this job, so a
+    // repeat with nothing new to say is not announced again.
     pub announced_checkpoints: AnnouncedCheckpoints,
-    /// Probe activation counter used to rotate sampled segments across rounds.
+    // Probe activation counter used to rotate sampled segments across rounds.
     pub health_probe_round: u32,
-    /// How many files had already lost a segment when the last probe round was
-    /// armed.
-    ///
-    /// A round is armed on a state change, not on every terminal segment: the
-    /// failed-byte watermark below, or a file that had not failed before. The
-    /// tenth dead article in a volume nobody posted tells the policy nothing
-    /// the first one did not.
+    // How many files had already lost a segment when the last probe round was
+    // armed.
+    //
+    // A round is armed on a state change, not on every terminal segment: the
+    // failed-byte watermark below, or a file that had not failed before. The
+    // tenth dead article in a volume nobody posted tells the policy nothing
+    // the first one did not.
     pub health_probe_failing_files: usize,
-    /// Indexes of the health-counted files this job has lost at least one
-    /// segment of, kept on the booking edge alongside `failed_bytes`.
-    ///
-    /// The probe policy reads its file count on every terminal segment; a
-    /// count derived by walking the terminal-state ledger there would be a
-    /// scan of every failure per failure, quadratic on exactly the release
-    /// the probe exists to abandon quickly.
+    // Indexes of the health-counted files this job has lost at least one
+    // segment of, kept on the booking edge alongside `failed_bytes`.
+    //
+    // The probe policy reads its file count on every terminal segment; a
+    // count derived by walking the terminal-state ledger there would be a
+    // scan of every failure per failure, quadratic on exactly the release
+    // the probe exists to abandon quickly.
     pub health_failing_files: std::collections::HashSet<u32>,
-    /// Recovery blocks early promotion has already asked the queues for.
-    ///
-    /// Promotion walks the parked and queued recovery work to select blocks,
-    /// so it runs only when the shortfall has grown past this figure, not on
-    /// every failure that leaves it unchanged.
+    // Recovery blocks early promotion has already asked the queues for.
+    //
+    // Promotion walks the parked and queued recovery work to select blocks,
+    // so it runs only when the shortfall has grown past this figure, not on
+    // every failure that leaves it unchanged.
     pub early_recovery_requested_blocks: u32,
-    /// Highest failed-byte watermark that has already been health-probed.
+    // Highest failed-byte watermark that has already been health-probed.
     pub last_health_probe_failed_bytes: u64,
-    /// Minimum failed-byte watermark required before arming another probe round.
+    // Minimum failed-byte watermark required before arming another probe round.
     pub next_health_probe_failed_bytes: u64,
-    /// Persisted probe facts used for pre-extraction classification.
+    // Persisted probe facts used for pre-extraction classification.
     pub detected_archives: std::collections::HashMap<u32, DetectedArchiveIdentity>,
-    /// Mutable file identity used by runtime/archive logic after rename/classification.
+    // Mutable file identity used by runtime/archive logic after rename/classification.
     pub file_identities: std::collections::HashMap<u32, ActiveFileIdentity>,
-    /// Segments pulled from queues while health probe runs. Restored on
-    /// probe pass, dropped on probe fail.
+    // Segments pulled from queues while health probe runs. Restored on
+    // probe pass, dropped on probe fail.
     pub held_segments: Vec<DownloadWork>,
-    /// Primary download queue (data files, PAR2 index, RAR volumes).
+    // Primary download queue (data files, PAR2 index, RAR volumes).
     pub download_queue: DownloadQueue,
-    /// Recovery download queue (PAR2 repair blocks, spare bandwidth).
+    // Recovery download queue (PAR2 repair blocks, spare bandwidth).
     pub recovery_queue: DownloadQueue,
-    /// Staging directory for extraction output (under complete_dir).
-    /// Extraction writes chunks and assembled files here instead of
-    /// working_dir, keeping local storage usage low for NFS setups.
+    // Staging directory for extraction output (under complete_dir).
+    // Extraction writes chunks and assembled files here instead of
+    // working_dir, keeping local storage usage low for NFS setups.
     pub staging_dir: Option<PathBuf>,
-    /// Shared decoded-byte counter for this job's category.
-    ///
-    /// Resolved once, when the job enters the pipeline, so the per-segment byte
-    /// accounting site never looks a category up: it does a single `Relaxed`
-    /// `fetch_add` through this already-resolved pointer. `None` only while a
-    /// test builds a bare state; the accounting site simply skips then.
+    // Shared decoded-byte counter for this job's category.
+    //
+    // Resolved once, when the job enters the pipeline, so the per-segment byte
+    // accounting site never looks a category up: it does a single `Relaxed`
+    // `fetch_add` through this already-resolved pointer. `None` only while a
+    // test builds a bare state; the accounting site simply skips then.
     pub category_bytes: Option<Arc<AtomicU64>>,
-    /// Password candidates derived from the job's persisted NZB (its
-    /// `<meta type="password">` and the `{{password}}` file-name convention),
-    /// in harvest order and without the spec's explicit password.
-    ///
-    /// Filled when the job enters the pipeline, or by the first harvest that
-    /// reads the job's row; a row with no NZB fills it with an empty list. The
-    /// NZB never changes under a live job, so once filled the harvest reads
-    /// this instead of reloading and re-parsing the NZB on every archive file.
-    /// Left unset when the NZB could not be read or parsed, which keeps a
-    /// transient failure retryable.
+    // Password candidates derived from the job's persisted NZB (its
+    // `<meta type="password">` and the `{{password}}` file-name convention),
+    // in harvest order and without the spec's explicit password.
+    //
+    // Filled when the job enters the pipeline, or by the first harvest that
+    // reads the job's row; a row with no NZB fills it with an empty list. The
+    // NZB never changes under a live job, so once filled the harvest reads
+    // this instead of reloading and re-parsing the NZB on every archive file.
+    // Left unset when the NZB could not be read or parsed, which keeps a
+    // transient failure retryable.
     pub nzb_password_candidates: std::sync::OnceLock<Vec<ArchivePasswordCandidate>>,
 }
 
@@ -762,7 +779,7 @@ impl JobState {
     }
 }
 
-/// Current wall-clock time as Unix epoch milliseconds.
+// Current wall-clock time as Unix epoch milliseconds.
 pub fn epoch_ms_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

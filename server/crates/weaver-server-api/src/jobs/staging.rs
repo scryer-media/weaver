@@ -26,6 +26,7 @@ pub(crate) struct StagedUploadEntry {
     pub(crate) filename: String,
     pub(crate) nzb_zstd: Vec<u8>,
     pub(crate) preparation: Option<StagedSubmissionPreparation>,
+    pub(crate) scan_before_parse: bool,
     created_at: Instant,
     last_touched_at: Instant,
 }
@@ -42,6 +43,9 @@ fn staged_preparation_from_nzb(
 
 impl StagedUploadEntry {
     pub(crate) async fn rehydrate_preparation(&mut self) -> Result<(), SubmitNzbError> {
+        if self.scan_before_parse {
+            return Ok(());
+        }
         let filename = self.filename.clone();
         let nzb_zstd = self.nzb_zstd.clone();
         let preparation = tokio::task::spawn_blocking(move || {
@@ -75,8 +79,8 @@ pub(crate) struct StagedUploadSummary {
     pub(crate) staged_upload_id: String,
     pub(crate) filename: String,
     pub(crate) display_name: String,
-    pub(crate) total_files: u32,
-    pub(crate) total_bytes: u64,
+    pub(crate) total_files: Option<u32>,
+    pub(crate) total_bytes: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -122,12 +126,41 @@ impl StagedUploadManager {
         owner: CallerIdentity,
         upload: UploadValue,
         filename_override: Option<String>,
+        scan_before_parse: bool,
     ) -> Result<StagedUploadSummary, SubmitNzbError> {
         let filename = filename_override
             .filter(|value| !value.trim().is_empty())
             .or_else(|| (!upload.filename.trim().is_empty()).then_some(upload.filename.clone()))
             .unwrap_or_else(|| "upload.nzb".to_string());
         let source = normalize_uploaded_nzb_reader(upload)?;
+        if scan_before_parse {
+            // Selection depends on the category and parameters chosen at submit
+            // time. Keep the bounded decoded input intact until that scan runs.
+            let nzb_zstd = tokio::task::spawn_blocking(move || {
+                zstd::stream::encode_all(source, 3).map_err(SubmitNzbError::Save)
+            })
+            .await
+            .map_err(|error| SubmitNzbError::Upload(std::io::Error::other(error)))??;
+            let staged_upload_id = generate_api_key();
+            let now = Instant::now();
+            self.restore_entry(StagedUploadEntry {
+                id: staged_upload_id.clone(),
+                owner,
+                filename: filename.clone(),
+                nzb_zstd,
+                preparation: None,
+                scan_before_parse,
+                created_at: now,
+                last_touched_at: now,
+            });
+            return Ok(StagedUploadSummary {
+                staged_upload_id,
+                display_name: filename.clone(),
+                filename,
+                total_files: None,
+                total_bytes: None,
+            });
+        }
         let persist_result = tokio::task::spawn_blocking(move || {
             let mut source = source;
             persist_decoded_nzb_reader_to_zstd(&mut source)
@@ -173,6 +206,7 @@ impl StagedUploadManager {
             filename: filename.clone(),
             nzb_zstd,
             preparation: Some(preparation),
+            scan_before_parse,
             created_at: now,
             last_touched_at: now,
         };
@@ -188,8 +222,8 @@ impl StagedUploadManager {
             staged_upload_id,
             filename,
             display_name,
-            total_files,
-            total_bytes,
+            total_files: Some(total_files),
+            total_bytes: Some(total_bytes),
         })
     }
 
@@ -396,6 +430,46 @@ pub(crate) fn normalize_uploaded_nzb_reader(
     )))
 }
 
+// Read NZB bytes that arrived inline, decompressing them when their magic
+// says gzip, zstd or xz. Inline bytes carry no filename or content type, so
+// the bytes themselves are the only evidence; the upload limits still apply.
+pub(crate) fn read_inline_nzb_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, SubmitNzbError> {
+    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
+    const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
+    const XZ_MAGIC: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0x00];
+
+    let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
+    if bytes.len() as u64 > limits.nzb_upload_limit_bytes {
+        return Err(SubmitNzbError::Upload(Error::new(
+            ErrorKind::InvalidData,
+            format!("NZB upload exceeds {} bytes", limits.nzb_upload_limit_bytes),
+        )));
+    }
+    let source = std::io::Cursor::new(bytes);
+    let magic = source.get_ref().as_slice();
+    let decoded: Box<dyn Read + Send> = if magic.starts_with(GZIP_MAGIC) {
+        Box::new(flate2::read::GzDecoder::new(source))
+    } else if magic.starts_with(ZSTD_MAGIC) {
+        Box::new(zstd::stream::read::Decoder::new(source).map_err(SubmitNzbError::Upload)?)
+    } else if magic.starts_with(XZ_MAGIC) {
+        Box::new(
+            xz_multistream_decoder(source, XZ_DECODER_MEMORY_LIMIT_BYTES)
+                .map_err(SubmitNzbError::Upload)?,
+        )
+    } else {
+        Box::new(source)
+    };
+    let mut xml = Vec::new();
+    LimitedReader::new(
+        decoded,
+        limits.nzb_decompressed_limit_bytes,
+        "decompressed NZB",
+    )
+    .read_to_end(&mut xml)
+    .map_err(SubmitNzbError::Upload)?;
+    Ok(xml)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +542,7 @@ mod tests {
         let owner_a = CallerIdentity::Local([1; 32]);
         let owner_b = CallerIdentity::Local([2; 32]);
         let staged = manager
-            .stage_upload(owner_a.clone(), make_upload("owned"), None)
+            .stage_upload(owner_a.clone(), make_upload("owned"), None, false)
             .await
             .unwrap();
 
@@ -493,11 +567,12 @@ mod tests {
                     owner.clone(),
                     make_xz_upload(filename, content_type, "xz-upload"),
                     None,
+                    false,
                 )
                 .await
                 .unwrap();
             assert_eq!(staged.filename, filename);
-            assert_eq!(staged.total_files, 1);
+            assert_eq!(staged.total_files, Some(1));
         }
     }
 
@@ -509,12 +584,12 @@ mod tests {
         let owner = CallerIdentity::Local([5; 32]);
 
         let staged = manager
-            .stage_upload(owner, make_large_single_file_upload(SEGMENTS), None)
+            .stage_upload(owner, make_large_single_file_upload(SEGMENTS), None, false)
             .await
             .unwrap();
 
-        assert_eq!(staged.total_files, 1);
-        assert_eq!(staged.total_bytes, SEGMENTS as u64);
+        assert_eq!(staged.total_files, Some(1));
+        assert_eq!(staged.total_bytes, Some(SEGMENTS as u64));
         let entries = manager
             .inner
             .read()
@@ -531,7 +606,7 @@ mod tests {
         let manager = StagedUploadManager::with_timing(Duration::ZERO, Duration::from_secs(60));
         let owner = CallerIdentity::Local([3; 32]);
         let staged = manager
-            .stage_upload(owner.clone(), make_upload("expired"), None)
+            .stage_upload(owner.clone(), make_upload("expired"), None, false)
             .await
             .unwrap();
 
@@ -540,5 +615,44 @@ mod tests {
             manager.take_for_submit(&owner, std::slice::from_ref(&staged.staged_upload_id));
         assert!(found.is_empty());
         assert_eq!(missing, vec![staged.staged_upload_id]);
+    }
+
+    #[tokio::test]
+    async fn scan_staging_keeps_unparsed_input_and_retry_does_not_parse_it() {
+        let manager = StagedUploadManager::new();
+        let owner = CallerIdentity::Local([6; 32]);
+        let source = b"incomplete NZB for a scan script to repair";
+        let upload = || UploadValue {
+            filename: "repairable.nzb".into(),
+            content_type: None,
+            content: source.to_vec().into(),
+        };
+        assert!(
+            manager
+                .stage_upload(owner.clone(), upload(), None, false)
+                .await
+                .is_err()
+        );
+        let staged = manager
+            .stage_upload(owner.clone(), upload(), None, true)
+            .await
+            .unwrap();
+        assert_eq!(staged.total_files, None);
+        assert_eq!(staged.total_bytes, None);
+        let (mut found, missing) = manager.take_for_submit(&owner, &[staged.staged_upload_id]);
+        assert!(missing.is_empty());
+        let mut entry = found.pop().unwrap();
+        assert!(entry.preparation.is_none());
+        assert_eq!(
+            zstd::stream::decode_all(entry.nzb_zstd.as_slice()).unwrap(),
+            source
+        );
+        entry.rehydrate_preparation().await.unwrap();
+        assert!(entry.preparation.is_none());
+        let id = entry.id.clone();
+        manager.restore_entry(entry);
+        let (found, missing) = manager.take_for_submit(&owner, &[id]);
+        assert!(missing.is_empty());
+        assert!(found[0].scan_before_parse);
     }
 }

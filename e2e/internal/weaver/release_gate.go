@@ -50,6 +50,29 @@ type weaverReleaseFlowSpec struct {
 	Artifacts        []string
 	Timeout          time.Duration
 	Env              map[string]string
+	// SpecFiles names the Playwright spec files the script runs when it is
+	// not the single <PlaywrightScript>.spec.ts.
+	SpecFiles []string
+	// ComposeFiles are static Compose files, relative to the e2e directory,
+	// layered between docker-compose.yml and the generated override.
+	ComposeFiles []string
+	// NetworkLayout selects the generated network override.
+	NetworkLayout weaverReleaseNetworkLayout
+	// DropNetRaw starts Weaver without CAP_NET_RAW.
+	DropNetRaw bool
+	// Stages run the Playwright script once per stage, restarting Weaver
+	// between stages.
+	Stages []string
+	// StageScripts runs a different npm script in the named stage instead of
+	// PlaywrightScript, for stages that only need a subset of the specs.
+	StageScripts map[string]string
+	// ExtendedOnly keeps a flow out of "all" and "datastore-matrix"; it runs
+	// only when named.
+	ExtendedOnly bool
+	// ClockWhileStopped stops Weaver between stages instead of restarting it,
+	// and puts the instant a stage left in the clock's while-stopped file on
+	// the e2e clock before Weaver starts again.
+	ClockWhileStopped bool
 }
 
 var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
@@ -127,6 +150,14 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 		Artifacts:  []string{"flow.log", "status.json", "fake-nntp-counters.json"},
 		Timeout:    12 * time.Minute,
 	},
+	advancedNetworkingReleaseFlow(),
+	advancedNetworkingNoNetRawReleaseFlow(),
+	advancedNetworkingExtendedReleaseFlow(),
+	eventScriptsReleaseFlow(),
+	postProcessingScriptsReleaseFlow(),
+	schedulingReleaseFlow(),
+	schedulingDSTReleaseFlow(),
+	schedulingTracksReleaseFlow(),
 }
 
 func browserReleaseFlow(name string, timeout time.Duration) weaverReleaseFlowSpec {
@@ -199,6 +230,16 @@ func cloneWeaverReleaseFlowSpec(spec weaverReleaseFlowSpec) weaverReleaseFlowSpe
 	spec.Datastores = append([]weaverDatastore(nil), spec.Datastores...)
 	spec.SeedFixtures = append([]string(nil), spec.SeedFixtures...)
 	spec.Artifacts = append([]string(nil), spec.Artifacts...)
+	spec.SpecFiles = append([]string(nil), spec.SpecFiles...)
+	spec.ComposeFiles = append([]string(nil), spec.ComposeFiles...)
+	spec.Stages = append([]string(nil), spec.Stages...)
+	if spec.StageScripts != nil {
+		scripts := make(map[string]string, len(spec.StageScripts))
+		for stage, script := range spec.StageScripts {
+			scripts[stage] = script
+		}
+		spec.StageScripts = scripts
+	}
 	if spec.Env != nil {
 		env := make(map[string]string, len(spec.Env))
 		for key, value := range spec.Env {
@@ -210,20 +251,21 @@ func cloneWeaverReleaseFlowSpec(spec weaverReleaseFlowSpec) weaverReleaseFlowSpe
 }
 
 type weaverReleasePhase struct {
-	Flow             string `json:"flow"`
-	Kind             string `json:"kind"`
-	Datastore        string `json:"datastore"`
-	Project          string `json:"project"`
-	RootDir          string `json:"root_dir"`
-	RunDir           string `json:"run_dir"`
-	FixturesDir      string `json:"fixtures_dir"`
-	ArtifactsDir     string `json:"artifacts_dir"`
-	RuntimePortsFile string `json:"runtime_ports_file"`
-	NetworkSubnet    string `json:"network_subnet"`
-	ComposeOverride  string `json:"compose_override"`
-	LogPath          string `json:"log_path"`
-	StatusPath       string `json:"status_path"`
-	TimeoutSeconds   int64  `json:"timeout_seconds"`
+	Flow             string   `json:"flow"`
+	Kind             string   `json:"kind"`
+	Datastore        string   `json:"datastore"`
+	Project          string   `json:"project"`
+	RootDir          string   `json:"root_dir"`
+	RunDir           string   `json:"run_dir"`
+	FixturesDir      string   `json:"fixtures_dir"`
+	ArtifactsDir     string   `json:"artifacts_dir"`
+	RuntimePortsFile string   `json:"runtime_ports_file"`
+	NetworkSubnet    string   `json:"network_subnet"`
+	EgressSubnets    []string `json:"egress_subnets,omitempty"`
+	ComposeOverride  string   `json:"compose_override"`
+	LogPath          string   `json:"log_path"`
+	StatusPath       string   `json:"status_path"`
+	TimeoutSeconds   int64    `json:"timeout_seconds"`
 	Spec             weaverReleaseFlowSpec
 	RuntimePorts     runtimePortState
 }
@@ -347,6 +389,12 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 			_ = writeWeaverReleaseJSON(manifestPath, manifest)
 			return fmt.Errorf("prepare Weaver Playwright image before release fanout: %w", err)
 		}
+		if err := ensureAdvancedNetworkingImages(specs); err != nil {
+			manifest.FinishedAt = time.Now().UTC()
+			manifest.Status = "failed"
+			_ = writeWeaverReleaseJSON(manifestPath, manifest)
+			return fmt.Errorf("prepare networking fixture images before release fanout: %w", err)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -429,19 +477,54 @@ func assignWeaverReleaseNetworkSubnets(
 	if err != nil {
 		return fmt.Errorf("inspect Docker networks for Weaver release gate: %w", err)
 	}
-	subnets, err := composeutil.SelectNonOverlappingSubnets(
-		len(phases),
-		weaverReleaseNetworkCandidates(phases),
+	// Weaver refuses to fetch an NZB URL from a private address, so a phase
+	// whose fixture serves NZB URLs gets a subnet from the benchmarking range
+	// (198.18.0.0/15), which is neither private nor publicly routed.
+	count, fetchableCount := 0, 0
+	for _, phase := range phases {
+		if phase.Spec.NetworkLayout.servesNzbUrls() {
+			fetchableCount++
+			continue
+		}
+		count += 1 + phase.Spec.NetworkLayout.egressNetworks()
+	}
+	fetchable, err := composeutil.SelectNonOverlappingSubnets(
+		fetchableCount,
+		weaverReleaseFetchableNetworkCandidates(phases),
 		used,
 	)
 	if err != nil {
 		return err
 	}
-	for index, phase := range phases {
-		phase.NetworkSubnet = subnets[index]
+	subnets, err := composeutil.SelectNonOverlappingSubnets(
+		count,
+		weaverReleaseNetworkCandidates(phases),
+		append(append([]string(nil), used...), fetchable...),
+	)
+	if err != nil {
+		return err
+	}
+	next, nextFetchable := 0, 0
+	for _, phase := range phases {
+		if phase.Spec.NetworkLayout.servesNzbUrls() {
+			phase.NetworkSubnet = fetchable[nextFetchable]
+			nextFetchable++
+		} else {
+			phase.NetworkSubnet = subnets[next]
+			next++
+		}
+		extra := phase.Spec.NetworkLayout.egressNetworks()
+		phase.EgressSubnets = append([]string(nil), subnets[next:next+extra]...)
+		next += extra
 		phase.ComposeOverride = filepath.Join(phase.RootDir, "network.compose.override.yml")
 		if err := composeutil.WriteNetworkOverride(phase.ComposeOverride, phase.NetworkSubnet); err != nil {
 			return err
+		}
+		if phase.Spec.NetworkLayout != weaverNetworkLayoutDefault {
+			if err := writeAdvancedNetworkOverride(phase); err != nil {
+				return err
+			}
+			continue
 		}
 		if phase.Flow == "proxy-routing" {
 			if err := writeProxyRoutingNetwork(phase); err != nil {
@@ -450,6 +533,24 @@ func assignWeaverReleaseNetworkSubnets(
 		}
 	}
 	return nil
+}
+
+// weaverReleaseFetchableNetworkCandidates are /24s in 198.18.0.0/15, the
+// range reserved for network benchmarking. Weaver's URL fetch policy blocks
+// private, loopback and link-local destinations, not this range, so a fixture
+// on it can serve NZB URLs the way a public indexer would.
+func weaverReleaseFetchableNetworkCandidates(phases []*weaverReleasePhase) []string {
+	hasher := fnv.New32a()
+	for _, phase := range phases {
+		_, _ = hasher.Write([]byte(phase.Project))
+	}
+	start := int(hasher.Sum32() % 512)
+	candidates := make([]string, 0, 512)
+	for offset := range 512 {
+		index := (start + offset) % 512
+		candidates = append(candidates, fmt.Sprintf("198.%d.%d.0/24", 18+index/256, index%256))
+	}
+	return candidates
 }
 
 func weaverReleaseNetworkCandidates(phases []*weaverReleasePhase) []string {
@@ -475,6 +576,9 @@ func resolveWeaverReleaseGateSpecs(mode string) ([]weaverReleaseFlowSpec, error)
 	case "", "all", "datastore-matrix":
 		out := make([]weaverReleaseFlowSpec, 0, len(weaverReleaseFlowSpecs))
 		for _, spec := range weaverReleaseFlowSpecs {
+			if spec.ExtendedOnly {
+				continue
+			}
 			out = append(out, cloneWeaverReleaseFlowSpec(spec))
 		}
 		return out, nil
@@ -779,6 +883,7 @@ func (phase *weaverReleasePhase) env() map[string]string {
 		"E2E_WEAVER_DATABASE_URL":                   "",
 		"E2E_WEAVER_MODE":                           "1",
 		"E2E_WEAVER_CLOCK_FILE":                     "/e2e-clock/now",
+		"E2E_WEAVER_NETWORK_TIME_SCALE":             "1",
 		"E2E_WEAVER_BACKUP_SOURCE_DATASTORE":        phase.Spec.Env["E2E_WEAVER_BACKUP_SOURCE_DATASTORE"],
 		"E2E_WEAVER_BACKUP_TARGET_DATASTORE":        phase.Spec.Env["E2E_WEAVER_BACKUP_TARGET_DATASTORE"],
 		"E2E_WEAVER_RELEASE_FLOW":                   phase.Flow,
@@ -787,10 +892,14 @@ func (phase *weaverReleasePhase) env() map[string]string {
 		"E2E_WEAVER_RELEASE_FLOW_RUNTIME_PORT_FILE": phase.RuntimePortsFile,
 	}
 	if phase.ComposeOverride != "" {
-		env["COMPOSE_FILE"] = composeutil.ComposeFileValue(
-			filepath.Join(e2eDir(), "docker-compose.yml"),
-			phase.ComposeOverride,
-		)
+		files := []string{filepath.Join(e2eDir(), "docker-compose.yml")}
+		for _, file := range phase.Spec.ComposeFiles {
+			files = append(files, filepath.Join(e2eDir(), file))
+		}
+		env["COMPOSE_FILE"] = composeutil.ComposeFileValue(append(files, phase.ComposeOverride)...)
+	}
+	if len(phase.Spec.ComposeFiles) > 0 {
+		env["E2E_RUST_TOOLCHAIN"] = weaverPinnedRustToolchain(weaverRepoPath())
 	}
 	if phase.Datastore == string(weaverDatastorePostgres) {
 		env["E2E_WEAVER_DATABASE_URL"] = "postgres://weaver:weaver-pass@weaver-postgres:5432/weaver?sslmode=require"
@@ -966,6 +1075,12 @@ func runWeaverBrowserReleaseFlow(ctx context.Context, spec weaverReleaseFlowSpec
 			return err
 		}
 		return runWeaverBandwidthAndServerQuotasReleaseFlow(ctx, spec, datastore)
+	}
+	if len(spec.Stages) > 0 {
+		if err := ensureLocalWeaverPlaywrightImage(); err != nil {
+			return err
+		}
+		return runWeaverStagedReleaseFlow(ctx, spec, datastore)
 	}
 	if spec.Name == "ui-settings-crud" || spec.Name == "ui-security" {
 		if err := ensureLocalWeaverPlaywrightImage(); err != nil {
@@ -2162,7 +2277,7 @@ func inspectDockerVolume(name string) error {
 }
 
 const (
-	weaverReleasePlaywrightDefaultImage    = "weaver-e2e-playwright:local"
+	weaverReleasePlaywrightRepository      = "weaver-e2e-playwright"
 	weaverPlaywrightImageFingerprintLabel  = "org.weaver-e2e.playwright-source-fingerprint"
 	weaverPlaywrightImageFingerprintSchema = "weaver-e2e-playwright-image-v1"
 )
@@ -2183,14 +2298,16 @@ func ensureLocalWeaverPlaywrightImage() error {
 	weaverPlaywrightImageMu.Lock()
 	defer weaverPlaywrightImageMu.Unlock()
 
-	image := strings.TrimSpace(os.Getenv("E2E_WEAVER_PLAYWRIGHT_IMAGE"))
-	if image == "" {
-		image = weaverReleasePlaywrightDefaultImage
-		setEnv("E2E_WEAVER_PLAYWRIGHT_IMAGE", image)
-	}
 	fingerprint, err := weaverPlaywrightImageFingerprint(filepath.Join(e2eDir(), "playwright-weaver"))
 	if err != nil {
 		return err
+	}
+	image := strings.TrimSpace(os.Getenv("E2E_WEAVER_PLAYWRIGHT_IMAGE"))
+	if image == "" {
+		// The tag carries the fingerprint so checkouts with different specs
+		// never move each other's tag mid-run.
+		image = weaverReleasePlaywrightRepository + ":" + shortFingerprint(fingerprint)
+		setEnv("E2E_WEAVER_PLAYWRIGHT_IMAGE", image)
 	}
 	setEnv("E2E_WEAVER_PLAYWRIGHT_SOURCE_FINGERPRINT", fingerprint)
 	if !envBool("E2E_FORCE_REBUILD_WEAVER_PLAYWRIGHT_IMAGE", false) &&
@@ -2282,10 +2399,8 @@ func isWeaverBrowserCrash(err error) bool {
 	}
 	message := strings.ToLower(err.Error())
 	for _, marker := range []string{
-		"browser has been closed",
 		"browser closed unexpectedly",
 		"browser process exited",
-		"target page, context or browser has been closed",
 		"failed to launch browser",
 		"browser crashed",
 	} {
@@ -2293,7 +2408,12 @@ func isWeaverBrowserCrash(err error) bool {
 			return true
 		}
 	}
-	return false
+	// Playwright closes a timed-out test's context, so a call still in flight
+	// reports the browser as closed. That is the test failing, not the browser.
+	if strings.Contains(message, "test timeout of") {
+		return false
+	}
+	return strings.Contains(message, "browser has been closed")
 }
 
 type weaverReleaseNntpConnections struct {

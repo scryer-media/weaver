@@ -1,32 +1,34 @@
-//! Direct routing of 7z containers whose members are stored with the Copy
-//! method.
-//!
-//! A 7z states its map at the *tail*, so these fixtures exercise the one thing
-//! a RAR set never does: a layout that cannot be known until the last volume's
-//! last article has landed, whatever order the articles arrive in.
+// Direct routing of 7z containers whose members are stored with the Copy
+// method.
+//
+// A 7z states its map at the *tail*, so these fixtures exercise the one thing
+// a RAR set never does: a layout that cannot be known until the last volume's
+// last article has landed, whatever order the articles arrive in.
 
 use super::*;
 
-mod schedules;
+pub(super) mod embedded_par3;
+mod obfuscated_split;
+pub(super) mod schedules;
 
 use sevenz_turbo::encoder_options::AesEncoderOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
 
-/// One entry of a fixture archive.
-struct Entry {
+// One entry of a fixture archive.
+pub(super) struct Entry {
     name: &'static str,
-    /// `None` for an entry the archive names but stores no bytes for. Such an
-    /// entry has no stream at all — a zero-length stream is a different thing,
-    /// and not one a 7z writer produces.
+    // `None` for an entry the archive names but stores no bytes for. Such an
+    // entry has no stream at all — a zero-length stream is a different thing,
+    // and not one a 7z writer produces.
     bytes: Option<Vec<u8>>,
-    /// The deletion marker an incremental archive carries.
+    // The deletion marker an incremental archive carries.
     anti: bool,
-    /// The entry's stored attribute word, when the fixture sets one.
+    // The entry's stored attribute word, when the fixture sets one.
     attributes: Option<u32>,
 }
 
 impl Entry {
-    fn file(name: &'static str, bytes: Vec<u8>) -> Self {
+    pub(super) fn file(name: &'static str, bytes: Vec<u8>) -> Self {
         Self {
             name,
             bytes: Some(bytes),
@@ -44,7 +46,7 @@ impl Entry {
         }
     }
 
-    /// An entry the header marks for deletion rather than for writing.
+    // An entry the header marks for deletion rather than for writing.
     fn anti_item(name: &'static str) -> Self {
         Self {
             name,
@@ -54,7 +56,7 @@ impl Entry {
         }
     }
 
-    /// An entry whose attributes say the name is a redirection, not a file.
+    // An entry whose attributes say the name is a redirection, not a file.
     fn symlink(name: &'static str, target: &str) -> Self {
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         Self {
@@ -66,9 +68,9 @@ impl Entry {
     }
 }
 
-/// Deterministic member payload: compressible enough that a non-Copy fixture
-/// really does shrink, and varied enough that a misrouted byte shows up.
-fn payload(seed: u8, len: usize) -> Vec<u8> {
+// Deterministic member payload: compressible enough that a non-Copy fixture
+// really does shrink, and varied enough that a misrouted byte shows up.
+pub(super) fn payload(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| {
             let index = index as u64;
@@ -80,12 +82,12 @@ fn payload(seed: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Encodes a fixture archive in memory.
+// Encodes a fixture archive in memory.
 fn build_7z(entries: &[Entry], method: EncoderMethod, password: Option<&str>) -> Vec<u8> {
     build_7z_shaped(entries, method, password, false)
 }
 
-fn build_7z_shaped(
+pub(super) fn build_7z_shaped(
     entries: &[Entry],
     method: EncoderMethod,
     password: Option<&str>,
@@ -126,11 +128,11 @@ fn build_7z_shaped(
     writer.finish().expect("finish the archive").into_inner()
 }
 
-/// Cuts one container into `count` posted volumes, the way a 7z set is made:
-/// a pure byte split at a fixed size, with no per-volume header. The last
-/// volume is whatever is left, so an `archive` that does not divide evenly
-/// produces the short tail real sets have.
-fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
+// Cuts one container into `count` posted volumes, the way a 7z set is made:
+// a pure byte split at a fixed size, with no per-volume header. The last
+// volume is whatever is left, so an `archive` that does not divide evenly
+// produces the short tail real sets have.
+pub(super) fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
     assert!(count >= 1);
     if count == 1 {
         return vec![("silver.horizon.7z".to_string(), archive.to_vec())];
@@ -148,21 +150,21 @@ fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// [`direct_store_job_spec`] with the volumes' lengths stated **exactly**.
-///
-/// The shared helper pads each segment's `bytes=` with yEnc overhead, which is
-/// what an NZB carries; a 7z set instead needs the decoded length its articles'
-/// yEnc headers state, because the volumes are a byte split of one container
-/// and their lengths are the only way a container offset becomes a (volume,
-/// offset) pair. The test harness drives the yEnc layout from the assembly's
-/// total, so the spec is where the true length has to be put.
-fn sevenz_job_spec(volumes: &[(String, Vec<u8>)], articles: usize) -> JobSpec {
+// [`direct_store_job_spec`] with the volumes' lengths stated **exactly**.
+//
+// The shared helper pads each segment's `bytes=` with yEnc overhead, which is
+// what an NZB carries; a 7z set instead needs the decoded length its articles'
+// yEnc headers state, because the volumes are a byte split of one container
+// and their lengths are the only way a container offset becomes a (volume,
+// offset) pair. The test harness drives the yEnc layout from the assembly's
+// total, so the spec is where the true length has to be put.
+pub(super) fn sevenz_job_spec(volumes: &[(String, Vec<u8>)], articles: usize) -> JobSpec {
     sevenz_job_spec_stating(volumes, articles, |decoded| decoded)
 }
 
-/// [`sevenz_job_spec`] with each segment's `bytes=` passed through `stated`,
-/// for a test that needs the NZB to say something other than the exact decoded
-/// length — an encoded size, the way a real NZB states it.
+// [`sevenz_job_spec`] with each segment's `bytes=` passed through `stated`,
+// for a test that needs the NZB to say something other than the exact decoded
+// length — an encoded size, the way a real NZB states it.
 fn sevenz_job_spec_stating(
     volumes: &[(String, Vec<u8>)],
     articles: usize,
@@ -197,11 +199,11 @@ fn sevenz_job_spec_stating(
     }
 }
 
-/// [`submit_volume_article_of`] with the article's yEnc header stating a file
-/// size of the caller's choosing.
-///
-/// `0` is what the decoder reports for an article whose `=ybegin` carries no
-/// `size=` at all, so it is how a volume that states nothing is posted here.
+// [`submit_volume_article_of`] with the article's yEnc header stating a file
+// size of the caller's choosing.
+//
+// `0` is what the decoder reports for an article whose `=ybegin` carries no
+// `size=` at all, so it is how a volume that states nothing is posted here.
 async fn submit_volume_article_declaring(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -260,25 +262,25 @@ async fn submit_volume_article_declaring(
     settle_direct_placement_work(pipeline).await;
 }
 
-/// What one 7z gate run produced.
+// What one 7z gate run produced.
 struct SevenZipOutcome {
     status: Option<JobStatus>,
     sets: String,
-    /// Destination contents by name, for whatever the run was asked to read.
+    // Destination contents by name, for whatever the run was asked to read.
     files: BTreeMap<String, Option<Vec<u8>>>,
-    /// Whether any destination name resolved to a directory.
+    // Whether any destination name resolved to a directory.
     directories: BTreeMap<String, bool>,
-    /// The most bytes the working directory held at any point in the run.
+    // The most bytes the working directory held at any point in the run.
     peak_working_bytes: u64,
-    /// What the destination holds once the run has finished.
+    // What the destination holds once the run has finished.
     installed_bytes: u64,
 }
 
-/// Every payload byte resident under `root`. Sparse files are read through
-/// their apparent length, which is the number this measurement wants: what the
-/// subsystem asked the filesystem to hold, not what the filesystem chose to
-/// allocate for it. Weaver's own dot-prefixed directory markers are not
-/// payload and do not count.
+// Every payload byte resident under `root`. Sparse files are read through
+// their apparent length, which is the number this measurement wants: what the
+// subsystem asked the filesystem to hold, not what the filesystem chose to
+// allocate for it. Weaver's own dot-prefixed directory markers are not
+// payload and do not count.
 fn bytes_on_disk(root: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
@@ -296,23 +298,23 @@ fn bytes_on_disk(root: &std::path::Path) -> u64 {
 
 const ARTICLES_PER_VOLUME: usize = 2;
 
-/// Every distinct shape the job's direct sets passed through, in the order it
-/// was seen.
-///
-/// A verdict is not a state a set rests in. Demoting one hands its volumes
-/// back and retires the set, so a run that states a refusal usually has
-/// nothing left to read it off by the time it ends. Asking the live list
-/// afterwards therefore asks whether the read happened to fall inside that
-/// window — a question about how busy the machine was, not about what the
-/// router decided. This is the record the window cannot close on.
+// Every distinct shape the job's direct sets passed through, in the order it
+// was seen.
+//
+// A verdict is not a state a set rests in. Demoting one hands its volumes
+// back and retires the set, so a run that states a refusal usually has
+// nothing left to read it off by the time it ends. Asking the live list
+// afterwards therefore asks whether the read happened to fall inside that
+// window — a question about how busy the machine was, not about what the
+// router decided. This is the record the window cannot close on.
 #[derive(Default)]
 struct SetWitness {
     seen: Vec<String>,
 }
 
 impl SetWitness {
-    /// Takes the sets' shape as it stands, keeping it when it differs from the
-    /// last one taken.
+    // Takes the sets' shape as it stands, keeping it when it differs from the
+    // last one taken.
     fn observe(&mut self, pipeline: &Pipeline, job_id: JobId) {
         let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
         if self.seen.last() != Some(&shape) {
@@ -320,7 +322,7 @@ impl SetWitness {
         }
     }
 
-    /// Whether any shape the run passed through carried `marker`.
+    // Whether any shape the run passed through carried `marker`.
     fn contains(&self, marker: &str) -> bool {
         self.seen.iter().any(|shape| shape.contains(marker))
     }
@@ -330,11 +332,11 @@ impl SetWitness {
     }
 }
 
-/// Drains the asynchronous work a verdict starts of its own accord, recording
-/// the sets on either side of it.
-///
-/// Both of these wait on a channel rather than on a number of turns, so what
-/// they leave behind is the same whatever else the machine is running.
+// Drains the asynchronous work a verdict starts of its own accord, recording
+// the sets on either side of it.
+//
+// Both of these wait on a channel rather than on a number of turns, so what
+// they leave behind is the same whatever else the machine is running.
 async fn settle_sevenz_verdict(pipeline: &mut Pipeline, job_id: JobId, witness: &mut SetWitness) {
     witness.observe(pipeline, job_id);
     settle_direct_post_repair_work(pipeline).await;
@@ -343,12 +345,12 @@ async fn settle_sevenz_verdict(pipeline: &mut Pipeline, job_id: JobId, witness: 
     witness.observe(pipeline, job_id);
 }
 
-/// Everything a turn would have to change for the run to have moved at all.
-///
-/// Nothing in it is a clock. A turn that leaves all of it identical moved
-/// nothing, and because the turn that produced it first drained every channel
-/// and waited out everything in flight, there is nothing left for a further
-/// turn to pick up.
+// Everything a turn would have to change for the run to have moved at all.
+//
+// Nothing in it is a clock. A turn that leaves all of it identical moved
+// nothing, and because the turn that produced it first drained every channel
+// and waited out everything in flight, there is nothing left for a further
+// turn to pick up.
 fn sevenz_run_fingerprint(pipeline: &Pipeline, job_id: JobId, working_bytes: u64) -> String {
     format!(
         "{:?}|{:?}|{}|{:?}|{}|{}|{working_bytes}",
@@ -364,17 +366,17 @@ fn sevenz_run_fingerprint(pipeline: &Pipeline, job_id: JobId, working_bytes: u64
     )
 }
 
-/// Services the pipeline's own queues until the run has produced what the
-/// caller came for.
-///
-/// Three things end it and none of them is a number of turns. A job that
-/// reaches a terminal status is finished. A run whose whole subject is a
-/// verdict ends as soon as `awaited` appears in the witness. And a turn that
-/// drained every channel, waited out everything in flight and still changed
-/// nothing has proved there is no further progress to be had. Counting turns
-/// instead would make the outcome a function of how loaded the machine is:
-/// a demotion sweeps and hands back off-thread, and a fixed count can stop on
-/// either side of that.
+// Services the pipeline's own queues until the run has produced what the
+// caller came for.
+//
+// Three things end it and none of them is a number of turns. A job that
+// reaches a terminal status is finished. A run whose whole subject is a
+// verdict ends as soon as `awaited` appears in the witness. And a turn that
+// drained every channel, waited out everything in flight and still changed
+// nothing has proved there is no further progress to be had. Counting turns
+// instead would make the outcome a function of how loaded the machine is:
+// a demotion sweeps and hands back off-thread, and a fixed count can stop on
+// either side of that.
 async fn drive_sevenz(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -428,13 +430,13 @@ async fn run_sevenz_gate(
     run_sevenz_gate_declaring(job_id, volumes, &BTreeMap::new(), arrivals, wanted).await
 }
 
-/// [`run_sevenz_gate`] with the length some volumes' articles *declare* chosen
-/// by the caller, by volume index.
-///
-/// The NZB stays honest and every article carries its real bytes; what changes
-/// is the one number a container's geometry is hinted by. `=ybegin size=` is a
-/// declaration, not a measurement, and this is the only way to post one that
-/// is wrong without also making the posting inconsistent with itself.
+// [`run_sevenz_gate`] with the length some volumes' articles *declare* chosen
+// by the caller, by volume index.
+//
+// The NZB stays honest and every article carries its real bytes; what changes
+// is the one number a container's geometry is hinted by. `=ybegin size=` is a
+// declaration, not a measurement, and this is the only way to post one that
+// is wrong without also making the posting inconsistent with itself.
 async fn run_sevenz_gate_declaring(
     job_id: JobId,
     volumes: &[(String, Vec<u8>)],
@@ -445,14 +447,14 @@ async fn run_sevenz_gate_declaring(
     run_sevenz_gate_awaiting(job_id, volumes, declared, arrivals, wanted, None).await
 }
 
-/// [`run_sevenz_gate_declaring`] for a run whose subject is a verdict rather
-/// than a finished job.
-///
-/// `awaited` is the substring of a set's shape the caller is going to assert
-/// on. A demotion leaves the job needing volumes this harness has no server to
-/// refetch from, so such a run never reaches a terminal status and there is
-/// nothing else for it to stop on; naming the verdict is what makes the stop
-/// an observation rather than a guess.
+// [`run_sevenz_gate_declaring`] for a run whose subject is a verdict rather
+// than a finished job.
+//
+// `awaited` is the substring of a set's shape the caller is going to assert
+// on. A demotion leaves the job needing volumes this harness has no server to
+// refetch from, so such a run never reaches a terminal status and there is
+// nothing else for it to stop on; naming the verdict is what makes the stop
+// an observation rather than a guess.
 async fn run_sevenz_gate_awaiting(
     job_id: JobId,
     volumes: &[(String, Vec<u8>)],
@@ -473,9 +475,9 @@ async fn run_sevenz_gate_awaiting(
     .await
 }
 
-/// [`run_sevenz_gate_awaiting`] with `prepare` run just before the last
-/// arrival — once the set is planned, and before it can finalize — so a test
-/// can arrange the filesystem finalization will meet.
+// [`run_sevenz_gate_awaiting`] with `prepare` run just before the last
+// arrival — once the set is planned, and before it can finalize — so a test
+// can arrange the filesystem finalization will meet.
 async fn run_sevenz_gate_prepared(
     job_id: JobId,
     volumes: &[(String, Vec<u8>)],
@@ -577,7 +579,7 @@ async fn run_sevenz_gate_prepared(
     }
 }
 
-/// Arrival plans over `volumes` volumes at two articles each.
+// Arrival plans over `volumes` volumes at two articles each.
 fn tail_first(volume_count: usize) -> Vec<(u32, u32)> {
     let last = volume_count as u32 - 1;
     let mut plan = vec![(last, 1), (last, 0)];
@@ -695,13 +697,13 @@ async fn sevenz_store_routes_two_members() {
     );
 }
 
-/// What the whole subsystem is for, stated as a number.
-///
-/// The conventional path writes the container and then writes the member again
-/// as it extracts, so the working directory holds both at once. Routing writes
-/// the member once and the container's non-member bytes — its headers — into a
-/// sparse envelope, so the most the directory ever holds is one copy of the
-/// payload plus the map that describes it.
+// What the whole subsystem is for, stated as a number.
+//
+// The conventional path writes the container and then writes the member again
+// as it extracts, so the working directory holds both at once. Routing writes
+// the member once and the container's non-member bytes — its headers — into a
+// sparse envelope, so the most the directory ever holds is one copy of the
+// payload plus the map that describes it.
 #[tokio::test]
 async fn sevenz_store_holds_one_copy_of_the_payload_and_no_container() {
     let member = payload(23, 120_000);
@@ -787,11 +789,11 @@ async fn sevenz_store_creates_entries_the_archive_stores_no_bytes_for() {
     );
 }
 
-/// An entry the archive declares must be produced or the set must not count as
-/// extracted. A dataless entry whose creation fails — here its parent path is
-/// already a regular file — fails the job rather than finishing it without the
-/// entry. It does not demote: the refusal is the destination's, and refetching
-/// the set for the conventional extractor would only meet it again.
+// An entry the archive declares must be produced or the set must not count as
+// extracted. A dataless entry whose creation fails — here its parent path is
+// already a regular file — fails the job rather than finishing it without the
+// entry. It does not demote: the refusal is the destination's, and refetching
+// the set for the conventional extractor would only meet it again.
 #[tokio::test]
 async fn sevenz_store_fails_the_job_when_a_dataless_entry_cannot_be_created() {
     let member = payload(19, 20_000);
@@ -839,9 +841,9 @@ async fn sevenz_store_fails_the_job_when_a_dataless_entry_cannot_be_created() {
     );
 }
 
-/// A member the destination refuses — here a directory already stands at its
-/// path — fails the job. Demoting would refetch the whole set only for the
-/// conventional extractor to meet the same refusal.
+// A member the destination refuses — here a directory already stands at its
+// path — fails the job. Demoting would refetch the whole set only for the
+// conventional extractor to meet the same refusal.
 #[tokio::test]
 async fn sevenz_store_fails_the_job_when_the_destination_refuses_a_member() {
     let member = payload(21, 20_000);
@@ -881,10 +883,10 @@ async fn sevenz_store_fails_the_job_when_the_destination_refuses_a_member() {
     );
 }
 
-/// A member whose directory the destination refuses — here a regular file
-/// stands where the directory belongs — fails the job on its first routed
-/// write. Demoting would refetch the set only for the conventional extractor to
-/// meet the same file in the same place.
+// A member whose directory the destination refuses — here a regular file
+// stands where the directory belongs — fails the job on its first routed
+// write. Demoting would refetch the set only for the conventional extractor to
+// meet the same file in the same place.
 #[tokio::test]
 async fn sevenz_store_fails_the_job_when_a_member_directory_is_refused() {
     let member = payload(22, 20_000);
@@ -931,10 +933,10 @@ async fn sevenz_store_fails_the_job_when_a_member_directory_is_refused() {
     );
 }
 
-/// An archive of nothing but empty files and the directories they sit in has
-/// no member to route and none to verify, so a set could never finalize on
-/// it. The route is declined on the map, which hands the archive to the
-/// conventional extractor to create the entries.
+// An archive of nothing but empty files and the directories they sit in has
+// no member to route and none to verify, so a set could never finalize on
+// it. The route is declined on the map, which hands the archive to the
+// conventional extractor to create the entries.
 #[tokio::test]
 async fn sevenz_store_declines_an_archive_that_stores_no_bytes_at_all() {
     let archive = build_7z(
@@ -962,11 +964,11 @@ async fn sevenz_store_declines_an_archive_that_stores_no_bytes_at_all() {
     );
 }
 
-/// The eligibility matrix. Every shape here is one direct routing must decline
-/// **as a whole set**: a 7z block is the unit of coding, so tolerating one
-/// entry would mean decoding a container that has already been routed away.
-/// Declining hands the archive to the conventional extractor with its volumes
-/// still on disk, which is why each of these still finishes.
+// The eligibility matrix. Every shape here is one direct routing must decline
+// **as a whole set**: a 7z block is the unit of coding, so tolerating one
+// entry would mean decoding a container that has already been routed away.
+// Declining hands the archive to the conventional extractor with its volumes
+// still on disk, which is why each of these still finishes.
 #[tokio::test]
 async fn sevenz_store_declines_what_it_cannot_route() {
     let member = payload(17, 30_000);
@@ -1047,12 +1049,12 @@ async fn sevenz_store_declines_what_it_cannot_route() {
     }
 }
 
-/// A volume whose posted length disagrees with the place the geometry gives
-/// it. The part size and the total are volume zero's to state; every other
-/// volume's declaration is checked against them, and the first one that
-/// disagrees ends the route before a byte is written against a map that does
-/// not close. Here the container carries 64 bytes past its own end header, so
-/// the last volume is that much longer than its place allows.
+// A volume whose posted length disagrees with the place the geometry gives
+// it. The part size and the total are volume zero's to state; every other
+// volume's declaration is checked against them, and the first one that
+// disagrees ends the route before a byte is written against a map that does
+// not close. Here the container carries 64 bytes past its own end header, so
+// the last volume is that much longer than its place allows.
 #[tokio::test]
 async fn sevenz_store_declines_a_volume_whose_length_does_not_close_the_container() {
     let member = payload(19, 30_000);
@@ -1090,16 +1092,16 @@ async fn sevenz_store_declines_a_volume_whose_length_does_not_close_the_containe
     );
 }
 
-/// The same container with every stored CRC32 taken out of its end header.
-///
-/// 7z member checksums are optional and a writer that omits them produces a
-/// perfectly ordinary archive, but `sevenz_turbo`'s writer always records one,
-/// so the fixture has to be edited after the fact. All of a single-block
-/// archive's digests live in one place — the SubStreamsInfo's `kCRC` property —
-/// so removing it is a single, well-defined substitution, after which the end
-/// header's own two checksums are recomputed. Every checksum written here is
-/// **computed**, never a literal: a typed CRC is a fixture that agrees with
-/// itself and with nothing else.
+// The same container with every stored CRC32 taken out of its end header.
+//
+// 7z member checksums are optional and a writer that omits them produces a
+// perfectly ordinary archive, but `sevenz_turbo`'s writer always records one,
+// so the fixture has to be edited after the fact. All of a single-block
+// archive's digests live in one place — the SubStreamsInfo's `kCRC` property —
+// so removing it is a single, well-defined substitution, after which the end
+// header's own two checksums are recomputed. Every checksum written here is
+// **computed**, never a literal: a typed CRC is a fixture that agrees with
+// itself and with nothing else.
 fn strip_member_crcs(archive: &[u8], member: &[u8]) -> Vec<u8> {
     const K_END: u8 = 0x00;
     const K_HEADER: u8 = 0x01;
@@ -1146,18 +1148,18 @@ fn strip_member_crcs(archive: &[u8], member: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A 7z set that is interrupted mid-download restarts correctly.
-///
-/// The map is cached, so the restart costs one article and not a container.
-///
-/// A 7z set's header bytes sit below the published floors, so they are never
-/// refetched and the map cannot be re-read from the wire; it is cached on the
-/// same rows the volume lengths are, and restore re-resolves the one against
-/// the other. Three things had to hold for that to be reachable: conventional
-/// discovery must not delete rows for a set whose volumes are deliberately not
-/// files, the checkpoint's volume claims must be validated against the lengths
-/// rather than against RAR volume headers, and a restored container volume is
-/// confirmed by its map rather than by a per-volume walk it never had.
+// A 7z set that is interrupted mid-download restarts correctly.
+//
+// The map is cached, so the restart costs one article and not a container.
+//
+// A 7z set's header bytes sit below the published floors, so they are never
+// refetched and the map cannot be re-read from the wire; it is cached on the
+// same rows the volume lengths are, and restore re-resolves the one against
+// the other. Three things had to hold for that to be reachable: conventional
+// discovery must not delete rows for a set whose volumes are deliberately not
+// files, the checkpoint's volume claims must be validated against the lengths
+// rather than against RAR volume headers, and a restored container volume is
+// confirmed by its map rather than by a per-volume walk it never had.
 #[tokio::test]
 async fn a_sevenz_set_restarts_without_materializing_a_volume() {
     restart_a_sevenz_set(
@@ -1170,23 +1172,23 @@ async fn a_sevenz_set_restarts_without_materializing_a_volume() {
     .await;
 }
 
-/// The same restart with the NZB stating its segments the way a real one does:
-/// the yEnc-**encoded** size, a few percent over the payload.
-///
-/// Restore commits the skipped segments into the assembly at that stated size,
-/// so the restored volumes read a few percent longer than the part size the
-/// geometry requires. The length check is the authoritative one for a
-/// container volume, and taken at that number it would demote a set whose
-/// bytes are exactly where the map placed them — a whole-set materialization
-/// and redownload after every restart, for arithmetic. A restored volume's
-/// honest length is its coverage end, which is what the check must be given.
-///
-/// Four articles a volume, the last one withheld: the decoded floor vouches
-/// for the first two at their **encoded** size, the restore asks for the other
-/// two (the third is durable, but the encoded walk cannot prove it — the
-/// documented cost of the floor convention, shared with every format), and the
-/// volume completes at an encoded prefix plus a decoded remainder, a few
-/// hundred bytes over what the map says it is.
+// The same restart with the NZB stating its segments the way a real one does:
+// the yEnc-**encoded** size, a few percent over the payload.
+//
+// Restore commits the skipped segments into the assembly at that stated size,
+// so the restored volumes read a few percent longer than the part size the
+// geometry requires. The length check is the authoritative one for a
+// container volume, and taken at that number it would demote a set whose
+// bytes are exactly where the map placed them — a whole-set materialization
+// and redownload after every restart, for arithmetic. A restored volume's
+// honest length is its coverage end, which is what the check must be given.
+//
+// Four articles a volume, the last one withheld: the decoded floor vouches
+// for the first two at their **encoded** size, the restore asks for the other
+// two (the third is durable, but the encoded walk cannot prove it — the
+// documented cost of the floor convention, shared with every format), and the
+// volume completes at an encoded prefix plus a decoded remainder, a few
+// hundred bytes over what the map says it is.
 #[tokio::test]
 async fn a_restarted_sevenz_set_is_not_demoted_for_its_encoded_segment_sizes() {
     let witness = restart_a_sevenz_set(
@@ -1204,11 +1206,11 @@ async fn a_restarted_sevenz_set_is_not_demoted_for_its_encoded_segment_sizes() {
     );
 }
 
-/// The wholly missing volume again, protected by PAR3 rather than PAR2. The
-/// 7z set's geometry and map are the same; what differs is the repair seam —
-/// PAR3's readback routes the rebuilt volume slice by slice and confirms it
-/// through `note_volume_complete` itself — so both the middle and the tail
-/// absence are driven through it.
+// The wholly missing volume again, protected by PAR3 rather than PAR2. The
+// 7z set's geometry and map are the same; what differs is the repair seam —
+// PAR3's readback routes the rebuilt volume slice by slice and confirms it
+// through `note_volume_complete` itself — so both the middle and the tail
+// absence are driven through it.
 async fn a_wholly_missing_sevenz_volume_under_par3(
     job_id: JobId,
     missing: u32,
@@ -1308,12 +1310,12 @@ async fn sevenz_store_par3_rebuilds_a_wholly_missing_tail_volume() {
     );
 }
 
-/// Downloads all but one mid-container article, shuts down, restores, and
-/// drives the restored set to its end; returns the shapes it passed through.
-///
-/// `expected_queue` is what the restore may ask for again: the withheld
-/// article, plus whatever durable neighbours the encoded-size walk cannot
-/// prove covered.
+// Downloads all but one mid-container article, shuts down, restores, and
+// drives the restored set to its end; returns the shapes it passed through.
+//
+// `expected_queue` is what the restore may ask for again: the withheld
+// article, plus whatever durable neighbours the encoded-size walk cannot
+// prove covered.
 async fn restart_a_sevenz_set(
     job_id: JobId,
     articles: usize,
@@ -1357,6 +1359,7 @@ async fn restart_a_sevenz_set(
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -1443,15 +1446,15 @@ async fn restart_a_sevenz_set(
     witness
 }
 
-/// A member the archive records no checksum for publishes on the recovery
-/// set's verdict — and on nothing before it.
-///
-/// The ordering is the whole point. Full coverage marks such a member verified,
-/// because coverage of the declared size is the only evidence direct routing
-/// has, but `finalize_ready_direct_sets` refuses to commit any set of a
-/// par2-bearing job until that job is verified or bypassed. So an article that
-/// never arrives is repaired *first* and published *after*, rather than
-/// published on coverage and corrected afterwards.
+// A member the archive records no checksum for publishes on the recovery
+// set's verdict — and on nothing before it.
+//
+// The ordering is the whole point. Full coverage marks such a member verified,
+// because coverage of the declared size is the only evidence direct routing
+// has, but `finalize_ready_direct_sets` refuses to commit any set of a
+// par2-bearing job until that job is verified or bypassed. So an article that
+// never arrives is repaired *first* and published *after*, rather than
+// published on coverage and corrected afterwards.
 #[tokio::test]
 async fn sevenz_store_member_without_crc_finalizes_on_par2() {
     let member = payload(23, 24_000);
@@ -1556,8 +1559,8 @@ async fn sevenz_store_member_without_crc_finalizes_on_par2() {
     );
 }
 
-/// What a run with one whole volume withheld and a recovery set on hand left
-/// behind.
+// What a run with one whole volume withheld and a recovery set on hand left
+// behind.
 struct MissingVolumeRun {
     pipeline: Pipeline,
     _temp_dir: tempfile::TempDir,
@@ -1568,9 +1571,9 @@ struct MissingVolumeRun {
     job_id: JobId,
 }
 
-/// Downloads every article of a three-volume set except those of
-/// `missing_volume`, hands the job its recovery set, and drives it to a
-/// terminal status.
+// Downloads every article of a three-volume set except those of
+// `missing_volume`, hands the job its recovery set, and drives it to a
+// terminal status.
 async fn run_with_a_wholly_missing_volume(job_id: JobId, missing_volume: u32) -> MissingVolumeRun {
     let member = payload(37, 30_000);
     let second = payload(41, 6_000);
@@ -1706,8 +1709,8 @@ impl MissingVolumeRun {
         self.witness.seen.join("\n")
     }
 
-    /// Every member the archive holds is on disk under the job's output root,
-    /// byte for byte.
+    // Every member the archive holds is on disk under the job's output root,
+    // byte for byte.
     fn assert_members_published(&self) {
         let sets = self.sets();
         for (name, expected) in &self.members {
@@ -1720,16 +1723,16 @@ impl MissingVolumeRun {
     }
 }
 
-/// A **whole** middle volume that never arrives is rebuilt by the recovery set
-/// and routed back into the live direct set: the members are published from
-/// the set's own partials, the set never demotes, and only the missing volume
-/// is ever materialized — under a scratch name, not its own.
-///
-/// This is the hole a byte-split container is most exposed to: nothing in the
-/// missing volume is a header, so the set has no fact about it beyond the
-/// geometry volume 0 states and the tail's end header. Every byte of it is a
-/// member extent that PAR2 alone can supply, and the repair must land those
-/// bytes through the same layout the downloaded volumes were routed through.
+// A **whole** middle volume that never arrives is rebuilt by the recovery set
+// and routed back into the live direct set: the members are published from
+// the set's own partials, the set never demotes, and only the missing volume
+// is ever materialized — under a scratch name, not its own.
+//
+// This is the hole a byte-split container is most exposed to: nothing in the
+// missing volume is a header, so the set has no fact about it beyond the
+// geometry volume 0 states and the tail's end header. Every byte of it is a
+// member extent that PAR2 alone can supply, and the repair must land those
+// bytes through the same layout the downloaded volumes were routed through.
 #[tokio::test]
 async fn sevenz_store_par2_rebuilds_a_wholly_missing_middle_volume() {
     let missing_volume = 1u32;
@@ -1761,12 +1764,12 @@ async fn sevenz_store_par2_rebuilds_a_wholly_missing_middle_volume() {
     run.assert_members_published();
 }
 
-/// A **whole** tail volume that never arrives takes the end header with it, so
-/// the set can never read its map and demotes — by design, not by accident.
-/// What the demotion must then deliver is the ordinary path: the downloaded
-/// volumes hand back to disk, the recovery set rebuilds the missing one there,
-/// and extraction publishes every member whole. A missing file is repaired
-/// either way; only *where* the repair lands differs.
+// A **whole** tail volume that never arrives takes the end header with it, so
+// the set can never read its map and demotes — by design, not by accident.
+// What the demotion must then deliver is the ordinary path: the downloaded
+// volumes hand back to disk, the recovery set rebuilds the missing one there,
+// and extraction publishes every member whole. A missing file is repaired
+// either way; only *where* the repair lands differs.
 #[tokio::test]
 async fn sevenz_store_par2_rebuilds_a_wholly_missing_tail_volume_after_demotion() {
     let run = run_with_a_wholly_missing_volume(JobId(9_608), 2).await;
@@ -1787,12 +1790,12 @@ async fn sevenz_store_par2_rebuilds_a_wholly_missing_tail_volume_after_demotion(
     run.assert_members_published();
 }
 
-/// The fixtures themselves, read back through the library at full size.
-///
-/// A routing refusal and a fixture the library cannot read look identical from
-/// the outside, so this pins the difference: every archive these tests build is
-/// a valid 7z that parses from a complete image. What weaver then decides about
-/// it is the subject of the scenarios above.
+// The fixtures themselves, read back through the library at full size.
+//
+// A routing refusal and a fixture the library cannot read look identical from
+// the outside, so this pins the difference: every archive these tests build is
+// a valid 7z that parses from a complete image. What weaver then decides about
+// it is the subject of the scenarios above.
 #[test]
 fn every_fixture_is_a_readable_archive() {
     let member = payload(29, 12_000);
@@ -1870,7 +1873,7 @@ fn every_fixture_is_a_readable_archive() {
     }
 }
 
-/// [`sevenz_job_spec`] for a set the job carries a password for.
+// [`sevenz_job_spec`] for a set the job carries a password for.
 fn sevenz_job_spec_with_password(
     volumes: &[(String, Vec<u8>)],
     articles: usize,
@@ -1881,12 +1884,12 @@ fn sevenz_job_spec_with_password(
     spec
 }
 
-/// The same container with one byte of its end header flipped.
-///
-/// The signature header still places the end header exactly at the container's
-/// last byte, so the geometry closes and the bytes are all there; what no
-/// longer holds is the end header's own content. Nothing about that changes
-/// when the rest of the container arrives.
+// The same container with one byte of its end header flipped.
+//
+// The signature header still places the end header exactly at the container's
+// last byte, so the geometry closes and the bytes are all there; what no
+// longer holds is the end header's own content. Nothing about that changes
+// when the rest of the container arrives.
 fn corrupt_end_header(archive: &[u8]) -> Vec<u8> {
     let mut out = archive.to_vec();
     let offset = u64::from_le_bytes(out[12..20].try_into().expect("eight bytes")) as usize;
@@ -1897,32 +1900,32 @@ fn corrupt_end_header(archive: &[u8]) -> Vec<u8> {
 
 const SIGNATURE_HEADER_LEN: usize = 32;
 
-/// What makes a split container routable at all rather than merely readable.
-///
-/// A split container is a byte split at a fixed part size, so its whole
-/// geometry follows from two facts, and volume zero's front carries both: the
-/// part size is that volume's own yEnc length, and the total is in the 32-byte
-/// start header at its offset zero. Everything else — where each volume begins
-/// in container coordinates, how long the short tail is — is arithmetic over
-/// those two. The one thing they do not give is the map, which sits in the end
-/// header at the very last byte of the set.
-///
-/// So the set reaches past its own retention limit for two articles and no
-/// others: volume zero's front and the last volume's tail. Nothing is asked of
-/// the volumes in between, and nothing they could say would be waited on — a
-/// set that waited for every volume to declare a length would hold the whole
-/// container as holds before a byte routed, which is the opposite of what
-/// direct routing is for.
-///
-/// The arrangement below is what makes that visible. Volume zero's articles
-/// arrive before the limit tightens and stage as holds, because there is no map
-/// to route them against; from there nothing fits, and the only article the set
-/// can be handed is the one it reaches past the limit for.
+// What makes a split container routable at all rather than merely readable.
+//
+// A split container is a byte split at a fixed part size, so its whole
+// geometry follows from two facts, and volume zero's front carries both: the
+// part size is that volume's own yEnc length, and the total is in the 32-byte
+// start header at its offset zero. Everything else — where each volume begins
+// in container coordinates, how long the short tail is — is arithmetic over
+// those two. The one thing they do not give is the map, which sits in the end
+// header at the very last byte of the set.
+//
+// So the set reaches past its own retention limit for two articles and no
+// others: volume zero's front and the last volume's tail. Nothing is asked of
+// the volumes in between, and nothing they could say would be waited on — a
+// set that waited for every volume to declare a length would hold the whole
+// container as holds before a byte routed, which is the opposite of what
+// direct routing is for.
+//
+// The arrangement below is what makes that visible. Volume zero's articles
+// arrive before the limit tightens and stage as holds, because there is no map
+// to route them against; from there nothing fits, and the only article the set
+// can be handed is the one it reaches past the limit for.
 #[tokio::test]
 async fn sevenz_store_probes_the_container_ends_rather_than_staging_it() {
     const VOLUMES: usize = 4;
     const ARTICLES: usize = 20;
-    /// Articles of the first volume that land before the limit tightens.
+    // Articles of the first volume that land before the limit tightens.
     const HELD: u32 = 16;
     let job_id = JobId(9_608);
     let member = payload(37, 32_600);
@@ -2081,13 +2084,13 @@ async fn sevenz_store_probes_the_container_ends_rather_than_staging_it() {
     );
 }
 
-/// An end header that is entirely present and still does not parse is a
-/// verdict, not a shortage.
-///
-/// The distinction is what keeps a malformed container from costing a set its
-/// whole holds budget: the reader cannot tell a hole in the sparse image from
-/// the end of a file, so without it every parse error would read as "wait for
-/// more" until there was nothing left to wait for.
+// An end header that is entirely present and still does not parse is a
+// verdict, not a shortage.
+//
+// The distinction is what keeps a malformed container from costing a set its
+// whole holds budget: the reader cannot tell a hole in the sparse image from
+// the end of a file, so without it every parse error would read as "wait for
+// more" until there was nothing left to wait for.
 #[tokio::test]
 async fn sevenz_store_declines_an_end_header_it_cannot_parse() {
     let member = payload(43, 30_000);
@@ -2129,14 +2132,14 @@ async fn sevenz_store_declines_an_end_header_it_cannot_parse() {
     );
 }
 
-/// A header-encrypted container opens with the job's password.
-///
-/// `-mhe` puts the map itself in an encrypted block, so with no key there is
-/// nothing to route and nothing to say about the archive beyond that. With the
-/// key the map reads, and the verdict moves to what the map actually says:
-/// `7z a -mhe=on -p` encrypts the content too, and an encrypted stored member
-/// is reported rather than routed. Reaching that refusal is the proof the
-/// header opened.
+// A header-encrypted container opens with the job's password.
+//
+// `-mhe` puts the map itself in an encrypted block, so with no key there is
+// nothing to route and nothing to say about the archive beyond that. With the
+// key the map reads, and the verdict moves to what the map actually says:
+// `7z a -mhe=on -p` encrypts the content too, and an encrypted stored member
+// is reported rather than routed. Reaching that refusal is the proof the
+// header opened.
 #[tokio::test]
 async fn sevenz_store_opens_a_header_encrypted_container_with_the_job_password() {
     let member = payload(47, 30_000);
@@ -2178,8 +2181,8 @@ async fn sevenz_store_opens_a_header_encrypted_container_with_the_job_password()
     );
 }
 
-/// Drives a `-mhe` container to a verdict with the job's password picture set
-/// by its spec and its persisted NZB, which is what the harvest reads.
+// Drives a `-mhe` container to a verdict with the job's password picture set
+// by its spec and its persisted NZB, which is what the harvest reads.
 async fn header_encrypted_verdict(
     job_id: JobId,
     archive_password: &str,
@@ -2217,13 +2220,13 @@ async fn header_encrypted_verdict(
     witness.render()
 }
 
-/// The key is in the NZB's meta and the spec carries an operator's guess.
-///
-/// The spec's password is only the *first* of the job's candidates. Reading it
-/// alone refuses a container for a password the job was holding all along —
-/// which is the same reason the `-hp` gate is offered the whole harvest rather
-/// than `spec.password`. Reaching the content refusal is the proof the meta
-/// candidate was tried after the guess was refuted.
+// The key is in the NZB's meta and the spec carries an operator's guess.
+//
+// The spec's password is only the *first* of the job's candidates. Reading it
+// alone refuses a container for a password the job was holding all along —
+// which is the same reason the `-hp` gate is offered the whole harvest rather
+// than `spec.password`. Reaching the content refusal is the proof the meta
+// candidate was tried after the guess was refuted.
 #[tokio::test]
 async fn sevenz_store_opens_a_container_keyed_by_the_nzb_meta_password() {
     let sets = header_encrypted_verdict(
@@ -2243,13 +2246,13 @@ async fn sevenz_store_opens_a_container_keyed_by_the_nzb_meta_password() {
     );
 }
 
-/// No candidate the job holds opens the header.
-///
-/// `EncryptedHeader` is then the whole verdict, and it is stated once for the
-/// list rather than per candidate — the same shape the `-hp` gate's
-/// `NoVerifiedCandidate` has, and sticky for the same reason: the set demotes,
-/// and the conventional extractor asks the same list again with nothing left
-/// for this router to add.
+// No candidate the job holds opens the header.
+//
+// `EncryptedHeader` is then the whole verdict, and it is stated once for the
+// list rather than per candidate — the same shape the `-hp` gate's
+// `NoVerifiedCandidate` has, and sticky for the same reason: the set demotes,
+// and the conventional extractor asks the same list again with nothing left
+// for this router to add.
 #[tokio::test]
 async fn sevenz_store_refuses_a_container_no_candidate_opens() {
     let sets = header_encrypted_verdict(
@@ -2269,14 +2272,14 @@ async fn sevenz_store_refuses_a_container_no_candidate_opens() {
     );
 }
 
-/// Runs a three-volume container with one volume terminally unavailable.
-///
-/// Every article of the set leaves the queue, the way leasing one empties it;
-/// the stranded volume's simply never come back — no result, no retry — which
-/// is what an article nothing will ever deliver looks like from here.
-///
-/// Returns the set's state twice: with the rest of the container landed and
-/// the stranded volume still owed, and again once nothing is owed at all.
+// Runs a three-volume container with one volume terminally unavailable.
+//
+// Every article of the set leaves the queue, the way leasing one empties it;
+// the stranded volume's simply never come back — no result, no retry — which
+// is what an article nothing will ever deliver looks like from here.
+//
+// Returns the set's state twice: with the rest of the container landed and
+// the stranded volume still owed, and again once nothing is owed at all.
 async fn sevenz_set_with_a_stranded_volume(job_id: JobId, stranded: u32) -> (String, String) {
     const VOLUMES: usize = 3;
     let member = payload(61, 36_000);
@@ -2347,14 +2350,14 @@ async fn sevenz_set_with_a_stranded_volume(job_id: JobId, stranded: u32) -> (Str
     (while_owed, starved.render())
 }
 
-/// The map lives in the last volume's last article. With that volume
-/// terminally unavailable there is nothing left that could ever read it.
-///
-/// Nothing else ends that wait. The probe planner skips a volume with nothing
-/// left to ask for, so the gate stays shut with no request outstanding to
-/// reopen it, and the holds ceilings only fire on a set big enough to reach
-/// them — this one is far too small. Before the sweep this was a job parked at
-/// its last article for good.
+// The map lives in the last volume's last article. With that volume
+// terminally unavailable there is nothing left that could ever read it.
+//
+// Nothing else ends that wait. The probe planner skips a volume with nothing
+// left to ask for, so the gate stays shut with no request outstanding to
+// reopen it, and the holds ceilings only fire on a set big enough to reach
+// them — this one is far too small. Before the sweep this was a job parked at
+// its last article for good.
 #[tokio::test]
 async fn a_sevenz_set_whose_tail_never_arrives_demotes() {
     let (_, sets) = sevenz_set_with_a_stranded_volume(JobId(9_614), 2).await;
@@ -2364,9 +2367,9 @@ async fn a_sevenz_set_whose_tail_never_arrives_demotes() {
     );
 }
 
-/// Volume zero carries both facts the geometry is derived from, so a set that
-/// never receives it never places its map either — the same verdict, reached
-/// from the other end of the container.
+// Volume zero carries both facts the geometry is derived from, so a set that
+// never receives it never places its map either — the same verdict, reached
+// from the other end of the container.
 #[tokio::test]
 async fn a_sevenz_set_whose_first_volume_never_arrives_demotes() {
     let (_, sets) = sevenz_set_with_a_stranded_volume(JobId(9_615), 0).await;
@@ -2376,12 +2379,12 @@ async fn a_sevenz_set_whose_first_volume_never_arrives_demotes() {
     );
 }
 
-/// A volume in the middle is a different case, and the distinction is the
-/// whole point of deriving the geometry from two facts instead of from every
-/// volume's declared length: nothing in the middle is needed to read the map.
-/// This set reads its map, routes what it has, and carries the shortfall
-/// forward as the ordinary one it is — bytes that have not arrived — rather
-/// than being parked waiting for a length it was never going to be told.
+// A volume in the middle is a different case, and the distinction is the
+// whole point of deriving the geometry from two facts instead of from every
+// volume's declared length: nothing in the middle is needed to read the map.
+// This set reads its map, routes what it has, and carries the shortfall
+// forward as the ordinary one it is — bytes that have not arrived — rather
+// than being parked waiting for a length it was never going to be told.
 #[tokio::test]
 async fn a_sevenz_set_missing_a_middle_volume_still_reads_its_map() {
     let (while_owed, starved) = sevenz_set_with_a_stranded_volume(JobId(9_616), 1).await;
@@ -2395,13 +2398,178 @@ async fn a_sevenz_set_missing_a_middle_volume_still_reads_its_map() {
     );
 }
 
-/// The completion gate's installed-members clause is 7z-only, in both of a RAR
-/// direct set's states.
-///
-/// A job whose archives are all RAR never reaches the readiness check the
-/// clause lives in — the completion gate sends it to the RAR check instead —
-/// so a RAR direct set has never needed it. Pinned here because the clause
-/// sits on a function a mixed job's RAR volumes do reach.
+// What a container set did around a terminal verdict on one article of its
+// last volume — `lost`, an ordinal of that volume, or none — while the rest
+// of the container kept arriving: the demotions it took, the shapes it went
+// through, and the most holds scratch it ever had written.
+//
+// A split set's last volume arrives after everything else, and a one-volume
+// set's closing article does; either way the closing article, unless it is
+// the one lost, lands last of all.
+async fn sevenz_set_around_a_lost_tail_article(
+    job_id: JobId,
+    volume_count: usize,
+    lost: Option<u32>,
+) -> (Vec<DemotionReason>, String, u64) {
+    const ARTICLES: usize = 20;
+    let closing = ARTICLES as u32 - 1;
+    let member = payload(43, 32_600);
+    let archive = build_7z(
+        &[Entry::file(MEMBER, member.clone())],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, volume_count);
+    let article = (volumes[0].1.len() as u64).div_ceil(ARTICLES as u64);
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    // Two articles of RAM, so whatever the set holds past them is paged out
+    // to its scratch, where it can be counted.
+    pipeline.direct_store.set_holds_budget(2 * article);
+    let spec = sevenz_job_spec(&volumes, ARTICLES);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let last = volumes.len() as u32 - 1;
+    let segment = |file_index: u32, segment_number: u32| SegmentId {
+        file_id: NzbFileId { job_id, file_index },
+        segment_number,
+    };
+
+    // The front, which states the part size and the start header.
+    take_queued_segment(&mut pipeline, job_id, segment(0, 0));
+    submit_volume_article_of(&mut pipeline, job_id, &volumes, 0, 0, ARTICLES).await;
+    // The tail probe's article, ruled missing on every server.
+    if let Some(lost) = lost {
+        take_queued_segment(&mut pipeline, job_id, segment(last, lost));
+        pipeline.book_failed_segment(segment(last, lost));
+    }
+    pipeline.settle_direct_end_header_verdicts().await;
+    let mut witness = SetWitness::default();
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+
+    // A split set whose closing article is lost has lost its whole last
+    // volume; otherwise the last volume follows the body, closing article
+    // last.
+    let tail: Vec<(u32, u32)> = if volume_count == 1 {
+        vec![(last, closing)]
+    } else {
+        (0..ARTICLES as u32)
+            .map(|article| (last, article))
+            .collect()
+    };
+    let body = (0..volumes.len() as u32)
+        .flat_map(|file_index| (0..ARTICLES as u32).map(move |article| (file_index, article)))
+        .filter(|arrival| *arrival != (0, 0) && !tail.contains(arrival));
+    let tail = tail
+        .clone()
+        .into_iter()
+        .filter(|_| lost != Some(closing))
+        .filter(|(_, article)| Some(*article) != lost);
+    let mut peak_scratch = 0u64;
+    for (file_index, segment_number) in body.chain(tail) {
+        take_queued_segment(&mut pipeline, job_id, segment(file_index, segment_number));
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+        // The set's own scratch, and the process-wide ledger every set's
+        // scratch is charged to.
+        if let Some(set) = pipeline.direct_store.set(job_id, 0) {
+            peak_scratch = peak_scratch.max(set.router.scratch_bytes());
+        }
+        peak_scratch = peak_scratch.max(pipeline.direct_store.holds_accountant().scratch_bytes());
+        witness.observe(&pipeline, job_id);
+    }
+    pipeline.settle_direct_end_header_verdicts().await;
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+    let demotions = std::mem::take(&mut pipeline.direct_store.demotions);
+    (demotions, witness.render(), peak_scratch)
+}
+
+// A container whose end-header article is ruled missing hands over the
+// moment that verdict lands: its map is gone with that article, and no
+// byte that arrives afterwards could bring it back. Waiting for every other
+// article to land first only pages the whole container out to scratch for
+// the conventional path to take back.
+#[tokio::test]
+async fn a_sevenz_set_whose_end_header_is_lost_demotes_before_holding_its_body() {
+    let (demotions, sets, peak_scratch) =
+        sevenz_set_around_a_lost_tail_article(JobId(9_617), 4, Some(19)).await;
+    assert_eq!(
+        demotions,
+        vec![DemotionReason::SevenZip(
+            crate::pipeline::direct_store::router::sevenz::SevenZipRefusal::EndHeaderLost
+        )],
+        "sets: {sets}"
+    );
+    assert_eq!(
+        peak_scratch, 0,
+        "the body was held after the map was lost\nsets: {sets}"
+    );
+}
+
+// The same for a one-volume container: the end header closes the volume,
+// so the volume's last article carries it.
+#[tokio::test]
+async fn a_one_volume_sevenz_set_whose_end_header_is_lost_demotes_before_holding_its_body() {
+    let (demotions, sets, peak_scratch) =
+        sevenz_set_around_a_lost_tail_article(JobId(9_618), 1, Some(19)).await;
+    assert_eq!(
+        demotions,
+        vec![DemotionReason::SevenZip(
+            crate::pipeline::direct_store::router::sevenz::SevenZipRefusal::EndHeaderLost
+        )],
+        "sets: {sets}"
+    );
+    assert_eq!(
+        peak_scratch, 0,
+        "the body was held after the map was lost\nsets: {sets}"
+    );
+}
+
+// A closing article that is only late is not a verdict: the set holds what
+// arrives ahead of it, reads its map when it lands, and stays direct.
+#[tokio::test]
+async fn a_sevenz_set_whose_end_header_is_late_still_reads_its_map() {
+    for (job_id, volume_count) in [(JobId(9_619), 4), (JobId(9_620), 1)] {
+        let (demotions, sets, peak_scratch) =
+            sevenz_set_around_a_lost_tail_article(job_id, volume_count, None).await;
+        assert!(demotions.is_empty(), "volumes={volume_count} sets: {sets}");
+        // What the lost case is spared: the body, held and paged out.
+        assert!(peak_scratch > 0, "volumes={volume_count} sets: {sets}");
+    }
+}
+
+// Losing an article of the last volume other than the one that closes it
+// says nothing about the end header, so the set keeps waiting for it.
+#[tokio::test]
+async fn a_sevenz_set_that_loses_another_tail_article_keeps_its_end_header() {
+    let (demotions, sets, _) =
+        sevenz_set_around_a_lost_tail_article(JobId(9_621), 4, Some(3)).await;
+    assert!(
+        !demotions.contains(&DemotionReason::SevenZip(
+            crate::pipeline::direct_store::router::sevenz::SevenZipRefusal::EndHeaderLost
+        )),
+        "sets: {sets}"
+    );
+    assert!(
+        sets.contains("Routing") && !sets.contains("Demoted"),
+        "sets: {sets}"
+    );
+}
+
+// The completion gate's installed-members clause is 7z-only, in both of a RAR
+// direct set's states.
+//
+// A job whose archives are all RAR never reaches the readiness check the
+// clause lives in — the completion gate sends it to the RAR check instead —
+// so a RAR direct set has never needed it. Pinned here because the clause
+// sits on a function a mixed job's RAR volumes do reach.
 #[tokio::test]
 async fn a_rar_direct_set_is_never_counted_as_installed() {
     let member = payload(53, 8_400);
@@ -2449,21 +2617,24 @@ async fn a_rar_direct_set_is_never_counted_as_installed() {
     );
 }
 
-/// The same container with its signature header pointing at an end header far
-/// beyond anything that was posted.
+// The same container with its signature header pointing at an end header far
+// beyond anything that was posted.
 fn overstate_next_header_offset(archive: &[u8]) -> Vec<u8> {
     let mut out = archive.to_vec();
     out[12..20].copy_from_slice(&(1u64 << 50).to_le_bytes());
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(&out[12..32]);
+    out[8..12].copy_from_slice(&crc.finalize().to_le_bytes());
     out
 }
 
-/// A start header is read before a single byte of it has been checked against
-/// anything, so the part count it implies is arithmetic over two numbers a bad
-/// posting is free to have made up. The ceiling is what keeps a container
-/// claiming a petabyte from asking this router to plan a map for it.
-///
-/// The verdict lands on volume zero's very first article — the one that carries
-/// both facts — so nothing of the set is ever held against the claim.
+// A start header is read before a single byte of it has been checked against
+// anything, so the part count it implies is arithmetic over two numbers a bad
+// posting is free to have made up. The ceiling is what keeps a container
+// claiming a petabyte from asking this router to plan a map for it.
+//
+// The verdict lands on volume zero's very first article — the one that carries
+// both facts — so nothing of the set is ever held against the claim.
 #[tokio::test]
 async fn sevenz_store_refuses_a_start_header_claiming_more_parts_than_can_exist() {
     let member = payload(71, 30_000);
@@ -2495,15 +2666,15 @@ async fn sevenz_store_refuses_a_start_header_claiming_more_parts_than_can_exist(
     );
 }
 
-/// Volume zero's yEnc length is a hint, not a fact this router may fail a job
-/// over.
-///
-/// Weaver does not validate a posting's declared sizes anywhere else — the
-/// `=yend` CRC is the acceptance test — and a container is no exception. The
-/// hint is used to place the map; every disagreement with it costs the set its
-/// route and nothing more, with the job left to the conventional path. Here
-/// volume zero overstates itself by a byte, which the next volume's own
-/// declaration contradicts.
+// Volume zero's yEnc length is a hint, not a fact this router may fail a job
+// over.
+//
+// Weaver does not validate a posting's declared sizes anywhere else — the
+// `=yend` CRC is the acceptance test — and a container is no exception. The
+// hint is used to place the map; every disagreement with it costs the set its
+// route and nothing more, with the job left to the conventional path. Here
+// volume zero overstates itself by a byte, which the next volume's own
+// declaration contradicts.
 #[tokio::test]
 async fn sevenz_store_demotes_a_container_whose_part_size_hint_is_wrong() {
     let member = payload(73, 36_000);
@@ -2536,9 +2707,9 @@ async fn sevenz_store_demotes_a_container_whose_part_size_hint_is_wrong() {
     );
 }
 
-/// With no length stated for volume zero there is no part size, and with no
-/// part size there is no map to place — this route needs the hint, and the
-/// conventional path does not. So the set steps aside rather than guessing.
+// With no length stated for volume zero there is no part size, and with no
+// part size there is no map to place — this route needs the hint, and the
+// conventional path does not. So the set steps aside rather than guessing.
 #[tokio::test]
 async fn sevenz_store_refuses_a_container_whose_first_volume_states_no_length() {
     let member = payload(79, 36_000);
@@ -2571,17 +2742,17 @@ async fn sevenz_store_refuses_a_container_whose_first_volume_states_no_length() 
     );
 }
 
-/// A truncated last volume is a length verdict whichever order the volumes land
-/// in.
-///
-/// The truncation takes the end header with it, so the map can never be read.
-/// When the last volume lands before volume zero's front, its length arrives
-/// before there is a geometry to check it against. It still has to be checked
-/// once the geometry exists, rather than leaving the set waiting for a map
-/// until every article is in.
+// A truncated last volume is a length verdict whichever order the volumes land
+// in.
+//
+// The truncation takes the end header with it, so the map can never be read.
+// When the last volume lands before volume zero's front, its length arrives
+// before there is a geometry to check it against. It still has to be checked
+// once the geometry exists, rather than leaving the set waiting for a map
+// until every article is in.
 #[tokio::test]
 async fn sevenz_store_refuses_a_truncated_last_volume_that_lands_before_volume_zero() {
-    /// Bytes cut off the end of the last volume, end header included.
+    // Bytes cut off the end of the last volume, end header included.
     const TRUNCATED_BY: usize = 16;
     let member = payload(89, 36_000);
     let archive = build_7z(
@@ -2618,16 +2789,16 @@ async fn sevenz_store_refuses_a_truncated_last_volume_that_lands_before_volume_z
     );
 }
 
-/// What a volume actually decoded to is the authority; the declaration was only
-/// ever the early warning.
-///
-/// A volume that ends shorter than the map placed it means every byte routed
-/// after its boundary went somewhere wrong, so the check is deliberately not
-/// conditional on having routed nothing yet: the set demotes, and the members
-/// it was part-way through writing are not shipped.
+// What a volume actually decoded to is the authority; the declaration was only
+// ever the early warning.
+//
+// A volume that ends shorter than the map placed it means every byte routed
+// after its boundary went somewhere wrong, so the check is deliberately not
+// conditional on having routed nothing yet: the set demotes, and the members
+// it was part-way through writing are not shipped.
 #[tokio::test]
 async fn sevenz_store_demotes_a_volume_that_decodes_shorter_than_the_map_placed_it() {
-    /// Bytes withheld from the middle volume's last article.
+    // Bytes withheld from the middle volume's last article.
     const SHORT_BY: usize = 8;
     let member = payload(83, 36_000);
     let archive = build_7z(
@@ -2692,7 +2863,7 @@ async fn sevenz_store_demotes_a_volume_that_decodes_shorter_than_the_map_placed_
     );
 }
 
-/// What one handout over the whole link takes, by segment.
+// What one handout over the whole link takes, by segment.
 fn handout(pipeline: &mut Pipeline, want: usize) -> Vec<SegmentId> {
     let pressure = pipeline.refresh_download_pressure();
     assert_eq!(pressure.state, DownloadPressureState::Clear);

@@ -1,115 +1,123 @@
-//! The direct-store coverage snapshot blob.
-//!
-//! One compact encoded blob per archive set, holding everything the checkpoint
-//! knows: schema version, generation counter, the exact layout-plan digest,
-//! destination identities with their claimed extents, and every per-volume
-//! contiguous floor. Encoded and decoded in **one** operation — no per-volume
-//! statements and no per-volume round trips, which matters most on Postgres
-//! where per-statement RTT dominates.
-//!
-//! Framing is `magic | schema version | MessagePack body`. MessagePack matches
-//! how the rest of this crate persists binary state (cached RAR headers and
-//! `RarVolumeFacts` both go through `rmp_serde`), but this codec uses the
-//! **compact** positional form rather than `to_vec_named`: at 2 000 volumes the
-//! field names would be most of the blob, and the explicit schema version in
-//! the frame already does the job field names would otherwise do. Adding,
-//! removing or reordering a field is a schema-version bump.
+// The direct-store coverage snapshot blob.
+//
+// One compact encoded blob per archive set, holding everything the checkpoint
+// knows: schema version, generation counter, the exact layout-plan digest,
+// destination identities with their claimed extents, and every per-volume
+// contiguous floor. Encoded and decoded in **one** operation — no per-volume
+// statements and no per-volume round trips, which matters most on Postgres
+// where per-statement RTT dominates.
+//
+// Framing is `magic | schema version | MessagePack body`. MessagePack matches
+// how the rest of this crate persists binary state (cached RAR headers and
+// `RarVolumeFacts` both go through `rmp_serde`), but this codec uses the
+// **compact** positional form rather than `to_vec_named`: at 2 000 volumes the
+// field names would be most of the blob, and the explicit schema version in
+// the frame already does the job field names would otherwise do. Adding,
+// removing or reordering a field is a schema-version bump.
 
 use serde::{Deserialize, Serialize};
 
 use super::ByteRanges;
 use crate::pipeline::extraction::validate_sanitized_rar_member_path;
 
-/// `W`eaver `D`irect `S`tore `C`overage.
+// `W`eaver `D`irect `S`tore `C`overage.
 pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 
-/// Bump on any change to the body layout below. Encoding writes **only** this
-/// version. Decoding accepts this version and, where a bump only *added*
-/// something, the version before it, lifted with the addition absent — see
-/// [`SNAPSHOT_LIFTED_VERSION`]. A newer writer's blob is always rejected rather
-/// than partially trusted, and so is any older one, so a bump is also the way
-/// to retire rows whose *meaning* changed under a field that kept its type.
-///
-/// - 2: `VolumeFloor::complete` added.
-/// - 3: `VolumeFloor::complete` narrowed from "every article arrived" to "every
-///   article arrived **and** the floor covers all of them". A v2 writer could
-///   publish `{floor: 0, complete: true}` for a volume whose bytes were still
-///   held, and a v3 reader trusting that bit would skip every segment of a
-///   volume no byte of which exists. Refusing the row costs one redownload;
-///   trusting it wedges the set permanently.
-/// - 4: `DestinationClaim::crypt` added. An encrypted member's
-///   destination holds **plaintext**, so the claim alone no longer describes
-///   what a resumed run needs: the crypt facts to rebuild a key without
-///   re-parsing, the ≤15 tail-padding bytes that exist nowhere on disk, and the
-///   cipher checkpoints that let a resumed span decrypt at the coverage frontier
-///   without re-encrypting the member from its IV. A v3 reader would see a claim
-///   over plaintext and treat it as posted bytes, which is why this is a version
-///   bump and not an optional field.
-/// - 5: `MemberCryptSnapshot`'s flat RAR5 crypt fields became the
-///   `MemberCryptKeying` discriminant. RAR4 file encryption is
-///   keyed by an 8-byte per-file salt and no KDF count, and its IV is a KDF
-///   output rather than a header field — so it does not fit v4's `salt[16] +
-///   kdf_count_lg2 + iv[16] + psw_check_present` shape, and squeezing it in
-///   (zero-padding the salt, inventing a sentinel count) would let a RAR5 row
-///   and a RAR4 row compare *equal* at restore, which is precisely the
-///   "different archive" case the comparison exists to catch. The body is the
-///   compact **positional** MessagePack form, so a changed field set is a
-///   changed array shape whatever the field names would have said: this is a
-///   bump by the codec's own rule, not by choice.
-///
-///   Operationally it costs nothing. v4 has never shipped — it landed on
-///   `release-0.8.0` after the 0.7 line — so the only rows it can refuse are
-///   ones written by an unreleased build of the same branch, and the refusal
-///   costs exactly one redownload of a set that was mid-flight across a
-///   developer's rebuild. The v3 note below is the one that reaches users.
-/// - 6: `DestinationClaim::relative_path` **changed meaning** for a member
-///   claim. It was relative to the job's working directory; it is now relative
-///   to the job's staging root, `complete_dir/.weaver-staging/<job_id>`, because
-///   member payload is written straight onto the complete volume so its commit
-///   rename and completion's publish are both same-filesystem. Envelope claims
-///   are unchanged and still working-directory-relative.
-///
-///   This is the case this constant's doc has always described as a bump: a
-///   field that kept its type and changed what it means. Nothing about the
-///   *bytes* would tell a v5 reader apart from a v6 one, so trusting a v5 row
-///   would have restart probing the working directory for files the run before
-///   it wrote — and, worse, a v5 row that happened to find something there
-///   would claim coverage in a file the new run never writes to. Refusing costs
-///   one redownload; there is no upgrade path worth writing, because the bytes
-///   the old row describes are on the wrong filesystem for the new layout
-///   anyway and the restart sweep deletes them.
-///
-///   Operationally this is no longer free: the direct-store gate now defaults
-///   **on**, so a shipped install does carry rows, and the refusal costs one
-///   redownload per checkpointed set on the first start after the bump — the
-///   same cost the v3 note below records.
-/// - 7: `CoverageSnapshot::identity` added. A set admitted by identity rather
-///   than by its file names is not rediscovered from the spec at restart, so
-///   the checkpoint has to carry the volume-to-file mapping its plan was built
-///   on or the row cannot be judged. This is purely additive: every v6 field
-///   kept its type and meaning, and a v6 row is exactly a v7 row with no
-///   identity binding, which is what every v6 writer checkpointed (it refused
-///   identity sets at restart). So v6 is **read** and lifted rather than
-///   refused, and a set mid-flight across the upgrade resumes the way it would
-///   have without it.
-///
-/// # The v3 refusal is a release note
-///
-/// Refusing rather than upgrading means **a direct-store set checkpointed by a
-/// pre-0.8.0 build re-downloads its volumes once on the first start after the
-/// upgrade**. Nothing is lost and no job fails — the cost is exactly one
-/// redownload per set that was mid-download across the upgrade — but it is
-/// user-visible traffic and belongs in the notes rather than in a support
-/// thread.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 7;
+// Bump on any change to the body layout below. Encoding writes **only** this
+// version. Decoding accepts this version and, where a bump only *added*
+// something, the version before it, lifted with the addition absent — see
+// [`SNAPSHOT_LIFTED_VERSION`]. A newer writer's blob is always rejected rather
+// than partially trusted, and so is any older one, so a bump is also the way
+// to retire rows whose *meaning* changed under a field that kept its type.
+//
+// - 2: `VolumeFloor::complete` added.
+// - 3: `VolumeFloor::complete` narrowed from "every article arrived" to "every
+//   article arrived **and** the floor covers all of them". A v2 writer could
+//   publish `{floor: 0, complete: true}` for a volume whose bytes were still
+//   held, and a v3 reader trusting that bit would skip every segment of a
+//   volume no byte of which exists. Refusing the row costs one redownload;
+//   trusting it wedges the set permanently.
+// - 4: `DestinationClaim::crypt` added. An encrypted member's
+//   destination holds **plaintext**, so the claim alone no longer describes
+//   what a resumed run needs: the crypt facts to rebuild a key without
+//   re-parsing, the ≤15 tail-padding bytes that exist nowhere on disk, and the
+//   cipher checkpoints that let a resumed span decrypt at the coverage frontier
+//   without re-encrypting the member from its IV. A v3 reader would see a claim
+//   over plaintext and treat it as posted bytes, which is why this is a version
+//   bump and not an optional field.
+// - 5: `MemberCryptSnapshot`'s flat RAR5 crypt fields became the
+//   `MemberCryptKeying` discriminant. RAR4 file encryption is
+//   keyed by an 8-byte per-file salt and no KDF count, and its IV is a KDF
+//   output rather than a header field — so it does not fit v4's `salt[16] +
+//   kdf_count_lg2 + iv[16] + psw_check_present` shape, and squeezing it in
+//   (zero-padding the salt, inventing a sentinel count) would let a RAR5 row
+//   and a RAR4 row compare *equal* at restore, which is precisely the
+//   "different archive" case the comparison exists to catch. The body is the
+//   compact **positional** MessagePack form, so a changed field set is a
+//   changed array shape whatever the field names would have said: this is a
+//   bump by the codec's own rule, not by choice.
+//
+//   Operationally it costs nothing. v4 has never shipped — it landed on
+//   `release-0.8.0` after the 0.7 line — so the only rows it can refuse are
+//   ones written by an unreleased build of the same branch, and the refusal
+//   costs exactly one redownload of a set that was mid-flight across a
+//   developer's rebuild. The v3 note below is the one that reaches users.
+// - 6: `DestinationClaim::relative_path` **changed meaning** for a member
+//   claim. It was relative to the job's working directory; it is now relative
+//   to the job's staging root, `complete_dir/.weaver-staging/<job_id>`, because
+//   member payload is written straight onto the complete volume so its commit
+//   rename and completion's publish are both same-filesystem. Envelope claims
+//   are unchanged and still working-directory-relative.
+//
+//   This is the case this constant's doc has always described as a bump: a
+//   field that kept its type and changed what it means. Nothing about the
+//   *bytes* would tell a v5 reader apart from a v6 one, so trusting a v5 row
+//   would have restart probing the working directory for files the run before
+//   it wrote — and, worse, a v5 row that happened to find something there
+//   would claim coverage in a file the new run never writes to. Refusing costs
+//   one redownload; there is no upgrade path worth writing, because the bytes
+//   the old row describes are on the wrong filesystem for the new layout
+//   anyway and the restart sweep deletes them.
+//
+//   Operationally this is no longer free: the direct-store gate now defaults
+//   **on**, so a shipped install does carry rows, and the refusal costs one
+//   redownload per checkpointed set on the first start after the bump — the
+//   same cost the v3 note below records.
+// - 7: `CoverageSnapshot::identity` added. A set admitted by identity rather
+//   than by its file names is not rediscovered from the spec at restart, so
+//   the checkpoint has to carry the volume-to-file mapping its plan was built
+//   on or the row cannot be judged. This is purely additive: every v6 field
+//   kept its type and meaning, and a v6 row is exactly a v7 row with no
+//   identity binding, which is what every v6 writer checkpointed (it refused
+//   identity sets at restart). So v6 is **read** and lifted rather than
+//   refused, and a set mid-flight across the upgrade resumes the way it would
+//   have without it.
+// - 8: `CoverageSnapshot::fingerprints` added. A standalone set is admitted
+//   by its file's own header, so after a restart nothing can say again which
+//   recovery-set description that file is: its first bytes routed before the
+//   restart and were never kept. Without that binding a repair counts the
+//   whole file as missing. The fingerprint is what the binding is made from,
+//   so the checkpoint carries it. Additive again, so v6 and v7 are read and
+//   lifted with no fingerprints, exactly what their writers knew.
+//
+// # The v3 refusal is a release note
+//
+// Refusing rather than upgrading means **a direct-store set checkpointed by a
+// pre-0.8.0 build re-downloads its volumes once on the first start after the
+// upgrade**. Nothing is lost and no job fails — the cost is exactly one
+// redownload per set that was mid-download across the upgrade — but it is
+// user-visible traffic and belongs in the notes rather than in a support
+// thread.
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 8;
 
-/// The one older version [`decode`] still reads, lifted into the current shape
-/// with `identity: None`. Nothing writes it.
-pub(crate) const SNAPSHOT_LIFTED_VERSION: u16 = 6;
+// The older versions [`decode`] still reads, lifted into the current shape
+// with what they did not carry absent. Nothing writes them.
+const SNAPSHOT_V6: u16 = 6;
+const SNAPSHOT_V7: u16 = 7;
 
 const FRAME_HEADER_LEN: usize = 6;
 
-/// One contiguous claimed span of a destination file, half-open.
+// One contiguous claimed span of a destination file, half-open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct DestinationExtent {
     pub(crate) start: u64,
@@ -122,138 +130,152 @@ impl DestinationExtent {
     }
 }
 
-/// A destination file the set claims coverage in.
-///
-/// Keyed by **member identity**, not by the final sanitized path: sanitized
-/// destinations are only committed in archive order at finalization, so the
-/// path here is the relative partial and the member index is the stable
-/// identity.
+// A destination file the set claims coverage in.
+//
+// Keyed by **member identity**, not by the final sanitized path: sanitized
+// destinations are only committed in archive order at finalization, so the
+// path here is the relative partial and the member index is the stable
+// identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DestinationClaim {
     pub(crate) member_index: u32,
-    /// Relative to the claim's **own root**, which the destination key decides:
-    /// the staging root for a member payload file, the working directory for a
-    /// volume envelope. See [`super::restart::DestinationRoots`] and schema
-    /// version 6 above.
+    // Relative to the claim's **own root**, which the destination key decides:
+    // the staging root for a member payload file, the working directory for a
+    // volume envelope. See [`super::restart::DestinationRoots`] and schema
+    // version 6 above.
     pub(crate) relative_path: String,
-    /// Sorted, disjoint, coalesced.
+    // Sorted, disjoint, coalesced.
     pub(crate) extents: Vec<DestinationExtent>,
-    /// Present exactly for an encrypted member direct-store decrypted at write
-    /// time. `None` for every plaintext member and for every
-    /// envelope destination.
-    ///
-    /// It carries no password and never will: what is here is what the headers
-    /// already state in the clear, plus the two things this process computed
-    /// that no restart could re-derive — the retained tail padding, and the
-    /// cipher checkpoints. A restore rebuilds the key from the job's live
-    /// password and these facts, and **refuses** when they disagree with the
-    /// headers the layout was rebuilt from.
+    // Present exactly for an encrypted member direct-store decrypted at write
+    // time. `None` for every plaintext member and for every
+    // envelope destination.
+    //
+    // It carries no password and never will: what is here is what the headers
+    // already state in the clear, plus the two things this process computed
+    // that no restart could re-derive — the retained tail padding, and the
+    // cipher checkpoints. A restore rebuilds the key from the job's live
+    // password and these facts, and **refuses** when they disagree with the
+    // headers the layout was rebuilt from.
     pub(crate) crypt: Option<super::router::crypt::MemberCryptSnapshot>,
 }
 
 impl DestinationClaim {
-    /// The length the destination file must have for this claim to be
-    /// admissible at restart. A **longer** file is expected and fine: file
-    /// length never implies coverage, in either direction.
+    // The length the destination file must have for this claim to be
+    // admissible at restart. A **longer** file is expected and fine: file
+    // length never implies coverage, in either direction.
     pub(crate) fn claimed_len(&self) -> u64 {
         self.extents.last().map(|extent| extent.end).unwrap_or(0)
     }
 }
 
-/// One source volume's durable contiguous coverage floor.
+// One source volume's durable contiguous coverage floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VolumeFloor {
-    /// Volume index within the archive set — the layout coordinate.
+    // Volume index within the archive set — the layout coordinate.
     pub(crate) volume_index: u32,
-    /// NZB file index for that volume — the coordinate segments live in, and
-    /// therefore what the refetch derivation needs.
+    // NZB file index for that volume — the coordinate segments live in, and
+    // therefore what the refetch derivation needs.
     pub(crate) file_index: u32,
-    /// Contiguous bytes of the source volume durably written to destinations.
-    /// Everything above this is redownloaded.
+    // Contiguous bytes of the source volume durably written to destinations.
+    // Everything above this is redownloaded.
     pub(crate) floor: u64,
-    /// Every article of the source volume arrived **and** every one of its bytes
-    /// is below `floor`, so restart may skip the volume's segments outright.
-    ///
-    /// Carried explicitly because the floor **cannot** say it. A floor counts
-    /// *decoded* source bytes, while an NZB's `<segment bytes>` is the
-    /// yEnc-**encoded** size — about 3% larger — so walking the spec's segments
-    /// against a decoded floor always stops one article short of the truth.
-    /// That is safe (it refetches), but for a byte-complete volume it means
-    /// refetching the last article of every volume of a set that is entirely on
-    /// disk, which is precisely the restart the PAR2 finalization wait makes
-    /// common. This flag is the one bit that closes the gap, and it is a bit
-    /// **per volume**, not per segment, so it costs nothing the checkpoint
-    /// shape objects to.
-    ///
-    /// # It is a conjunction, not a latch
-    ///
-    /// "Every article arrived" on its own is **not** what restart reads. Restart
-    /// reads this as *all bytes durable* and skips every segment of the file on
-    /// the strength of it. A volume can finish downloading while its bytes are
-    /// still held — payload staged before the header that classifies it, an
-    /// out-of-order volume the layout cannot place yet — and a bit latched at the
-    /// article-complete seam would checkpoint `{floor: 0, complete: true}`. That
-    /// row skips every segment of a volume no byte of which exists: the set can
-    /// then neither finalize (its member gate has nothing to compose) nor demote
-    /// (its reconstruction has nothing to read), which is a permanent zombie.
-    ///
-    /// So the writer re-derives it at **every** barrier as `download finished &&
-    /// floor >= decoded length` ([`super::barrier::CoverageBarrier`]), and a
-    /// volume whose held bytes have not reached the floor publishes `false` until
-    /// they do. `complete == true` therefore always implies `floor` is the
-    /// volume's whole decoded length, which is what the restore seam relies on
-    /// when it derives a restored volume's confirmation.
-    ///
-    /// Trusting it is bounded: the bytes it lets restart skip are the same bytes
-    /// the destination probe length-checks and the member gate re-reads and
-    /// re-composes before the set may finalize, so a wrong flag fails a checksum
-    /// rather than committing a hole.
-    ///
-    /// No `#[serde(default)]`: the body is the **compact positional** MessagePack
-    /// form, where a missing trailing field is a short array rather than an absent
-    /// name, and decoding refuses any schema version but its own — so a default
-    /// here could never fire.
+    // Every article of the source volume arrived **and** every one of its bytes
+    // is below `floor`, so restart may skip the volume's segments outright.
+    //
+    // Carried explicitly because the floor **cannot** say it. A floor counts
+    // *decoded* source bytes, while an NZB's `<segment bytes>` is the
+    // yEnc-**encoded** size — about 3% larger — so walking the spec's segments
+    // against a decoded floor always stops one article short of the truth.
+    // That is safe (it refetches), but for a byte-complete volume it means
+    // refetching the last article of every volume of a set that is entirely on
+    // disk, which is precisely the restart the PAR2 finalization wait makes
+    // common. This flag is the one bit that closes the gap, and it is a bit
+    // **per volume**, not per segment, so it costs nothing the checkpoint
+    // shape objects to.
+    //
+    // # It is a conjunction, not a latch
+    //
+    // "Every article arrived" on its own is **not** what restart reads. Restart
+    // reads this as *all bytes durable* and skips every segment of the file on
+    // the strength of it. A volume can finish downloading while its bytes are
+    // still held — payload staged before the header that classifies it, an
+    // out-of-order volume the layout cannot place yet — and a bit latched at the
+    // article-complete seam would checkpoint `{floor: 0, complete: true}`. That
+    // row skips every segment of a volume no byte of which exists: the set can
+    // then neither finalize (its member gate has nothing to compose) nor demote
+    // (its reconstruction has nothing to read), which is a permanent zombie.
+    //
+    // So the writer re-derives it at **every** barrier as `download finished &&
+    // floor >= decoded length` ([`super::barrier::CoverageBarrier`]), and a
+    // volume whose held bytes have not reached the floor publishes `false` until
+    // they do. `complete == true` therefore always implies `floor` is the
+    // volume's whole decoded length, which is what the restore seam relies on
+    // when it derives a restored volume's confirmation.
+    //
+    // Trusting it is bounded: the bytes it lets restart skip are the same bytes
+    // the destination probe length-checks and the member gate re-reads and
+    // re-composes before the set may finalize, so a wrong flag fails a checksum
+    // rather than committing a hole.
+    //
+    // No `#[serde(default)]`: the body is the **compact positional** MessagePack
+    // form, where a missing trailing field is a short array rather than an absent
+    // name, and decoding refuses any schema version but its own — so a default
+    // here could never fire.
     pub(crate) complete: bool,
 }
 
-/// The plan an identity-admitted set's coverage was produced against.
-///
-/// A name-admitted set is rediscovered from the spec's file names at restart,
-/// so its plan needs no record. An identity-admitted one was matched by what
-/// its files *contain* — the recovery set's descriptions, or the volumes' own
-/// archive headers — and the evidence for that is gone after a restart: the
-/// bound files' first bytes were never kept. What restart needs to rebuild the
-/// exact plan is the mapping and the facts it was admitted with, and those are
-/// recorded here.
+// The plan an identity-admitted set's coverage was produced against.
+//
+// A name-admitted set is rediscovered from the spec's file names at restart,
+// so its plan needs no record. An identity-admitted one was matched by what
+// its files *contain* — the recovery set's descriptions, or the volumes' own
+// archive headers — and the evidence for that is gone after a restart: the
+// bound files' first bytes were never kept. What restart needs to rebuild the
+// exact plan is the mapping and the facts it was admitted with, and those are
+// recorded here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct IdentityBinding {
     pub(crate) kind: super::plan::IdentityKind,
-    /// Volume index to NZB file index, sorted by volume.
+    // Volume index to NZB file index, sorted by volume.
     pub(crate) volumes: Vec<(u32, u32)>,
     pub(crate) expected_volumes: Option<u32>,
-    /// The NZB file whose index names the set.
+    // The NZB file whose index names the set.
     pub(crate) discriminator: u32,
 }
 
-/// The decoded checkpoint.
+// The decoded checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CoverageSnapshot {
-    /// Monotonic per set. A committed checkpoint is always at least 1.
+    // Monotonic per set. A committed checkpoint is always at least 1.
     pub(crate) generation: u64,
-    /// Digest of the exact layout plan the coverage was produced against.
-    /// A mismatch is a hard stop: safe redownload or demotion, never partial
-    /// trust.
+    // Digest of the exact layout plan the coverage was produced against.
+    // A mismatch is a hard stop: safe redownload or demotion, never partial
+    // trust.
     pub(crate) plan_digest: [u8; 32],
-    /// Sorted by `member_index`.
+    // Sorted by `member_index`.
     pub(crate) destinations: Vec<DestinationClaim>,
-    /// Sorted by `volume_index`.
+    // Sorted by `volume_index`.
     pub(crate) floors: Vec<VolumeFloor>,
-    /// Present exactly for a set admitted by identity; `None` for a set its
-    /// file names admitted.
+    // Present exactly for a set admitted by identity; `None` for a set its
+    // file names admitted.
     pub(crate) identity: Option<IdentityBinding>,
+    // Sorted by `file_index`. Empty for every set but a standalone one whose
+    // file's opening bytes have arrived.
+    pub(crate) fingerprints: Vec<ProvenFingerprint>,
 }
 
-/// The v6 body, positionally: everything v7 has but the identity binding.
+// The recovery-set fingerprint of a standalone set's file, taken from its
+// opening bytes while they were still in memory: the MD5 of the first
+// `min(length, 16 KiB)` bytes, the same window a PAR2 description's
+// `hash_16k` covers, and the file's decoded length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProvenFingerprint {
+    pub(crate) file_index: u32,
+    pub(crate) hash_16k: [u8; 16],
+    pub(crate) length: u64,
+}
+
+// The v6 body, positionally: everything v7 has but the identity binding.
 #[derive(Deserialize)]
 struct CoverageSnapshotV6 {
     generation: u64,
@@ -270,15 +292,39 @@ impl From<CoverageSnapshotV6> for CoverageSnapshot {
             destinations: old.destinations,
             floors: old.floors,
             identity: None,
+            fingerprints: Vec::new(),
+        }
+    }
+}
+
+// The v7 body, positionally: everything v8 has but the fingerprints.
+#[derive(Deserialize)]
+struct CoverageSnapshotV7 {
+    generation: u64,
+    plan_digest: [u8; 32],
+    destinations: Vec<DestinationClaim>,
+    floors: Vec<VolumeFloor>,
+    identity: Option<IdentityBinding>,
+}
+
+impl From<CoverageSnapshotV7> for CoverageSnapshot {
+    fn from(old: CoverageSnapshotV7) -> Self {
+        Self {
+            generation: old.generation,
+            plan_digest: old.plan_digest,
+            destinations: old.destinations,
+            floors: old.floors,
+            identity: old.identity,
+            fingerprints: Vec::new(),
         }
     }
 }
 
 impl CoverageSnapshot {
-    /// Restart-side lookup by volume. The restore seam derives its refetch
-    /// floors per **NZB file** ([`super::restart::refetch_floors`]), which is the
-    /// coordinate segments live in; this is the layout-side view, kept for the
-    /// tests that assert the two agree.
+    // Restart-side lookup by volume. The restore seam derives its refetch
+    // floors per **NZB file** ([`super::restart::refetch_floors`]), which is the
+    // coordinate segments live in; this is the layout-side view, kept for the
+    // tests that assert the two agree.
     #[cfg(test)]
     pub(crate) fn floor_for_volume(&self, volume_index: u32) -> Option<u64> {
         self.floors
@@ -287,7 +333,7 @@ impl CoverageSnapshot {
             .map(|index| self.floors[index].floor)
     }
 
-    /// Canonical ordering, so equal content always encodes to equal bytes.
+    // Canonical ordering, so equal content always encodes to equal bytes.
     fn normalized(&self) -> Self {
         let mut normalized = self.clone();
         normalized
@@ -309,22 +355,20 @@ impl CoverageSnapshot {
             identity.volumes.sort_unstable();
         }
         normalized
+            .fingerprints
+            .sort_by_key(|fingerprint| fingerprint.file_index);
+        normalized
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SnapshotError {
-    /// Shorter than the fixed frame header.
-    Truncated {
-        len: usize,
-    },
+    // Shorter than the fixed frame header.
+    Truncated { len: usize },
     BadMagic,
-    /// Written by a schema this binary does not know. Forward-refusing.
-    UnsupportedVersion {
-        found: u16,
-        supported: u16,
-    },
-    /// Well-framed but structurally invalid, or not decodable as the body.
+    // Written by a schema this binary does not know. Forward-refusing.
+    UnsupportedVersion { found: u16, supported: u16 },
+    // Well-framed but structurally invalid, or not decodable as the body.
     Malformed(String),
 }
 
@@ -346,8 +390,8 @@ impl std::fmt::Display for SnapshotError {
     }
 }
 
-/// Encodes one checkpoint. Deterministic: equal content always yields equal
-/// bytes, because the body is canonically ordered first.
+// Encodes one checkpoint. Deterministic: equal content always yields equal
+// bytes, because the body is canonically ordered first.
 pub(crate) fn encode(snapshot: &CoverageSnapshot) -> Result<Vec<u8>, SnapshotError> {
     let normalized = snapshot.normalized();
     let body = rmp_serde::to_vec(&normalized)
@@ -359,11 +403,11 @@ pub(crate) fn encode(snapshot: &CoverageSnapshot) -> Result<Vec<u8>, SnapshotErr
     Ok(blob)
 }
 
-/// Decodes one checkpoint, validating framing, schema version and structure.
-///
-/// Every failure mode is total: there is no "decoded the floors but not the
-/// destinations" outcome, because a partially trusted checkpoint would claim
-/// coverage nothing verified.
+// Decodes one checkpoint, validating framing, schema version and structure.
+//
+// Every failure mode is total: there is no "decoded the floors but not the
+// destinations" outcome, because a partially trusted checkpoint would claim
+// coverage nothing verified.
 pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
     if blob.len() < FRAME_HEADER_LEN {
         return Err(SnapshotError::Truncated { len: blob.len() });
@@ -372,7 +416,7 @@ pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
         return Err(SnapshotError::BadMagic);
     }
     let version = u16::from_le_bytes([blob[4], blob[5]]);
-    if version != SNAPSHOT_SCHEMA_VERSION && version != SNAPSHOT_LIFTED_VERSION {
+    if version != SNAPSHOT_SCHEMA_VERSION && version != SNAPSHOT_V6 && version != SNAPSHOT_V7 {
         return Err(SnapshotError::UnsupportedVersion {
             found: version,
             supported: SNAPSHOT_SCHEMA_VERSION,
@@ -386,10 +430,14 @@ pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
     // row, and neither is something to partially trust.
     let body = &blob[FRAME_HEADER_LEN..];
     let mut deserializer = rmp_serde::Deserializer::new(std::io::Cursor::new(body));
-    let snapshot = if version == SNAPSHOT_LIFTED_VERSION {
-        CoverageSnapshotV6::deserialize(&mut deserializer).map(CoverageSnapshot::from)
-    } else {
-        CoverageSnapshot::deserialize(&mut deserializer)
+    let snapshot = match version {
+        SNAPSHOT_V6 => {
+            CoverageSnapshotV6::deserialize(&mut deserializer).map(CoverageSnapshot::from)
+        }
+        SNAPSHOT_V7 => {
+            CoverageSnapshotV7::deserialize(&mut deserializer).map(CoverageSnapshot::from)
+        }
+        _ => CoverageSnapshot::deserialize(&mut deserializer),
     }
     .map_err(|error| SnapshotError::Malformed(error.to_string()))?;
     let consumed = deserializer.position();
@@ -461,59 +509,69 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
         }
     }
 
+    let mut previous_file: Option<u32> = None;
+    for fingerprint in &snapshot.fingerprints {
+        if previous_file.is_some_and(|previous| previous >= fingerprint.file_index) {
+            return Err(SnapshotError::Malformed(
+                "fingerprints are not sorted by file index".into(),
+            ));
+        }
+        previous_file = Some(fingerprint.file_index);
+    }
+
     Ok(())
 }
 
-/// `W`eaver `D`irect `S`tore `I`nstalled.
-///
-/// The second thing a coverage row can hold. A set that finalizes has no
-/// coverage left to checkpoint — its partials are renamed to their
-/// destinations and its envelopes are gone — but a restart before the job is
-/// archived still has to know the set is **done**, not new: without that it
-/// rediscovers the set from the spec, finds no row, and installs it fresh,
-/// refetching every volume of output that is already sitting in the staging
-/// root. If those articles have since expired, the job fails with its output
-/// finished.
-///
-/// A separate magic rather than a coverage-snapshot schema bump, so a binary
-/// that predates it refuses the row as a bad magic and redownloads the set —
-/// which is exactly what that binary did before the marker existed.
+// `W`eaver `D`irect `S`tore `I`nstalled.
+//
+// The second thing a coverage row can hold. A set that finalizes has no
+// coverage left to checkpoint — its partials are renamed to their
+// destinations and its envelopes are gone — but a restart before the job is
+// archived still has to know the set is **done**, not new: without that it
+// rediscovers the set from the spec, finds no row, and installs it fresh,
+// refetching every volume of output that is already sitting in the staging
+// root. If those articles have since expired, the job fails with its output
+// finished.
+//
+// A separate magic rather than a coverage-snapshot schema bump, so a binary
+// that predates it refuses the row as a bad magic and redownloads the set —
+// which is exactly what that binary did before the marker existed.
 pub(crate) const INSTALLED_MAGIC: [u8; 4] = *b"WDSI";
 
-/// Decoding accepts exactly this version, the same rule as the snapshot's.
-///
-/// v2 records every output finalization produced, not only the stored
-/// members. A v1 marker cannot say whether a tolerated member, an empty file
-/// or a directory is still in place, so it is refused and the set redownloads.
+// Decoding accepts exactly this version, the same rule as the snapshot's.
+//
+// v2 records every output finalization produced, not only the stored
+// members. A v1 marker cannot say whether a tolerated member, an empty file
+// or a directory is still in place, so it is refused and the set redownloads.
 pub(crate) const INSTALLED_SCHEMA_VERSION: u16 = 2;
 
-/// One output file, as restore re-checks it.
+// One output file, as restore re-checks it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InstalledMember {
-    /// Relative to the job's staging root, where finalization renamed it.
+    // Relative to the job's staging root, where finalization renamed it.
     pub(crate) relative_path: String,
-    /// Its exact length. A committed member is finished output, so unlike a
-    /// coverage claim a longer file is as wrong as a shorter one.
+    // Its exact length. A committed member is finished output, so unlike a
+    // coverage claim a longer file is as wrong as a shorter one.
     pub(crate) len: u64,
 }
 
-/// A finalized set's durable proof of installation.
+// A finalized set's durable proof of installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InstalledSet {
-    /// Volume index to NZB file index, sorted by volume. Restore requires the
-    /// rediscovered plan to map the same files, because those are the files
-    /// whose segments the marker lets it skip.
+    // Volume index to NZB file index, sorted by volume. Restore requires the
+    // rediscovered plan to map the same files, because those are the files
+    // whose segments the marker lets it skip.
     pub(crate) volumes: Vec<(u32, u32)>,
-    /// Every file finalization left in place: the stored members the commit
-    /// renamed, the members the tolerance extracted, and the empty entries
-    /// finalization created.
+    // Every file finalization left in place: the stored members the commit
+    // renamed, the members the tolerance extracted, and the empty entries
+    // finalization created.
     pub(crate) members: Vec<InstalledMember>,
-    /// Every directory finalization left in place, relative to the staging
-    /// root the same way a member is.
+    // Every directory finalization left in place, relative to the staging
+    // root the same way a member is.
     pub(crate) directories: Vec<String>,
-    /// Every name finalization recorded as extracted — stored, tolerated and
-    /// dataless alike — so a restored job judges its completion against the
-    /// same set of names the finalizing run did.
+    // Every name finalization recorded as extracted — stored, tolerated and
+    // dataless alike — so a restored job judges its completion against the
+    // same set of names the finalizing run did.
     pub(crate) extracted: Vec<String>,
 }
 
@@ -540,7 +598,7 @@ pub(crate) fn encode_installed(installed: &InstalledSet) -> Result<Vec<u8>, Snap
     Ok(blob)
 }
 
-/// Decodes one installation marker, total in the same way [`decode`] is.
+// Decodes one installation marker, total in the same way [`decode`] is.
 pub(crate) fn decode_installed(blob: &[u8]) -> Result<InstalledSet, SnapshotError> {
     if blob.len() < FRAME_HEADER_LEN {
         return Err(SnapshotError::Truncated { len: blob.len() });

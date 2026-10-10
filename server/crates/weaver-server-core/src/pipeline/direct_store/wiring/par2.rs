@@ -1,27 +1,30 @@
-//! Continuation of the `impl Pipeline` block from `direct_store/wiring.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `direct_store/wiring.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 
-/// Why a job's demoted direct set is still holding the PAR2 verdict up.
-///
-/// Every variant names one file of one set and what is still owed on it, so a
-/// job resting in `Downloading` behind this gate can be read from the log
-/// instead of inferred from the absence of anything else.
+// Why a job's demoted direct set is still holding the PAR2 verdict up.
+//
+// Every variant names one file of one set and what is still owed on it, so a
+// job resting in `Downloading` behind this gate can be read from the log
+// instead of inferred from the absence of anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DemotedMaterializationBlock {
-    /// Every article is in, but the completing commit has not settled the file
-    /// yet: its buffer flush, handle release and row are still owed.
-    AwaitingSettle { set_index: usize, file_index: u32 },
-    /// Something in the pipeline still owns an article of this file.
+    // Every article is in, but the completing commit has not settled the file
+    // yet: its buffer flush, handle release and row are still owed.
+    AwaitingSettle {
+        set_index: usize,
+        file_index: u32,
+    },
+    // Something in the pipeline still owns an article of this file.
     Owned {
         set_index: usize,
         file_index: u32,
         owner: &'static str,
     },
-    /// Articles the sweep could not vouch for went back on the wire and have
-    /// not reached a terminal state yet.
+    // Articles the sweep could not vouch for went back on the wire and have
+    // not reached a terminal state yet.
     Rescued {
         set_index: usize,
         file_index: u32,
@@ -59,49 +62,49 @@ impl DemotedMaterializationBlock {
     }
 }
 
-/// One direct set's share of a repair, decided before anything is changed.
+// One direct set's share of a repair, decided before anything is changed.
 pub(crate) struct PreparedDirectRepair {
     set_index: usize,
     set_name: String,
-    /// The set's damaged volumes, in its own volume space.
+    // The set's damaged volumes, in its own volume space.
     damaged: Vec<super::super::repair::DamagedDirectVolume>,
     affected_files: Vec<NzbFileId>,
-    /// The set's volume lengths, in its own volume space.
+    // The set's volume lengths, in its own volume space.
     set_lengths: std::collections::BTreeMap<u32, u64>,
     rewrite_bytes: u64,
 }
 
-/// A damaged file outside every live direct set that a direct repair may
-/// write in place: a demoted set's volume, or any other real file of the job
-/// sitting at its declared PAR2 name.
+// A damaged file outside every live direct set that a direct repair may
+// write in place: a demoted set's volume, or any other real file of the job
+// sitting at its declared PAR2 name.
 pub(crate) struct ConventionalRepairTarget {
     par2_file_id: par2_rs::FileId,
     file_id: NzbFileId,
 }
 
 impl Pipeline {
-    /// Take any set claiming this file off the direct path, because its
-    /// articles arrived uuencoded.
-    ///
-    /// Sets are admitted from the NZB's filenames, before a single article has
-    /// been decoded, so an archive posted in uuencode is admitted exactly like a
-    /// yEnc one. It can never be routed: routing writes an article's bytes into
-    /// a volume at the offset the article declares, and a uuencode article
-    /// declares no offset — its position is the decoded length of its whole
-    /// prefix, which only sequential assembly can supply.
-    ///
-    /// Excluding those articles from the routing seam is not enough on its own.
-    /// A set that is merely starved never finalizes and never demotes, so every
-    /// suppression keyed on [`Self::is_direct_source_file`] keeps holding for
-    /// its volumes — including the archive probe that dispatches extraction,
-    /// which would leave the job completing with its archive unextracted on
-    /// disk. Demoting puts the volumes back on the conventional path, where the
-    /// sequential cursor is already writing them.
-    ///
-    /// `ensure_direct_sets` runs first for the same reason
-    /// [`Self::direct_route_target`] runs it: admission is lazy, so a job whose
-    /// very first article is uuencoded would otherwise find no set to demote
-    /// and admit one moments later.
+    // Take any set claiming this file off the direct path, because its
+    // articles arrived uuencoded.
+    //
+    // Sets are admitted from the NZB's filenames, before a single article has
+    // been decoded, so an archive posted in uuencode is admitted exactly like a
+    // yEnc one. It can never be routed: routing writes an article's bytes into
+    // a volume at the offset the article declares, and a uuencode article
+    // declares no offset — its position is the decoded length of its whole
+    // prefix, which only sequential assembly can supply.
+    //
+    // Excluding those articles from the routing seam is not enough on its own.
+    // A set that is merely starved never finalizes and never demotes, so every
+    // suppression keyed on [`Self::is_direct_source_file`] keeps holding for
+    // its volumes — including the archive probe that dispatches extraction,
+    // which would leave the job completing with its archive unextracted on
+    // disk. Demoting puts the volumes back on the conventional path, where the
+    // sequential cursor is already writing them.
+    //
+    // `ensure_direct_sets` runs first for the same reason
+    // [`Self::direct_route_target`] runs it: admission is lazy, so a job whose
+    // very first article is uuencoded would otherwise find no set to demote
+    // and admit one moments later.
     pub(crate) async fn demote_direct_sets_for_uu_article(&mut self, file_id: NzbFileId) {
         self.demote_direct_sets_for_article(file_id, DemotionReason::UuencodedSourceVolume)
             .await;
@@ -133,16 +136,16 @@ impl Pipeline {
         }
     }
 
-    /// Whether this file's bytes are a direct set's source volume, so no legacy
-    /// floor, completed-file row or archive re-probe may be written for it.
-    /// `&self`, because the suppression checks sit inside paths that already
-    /// hold the pipeline immutably.
-    ///
-    /// Deliberately **not** narrowed to still-routing sets the way
-    /// [`Self::direct_route_target`] is: a finalized set's source volumes were
-    /// never written and never will be, so every suppression the routing seam
-    /// relied on has to keep holding afterwards. Only a demotion puts the
-    /// volume back on the conventional path, and only then does it get a file.
+    // Whether this file's bytes are a direct set's source volume, so no legacy
+    // floor, completed-file row or archive re-probe may be written for it.
+    // `&self`, because the suppression checks sit inside paths that already
+    // hold the pipeline immutably.
+    //
+    // Deliberately **not** narrowed to still-routing sets the way
+    // [`Self::direct_route_target`] is: a finalized set's source volumes were
+    // never written and never will be, so every suppression the routing seam
+    // relied on has to keep holding afterwards. Only a demotion puts the
+    // volume back on the conventional path, and only then does it get a file.
     pub(crate) fn is_direct_source_file(&self, file_id: NzbFileId) -> bool {
         self.direct_store
             .sets_for(file_id.job_id)
@@ -152,19 +155,19 @@ impl Pipeline {
             })
     }
 
-    /// The current names of every source volume a finalized direct set owns,
-    /// for the job's post-extraction cleanup.
-    ///
-    /// A finalized set never wrote these files, so anything at their names is
-    /// left over from an earlier incarnation of the job: a restart that kept no
-    /// progress for a file the dead process had already started conventionally
-    /// leaves those bytes behind, and the set admitted afterwards routes the
-    /// refetched articles past them. The cleanup otherwise finds archive input
-    /// by its classified role, which an identity-bound volume under an
-    /// obfuscated name never gets, so the leftover would be published. Each name
-    /// is a file of this job in its own working directory, consumed by a set
-    /// that delivered every member, which is exactly what the cleanup deletes
-    /// for a conventional set.
+    // The current names of every source volume a finalized direct set owns,
+    // for the job's post-extraction cleanup.
+    //
+    // A finalized set never wrote these files, so anything at their names is
+    // left over from an earlier incarnation of the job: a restart that kept no
+    // progress for a file the dead process had already started conventionally
+    // leaves those bytes behind, and the set admitted afterwards routes the
+    // refetched articles past them. The cleanup otherwise finds archive input
+    // by its classified role, which an identity-bound volume under an
+    // obfuscated name never gets, so the leftover would be published. Each name
+    // is a file of this job in its own working directory, consumed by a set
+    // that delivered every member, which is exactly what the cleanup deletes
+    // for a conventional set.
     pub(in crate::pipeline) fn finalized_direct_volume_filenames(
         &self,
         job_id: JobId,
@@ -182,22 +185,22 @@ impl Pipeline {
             .collect()
     }
 
-    /// Whether this file is a volume of a demoted set whose reconstruction
-    /// sweep is still outstanding.
-    ///
-    /// A demoted set fails [`Self::is_direct_source_file`] on purpose — its
-    /// volumes are ordinary files from the demotion on — but for as long as the
-    /// detached sweep runs, those files are half written: the sweep owns them,
-    /// sets their length, and may remove one outright. An article that
-    /// completes such a volume through the conventional path in that window
-    /// must not have the file classified, probed or entered into the archive
-    /// topology over an image the sweep has not finished; the handback replays
-    /// the completion hook for every volume once the ticket lands.
-    ///
-    /// A volume the sweep has finished and the actor has handed back is not
-    /// owned any more, ticket or no ticket: the sweep never returns to a
-    /// volume once its outcome is reported, and the handback has seeded and
-    /// drained everything that was parked for it.
+    // Whether this file is a volume of a demoted set whose reconstruction
+    // sweep is still outstanding.
+    //
+    // A demoted set fails [`Self::is_direct_source_file`] on purpose — its
+    // volumes are ordinary files from the demotion on — but for as long as the
+    // detached sweep runs, those files are half written: the sweep owns them,
+    // sets their length, and may remove one outright. An article that
+    // completes such a volume through the conventional path in that window
+    // must not have the file classified, probed or entered into the archive
+    // topology over an image the sweep has not finished; the handback replays
+    // the completion hook for every volume once the ticket lands.
+    //
+    // A volume the sweep has finished and the actor has handed back is not
+    // owned any more, ticket or no ticket: the sweep never returns to a
+    // volume once its outcome is reported, and the handback has seeded and
+    // drained everything that was parked for it.
     pub(crate) fn demotion_sweep_owns_file(&self, file_id: NzbFileId) -> bool {
         self.direct_demotion_in_flight
             .get(&file_id.job_id)
@@ -214,32 +217,32 @@ impl Pipeline {
             })
     }
 
-    /// Whether the archive set `set_name` has a demotion sweep whose ticket
-    /// has not landed, however many of its volumes are already handed back.
-    ///
-    /// A chase reads every volume of its set, so one handed-back volume does
-    /// not make the set readable: the sweep may still be rebuilding or
-    /// removing its siblings, and the set's routed outputs are deleted only
-    /// when the ticket lands. The completion replay that follows re-enters
-    /// every complete volume, and that is where the set may arm.
+    // Whether the archive set `set_name` has a demotion sweep whose ticket
+    // has not landed, however many of its volumes are already handed back.
+    //
+    // A chase reads every volume of its set, so one handed-back volume does
+    // not make the set readable: the sweep may still be rebuilding or
+    // removing its siblings, and the set's routed outputs are deleted only
+    // when the ticket lands. The completion replay that follows re-enters
+    // every complete volume, and that is where the set may arm.
     pub(crate) fn demotion_sweep_outstanding_for_set(&self, job_id: JobId, set_name: &str) -> bool {
         self.direct_demotion_in_flight
             .get(&job_id)
             .is_some_and(|sets| sets.values().any(|work| work.plan.set_name == set_name))
     }
 
-    /// File indices whose queued articles are held back while a demotion
-    /// sweep owns them, or `None` when no sweep is in flight for the job.
-    ///
-    /// An article for a sweep-owned file cannot be written when it lands: the
-    /// decode seam parks it in the write buffer, and neither relief path may
-    /// spill it, since a flush would commit over the image the sweep is
-    /// still rebuilding. Fetching more of them while the sweep runs only
-    /// grows that parked backlog toward the write-pressure latch, which then
-    /// stops every other file too. Dispatch skips them until *their* handback:
-    /// the sweep reports one volume at a time, and a volume it has finished
-    /// goes back into dispatch while the rest are still being rebuilt, so a
-    /// long sweep over a slow working directory never idles the whole job.
+    // File indices whose queued articles are held back while a demotion
+    // sweep owns them, or `None` when no sweep is in flight for the job.
+    //
+    // An article for a sweep-owned file cannot be written when it lands: the
+    // decode seam parks it in the write buffer, and neither relief path may
+    // spill it, since a flush would commit over the image the sweep is
+    // still rebuilding. Fetching more of them while the sweep runs only
+    // grows that parked backlog toward the write-pressure latch, which then
+    // stops every other file too. Dispatch skips them until *their* handback:
+    // the sweep reports one volume at a time, and a volume it has finished
+    // goes back into dispatch while the rest are still being rebuilt, so a
+    // long sweep over a slow working directory never idles the whole job.
     pub(crate) fn demotion_sweep_held_file_indices(&self, job_id: JobId) -> Option<Vec<u32>> {
         let sets = self.direct_demotion_in_flight.get(&job_id)?;
         let held: Vec<u32> = sets
@@ -255,25 +258,25 @@ impl Pipeline {
         (!held.is_empty()).then_some(held)
     }
 
-    /// The virtual volume behind one direct source file, as a **one-volume**
-    /// provider plus its logical length.
-    ///
-    /// A test-only accessor: production reads a direct set through
-    /// [`super::super::par2_access::DirectVolumeFileAccess`], which builds the whole
-    /// set's provider once for the pass. This answers the one-volume question a
-    /// test asks when it wants to inspect what a single volume reads back as,
-    /// without rebuilding the set's plan lookup in test code.
-    ///
-    /// The length is the decoded total the download layer tracks, never a
-    /// file's `metadata().len()`: for a direct volume there is no file to ask.
-    /// `None` for anything that is not a live direct set's source volume,
-    /// including a demoted set's — whose volumes are materializing or being
-    /// refetched, and are read from disk like any other file.
-    ///
-    /// An **encrypted** set answers here like any other: the provider
-    /// re-encrypts the member ranges it reads out of the partials, so what comes
-    /// back is the posted bytes the caller asked for rather than the plaintext
-    /// sitting on disk.
+    // The virtual volume behind one direct source file, as a **one-volume**
+    // provider plus its logical length.
+    //
+    // A test-only accessor: production reads a direct set through
+    // [`super::super::par2_access::DirectVolumeFileAccess`], which builds the whole
+    // set's provider once for the pass. This answers the one-volume question a
+    // test asks when it wants to inspect what a single volume reads back as,
+    // without rebuilding the set's plan lookup in test code.
+    //
+    // The length is the decoded total the download layer tracks, never a
+    // file's `metadata().len()`: for a direct volume there is no file to ask.
+    // `None` for anything that is not a live direct set's source volume,
+    // including a demoted set's — whose volumes are materializing or being
+    // refetched, and are read from disk like any other file.
+    //
+    // An **encrypted** set answers here like any other: the provider
+    // re-encrypts the member ranges it reads out of the partials, so what comes
+    // back is the posted bytes the caller asked for rather than the plaintext
+    // sitting on disk.
     #[cfg(test)]
     pub(crate) fn direct_virtual_volume(
         &self,
@@ -302,31 +305,31 @@ impl Pipeline {
         Some((volume_index, len, set.virtual_provider(&lengths)))
     }
 
-    /// The direct sets of `job_id` that the authoritative PAR2 pass must read
-    /// virtually, or `None` when it has none and today's `PlacementFileAccess`
-    /// is the whole answer.
-    ///
-    /// A volume is included only when its PAR2 identity resolves unambiguously
-    /// through the same name candidates the grid's binding resolver uses. An
-    /// unresolved one is skipped **here**, but that skip is not the safety net:
-    /// a half-bound set would have the pass read its remaining volumes off a
-    /// disk they are not on and report them missing, and
-    /// [`Self::demote_direct_sets_with_par2_damage`] could not even attribute
-    /// that damage back to the set, because attribution is keyed by the very
-    /// binding that failed. The net is [`Self::demote_unbindable_direct_sets`],
-    /// which runs *before* the pass and demotes any live set with an unbindable
-    /// volume outright, so what reaches here is either a fully bound set or no
-    /// set at all.
+    // The direct sets of `job_id` that the authoritative PAR2 pass must read
+    // virtually, or `None` when it has none and today's `PlacementFileAccess`
+    // is the whole answer.
+    //
+    // A volume is included only when its PAR2 identity resolves unambiguously
+    // through the same name candidates the grid's binding resolver uses. An
+    // unresolved one is skipped **here**, but that skip is not the safety net:
+    // a half-bound set would have the pass read its remaining volumes off a
+    // disk they are not on and report them missing, and
+    // [`Self::demote_direct_sets_with_par2_damage`] could not even attribute
+    // that damage back to the set, because attribution is keyed by the very
+    // binding that failed. The net is [`Self::demote_unbindable_direct_sets`],
+    // which runs *before* the pass and demotes any live set with an unbindable
+    // volume outright, so what reaches here is either a fully bound set or no
+    // set at all.
     pub(crate) fn direct_par2_overlay(&self, job_id: JobId) -> Option<DirectPar2Overlay> {
         self.direct_par2_overlay_for_set(job_id, self.par2_served_set_id(job_id)?)
     }
 
-    /// The virtual direct volumes that bind wholly to one recovery set.
-    ///
-    /// The compatibility wrapper above still answers the served set. Callers
-    /// that already know which recovery set they are verifying must use this
-    /// form, so a direct set owned by another parsed set is neither read nor
-    /// damaged by the wrong pass.
+    // The virtual direct volumes that bind wholly to one recovery set.
+    //
+    // The compatibility wrapper above still answers the served set. Callers
+    // that already know which recovery set they are verifying must use this
+    // form, so a direct set owned by another parsed set is neither read nor
+    // damaged by the wrong pass.
     pub(crate) fn direct_par2_overlay_for_set(
         &self,
         job_id: JobId,
@@ -444,21 +447,21 @@ impl Pipeline {
         })
     }
 
-    /// Whether the authoritative PAR2 pass may run over `job_id`'s direct sets
-    /// yet, or has to wait for their payload.
-    ///
-    /// Deliberately the same shape as the completion gate's own
-    /// `par2_primary_payload_ready`: **every live set's volumes have finished
-    /// downloading, or nothing more is coming**. A set that is still receiving
-    /// articles reads its outstanding ranges as holes, and PAR2 cannot tell a
-    /// hole from corruption — so a pass run early would report damage that is
-    /// only a download in progress, demote a healthy set and hand the repairer
-    /// volumes it would have to rebuild from scratch. The second half of the
-    /// disjunction is what keeps this from waiting forever: once the download
-    /// pipeline has drained, the holes are permanent and the verdict is real.
-    ///
-    /// `true` for every job with no live direct set, which is every conventional
-    /// job — the gate is unchanged for them by construction.
+    // Whether the authoritative PAR2 pass may run over `job_id`'s direct sets
+    // yet, or has to wait for their payload.
+    //
+    // Deliberately the same shape as the completion gate's own
+    // `par2_primary_payload_ready`: **every live set's volumes have finished
+    // downloading, or nothing more is coming**. A set that is still receiving
+    // articles reads its outstanding ranges as holes, and PAR2 cannot tell a
+    // hole from corruption — so a pass run early would report damage that is
+    // only a download in progress, demote a healthy set and hand the repairer
+    // volumes it would have to rebuild from scratch. The second half of the
+    // disjunction is what keeps this from waiting forever: once the download
+    // pipeline has drained, the holes are permanent and the verdict is real.
+    //
+    // `true` for every job with no live direct set, which is every conventional
+    // job — the gate is unchanged for them by construction.
     pub(super) fn direct_set_binds_to_par2_set(
         &self,
         job_id: JobId,
@@ -496,9 +499,9 @@ impl Pipeline {
         })
     }
 
-    /// The one ownership gate between direct demotion and every PAR2 verdict.
-    /// A pending file leaves through the durable conventional completion seam,
-    /// or once every article it still lacks is terminally unavailable.
+    // The one ownership gate between direct demotion and every PAR2 verdict.
+    // A pending file leaves through the durable conventional completion seam,
+    // or once every article it still lacks is terminally unavailable.
     #[cfg(test)]
     pub(crate) fn demoted_materializations_ready_for_par2(
         &mut self,
@@ -509,12 +512,12 @@ impl Pipeline {
             .is_none()
     }
 
-    /// Whether anything at all could still move this job's download pipeline.
-    ///
-    /// The question the materialization backstop asks: with no sweep running,
-    /// nothing queued on either queue, nothing in flight, nothing retrying,
-    /// nothing parked and no buffered bytes, there is no event left that could
-    /// ever clear a pending file. Waiting for one is then waiting for nothing.
+    // Whether anything at all could still move this job's download pipeline.
+    //
+    // The question the materialization backstop asks: with no sweep running,
+    // nothing queued on either queue, nothing in flight, nothing retrying,
+    // nothing parked and no buffered bytes, there is no event left that could
+    // ever clear a pending file. Waiting for one is then waiting for nothing.
     fn job_download_pipeline_is_idle(&self, job_id: JobId) -> bool {
         !self.job_has_pending_download_pipeline_work(job_id)
             && self
@@ -530,12 +533,12 @@ impl Pipeline {
                 .any(|segment_id| segment_id.file_id.job_id == job_id)
     }
 
-    /// The gate above, with the reason it refused.
-    ///
-    /// `None` is ready. Otherwise the first block found, which is what the
-    /// completion checkpoint names: a gate that can only say "not yet" leaves
-    /// the operator with a job sitting in `Downloading` and no line saying
-    /// which file it is sitting on.
+    // The gate above, with the reason it refused.
+    //
+    // `None` is ready. Otherwise the first block found, which is what the
+    // completion checkpoint names: a gate that can only say "not yet" leaves
+    // the operator with a job sitting in `Downloading` and no line saying
+    // which file it is sitting on.
     pub(crate) fn demoted_materialization_block_for_par2(
         &mut self,
         job_id: JobId,
@@ -768,20 +771,20 @@ impl Pipeline {
         block
     }
 
-    /// Restores the content evidence a live direct volume lost to a restart,
-    /// for every volume that has nothing else to bind by.
-    ///
-    /// A volume bound by content answers to its PAR2 description only through
-    /// the 16 KiB prefix its first article delivered, and that capture lives
-    /// in memory. A restart that resumes the set from its coverage checkpoint
-    /// skips the durable first article, so nothing captures it again, and the
-    /// length the assembly restored is the posted, encoded one, which
-    /// contradicts every description. The bytes are still in the set's
-    /// destinations and a complete volume's served extent is its exact decoded
-    /// length, so the window is read back once, off the actor, and a complete
-    /// volume's fingerprint is proven at that length, instead of demoting a
-    /// healthy set for facts it already held. A window the set cannot serve
-    /// whole is left alone; nothing is ever padded.
+    // Restores the content evidence a live direct volume lost to a restart,
+    // for every volume that has nothing else to bind by.
+    //
+    // A volume bound by content answers to its PAR2 description only through
+    // the 16 KiB prefix its first article delivered, and that capture lives
+    // in memory. A restart that resumes the set from its coverage checkpoint
+    // skips the durable first article, so nothing captures it again, and the
+    // length the assembly restored is the posted, encoded one, which
+    // contradicts every description. The bytes are still in the set's
+    // destinations and a complete volume's served extent is its exact decoded
+    // length, so the window is read back once, off the actor, and a complete
+    // volume's fingerprint is proven at that length, instead of demoting a
+    // healthy set for facts it already held. A window the set cannot serve
+    // whole is left alone; nothing is ever padded.
     async fn recapture_restored_direct_prefixes(&mut self, job_id: JobId) {
         let window = crate::pipeline::PAR2_HASH_16K_BYTES as u64;
         let mut reads = Vec::new();
@@ -890,21 +893,21 @@ impl Pipeline {
         }
     }
 
-    /// Demotes every live direct set of `job_id` holding a source volume that
-    /// cannot be bound, unambiguously, to a PAR2 description.
-    ///
-    /// The overlay is keyed by PAR2 file id, so an unbound volume is one the
-    /// pass cannot be told about *and* one whose verdict cannot be attributed
-    /// back to its set. Leaving it out — which is all
-    /// [`Self::direct_par2_overlay`] can do on its own — produces the worst of
-    /// both: the pass reads that volume off a disk it is not on and calls it
-    /// missing, `demote_direct_sets_with_par2_damage` finds no set to blame, and
-    /// the repairer is handed a virtual volume to write into. A set with *every*
-    /// volume unbound does not even produce an overlay, so the damage path is
-    /// skipped entirely.
-    ///
-    /// Demoting up front is what makes the pass's world binary: either a fully
-    /// bound virtual set, or real files on disk.
+    // Demotes every live direct set of `job_id` holding a source volume that
+    // cannot be bound, unambiguously, to a PAR2 description.
+    //
+    // The overlay is keyed by PAR2 file id, so an unbound volume is one the
+    // pass cannot be told about *and* one whose verdict cannot be attributed
+    // back to its set. Leaving it out — which is all
+    // [`Self::direct_par2_overlay`] can do on its own — produces the worst of
+    // both: the pass reads that volume off a disk it is not on and calls it
+    // missing, `demote_direct_sets_with_par2_damage` finds no set to blame, and
+    // the repairer is handed a virtual volume to write into. A set with *every*
+    // volume unbound does not even produce an overlay, so the damage path is
+    // skipped entirely.
+    //
+    // Demoting up front is what makes the pass's world binary: either a fully
+    // bound virtual set, or real files on disk.
     pub(crate) async fn demote_unbindable_direct_sets_for_set(
         &mut self,
         job_id: JobId,
@@ -996,47 +999,47 @@ impl Pipeline {
             .await
     }
 
-    /// Rewrites `Missing` to `Complete` for every source volume of a
-    /// **finalized** direct set, before the caller counts damage.
-    ///
-    /// Exactly the eager-delete precedent, and for exactly the same reason: the
-    /// bytes were verified and the file is legitimately absent. A finalized set
-    /// passed the whole-member CRC32 gate on every member *and* the job's own
-    /// PAR2 verdict — finalization is gated on that verdict — and then renamed
-    /// its partials to their destinations and deleted its envelopes. Nothing on
-    /// disk answers for its source volumes afterwards, and nothing should: they
-    /// were never written and never will be.
-    ///
-    /// Without this, any *later* pass over the same job — a conventional set's
-    /// extraction failing after the direct set finalized is enough — reports
-    /// every finalized volume missing and either fails the job as unrepairable
-    /// or has the repairer reconstruct source volumes onto disk that the job
-    /// already finished without.
-    ///
-    /// Live and demoted sets are deliberately untouched: a live set's volumes
-    /// are served virtually and its verdict is real, and a demoted set's are
-    /// materializing or being refetched, so missing means missing.
-    ///
-    /// # Retention does not replace it, and does not fight it either
-    ///
-    /// A set that finalized beside a live neighbour keeps its envelopes and
-    /// serves its volumes out of the committed members
-    /// ([`Self::retain_finalized_direct_volumes`]), so in that window they read
-    /// `Complete` on their own and there is nothing here to forgive — the same
-    /// verdict, reached by reading rather than by excusing. This still runs, and
-    /// still has to: retention covers one window of one shape, and the pass that
-    /// motivated this rule is the *later* one, over a job whose sets are all
-    /// committed and whose envelopes are therefore gone. It is also the only
-    /// answer on the paths that read no overlay at all — `analyze_par2_damage`'s
-    /// filesystem-bound repairer among them.
-    ///
-    /// Deliberately confined to `Missing`. A retained volume that read `Damaged`
-    /// would be one whose destination moved or whose image is short, and
-    /// excusing that would hand the repair bytes it should not trust; it is left
-    /// as damage, the repair refuses on an unmaterialized write target, and the
-    /// job falls back to the demotion path.
-    ///
-    /// Returns the number of missing slices forgiven.
+    // Rewrites `Missing` to `Complete` for every source volume of a
+    // **finalized** direct set, before the caller counts damage.
+    //
+    // Exactly the eager-delete precedent, and for exactly the same reason: the
+    // bytes were verified and the file is legitimately absent. A finalized set
+    // passed the whole-member CRC32 gate on every member *and* the job's own
+    // PAR2 verdict — finalization is gated on that verdict — and then renamed
+    // its partials to their destinations and deleted its envelopes. Nothing on
+    // disk answers for its source volumes afterwards, and nothing should: they
+    // were never written and never will be.
+    //
+    // Without this, any *later* pass over the same job — a conventional set's
+    // extraction failing after the direct set finalized is enough — reports
+    // every finalized volume missing and either fails the job as unrepairable
+    // or has the repairer reconstruct source volumes onto disk that the job
+    // already finished without.
+    //
+    // Live and demoted sets are deliberately untouched: a live set's volumes
+    // are served virtually and its verdict is real, and a demoted set's are
+    // materializing or being refetched, so missing means missing.
+    //
+    // # Retention does not replace it, and does not fight it either
+    //
+    // A set that finalized beside a live neighbour keeps its envelopes and
+    // serves its volumes out of the committed members
+    // ([`Self::retain_finalized_direct_volumes`]), so in that window they read
+    // `Complete` on their own and there is nothing here to forgive — the same
+    // verdict, reached by reading rather than by excusing. This still runs, and
+    // still has to: retention covers one window of one shape, and the pass that
+    // motivated this rule is the *later* one, over a job whose sets are all
+    // committed and whose envelopes are therefore gone. It is also the only
+    // answer on the paths that read no overlay at all — `analyze_par2_damage`'s
+    // filesystem-bound repairer among them.
+    //
+    // Deliberately confined to `Missing`. A retained volume that read `Damaged`
+    // would be one whose destination moved or whose image is short, and
+    // excusing that would hand the repair bytes it should not trust; it is left
+    // as damage, the repair refuses on an unmaterialized write target, and the
+    // job falls back to the demotion path.
+    //
+    // Returns the number of missing slices forgiven.
     pub(crate) fn forgive_finalized_direct_volumes(
         &self,
         job_id: JobId,
@@ -1088,35 +1091,35 @@ impl Pipeline {
         forgiven
     }
 
-    /// Answers PAR2 damage on a job's direct sets.
-    ///
-    /// The entry point, and the whole of *repair while still direct* transition
-    /// seen from the pipeline. It tries the repair first and falls back to the
-    /// whole-set demotion on any refusal, so `Resolved` means the job's next
-    /// move is a fresh completion check, over either repaired virtual volumes
-    /// or materialized physical ones.
-    ///
-    /// `Deferred` is the third answer and it is not a refusal: the damage is
-    /// coverable by the recovery set, just not by the slices merged so far, so
-    /// the missing recovery has been asked for and the sets are staying direct
-    /// until it arrives. Falling through to the demotion there would materialize
-    /// every volume moments before the blocks that would have repaired them in
-    /// place land.
-    ///
-    /// The ordering is normative:
-    ///
-    /// 1. the set's **checkpoint row is deleted first**, because everything
-    ///    below rewrites bytes the row claims. The next barrier recreates
-    ///    coverage from scratch. Deliberately lossy: a crash between here and
-    ///    that barrier costs a full redownload of the set, which is bounded and
-    ///    is what the whole model already accepts for uncheckpointed work;
-    /// 2. only the damaged volumes materialize, into scratch files;
-    /// 3. the repair runs with every clean volume read **virtually**;
-    /// 4. the repaired spans re-enter the router with replacement semantics and
-    ///    their destination writes are awaited before anything is recorded;
-    /// 5. the stale composition gaps the rewrite left are re-read from the
-    ///    partials that hold them, which re-arms the whole-member gates;
-    /// 6. the scratch is deleted, and the set is back to fully virtual.
+    // Answers PAR2 damage on a job's direct sets.
+    //
+    // The entry point, and the whole of *repair while still direct* transition
+    // seen from the pipeline. It tries the repair first and falls back to the
+    // whole-set demotion on any refusal, so `Resolved` means the job's next
+    // move is a fresh completion check, over either repaired virtual volumes
+    // or materialized physical ones.
+    //
+    // `Deferred` is the third answer and it is not a refusal: the damage is
+    // coverable by the recovery set, just not by the slices merged so far, so
+    // the missing recovery has been asked for and the sets are staying direct
+    // until it arrives. Falling through to the demotion there would materialize
+    // every volume moments before the blocks that would have repaired them in
+    // place land.
+    //
+    // The ordering is normative:
+    //
+    // 1. the set's **checkpoint row is deleted first**, because everything
+    //    below rewrites bytes the row claims. The next barrier recreates
+    //    coverage from scratch. Deliberately lossy: a crash between here and
+    //    that barrier costs a full redownload of the set, which is bounded and
+    //    is what the whole model already accepts for uncheckpointed work;
+    // 2. only the damaged volumes materialize, into scratch files;
+    // 3. the repair runs with every clean volume read **virtually**;
+    // 4. the repaired spans re-enter the router with replacement semantics and
+    //    their destination writes are awaited before anything is recorded;
+    // 5. the stale composition gaps the rewrite left are re-read from the
+    //    partials that hold them, which re-arms the whole-member gates;
+    // 6. the scratch is deleted, and the set is back to fully virtual.
     pub(crate) async fn resolve_direct_sets_with_par2_damage_for_set(
         &mut self,
         job_id: JobId,
@@ -1164,24 +1167,24 @@ impl Pipeline {
             .await
     }
 
-    /// The repair chance for a live direct set, taken **before** the completion
-    /// gate hands the job to `Par2Repairer`.
-    ///
-    /// That branch exists for jobs the fast paths could not clear, and a live
-    /// direct set reaches it routinely: it contributes nothing to the
-    /// clean-PAR2 integrity gate — a direct set never enters the archive
-    /// topology — so a damaged one always arrives here rather than at the
-    /// verify branch. The repairer is filesystem-bound, so today's answer is
-    /// [`Self::demote_live_direct_sets_for_par2_repair`]: materialize
-    /// everything and let it work over real files. This is what repair puts in
-    /// front of that, and `Unresolved` means the demotion is still the answer.
-    ///
-    /// The verdict is computed here rather than borrowed, because the branch has
-    /// none yet. It is deliberately a **quiet** pass — no status transition, no
-    /// verification events — for two reasons: the analyze pass immediately below
-    /// emits its own, so a job that falls through would report verifying twice;
-    /// and this one exists to answer a question about direct sets, not to record
-    /// the job's verdict.
+    // The repair chance for a live direct set, taken **before** the completion
+    // gate hands the job to `Par2Repairer`.
+    //
+    // That branch exists for jobs the fast paths could not clear, and a live
+    // direct set reaches it routinely: it contributes nothing to the
+    // clean-PAR2 integrity gate — a direct set never enters the archive
+    // topology — so a damaged one always arrives here rather than at the
+    // verify branch. The repairer is filesystem-bound, so today's answer is
+    // [`Self::demote_live_direct_sets_for_par2_repair`]: materialize
+    // everything and let it work over real files. This is what repair puts in
+    // front of that, and `Unresolved` means the demotion is still the answer.
+    //
+    // The verdict is computed here rather than borrowed, because the branch has
+    // none yet. It is deliberately a **quiet** pass — no status transition, no
+    // verification events — for two reasons: the analyze pass immediately below
+    // emits its own, so a job that falls through would report verifying twice;
+    // and this one exists to answer a question about direct sets, not to record
+    // the job's verdict.
     pub(crate) async fn resolve_direct_sets_before_par2_repairer_for_set(
         &mut self,
         job_id: JobId,
@@ -1315,18 +1318,18 @@ impl Pipeline {
         .await
     }
 
-    /// The detached read-back behind [`Self::verify_direct_sets_quietly`]:
-    /// returns a finished verdict for this job and recovery set if one is
-    /// parked, starts the read and returns `None` if none is, and returns
-    /// `None` while one is running. The done message schedules the completion
-    /// check that re-enters here and takes the verdict.
-    ///
-    /// Both of the pass's shapes go through it — the post-repair read of what a
-    /// repair rewrote, and the pre-repair read of the files the grid could not
-    /// claim — because both are the whole set read back from disk, which on a
-    /// slow destination is tens of seconds no lane may wait on. `post_repair`
-    /// is part of the ticket's identity: a verdict read under one shape is not
-    /// an answer for the other.
+    // The detached read-back behind [`Self::verify_direct_sets_quietly`]:
+    // returns a finished verdict for this job and recovery set if one is
+    // parked, starts the read and returns `None` if none is, and returns
+    // `None` while one is running. The done message schedules the completion
+    // check that re-enters here and takes the verdict.
+    //
+    // Both of the pass's shapes go through it — the post-repair read of what a
+    // repair rewrote, and the pre-repair read of the files the grid could not
+    // claim — because both are the whole set read back from disk, which on a
+    // slow destination is tens of seconds no lane may wait on. `post_repair`
+    // is part of the ticket's identity: a verdict read under one shape is not
+    // an answer for the other.
     pub(super) fn take_or_start_direct_post_repair_verification(
         &mut self,
         job_id: JobId,
@@ -1486,76 +1489,76 @@ impl Pipeline {
         self.schedule_job_completion_check(done.job_id);
     }
 
-    /// One verification pass over the job's recovery set, reading every live
-    /// direct volume virtually and emitting nothing.
-    ///
-    /// The verdict is **adjusted before it is returned**, by exactly the two
-    /// rules the authoritative pass applies to its own
-    /// ([`Pipeline::apply_direct_damage_adjustments`]). Skipping them was not a
-    /// small omission: a job with a *finalized* direct set beside a live
-    /// damaged one reads every finalized volume as `Missing` here,
-    /// `damaged_files_by_set` finds no live owner for them and refuses the
-    /// whole attempt with `DamageOutsideDirectSets` — so the live set demotes
-    /// for damage that belongs to files the job legitimately finished without,
-    /// which is precisely the case repair exists for.
-    ///
-    /// # Before a repair, and after one
-    ///
-    /// The same pass runs on both sides of a repair-while-direct, and the two
-    /// are not asking the same question.
-    ///
-    /// *Before*, it is asking whether the set is damaged, and a file the
-    /// dual-CRC grid adjudicated in stream is answered from that evidence
-    /// rather than read. That is the clean path and it is unchanged.
-    ///
-    /// *After*, it is asking whether the repair landed — and that question has
-    /// to be answered by reading the bytes. Every claim source this pass has is
-    /// a statement about what the **wire** delivered: the grid folds per-article
-    /// CRCs recorded at the durability seam, and the session is seeded from the
-    /// same verdicts. None of them can see a `pwrite` that silently short-wrote,
-    /// a bad sector under the envelope, or a repaired span that never reached
-    /// the platter. A direct set's source volumes are exactly the files nothing
-    /// else ever re-reads, so if this pass stands on wire evidence, a disk fault
-    /// under a repaired set ships in a `Completed` job.
-    ///
-    /// So a post-repair pass takes no *wire* claims — the grid and the
-    /// session are both skipped, unconditionally and with no knob to turn
-    /// that off. See [`Self::direct_sets_repaired_in_place`] for how the two
-    /// are told apart.
-    ///
-    /// It does not follow that every described file is read, though. When
-    /// [`Pipeline::resolve_direct_sets_before_par2_repairer_for_set`] left a
-    /// [`DirectPostRepairCarry`] for this recovery set, the files the repair
-    /// did not rewrite carry their entry forward from that *disk* read — the
-    /// pre-repair pass's own, taken minutes ago in this same flow — rather
-    /// than being re-read. That is not wire evidence standing in for a read;
-    /// it is the same trust class [`Pipeline::verify_repaired_par2_files_with_placement`]
-    /// already extends to a conventional set's untouched files, applied here
-    /// for the same reason: the repair could only ever have rewritten the
-    /// files its own pre-repair verdict called not-`Complete`, so re-reading
-    /// the rest answers a question the disk already answered once this pass.
-    /// A carry that is missing or stale for this recovery set gets no such
-    /// shortcut; every described file is read, which is this pass's answer
-    /// whenever it cannot prove a narrower one is enough.
-    ///
-    /// The reads themselves go to real files — [`super::super::provider::VirtualVolumeReader`]
-    /// holds an open handle on the envelope and on each member `.direct.partial`
-    /// — so "read the bytes" here means the same thing it means for a
-    /// conventional file, even though the volume it reconstructs is virtual.
-    ///
-    /// # Why the post-repair pass may still verify from slice proof
-    ///
-    /// `fast_verify` is not a sampled read: par2-rs proves an intact candidate
-    /// from its per-slice IFSC checksums scanned at read speed and skips only
-    /// the inherently serial whole-file MD5, and a file it cannot prove that way
-    /// falls through to the strict pipeline with its per-slice accounting fully
-    /// intact (par2-rs `verify.rs`, the `fast_verify && let Some(..)` arms). So
-    /// every byte is still read and a damaged volume — the only kind whose
-    /// accounting a follow-up repair would be sized from — is still measured
-    /// slice by slice.
-    ///
-    /// The pre-repair pass keeps the strict default. Its verdict is what sizes
-    /// the repair, and it is not the pass this optimisation was measured for.
+    // One verification pass over the job's recovery set, reading every live
+    // direct volume virtually and emitting nothing.
+    //
+    // The verdict is **adjusted before it is returned**, by exactly the two
+    // rules the authoritative pass applies to its own
+    // ([`Pipeline::apply_direct_damage_adjustments`]). Skipping them was not a
+    // small omission: a job with a *finalized* direct set beside a live
+    // damaged one reads every finalized volume as `Missing` here,
+    // `damaged_files_by_set` finds no live owner for them and refuses the
+    // whole attempt with `DamageOutsideDirectSets` — so the live set demotes
+    // for damage that belongs to files the job legitimately finished without,
+    // which is precisely the case repair exists for.
+    //
+    // # Before a repair, and after one
+    //
+    // The same pass runs on both sides of a repair-while-direct, and the two
+    // are not asking the same question.
+    //
+    // *Before*, it is asking whether the set is damaged, and a file the
+    // dual-CRC grid adjudicated in stream is answered from that evidence
+    // rather than read. That is the clean path and it is unchanged.
+    //
+    // *After*, it is asking whether the repair landed — and that question has
+    // to be answered by reading the bytes. Every claim source this pass has is
+    // a statement about what the **wire** delivered: the grid folds per-article
+    // CRCs recorded at the durability seam, and the session is seeded from the
+    // same verdicts. None of them can see a `pwrite` that silently short-wrote,
+    // a bad sector under the envelope, or a repaired span that never reached
+    // the platter. A direct set's source volumes are exactly the files nothing
+    // else ever re-reads, so if this pass stands on wire evidence, a disk fault
+    // under a repaired set ships in a `Completed` job.
+    //
+    // So a post-repair pass takes no *wire* claims — the grid and the
+    // session are both skipped, unconditionally and with no knob to turn
+    // that off. See [`Self::direct_sets_repaired_in_place`] for how the two
+    // are told apart.
+    //
+    // It does not follow that every described file is read, though. When
+    // [`Pipeline::resolve_direct_sets_before_par2_repairer_for_set`] left a
+    // [`DirectPostRepairCarry`] for this recovery set, the files the repair
+    // did not rewrite carry their entry forward from that *disk* read — the
+    // pre-repair pass's own, taken minutes ago in this same flow — rather
+    // than being re-read. That is not wire evidence standing in for a read;
+    // it is the same trust class [`Pipeline::verify_repaired_par2_files_with_placement`]
+    // already extends to a conventional set's untouched files, applied here
+    // for the same reason: the repair could only ever have rewritten the
+    // files its own pre-repair verdict called not-`Complete`, so re-reading
+    // the rest answers a question the disk already answered once this pass.
+    // A carry that is missing or stale for this recovery set gets no such
+    // shortcut; every described file is read, which is this pass's answer
+    // whenever it cannot prove a narrower one is enough.
+    //
+    // The reads themselves go to real files — [`super::super::provider::VirtualVolumeReader`]
+    // holds an open handle on the envelope and on each member `.direct.partial`
+    // — so "read the bytes" here means the same thing it means for a
+    // conventional file, even though the volume it reconstructs is virtual.
+    //
+    // # Why the post-repair pass may still verify from slice proof
+    //
+    // `fast_verify` is not a sampled read: par2-rs proves an intact candidate
+    // from its per-slice IFSC checksums scanned at read speed and skips only
+    // the inherently serial whole-file MD5, and a file it cannot prove that way
+    // falls through to the strict pipeline with its per-slice accounting fully
+    // intact (par2-rs `verify.rs`, the `fast_verify && let Some(..)` arms). So
+    // every byte is still read and a damaged volume — the only kind whose
+    // accounting a follow-up repair would be sized from — is still measured
+    // slice by slice.
+    //
+    // The pre-repair pass keeps the strict default. Its verdict is what sizes
+    // the repair, and it is not the pass this optimisation was measured for.
     pub(crate) async fn verify_direct_sets_quietly(
         &mut self,
         job_id: JobId,
@@ -1933,49 +1936,49 @@ impl Pipeline {
         Some(verification)
     }
 
-    /// Has a repair-while-direct already run for one of this job's live sets?
-    ///
-    /// The discriminator between the two passes
-    /// [`Self::verify_direct_sets_quietly`] serves. The latch it reads is burned
-    /// at a repair's first irreversible step, so it is true from the moment any
-    /// byte of a set could have moved — which is exactly when a claim about what
-    /// the wire delivered stops being a claim about what is on disk.
-    ///
-    /// Per job rather than per set. The pass verifies the job's whole recovery
-    /// set in one go and its claim sources are job-scoped, so there is no
-    /// coherent way to read half of it from evidence and half from disk; one
-    /// repaired set makes the whole pass a read-back.
-    ///
-    /// Demoted sets are skipped: their volumes are real files that the
-    /// conventional repairer and its own post-repair pass now own.
-    ///
-    /// # This is defence in depth, and it is worth having anyway
-    ///
-    /// The repaired set's grid claims are already retired on a post-repair pass:
-    /// the repair drops its affected files before it rewrites a byte, and the
-    /// session arm is gated on that evidence. A counterfactual run with both
-    /// guards removed still reads every volume back.
-    ///
-    /// It stays because the emptiness is a *consequence* of a decision made
-    /// several hundred lines away, for a different reason — retiring claims over
-    /// bytes that moved — and the requirement here is a different statement: a
-    /// post-repair pass must read the disk. Deriving a safety property from
-    /// another decision's side effect is how it lapses silently when that
-    /// decision is refactored. One bool is a cheap price for saying it where it
-    /// is meant.
-    /// The PAR2 descriptions of live direct volumes carrying a recorded
-    /// part-checksum mismatch.
-    ///
-    /// The bridge between an archive-level fact and a PAR2-level one. A volume
-    /// lands here because RAR's own packed checksum disagreed with bytes the
-    /// wire delivered *and vouched for*, which makes every claim derived from
-    /// that same wire — the retained session's slice evidence, the dual-CRC
-    /// grid's whole-file and per-slice proofs — evidence from the witness whose
-    /// account is in question. So the pass reads these volumes, and nothing
-    /// stands in for them.
-    ///
-    /// Empty for every set with no damage on record, which is every set in
-    /// every healthy job: the claim ladder is untouched for them.
+    // Has a repair-while-direct already run for one of this job's live sets?
+    //
+    // The discriminator between the two passes
+    // [`Self::verify_direct_sets_quietly`] serves. The latch it reads is burned
+    // at a repair's first irreversible step, so it is true from the moment any
+    // byte of a set could have moved — which is exactly when a claim about what
+    // the wire delivered stops being a claim about what is on disk.
+    //
+    // Per job rather than per set. The pass verifies the job's whole recovery
+    // set in one go and its claim sources are job-scoped, so there is no
+    // coherent way to read half of it from evidence and half from disk; one
+    // repaired set makes the whole pass a read-back.
+    //
+    // Demoted sets are skipped: their volumes are real files that the
+    // conventional repairer and its own post-repair pass now own.
+    //
+    // # This is defence in depth, and it is worth having anyway
+    //
+    // The repaired set's grid claims are already retired on a post-repair pass:
+    // the repair drops its affected files before it rewrites a byte, and the
+    // session arm is gated on that evidence. A counterfactual run with both
+    // guards removed still reads every volume back.
+    //
+    // It stays because the emptiness is a *consequence* of a decision made
+    // several hundred lines away, for a different reason — retiring claims over
+    // bytes that moved — and the requirement here is a different statement: a
+    // post-repair pass must read the disk. Deriving a safety property from
+    // another decision's side effect is how it lapses silently when that
+    // decision is refactored. One bool is a cheap price for saying it where it
+    // is meant.
+    // The PAR2 descriptions of live direct volumes carrying a recorded
+    // part-checksum mismatch.
+    //
+    // The bridge between an archive-level fact and a PAR2-level one. A volume
+    // lands here because RAR's own packed checksum disagreed with bytes the
+    // wire delivered *and vouched for*, which makes every claim derived from
+    // that same wire — the retained session's slice evidence, the dual-CRC
+    // grid's whole-file and per-slice proofs — evidence from the witness whose
+    // account is in question. So the pass reads these volumes, and nothing
+    // stands in for them.
+    //
+    // Empty for every set with no damage on record, which is every set in
+    // every healthy job: the claim ladder is untouched for them.
     pub(crate) fn direct_suspect_par2_file_ids(
         &self,
         job_id: JobId,
@@ -2015,20 +2018,20 @@ impl Pipeline {
                 .any(|set| !set.is_demoted() && set.repair_attempted())
     }
 
-    /// The `FileVerification` entries the dual-CRC grid can stand in for, in
-    /// the shape `par2_rs::verify_all` would have produced by reading them.
-    ///
-    /// The claim is per description and it is the same claim
-    /// [`Pipeline::grid_adjudicated_par2_bindings`] makes for the whole set:
-    /// this file bound uniquely to this description, its assembled decoded
-    /// length equals the described length, and every described slice closed
-    /// `Intact` with independent article coverage. Nothing here is derived from
-    /// the *pass*; it is derived from evidence the download seam recorded once
-    /// the bytes were durable.
-    ///
-    /// Empty on ambiguity — two pipeline files claiming one description — so an
-    /// unresolvable binding costs the reads it always did rather than producing
-    /// a claim from a resolution that cannot be trusted.
+    // The `FileVerification` entries the dual-CRC grid can stand in for, in
+    // the shape `par2_rs::verify_all` would have produced by reading them.
+    //
+    // The claim is per description and it is the same claim
+    // [`Pipeline::grid_adjudicated_par2_bindings`] makes for the whole set:
+    // this file bound uniquely to this description, its assembled decoded
+    // length equals the described length, and every described slice closed
+    // `Intact` with independent article coverage. Nothing here is derived from
+    // the *pass*; it is derived from evidence the download seam recorded once
+    // the bytes were durable.
+    //
+    // Empty on ambiguity — two pipeline files claiming one description — so an
+    // unresolvable binding costs the reads it always did rather than producing
+    // a claim from a resolution that cannot be trusted.
     pub(crate) fn grid_claimed_file_verifications(
         &self,
         job_id: JobId,
@@ -2062,32 +2065,32 @@ impl Pipeline {
             .collect()
     }
 
-    /// The retained session's verdict for a job's direct sets, or `None` to
-    /// fall back to the read-and-verify pass.
-    ///
-    /// # Why this can refuse
-    ///
-    /// An access-backed session reads **no** source bytes: `analyze()` skips
-    /// the scan entirely, because `base_dir` holds no sources to find. It
-    /// reports what its evidence established and nothing more. So it can stand
-    /// in for the pass only when the dual-CRC grid already adjudicated every
-    /// described slice in stream, which is what
-    /// [`Pipeline::grid_adjudicated_par2_bindings`] checks. A slice with no
-    /// verdict does not qualify, and one of those is enough to send the whole
-    /// job back to `verify_all`, which can actually read a virtual volume.
-    ///
-    /// Refusing is therefore ordinary, not exceptional — any set the grid could
-    /// not fully claim in stream takes the pass, as does every damaged one.
-    ///
-    /// # What feeds the gate
-    ///
-    /// The grid is fed for a direct volume by `commit_direct_segment`, in
-    /// source-volume coordinates, on the same durability contract the
-    /// conventional seam states: the article's destination writes returned
-    /// before the claim was recorded. So a clean direct set can satisfy the gate
-    /// and take this arm, and a set the grid could only partly claim falls to
-    /// the pass below — which stands in for the files it *did* claim and reads
-    /// only the rest.
+    // The retained session's verdict for a job's direct sets, or `None` to
+    // fall back to the read-and-verify pass.
+    //
+    // # Why this can refuse
+    //
+    // An access-backed session reads **no** source bytes: `analyze()` skips
+    // the scan entirely, because `base_dir` holds no sources to find. It
+    // reports what its evidence established and nothing more. So it can stand
+    // in for the pass only when the dual-CRC grid already adjudicated every
+    // described slice in stream, which is what
+    // [`Pipeline::grid_adjudicated_par2_bindings`] checks. A slice with no
+    // verdict does not qualify, and one of those is enough to send the whole
+    // job back to `verify_all`, which can actually read a virtual volume.
+    //
+    // Refusing is therefore ordinary, not exceptional — any set the grid could
+    // not fully claim in stream takes the pass, as does every damaged one.
+    //
+    // # What feeds the gate
+    //
+    // The grid is fed for a direct volume by `commit_direct_segment`, in
+    // source-volume coordinates, on the same durability contract the
+    // conventional seam states: the article's destination writes returned
+    // before the claim was recorded. So a clean direct set can satisfy the gate
+    // and take this arm, and a set the grid could only partly claim falls to
+    // the pass below — which stands in for the files it *did* claim and reads
+    // only the rest.
     pub(super) async fn verify_direct_sets_through_session(
         &mut self,
         job_id: JobId,
@@ -2187,10 +2190,10 @@ impl Pipeline {
         }
     }
 
-    /// Repair-while-direct. [`DirectRepairAnswer::Declined`] means nothing was
-    /// repaired and the caller should fall back to demotion;
-    /// [`DirectRepairAnswer::Deferred`] means the sets are waiting for recovery
-    /// that has been asked for, and the caller must leave them alone.
+    // Repair-while-direct. [`DirectRepairAnswer::Declined`] means nothing was
+    // repaired and the caller should fall back to demotion;
+    // [`DirectRepairAnswer::Deferred`] means the sets are waiting for recovery
+    // that has been asked for, and the caller must leave them alone.
     pub(super) async fn repair_direct_sets_with_par2_damage(
         &mut self,
         job_id: JobId,
@@ -2240,6 +2243,20 @@ impl Pipeline {
         };
         if by_set.is_empty() && conventional.is_empty() {
             return DirectRepairAnswer::Declined;
+        }
+        // A conventional target is a file this repair will write on disk, and
+        // a set admitted from volume headers that could have claimed it never
+        // will: it would hold its own volumes virtually while the
+        // conventional set naming the rebuilt file waits on them, and a
+        // repair of its own could not place bytes for a member that opens in
+        // a volume it does not hold. It leaves before the repair, and the
+        // conventional repairer answers the whole set.
+        let rebuilt: Vec<u32> = conventional
+            .iter()
+            .map(|target| target.file_id.file_index)
+            .collect();
+        if self.note_identity_repaired_files(job_id, &rebuilt).await {
+            return DirectRepairAnswer::Acted;
         }
 
         // The wait, decided **before** the first attempt.
@@ -2441,21 +2458,21 @@ impl Pipeline {
         }
     }
 
-    /// Asks for the recovery the verdict needs and says whether the sets should
-    /// wait for it instead of demoting.
-    ///
-    /// Three questions, in the order that makes each one cheap:
-    ///
-    /// 1. **Can the recovery set cover this at all?** `blocks_available` is what
-    ///    is merged; the NZB's advertised recovery is the ceiling. If the damage
-    ///    exceeds even that, no amount of downloading helps, and the demotion
-    ///    has to be immediate — the conventional path reaches the same dead end
-    ///    with better diagnostics, and delaying it helps nobody.
-    /// 2. **Has this job spent its waves?** The budget below.
-    /// 3. **Is recovery actually coming?** Either this call promoted some, or a
-    ///    previous wave is still on the wire. Neither, and there is nothing to
-    ///    wait for: waiting on recovery that cannot arrive is how this branch
-    ///    livelocked before, so the exhausted case demotes rather than parks.
+    // Asks for the recovery the verdict needs and says whether the sets should
+    // wait for it instead of demoting.
+    //
+    // Three questions, in the order that makes each one cheap:
+    //
+    // 1. **Can the recovery set cover this at all?** `blocks_available` is what
+    //    is merged; the NZB's advertised recovery is the ceiling. If the damage
+    //    exceeds even that, no amount of downloading helps, and the demotion
+    //    has to be immediate — the conventional path reaches the same dead end
+    //    with better diagnostics, and delaying it helps nobody.
+    // 2. **Has this job spent its waves?** The budget below.
+    // 3. **Is recovery actually coming?** Either this call promoted some, or a
+    //    previous wave is still on the wire. Neither, and there is nothing to
+    //    wait for: waiting on recovery that cannot arrive is how this branch
+    //    livelocked before, so the exhausted case demotes rather than parks.
     pub(crate) fn defer_direct_repair_for_recovery(
         &mut self,
         job_id: JobId,
@@ -2545,30 +2562,30 @@ impl Pipeline {
         debug!(job_id = job_id.0, failure = %failure, "direct-store repair refused");
     }
 
-    /// Admits the damaged files no live direct set owns as in-place write
-    /// targets for the direct repair, or refuses the lot.
-    ///
-    /// One recovery set routinely covers two archive sets, and when one of
-    /// them was demoted its damage is still the recovery set's damage. PAR2
-    /// repairs a recovery set's damaged files together, so refusing here used
-    /// to demote the set that stayed direct and clean for damage it never
-    /// had. The repair does not need that set's volumes on disk: it reads them
-    /// virtually, as source, and only ever writes the damaged files.
-    ///
-    /// A file is admitted only when the repair will write the very file the
-    /// verdict measured. The verdict this repair is planned from reads every
-    /// file outside a direct set where [`Self::direct_par2_fallback_names`]
-    /// puts it, and so does the repair's fallback access, so the job's file
-    /// must bind uniquely to that description and sit at exactly that name. A
-    /// file still owned by a
-    /// direct set that has not been demoted is never written: a finalized
-    /// set's volumes are not the repair's to recreate. Anything else refuses,
-    /// and the caller demotes exactly as before.
-    ///
-    /// The settle guard is the repair's own, applied to the job as a whole:
-    /// these files have no per-set completeness to fall back on, so the job's
-    /// payload must be settled and no demoted volume may still be on its way
-    /// to disk.
+    // Admits the damaged files no live direct set owns as in-place write
+    // targets for the direct repair, or refuses the lot.
+    //
+    // One recovery set routinely covers two archive sets, and when one of
+    // them was demoted its damage is still the recovery set's damage. PAR2
+    // repairs a recovery set's damaged files together, so refusing here used
+    // to demote the set that stayed direct and clean for damage it never
+    // had. The repair does not need that set's volumes on disk: it reads them
+    // virtually, as source, and only ever writes the damaged files.
+    //
+    // A file is admitted only when the repair will write the very file the
+    // verdict measured. The verdict this repair is planned from reads every
+    // file outside a direct set where [`Self::direct_par2_fallback_names`]
+    // puts it, and so does the repair's fallback access, so the job's file
+    // must bind uniquely to that description and sit at exactly that name. A
+    // file still owned by a
+    // direct set that has not been demoted is never written: a finalized
+    // set's volumes are not the repair's to recreate. Anything else refuses,
+    // and the caller demotes exactly as before.
+    //
+    // The settle guard is the repair's own, applied to the job as a whole:
+    // these files have no per-set completeness to fall back on, so the job's
+    // payload must be settled and no demoted volume may still be on its way
+    // to disk.
     pub(super) fn conventional_direct_repair_targets(
         &self,
         job_id: JobId,
@@ -2645,24 +2662,24 @@ impl Pipeline {
             .collect()
     }
 
-    /// The names the direct verify and repair read a file outside every
-    /// direct set under, for each such file that does not sit at its declared
-    /// PAR2 name.
-    ///
-    /// An obfuscated or renamed post keeps its posted name on disk until
-    /// completion renames it, so a demoted set's volume is still under that
-    /// name when one recovery set's verdict and repair cover it beside a set
-    /// that stayed direct. Read at its declared name it is simply absent: the
-    /// verdict calls every slice missing and the repair has nowhere to write,
-    /// so the set that stayed direct was demoted for damage it never had.
-    ///
-    /// The name comes from the identity the job already proved, the same
-    /// binding the dual-CRC grid measures the file against: by name, or by
-    /// the content fingerprint its offset-zero article captured. Nothing is
-    /// read or hashed beyond that. A file is redirected only when the binding
-    /// is the description's alone, so two files claiming one description, or a
-    /// name some other description declares, leave the description at its
-    /// declared name exactly as before.
+    // The names the direct verify and repair read a file outside every
+    // direct set under, for each such file that does not sit at its declared
+    // PAR2 name.
+    //
+    // An obfuscated or renamed post keeps its posted name on disk until
+    // completion renames it, so a demoted set's volume is still under that
+    // name when one recovery set's verdict and repair cover it beside a set
+    // that stayed direct. Read at its declared name it is simply absent: the
+    // verdict calls every slice missing and the repair has nowhere to write,
+    // so the set that stayed direct was demoted for damage it never had.
+    //
+    // The name comes from the identity the job already proved, the same
+    // binding the dual-CRC grid measures the file against: by name, or by
+    // the content fingerprint its offset-zero article captured. Nothing is
+    // read or hashed beyond that. A file is redirected only when the binding
+    // is the description's alone, so two files claiming one description, or a
+    // name some other description declares, leave the description at its
+    // declared name exactly as before.
     pub(super) fn direct_par2_fallback_names(
         &self,
         job_id: JobId,
@@ -2702,9 +2719,9 @@ impl Pipeline {
             .collect()
     }
 
-    /// Everything one set's repair can refuse for free: which of its volumes
-    /// are damaged, what the repair would rewrite, and whether that fits.
-    /// Nothing is changed, so a refusal here costs the set nothing.
+    // Everything one set's repair can refuse for free: which of its volumes
+    // are damaged, what the repair would rewrite, and whether that fits.
+    // Nothing is changed, so a refusal here costs the set nothing.
     pub(super) fn prepare_direct_set_repair(
         &self,
         job_id: JobId,
@@ -2862,8 +2879,8 @@ impl Pipeline {
         })
     }
 
-    /// The repair itself, for every prepared set at once: from the checkpoint
-    /// deletes to the scratch cleanup.
+    // The repair itself, for every prepared set at once: from the checkpoint
+    // deletes to the scratch cleanup.
     pub(super) async fn repair_prepared_direct_sets(
         &mut self,
         job_id: JobId,
@@ -3077,8 +3094,8 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Routes one set's repaired volumes back, confirms them and settles the
-    /// rewrite.
+    // Routes one set's repaired volumes back, confirms them and settles the
+    // rewrite.
     async fn settle_repaired_direct_set(
         &mut self,
         job_id: JobId,
@@ -3171,18 +3188,18 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Reads each repaired volume's spans back and feeds them through the
-    /// router and out to every destination they touch (replacement semantics).
-    ///
-    /// **One volume at a time, read then routed then dropped.** Both halves of
-    /// that are load-bearing and they pull in opposite directions:
-    ///
-    /// - a whole volume at once, because the classification frontier is a
-    ///   per-volume fact — a span routed before its volume's end record was
-    ///   staged would be held rather than routed, and the repair would refuse;
-    /// - never more than one volume, because the spans are bytes, and holding
-    ///   every damaged volume's rewrite so the last one could be staged put the
-    ///   set's whole repair in RAM twice over with nothing bounding it.
+    // Reads each repaired volume's spans back and feeds them through the
+    // router and out to every destination they touch (replacement semantics).
+    //
+    // **One volume at a time, read then routed then dropped.** Both halves of
+    // that are load-bearing and they pull in opposite directions:
+    //
+    // - a whole volume at once, because the classification frontier is a
+    //   per-volume fact — a span routed before its volume's end record was
+    //   staged would be held rather than routed, and the repair would refuse;
+    // - never more than one volume, because the spans are bytes, and holding
+    //   every damaged volume's rewrite so the last one could be staged put the
+    //   set's whole repair in RAM twice over with nothing bounding it.
     pub(super) async fn route_repaired_volumes(
         &mut self,
         job_id: JobId,
@@ -3336,15 +3353,15 @@ impl Pipeline {
         true
     }
 
-    /// The few posted bytes per member-extent edge that live in a
-    /// **neighbouring** volume of the same set.
-    ///
-    /// Read through the set's own virtual provider, which re-encrypts them out
-    /// of the neighbour's destination — those bytes did not change, so what
-    /// comes back is exactly what was posted there. Blocking work, but bounded
-    /// at 46 bytes per member extent of one volume — ≤31 below it, which is the
-    /// straddling block plus its CBC predecessor, and ≤15 above — so it is done
-    /// inline rather than on the pool.
+    // The few posted bytes per member-extent edge that live in a
+    // **neighbouring** volume of the same set.
+    //
+    // Read through the set's own virtual provider, which re-encrypts them out
+    // of the neighbour's destination — those bytes did not change, so what
+    // comes back is exactly what was posted there. Blocking work, but bounded
+    // at 46 bytes per member extent of one volume — ≤31 below it, which is the
+    // straddling block plus its CBC predecessor, and ≤15 above — so it is done
+    // inline rather than on the pool.
     pub(super) fn read_cipher_edges(
         &self,
         job_id: JobId,
@@ -3377,14 +3394,14 @@ impl Pipeline {
         edges
     }
 
-    /// Closes the composition gaps a repair's rewrite left, with one bounded
-    /// read of the partials that hold them.
-    ///
-    /// The shape is deliberately the restart re-arm: the same plan, the same
-    /// reader, the same "a run that will not read demotes rather than passes"
-    /// rule. What differs is only why the value is missing — a rewrite
-    /// discarded it rather than a restart losing it — and that difference has
-    /// no bearing on what it costs to recover.
+    // Closes the composition gaps a repair's rewrite left, with one bounded
+    // read of the partials that hold them.
+    //
+    // The shape is deliberately the restart re-arm: the same plan, the same
+    // reader, the same "a run that will not read demotes rather than passes"
+    // rule. What differs is only why the value is missing — a rewrite
+    // discarded it rather than a restart losing it — and that difference has
+    // no bearing on what it costs to recover.
     pub(super) async fn reread_direct_stale_gaps(&mut self, job_id: JobId, set_index: usize) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -3469,14 +3486,14 @@ impl Pipeline {
         }
     }
 
-    /// Demotes every direct set the PAR2 pass found damage on, and reports
-    /// whether any did.
-    ///
-    /// The fallback, and the earlier whole answer. A demoted set materializes
-    /// its volumes from its own routed bytes, refetches whatever reconstruction
-    /// could not verify, and hands the job to the conventional repair path —
-    /// which is exactly the shape the same job would have had with the gate
-    /// off.
+    // Demotes every direct set the PAR2 pass found damage on, and reports
+    // whether any did.
+    //
+    // The fallback, and the earlier whole answer. A demoted set materializes
+    // its volumes from its own routed bytes, refetches whatever reconstruction
+    // could not verify, and hands the job to the conventional repair path —
+    // which is exactly the shape the same job would have had with the gate
+    // off.
     pub(crate) async fn demote_direct_sets_with_par2_damage_for_set(
         &mut self,
         job_id: JobId,
@@ -3574,21 +3591,21 @@ impl Pipeline {
             .await
     }
 
-    /// Demotes any live set still holding a part-checksum mismatch that the
-    /// PAR2 pass could not answer — either because it read the volume and
-    /// called it whole, or because it found the damage and had nothing to
-    /// repair it with.
-    ///
-    /// A part-checksum mismatch parks its set: the member holds its
-    /// whole-member gate, so the set never finalizes on its own. That is right
-    /// while a repair might still come and wrong the moment one cannot, and a
-    /// parked set must never be the end state. `verdict` names which of the two
-    /// endings this was, for the log only.
-    ///
-    /// The reason is the routing gate's own, so the metric bucket
-    /// (`part_checksum_mismatch`) counts it exactly where it was always
-    /// counted, and a job whose archive is genuinely wrong reports the same
-    /// failure it reported before any of this existed.
+    // Demotes any live set still holding a part-checksum mismatch that the
+    // PAR2 pass could not answer — either because it read the volume and
+    // called it whole, or because it found the damage and had nothing to
+    // repair it with.
+    //
+    // A part-checksum mismatch parks its set: the member holds its
+    // whole-member gate, so the set never finalizes on its own. That is right
+    // while a repair might still come and wrong the moment one cannot, and a
+    // parked set must never be the end state. `verdict` names which of the two
+    // endings this was, for the log only.
+    //
+    // The reason is the routing gate's own, so the metric bucket
+    // (`part_checksum_mismatch`) counts it exactly where it was always
+    // counted, and a job whose archive is genuinely wrong reports the same
+    // failure it reported before any of this existed.
     pub(super) async fn demote_direct_sets_with_unanswered_part_damage(
         &mut self,
         job_id: JobId,
@@ -3626,11 +3643,11 @@ impl Pipeline {
         true
     }
 
-    /// Demotes every set of `job_id` that is still routing, because a PAR2
-    /// **repair** is about to run and repair needs a file to write into.
-    ///
-    /// Returns whether anything demoted, so the caller can let the job go round
-    /// again over materialized volumes rather than repairing against nothing.
+    // Demotes every set of `job_id` that is still routing, because a PAR2
+    // **repair** is about to run and repair needs a file to write into.
+    //
+    // Returns whether anything demoted, so the caller can let the job go round
+    // again over materialized volumes rather than repairing against nothing.
     pub(crate) async fn demote_live_direct_sets_for_par2_repair_for_set(
         &mut self,
         job_id: JobId,

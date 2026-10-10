@@ -1,11 +1,11 @@
-//! Install an authenticated content identity without overwriting another file.
+// Install an authenticated content identity without overwriting another file.
 
 use super::*;
 use crate::jobs::record::FileIdentitySource;
 
 impl Pipeline {
-    /// Complete the durable intent before restore can publish a source or
-    /// decide that an obfuscated embedded archive is an ordinary payload.
+    // Complete the durable intent before restore can publish a source or
+    // decide that an obfuscated embedded archive is an ordinary payload.
     pub(crate) fn restore_pending_par3_content_names(
         &self,
         job_id: JobId,
@@ -62,8 +62,8 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Persist and install one validated name proposal. A failed exclusive
-    /// move restores the exact previous identity before returning its error.
+    // Persist and install one validated name proposal. A failed exclusive
+    // move restores the exact previous identity before returning its error.
     pub(in crate::pipeline) fn install_par3_content_name(
         &mut self,
         job_id: JobId,
@@ -237,8 +237,8 @@ impl Pipeline {
     }
 }
 
-/// Replaying the filesystem half grants no checksum evidence. Restored bytes
-/// must still pass native verification with their newly published generation.
+// Replaying the filesystem half grants no checksum evidence. Restored bytes
+// must still pass native verification with their newly published generation.
 fn finish_content_move(
     directory: &std::path::Path,
     old_name: &str,

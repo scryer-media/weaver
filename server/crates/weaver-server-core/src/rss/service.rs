@@ -10,9 +10,9 @@ use crate::RssRuleAction;
 use crate::SchedulerHandle;
 use crate::ingest::{SubmissionOptions, submit_nzb_bytes_with_options};
 use crate::jobs::{CallerScopedIdempotency, SubmissionOrigin};
-use crate::rss::model::{FeedItem, build_submission_metadata};
+use crate::rss::model::{FeedItem, build_submission_metadata, unix_now_secs};
 #[cfg(test)]
-use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items, unix_now_secs};
+use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items};
 use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};
@@ -72,9 +72,50 @@ pub(super) struct RssServiceInner {
     pub(super) config: SharedConfig,
     pub(super) security: RuntimeSecurityConfig,
     pub(super) sync_lock: Mutex<()>,
+    pub(super) scheduled_paused: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    clock_origin: tokio::time::Instant,
+    #[cfg(test)]
+    clock_epoch: i64,
+    // Full feed rows the due-sync path has loaded.
+    #[cfg(test)]
+    pub(super) full_feed_loads: std::sync::atomic::AtomicU64,
 }
 
 impl RssService {
+    pub fn set_scheduled_paused(&self, paused: bool) {
+        self.inner.scheduled_paused.send_if_modified(|value| {
+            if *value == paused {
+                return false;
+            }
+            *value = paused;
+            true
+        });
+    }
+
+    pub fn is_scheduled_paused(&self) -> bool {
+        *self.inner.scheduled_paused.borrow()
+    }
+
+    // Wall-clock seconds, so a host suspend or clock change is seen.
+    #[cfg(not(test))]
+    pub(super) fn now(&self) -> i64 {
+        unix_now_secs()
+    }
+
+    // Unit tests drive the poller with tokio's paused clock.
+    #[cfg(test)]
+    pub(super) fn now(&self) -> i64 {
+        self.inner.clock_epoch.saturating_add(
+            self.inner
+                .clock_origin
+                .elapsed()
+                .as_secs()
+                .try_into()
+                .unwrap_or(i64::MAX),
+        )
+    }
+
     pub fn new(handle: SchedulerHandle, config: SharedConfig, db: Database) -> Self {
         Self::new_with_security(
             handle,
@@ -97,32 +138,42 @@ impl RssService {
                 config,
                 security,
                 sync_lock: Mutex::new(()),
+                scheduled_paused: tokio::sync::watch::channel(false).0,
+                #[cfg(test)]
+                clock_origin: tokio::time::Instant::now(),
+                #[cfg(test)]
+                clock_epoch: unix_now_secs(),
+                #[cfg(test)]
+                full_feed_loads: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
 
-    pub(super) async fn accept_item(
+    pub(super) async fn accept_item_cancellable(
         &self,
         feed: &RssFeedRow,
         rule: &RssRuleRow,
         item: &FeedItem,
+        cancellation: &crate::bandwidth::schedule::ScheduleCancellation,
     ) -> Result<u64, String> {
         let Some(download_url) = item.download_url.clone() else {
             return Err("accepted item has no direct NZB URL".to_string());
         };
 
-        let response = self
-            .send_rss_request(feed, &download_url, false)
-            .await
-            .map_err(|e| format!("failed to fetch NZB: {e}"))?;
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".into()),
+            result = self.send_rss_request(feed, &download_url, false) => result.map_err(|e| format!("failed to fetch NZB: {e}"))?,
+        };
         if !response.status().is_success() {
             return Err(format!("failed to fetch NZB: HTTP {}", response.status()));
         }
 
-        let nzb_bytes =
-            read_response_with_limit(response, self.inner.security.nzb_decompressed_limit_bytes)
-                .await
-                .map_err(|e| format!("failed to read NZB body: {e}"))?;
+        let nzb_bytes = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".into()),
+            result = read_response_with_limit(response, self.inner.security.nzb_decompressed_limit_bytes) => result.map_err(|e| format!("failed to read NZB body: {e}"))?,
+        };
         weaver_nzb::parse_nzb(&nzb_bytes).map_err(|e| format!("invalid NZB: {e}"))?;
 
         let raw_category = rule
@@ -152,6 +203,10 @@ impl RssService {
         };
 
         let metadata = build_submission_metadata(feed, rule, item);
+        if cancellation.is_cancelled() {
+            return Err("scheduled RSS sync cancelled".into());
+        }
+        // Submission owns durable writes. Once started it must finish before shutdown.
         let idempotency =
             CallerScopedIdempotency::new(format!("rss:feed:{}", feed.id), item.item_id.clone());
         let submitted = submit_nzb_bytes_with_options(

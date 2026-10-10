@@ -17,9 +17,9 @@ fn limits_scale_with_effective_memory_without_exceeding_the_cap() {
     }
 }
 
-/// The total each profile gives PAR3: the widest profile is exactly the share
-/// a process with no profile gets, the smaller ones less, and none of them
-/// takes a small host below an eighth of its memory up to 128 MiB.
+// The total each profile gives PAR3: the widest profile is exactly the share
+// a process with no profile gets, the smaller ones less, and none of them
+// takes a small host below an eighth of its memory up to 128 MiB.
 #[test]
 fn each_hardware_profile_sizes_the_total_and_the_widest_matches_the_default() {
     use crate::runtime::HardwareProfile;

@@ -1,5 +1,5 @@
-//! Worker execution and actor handback are distinct events. Holding WorkDone
-//! gives a deterministic gate after native work without a clock or a sleep.
+// Worker execution and actor handback are distinct events. Holding WorkDone
+// gives a deterministic gate after native work without a clock or a sleep.
 use super::*;
 
 async fn settle_all(coordinator: &mut Coordinator, job: JobId) {

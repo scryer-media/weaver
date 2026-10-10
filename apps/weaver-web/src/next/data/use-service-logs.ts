@@ -15,7 +15,7 @@ import {
  * The service log tail.
  *
  * Seeded from `serviceLogs` and kept current by the `serviceLogLines`
- * subscription — the same two operations the classic viewer uses. Lines arrive
+ * subscription. Lines arrive
  * far faster than React should re-render, so ingestion batches into a ref and
  * only publishes a snapshot on a timer.
  */

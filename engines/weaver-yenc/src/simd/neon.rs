@@ -161,33 +161,33 @@ pub(super) unsafe fn decode_kernel_neon(
     })
 }
 
-/// Faithful port of rapidyenc `do_decode_neon<isRaw=true, searchEnd=SEARCH_END>`
-/// (decoder_neon64.cc): the flat, register-carried decode loop over 64-byte
-/// windows (4× `uint8x16`). Structurally a 1:1 clone of
-/// [`decode_kernel_avx2_raw`](super::x86_avx2) / `decode_kernel_avx512_raw`,
-/// differing only in the vector ops. The scalar `u64` bit-math (`fix_eq_mask`,
-/// `escaped`, `esc_first`, `skip`, entry/exit state) is byte-identical to those
-/// tiers, so all three share the same correctness envelope.
-///
-/// Register-carried state (oracle → here):
-/// - `escFirst` → `esc_first: u64`
-/// - `yencOffset` (byte0 = 106 on a carried escape, else 42; lanes 1..15 = 42)
-///   → NOT carried. It is a pure function of `esc_first`, so the two arms that
-///   need it derive it at the point of use and the clean window touches only
-///   the `dup(42)` constant (see the note in the body — the carried form is a
-///   measured +56% cliff in the `SEARCH_END = true` instantiation).
-/// - `nextMask`/`minMask` → `next_mask_mix: uint8x16_t`. Unlike AVX2/VBMI2
-///   (which clamp via `min_epu8` + a `min_mask`), NEON keeps `.` OUT of the
-///   specials LUT and injects a line-start dot by OR-ing `next_mask_mix` into
-///   `cmp_a` after the `vqtbx1q` merge (oracle line 96). It is consumed exactly
-///   once per window and recomputed (or zeroed) inside the `\r\n.` sub-branch.
-///
-/// With `SEARCH_END`, the `\r\n.` sub-branch additionally runs the oracle's
-/// terminator probe (decoder_neon64.cc:126-290) for `\r\n.\r\n`, `\r\n.=y` and
-/// `\r\n=y`. On a hit the window is NOT consumed: the exit state is set from
-/// the no-backtrack `decoder_set_nextMask` rule (decoder_common.h:129-132,
-/// :190-199) and the scalar drain re-scans the window as the authority on the
-/// exact `end`/`consumed` split — the oracle's `len += i; break;` epilogue.
+// Faithful port of rapidyenc `do_decode_neon<isRaw=true, searchEnd=SEARCH_END>`
+// (decoder_neon64.cc): the flat, register-carried decode loop over 64-byte
+// windows (4× `uint8x16`). Structurally a 1:1 clone of
+// [`decode_kernel_avx2_raw`](super::x86_avx2) / `decode_kernel_avx512_raw`,
+// differing only in the vector ops. The scalar `u64` bit-math (`fix_eq_mask`,
+// `escaped`, `esc_first`, `skip`, entry/exit state) is byte-identical to those
+// tiers, so all three share the same correctness envelope.
+//
+// Register-carried state (oracle → here):
+// - `escFirst` → `esc_first: u64`
+// - `yencOffset` (byte0 = 106 on a carried escape, else 42; lanes 1..15 = 42)
+//   → NOT carried. It is a pure function of `esc_first`, so the two arms that
+//   need it derive it at the point of use and the clean window touches only
+//   the `dup(42)` constant (see the note in the body — the carried form is a
+//   measured +56% cliff in the `SEARCH_END = true` instantiation).
+// - `nextMask`/`minMask` → `next_mask_mix: uint8x16_t`. Unlike AVX2/VBMI2
+//   (which clamp via `min_epu8` + a `min_mask`), NEON keeps `.` OUT of the
+//   specials LUT and injects a line-start dot by OR-ing `next_mask_mix` into
+//   `cmp_a` after the `vqtbx1q` merge (oracle line 96). It is consumed exactly
+//   once per window and recomputed (or zeroed) inside the `\r\n.` sub-branch.
+//
+// With `SEARCH_END`, the `\r\n.` sub-branch additionally runs the oracle's
+// terminator probe (decoder_neon64.cc:126-290) for `\r\n.\r\n`, `\r\n.=y` and
+// `\r\n=y`. On a hit the window is NOT consumed: the exit state is set from
+// the no-backtrack `decoder_set_nextMask` rule (decoder_common.h:129-132,
+// :190-199) and the scalar drain re-scans the window as the authority on the
+// exact `end`/`consumed` split — the oracle's `len += i; break;` epilogue.
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
@@ -932,26 +932,26 @@ unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     })
 }
 
-/// "Is any lane of `v` nonzero?" — the oracle's `neon_vect_is_nonzero`
-/// (decoder_neon64.cc:33-35), byte for byte.
-///
-/// The obvious spelling, `vmaxvq_u8(v) != 0`, lowers to `umaxv` — a full
-/// cross-lane horizontal max whose latency dominates the dependent branch. The
-/// oracle instead narrows the 2×u64 view saturating to 2×u32 (`uqxtn`, which is
-/// nonzero iff some source lane was) and reads the resulting 64-bit D register
-/// out with one `fmov`. Same predicate, materially cheaper: saturating
-/// narrowing keeps a nonzero u64 half nonzero (it clamps to `u32::MAX`, never
-/// to 0), so the packed pair is zero exactly when `v` is.
+// "Is any lane of `v` nonzero?" — the oracle's `neon_vect_is_nonzero`
+// (decoder_neon64.cc:33-35), byte for byte.
+//
+// The obvious spelling, `vmaxvq_u8(v) != 0`, lowers to `umaxv` — a full
+// cross-lane horizontal max whose latency dominates the dependent branch. The
+// oracle instead narrows the 2×u64 view saturating to 2×u32 (`uqxtn`, which is
+// nonzero iff some source lane was) and reads the resulting 64-bit D register
+// out with one `fmov`. Same predicate, materially cheaper: saturating
+// narrowing keeps a nonzero u64 half nonzero (it clamps to `u32::MAX`, never
+// to 0), so the packed pair is zero exactly when `v` is.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn neon64_any(v: std::arch::aarch64::uint8x16_t) -> bool {
     unsafe { neon64_any_bits(v) != 0 }
 }
 
-/// The scalar behind [`neon64_any`]: the `uqxtn`-narrowed 64-bit view of `v`,
-/// nonzero iff some lane of `v` is. Exposed so a caller can fold another
-/// scalar predicate into the same zero test (`(bits | x) == 0`) with one `orr`
-/// instead of a second compare-and-branch.
+// The scalar behind [`neon64_any`]: the `uqxtn`-narrowed 64-bit view of `v`,
+// nonzero iff some lane of `v` is. Exposed so a caller can fold another
+// scalar predicate into the same zero test (`(bits | x) == 0`) with one `orr`
+// instead of a second compare-and-branch.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn neon64_any_bits(v: std::arch::aarch64::uint8x16_t) -> u64 {
@@ -960,21 +960,21 @@ unsafe fn neon64_any_bits(v: std::arch::aarch64::uint8x16_t) -> u64 {
     unsafe { vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(v)))) }
 }
 
-/// The oracle's `vpaddq_u8` (decoder_neon64.cc:102-125, 240-250), which clang
-/// emits as a single `addp.16b`.
-///
-/// Rust's `core::arch::aarch64::vpaddq_u8` is *generic IR* (two shufflevectors
-/// plus an add), not the `llvm.aarch64.neon.addp` intrinsic; the AArch64 backend
-/// pattern-matches `add(uzp1(a,b), uzp2(a,b))` back into `addp`. Every use in
-/// this file feeds it `cmp & bit_weights` operands, whose set bits are provably
-/// disjoint, so InstCombine rewrites the `add` into an `or disjoint` — and the
-/// backend has no `or(uzp1, uzp2)` pattern. The result is a 3-instruction
-/// `uzp1`/`uzp2`/`orr` expansion of every pairwise add: 21 instructions where
-/// the oracle emits 7, on every window that contains a special character.
-/// Verified in the emitted asm for both `SEARCH_END` instantiations.
-///
-/// Spelling it as `asm!` restores the oracle's instruction exactly. `pure` +
-/// `nomem` keeps it CSE-able and hoistable, so scheduling is unaffected.
+// The oracle's `vpaddq_u8` (decoder_neon64.cc:102-125, 240-250), which clang
+// emits as a single `addp.16b`.
+//
+// Rust's `core::arch::aarch64::vpaddq_u8` is *generic IR* (two shufflevectors
+// plus an add), not the `llvm.aarch64.neon.addp` intrinsic; the AArch64 backend
+// pattern-matches `add(uzp1(a,b), uzp2(a,b))` back into `addp`. Every use in
+// this file feeds it `cmp & bit_weights` operands, whose set bits are provably
+// disjoint, so InstCombine rewrites the `add` into an `or disjoint` — and the
+// backend has no `or(uzp1, uzp2)` pattern. The result is a 3-instruction
+// `uzp1`/`uzp2`/`orr` expansion of every pairwise add: 21 instructions where
+// the oracle emits 7, on every window that contains a special character.
+// Verified in the emitted asm for both `SEARCH_END` instantiations.
+//
+// Spelling it as `asm!` restores the oracle's instruction exactly. `pure` +
+// `nomem` keeps it CSE-able and hoistable, so scheduling is unaffected.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn neon64_addp(
@@ -994,8 +994,8 @@ unsafe fn neon64_addp(
     out
 }
 
-/// `vsriq_n_u16::<8>` on byte vectors: per 16-bit lane, keep `hi`'s high byte
-/// and take `lo`'s high byte as the low byte (oracle decoder_neon64.cc:220).
+// `vsriq_n_u16::<8>` on byte vectors: per 16-bit lane, keep `hi`'s high byte
+// and take `lo`'s high byte as the low byte (oracle decoder_neon64.cc:220).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn neon64_sri8(
@@ -1012,14 +1012,14 @@ unsafe fn neon64_sri8(
     }
 }
 
-/// Exit state for a window the SEARCH_END probe aborted, via the oracle's
-/// no-backtrack `decoder_set_nextMask` (decoder_common.h:190-199) plus the
-/// driver's `escFirst`-wins mapping (decoder_common.h:129-132). `esc_first` is
-/// the PRE-window carry: the aborted window is never consumed, so its own
-/// escape bookkeeping has not run yet.
-///
-/// `src + 1 < input.len()` is guaranteed by the loop bound (`src + 131 <=
-/// input.len()`).
+// Exit state for a window the SEARCH_END probe aborted, via the oracle's
+// no-backtrack `decoder_set_nextMask` (decoder_common.h:190-199) plus the
+// driver's `escFirst`-wins mapping (decoder_common.h:129-132). `esc_first` is
+// the PRE-window carry: the aborted window is never consumed, so its own
+// escape bookkeeping has not run yet.
+//
+// `src + 1 < input.len()` is guaranteed by the loop bound (`src + 131 <=
+// input.len()`).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn neon64_break_state(input: &[u8], src: usize, mask: u64, esc_first: u64) -> DecoderState {
@@ -1078,19 +1078,19 @@ impl Neon64Constants {
     }
 }
 
-/// Result of one 64-byte SIMD block attempt.
+// Result of one 64-byte SIMD block attempt.
 #[cfg(target_arch = "aarch64")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpanBlockOutcome {
-    /// The whole 64-byte window was consumed and decoded.
+    // The whole 64-byte window was consumed and decoded.
     Consumed,
-    /// A control/terminator candidate needs the scalar state machine; the
-    /// driver must consume through this absolute source index before
-    /// re-entering SIMD so the trigger is behind the next window.
+    // A control/terminator candidate needs the scalar state machine; the
+    // driver must consume through this absolute source index before
+    // re-entering SIMD so the trigger is behind the next window.
     ScalarThrough(usize),
 }
 
-/// Immutable per-kernel-call context for the 64-byte NEON block.
+// Immutable per-kernel-call context for the 64-byte NEON block.
 #[cfg(target_arch = "aarch64")]
 pub(super) struct Neon64Ctx<'a> {
     pub(super) dot_unstuffing: bool,
@@ -1099,8 +1099,8 @@ pub(super) struct Neon64Ctx<'a> {
     pub(super) table: &'a [[u8; 16]; 32768],
 }
 
-/// Per-16-bit-group keep counts for a 64-bit skip mask, via one SWAR popcount
-/// pass (stays in the scalar domain where the mask already lives).
+// Per-16-bit-group keep counts for a 64-bit skip mask, via one SWAR popcount
+// pass (stays in the scalar domain where the mask already lives).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(super) fn per_group_keeps(skip: u64) -> (usize, usize, usize, usize) {
@@ -1745,14 +1745,14 @@ pub(super) unsafe fn compact_store_16(
     *dst += keep;
 }
 
-/// [`compact_store_16`] against a running output pointer instead of a
-/// `(&mut [u8], &mut usize)` pair, returning the advanced cursor.
-///
-/// Same store, same LUT row, same overwrite-ahead contract — the caller still
-/// guarantees 64 spare output bytes per window. The pair form makes LLVM
-/// re-derive `base + index` for every one of the four lane stores; the pointer
-/// form carries one register through, which is the shape the oracle uses
-/// (`p += counts & 0xff`, decoder_neon64.cc:396-419).
+// [`compact_store_16`] against a running output pointer instead of a
+// `(&mut [u8], &mut usize)` pair, returning the advanced cursor.
+//
+// Same store, same LUT row, same overwrite-ahead contract — the caller still
+// guarantees 64 spare output bytes per window. The pair form makes LLVM
+// re-derive `base + index` for every one of the four lane stores; the pointer
+// form carries one register through, which is the shape the oracle uses
+// (`p += counts & 0xff`, decoder_neon64.cc:396-419).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(super) unsafe fn compact_store_16_at(
@@ -1771,7 +1771,7 @@ pub(super) unsafe fn compact_store_16_at(
     unsafe { out.add(keep) }
 }
 
-/// NEON implementation for aarch64: process 16 bytes at a time.
+// NEON implementation for aarch64: process 16 bytes at a time.
 #[cfg(target_arch = "aarch64")]
 pub(super) unsafe fn decode_normal_run_neon(
     input: &[u8],
@@ -1869,9 +1869,9 @@ pub(super) mod n1_span {
     // bytes 2..7 reached by ext-shifted copies of the mask register.
     pub static N1_BCAST01: A16 = A16([0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]);
 
-    /// Engage on Neoverse-N1 (MIDR implementer 0x41 part 0xd0c) only, with a
-    /// runtime escape hatch. Apple silicon compiles this module out entirely
-    /// (target_os gate), so the M5-winning Rust path is untouched there.
+    // Engage on Neoverse-N1 (MIDR implementer 0x41 part 0xd0c) only, with a
+    // runtime escape hatch. Apple silicon compiles this module out entirely
+    // (target_os gate), so the M5-winning Rust path is untouched there.
     pub fn engaged() -> bool {
         static ENGAGED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENGAGED.get_or_init(|| {
@@ -1885,10 +1885,10 @@ pub(super) mod n1_span {
         })
     }
 
-    /// Decode the whole SIMD span (`*i` negative, steps of 64 to 0). On exit
-    /// `*i == 0`, `*out` is the advanced output cursor and `*esc_first` the
-    /// carried trailing-`=` flag. The caller's tail reserve covers every
-    /// lookahead this block performs (deepest read: window + 67).
+    // Decode the whole SIMD span (`*i` negative, steps of 64 to 0). On exit
+    // `*i == 0`, `*out` is the advanced output cursor and `*esc_first` the
+    // carried trailing-`=` flag. The caller's tail reserve covers every
+    // lookahead this block performs (deepest read: window + 67).
     #[allow(unused_assignments)]
     pub unsafe fn span(
         sp: *const u8,
@@ -2161,24 +2161,24 @@ pub(super) mod n1_span {
 pub(super) mod n1_span_se {
     use super::n1_span::{N1_BCAST01, N1_BIT_LANES, N1_TBX_CRLF};
 
-    /// SEARCH_END = true variant of [`super::n1_span::span`]: the same frozen
-    /// window body, plus weaver's OWN terminator machinery (NOT the oracle's —
-    /// weaver's mask-space candidate probe beats the oracle's per-window
-    /// vector probe by ~19% on crlf until_end, so this block freezes weaver's
-    /// design, hand-scheduled):
-    ///   - loop-top pending-tail dispatch (`cbz` + 2 `tbnz`, tags at bits
-    ///     61/62/63 exactly as the Rust loop);
-    ///   - no-dot arm: scalar cand = mask & (mask>>1 | 1<<63) & (eq>>2 | 3<<62),
-    ///     in-asm vector resolution on hit, in-asm tail classification;
-    ///   - dot arm: scalar cand2 over the reduced `\r\n.` bits; any hit exits
-    ///     with `kind = 5` and the window unconsumed — the Rust loop reprocesses
-    ///     it with its full probe and continues (rare^2: a dot window whose
-    ///     specials also alias a terminator shape).
-    ///
-    /// Exit protocol via `kind`: 0 = span done (i == 0); 1 = terminator break
-    /// (mask_out valid, i at the unconsumed window); 2/3/4 = pending-tail
-    /// resume hit (Cr / CrLf / CrLfEq); 5 = resolve-window-in-Rust (v26
-    /// exported to `nmm_out`, pending clear).
+    // SEARCH_END = true variant of [`super::n1_span::span`]: the same frozen
+    // window body, plus weaver's OWN terminator machinery (NOT the oracle's —
+    // weaver's mask-space candidate probe beats the oracle's per-window
+    // vector probe by ~19% on crlf until_end, so this block freezes weaver's
+    // design, hand-scheduled):
+    //   - loop-top pending-tail dispatch (`cbz` + 2 `tbnz`, tags at bits
+    //     61/62/63 exactly as the Rust loop);
+    //   - no-dot arm: scalar cand = mask & (mask>>1 | 1<<63) & (eq>>2 | 3<<62),
+    //     in-asm vector resolution on hit, in-asm tail classification;
+    //   - dot arm: scalar cand2 over the reduced `\r\n.` bits; any hit exits
+    //     with `kind = 5` and the window unconsumed — the Rust loop reprocesses
+    //     it with its full probe and continues (rare^2: a dot window whose
+    //     specials also alias a terminator shape).
+    //
+    // Exit protocol via `kind`: 0 = span done (i == 0); 1 = terminator break
+    // (mask_out valid, i at the unconsumed window); 2/3/4 = pending-tail
+    // resume hit (Cr / CrLf / CrLfEq); 5 = resolve-window-in-Rust (v26
+    // exported to `nmm_out`, pending clear).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn span_se(
         sp: *const u8,

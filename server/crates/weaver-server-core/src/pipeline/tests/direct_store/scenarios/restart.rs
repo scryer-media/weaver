@@ -1,11 +1,58 @@
-//! Restart
-//! Repair while still direct
+// Restart
+// Repair while still direct
 
 use super::*;
 
 // ---------------------------------------------------------------------------
 // Restart
 // ---------------------------------------------------------------------------
+
+// The next incarnation opens the database only once the old one has let go
+// of it. Here the old one still has a write transaction open on one of its
+// pooled connections when the restart begins — the shape of a writer the drop
+// did not stop — and the reopen must wait for that connection to be returned
+// and closed rather than meet its lock.
+#[tokio::test]
+async fn restart_reopens_the_database_only_after_the_old_incarnation_released_it() {
+    use crate::persistence::sql_runtime::StoreDatastore;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let StoreDatastore::Sqlite { pool, .. } = pipeline.db.datastore() else {
+        panic!("the harness database is SQLite");
+    };
+    let mut held = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let closing = pool.close_event();
+
+    let mut restart = tokio::spawn(async move {
+        retire_pipeline_database(pipeline).await;
+        let (restarted, _, _) = new_direct_pipeline(&temp_dir).await;
+        (restarted, temp_dir)
+    });
+    // The pool closes before the reopen and cannot finish closing while the
+    // transaction is held, so the close is the only thing that can come first.
+    tokio::pin!(closing);
+    tokio::select! {
+        _ = &mut closing => {}
+        outcome = &mut restart => panic!(
+            "the restart reopened the database while the old incarnation held a write \
+             transaction on it: {:?}",
+            outcome.map(|_| ())
+        ),
+    }
+    sqlx::query("COMMIT").execute(&mut *held).await.unwrap();
+    drop(held);
+
+    let (restarted, _temp_dir) = restart.await.unwrap();
+    assert!(
+        restarted.db.load_active_jobs().unwrap().is_empty(),
+        "the restarted incarnation reads the database it reopened"
+    );
+}
 
 #[tokio::test]
 async fn restart_after_refetch_demotion_restores_incomplete_source_ownership() {
@@ -46,7 +93,7 @@ async fn restart_after_refetch_demotion_restores_incomplete_source_ownership() {
         volumes.len(),
         "the live process still owns the demotion gate before the crash"
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
 
     let (mut restarted, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     restarted.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -122,13 +169,13 @@ async fn restart_after_refetch_demotion_restores_incomplete_source_ownership() {
     ));
 }
 
-/// The headline restart differential.
-///
-/// Volume 0 arrives whole, volume 1 arrives half. After the restart the
-/// checkpoint's floors must keep every article below them off the download
-/// queue, everything above them must come back, and the finished member must be
-/// byte-identical to a run that was never interrupted — and to the conventional
-/// extractor.
+// The headline restart differential.
+//
+// Volume 0 arrives whole, volume 1 arrives half. After the restart the
+// checkpoint's floors must keep every article below them off the download
+// queue, everything above them must come back, and the finished member must be
+// byte-identical to a run that was never interrupted — and to the conventional
+// extractor.
 #[tokio::test]
 async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identically() {
     const ARTICLES: usize = 4;
@@ -162,7 +209,7 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         retained_facts.values().any(|rows| !rows.is_empty()),
         "conventional restore must retain facts owned by the accepted direct checkpoint"
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let mut pipeline = direct_store_after_restart(
         &temp_dir,
         DirectStoreGate::Enabled,
@@ -317,8 +364,8 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
     );
 }
 
-/// A byte corrupted on disk while the process was down is caught by the
-/// re-read, not committed.
+// A byte corrupted on disk while the process was down is caught by the
+// re-read, not committed.
 #[tokio::test]
 async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
     const ARTICLES: usize = 2;
@@ -393,13 +440,13 @@ async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
     );
 }
 
-/// The payload lands on the **complete** volume and the scratch does not.
-///
-/// The two are observed on a live job rather than derived from a plan, because
-/// the derivation is only half the claim: what matters operationally is which
-/// filesystem the bytes are actually written to as the articles arrive, and that
-/// they are still there — under the staging root — when finalization renames
-/// them into place.
+// The payload lands on the **complete** volume and the scratch does not.
+//
+// The two are observed on a live job rather than derived from a plan, because
+// the derivation is only half the claim: what matters operationally is which
+// filesystem the bytes are actually written to as the articles arrive, and that
+// they are still there — under the staging root — when finalization renames
+// them into place.
 #[tokio::test]
 async fn a_direct_set_writes_payload_to_the_staging_root_and_scratch_to_the_working_dir() {
     let member_name = "Silver.Horizon.S01E44.mkv";
@@ -500,14 +547,14 @@ async fn a_direct_set_writes_payload_to_the_staging_root_and_scratch_to_the_work
     );
 }
 
-/// A restart re-derives the same destinations, in the same staging root.
-///
-/// The staging root is deterministic per job id, so the "after" pipeline builds
-/// it from the job id alone — before the job state exists — and has to arrive at
-/// the byte-identical path the "before" pipeline wrote into. If it did not, every
-/// destination claim in the checkpoint would fail its probe, the row would be
-/// deleted and the set would redownload from zero: safe, silent, and a complete
-/// loss of the resume.
+// A restart re-derives the same destinations, in the same staging root.
+//
+// The staging root is deterministic per job id, so the "after" pipeline builds
+// it from the job id alone — before the job state exists — and has to arrive at
+// the byte-identical path the "before" pipeline wrote into. If it did not, every
+// destination claim in the checkpoint would fail its probe, the row would be
+// deleted and the set would redownload from zero: safe, silent, and a complete
+// loss of the resume.
 #[tokio::test]
 async fn a_restart_re_derives_its_destinations_in_the_same_staging_root() {
     const ARTICLES: usize = 2;
@@ -606,8 +653,8 @@ async fn a_restart_re_derives_its_destinations_in_the_same_staging_root() {
     );
 }
 
-/// With the gate off the rows are ignored, the job redownloads conventionally,
-/// and the direct-store files nothing claims are swept out of the way.
+// With the gate off the rows are ignored, the job redownloads conventionally,
+// and the direct-store files nothing claims are swept out of the way.
 #[tokio::test]
 async fn a_restart_with_the_gate_off_redownloads_and_sweeps_the_orphans() {
     const ARTICLES: usize = 2;
@@ -652,8 +699,8 @@ async fn a_restart_with_the_gate_off_redownloads_and_sweeps_the_orphans() {
     );
 }
 
-/// A row written against a different layout plan is refused, its files are
-/// swept, and the row is deleted.
+// A row written against a different layout plan is refused, its files are
+// swept, and the row is deleted.
 #[tokio::test]
 async fn a_digest_mismatch_sweeps_the_sets_files_and_deletes_the_row() {
     const ARTICLES: usize = 2;
@@ -681,6 +728,7 @@ async fn a_digest_mismatch_sweeps_the_sets_files_and_deletes_the_row() {
             .db
             .save_direct_coverage(job_id, &set_name, &corrupted)
             .unwrap();
+        retire_pipeline_database(pipeline).await;
     }
 
     let partial = direct_partial(&temp_dir, JobId(41065), member_name);
@@ -712,16 +760,16 @@ async fn a_digest_mismatch_sweeps_the_sets_files_and_deletes_the_row() {
     );
 }
 
-/// A member first seen in a **later volume** must not silently invalidate the
-/// checkpoint the earlier volumes wrote.
-///
-/// The plan digest binds the member names and their unpacked sizes, so it
-/// changes the moment a set adopts a member it had not seen — which is the
-/// ordinary shape of a multi-member set, whose members are discovered in
-/// whatever order their volumes arrive. A digest stamped once, at the first
-/// member, describes a plan the restart no longer computes: every row written
-/// afterwards is refused for a set nothing is wrong with, and the whole thing
-/// redownloads.
+// A member first seen in a **later volume** must not silently invalidate the
+// checkpoint the earlier volumes wrote.
+//
+// The plan digest binds the member names and their unpacked sizes, so it
+// changes the moment a set adopts a member it had not seen — which is the
+// ordinary shape of a multi-member set, whose members are discovered in
+// whatever order their volumes arrive. A digest stamped once, at the first
+// member, describes a plan the restart no longer computes: every row written
+// afterwards is refused for a set nothing is wrong with, and the whole thing
+// redownloads.
 #[tokio::test]
 async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoint() {
     const ARTICLES: usize = 2;
@@ -768,6 +816,7 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
     let committed = {
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        retire_pipeline_database(pipeline).await;
         rows.into_iter()
             .next()
             .expect("the shutdown barrier must have committed a row")
@@ -889,14 +938,14 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
     );
 }
 
-/// A restart in the window after a member migration keeps its checkpoint
-/// (`task_9ee23560`).
-///
-/// The migration moves a tolerated split BLAKE2sp-only member's bytes into the
-/// envelope and **unlinks its partial**. Both halves of this pass are needed for
-/// the row to survive that: the barrier has to stop claiming the file that is
-/// gone, and it has to re-stamp the plan digest the member's departure changed.
-/// Either one missing is a refused row and a whole-set redownload.
+// A restart in the window after a member migration keeps its checkpoint
+// (`task_9ee23560`).
+//
+// The migration moves a tolerated split BLAKE2sp-only member's bytes into the
+// envelope and **unlinks its partial**. Both halves of this pass are needed for
+// the row to survive that: the barrier has to stop claiming the file that is
+// gone, and it has to re-stamp the plan digest the member's departure changed.
+// Either one missing is a refused row and a whole-set redownload.
 #[tokio::test]
 async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
     const ARTICLES: usize = 2;
@@ -938,6 +987,7 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
     let committed = {
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        retire_pipeline_database(pipeline).await;
         rows.into_iter()
             .next()
             .expect("the shutdown barrier must have committed a row")
@@ -1056,8 +1106,8 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
     );
 }
 
-/// Holds scratch from a killed run is swept at restore: it is append-only and
-/// meaningless without the in-memory index that named its regions.
+// Holds scratch from a killed run is swept at restore: it is append-only and
+// meaningless without the in-memory index that named its regions.
 #[tokio::test]
 async fn restart_sweeps_stale_holds_scratch() {
     const ARTICLES: usize = 2;
@@ -1121,19 +1171,19 @@ async fn restart_sweeps_stale_holds_scratch() {
     }
 }
 
-/// A set admitted by identity is never rediscovered from the spec, so its
-/// checkpoint is refused at restore and the set redownloads — and its scratch
-/// has to go before it does.
-///
-/// Nothing in this spec classifies as a RAR volume and no plan names the set,
-/// which is exactly how a refused identity set's partial and envelopes used to
-/// survive the restore and be published beside the finished member: the sweep
-/// either never ran or had no name for them.
-/// A set admitted by identity rebuilds its plan from the binding its checkpoint
-/// carries, and only while that binding still holds against the spec. Here a
-/// bound file's name now classifies it, which no identity rung would have bound:
-/// the row is refused exactly as an unknown set's, and the set's scratch is
-/// swept before it redownloads.
+// A set admitted by identity is never rediscovered from the spec, so its
+// checkpoint is refused at restore and the set redownloads — and its scratch
+// has to go before it does.
+//
+// Nothing in this spec classifies as a RAR volume and no plan names the set,
+// which is exactly how a refused identity set's partial and envelopes used to
+// survive the restore and be published beside the finished member: the sweep
+// either never ran or had no name for them.
+// A set admitted by identity rebuilds its plan from the binding its checkpoint
+// carries, and only while that binding still holds against the spec. Here a
+// bound file's name now classifies it, which no identity rung would have bound:
+// the row is refused exactly as an unknown set's, and the set's scratch is
+// swept before it redownloads.
 #[tokio::test]
 async fn an_identity_binding_whose_file_now_classifies_is_refused_and_swept() {
     const ARTICLES: usize = 2;
@@ -1174,6 +1224,7 @@ async fn an_identity_binding_whose_file_now_classifies_is_refused_and_swept() {
             !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
             "non-vacuity: the identity set must have checkpointed"
         );
+        retire_pipeline_database(pipeline).await;
     }
     // An `.envelope` at the top level whose name rebuilds from no set the job's
     // rows name is not direct-store's, and the sweep must leave it alone.
@@ -1240,8 +1291,8 @@ async fn an_identity_binding_whose_file_now_classifies_is_refused_and_swept() {
     );
 }
 
-/// Feeds exactly what a restored identity job asks for and returns the member
-/// it produced, where it landed, and the job's status.
+// Feeds exactly what a restored identity job asks for and returns the member
+// it produced, where it landed, and the job's status.
 #[allow(clippy::too_many_arguments)]
 async fn finish_restored_identity_job(
     pipeline: &mut Pipeline,
@@ -1288,8 +1339,8 @@ async fn finish_restored_identity_job(
     (member, location, job_status_for_assert(pipeline, job_id))
 }
 
-/// The restored set is the one the checkpoint named, admitted by the same
-/// evidence, and alone: no rung admitted a second set out of its files.
+// The restored set is the one the checkpoint named, admitted by the same
+// evidence, and alone: no rung admitted a second set out of its files.
 fn assert_one_restored_identity_set(
     pipeline: &Pipeline,
     job_id: JobId,
@@ -1310,14 +1361,14 @@ fn assert_one_restored_identity_set(
     );
 }
 
-/// The headline restart differential, for a set admitted from its volumes' own
-/// RAR5 headers rather than from its file names.
-///
-/// Nothing in the spec names the set, so before the checkpoint carried its
-/// binding the restart refused the row as an unknown set and refetched every
-/// volume. Now the floors are honoured, the volume that had not arrived binds
-/// to the restored set through the header rung, and the member is
-/// byte-identical to an uninterrupted run's.
+// The headline restart differential, for a set admitted from its volumes' own
+// RAR5 headers rather than from its file names.
+//
+// Nothing in the spec names the set, so before the checkpoint carried its
+// binding the restart refused the row as an unknown set and refetched every
+// volume. Now the floors are honoured, the volume that had not arrived binds
+// to the restored set through the header rung, and the member is
+// byte-identical to an uninterrupted run's.
 #[tokio::test]
 async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_identically() {
     const ARTICLES: usize = 4;
@@ -1354,6 +1405,7 @@ async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_ident
             )),
             "the checkpoint must carry the plan the header rung admitted"
         );
+        retire_pipeline_database(pipeline).await;
     }
 
     // Twice, as the headline differential does: the second restore rebuilds
@@ -1373,7 +1425,7 @@ async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_ident
         "obfuscated-set.f0",
         crate::pipeline::direct_store::plan::IdentityKind::HeaderVolumeSet,
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let mut pipeline = direct_store_after_restart(
         &temp_dir,
         DirectStoreGate::Enabled,
@@ -1437,16 +1489,16 @@ async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_ident
     );
 }
 
-/// The prefix read-back must replace a held capture shorter than its window.
-///
-/// Content binding prefers any held prefix over a proven fingerprint and
-/// refuses one that does not cover the description's window, so an undersized
-/// capture — a duplicate offset-zero article, or a first article shorter than
-/// 16 KiB — left in place by the read-back holds the window closed and demotes
-/// a set whose placed bytes prove every volume. A live header-admitted set
-/// stands in for a restored one: the read-back runs for any live volume with
-/// nothing to bind by, and the short capture is seeded where the restart
-/// would have left nothing.
+// The prefix read-back must replace a held capture shorter than its window.
+//
+// Content binding prefers any held prefix over a proven fingerprint and
+// refuses one that does not cover the description's window, so an undersized
+// capture — a duplicate offset-zero article, or a first article shorter than
+// 16 KiB — left in place by the read-back holds the window closed and demotes
+// a set whose placed bytes prove every volume. A live header-admitted set
+// stands in for a restored one: the read-back runs for any live volume with
+// nothing to bind by, and the short capture is seeded where the restart
+// would have left nothing.
 #[tokio::test]
 async fn a_short_held_prefix_is_replaced_by_the_window_read_back_from_the_placed_bytes() {
     let member_name = "Silver.Horizon.S01E45.mkv";
@@ -1492,6 +1544,13 @@ async fn a_short_held_prefix_is_replaced_by_the_window_read_back_from_the_placed
         .file_prefix_16k
         .insert(file_id, real[..window / 4].to_vec());
     pipeline.file_proven_par2_fingerprint.remove(&file_id);
+    // The earlier complete prefix now establishes a canonical identity as
+    // soon as the index arrives. Remove that proof too to model the restored
+    // header-only state this read-back regression is intended to exercise.
+    let mut identity = pipeline.effective_file_identity(job_id, file_id).unwrap();
+    identity.canonical_filename = None;
+    identity.classification_source = crate::jobs::record::FileIdentitySource::Probe;
+    pipeline.set_file_identity(job_id, identity).unwrap();
     assert!(
         pipeline.resolve_par2_file_binding(file_id).is_none(),
         "non-vacuity: the short capture must leave the volume unbound"
@@ -1515,7 +1574,7 @@ async fn a_short_held_prefix_is_replaced_by_the_window_read_back_from_the_placed
     );
 }
 
-/// One RAR5 archive that is not a volume, under a name that says nothing.
+// One RAR5 archive that is not a volume, under a name that says nothing.
 fn obfuscated_standalone_archive(member_name: &str, payload: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&TEST_RAR5_SIG);
@@ -1532,8 +1591,8 @@ fn obfuscated_standalone_archive(member_name: &str, payload: &[u8]) -> Vec<(Stri
     vec![(format!("{:032x}", 0xd1c7_5000_u128), bytes)]
 }
 
-/// The same differential for a standalone archive: a set of one, closed at
-/// admission, whose restart has no later file to bind.
+// The same differential for a standalone archive: a set of one, closed at
+// admission, whose restart has no later file to bind.
 #[tokio::test]
 async fn a_standalone_identity_archive_restarts_from_its_floor_and_completes_byte_identically() {
     const ARTICLES: usize = 4;
@@ -1559,6 +1618,7 @@ async fn a_standalone_identity_archive_restarts_from_its_floor_and_completes_byt
             )),
             "non-vacuity: the header rung admitted a standalone archive"
         );
+        retire_pipeline_database(pipeline).await;
     }
 
     let pipeline = direct_store_after_restart(
@@ -1576,7 +1636,7 @@ async fn a_standalone_identity_archive_restarts_from_its_floor_and_completes_byt
         "obfuscated-archive.f0",
         crate::pipeline::direct_store::plan::IdentityKind::Standalone,
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let mut pipeline = direct_store_after_restart(
         &temp_dir,
         DirectStoreGate::Enabled,
@@ -1620,9 +1680,9 @@ async fn a_standalone_identity_archive_restarts_from_its_floor_and_completes_byt
     );
 }
 
-/// Restores a job whose spec carries a PAR2 index the previous run already
-/// downloaded whole, as a real restart finds it: the index is a completed file
-/// in the working directory, and its descriptions are parsed again on restore.
+// Restores a job whose spec carries a PAR2 index the previous run already
+// downloaded whole, as a real restart finds it: the index is a completed file
+// in the working directory, and its descriptions are parsed again on restore.
 async fn restore_with_downloaded_index(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -1662,11 +1722,11 @@ async fn restore_with_downloaded_index(
     pipeline
 }
 
-/// The same differential for a set admitted from the recovery set's
-/// descriptions. Its roster is not in the checkpoint — the descriptions say it
-/// again when the index is re-parsed on restore — but its bindings are, and the
-/// re-armed roster must start from them: the volume still to come binds to the
-/// restored set, and the ones bound before the restart are not matched again.
+// The same differential for a set admitted from the recovery set's
+// descriptions. Its roster is not in the checkpoint — the descriptions say it
+// again when the index is re-parsed on restore — but its bindings are, and the
+// re-armed roster must start from them: the volume still to come binds to the
+// restored set, and the ones bound before the restart are not matched again.
 #[tokio::test]
 async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_identically() {
     const ARTICLES: usize = 4;
@@ -1702,6 +1762,7 @@ async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_id
         // The names the recovery set's content binding learned for the
         // obfuscated files, which the job persists and a restart reads back.
         let file_identities = pipeline.jobs[&job_id].file_identities.clone();
+        retire_pipeline_database(pipeline).await;
         (working_dir, file_identities)
     };
     let set_name = {
@@ -1722,6 +1783,7 @@ async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_id
             )),
             "the checkpoint must carry the plan the roster admitted"
         );
+        retire_pipeline_database(pipeline).await;
         rows.keys().next().unwrap().clone()
     };
 
@@ -1740,7 +1802,7 @@ async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_id
         &set_name,
         crate::pipeline::direct_store::plan::IdentityKind::Roster,
     );
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let mut pipeline = restore_with_downloaded_index(
         &temp_dir,
         job_id,
@@ -1802,11 +1864,11 @@ async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_id
     );
 }
 
-/// A restart inside the PAR2 finalization wait — the common case now, because a
-/// par2-bearing set stays byte-complete-but-uncommitted for the whole PAR2
-/// download and verify.
-///
-/// Nothing of the set may be refetched: only the PAR2 index is still owed.
+// A restart inside the PAR2 finalization wait — the common case now, because a
+// par2-bearing set stays byte-complete-but-uncommitted for the whole PAR2
+// download and verify.
+//
+// Nothing of the set may be refetched: only the PAR2 index is still owed.
 #[tokio::test]
 async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
     let member_name = "Silver.Horizon.S01E35.mkv";
@@ -1842,6 +1904,7 @@ async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -1947,14 +2010,14 @@ async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
     );
 }
 
-/// The predicate that keeps the `StrongDecode` contribution honest: the fold is
-/// job-wide and the strongest contribution wins, so a restored direct RAR set in
-/// a job that also carries a conventional split archive must contribute
-/// **nothing** — otherwise the split archive's authoritative PAR2 pass is skipped
-/// on the strength of member CRCs that say nothing about it.
-///
-/// The set is restored rather than live so the *other* two predicates are
-/// satisfied and `only_rar_archives` is the one thing deciding the outcome.
+// The predicate that keeps the `StrongDecode` contribution honest: the fold is
+// job-wide and the strongest contribution wins, so a restored direct RAR set in
+// a job that also carries a conventional split archive must contribute
+// **nothing** — otherwise the split archive's authoritative PAR2 pass is skipped
+// on the strength of member CRCs that say nothing about it.
+//
+// The set is restored rather than live so the *other* two predicates are
+// satisfied and `only_rar_archives` is the one thing deciding the outcome.
 #[tokio::test]
 async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritative_pass() {
     let member_name = "Silver.Horizon.S01E42.mkv";
@@ -2006,6 +2069,7 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -2103,6 +2167,7 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
         pipeline
             .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
             .await;
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
     let (mut rar_pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -2158,7 +2223,7 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
     );
 }
 
-/// The last holds failure mode: the scratch file cannot be opened at all.
+// The last holds failure mode: the scratch file cannot be opened at all.
 #[tokio::test]
 async fn a_restart_inside_a_handback_window_refuses_the_row_and_keeps_the_rebuilt_volume() {
     // The per-volume handback writes a rebuilt volume's completed-file row
@@ -2208,7 +2273,7 @@ async fn a_restart_inside_a_handback_window_refuses_the_row_and_keeps_the_rebuil
         .into_iter()
         .map(|file_index| NzbFileId { job_id, file_index })
         .collect();
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
 
     let (mut restarted, _, _) = new_direct_pipeline(&temp_dir).await;
     restarted.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -2263,10 +2328,10 @@ async fn a_restart_inside_a_handback_window_refuses_the_row_and_keeps_the_rebuil
     );
 }
 
-/// A handback whose sweep could not verify the volume's first article but did
-/// verify a later one leaves conventional bytes that no floor records — the
-/// floor is a contiguous prefix, and there is none. The restore could not
-/// refuse the set's row on anything, so the handback retires it itself.
+// A handback whose sweep could not verify the volume's first article but did
+// verify a later one leaves conventional bytes that no floor records — the
+// floor is a contiguous prefix, and there is none. The restore could not
+// refuse the set's row on anything, so the handback retires it itself.
 #[tokio::test]
 async fn a_handback_with_no_floor_under_its_swept_bytes_retires_the_row() {
     let member_name = "Silver.Horizon.S01E29.mkv";
@@ -2356,7 +2421,7 @@ async fn a_scratch_io_failure_demotes_the_set() {
     );
 }
 
-/// The pause demand, driven through the command seam it is wired at.
+// The pause demand, driven through the command seam it is wired at.
 #[tokio::test]
 async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
     let member_name = "Silver.Horizon.S01E37.mkv";
@@ -2413,11 +2478,11 @@ async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
     );
 }
 
-/// A demanded barrier joins the set's flight through the flight's own outcome
-/// channel, never through the done channel: the pipeline task drains that
-/// channel and is the task doing the joining, so a demand raised with the
-/// channel full — every set of a large job syncing at once at a shutdown —
-/// would otherwise wait on itself.
+// A demanded barrier joins the set's flight through the flight's own outcome
+// channel, never through the done channel: the pipeline task drains that
+// channel and is the task doing the joining, so a demand raised with the
+// channel full — every set of a large job syncing at once at a shutdown —
+// would otherwise wait on itself.
 #[tokio::test]
 async fn a_demanded_barrier_joins_a_flight_with_the_done_channel_full() {
     use crate::pipeline::direct_store::barrier::{BarrierDemand, BarrierTrigger};
@@ -2482,9 +2547,9 @@ async fn a_demanded_barrier_joins_a_flight_with_the_done_channel_full() {
     assert!(pipeline.direct_barrier_flights.is_empty());
 }
 
-/// A flight joined by a demand leaves its done message queued. When it
-/// arrives, the set may have a newer flight out; the message names its own
-/// flight and must leave the newer one — and its unfinished syncs — alone.
+// A flight joined by a demand leaves its done message queued. When it
+// arrives, the set may have a newer flight out; the message names its own
+// flight and must leave the newer one — and its unfinished syncs — alone.
 #[tokio::test]
 async fn a_stale_done_message_does_not_settle_a_newer_flight() {
     use crate::pipeline::direct_store::barrier::{BarrierDemand, BarrierTrigger};
@@ -2535,16 +2600,16 @@ async fn a_stale_done_message_does_not_settle_a_newer_flight() {
     assert!(pipeline.direct_barrier_flights.is_empty());
 }
 
-/// The checkpoint's per-volume `complete` bit means *all bytes durable*, and
-/// restart skips every segment of the file on the strength of it.
-///
-/// A volume can finish downloading while every one of its bytes is still held —
-/// here a middle volume arrives whole before the volume whose chain would let
-/// the layout place it — and a bit latched at the article-complete seam
-/// checkpoints `{floor: header prefix only, complete: true}`. Restart then skips
-/// every segment of a volume whose payload does not exist, and the set can
-/// neither finalize (its member gate has nothing to compose) nor demote (its
-/// reconstruction has nothing to read): a permanent zombie.
+// The checkpoint's per-volume `complete` bit means *all bytes durable*, and
+// restart skips every segment of the file on the strength of it.
+//
+// A volume can finish downloading while every one of its bytes is still held —
+// here a middle volume arrives whole before the volume whose chain would let
+// the layout place it — and a bit latched at the article-complete seam
+// checkpoints `{floor: header prefix only, complete: true}`. Restart then skips
+// every segment of a volume whose payload does not exist, and the set can
+// neither finalize (its member gate has nothing to compose) nor demote (its
+// reconstruction has nothing to read): a permanent zombie.
 #[tokio::test]
 async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
     const ARTICLES: usize = 2;
@@ -2587,6 +2652,7 @@ async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
              complete: restart would skip every segment of a volume whose bytes do not \
              exist ({entry:?})"
         );
+        retire_pipeline_database(probe).await;
     }
 
     let mut pipeline = direct_store_after_restart(
@@ -2633,18 +2699,18 @@ async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
     );
 }
 
-/// A restart mid-download of a set's **last** volume.
-///
-/// The one shape the structural proof cannot reach: the cached facts stopped
-/// short of the end-of-archive record, and the volume *closes* the member
-/// chain, so `split_after` says nothing about whether a second member's header
-/// sits past the first's data area. An earlier shape demoted here by design.
-///
-/// The expensive arm does the only thing that actually answers the question: it
-/// rebuilds the walk's reader out of the volume's **envelope**, which holds every
-/// non-member byte at its true physical offset and is therefore exactly the
-/// header region, and re-parses. The set finishes one-pass and byte-identically
-/// instead of paying a materialization.
+// A restart mid-download of a set's **last** volume.
+//
+// The one shape the structural proof cannot reach: the cached facts stopped
+// short of the end-of-archive record, and the volume *closes* the member
+// chain, so `split_after` says nothing about whether a second member's header
+// sits past the first's data area. An earlier shape demoted here by design.
+//
+// The expensive arm does the only thing that actually answers the question: it
+// rebuilds the walk's reader out of the volume's **envelope**, which holds every
+// non-member byte at its true physical offset and is therefore exactly the
+// header region, and re-parses. The set finishes one-pass and byte-identically
+// instead of paying a materialization.
 #[tokio::test]
 async fn a_restored_last_volume_reconfirms_from_its_envelope_and_finalizes() {
     const ARTICLES: usize = 4;
@@ -2728,14 +2794,14 @@ async fn a_restored_last_volume_reconfirms_from_its_envelope_and_finalizes() {
     );
 }
 
-/// The other half of the same seam: the re-parse is a *proof*, not a permission.
-///
-/// With the restored volume's envelope gone, the walk's reader has a hole where
-/// the headers were — nothing can prove the tail holds no undiscovered member —
-/// and the volume must demote under its own name exactly as it always has. What
-/// must not happen is confirming on the strength of "every article arrived",
-/// which would file an unproven region into an envelope that finalization
-/// deletes.
+// The other half of the same seam: the re-parse is a *proof*, not a permission.
+//
+// With the restored volume's envelope gone, the walk's reader has a hole where
+// the headers were — nothing can prove the tail holds no undiscovered member —
+// and the volume must demote under its own name exactly as it always has. What
+// must not happen is confirming on the strength of "every article arrived",
+// which would file an unproven region into an envelope that finalization
+// deletes.
 #[tokio::test]
 async fn a_restored_last_volume_whose_envelope_is_gone_still_demotes_by_name() {
     const ARTICLES: usize = 4;
@@ -3071,11 +3137,11 @@ async fn an_absent_closing_volume_is_confirmed_from_its_own_repaired_image() {
     );
 }
 
-/// The same two absences under PAR3 instead of PAR2: a whole middle volume
-/// nobody posted, and the closing one. The set holds no byte of either, so
-/// the recovery set has to create the volume at the length its descriptions
-/// state and the re-route has to confirm it from the repaired image — the
-/// PAR3 readback path, which is not the PAR2 overlay's.
+// The same two absences under PAR3 instead of PAR2: a whole middle volume
+// nobody posted, and the closing one. The set holds no byte of either, so
+// the recovery set has to create the volume at the length its descriptions
+// state and the re-route has to confirm it from the repaired image — the
+// PAR3 readback path, which is not the PAR2 overlay's.
 async fn a_wholly_absent_rar_volume_under_par3(job_id: JobId, absent: u32) -> Par3RepairOutcome {
     let member_name = "Silver.Horizon.S01E33.mkv";
     let payload: Vec<u8> = (0..4000u32).map(|index| (index % 211) as u8).collect();
@@ -3606,10 +3672,10 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
     );
 }
 
-/// Three stored volumes and one trailing file that does not arrive before the
-/// restart. The trailing file is what keeps the job downloading once the set
-/// has finalized — the window a restart has to survive — rather than letting it
-/// complete and publish the member out of staging before the process goes down.
+// Three stored volumes and one trailing file that does not arrive before the
+// restart. The trailing file is what keeps the job downloading once the set
+// has finalized — the window a restart has to survive — rather than letting it
+// complete and publish the member out of staging before the process goes down.
 fn installed_set_fixture(member_name: &str, payload: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut files = single_member_store_set(member_name, payload, 3);
     files.push((
@@ -3619,9 +3685,9 @@ fn installed_set_fixture(member_name: &str, payload: &[u8]) -> Vec<(String, Vec<
     files
 }
 
-/// A set that finalized while its job was still downloading is done, not new.
-/// The restart must bring it back installed, refetch none of its volumes, and
-/// still let the job finish exactly as an uninterrupted run does.
+// A set that finalized while its job was still downloading is done, not new.
+// The restart must bring it back installed, refetch none of its volumes, and
+// still let the job finish exactly as an uninterrupted run does.
 #[tokio::test]
 async fn a_restart_after_finalization_restores_the_set_as_installed() {
     const ARTICLES: usize = 2;
@@ -3718,9 +3784,9 @@ async fn a_restart_after_finalization_restores_the_set_as_installed() {
     );
 }
 
-/// The marker is a claim about the staging root, and a claim restart can check.
-/// A member gone while the process was down refuses it, and the set
-/// redownloads as it would have with no marker at all.
+// The marker is a claim about the staging root, and a claim restart can check.
+// A member gone while the process was down refuses it, and the set
+// redownloads as it would have with no marker at all.
 #[tokio::test]
 async fn an_installation_marker_whose_member_vanished_redownloads_the_set() {
     const ARTICLES: usize = 2;
@@ -3770,10 +3836,10 @@ async fn an_installation_marker_whose_member_vanished_redownloads_the_set() {
     );
 }
 
-/// A folder-tree set — a stored member inside a folder and an empty folder
-/// beside it — finalized ahead of a trailing file, then stopped. Its directory
-/// entries are tolerated members, so the marker has outputs beyond the stored
-/// member to account for. Returns the files and the job's working directory.
+// A folder-tree set — a stored member inside a folder and an empty folder
+// beside it — finalized ahead of a trailing file, then stopped. Its directory
+// entries are tolerated members, so the marker has outputs beyond the stored
+// member to account for. Returns the files and the job's working directory.
 async fn folder_tree_set_installed_before_restart(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -3821,11 +3887,12 @@ async fn folder_tree_set_installed_before_restart(
     pipeline
         .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
         .await;
+    retire_pipeline_database(pipeline).await;
     (files, working_dir)
 }
 
-/// The marker's other outputs are part of the claim: with every one of them
-/// still in place the set comes back installed.
+// The marker's other outputs are part of the claim: with every one of them
+// still in place the set comes back installed.
 #[tokio::test]
 async fn a_restart_restores_a_set_whose_tolerated_outputs_are_in_place() {
     const ARTICLES: usize = 2;
@@ -3859,9 +3926,9 @@ async fn a_restart_restores_a_set_whose_tolerated_outputs_are_in_place() {
     );
 }
 
-/// An output the stored members do not account for — here an empty folder the
-/// tolerance extracted — gone while the process was down refuses the marker
-/// just as a vanished member does, instead of finishing the job without it.
+// An output the stored members do not account for — here an empty folder the
+// tolerance extracted — gone while the process was down refuses the marker
+// just as a vanished member does, instead of finishing the job without it.
 #[tokio::test]
 async fn an_installation_marker_whose_tolerated_output_vanished_redownloads_the_set() {
     const ARTICLES: usize = 2;
@@ -3900,11 +3967,11 @@ async fn an_installation_marker_whose_tolerated_output_vanished_redownloads_the_
     );
 }
 
-/// Finalization leaves the set's installation marker in its coverage row, and
-/// the process keeps demanding barriers after that — on shutdown, on pause,
-/// and whenever another set of the job finalizes. None of them may turn the
-/// marker back into a coverage snapshot, which would claim nothing and send
-/// the restart back to fetching every volume.
+// Finalization leaves the set's installation marker in its coverage row, and
+// the process keeps demanding barriers after that — on shutdown, on pause,
+// and whenever another set of the job finalizes. None of them may turn the
+// marker back into a coverage snapshot, which would claim nothing and send
+// the restart back to fetching every volume.
 #[tokio::test]
 async fn a_barrier_demanded_after_finalization_keeps_the_set_installed() {
     const ARTICLES: usize = 2;
@@ -3958,6 +4025,7 @@ async fn a_barrier_demanded_after_finalization_keeps_the_set_installed() {
                     .all(|blob| crate::pipeline::direct_store::snapshot::is_installed_marker(blob)),
             "the set's row must still be its installation marker after every demand"
         );
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 

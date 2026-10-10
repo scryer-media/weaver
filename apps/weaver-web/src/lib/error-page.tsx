@@ -5,12 +5,10 @@ import { TranslateContext, type Translate } from "@/lib/context/translate-contex
 import { interpolate } from "@/lib/i18n/types";
 
 /**
- * The page either interface shows when it cannot show anything else.
+ * The page the interface shows when it cannot show anything else.
  *
- * It lives beside the brand lockup rather than under either interface because
- * both mount it, and it draws its own palette -- the Next UI's -- rather than
- * either one's theme tokens: the classic tree has no Next tokens, and a crash can
- * land before any theme has been applied at all. The server's startup holding
+ * It draws its own palette rather than the theme tokens, because a crash can
+ * land before any stylesheet has been applied at all. The server's startup holding
  * page draws the same design in plain HTML, so a Weaver that is failing looks
  * the same whether the browser or the server found out first.
  *
@@ -21,7 +19,7 @@ import { interpolate } from "@/lib/i18n/types";
 
 /**
  * English, for a crash above the language provider. The same keys live in the
- * Next dictionaries, which every locale carries whichever interface is in use.
+ * interface dictionaries, which every locale carries.
  */
 const ENGLISH: Record<string, string> = {
   "next.errorPage.title": "Something went wrong",

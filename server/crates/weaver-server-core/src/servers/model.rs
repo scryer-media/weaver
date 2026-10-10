@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::bandwidth::IspBandwidthCapWeekday;
+use crate::bandwidth::QuotaWeekday;
 
-/// Largest byte count accepted by persistence-backed per-server policies.
+// Largest byte count accepted by persistence-backed per-server policies.
 pub const MAX_PERSISTED_SERVER_DOWNLOAD_BYTES: u64 = i64::MAX as u64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ pub struct ServerDownloadQuotaConfig {
     #[serde(default)]
     pub reset_time_minutes_local: u16,
     #[serde(default = "default_quota_weekday")]
-    pub weekly_reset_weekday: IspBandwidthCapWeekday,
+    pub weekly_reset_weekday: QuotaWeekday,
     #[serde(default = "default_monthly_reset_day")]
     pub monthly_reset_day: u8,
 }
@@ -67,21 +67,31 @@ impl Default for ServerDownloadQuotaConfig {
 
 impl ServerDownloadQuotaConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_for("server")
+    }
+
+    // The same bounds for a quota held by something other than a server;
+    // `subject` names it in the error.
+    pub fn validate_for(&self, subject: &str) -> Result<(), String> {
         if self.limit_bytes > MAX_PERSISTED_SERVER_DOWNLOAD_BYTES {
-            return Err("server download quota limit exceeds database range".to_string());
+            return Err(format!(
+                "{subject} download quota limit exceeds database range"
+            ));
         }
         if self.enabled && self.limit_bytes == 0 {
-            return Err(
-                "enabled server download quota limit must be greater than zero".to_string(),
-            );
+            return Err(format!(
+                "enabled {subject} download quota limit must be greater than zero"
+            ));
         }
         if self.reset_time_minutes_local >= 24 * 60 {
-            return Err("server download quota reset time must be between 0 and 1439".to_string());
+            return Err(format!(
+                "{subject} download quota reset time must be between 0 and 1439"
+            ));
         }
         if !(1..=31).contains(&self.monthly_reset_day) {
-            return Err(
-                "server download quota monthly reset day must be between 1 and 31".to_string(),
-            );
+            return Err(format!(
+                "{subject} download quota monthly reset day must be between 1 and 31"
+            ));
         }
         Ok(())
     }
@@ -89,7 +99,7 @@ impl ServerDownloadQuotaConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Stable identifier for CRUD operations.
+    // Stable identifier for CRUD operations.
     #[serde(default)]
     pub id: u32,
     pub host: String,
@@ -98,44 +108,44 @@ pub struct ServerConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub connections: u16,
-    /// Whether this server is enabled. Defaults to true.
+    // Whether this server is enabled. Defaults to true.
     #[serde(default = "default_true")]
     pub active: bool,
-    /// Whether the server supports NNTP command pipelining (RFC 4644).
-    /// Auto-detected when the server is added or tested.
+    // Whether the server supports NNTP command pipelining (RFC 4644).
+    // Auto-detected when the server is added or tested.
     #[serde(default)]
     pub supports_pipelining: bool,
-    /// BODY pipelining depth a previous run proved for this server. The
-    /// download lanes rediscover it when absent; persisting it only saves the
-    /// rediscovery.
+    // BODY pipelining depth a previous run proved for this server. The
+    // download lanes rediscover it when absent; persisting it only saves the
+    // rediscovery.
     #[serde(default)]
     pub pipelining_depth: Option<u8>,
-    /// Priority group. Lower values tried first within the fill tier.
+    // Priority group. Lower values tried first within the fill tier.
     #[serde(default)]
     pub priority: u32,
-    /// Backfill servers only serve articles the fill tier could not:
-    /// missing/corrupt there, or outside a fill server's retention window.
-    /// Non-backfill ("fill") servers download ordinary work ordered by
-    /// priority.
+    // Backfill servers only serve articles the fill tier could not:
+    // missing/corrupt there, or outside a fill server's retention window.
+    // Non-backfill ("fill") servers download ordinary work ordered by
+    // priority.
     #[serde(default)]
     pub backfill: bool,
-    /// Days of retention this server is expected to hold. Articles older
-    /// than this skip the server without a network attempt. 0 = unlimited.
+    // Days of retention this server is expected to hold. Articles older
+    // than this skip the server without a network attempt. 0 = unlimited.
     #[serde(default)]
     pub retention_days: u32,
-    /// Aggregate download rate across this server's connections in bytes/sec.
-    /// Zero means unlimited.
+    // Aggregate download rate across this server's connections in bytes/sec.
+    // Zero means unlimited.
     #[serde(default)]
     pub max_download_speed: u64,
-    /// Hard raw BODY-byte quota policy for this server.
+    // Hard raw BODY-byte quota policy for this server.
     #[serde(default)]
     pub download_quota: ServerDownloadQuotaConfig,
-    /// Optional path to a PEM-encoded CA certificate to trust for TLS
-    /// connections to this server (e.g. self-signed or internal CAs).
+    // Optional path to a PEM-encoded CA certificate to trust for TLS
+    // connections to this server (e.g. self-signed or internal CAs).
     #[serde(default)]
     pub tls_ca_cert: Option<std::path::PathBuf>,
-    /// One leaf certificate that may bypass only a hostname mismatch after
-    /// normal certificate chain and expiry validation has succeeded.
+    // One leaf certificate that may bypass only a hostname mismatch after
+    // normal certificate chain and expiry validation has succeeded.
     #[serde(default)]
     pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
 }
@@ -158,8 +168,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_quota_weekday() -> IspBandwidthCapWeekday {
-    IspBandwidthCapWeekday::Mon
+fn default_quota_weekday() -> QuotaWeekday {
+    QuotaWeekday::Mon
 }
 
 fn default_monthly_reset_day() -> u8 {

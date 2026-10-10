@@ -1,45 +1,45 @@
-//! Where direct-store meets the download pipeline.
-//!
-//! Three seams, and nothing else:
-//!
-//! 1. **Admission** — the first decoded segment of a job admits its RAR sets
-//!    from the job spec. Sets are named and their volume-to-file mapping fixed
-//!    before a byte is written, which is what the coverage barrier needs and
-//!    what the completion-gated topology layer cannot give.
-//! 2. **Routing** — [`Pipeline::handle_direct_decode_success`] replaces the
-//!    conventional write for a direct source volume: it maps the span, writes
-//!    every destination it touches in one multi-path batch, and only then
-//!    records coverage, feeds live PAR2 and commits the segment.
-//! 3. **Finalization / demotion** — a set whose members all pass the
-//!    whole-member gate commits its partials to the extractor's destinations in
-//!    archive order and is marked extracted; a set that demotes materializes
-//!    its volumes from its own routed bytes, persists the legacy state that
-//!    replaces its coverage, and hands them to the conventional path — falling
-//!    back to refetching everything only when reconstruction is impossible.
-//!
-//! # Suppression points
-//!
-//! Successful routing returns before `persist_ready_segments`, so for a direct
-//! source volume there is no physical write, **no `active_file_progress` floor
-//! upsert**, and no `commit_persisted_segment`. A demotion returns the still-live
-//! article to that conventional seam instead. The file-complete work successful
-//! routing would have done is re-implemented here without the parts that need a file:
-//! **no completed-file row**, no whole-volume hashing, no archive re-probe and
-//! no incremental-extraction dispatch. Live reporting keeps using
-//! `FileAssembly`, which is source-space truth either way.
-//!
-//! Suppressing it *here* is not enough, because these are not the only callers:
-//!
-//! - `refresh_archive_state_for_completed_file` has nine callers — completion
-//!   checks, PAR2 merge, RAR finalization, the job service — every one of which
-//!   fires for a complete file whether or not routing suppressed its own call.
-//!   It carries the rule at its own entry instead.
-//! - `try_rar_extraction` is job-scoped and needs no guard: it dispatches from
-//!   the archive topology, and the topology's only non-test writer is
-//!   `try_update_archive_topology`, whose only non-test caller is the refresh
-//!   above. A direct set therefore never enters the topology at all.
-//! - The completed-file row has exactly one pipeline writer, in the conventional
-//!   file-complete path successful routing returns before.
+// Where direct-store meets the download pipeline.
+//
+// Three seams, and nothing else:
+//
+// 1. **Admission** — the first decoded segment of a job admits its RAR sets
+//    from the job spec. Sets are named and their volume-to-file mapping fixed
+//    before a byte is written, which is what the coverage barrier needs and
+//    what the completion-gated topology layer cannot give.
+// 2. **Routing** — [`Pipeline::handle_direct_decode_success`] replaces the
+//    conventional write for a direct source volume: it maps the span, writes
+//    every destination it touches in one multi-path batch, and only then
+//    records coverage, feeds live PAR2 and commits the segment.
+// 3. **Finalization / demotion** — a set whose members all pass the
+//    whole-member gate commits its partials to the extractor's destinations in
+//    archive order and is marked extracted; a set that demotes materializes
+//    its volumes from its own routed bytes, persists the legacy state that
+//    replaces its coverage, and hands them to the conventional path — falling
+//    back to refetching everything only when reconstruction is impossible.
+//
+// # Suppression points
+//
+// Successful routing returns before `persist_ready_segments`, so for a direct
+// source volume there is no physical write, **no `active_file_progress` floor
+// upsert**, and no `commit_persisted_segment`. A demotion returns the still-live
+// article to that conventional seam instead. The file-complete work successful
+// routing would have done is re-implemented here without the parts that need a file:
+// **no completed-file row**, no whole-volume hashing, no archive re-probe and
+// no incremental-extraction dispatch. Live reporting keeps using
+// `FileAssembly`, which is source-space truth either way.
+//
+// Suppressing it *here* is not enough, because these are not the only callers:
+//
+// - `refresh_archive_state_for_completed_file` has nine callers — completion
+//   checks, PAR2 merge, RAR finalization, the job service — every one of which
+//   fires for a complete file whether or not routing suppressed its own call.
+//   It carries the rule at its own entry instead.
+// - `try_rar_extraction` is job-scoped and needs no guard: it dispatches from
+//   the archive topology, and the topology's only non-test writer is
+//   `try_update_archive_topology`, whose only non-test caller is the refresh
+//   above. A direct set therefore never enters the topology at all.
+// - The completed-file row has exactly one pipeline writer, in the conventional
+//   file-complete path successful routing returns before.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -66,13 +66,13 @@ use crate::pipeline::{
     DirectToleratedWorkDone, Pipeline,
 };
 
-/// Read chunk for the restart gate re-arm. Matches the reconstruction sweep's:
-/// large enough that a big part is a few hundred iterations, small enough to
-/// keep the whole plan's resident cost to one buffer.
+// Read chunk for the restart gate re-arm. Matches the reconstruction sweep's:
+// large enough that a big part is a few hundred iterations, small enough to
+// keep the whole plan's resident cost to one buffer.
 const REARM_CHUNK_BYTES: usize = 256 * 1024;
 
-/// A placement failure before any coverage is admitted. The caller decides
-/// whether to reconstruct conventional volumes or retain verified repair output.
+// A placement failure before any coverage is admitted. The caller decides
+// whether to reconstruct conventional volumes or retain verified repair output.
 #[derive(Debug)]
 pub(crate) enum DirectPlacementError {
     Sparse {
@@ -89,236 +89,242 @@ struct PendingDemotionMaterialization {
     rescued: HashSet<SegmentId>,
 }
 
-/// One volume of an identity roster: the facts a file's first decoded bytes
-/// are matched against. Straight from the recovery set's file description —
-/// the same window semantics as the PAR2 content binder, whose fingerprint is
-/// `md5(min(length, 16 KiB))` of the file.
+// One volume of an identity roster: the facts a file's first decoded bytes
+// are matched against. Straight from the recovery set's file description —
+// the same window semantics as the PAR2 content binder, whose fingerprint is
+// `md5(min(length, 16 KiB))` of the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IdentityRosterVolume {
     pub(crate) hash_16k: [u8; 16],
     pub(crate) length: u64,
 }
 
-/// One archive set the recovery metadata describes, tracked from arming until
-/// the set finalizes, demotes, or proves unfillable.
+// One archive set the recovery metadata describes, tracked from arming until
+// the set finalizes, demotes, or proves unfillable.
 #[derive(Debug, Default)]
 pub(crate) struct IdentityRoster {
-    /// Volume index to identity facts. Dense from zero, complete at arming.
+    // Volume index to identity facts. Dense from zero, complete at arming.
     pub(crate) volumes: BTreeMap<u32, IdentityRosterVolume>,
-    /// NZB file index to the volume it matched. Grows as files bind.
+    // NZB file index to the volume it matched. Grows as files bind.
     pub(crate) bound: HashMap<u32, u32>,
-    /// Index into the job's set vector once the first binding admitted the
-    /// set. Stable: sets are only ever pushed, never removed, while a job
-    /// lives.
+    // Index into the job's set vector once the first binding admitted the
+    // set. Stable: sets are only ever pushed, never removed, while a job
+    // lives.
     pub(crate) set_index: Option<usize>,
+    // The container family the descriptions name.
+    pub(crate) format: super::plan::SetFormat,
 }
 
-/// Per-job identity-admission state: rosters awaiting or holding bindings,
-/// plus the evidence that decides when a roster can no longer be filled.
-///
-/// # Why this exists at all
-///
-/// [`DirectSetPlan::discover`] admits from the NZB's filenames, and an
-/// obfuscated post carries none worth reading — every file is a hex string
-/// with no role, so discovery finds nothing and the job settles conventional
-/// forever, even though its PAR2 metadata names every real volume. This state
-/// is the byte-driven second chance: the recovery set's descriptions supply
-/// the roster (set names, dense volume indices, per-volume content
-/// fingerprints), and each file identifies *itself* at the routing seam, by
-/// hashing the first bytes of its offset-zero article against that roster —
-/// before any of its bytes have been written anywhere.
-///
-/// # The one invariant
-///
-/// A file may only bind while it has **zero** conventionally written bytes.
-/// The envelope model owns every byte of a routed volume; a volume whose
-/// early articles already landed in a conventional file would leave the set
-/// half-owned, its barrier waiting on bytes that live elsewhere. So arming
-/// refuses rosters any of whose volumes may already have leaked, the seam
-/// marks every conventionally written file, and a marked file that later
-/// proves to *be* a roster volume condemns that roster instead of joining it.
+// Per-job identity-admission state: rosters awaiting or holding bindings,
+// plus the evidence that decides when a roster can no longer be filled.
+//
+// # Why this exists at all
+//
+// [`DirectSetPlan::discover`] admits from the NZB's filenames, and an
+// obfuscated post carries none worth reading — every file is a hex string
+// with no role, so discovery finds nothing and the job settles conventional
+// forever, even though its PAR2 metadata names every real volume. This state
+// is the byte-driven second chance: the recovery set's descriptions supply
+// the roster (set names, dense volume indices, per-volume content
+// fingerprints), and each file identifies *itself* at the routing seam, by
+// hashing the first bytes of its offset-zero article against that roster —
+// before any of its bytes have been written anywhere.
+//
+// # The one invariant
+//
+// A file may only bind while it has **zero** conventionally written bytes.
+// The envelope model owns every byte of a routed volume; a volume whose
+// early articles already landed in a conventional file would leave the set
+// half-owned, its barrier waiting on bytes that live elsewhere. So arming
+// refuses rosters any of whose volumes may already have leaked, the seam
+// marks every conventionally written file, and a marked file that later
+// proves to *be* a roster volume condemns that roster instead of joining it.
 #[derive(Debug, Default)]
 pub(crate) struct IdentityAdmission {
-    /// Set name to roster.
+    // Set name to roster.
     pub(crate) rosters: HashMap<String, IdentityRoster>,
-    /// Sets admitted from the volumes' own RAR5 headers — the rung for a
-    /// post with no PAR2 anywhere. Mutually exclusive with `rosters` by
-    /// construction: the header rung only fires while no rosters are armed,
-    /// and arming skips a job whose header sets are live, so the two kinds
-    /// of evidence never bid for the same file.
+    // Sets admitted from the volumes' own RAR5 headers — the rung for a
+    // post with no PAR2 anywhere. Mutually exclusive with `rosters` by
+    // construction: the header rung only fires while no rosters are armed,
+    // and arming skips a job whose header sets are live, so the two kinds
+    // of evidence never bid for the same file.
     pub(crate) header_sets: Vec<HeaderSet>,
-    /// A header-declared volume position was claimed twice — two interleaved
-    /// header-only sets, which nothing in the bytes can tell apart. Latched:
-    /// no further header volume-set may form for this job, because a third
-    /// claimant would resurrect exactly the ambiguity that was just refused.
+    // A header-declared volume position was claimed twice — two interleaved
+    // header-only sets, which nothing in the bytes can tell apart. Latched:
+    // no further header volume-set may form for this job, because a third
+    // claimant would resurrect exactly the ambiguity that was just refused.
     pub(crate) header_volume_sets_poisoned: bool,
-    /// Files with at least one conventionally written segment. Never bindable.
+    // Files with at least one conventionally written segment. Never bindable.
     pub(crate) leaked: HashSet<u32>,
-    /// Files whose offset-zero bytes were evaluated and matched no roster
-    /// volume — the extras: samples, nfo files, unrelated payload.
+    // Files whose offset-zero bytes were evaluated and matched no roster
+    // volume — the extras: samples, nfo files, unrelated payload.
     pub(crate) no_match: HashSet<u32>,
-    /// Described sets a restart brought back from their checkpoints, by set
-    /// name, waiting for the recovery set's descriptions to be parsed again.
-    ///
-    /// The roster itself — each volume's fingerprint — was never persisted: the
-    /// descriptions are still on disk and say it again. What the checkpoint
-    /// kept is the set and its bindings, and those are what a re-armed roster
-    /// must start from, or a file bound before the restart would be matched a
-    /// second time and a second set admitted beside the first. Arming moves an
-    /// entry into [`Self::rosters`]; the restore drains whatever arming did not
-    /// claim right after the job's metadata reload, so this is empty again
-    /// before the job decodes an article.
+    // Described sets a restart brought back from their checkpoints, by set
+    // name, waiting for the recovery set's descriptions to be parsed again.
+    //
+    // The roster itself — each volume's fingerprint — was never persisted: the
+    // descriptions are still on disk and say it again. What the checkpoint
+    // kept is the set and its bindings, and those are what a re-armed roster
+    // must start from, or a file bound before the restart would be matched a
+    // second time and a second set admitted beside the first. Arming moves an
+    // entry into [`Self::rosters`]; the restore drains whatever arming did not
+    // claim right after the job's metadata reload, so this is empty again
+    // before the job decodes an article.
     pub(crate) restored_rosters: HashMap<String, RestoredRoster>,
 }
 
-/// A described set restored from its checkpoint, before its roster is armed.
+// A described set restored from its checkpoint, before its roster is armed.
 #[derive(Debug)]
 pub(crate) struct RestoredRoster {
     pub(crate) set_index: usize,
-    /// NZB file index to volume index, exactly as the checkpoint bound them.
+    // NZB file index to volume index, exactly as the checkpoint bound them.
     pub(crate) bound: HashMap<u32, u32>,
 }
 
-/// One set admitted from RAR5 headers rather than PAR2 descriptions.
-///
-/// The header is both the identity evidence and the position: a RAR5 volume
-/// states its own number, so binding needs no roster — but the set's size is
-/// unknowable until the final volume's end record parses (the plan stays
-/// open; see [`super::plan::IdentityPlanFacts::expected_volumes`]), and the
-/// set's name is synthetic, which costs nothing because member destinations
-/// derive from the member names inside the archive, never from the set name.
+// One set admitted from RAR5 headers rather than PAR2 descriptions.
+//
+// The header is both the identity evidence and the position: a RAR5 volume
+// states its own number, so binding needs no roster — but the set's size is
+// unknowable until the final volume's end record parses (the plan stays
+// open; see [`super::plan::IdentityPlanFacts::expected_volumes`]), and the
+// set's name is synthetic, which costs nothing because member destinations
+// derive from the member names inside the archive, never from the set name.
 #[derive(Debug)]
 pub(crate) struct HeaderSet {
-    /// Index into the job's set vector. Stable: sets are only pushed.
+    // Index into the job's set vector. Stable: sets are only pushed.
     pub(crate) set_index: usize,
-    /// NZB file index to the volume position its header declared.
+    // NZB file index to the volume position its header declared.
     pub(crate) bound: HashMap<u32, u32>,
-    /// Whether this is the job's volume set (RAR5 volume flag) as opposed to
-    /// a standalone archive. At most one volume set exists per job — the
-    /// bytes carry positions but no set identity, so a second one is
-    /// indistinguishable interleaving and is refused.
+    // Whether this is the job's volume set (RAR5 volume flag) as opposed to
+    // a standalone archive. At most one volume set exists per job — the
+    // bytes carry positions but no set identity, so a second one is
+    // indistinguishable interleaving and is refused.
     pub(crate) volume_set: bool,
 }
 
-/// Per-pipeline direct-store state. Empty and inert while the gate is off.
+// Per-pipeline direct-store state. Empty and inert while the gate is off.
 #[derive(Default)]
 pub(crate) struct DirectStoreRuntime {
-    /// Resolved once at pipeline construction from config plus the env
-    /// override, and never re-read: a set admitted under an enabled gate must
-    /// not find it disabled at finalization. `None` only in the tests that
-    /// build a runtime by hand, where [`Self::gate`] falls back to the
-    /// all-defaults resolution (gate off).
+    // Resolved once at pipeline construction from config plus the env
+    // override, and never re-read: a set admitted under an enabled gate must
+    // not find it disabled at finalization. `None` only in the tests that
+    // build a runtime by hand, where [`Self::gate`] falls back to the
+    // all-defaults resolution (gate off).
     settings: Option<DirectStoreSettings>,
-    /// The process-wide holds accountant every set this runtime admits charges
-    /// to. Built from the settings' limits; unbounded for a runtime built by
-    /// hand. See [`super::accountant`].
+    // The process-wide holds accountant every set this runtime admits charges
+    // to. Built from the settings' limits; unbounded for a runtime built by
+    // hand. See [`super::accountant`].
     accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
-    /// Jobs whose spec has already been examined for candidate sets.
+    // Jobs whose spec has already been examined for candidate sets.
     examined: HashSet<JobId>,
-    /// Each job's archive-password harvest, once one has run, for the `-hp`
-    /// gates of its sets. Kept rather than only offered because a set can be
-    /// admitted after the harvest ran — identity admission binds sets as
-    /// volumes are recognised — and it needs the same candidates. Separate from
-    /// [`Self::examined`] because a **restored** job is examined without ever
-    /// passing through the admission seam, and its sets still need candidates.
+    // Each job's archive-password harvest, once one has run, for the `-hp`
+    // gates of its sets. Kept rather than only offered because a set can be
+    // admitted after the harvest ran — identity admission binds sets as
+    // volumes are recognised — and it needs the same candidates. Separate from
+    // [`Self::examined`] because a **restored** job is examined without ever
+    // passing through the admission seam, and its sets still need candidates.
     header_harvest: HashMap<JobId, Vec<crate::jobs::model::ArchivePasswordCandidate>>,
     sets: HashMap<JobId, Vec<DirectSet>>,
-    /// Destinations already created and marked sparse, per job. A member stored
-    /// inside a directory names a partial inside that directory and nothing
-    /// else creates it, and every destination has to carry the sparse attribute
-    /// before its first routed byte.
+    // Jobs with a container set whose end header was lost with its article,
+    // to be handed over on the next turn. The booking that rules an article
+    // missing cannot demote a set itself, so it notes the job here.
+    end_header_verdicts: std::collections::BTreeSet<JobId>,
+    // Destinations already created and marked sparse, per job. A member stored
+    // inside a directory names a partial inside that directory and nothing
+    // else creates it, and every destination has to carry the sparse attribute
+    // before its first routed byte.
     prepared_destinations: HashMap<JobId, HashSet<PathBuf>>,
-    /// Member names **direct finalization** wrote into `extracted_members`, per
-    /// job. `extracted_members` blends two sources — the incremental extractor
-    /// and direct sets — and the claim assertions need them apart: two sets of
-    /// one job may legitimately finalize the same member *name* (last rename
-    /// wins, as two conventionally extracted archives resolve), and without
-    /// this record a sibling's finalized name is indistinguishable from an
-    /// extraction checkpoint claiming ours.
+    // Member names **direct finalization** wrote into `extracted_members`, per
+    // job. `extracted_members` blends two sources — the incremental extractor
+    // and direct sets — and the claim assertions need them apart: two sets of
+    // one job may legitimately finalize the same member *name* (last rename
+    // wins, as two conventionally extracted archives resolve), and without
+    // this record a sibling's finalized name is indistinguishable from an
+    // extraction checkpoint claiming ours.
     direct_extracted_members: HashMap<JobId, HashSet<String>>,
-    /// Waves of targeted recovery a job's direct sets have waited for rather
-    /// than demoting, per job.
-    ///
-    /// The termination budget for the defer, and nothing else. The structural
-    /// bound is already there — the first wave asks for every block the verdict
-    /// needs, so a second one only happens if the first arrived and still did
-    /// not cover the damage — but "already promoted" is derived state, and a
-    /// derivation that goes wrong here waits forever. Counting the waves makes
-    /// the bound arithmetic instead. Deliberately **not** persisted: after a
-    /// restart the damage is re-detected from scratch and the defer re-derives
-    /// itself, so a stale count would only shorten a fresh job's budget.
+    // Waves of targeted recovery a job's direct sets have waited for rather
+    // than demoting, per job.
+    //
+    // The termination budget for the defer, and nothing else. The structural
+    // bound is already there — the first wave asks for every block the verdict
+    // needs, so a second one only happens if the first arrived and still did
+    // not cover the damage — but "already promoted" is derived state, and a
+    // derivation that goes wrong here waits forever. Counting the waves makes
+    // the bound arithmetic instead. Deliberately **not** persisted: after a
+    // restart the damage is re-detected from scratch and the defer re-derives
+    // itself, so a stale count would only shorten a fresh job's budget.
     repair_defer_waves: HashMap<JobId, u32>,
-    /// Jobs whose direct repair rewrote files outside every direct set.
-    ///
-    /// One recovery set can cover a live direct set and a demoted one, and
-    /// damage confined to the demoted set's files is still repaired through
-    /// the direct seam, reading the live set's volumes virtually. That repair
-    /// burns no set's latch, because it rewrote no direct volume, so this is
-    /// its latch instead: it makes the next pass a disk read-back, and a job
-    /// whose damage survived it demotes rather than repairing a second time.
+    // Jobs whose direct repair rewrote files outside every direct set.
+    //
+    // One recovery set can cover a live direct set and a demoted one, and
+    // damage confined to the demoted set's files is still repaired through
+    // the direct seam, reading the live set's volumes virtually. That repair
+    // burns no set's latch, because it rewrote no direct volume, so this is
+    // its latch instead: it makes the next pass a disk read-back, and a job
+    // whose damage survived it demotes rather than repairing a second time.
     pub(crate) conventional_targets_repaired: HashSet<JobId>,
-    /// Demoted source volumes that have not reached the conventional durable
-    /// seam yet, grouped by the direct set that owned them.
+    // Demoted source volumes that have not reached the conventional durable
+    // seam yet, grouped by the direct set that owned them.
     pending_materializations: HashMap<JobId, HashMap<usize, PendingDemotionMaterialization>>,
-    /// Identity-admission state for jobs whose spec named no candidate sets
-    /// but whose PAR2 metadata describes some. See [`IdentityAdmission`].
+    // Identity-admission state for jobs whose spec named no candidate sets
+    // but whose PAR2 metadata describes some. See [`IdentityAdmission`].
     pub(crate) identity: HashMap<JobId, IdentityAdmission>,
-    /// Test-only holds ceiling applied to every set this runtime admits.
+    // Test-only holds ceiling applied to every set this runtime admits.
     #[cfg(test)]
     holds_budget_override: Option<u64>,
-    /// Test-only scratch ceiling, which shortcuts the configured one so a
-    /// breach is reachable without paging half a gigabyte.
+    // Test-only scratch ceiling, which shortcuts the configured one so a
+    // breach is reachable without paging half a gigabyte.
     #[cfg(test)]
     holds_scratch_ceiling_override: Option<u64>,
-    /// Sparse marker for every file this runtime's sets create. Only the tests
-    /// that drive the marking-failure demotion ever change it.
+    // Sparse marker for every file this runtime's sets create. Only the tests
+    // that drive the marking-failure demotion ever change it.
     sparse: SparseMarking,
-    /// Source volumes a repair has materialized over this pipeline's life.
-    ///
-    /// Counted because "only the damaged volumes materialize" is the claim
-    /// repair-while-direct rests on, and no artefact survives to prove it
-    /// afterwards: the scratch is deleted as soon as its spans are routed, so a
-    /// run that quietly materialized every volume of the set and then tidied up
-    /// would look identical on disk to one that materialized a single volume.
+    // Source volumes a repair has materialized over this pipeline's life.
+    //
+    // Counted because "only the damaged volumes materialize" is the claim
+    // repair-while-direct rests on, and no artefact survives to prove it
+    // afterwards: the scratch is deleted as soon as its spans are routed, so a
+    // run that quietly materialized every volume of the set and then tidied up
+    // would look identical on disk to one that materialized a single volume.
     #[cfg(test)]
     pub(crate) repair_materialized_volumes: usize,
-    /// Sets that committed their members from their own partials, ever.
+    // Sets that committed their members from their own partials, ever.
     #[cfg(test)]
     pub(crate) finalized_sets: usize,
-    /// Repairs that got as far as the checkpoint delete — the one irreversible
-    /// step — over this pipeline's life.
-    ///
-    /// The repair once-latch is only observable as a *count*. Every other trace
-    /// a second attempt leaves is one a first attempt leaves too, and an attempt
-    /// that refuses somewhere downstream is indistinguishable from one that was
-    /// never made: the scratch is deleted either way, and
-    /// [`Self::repair_materialized_volumes`] counts successful repairs only.
+    // Repairs that got as far as the checkpoint delete — the one irreversible
+    // step — over this pipeline's life.
+    //
+    // The repair once-latch is only observable as a *count*. Every other trace
+    // a second attempt leaves is one a first attempt leaves too, and an attempt
+    // that refuses somewhere downstream is indistinguishable from one that was
+    // never made: the scratch is deleted either way, and
+    // [`Self::repair_materialized_volumes`] counts successful repairs only.
     #[cfg(test)]
     pub(crate) repair_attempts: usize,
-    /// Recovery blocks a repair spent, which is one per damaged slice.
-    ///
-    /// The number the damage accounting produces, in the only form that can be
-    /// checked end to end: a count inflated by a sequential sweep stopping at an
-    /// interior hole shows up here as blocks spent rebuilding slices that were
-    /// never broken.
+    // Recovery blocks a repair spent, which is one per damaged slice.
+    //
+    // The number the damage accounting produces, in the only form that can be
+    // checked end to end: a count inflated by a sequential sweep stopping at an
+    // interior hole shows up here as blocks spent rebuilding slices that were
+    // never broken.
     #[cfg(test)]
     pub(crate) repair_recovery_blocks_used: usize,
-    /// Damage verdicts that were answered by waiting for targeted recovery
-    /// instead of repairing or demoting, over this pipeline's life.
-    ///
-    /// Counted for the same reason [`Self::repair_attempts`] is: a defer leaves
-    /// no artefact. Nothing is materialized, nothing is deleted, the set is
-    /// exactly as it was — which is the whole point, and which makes a defer
-    /// indistinguishable from a pass that found nothing to do.
+    // Damage verdicts that were answered by waiting for targeted recovery
+    // instead of repairing or demoting, over this pipeline's life.
+    //
+    // Counted for the same reason [`Self::repair_attempts`] is: a defer leaves
+    // no artefact. Nothing is materialized, nothing is deleted, the set is
+    // exactly as it was — which is the whole point, and which makes a defer
+    // indistinguishable from a pass that found nothing to do.
     #[cfg(test)]
     pub(crate) repair_defers: usize,
-    /// Every demotion this pipeline's sets went through, in order, with the
-    /// reason the set actually carries.
-    ///
-    /// A log because a demotion is otherwise invisible in a finished job: the
-    /// conventional path delivers the same bytes, and the set is dropped with
-    /// the job, so a route that quietly fell back looks identical on disk to
-    /// one that stayed direct.
+    // Every demotion this pipeline's sets went through, in order, with the
+    // reason the set actually carries.
+    //
+    // A log because a demotion is otherwise invisible in a finished job: the
+    // conventional path delivers the same bytes, and the set is dropped with
+    // the job, so a route that quietly fell back looks identical on disk to
+    // one that stayed direct.
     #[cfg(test)]
     pub(crate) demotions: Vec<DemotionReason>,
 }
@@ -333,15 +339,15 @@ impl std::fmt::Debug for DirectStoreRuntime {
 }
 
 impl DirectStoreRuntime {
-    /// A runtime whose holds disk reserve has no free-space reading.
+    // A runtime whose holds disk reserve has no free-space reading.
     #[cfg(test)]
     pub(crate) fn with_settings(settings: DirectStoreSettings) -> Self {
         Self::with_working_capacity(settings, crate::operations::CapacityReader::unknown())
     }
 
-    /// Builds a runtime from the settings resolved at pipeline construction
-    /// (config, with the env override winning). `working_capacity` reads the
-    /// working directory's free space for the holds disk reserve.
+    // Builds a runtime from the settings resolved at pipeline construction
+    // (config, with the env override winning). `working_capacity` reads the
+    // working directory's free space for the holds disk reserve.
     pub(crate) fn with_working_capacity(
         settings: DirectStoreSettings,
         working_capacity: crate::operations::CapacityReader,
@@ -356,12 +362,12 @@ impl DirectStoreRuntime {
         }
     }
 
-    /// Per-job counts of the sets this runtime is carrying, for the read-only
-    /// diagnostics snapshot.
-    ///
-    /// Deliberately counts rather than set state: the snapshot is copied out of
-    /// the actor while it is blocked on the reply, so everything it reads has
-    /// to be cheap and allocation-bounded.
+    // Per-job counts of the sets this runtime is carrying, for the read-only
+    // diagnostics snapshot.
+    //
+    // Deliberately counts rather than set state: the snapshot is copied out of
+    // the actor while it is blocked on the reply, so everything it reads has
+    // to be cheap and allocation-bounded.
     pub(crate) fn set_counts_by_job(&self) -> Vec<(JobId, DirectSetCounts)> {
         let mut counts: Vec<(JobId, DirectSetCounts)> = self
             .sets
@@ -385,22 +391,22 @@ impl DirectStoreRuntime {
         counts
     }
 
-    /// The process-wide holds accountant.
+    // The process-wide holds accountant.
     #[cfg(test)]
     pub(crate) fn holds_accountant(&self) -> &super::accountant::HoldsAccountant {
         &self.accountant
     }
 
-    /// Test hook: replace the shared limits, so a process-wide breach is
-    /// reachable with a few hundred bytes across two sets. Applies to the sets
-    /// admitted afterwards.
+    // Test hook: replace the shared limits, so a process-wide breach is
+    // reachable with a few hundred bytes across two sets. Applies to the sets
+    // admitted afterwards.
     #[cfg(test)]
     pub(crate) fn set_holds_limits(&mut self, limits: super::accountant::HoldsLimits) {
         self.accountant = std::sync::Arc::new(super::accountant::HoldsAccountant::new(limits));
     }
 
-    /// Test hook: [`Self::set_holds_limits`] with the free-space reading
-    /// behind the disk reserve replaced.
+    // Test hook: [`Self::set_holds_limits`] with the free-space reading
+    // behind the disk reserve replaced.
     #[cfg(test)]
     pub(crate) fn set_holds_limits_with_disk_probe(
         &mut self,
@@ -420,19 +426,19 @@ impl DirectStoreRuntime {
         self.settings().gate
     }
 
-    /// Test hook: whether the once-per-job `-hp` harvest has already run for
-    /// this job.
-    ///
-    /// Tests read it to establish the *precondition* of what they test: once
-    /// this is true the harvest never runs again, so a password supplied later
-    /// has exactly one route left into the `-hp` ring — the per-article
-    /// re-offer in [`Pipeline::refresh_direct_passwords`].
+    // Test hook: whether the once-per-job `-hp` harvest has already run for
+    // this job.
+    //
+    // Tests read it to establish the *precondition* of what they test: once
+    // this is true the harvest never runs again, so a password supplied later
+    // has exactly one route left into the `-hp` ring — the per-article
+    // re-offer in [`Pipeline::refresh_direct_passwords`].
     #[cfg(test)]
     pub(crate) fn header_candidates_offered(&self, job_id: JobId) -> bool {
         self.header_harvest.contains_key(&job_id)
     }
 
-    /// Test hook: force the gate without going through a config load.
+    // Test hook: force the gate without going through a config load.
     #[cfg(test)]
     pub(crate) fn set_gate(&mut self, gate: DirectStoreGate) {
         let mut settings = self.settings();
@@ -440,30 +446,30 @@ impl DirectStoreRuntime {
         self.settings = Some(settings);
     }
 
-    /// Test hook: lower the holds ceiling so a breach is reachable without
-    /// staging tens of megabytes.
+    // Test hook: lower the holds ceiling so a breach is reachable without
+    // staging tens of megabytes.
     #[cfg(test)]
     pub(crate) fn set_holds_budget(&mut self, bytes: u64) {
         self.holds_budget_override = Some(bytes);
     }
 
-    /// Test hook: lower the scratch ceiling so a breach is reachable without
-    /// paging half a gigabyte.
+    // Test hook: lower the scratch ceiling so a breach is reachable without
+    // paging half a gigabyte.
     #[cfg(test)]
     pub(crate) fn set_holds_scratch_ceiling(&mut self, bytes: u64) {
         self.holds_scratch_ceiling_override = Some(bytes);
     }
 
-    /// Test hook: pre-spend the defer budget, so the exhausted arm is reachable
-    /// without actually downloading three waves of recovery.
+    // Test hook: pre-spend the defer budget, so the exhausted arm is reachable
+    // without actually downloading three waves of recovery.
     #[cfg(test)]
     pub(crate) fn set_repair_defer_waves(&mut self, job_id: JobId, waves: u32) {
         self.repair_defer_waves.insert(job_id, waves);
     }
 
-    /// Test hook: make every sparse marking attempt fail, which is the only way
-    /// to reach the sparse-marking demotion arm on a platform whose marker
-    /// cannot fail.
+    // Test hook: make every sparse marking attempt fail, which is the only way
+    // to reach the sparse-marking demotion arm on a platform whose marker
+    // cannot fail.
     #[cfg(test)]
     pub(crate) fn set_sparse_marking(&mut self, marking: SparseMarking) {
         self.sparse = marking;
@@ -473,15 +479,15 @@ impl DirectStoreRuntime {
         self.sparse
     }
 
-    /// Applies this runtime's configured ceilings and sparse marker to a set it
-    /// is about to own.
-    ///
-    /// Every path that builds a `DirectSet` goes through here, restore
-    /// included. Restore used to skip it, so a restart test could set a budget
-    /// and then watch the restored set quietly use the 64 MiB / 512 MiB
-    /// defaults — which makes every budget assertion about a restored set
-    /// vacuous, and those are exactly the assertions the holds ceilings need
-    /// after a restart.
+    // Applies this runtime's configured ceilings and sparse marker to a set it
+    // is about to own.
+    //
+    // Every path that builds a `DirectSet` goes through here, restore
+    // included. Restore used to skip it, so a restart test could set a budget
+    // and then watch the restored set quietly use the 64 MiB / 512 MiB
+    // defaults — which makes every budget assertion about a restored set
+    // vacuous, and those are exactly the assertions the holds ceilings need
+    // after a restart.
     pub(crate) fn apply_ceilings(&self, set: &mut DirectSet) {
         set.router
             .set_holds_accountant(std::sync::Arc::clone(&self.accountant));
@@ -499,9 +505,9 @@ impl DirectStoreRuntime {
         }
     }
 
-    /// Drops every trace of a job. Called from the job-removal seam: a barrier
-    /// for a job that no longer exists must stop being polled, and its sets
-    /// hold the routed byte state of a working directory that is being deleted.
+    // Drops every trace of a job. Called from the job-removal seam: a barrier
+    // for a job that no longer exists must stop being polled, and its sets
+    // hold the routed byte state of a working directory that is being deleted.
     pub(crate) fn clear_job(&mut self, job_id: JobId) {
         self.sets.remove(&job_id);
         self.examined.remove(&job_id);
@@ -615,17 +621,17 @@ impl DirectStoreRuntime {
             .unwrap_or(0)
     }
 
-    /// Whether this job has a repair defer outstanding — a wave of targeted
-    /// recovery was promoted for a set that is still direct and still waiting.
+    // Whether this job has a repair defer outstanding — a wave of targeted
+    // recovery was promoted for a set that is still direct and still waiting.
     fn repair_defer_pending(&self, job_id: JobId) -> bool {
         self.repair_defer_waves
             .get(&job_id)
             .is_some_and(|waves| *waves > 0)
     }
 
-    /// Installs the sets a job restore rebuilt, and marks the job examined so
-    /// the lazy admission seam does not rediscover them from the spec and throw
-    /// the restored coverage away.
+    // Installs the sets a job restore rebuilt, and marks the job examined so
+    // the lazy admission seam does not rediscover them from the spec and throw
+    // the restored coverage away.
     pub(crate) fn install_restored(&mut self, job_id: JobId, sets: Vec<DirectSet>) {
         self.examined.insert(job_id);
         if sets.is_empty() {
@@ -642,8 +648,8 @@ impl DirectStoreRuntime {
             && !self.prepared_destinations.contains_key(&job_id)
     }
 
-    /// Sets across every job that are still routing: neither demoted nor
-    /// finalized. These are the sets sharing the accountant's limits.
+    // Sets across every job that are still routing: neither demoted nor
+    // finalized. These are the sets sharing the accountant's limits.
     pub(crate) fn live_set_count(&self) -> usize {
         self.sets
             .values()
@@ -660,8 +666,8 @@ impl DirectStoreRuntime {
         self.sets.get_mut(&job_id)?.get_mut(index)
     }
 
-    /// Every set of one job, mutably. Used by the password refresh, which has to
-    /// touch all of a job's sets rather than one indexed set.
+    // Every set of one job, mutably. Used by the password refresh, which has to
+    // touch all of a job's sets rather than one indexed set.
     pub(crate) fn sets_mut(&mut self, job_id: JobId) -> &mut [DirectSet] {
         self.sets
             .get_mut(&job_id)
@@ -673,7 +679,7 @@ impl DirectStoreRuntime {
         self.sets.get(&job_id)?.get(index)
     }
 
-    /// Jobs with at least one set still routing.
+    // Jobs with at least one set still routing.
     pub(crate) fn active_jobs(&self) -> Vec<JobId> {
         self.sets
             .iter()
@@ -686,9 +692,9 @@ impl DirectStoreRuntime {
     }
 }
 
-/// Step 1 of the barrier. Routing runs inline on the pipeline task and every
-/// destination write is awaited before the span is recorded, so by the time a
-/// barrier can be requested nothing for this set is in flight.
+// Step 1 of the barrier. Routing runs inline on the pipeline task and every
+// destination write is awaited before the span is recorded, so by the time a
+// barrier can be requested nothing for this set is in flight.
 struct InlineDrain;
 
 impl BarrierDrain for InlineDrain {
@@ -697,13 +703,13 @@ impl BarrierDrain for InlineDrain {
     }
 }
 
-/// Step 2 of the barrier, pre-computed.
-///
-/// The barrier's sync hook is synchronous and weaver's durable sync goes
-/// through the disk owner thread that holds the destination's handle, which is
-/// an await. So the syncs run immediately before [`super::barrier::CoverageBarrier::barrier`]
-/// and their outcomes are replayed here — same order, same failure semantics: a
-/// destination that did not sync fails step 2 and nothing is published.
+// Step 2 of the barrier, pre-computed.
+//
+// The barrier's sync hook is synchronous and weaver's durable sync goes
+// through the disk owner thread that holds the destination's handle, which is
+// an await. So the syncs run immediately before [`super::barrier::CoverageBarrier::barrier`]
+// and their outcomes are replayed here — same order, same failure semantics: a
+// destination that did not sync fails step 2 and nothing is published.
 struct PreSyncedDestinations {
     results: HashMap<String, Result<(), String>>,
 }
@@ -717,70 +723,70 @@ impl DestinationSync for PreSyncedDestinations {
     }
 }
 
-/// What one demotion's reconstruction sweep did to the set's volumes.
-///
-/// The two counts are **not** disjoint any more, and that is the point: a
-/// volume that refuses one run is both materialized (for everything the sweep
-/// verified) and refetched (for the articles it did not). The byte totals are
-/// what actually says how much the demotion cost, because a volume count cannot
-/// tell a whole volume off the wire from one missing article.
+// What one demotion's reconstruction sweep did to the set's volumes.
+//
+// The two counts are **not** disjoint any more, and that is the point: a
+// volume that refuses one run is both materialized (for everything the sweep
+// verified) and refetched (for the articles it did not). The byte totals are
+// what actually says how much the demotion cost, because a volume count cannot
+// tell a whole volume off the wire from one missing article.
 #[derive(Debug, Default)]
 pub(crate) struct ReconstructionSummary {
-    /// Volumes that came out of the sweep with a verified contiguous prefix.
+    // Volumes that came out of the sweep with a verified contiguous prefix.
     materialized: usize,
-    /// Volumes the sweep could not rebuild in full, and the first reason each
-    /// refused. Each costs the articles its verified ranges do not back, and
-    /// nothing of its siblings.
+    // Volumes the sweep could not rebuild in full, and the first reason each
+    // refused. Each costs the articles its verified ranges do not back, and
+    // nothing of its siblings.
     refetched: Vec<(u32, ReconstructionFailure)>,
-    /// Decoded bytes the sweep verified and handed to the conventional path as
-    /// already on disk. These are the bytes a demotion no longer pays for
-    /// twice.
+    // Decoded bytes the sweep verified and handed to the conventional path as
+    // already on disk. These are the bytes a demotion no longer pays for
+    // twice.
     retained_bytes: u64,
-    /// Decoded bytes that were routed once and have to come off the wire again:
-    /// everything a volume had committed that its verified ranges do not back.
+    // Decoded bytes that were routed once and have to come off the wire again:
+    // everything a volume had committed that its verified ranges do not back.
     refetched_bytes: u64,
 }
 
-/// The reconciliation's half of a detached demotion sweep, snapshotted when the
-/// sweep was handed off and carried by the ticket until it lands.
-///
-/// It holds no borrow of the set or the job on purpose: by the time it is read
-/// back, the actor has processed an unbounded number of other messages, and
-/// only the sweep's own outcomes plus this snapshot may decide what the volumes
-/// now contain.
+// The reconciliation's half of a detached demotion sweep, snapshotted when the
+// sweep was handed off and carried by the ticket until it lands.
+//
+// It holds no borrow of the set or the job on purpose: by the time it is read
+// back, the actor has processed an unbounded number of other messages, and
+// only the sweep's own outcomes plus this snapshot may decide what the volumes
+// now contain.
 pub(crate) struct DemotedSweepPlan {
     set_name: String,
-    /// Carried for the ticket's log lines only. The demotion has already
-    /// recorded the reason everywhere it is acted on.
+    // Carried for the ticket's log lines only. The demotion has already
+    // recorded the reason everywhere it is acted on.
     reason: DemotionReason,
-    /// `(volume_index, file_index, filename, sweep plan)`, in the order the
-    /// sweep reports its outcomes.
+    // `(volume_index, file_index, filename, sweep plan)`, in the order the
+    // sweep reports its outcomes.
     targets: Vec<(u32, u32, String, VolumeReconstruction)>,
-    /// Per volume, the decoded extent of each of its articles — the geometry
-    /// that turns verified ranges into a keep set and a segment-aligned floor.
+    // Per volume, the decoded extent of each of its articles — the geometry
+    // that turns verified ranges into a keep set and a segment-aligned floor.
     extents_by_volume: HashMap<u32, std::collections::BTreeMap<u32, (u64, u64)>>,
-    /// Every volume of the set as an NZB file, for the completion replay the
-    /// handback ends with.
+    // Every volume of the set as an NZB file, for the completion replay the
+    // handback ends with.
     volume_files: Vec<NzbFileId>,
-    /// Articles the decode seam took ownership of at the demotion instant: the
-    /// one that was routing when the set demoted, and any that reached an
-    /// already-demoted set behind it.
-    ///
-    /// Snapshotted here because the seam writes them while the sweep runs and
-    /// clears its own record as soon as it has. The reconciliation must not
-    /// then read their segments as "committed but not verified" and requeue
-    /// them: their bytes are on disk, written by their owner, at the offsets
-    /// the conventional path expects.
+    // Articles the decode seam took ownership of at the demotion instant: the
+    // one that was routing when the set demoted, and any that reached an
+    // already-demoted set behind it.
+    //
+    // Snapshotted here because the seam writes them while the sweep runs and
+    // clears its own record as soon as it has. The reconciliation must not
+    // then read their segments as "committed but not verified" and requeue
+    // them: their bytes are on disk, written by their owner, at the offsets
+    // the conventional path expects.
     handoffs: HashSet<SegmentId>,
 }
 
-/// Chunks a demoted volume's handback unblocked in the write buffer: the file
-/// they belong to, the ready `(offset, chunk)` pairs in write order, and the
-/// contiguous end the buffer reports after draining them.
+// Chunks a demoted volume's handback unblocked in the write buffer: the file
+// they belong to, the ready `(offset, chunk)` pairs in write order, and the
+// contiguous end the buffer reports after draining them.
 type UnblockedHandbackWrites = (NzbFileId, Vec<(u64, BufferedDecodedSegment)>, u64);
 
-/// A demotion sweep ready to be handed off: the worker's half (which is moved
-/// into the blocking task and never comes back) and the reconciliation's.
+// A demotion sweep ready to be handed off: the worker's half (which is moved
+// into the blocking task and never comes back) and the reconciliation's.
 struct PreparedDemotedSweep {
     provider: super::provider::HybridVolumeProvider,
     plans: Vec<VolumeReconstruction>,
@@ -788,30 +794,30 @@ struct PreparedDemotedSweep {
     plan: DemotedSweepPlan,
 }
 
-/// One member the member tolerance produces at finalization, with
-/// the two path forms the two arms need.
+// One member the member tolerance produces at finalization, with
+// the two path forms the two arms need.
 struct ToleratedTarget {
-    /// Raw header name, which is what `find_member` is asked for.
+    // Raw header name, which is what `find_member` is asked for.
     name: String,
-    /// Absolute destination under the job's staging root.
+    // Absolute destination under the job's staging root.
     destination: PathBuf,
-    /// The same path relative to that root, for [`ExtractionRoot`].
+    // The same path relative to that root, for [`ExtractionRoot`].
     relative: PathBuf,
     is_directory: bool,
 }
 
-/// What the tolerance produced: the member names, and the directory entries
-/// whose metadata still has to be restored.
+// What the tolerance produced: the member names, and the directory entries
+// whose metadata still has to be restored.
 #[derive(Debug, Default)]
 pub(crate) struct ToleratedExtraction {
-    /// Raw header names produced, for `extracted_members`. Directory entries
-    /// are in here too — the conventional extractor reports one the same way,
-    /// and a name in neither list is a name completion cannot account for.
+    // Raw header names produced, for `extracted_members`. Directory entries
+    // are in here too — the conventional extractor reports one the same way,
+    // and a name in neither list is a name completion cannot account for.
     members: Vec<String>,
-    /// `(metadata, absolute path)` per directory entry, applied **after** the
-    /// commit loop: every file renamed into a directory bumps that directory's
-    /// mtime, so restoring it before the members land would restore a value the
-    /// next rename overwrites.
+    // `(metadata, absolute path)` per directory entry, applied **after** the
+    // commit loop: every file renamed into a directory bumps that directory's
+    // mtime, so restoring it before the members land would restore a value the
+    // next rename overwrites.
     directories: Vec<(ToleratedDirectoryMetadata, PathBuf)>,
 }
 
@@ -840,55 +846,55 @@ impl ToleratedDirectoryMetadata {
     }
 }
 
-/// Everything the authoritative PAR2 pass needs to read a job's direct sets
-/// virtually.
-///
-/// The provider is keyed by **NZB file index**, not by volume index: one job can
-/// carry several direct sets and every set numbers its volumes from zero, so the
-/// volume index is not unique inside a job while the file index always is. The
-/// adapter only ever uses the key to reach a reader, so any injective key works,
-/// and this one is already the identity the PAR2 binding is resolved through.
+// Everything the authoritative PAR2 pass needs to read a job's direct sets
+// virtually.
+//
+// The provider is keyed by **NZB file index**, not by volume index: one job can
+// carry several direct sets and every set numbers its volumes from zero, so the
+// volume index is not unique inside a job while the file index always is. The
+// adapter only ever uses the key to reach a reader, so any injective key works,
+// and this one is already the identity the PAR2 binding is resolved through.
 pub(crate) struct DirectPar2Overlay {
-    /// The recovery set every virtual volume in this overlay belongs to.
+    // The recovery set every virtual volume in this overlay belongs to.
     pub(crate) recovery_set_id: par2_rs::RecoverySetId,
     pub(crate) provider: super::provider::HybridVolumeProvider,
     pub(crate) volumes: Vec<super::par2_access::VirtualPar2Volume>,
-    /// Which direct set owns each bound PAR2 file, so damage demotes the set
-    /// that produced the bytes rather than every set of the job.
+    // Which direct set owns each bound PAR2 file, so damage demotes the set
+    // that produced the bytes rather than every set of the job.
     sets: HashMap<par2_rs::FileId, usize>,
-    /// The job file index each bound PAR2 file resolved to. The overlay re-keys
-    /// virtual volumes by it, so it is also how repair walks back from a
-    /// damaged PAR2 file to the set's own volume index.
+    // The job file index each bound PAR2 file resolved to. The overlay re-keys
+    // virtual volumes by it, so it is also how repair walks back from a
+    // damaged PAR2 file to the set's own volume index.
     file_indices: HashMap<par2_rs::FileId, u32>,
-    /// The volume lengths the overlay was built with, so a repair can rebuild
-    /// the very same provider without re-deriving them from the assembly.
+    // The volume lengths the overlay was built with, so a repair can rebuild
+    // the very same provider without re-deriving them from the assembly.
     lengths: Vec<(usize, std::collections::BTreeMap<u32, u64>)>,
 }
 
 impl DirectPar2Overlay {
-    /// The direct set that owns one bound PAR2 file.
+    // The direct set that owns one bound PAR2 file.
     pub(crate) fn owner_of(&self, file_id: &par2_rs::FileId) -> Option<usize> {
         self.sets.get(file_id).copied()
     }
 
-    /// The job file index one bound PAR2 file resolved to.
+    // The job file index one bound PAR2 file resolved to.
     pub(crate) fn file_index_of(&self, file_id: &par2_rs::FileId) -> Option<u32> {
         self.file_indices.get(file_id).copied()
     }
 
-    /// Rebuilds the overlay's virtual volumes against the sets as they stand
-    /// now, re-keyed by job file index exactly as [`Pipeline::direct_par2_overlay`]
-    /// does.
-    ///
-    /// Deliberately re-derived rather than cloned out of `provider`: a repair
-    /// materializes and re-routes between the pass and the repair, and the
-    /// coverage the sets carry afterwards is the coverage the repair's reads
-    /// must see.
-    ///
-    /// A **retained** finalized set is the one exception, and for the same
-    /// reason: its image was captured at finalization precisely because nothing
-    /// can re-derive it afterwards — the coverage controller has been retired
-    /// and the partials renamed away — so it is replayed rather than rebuilt.
+    // Rebuilds the overlay's virtual volumes against the sets as they stand
+    // now, re-keyed by job file index exactly as [`Pipeline::direct_par2_overlay`]
+    // does.
+    //
+    // Deliberately re-derived rather than cloned out of `provider`: a repair
+    // materializes and re-routes between the pass and the repair, and the
+    // coverage the sets carry afterwards is the coverage the repair's reads
+    // must see.
+    //
+    // A **retained** finalized set is the one exception, and for the same
+    // reason: its image was captured at finalization precisely because nothing
+    // can re-derive it afterwards — the coverage controller has been retired
+    // and the partials renamed away — so it is replayed rather than rebuilt.
     pub(crate) fn virtual_volumes_for(
         &self,
         runtime: &DirectStoreRuntime,
@@ -916,120 +922,120 @@ impl DirectPar2Overlay {
     }
 }
 
-/// What a live direct set turned out to need, just before the completion gate
-/// would have handed the job to `Par2Repairer`.
+// What a live direct set turned out to need, just before the completion gate
+// would have handed the job to `Par2Repairer`.
 #[derive(Debug)]
 pub(crate) enum DirectPar2Resolution {
-    /// Damage was found and repaired in place. The job goes round again and
-    /// re-verifies over the repaired virtual volumes.
+    // Damage was found and repaired in place. The job goes round again and
+    // re-verifies over the repaired virtual volumes.
     Repaired,
-    /// The direct sets verify clean.
-    ///
-    /// Load-bearing rather than a nicety: the branch that was about to run
-    /// cannot read a virtual volume, so it would have demoted every live set to
-    /// get files it could — for a job whose sets are *fine*. The caller instead
-    /// skips the repairer and lets the ordinary verify path, which reads them
-    /// virtually, record the same verdict this pass just reached.
-    ///
-    /// Carries the verdict itself, because the caller now settles it directly
-    /// instead of throwing it away and asking [`Pipeline::verify_par2_with_placement`]
-    /// to read the whole set again to reach the same answer. Boxed to keep this
-    /// enum small on the branches that carry nothing.
+    // The direct sets verify clean.
+    //
+    // Load-bearing rather than a nicety: the branch that was about to run
+    // cannot read a virtual volume, so it would have demoted every live set to
+    // get files it could — for a job whose sets are *fine*. The caller instead
+    // skips the repairer and lets the ordinary verify path, which reads them
+    // virtually, record the same verdict this pass just reached.
+    //
+    // Carries the verdict itself, because the caller now settles it directly
+    // instead of throwing it away and asking [`Pipeline::verify_par2_with_placement`]
+    // to read the whole set again to reach the same answer. Boxed to keep this
+    // enum small on the branches that carry nothing.
     Clean(Box<par2_rs::VerificationResult>),
-    /// Native verification exhausted reachable PAR2 recovery. Preserve virtual
-    /// sources while the completion coordinator considers the PAR3 fallback.
+    // Native verification exhausted reachable PAR2 recovery. Preserve virtual
+    // sources while the completion coordinator considers the PAR3 fallback.
     RecoveryExhausted { needed: u32, available: u32 },
-    /// Damage was found that the recovery *merged so far* cannot cover, but the
-    /// recovery set as a whole can. Targeted recovery has been asked for and the
-    /// sets stay direct until it lands. The caller must not run the repairer and
-    /// must not demote: doing either throws away the direct outputs the wait
-    /// exists to keep.
+    // Damage was found that the recovery *merged so far* cannot cover, but the
+    // recovery set as a whole can. Targeted recovery has been asked for and the
+    // sets stay direct until it lands. The caller must not run the repairer and
+    // must not demote: doing either throws away the direct outputs the wait
+    // exists to keep.
     Deferred,
-    /// The post-processing lane owns the post-repair read-back. Its terminal
-    /// verdict re-arms this job without holding the queue actor.
+    // The post-processing lane owns the post-repair read-back. Its terminal
+    // verdict re-arms this job without holding the queue actor.
     Pending,
-    /// A set left direct mode inside this call and its volumes are being
-    /// materialized. Bytes are moving, so the caller must go round again rather
-    /// than settle anything on a verdict taken over the virtual volumes the set
-    /// no longer has — the same answer [`Self::Repaired`] gets, for the same
-    /// reason.
+    // A set left direct mode inside this call and its volumes are being
+    // materialized. Bytes are moving, so the caller must go round again rather
+    // than settle anything on a verdict taken over the virtual volumes the set
+    // no longer has — the same answer [`Self::Repaired`] gets, for the same
+    // reason.
     Demoted,
-    /// Neither: no live set, no verdict, or a repair that refused. The caller
-    /// falls back to demoting for the repairer, which is the earlier behaviour.
+    // Neither: no live set, no verdict, or a repair that refused. The caller
+    // falls back to demoting for the repairer, which is the earlier behaviour.
     Unresolved,
 }
 
-/// What the verify branch's direct-aware seam settled on.
-///
-/// The bool this replaced could say "act on it" or "fall through", and the
-/// third answer — *wait* — is neither: bytes have not changed, so there is
-/// nothing to re-verify, but the sets must not be handed on either.
+// What the verify branch's direct-aware seam settled on.
+//
+// The bool this replaced could say "act on it" or "fall through", and the
+// third answer — *wait* — is neither: bytes have not changed, so there is
+// nothing to re-verify, but the sets must not be handed on either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectDamageResolution {
-    /// Repaired in place, or demoted. Either way bytes moved and the job's next
-    /// move is a fresh pass over them.
+    // Repaired in place, or demoted. Either way bytes moved and the job's next
+    // move is a fresh pass over them.
     Resolved,
-    /// Waiting for targeted recovery, still direct. The job's next move comes
-    /// from the recovery arriving, not from this pass.
+    // Waiting for targeted recovery, still direct. The job's next move comes
+    // from the recovery arriving, not from this pass.
     Deferred,
-    /// Nothing here answered the damage; the caller carries on.
+    // Nothing here answered the damage; the caller carries on.
     Unresolved,
 }
 
-/// What the repair seam did with a damaged live direct set.
+// What the repair seam did with a damaged live direct set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectRepairAnswer {
-    /// A repair ran, or a refusal partway through one had already demoted the
-    /// set. Both leave the job with changed bytes to re-read.
+    // A repair ran, or a refusal partway through one had already demoted the
+    // set. Both leave the job with changed bytes to re-read.
     Acted,
-    /// The damage is repairable out of the recovery set but not out of the
-    /// slices merged today, so the missing recovery was promoted and the set
-    /// was left alone to wait for it.
+    // The damage is repairable out of the recovery set but not out of the
+    // slices merged today, so the missing recovery was promoted and the set
+    // was left alone to wait for it.
     Deferred,
-    /// Nothing was done, and waiting cannot help. The caller demotes.
+    // Nothing was done, and waiting cannot help. The caller demotes.
     Declined,
 }
 
-/// How many waves of targeted recovery one job's direct sets may wait through
-/// before demoting instead.
-///
-/// Three, because one is what the design predicts and two is what a bad article
-/// costs. The first wave asks for every block the verdict needs, so a second
-/// exists only because some of the first wave's articles turned out unavailable
-/// and the re-verdict still comes up short; a third is the same thing happening
-/// twice. Past that the recovery stream is not delivering, and the conventional
-/// path — which has its own, better-instrumented dead end — should get the job.
+// How many waves of targeted recovery one job's direct sets may wait through
+// before demoting instead.
+//
+// Three, because one is what the design predicts and two is what a bad article
+// costs. The first wave asks for every block the verdict needs, so a second
+// exists only because some of the first wave's articles turned out unavailable
+// and the re-verdict still comes up short; a third is the same thing happening
+// twice. Past that the recovery stream is not delivering, and the conventional
+// path — which has its own, better-instrumented dead end — should get the job.
 pub(crate) const MAX_DIRECT_REPAIR_DEFER_WAVES: u32 = 3;
 
-/// What the routing seam did with an article.
+// What the routing seam did with an article.
 pub(crate) enum DirectRouteOutcome {
-    /// The bytes were routed; the caller must not write the source volume.
+    // The bytes were routed; the caller must not write the source volume.
     Routed,
-    /// The set demoted before taking ownership. The caller must pass this same
-    /// decoded article through the conventional assembly path.
+    // The set demoted before taking ownership. The caller must pass this same
+    // decoded article through the conventional assembly path.
     Conventional(BufferedDecodedSegment),
 }
 
-/// What the decode seam should do with one file's bytes.
+// What the decode seam should do with one file's bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectFileTarget {
-    /// A live set's source volume: route it.
+    // A live set's source volume: route it.
     Route { set_index: usize, volume_index: u32 },
-    /// A **finalized** set's source volume. The set's members are already at
-    /// their destinations and the volume was never a file, so a late duplicate
-    /// has nowhere to go: routing it would write through stale partial paths,
-    /// and writing it conventionally would materialize a volume the whole point
-    /// was never to create. It is dropped.
+    // A **finalized** set's source volume. The set's members are already at
+    // their destinations and the volume was never a file, so a late duplicate
+    // has nowhere to go: routing it would write through stale partial paths,
+    // and writing it conventionally would materialize a volume the whole point
+    // was never to create. It is dropped.
     Discard,
 }
 
 impl Pipeline {
-    /// Admits the job's candidate RAR sets, once per job.
-    ///
-    /// Deliberately lazy rather than hooked into job start: the first decoded
-    /// segment is the earliest moment a byte could be written, so admitting
-    /// here is still "before any byte lands" while touching no submit or
-    /// restore plumbing.
+    // Admits the job's candidate RAR sets, once per job.
+    //
+    // Deliberately lazy rather than hooked into job start: the first decoded
+    // segment is the earliest moment a byte could be written, so admitting
+    // here is still "before any byte lands" while touching no submit or
+    // restore plumbing.
     fn ensure_direct_sets(&mut self, job_id: JobId) {
         if self.direct_store.examined.contains(&job_id) {
             return;
@@ -1149,21 +1155,21 @@ impl Pipeline {
         self.direct_store.sets.insert(job_id, sets);
     }
 
-    /// Arms identity admission for a job whose PAR2 metadata just parsed.
-    ///
-    /// Called from the metadata-load seam. The name path admits from the spec
-    /// before a byte lands; this is the second chance for the jobs that path
-    /// cannot see — obfuscated posts, whose real volume names exist only in
-    /// the recovery set's descriptions. Each description names a real file and
-    /// carries its `md5(min(length, 16 KiB))` fingerprint, so the roster (set
-    /// name, dense volume indices, per-volume fingerprints) is complete here,
-    /// while the volume-to-file mapping is established later, file by file, at
-    /// the routing seam.
-    ///
-    /// Fail-closed throughout: a roster is only armed when every one of its
-    /// volumes is still provably clean of conventional writes, described by
-    /// exactly one recovery set, and fingerprint-unique — anything less routes
-    /// nothing and leaves the job on the conventional path it is on today.
+    // Arms identity admission for a job whose PAR2 metadata just parsed.
+    //
+    // Called from the metadata-load seam. The name path admits from the spec
+    // before a byte lands; this is the second chance for the jobs that path
+    // cannot see — obfuscated posts, whose real volume names exist only in
+    // the recovery set's descriptions. Each description names a real file and
+    // carries its `md5(min(length, 16 KiB))` fingerprint, so the roster (set
+    // name, dense volume indices, per-volume fingerprints) is complete here,
+    // while the volume-to-file mapping is established later, file by file, at
+    // the routing seam.
+    //
+    // Fail-closed throughout: a roster is only armed when every one of its
+    // volumes is still provably clean of conventional writes, described by
+    // exactly one recovery set, and fingerprint-unique — anything less routes
+    // nothing and leaves the job on the conventional path it is on today.
     pub(crate) async fn arm_direct_identity_admission(&mut self, job_id: JobId) {
         if !self.direct_store.gate().is_enabled() {
             return;
@@ -1201,6 +1207,8 @@ impl Pipeline {
         let set_ids = runtime.ordered_set_ids();
         let mut candidates: BTreeMap<String, Vec<(u32, IdentityRosterVolume)>> = BTreeMap::new();
         let mut described_by: HashMap<String, HashSet<par2_rs::RecoverySetId>> = HashMap::new();
+        // `None` once two families claimed one name.
+        let mut formats: HashMap<String, Option<super::plan::SetFormat>> = HashMap::new();
         for set_id in set_ids {
             let Some(set) = self.par2_set_for(job_id, set_id) else {
                 continue;
@@ -1208,12 +1216,24 @@ impl Pipeline {
             for desc in set.files.values() {
                 let name = weaver_model::files::sanitize_download_filename(&desc.filename);
                 let role = weaver_model::files::FileRole::from_filename(&name);
-                let weaver_model::files::FileRole::RarVolume { volume_number } = role else {
-                    continue;
+                // A whole `.7z` is not here: its own signature header admits
+                // it, with no description needed.
+                let (format, volume_number) = match role {
+                    weaver_model::files::FileRole::RarVolume { volume_number } => {
+                        (super::plan::SetFormat::Rar, volume_number)
+                    }
+                    weaver_model::files::FileRole::SevenZipSplit { number } => {
+                        (super::plan::SetFormat::SevenZip, number)
+                    }
+                    _ => continue,
                 };
                 let Some(set_name) = weaver_model::files::archive_base_name(&name, &role) else {
                     continue;
                 };
+                let named = formats.entry(set_name.clone()).or_insert(Some(format));
+                if *named != Some(format) {
+                    *named = None;
+                }
                 candidates.entry(set_name.clone()).or_default().push((
                     volume_number,
                     IdentityRosterVolume {
@@ -1245,6 +1265,10 @@ impl Pipeline {
             {
                 continue;
             }
+            // Two families under one name: one of them is not this archive.
+            let Some(Some(format)) = formats.get(&set_name).copied() else {
+                continue;
+            };
             if self
                 .direct_store
                 .identity
@@ -1276,6 +1300,7 @@ impl Pipeline {
                     volumes,
                     bound: HashMap::new(),
                     set_index: None,
+                    format,
                 },
             );
         }
@@ -1292,14 +1317,15 @@ impl Pipeline {
                     admission.restored_rosters.insert(set_name, restored);
                     continue;
                 };
-                let expected = self
+                let identity = self
                     .direct_store
                     .sets
                     .get(&job_id)
                     .and_then(|sets| sets.get(restored.set_index))
-                    .and_then(|set| set.plan().identity)
-                    .and_then(|identity| identity.expected_volumes);
+                    .and_then(|set| set.plan().identity);
+                let expected = identity.and_then(|identity| identity.expected_volumes);
                 let consistent = expected == Some(roster.volumes.len() as u32)
+                    && identity.is_some_and(|identity| identity.kind.format() == roster.format)
                     && restored
                         .bound
                         .values()
@@ -1529,30 +1555,187 @@ impl Pipeline {
         self.identity_viability_sweep(job_id).await;
     }
 
-    /// The identity half of the routing seam: matches one file's offset-zero
-    /// bytes against the job's armed rosters, and turns the unique match into
-    /// a routed binding — admitting the set on its first one.
-    ///
-    /// Called only after [`Self::direct_route_target`] answered `None`, at the
-    /// decode seam — after the binder's prefix capture and before the write —
-    /// which is what makes the binding decision atomic with the write
-    /// decision: the article either routes under the binding made here or
-    /// takes the conventional path and marks the file leaked. There is no
-    /// window in which a bindable file's bytes land somewhere a later binding
-    /// would contradict. The bytes themselves are read from
-    /// [`crate::pipeline::Pipeline::file_prefix_16k`], the same capture the
-    /// PAR2 content binder answers from, populated earlier on this very call
-    /// path.
+    fn orphan_named_rar_volume(&self, file_id: NzbFileId) -> bool {
+        let Some(state) = self.jobs.get(&file_id.job_id) else {
+            return false;
+        };
+        let Some(file) = state.assembly.file(file_id) else {
+            return false;
+        };
+        if !matches!(
+            file.declared_role(),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ) {
+            return false;
+        }
+        let set = weaver_model::files::archive_base_name(file.filename(), file.declared_role());
+        !state.assembly.files().any(|candidate| {
+            matches!(
+                candidate.declared_role(),
+                weaver_model::files::FileRole::RarVolume { volume_number: 0 }
+            ) && weaver_model::files::archive_base_name(
+                candidate.filename(),
+                candidate.declared_role(),
+            ) == set
+        })
+    }
+
+    pub(in crate::pipeline) fn identity_prefix_pending(
+        &mut self,
+        file_id: NzbFileId,
+        declared_len: u64,
+    ) -> bool {
+        if !self.direct_store.gate().is_enabled() {
+            return false;
+        }
+        let admission = self.direct_store.identity.get(&file_id.job_id);
+        if admission.is_some_and(|admission| {
+            admission.leaked.contains(&file_id.file_index)
+                || admission.no_match.contains(&file_id.file_index)
+        }) || self
+            .identity_par2_carrier_files(file_id.job_id)
+            .contains(&file_id.file_index)
+        {
+            return false;
+        }
+        let captured = self.file_prefix_16k.get(&file_id).map_or(0, Vec::len);
+        if captured == 0 && self.orphan_named_rar_volume(file_id) {
+            return true;
+        }
+        let Some(admission) = admission else {
+            return false;
+        };
+        admission.rosters.values().any(|roster| {
+            roster.volumes.iter().any(|(index, volume)| {
+                volume.length == declared_len
+                    && !roster.bound.values().any(|bound| bound == index)
+                    && captured
+                        < volume
+                            .length
+                            .min(crate::pipeline::PAR2_HASH_16K_BYTES as u64)
+                            as usize
+            })
+        })
+    }
+
+    // A complete repost can be kept conventionally without condemning the
+    // original direct set, but only after comparing all its decoded bytes
+    // with the completed virtual source. A shared header is not enough.
+    pub(in crate::pipeline) async fn complete_header_repost(
+        &mut self,
+        file_id: NzbFileId,
+        offset: u64,
+        segment: &crate::pipeline::BufferedDecodedSegment,
+    ) -> bool {
+        if offset != 0
+            || segment.data.len_bytes() as u64 != segment.declared_file_len
+            || segment.damaged_source.is_some()
+        {
+            return false;
+        }
+        let Some(prefix) = self.file_prefix_16k.get(&file_id) else {
+            return false;
+        };
+        let super::sniff::PrefixSniff::Rar5 {
+            volume_number,
+            is_volume: true,
+        } = super::sniff::sniff_rar_prefix(prefix)
+        else {
+            return false;
+        };
+        let Some(header_set) =
+            self.direct_store
+                .identity
+                .get(&file_id.job_id)
+                .and_then(|admission| {
+                    admission.header_sets.iter().find(|set| {
+                        set.volume_set
+                            && set.bound.iter().any(|(file, volume)| {
+                                *file != file_id.file_index && *volume == volume_number
+                            })
+                    })
+                })
+        else {
+            return false;
+        };
+        let Some(set) = self.direct_store.set(file_id.job_id, header_set.set_index) else {
+            return false;
+        };
+        if set.is_demoted() || !set.volume_is_complete(volume_number) {
+            return false;
+        }
+        let Some(original) = set.plan().volumes.get(&volume_number) else {
+            return false;
+        };
+        let original_id = NzbFileId {
+            job_id: file_id.job_id,
+            file_index: *original,
+        };
+        if self.file_declared_size.get(&original_id) != Some(&segment.declared_file_len) {
+            return false;
+        }
+        let volumes = set
+            .retained_volumes()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                set.virtual_volumes(&BTreeMap::from([(
+                    volume_number,
+                    segment.declared_file_len,
+                )]))
+            });
+        let provider = super::provider::HybridVolumeProvider::new(volumes);
+        let mut expected = blake3::Hasher::new();
+        segment.data.for_each_slice(|bytes| {
+            expected.update(bytes);
+        });
+        let expected = expected.finalize();
+        let length = segment.declared_file_len;
+        let equal = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut reader = provider.open(volume_number)?;
+            let mut remaining = length;
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut actual = blake3::Hasher::new();
+            while remaining != 0 {
+                let take = remaining.min(buffer.len() as u64) as usize;
+                reader.read_exact(&mut buffer[..take]).ok()?;
+                actual.update(&buffer[..take]);
+                remaining -= take as u64;
+            }
+            Some(actual.finalize() == expected)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if equal && let Some(admission) = self.direct_store.identity.get_mut(&file_id.job_id) {
+            admission.no_match.insert(file_id.file_index);
+        }
+        equal
+    }
+
+    // The identity half of the routing seam: matches one file's offset-zero
+    // bytes against the job's armed rosters, and turns the unique match into
+    // a routed binding — admitting the set on its first one.
+    //
+    // Called only after [`Self::direct_route_target`] answered `None`, at the
+    // decode seam — after the binder's prefix capture and before the write —
+    // which is what makes the binding decision atomic with the write
+    // decision: the article either routes under the binding made here or
+    // takes the conventional path and marks the file leaked. There is no
+    // window in which a bindable file's bytes land somewhere a later binding
+    // would contradict. The bytes themselves are read from
+    // [`crate::pipeline::Pipeline::file_prefix_16k`], the same capture the
+    // PAR2 content binder answers from, populated earlier on this very call
+    // path.
     pub(crate) async fn direct_identity_route_target(
         &mut self,
         file_id: NzbFileId,
         file_offset: u64,
+        declared_file_len: u64,
     ) -> Option<DirectFileTarget> {
         let job_id = file_id.job_id;
         let file_index = file_id.file_index;
-        if file_offset != 0 {
-            return None;
-        }
         // Two rungs, mutually exclusive per job. Described rosters — PAR2
         // metadata named the volumes — are the stronger evidence and go
         // first; a job without them falls to the header rung, where the
@@ -1574,6 +1757,9 @@ impl Pipeline {
             return None;
         }
         if !has_rosters {
+            if file_offset != 0 {
+                return None;
+            }
             return self.direct_header_route_target(file_id).await;
         }
         // Evaluate against every roster's unclaimed volumes.
@@ -1624,7 +1810,7 @@ impl Pipeline {
             for (set_name, roster) in &admission.rosters {
                 let claimed: HashSet<u32> = roster.bound.values().copied().collect();
                 for (volume_index, volume) in &roster.volumes {
-                    if claimed.contains(volume_index) {
+                    if claimed.contains(volume_index) || declared_file_len != volume.length {
                         continue;
                     }
                     let window = volume
@@ -1731,19 +1917,22 @@ impl Pipeline {
         let state = self.jobs.get(&job_id)?;
         let working_dir = state.working_dir.clone();
         let password = state.spec.password.clone();
-        let expected_volumes = self
+        let (expected_volumes, format) = self
             .direct_store
             .identity
             .get(&job_id)
             .and_then(|admission| admission.rosters.get(&set_name))
-            .map(|roster| roster.volumes.len() as u32)?;
+            .map(|roster| (roster.volumes.len() as u32, roster.format))?;
         let plan = DirectSetPlan {
             set_name: set_name.clone(),
-            format: crate::pipeline::direct_store::plan::SetFormat::Rar,
+            format,
             volumes: BTreeMap::from([(volume_index, file_index)]),
             files: HashMap::from([(file_index, volume_index)]),
             identity: Some(IdentityPlanFacts {
-                kind: super::plan::IdentityKind::Roster,
+                kind: match format {
+                    super::plan::SetFormat::Rar => super::plan::IdentityKind::Roster,
+                    super::plan::SetFormat::SevenZip => super::plan::IdentityKind::SevenZipRoster,
+                },
                 expected_volumes: Some(expected_volumes),
                 // The first bound file's index: stable by construction, which
                 // the derived minimum is not while the mapping grows.
@@ -1782,13 +1971,13 @@ impl Pipeline {
         })
     }
 
-    /// The job's files that really are PAR2 material — declared by role, or
-    /// carriers by the discovery machinery's own evidence. Deliberately NOT
-    /// "every file the discovery has touched": obfuscated par2 discovery
-    /// prefix-probes ordinary data files too, and an entry whose probe found
-    /// nothing (or has not run) is a data file, not a carrier. Treating mere
-    /// presence as carrierhood silently withheld a dozen volumes from binding
-    /// on the first production sets.
+    // The job's files that really are PAR2 material — declared by role, or
+    // carriers by the discovery machinery's own evidence. Deliberately NOT
+    // "every file the discovery has touched": obfuscated par2 discovery
+    // prefix-probes ordinary data files too, and an entry whose probe found
+    // nothing (or has not run) is a data file, not a carrier. Treating mere
+    // presence as carrierhood silently withheld a dozen volumes from binding
+    // on the first production sets.
     fn identity_par2_carrier_files(&self, job_id: JobId) -> HashSet<u32> {
         let mut carriers: HashSet<u32> = self
             .par2_runtime(job_id)
@@ -1818,19 +2007,19 @@ impl Pipeline {
         carriers
     }
 
-    /// Reorders the job's download queue so every identity candidate's first
-    /// article arrives before any candidate's payload — the probe wave.
-    ///
-    /// Why dispatch order is a correctness lever here: an obfuscated post's
-    /// NZB order routinely scrambles the volume order, and a mid-set volume's
-    /// member payload cannot be *placed* until every earlier volume's headers
-    /// have stated their part sizes. Streamed in NZB order, such a set piles
-    /// its payload into holds until the scratch ceiling demotes it — the
-    /// ceiling is direct-store's own disk promise and must not move. Pulling
-    /// each candidate's first article forward binds every file within a few
-    /// round trips (and carries exactly the headers the layout needs), after
-    /// which [`Self::reprioritize_bound_identity_file`] streams the volumes
-    /// in order, precisely as a name-classified job always has.
+    // Reorders the job's download queue so every identity candidate's first
+    // article arrives before any candidate's payload — the probe wave.
+    //
+    // Why dispatch order is a correctness lever here: an obfuscated post's
+    // NZB order routinely scrambles the volume order, and a mid-set volume's
+    // member payload cannot be *placed* until every earlier volume's headers
+    // have stated their part sizes. Streamed in NZB order, such a set piles
+    // its payload into holds until the scratch ceiling demotes it — the
+    // ceiling is direct-store's own disk promise and must not move. Pulling
+    // each candidate's first article forward binds every file within a few
+    // round trips (and carries exactly the headers the layout needs), after
+    // which [`Self::reprioritize_bound_identity_file`] streams the volumes
+    // in order, precisely as a name-classified job always has.
     fn boost_identity_probe_segments(&mut self, job_id: JobId) {
         let mut first_segments: HashMap<u32, u32> = HashMap::new();
         {
@@ -1895,11 +2084,11 @@ impl Pipeline {
         }
     }
 
-    /// Re-ranks one bound file's queued articles to the priority a
-    /// name-classified volume of the same position always had: `10 + volume`.
-    /// This is what turns the probe wave's scattered bindings back into
-    /// in-order volume streaming, which keeps the holds footprint at the
-    /// out-of-order jitter of the connection pool rather than the whole set.
+    // Re-ranks one bound file's queued articles to the priority a
+    // name-classified volume of the same position always had: `10 + volume`.
+    // This is what turns the probe wave's scattered bindings back into
+    // in-order volume streaming, which keeps the holds footprint at the
+    // out-of-order jitter of the connection pool rather than the whole set.
     fn reprioritize_bound_identity_file(
         &mut self,
         job_id: JobId,
@@ -1915,9 +2104,9 @@ impl Pipeline {
         });
     }
 
-    /// Pushes one identity-admitted set into the job's set vector with the
-    /// ceilings and password every admission path applies, and returns its
-    /// stable index.
+    // Pushes one identity-admitted set into the job's set vector with the
+    // ceilings and password every admission path applies, and returns its
+    // stable index.
     pub(crate) fn admit_identity_set(
         &mut self,
         job_id: JobId,
@@ -1937,32 +2126,32 @@ impl Pipeline {
         set.router.set_password(password);
         set.router.note_par2_available(par2_available);
         set.router.note_par3_available(par3_available);
-        // A set bound after the job's harvest ran would otherwise never see
-        // it: the live seam offers the harvest when it runs, and it has run.
-        if let Some(harvest) = self.direct_store.header_harvest.get(&job_id) {
-            offer_direct_header_candidates(&mut set, password, harvest);
-        }
+        // Identity admission can happen after the article's password refresh,
+        // when no set existed to receive it. The first routed bytes already
+        // need the header key, so offer the candidates before publishing it.
+        let harvest = self.harvest_direct_header_passwords(job_id);
+        offer_direct_header_candidates(&mut set, password, &harvest);
         let sets = self.direct_store.sets.entry(job_id).or_default();
         sets.push(set);
         sets.len() - 1
     }
 
-    /// The header rung of the identity seam: for a job with no described
-    /// rosters, an unclassified file's own RAR5 head is the remaining
-    /// identity source — the volume states its position itself.
-    ///
-    /// Grounded fail-closed, in order of appearance below: only a file whose
-    /// name says nothing may be sniffed (a *named* file whose bytes are a RAR
-    /// is the deliverable itself, not a volume); a file with earlier
-    /// conventional bytes never binds, exactly as on the roster rung; RAR4 is
-    /// declined outright — its headers carry no position, and the interior
-    /// volumes of a stored RAR4 set are identical in every field that could
-    /// place one, so there is nothing to bind on and the conventional path
-    /// owns the shape; header-encrypted RAR5 withholds the position field
-    /// itself; and at most one header volume set may exist per job, because
-    /// the bytes carry positions but no set identity — a second claimant to a
-    /// claimed position is indistinguishable interleaving, and both sets are
-    /// refused rather than guessed apart.
+    // The header rung of the identity seam: for a job with no described
+    // rosters, an unclassified file's own RAR5 head is the remaining
+    // identity source — the volume states its position itself.
+    //
+    // Grounded fail-closed, in order of appearance below: only a file whose
+    // name says nothing may be sniffed (a *named* file whose bytes are a RAR
+    // is the deliverable itself, not a volume); a file with earlier
+    // conventional bytes never binds, exactly as on the roster rung; RAR4 is
+    // declined outright — its headers carry no position, and the interior
+    // volumes of a stored RAR4 set are identical in every field that could
+    // place one, so there is nothing to bind on and the conventional path
+    // owns the shape; header-encrypted RAR5 withholds the position field
+    // itself; and at most one header volume set may exist per job, because
+    // the bytes carry positions but no set identity — a second claimant to a
+    // claimed position is indistinguishable interleaving, and both sets are
+    // refused rather than guessed apart.
     async fn direct_header_route_target(&mut self, file_id: NzbFileId) -> Option<DirectFileTarget> {
         let job_id = file_id.job_id;
         let file_index = file_id.file_index;
@@ -1976,6 +2165,16 @@ impl Pipeline {
             .sets_for(job_id)
             .iter()
             .any(|set| set.plan().identity.is_none())
+        {
+            return None;
+        }
+        // A file a set already owns reaches this rung only once that set has
+        // left the direct path; its refetched front must not admit it again.
+        if self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.plan().volume_for_file(file_index).is_some())
         {
             return None;
         }
@@ -2008,19 +2207,37 @@ impl Pipeline {
         // so the name proves nothing either way — the byte sniff below is the
         // gate, exactly as it is for the hex names. A real split payload
         // sniffs as not-RAR and settles as an ordinary conventional file.
+        // Unclaimed named RAR continuations also need this rung when the
+        // first volume alone is obfuscated. Plan ownership was excluded above.
+        if matches!(role, weaver_model::files::FileRole::RarVolume { .. })
+            && !self.orphan_named_rar_volume(file_id)
+        {
+            return None;
+        }
         if !matches!(
             role,
             weaver_model::files::FileRole::Unknown
                 | weaver_model::files::FileRole::SplitFile { .. }
+                | weaver_model::files::FileRole::RarVolume { .. }
         ) {
             return None;
         }
-        let sniff = super::sniff::sniff_rar_prefix(self.file_prefix_16k.get(&file_id)?);
+        let prefix = self.file_prefix_16k.get(&file_id)?;
+        let sniff = super::sniff::sniff_rar_prefix(prefix);
         let super::sniff::PrefixSniff::Rar5 {
             volume_number,
             is_volume,
         } = sniff
         else {
+            if sniff == super::sniff::PrefixSniff::NotRar
+                && super::sniff::sniff_sevenz_prefix(
+                    prefix,
+                    self.file_declared_size.get(&file_id).copied(),
+                ) == super::sniff::SevenZipSniff::Whole
+                && !leaked
+            {
+                return self.admit_standalone_sevenz(file_id);
+            }
             if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
                 admission.no_match.insert(file_index);
             }
@@ -2048,6 +2265,12 @@ impl Pipeline {
                         })
                 });
             if let Some((set_index, position_claimed)) = existing {
+                // A volume whose first member does not continue the member its
+                // neighbour leaves open belongs to another archive: the same
+                // two sets the claim collision proves, caught one volume
+                // earlier.
+                let position_claimed = position_claimed
+                    || self.header_chain_breaks(job_id, set_index, file_index, volume_number);
                 if position_claimed || leaked {
                     // A second file for a claimed position is a second set
                     // the bytes cannot tell apart; a leaked file that proves
@@ -2085,12 +2308,21 @@ impl Pipeline {
                     volume_index: volume_number,
                 });
             }
+            // One header volume set per job for the job's life, not only while
+            // the first is open: a set retires from the registry once whole,
+            // and a volume arriving after that is a second archive's, which
+            // nothing in the bytes ties to positions of its own.
             if leaked
                 || self
                     .direct_store
                     .identity
                     .get(&job_id)
                     .is_some_and(|admission| admission.header_volume_sets_poisoned)
+                || self.direct_store.sets_for(job_id).iter().any(|set| {
+                    set.plan().identity.is_some_and(|identity| {
+                        identity.kind == super::plan::IdentityKind::HeaderVolumeSet
+                    })
+                })
             {
                 return None;
             }
@@ -2181,25 +2413,115 @@ impl Pipeline {
             "direct-store admitted a standalone archive from its own RAR5 head"
         );
         let set_index = self.admit_identity_set(job_id, plan, password.as_deref());
+        self.prove_direct_standalone_fingerprint(file_id);
         Some(DirectFileTarget::Route {
             set_index,
             volume_index: 0,
         })
     }
 
-    /// Routes a freshly bound file's parked reorder-stage segments into its
-    /// volume.
-    ///
-    /// Decode order within a file is not arrival order: on a wide connection
-    /// pool a later article routinely decodes before the file's offset-zero
-    /// article, and the conventional path parks it in the write reorder
-    /// buffer — in memory, unwritten, because nothing flushes until the
-    /// stream is contiguous from zero. Those bytes are therefore still
-    /// claimable when the offset-zero article establishes the binding, and
-    /// reclaiming them is what makes the identity seam immune to in-file
-    /// reordering. The flush seams mark a file unbindable the moment bytes
-    /// actually leave the reorder stage, so a file this runs for has nothing
-    /// conventional on disk by construction.
+    // The header rung's 7z answer: an unclassified file whose signature
+    // header closes the container exactly at the file's own length is a whole
+    // container, a set of one closed at admission like a standalone RAR5
+    // archive. The start header places the end header, so the tail probe can
+    // fetch the map without a name ever saying what the file is.
+    fn admit_standalone_sevenz(&mut self, file_id: NzbFileId) -> Option<DirectFileTarget> {
+        let job_id = file_id.job_id;
+        let file_index = file_id.file_index;
+        let destination_dir = self.deterministic_extraction_staging_dir(job_id);
+        let state = self.jobs.get(&job_id)?;
+        let working_dir = state.working_dir.clone();
+        let password = state.spec.password.clone();
+        let plan = DirectSetPlan {
+            set_name: format!("obfuscated-archive.f{file_index}"),
+            format: crate::pipeline::direct_store::plan::SetFormat::SevenZip,
+            volumes: BTreeMap::from([(0, file_index)]),
+            files: HashMap::from([(file_index, 0)]),
+            identity: Some(IdentityPlanFacts {
+                kind: super::plan::IdentityKind::SevenZipStandalone,
+                expected_volumes: Some(1),
+                discriminator: file_index,
+            }),
+            working_dir,
+            destination_dir,
+        };
+        crate::runtime::perf_probe::record(
+            "direct_store.identity.header_admitted",
+            std::time::Duration::from_nanos(1),
+        );
+        info!(
+            job_id = job_id.0,
+            set_name = %plan.set_name,
+            "direct-store admitted a whole 7z container from its own signature header"
+        );
+        let set_index = self.admit_identity_set(job_id, plan, password.as_deref());
+        self.prove_direct_standalone_fingerprint(file_id);
+        Some(DirectFileTarget::Route {
+            set_index,
+            volume_index: 0,
+        })
+    }
+
+    // Takes a standalone set's recovery-set fingerprint for one of its files,
+    // once, as soon as the file's opening bytes are all in memory.
+    //
+    // A standalone set is admitted by its file's own header, so nothing but
+    // those bytes can say which recovery-set description the file is, and they
+    // do not survive a restart. Without that binding, a repair after a restart
+    // counts the whole file as missing. The checkpoint carries the
+    // fingerprint instead, the way a roster set's carries the description it
+    // matched.
+    //
+    // Called at admission and when the prefix capture completes, whichever
+    // comes last. One MD5 over at most 16 KiB per standalone file, never per
+    // article.
+    pub(crate) fn prove_direct_standalone_fingerprint(&mut self, file_id: NzbFileId) {
+        let job_id = file_id.job_id;
+        let file_index = file_id.file_index;
+        let Some(set_index) = self.direct_store.sets_for(job_id).iter().position(|set| {
+            !set.is_demoted()
+                && !set.is_finalized()
+                && set.plan().files.contains_key(&file_index)
+                && set.plan().identity.is_some_and(|identity| {
+                    matches!(
+                        identity.kind,
+                        super::plan::IdentityKind::Standalone
+                            | super::plan::IdentityKind::SevenZipStandalone
+                    )
+                })
+                && !set.proven_fingerprints().contains_key(&file_index)
+        }) else {
+            return;
+        };
+        let Some(length) = self.file_declared_size.get(&file_id).copied() else {
+            return;
+        };
+        let window = (length as usize).min(crate::pipeline::PAR2_HASH_16K_BYTES);
+        let Some(prefix) = self.file_prefix_16k.get(&file_id) else {
+            return;
+        };
+        if window == 0 || prefix.len() < window {
+            return;
+        }
+        let hash_16k = par2_rs::checksum::md5(&prefix[..window]);
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            set.record_proven_fingerprint(file_index, hash_16k, length);
+        }
+    }
+
+    // Routes a freshly bound file's parked reorder-stage segments into its
+    // volume.
+    //
+    // Decode order within a file is not arrival order: on a wide connection
+    // pool a later article routinely decodes before the file's offset-zero
+    // article, and the conventional path parks it in the write reorder
+    // buffer — in memory, unwritten, because nothing flushes until the
+    // stream is contiguous from zero. Those bytes are therefore still
+    // claimable when the offset-zero article establishes the binding, and
+    // reclaiming them is what makes the identity seam immune to in-file
+    // reordering. The flush seams mark a file unbindable the moment bytes
+    // actually leave the reorder stage, so a file this runs for has nothing
+    // conventional on disk by construction.
     pub(crate) async fn reclaim_parked_segments_for_identity_bind(
         &mut self,
         file_id: NzbFileId,
@@ -2269,8 +2591,70 @@ impl Pipeline {
         }
     }
 
-    /// Books one header binding, retiring the set's bookkeeping once its plan
-    /// closed and every position bound.
+    // Books one header binding, retiring the set's bookkeeping once its plan
+    // closed and every position bound.
+    // Whether binding `file_index` at `volume_number` into a header volume
+    // set breaks the member chain a bound neighbour states.
+    //
+    // A RAR5 volume whose first member continues past its end holds that one
+    // member and nothing else, so the next volume of the same archive opens
+    // with the continuation of exactly that member. Anything else is a
+    // volume of another archive at the same position. A volume whose first
+    // member closes inside it says nothing about its last member from its
+    // first 16 KiB, and binds as before; so does a pair whose prefixes are
+    // not both held.
+    fn header_chain_breaks(
+        &self,
+        job_id: JobId,
+        set_index: usize,
+        file_index: u32,
+        volume_number: u32,
+    ) -> bool {
+        let Some(header_set) = self
+            .direct_store
+            .identity
+            .get(&job_id)
+            .and_then(|admission| {
+                admission
+                    .header_sets
+                    .iter()
+                    .find(|header_set| header_set.set_index == set_index)
+            })
+        else {
+            return false;
+        };
+        let first_member = |file_index: u32| {
+            let prefix = self
+                .file_prefix_16k
+                .get(&NzbFileId { job_id, file_index })?;
+            let walk = unrar_rs::RarArchive::parse_volume_facts_walk(
+                std::io::Cursor::new(prefix.clone()),
+                None,
+            )
+            .ok()?;
+            walk.facts
+                .members
+                .into_iter()
+                .next()
+                .map(|member| (member.name, member.split_before, member.split_after))
+        };
+        let breaks = |previous: &(String, bool, bool), next: &(String, bool, bool)| {
+            previous.2 && !(next.1 && next.0 == previous.0)
+        };
+        let Some(own) = first_member(file_index) else {
+            return false;
+        };
+        header_set.bound.iter().any(|(&other, &position)| {
+            if position.checked_add(1) == Some(volume_number) {
+                first_member(other).is_some_and(|previous| breaks(&previous, &own))
+            } else if volume_number.checked_add(1) == Some(position) {
+                first_member(other).is_some_and(|next| breaks(&own, &next))
+            } else {
+                false
+            }
+        })
+    }
+
     fn record_header_binding(
         &mut self,
         job_id: JobId,
@@ -2322,26 +2706,27 @@ impl Pipeline {
         }
     }
 
-    /// Registers the identity-admitted sets a restore brought back, so the
-    /// live rungs extend them with the files still to come instead of
-    /// admitting a second set out of those files.
-    ///
-    /// Called once the job exists and its sets are installed, before its
-    /// metadata is reloaded. A header volume set joins the header registry
-    /// with its checkpointed bindings; a described set waits in
-    /// [`IdentityAdmission::restored_rosters`] for its descriptions to re-arm
-    /// it; a standalone archive, closed at admission, needs neither. A set
-    /// whose every volume is already bound needs no registration at all,
-    /// exactly as a live set retires its bookkeeping once it is whole.
-    ///
-    /// The files the job already downloaded conventionally are recorded as
-    /// leaked: the run that wrote them knew it, and a set's viability is
-    /// judged against the files that could still bind — which those never can.
+    // Registers the identity-admitted sets a restore brought back, so the
+    // live rungs extend them with the files still to come instead of
+    // admitting a second set out of those files.
+    //
+    // Called once the job exists and its sets are installed, before its
+    // metadata is reloaded. A header volume set joins the header registry
+    // with its checkpointed bindings; a described set waits in
+    // [`IdentityAdmission::restored_rosters`] for its descriptions to re-arm
+    // it; a standalone archive, closed at admission, needs neither. A set
+    // whose every volume is already bound needs no registration at all,
+    // exactly as a live set retires its bookkeeping once it is whole.
+    //
+    // The files the job already downloaded conventionally are recorded as
+    // leaked: the run that wrote them knew it, and a set's viability is
+    // judged against the files that could still bind — which those never can.
     pub(crate) fn reinstate_restored_identity_sets(&mut self, job_id: JobId) {
         let mut header_sets: Vec<HeaderSet> = Vec::new();
         let mut restored_rosters: HashMap<String, RestoredRoster> = HashMap::new();
         let mut owned_files: HashSet<u32> = HashSet::new();
         let mut reprioritize: Vec<(u32, u32)> = Vec::new();
+        let mut fingerprints: Vec<(u32, ([u8; 16], u64))> = Vec::new();
         for (set_index, set) in self.direct_store.sets_for(job_id).iter().enumerate() {
             let plan = set.plan();
             owned_files.extend(plan.files.keys().copied());
@@ -2355,11 +2740,22 @@ impl Pipeline {
                 .expected_volumes
                 .is_some_and(|expected| plan.volumes.len() as u32 == expected);
             match identity.kind {
-                super::plan::IdentityKind::Standalone => continue,
+                // Its file's opening bytes routed before the restart; the
+                // fingerprint its checkpoint kept is what binds the file to
+                // its description again.
+                super::plan::IdentityKind::Standalone
+                | super::plan::IdentityKind::SevenZipStandalone => {
+                    fingerprints.extend(
+                        set.proven_fingerprints()
+                            .iter()
+                            .map(|(&file_index, &fingerprint)| (file_index, fingerprint)),
+                    );
+                    continue;
+                }
                 // A whole described set binds nothing further, but its files'
                 // captured prefixes died with the process: only its
                 // descriptions can say again which description each file is.
-                super::plan::IdentityKind::Roster => {
+                super::plan::IdentityKind::Roster | super::plan::IdentityKind::SevenZipRoster => {
                     restored_rosters.insert(
                         plan.set_name.clone(),
                         RestoredRoster {
@@ -2380,6 +2776,13 @@ impl Pipeline {
                     .iter()
                     .map(|(volume_index, file_index)| (*file_index, *volume_index)),
             );
+        }
+        for (file_index, fingerprint) in fingerprints {
+            let file_id = NzbFileId { job_id, file_index };
+            if !self.file_prefix_16k.contains_key(&file_id) {
+                self.file_proven_par2_fingerprint
+                    .insert(file_id, fingerprint);
+            }
         }
         if header_sets.is_empty() && restored_rosters.is_empty() {
             return;
@@ -2430,13 +2833,13 @@ impl Pipeline {
         self.boost_identity_probe_segments(job_id);
     }
 
-    /// Ends the wait of every restored described set whose roster the
-    /// metadata reload did not re-arm.
-    ///
-    /// Such a set can bind nothing further — the roster is what a new file is
-    /// matched against — so it could never become whole and never finalize. It
-    /// demotes, which costs what refusing its row would have: its volumes are
-    /// materialized and the job goes on conventionally.
+    // Ends the wait of every restored described set whose roster the
+    // metadata reload did not re-arm.
+    //
+    // Such a set can bind nothing further — the roster is what a new file is
+    // matched against — so it could never become whole and never finalize. It
+    // demotes, which costs what refusing its row would have: its volumes are
+    // materialized and the job goes on conventionally.
     pub(crate) async fn settle_restored_identity_rosters(&mut self, job_id: JobId) {
         let unarmed: Vec<(String, usize)> = self
             .direct_store
@@ -2470,8 +2873,8 @@ impl Pipeline {
         }
     }
 
-    /// Demotes a restored described set its roster cannot carry, with the
-    /// same latch a failed live roster set sets.
+    // Demotes a restored described set its roster cannot carry, with the
+    // same latch a failed live roster set sets.
     async fn condemn_restored_identity_set(&mut self, job_id: JobId, set_index: usize) {
         if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
             admission.header_volume_sets_poisoned = true;
@@ -2480,8 +2883,8 @@ impl Pipeline {
             .await;
     }
 
-    /// Retires one header set: drops its bookkeeping and demotes it through
-    /// the ordinary materialization.
+    // Retires one header set: drops its bookkeeping and demotes it through
+    // the ordinary materialization.
     async fn condemn_header_set(&mut self, job_id: JobId, set_index: usize) {
         if let Some(admission) = self.direct_store.identity.get_mut(&job_id) {
             admission
@@ -2496,10 +2899,10 @@ impl Pipeline {
             .await;
     }
 
-    /// Books one established binding and retires the roster once it is whole —
-    /// a fully mapped set needs no further identity work, and dropping the
-    /// bookkeeping is what returns the per-article cost of this whole seam to
-    /// a single map miss for the rest of the job.
+    // Books one established binding and retires the roster once it is whole —
+    // a fully mapped set needs no further identity work, and dropping the
+    // bookkeeping is what returns the per-article cost of this whole seam to
+    // a single map miss for the rest of the job.
     fn record_identity_binding(
         &mut self,
         job_id: JobId,
@@ -2547,9 +2950,9 @@ impl Pipeline {
         }
     }
 
-    /// Marks one conventionally written segment's file as leaked and lets the
-    /// viability arm draw the consequences. A no-op — one map miss — for every
-    /// job without armed rosters.
+    // Marks one conventionally written segment's file as leaked and lets the
+    // viability arm draw the consequences. A no-op — one map miss — for every
+    // job without armed rosters.
     pub(crate) async fn note_identity_conventional_segment(&mut self, file_id: NzbFileId) {
         let job_id = file_id.job_id;
         let newly_leaked = self
@@ -2567,8 +2970,110 @@ impl Pipeline {
         }
     }
 
-    /// Retires one roster: a pending one is simply dropped, an admitted one
-    /// demotes its set through the ordinary materialization.
+    // Retires every header volume set a repair overtakes.
+    //
+    // A file a repair rebuilds holds conventional bytes, so no set admitted
+    // from volume headers can bind it any more. A live header volume set
+    // that does not already hold that file could have needed it, and the
+    // conventional set naming the file would wait on the volumes the header
+    // set holds virtually: neither would ever finish. The header set demotes,
+    // its volumes materialize, and the conventional set completes. A
+    // standalone header archive is whole at admission and stays.
+    //
+    // Returns whether a header set left. A job without header sets is left
+    // as it was: rosters never coexist with header sets, and their own arms
+    // judge a repaired file.
+    pub(crate) async fn note_identity_repaired_files(
+        &mut self,
+        job_id: JobId,
+        files: &[u32],
+    ) -> bool {
+        if files.is_empty() {
+            return false;
+        }
+        let overtaken: Vec<usize> = {
+            let Some(admission) = self.direct_store.identity.get_mut(&job_id) else {
+                return false;
+            };
+            if admission.header_sets.is_empty() {
+                return false;
+            }
+            admission.leaked.extend(files.iter().copied());
+            let admission = &self.direct_store.identity[&job_id];
+            let held: HashSet<u32> = admission
+                .header_sets
+                .iter()
+                .flat_map(|header_set| header_set.bound.keys().copied())
+                .chain(
+                    admission
+                        .rosters
+                        .values()
+                        .flat_map(|roster| roster.bound.keys().copied()),
+                )
+                .collect();
+            admission
+                .header_sets
+                .iter()
+                .filter(|header_set| {
+                    header_set.volume_set
+                        && self
+                            .direct_store
+                            .set(job_id, header_set.set_index)
+                            .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
+                        && files.iter().any(|file| !held.contains(file))
+                })
+                .map(|header_set| header_set.set_index)
+                .collect()
+        };
+        let any = !overtaken.is_empty();
+        for set_index in overtaken {
+            warn!(
+                job_id = job_id.0,
+                set_index,
+                repaired = files.len(),
+                "a repair rebuilt a file a header-admitted set could have claimed"
+            );
+            self.condemn_header_set(job_id, set_index).await;
+        }
+        self.identity_viability_sweep(job_id).await;
+        any
+    }
+
+    // Demotes every identity-admitted set still routing when the job is
+    // about to leave for extraction or the final move.
+    //
+    // By then every article is in and the PAR2 question is settled, so a
+    // live set is one that will never finalize: its evidence bound volumes
+    // that do not make one archive. Its volumes exist only virtually, so no
+    // conventional set can see them, and completing the job would publish
+    // the set's member partials and envelopes in place of its members. The
+    // set demotes, its volumes materialize, and the job goes round again.
+    pub(crate) async fn demote_stranded_identity_sets(&mut self, job_id: JobId) -> bool {
+        let stranded: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                set.plan().identity.is_some() && !set.is_demoted() && !set.is_finalized()
+            })
+            .map(|(set_index, _)| set_index)
+            .collect();
+        if stranded.is_empty() {
+            return false;
+        }
+        for set_index in stranded {
+            warn!(
+                job_id = job_id.0,
+                set_index, "an identity-admitted set was still routing when the job settled"
+            );
+            self.condemn_header_set(job_id, set_index).await;
+        }
+        true
+    }
+
+    // Retires one roster: a pending one is simply dropped, an admitted one
+    // demotes its set through the ordinary materialization.
     async fn condemn_identity_roster(&mut self, job_id: JobId, set_name: &str) {
         let removed = self
             .direct_store
@@ -2605,15 +3110,15 @@ impl Pipeline {
         }
     }
 
-    /// The starvation arm: retires every roster whose unclaimed volumes
-    /// outnumber the files that could still claim one.
-    ///
-    /// An identity set with an unclaimable volume is a starved set — it never
-    /// finalizes and never demotes on its own (see
-    /// [`DemotionReason::IdentityRosterUnfillable`]) — so this must fire from
-    /// every event that shrinks the candidate pool: a leak, a settled
-    /// no-match, and arming itself. The pool is counted conservatively: a
-    /// file no evidence has touched stays a candidate for every roster.
+    // The starvation arm: retires every roster whose unclaimed volumes
+    // outnumber the files that could still claim one.
+    //
+    // An identity set with an unclaimable volume is a starved set — it never
+    // finalizes and never demotes on its own (see
+    // [`DemotionReason::IdentityRosterUnfillable`]) — so this must fire from
+    // every event that shrinks the candidate pool: a leak, a settled
+    // no-match, and arming itself. The pool is counted conservatively: a
+    // file no evidence has touched stays a candidate for every roster.
     async fn identity_viability_sweep(&mut self, job_id: JobId) {
         let (condemned, condemned_header_sets): (Vec<String>, Vec<usize>) = {
             let Some(admission) = self.direct_store.identity.get(&job_id) else {
@@ -2695,31 +3200,115 @@ impl Pipeline {
         }
     }
 
-    /// Ends the wait of a container set whose map will never be read.
-    ///
-    /// A 7z set resolves its layout from two ends — volume zero's front, which
-    /// states the part size and carries the start header, and the tail, which
-    /// carries the map. Whichever of those is missing, the symptom is one and
-    /// the same: a parse that is not settled, with no article left anywhere in
-    /// the set that could settle it. The probe planner asks for nothing it
-    /// cannot get, so the gate stays shut with no request outstanding to
-    /// reopen it. On a set large enough to reach them the holds ceilings would
-    /// eventually end it; on a small one nothing would, and the job would sit
-    /// at its last article forever.
-    ///
-    /// Judged for the whole set rather than per volume, because that is the
-    /// shape of the question: nothing outstanding anywhere means nothing can
-    /// change the parse, whether what is missing is volume zero, a volume in
-    /// the middle or the tail.
-    ///
-    /// The verdict is the demotion the set would have reached the slow way. Its
-    /// volumes materialize and the conventional path takes them, which is also
-    /// where the missing articles become a repair the recovery set can answer.
-    ///
-    /// Judged against the same evidence the probe planner admits on, and one
-    /// conservative addition: a released lane result is attributable only to
-    /// the job, so while any is outstanding nothing is called unreachable — the
-    /// article it answers may be the one that would have settled the parse.
+    // Notes a terminal verdict on an article against the container set whose
+    // last volume it closes.
+    //
+    // Called on the edge into the terminal state, so only a verdict reaches
+    // it — an article that is merely slow, or still has a server or a retry
+    // left, never does. The set is not demoted here: the booking is not a
+    // place a demotion can run, so the job is noted for the next turn.
+    pub(crate) fn note_direct_article_terminal(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        let file_index = segment_id.file_id.file_index;
+        let Some(closing) = self.jobs.get(&job_id).and_then(|state| {
+            state
+                .spec
+                .files
+                .get(file_index as usize)?
+                .segments
+                .iter()
+                .map(|segment| segment.ordinal)
+                .max()
+        }) else {
+            return;
+        };
+        if segment_id.segment_number != closing {
+            return;
+        }
+        let mut lost = false;
+        for index in 0..self.direct_store.sets_for(job_id).len() {
+            let Some(set) = self.direct_store.set_mut(job_id, index) else {
+                continue;
+            };
+            if set.plan().format != super::plan::SetFormat::SevenZip
+                || set.is_demoted()
+                || set.is_finalized()
+                || set.plan().volumes.values().next_back() != Some(&file_index)
+            {
+                continue;
+            }
+            set.router.note_end_article_lost();
+            lost |= set.router.end_header_lost();
+        }
+        if lost {
+            self.direct_store.end_header_verdicts.insert(job_id);
+        }
+    }
+
+    // Whether a lost end header is waiting to be acted on.
+    pub(crate) fn has_direct_end_header_verdicts(&self) -> bool {
+        !self.direct_store.end_header_verdicts.is_empty()
+    }
+
+    // Hands over every container set whose end header was lost with its
+    // article.
+    //
+    // The map cannot be read, so the set will demote whatever arrives next;
+    // doing it now is what keeps the rest of the container from being held,
+    // and paged out to scratch, for nothing.
+    pub(crate) async fn settle_direct_end_header_verdicts(&mut self) {
+        let jobs = std::mem::take(&mut self.direct_store.end_header_verdicts);
+        for job_id in jobs {
+            let lost: Vec<usize> = self
+                .direct_store
+                .sets_for(job_id)
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| {
+                    !set.is_demoted() && !set.is_finalized() && set.router.end_header_lost()
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for set_index in lost {
+                warn!(
+                    job_id = job_id.0,
+                    set_index, "a container's end header was lost with the article that closes it"
+                );
+                self.demote_direct_set(
+                    job_id,
+                    set_index,
+                    DemotionReason::SevenZip(SevenZipRefusal::EndHeaderLost),
+                )
+                .await;
+            }
+        }
+    }
+
+    // Ends the wait of a container set whose map will never be read.
+    //
+    // A 7z set resolves its layout from two ends — volume zero's front, which
+    // states the part size and carries the start header, and the tail, which
+    // carries the map. Whichever of those is missing, the symptom is one and
+    // the same: a parse that is not settled, with no article left anywhere in
+    // the set that could settle it. The probe planner asks for nothing it
+    // cannot get, so the gate stays shut with no request outstanding to
+    // reopen it. On a set large enough to reach them the holds ceilings would
+    // eventually end it; on a small one nothing would, and the job would sit
+    // at its last article forever.
+    //
+    // Judged for the whole set rather than per volume, because that is the
+    // shape of the question: nothing outstanding anywhere means nothing can
+    // change the parse, whether what is missing is volume zero, a volume in
+    // the middle or the tail.
+    //
+    // The verdict is the demotion the set would have reached the slow way. Its
+    // volumes materialize and the conventional path takes them, which is also
+    // where the missing articles become a repair the recovery set can answer.
+    //
+    // Judged against the same evidence the probe planner admits on, and one
+    // conservative addition: a released lane result is attributable only to
+    // the job, so while any is outstanding nothing is called unreachable — the
+    // article it answers may be the one that would have settled the parse.
     pub(crate) async fn demote_direct_sets_with_an_unreadable_map(&mut self, job_id: JobId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -2794,38 +3383,38 @@ impl Pipeline {
         }
     }
 
-    /// Re-reads the job's password into every set still willing to take one.
-    ///
-    /// The reason this exists at all: **weaver does support setting a password
-    /// after add** — the GraphQL `setJobPassword` mutation and the NZBGet
-    /// facade's `editqueue` / `GroupSetParameter *Unpack:Password` both mutate
-    /// the live `JobSpec` in place — and [`Self::ensure_direct_sets`] is
-    /// memoized per job, so a set built before the password arrived would never
-    /// see it. Re-reading it here costs one map lookup per article and stops
-    /// the moment a set **admits** a password or leaves direct mode, which for
-    /// every set with no encrypted member is the first parse.
-    ///
-    /// # The window closes at the first header parse
-    ///
-    /// Admission runs from the first successful header parse, so "after the job
-    /// was added" means *before the first article of the first volume*, not any
-    /// time during the download. A password arriving later finds the set already
-    /// demoted under `EncryptedMemberRefused(NoPassword)` and does not revive
-    /// it — see [`super::router::DirectSetRouter::wants_password`] for why
-    /// waiting instead would be worse than demoting.
-    ///
-    /// Within that window a **changed** password does land, which is the case
-    /// the narrower "still has no password" test used to drop on the floor: a
-    /// job added with the wrong password and corrected before its first parse
-    /// now admits with the correction rather than deriving keys from the stale
-    /// one and failing the keyed member gate a whole download later.
-    ///
-    /// It deliberately does **not** re-admit a set that already demoted for a
-    /// wrong or missing password, or one that has already admitted. Re-admission
-    /// would mean re-decrypting every byte already written under the old
-    /// verdict, which is a demotion with extra steps; the conventional path
-    /// takes the set and asks the job's whole candidate list, which is a
-    /// superset of this one.
+    // Re-reads the job's password into every set still willing to take one.
+    //
+    // The reason this exists at all: **weaver does support setting a password
+    // after add** — the GraphQL `setJobPassword` mutation and the NZBGet
+    // facade's `editqueue` / `GroupSetParameter *Unpack:Password` both mutate
+    // the live `JobSpec` in place — and [`Self::ensure_direct_sets`] is
+    // memoized per job, so a set built before the password arrived would never
+    // see it. Re-reading it here costs one map lookup per article and stops
+    // the moment a set **admits** a password or leaves direct mode, which for
+    // every set with no encrypted member is the first parse.
+    //
+    // # The window closes at the first header parse
+    //
+    // Admission runs from the first successful header parse, so "after the job
+    // was added" means *before the first article of the first volume*, not any
+    // time during the download. A password arriving later finds the set already
+    // demoted under `EncryptedMemberRefused(NoPassword)` and does not revive
+    // it — see [`super::router::DirectSetRouter::wants_password`] for why
+    // waiting instead would be worse than demoting.
+    //
+    // Within that window a **changed** password does land, which is the case
+    // the narrower "still has no password" test used to drop on the floor: a
+    // job added with the wrong password and corrected before its first parse
+    // now admits with the correction rather than deriving keys from the stale
+    // one and failing the keyed member gate a whole download later.
+    //
+    // It deliberately does **not** re-admit a set that already demoted for a
+    // wrong or missing password, or one that has already admitted. Re-admission
+    // would mean re-decrypting every byte already written under the old
+    // verdict, which is a demotion with extra steps; the conventional path
+    // takes the set and asks the job's whole candidate list, which is a
+    // superset of this one.
     fn refresh_direct_passwords(&mut self, job_id: JobId) {
         self.offer_direct_header_passwords(job_id);
         if !self
@@ -2861,39 +3450,39 @@ impl Pipeline {
         }
     }
 
-    /// Runs the job's archive-password harvest once and hands it to every
-    /// set's `-hp` gate. Sets admitted after that take the kept harvest at
-    /// admission.
-    ///
-    /// # Why the whole harvest, and not `spec.password`
-    ///
-    /// `spec.password` is the harvest's *first* candidate, which for a job
-    /// imported from an NZB is the `nzb.meta.password` or the `{{password}}`
-    /// filename convention — so it is usually the right one already. It stops
-    /// being enough the moment an operator supplies an explicit password:
-    /// that one takes priority in the spec, and a set whose archive key is the
-    /// NZB-meta password would then refuse for a password the job was holding
-    /// all along. The list is bounded by construction — `Explicit`, `NzbMeta`,
-    /// `FilenameConvention`, at most one each — so this bounds the `-hp` gate's
-    /// KDF work at three derivations however deep the archive asks for.
-    ///
-    /// # Why here rather than in `ensure_direct_sets`
-    ///
-    /// The harvest reads the job's persisted NZB, so it must not run per
-    /// article; and it must reach **restored** sets, which never go through
-    /// `ensure_direct_sets` at all — `install_restored` marks the job examined
-    /// precisely so the lazy seam does not rediscover them. This runs from the
-    /// one seam both populations pass through, and memoizes in the per-job map
-    /// `clear_job` clears.
-    ///
-    /// # Cost
-    ///
-    /// One persisted-NZB read per job that admitted a direct set, ever — the
-    /// `-hp` gate has to hold its candidates *before* the first header parse,
-    /// because that parse is where admission happens, and nothing cheaper than
-    /// the parse itself can say whether a set is `-hp`. That is strictly less
-    /// than the conventional path already pays: `try_update_archive_topology`
-    /// harvests once **per volume parse**.
+    // Runs the job's archive-password harvest once and hands it to every
+    // set's `-hp` gate. Sets admitted after that take the kept harvest at
+    // admission.
+    //
+    // # Why the whole harvest, and not `spec.password`
+    //
+    // `spec.password` is the harvest's *first* candidate, which for a job
+    // imported from an NZB is the `nzb.meta.password` or the `{{password}}`
+    // filename convention — so it is usually the right one already. It stops
+    // being enough the moment an operator supplies an explicit password:
+    // that one takes priority in the spec, and a set whose archive key is the
+    // NZB-meta password would then refuse for a password the job was holding
+    // all along. The list is bounded by construction — `Explicit`, `NzbMeta`,
+    // `FilenameConvention`, at most one each — so this bounds the `-hp` gate's
+    // KDF work at three derivations however deep the archive asks for.
+    //
+    // # Why here rather than in `ensure_direct_sets`
+    //
+    // The harvest reads the job's persisted NZB, so it must not run per
+    // article; and it must reach **restored** sets, which never go through
+    // `ensure_direct_sets` at all — `install_restored` marks the job examined
+    // precisely so the lazy seam does not rediscover them. This runs from the
+    // one seam both populations pass through, and memoizes in the per-job map
+    // `clear_job` clears.
+    //
+    // # Cost
+    //
+    // One persisted-NZB read per job that admitted a direct set, ever — the
+    // `-hp` gate has to hold its candidates *before* the first header parse,
+    // because that parse is where admission happens, and nothing cheaper than
+    // the parse itself can say whether a set is `-hp`. That is strictly less
+    // than the conventional path already pays: `try_update_archive_topology`
+    // harvests once **per volume parse**.
     fn offer_direct_header_passwords(&mut self, job_id: JobId) {
         if self.direct_store.header_harvest.contains_key(&job_id) {
             return;
@@ -2927,16 +3516,16 @@ impl Pipeline {
         }
     }
 
-    /// The job's archive-password harvest for the `-hp` gate: the kept one when
-    /// a harvest already ran, otherwise a fresh harvest, kept when it ran (see
-    /// [`Self::offer_direct_header_passwords`] for why a failed read is not
-    /// remembered).
-    ///
-    /// Shared by the live seam and the restart seam. A restored set rebuilds
-    /// its layout by re-running the header parse, and that parse is where
-    /// `-hp` admission happens — so the restart seam has to hold the same
-    /// candidates the live seam would have offered, *before* the rebuild, or
-    /// the parse refuses under `NoPassword` and the set redownloads in full.
+    // The job's archive-password harvest for the `-hp` gate: the kept one when
+    // a harvest already ran, otherwise a fresh harvest, kept when it ran (see
+    // [`Self::offer_direct_header_passwords`] for why a failed read is not
+    // remembered).
+    //
+    // Shared by the live seam and the restart seam. A restored set rebuilds
+    // its layout by re-running the header parse, and that parse is where
+    // `-hp` admission happens — so the restart seam has to hold the same
+    // candidates the live seam would have offered, *before* the rebuild, or
+    // the parse refuses under `NoPassword` and the set redownloads in full.
     pub(crate) fn harvest_direct_header_passwords(
         &mut self,
         job_id: JobId,
@@ -2953,11 +3542,11 @@ impl Pipeline {
         candidates
     }
 
-    /// What to do with one NZB file's decoded bytes.
-    ///
-    /// `None` when the file is not a direct set's source volume, and `None`
-    /// once its set has demoted — which is exactly what hands the volume back
-    /// to the conventional path.
+    // What to do with one NZB file's decoded bytes.
+    //
+    // `None` when the file is not a direct set's source volume, and `None`
+    // once its set has demoted — which is exactly what hands the volume back
+    // to the conventional path.
     pub(crate) fn direct_route_target(&mut self, file_id: NzbFileId) -> Option<DirectFileTarget> {
         self.ensure_direct_sets(file_id.job_id);
         self.refresh_direct_passwords(file_id.job_id);
@@ -2982,18 +3571,18 @@ impl Pipeline {
     }
 }
 
-/// Offers one set's `-hp` gate the job spec's password and the job's harvest.
-///
-/// The one implementation behind both the live seam and the restart seam, so a
-/// set rebuilt at restore holds exactly the candidates a live set would.
-///
-/// The spec's password is normalized the way the harvest normalizes, so a
-/// placeholder like `"yes"` — which `archive_password_candidates_for_job` drops
-/// — is not smuggled past it here and paid for in PBKDF2. It is labelled
-/// `job_spec` rather than `explicit` because that is all that is known: for a
-/// job imported from an NZB, the spec's password is seeded from the harvest's
-/// *first* candidate. Offering is idempotent, and a no-op once the ring has
-/// verified or refused.
+// Offers one set's `-hp` gate the job spec's password and the job's harvest.
+//
+// The one implementation behind both the live seam and the restart seam, so a
+// set rebuilt at restore holds exactly the candidates a live set would.
+//
+// The spec's password is normalized the way the harvest normalizes, so a
+// placeholder like `"yes"` — which `archive_password_candidates_for_job` drops
+// — is not smuggled past it here and paid for in PBKDF2. It is labelled
+// `job_spec` rather than `explicit` because that is all that is known: for a
+// job imported from an NZB, the spec's password is seeded from the harvest's
+// *first* candidate. Offering is idempotent, and a no-op once the ring has
+// verified or refused.
 pub(crate) fn offer_direct_header_candidates(
     set: &mut DirectSet,
     spec_password: Option<&str>,
@@ -3013,26 +3602,26 @@ mod demotion;
 mod par2;
 mod placement;
 
-/// One contiguous copy of a decoded span. Routing splits the span at
-/// destination boundaries, which a batched chunk list cannot express.
-/// Reads every restart-seeded run and returns its CRC32, in the order asked.
-///
-/// **One sequential pass per file**: the plan arrives grouped by member and in
-/// ascending offset, and the reader keeps the file open across a member's runs
-/// and seeks forward only. A short read is a failure, not a zero-filled answer —
-/// a partial that is shorter than the coverage claimed for it is exactly the
-/// state restart's length probe refuses, and reaching it here means the file
-/// changed under a validated checkpoint.
-///
-/// **Streamed, not slurped.** A run is one whole RAR *part*, which is a whole
-/// volume's worth of a member — hundreds of megabytes on an ordinary set, and
-/// this runs on the blocking pool at restore for every restored set at once. The
-/// CRC32 composes over a rolling buffer, so the resident cost is one
-/// [`REARM_CHUNK_BYTES`] buffer for the whole plan rather than the largest part
-/// in it.
-///
-/// `destination_dir` is the job's staging root, because every run names a member
-/// `.direct.partial` and those are payload.
+// One contiguous copy of a decoded span. Routing splits the span at
+// destination boundaries, which a batched chunk list cannot express.
+// Reads every restart-seeded run and returns its CRC32, in the order asked.
+//
+// **One sequential pass per file**: the plan arrives grouped by member and in
+// ascending offset, and the reader keeps the file open across a member's runs
+// and seeks forward only. A short read is a failure, not a zero-filled answer —
+// a partial that is shorter than the coverage claimed for it is exactly the
+// state restart's length probe refuses, and reaching it here means the file
+// changed under a validated checkpoint.
+//
+// **Streamed, not slurped.** A run is one whole RAR *part*, which is a whole
+// volume's worth of a member — hundreds of megabytes on an ordinary set, and
+// this runs on the blocking pool at restore for every restored set at once. The
+// CRC32 composes over a rolling buffer, so the resident cost is one
+// [`REARM_CHUNK_BYTES`] buffer for the whole plan rather than the largest part
+// in it.
+//
+// `destination_dir` is the job's staging root, because every run names a member
+// `.direct.partial` and those are payload.
 fn read_restart_seeded_runs(
     destination_dir: &std::path::Path,
     runs: &[super::router::RestartReadRun],

@@ -12,6 +12,13 @@ use crate::migration_assets::{
     EngineScope, MigrationInstallKind,
 };
 use crate::migration_hook_ids;
+use crate::persistence::sql_runtime::SqlConn;
+
+pub(crate) mod egress_quotas_v53;
+mod schedule_tracks_v55;
+pub(crate) mod script_concurrency_v58;
+pub(crate) mod script_instances_v55;
+pub(crate) mod unwanted_extensions_v56;
 
 const EMBEDDED_MIGRATION_CATALOG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/migration_catalog.json.zst"));
@@ -22,7 +29,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 50;
+const CURRENT_SCHEMA_VERSION: i64 = 58;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -313,19 +320,19 @@ async fn load_applied_migrations(pool: &SqlitePool) -> Result<Vec<MigrationLedge
         .collect()
 }
 
-/// Highest migration version recorded in the ledger, or `None` when no ledger
-/// exists yet.
-///
-/// Read *before* a migration run, this answers "which release last wrote to
-/// this database": no ledger means nothing has ever migrated it (a database
-/// this process is about to create), while a recorded maximum names the newest
-/// migration the previous binary shipped. That is the only reliable way to tell
-/// a fresh install from an upgrade of a specific older line, because the data a
-/// database holds says nothing about which version wrote it.
-///
-/// Deliberately not filtered by `success`: a recorded-but-failed row still
-/// proves the binary that wrote it reached that version, and counting it can
-/// only make a database look newer than it is, never older.
+// Highest migration version recorded in the ledger, or `None` when no ledger
+// exists yet.
+//
+// Read *before* a migration run, this answers "which release last wrote to
+// this database": no ledger means nothing has ever migrated it (a database
+// this process is about to create), while a recorded maximum names the newest
+// migration the previous binary shipped. That is the only reliable way to tell
+// a fresh install from an upgrade of a specific older line, because the data a
+// database holds says nothing about which version wrote it.
+//
+// Deliberately not filtered by `success`: a recorded-but-failed row still
+// proves the binary that wrote it reached that version, and counting it can
+// only make a database look newer than it is, never older.
 pub async fn max_recorded_migration_version(pool: &SqlitePool) -> Result<Option<i64>, StateError> {
     if !migration_ledger_exists(pool).await? {
         return Ok(None);
@@ -358,10 +365,10 @@ fn list_pending_migrations_from_applied(
     )
 }
 
-/// Checks the ledger against the embedded catalog and returns the versions
-/// whose recorded checksum is a legacy line-ending variant of the embedded one.
-/// Those rows are valid but stale: callers that may write should heal them with
-/// [`heal_line_ending_checksums`] so the next startup takes the plain path.
+// Checks the ledger against the embedded catalog and returns the versions
+// whose recorded checksum is a legacy line-ending variant of the embedded one.
+// Those rows are valid but stale: callers that may write should heal them with
+// [`heal_line_ending_checksums`] so the next startup takes the plain path.
 fn validate_known_migrations(
     applied: &[MigrationLedgerRow],
     catalog: &CompiledMigrationCatalog,
@@ -412,12 +419,12 @@ fn validate_known_migrations(
     Ok(stale_line_endings)
 }
 
-/// Rewrites the ledger checksum of `versions` to the embedded canonical value.
-///
-/// These rows were written by a build whose checkout carried the other line
-/// ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
-/// they hash the same SQL in a different form. Healing them keeps a database
-/// from bouncing between the released binary and a from-source build.
+// Rewrites the ledger checksum of `versions` to the embedded canonical value.
+//
+// These rows were written by a build whose checkout carried the other line
+// ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
+// they hash the same SQL in a different form. Healing them keeps a database
+// from bouncing between the released binary and a from-source build.
 async fn heal_line_ending_checksums(
     pool: &SqlitePool,
     catalog: &CompiledMigrationCatalog,
@@ -786,6 +793,19 @@ async fn run_rust_hook(
         "upgrade_to_schema_25" => upgrade_to_schema_25(tx).await,
         "restart_active_jobs_drop_active_segments_v28" => {
             restart_active_jobs_drop_active_segments_v28(tx).await
+        }
+        egress_quotas_v53::HOOK_ID => {
+            egress_quotas_v53::move_isp_cap_to_system_egress(&mut SqlConn::Sqlite(tx)).await
+        }
+        script_instances_v55::HOOK_ID => {
+            script_instances_v55::move_script_wiring_to_instances(&mut SqlConn::Sqlite(tx)).await
+        }
+        unwanted_extensions_v56::HOOK_ID => {
+            unwanted_extensions_v56::fill_default_unwanted_extensions(&mut SqlConn::Sqlite(tx))
+                .await
+        }
+        script_concurrency_v58::HOOK_ID => {
+            script_concurrency_v58::raise_script_concurrency(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
@@ -1261,6 +1281,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn previous_release_schema_upgrades_to_current_and_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("previous-release.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(50), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            max_recorded_migration_version(&pool).await.unwrap(),
+            Some(50)
+        );
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        pool.close().await;
+        let db = crate::Database::open(&db_path).unwrap();
+        db.validate_backup_catalog().unwrap();
+        assert_eq!(db.list_egress_interfaces().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn fresh_install_runs_remaining_migrations_to_current_schema() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1339,8 +1389,56 @@ mod tests {
         assert_eq!(usage_cascade, 1);
     }
 
-    /// The proven BODY pipelining depth is optional: a server that has never
-    /// been measured must read back as NULL, not as a depth nobody proved.
+    // Status exists from the first script-output schema and never needs to
+    // parse a result blob during upgrade.
+    #[tokio::test]
+    async fn sqlite_script_output_status_is_present_from_creation() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(52), true)
+            .await
+            .unwrap();
+
+        for (seq, status) in [(1_i64, "succeeded"), (2, "timed_out")] {
+            sqlx::query(
+                "INSERT INTO script_outputs
+                    (id, job_id, event, script, seq, raw_bytes, truncated, output, stored_bytes,
+                     result_json, created_at, status)
+                 VALUES (?, NULL, 'scan', 'scan.sh', ?, 0, 0, x'', 0, 'invalid JSON', 1, ?)",
+            )
+            .bind(format!("run-{seq}"))
+            .bind(seq)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap();
+
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM script_outputs ORDER BY seq")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            [
+                ("run-1".to_string(), "succeeded".to_string()),
+                ("run-2".to_string(), "timed_out".to_string()),
+            ]
+        );
+    }
+
+    // The proven BODY pipelining depth is optional: a server that has never
+    // been measured must read back as NULL, not as a depth nobody proved.
     #[tokio::test]
     async fn sqlite_v45_upgrade_adds_a_nullable_server_pipelining_depth() {
         let pool = SqlitePoolOptions::new()
@@ -2110,10 +2208,10 @@ mod tests {
         ));
     }
 
-    /// A database written by a build whose checkout carried CRLF SQL (the
-    /// released Windows binary) must open under a build from an LF checkout,
-    /// and must come out of that startup holding the canonical checksum so the
-    /// next open takes the plain equality path.
+    // A database written by a build whose checkout carried CRLF SQL (the
+    // released Windows binary) must open under a build from an LF checkout,
+    // and must come out of that startup holding the canonical checksum so the
+    // next open takes the plain equality path.
     #[tokio::test]
     async fn legacy_line_ending_ledger_checksum_opens_and_is_healed() {
         let pool = SqlitePoolOptions::new()

@@ -12,3 +12,5 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 quick-xml = { workspace = true, default-features = false }
 tracing = { workspace = true }
+blake3 = { workspace = true }
+serde_json = { workspace = true }

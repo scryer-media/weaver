@@ -110,6 +110,53 @@ active = true
 }
 
 #[test]
+fn migrate_from_toml_after_the_started_version_is_recorded() {
+    // Startup records the running version before first-run configuration is
+    // imported; that marker must not make a new database look configured.
+    let dir = std::env::temp_dir().join(format!(
+        "weaver_migration_started_version_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let toml_path = dir.join("weaver.toml");
+    std::fs::write(
+        &toml_path,
+        r#"
+data_dir = "/tmp/weaver-data"
+
+[[servers]]
+id = 1
+host = "news.example.com"
+port = 563
+tls = true
+connections = 4
+active = true
+"#,
+    )
+    .unwrap();
+
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    db.set_setting(
+        crate::security::SETTING_INSTALL_GENERATION,
+        crate::security::AUTHENTICATED_INSTALL_GENERATION,
+    )
+    .unwrap();
+    crate::operations::backup::record_started_version(&db).unwrap();
+    assert!(db.is_empty().unwrap());
+    assert!(db.migrate_from_toml(&toml_path).unwrap());
+    let config = db.load_config().unwrap();
+    assert_eq!(config.servers.len(), 1);
+    assert_eq!(config.servers[0].host, "news.example.com");
+    assert!(!db.is_empty().unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn migrate_no_toml_file() {
     let db = Database::open_in_memory().unwrap();
     assert!(
@@ -127,7 +174,7 @@ fn migrate_no_journal_file() {
     );
 }
 
-/// Write a journal entry in the binary format: [4-byte LE len][payload][4-byte LE CRC].
+// Write a journal entry in the binary format: [4-byte LE len][payload][4-byte LE CRC].
 fn write_journal_entry(buf: &mut Vec<u8>, entry: &JournalEntry) {
     let payload = rmp_serde::to_vec(entry).unwrap();
     let len = payload.len() as u32;

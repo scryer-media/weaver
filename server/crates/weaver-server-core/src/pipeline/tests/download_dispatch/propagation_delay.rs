@@ -1,4 +1,4 @@
-//! propagation delay
+// propagation delay
 
 use super::*;
 
@@ -34,9 +34,6 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline
-        .reserve_bandwidth_for_dispatch(segment_id, 1024)
-        .unwrap();
     pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -85,10 +82,10 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
     assert_eq!(restored.retry_count, 0);
 }
 
-/// Health-mutex contention is not a tiering verdict. Before it had its own
-/// variant it arrived as `NoEligibleServer`, which fails every leased article
-/// and resets the owned lane pool — churning a healthy cached TLS lane over a
-/// microsecond-long lock collision.
+// Health-mutex contention is not a tiering verdict. Before it had its own
+// variant it arrived as `NoEligibleServer`, which fails every leased article
+// and resets the owned lane pool — churning a healthy cached TLS lane over a
+// microsecond-long lock collision.
 #[tokio::test]
 async fn owned_download_lane_selection_contention_requeues_without_failing_the_articles() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -121,9 +118,6 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline
-        .reserve_bandwidth_for_dispatch(segment_id, 1024)
-        .unwrap();
     pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -776,46 +770,66 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
 }
 
 #[tokio::test]
-async fn dispatch_downloads_blocks_when_isp_bandwidth_cap_is_hit() {
+async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
-    let job_id = JobId(20005);
-    let spec = standalone_job_spec("ISP Cap Gate", &[("queued.bin".to_string(), 512u32)]);
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let block = crate::jobs::handle::EgressQuotaBlock {
+        egress_id: 4,
+        egress_name: "Metered uplink".to_string(),
+        used_bytes: 900,
+        limit_bytes: 1_000,
+        remaining_bytes: 0,
+        window_starts_at_epoch_ms: Some(1_000.0),
+        window_ends_at_epoch_ms: Some(2_000.0),
+        timezone_name: "UTC".to_string(),
+    };
 
-    let now = chrono::Local::now();
-    let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
+    pipeline.shared_state.set_server_quota_blocked(true);
     pipeline
-        .db
-        .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 1024)
-        .unwrap();
-    pipeline
-        .apply_bandwidth_cap_policy(Some(crate::bandwidth::IspBandwidthCapConfig {
-            enabled: true,
-            period: crate::bandwidth::IspBandwidthCapPeriod::Daily,
-            limit_bytes: 512,
-            reset_time_minutes_local: reset_minutes,
-            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 1,
-        }))
-        .unwrap();
+        .shared_state
+        .set_egress_quota_block(Some(block.clone()));
+    let state = pipeline.shared_state.download_block();
+    assert_eq!(
+        state.kind,
+        crate::jobs::handle::DownloadBlockKind::EgressQuota
+    );
+    assert_eq!(state.egress_id, Some(4));
+    assert_eq!(state.egress_name.as_deref(), Some("Metered uplink"));
+    assert_eq!(state.used_bytes, 900);
+    assert_eq!(state.limit_bytes, 1_000);
+    assert_eq!(state.window_ends_at_epoch_ms, Some(2_000.0));
 
-    pipeline.dispatch_downloads();
-
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 1);
+    // A refresh from the pause state keeps the egress block laid over it.
+    pipeline.publish_download_block();
     assert_eq!(
         pipeline.shared_state.download_block().kind,
-        crate::jobs::handle::DownloadBlockKind::IspCap
+        crate::jobs::handle::DownloadBlockKind::EgressQuota
+    );
+
+    // A manual pause outranks it, and the egress details stay readable.
+    pipeline.global_paused = true;
+    pipeline.publish_download_block();
+    let state = pipeline.shared_state.download_block();
+    assert_eq!(
+        state.kind,
+        crate::jobs::handle::DownloadBlockKind::ManualPause
+    );
+    assert_eq!(state.egress_id, Some(4));
+    pipeline.global_paused = false;
+    pipeline.publish_download_block();
+
+    // Once the egress clears, the server quota underneath shows again.
+    pipeline.shared_state.set_egress_quota_block(None);
+    let state = pipeline.shared_state.download_block();
+    assert_eq!(
+        state.kind,
+        crate::jobs::handle::DownloadBlockKind::ServerQuota
+    );
+    assert_eq!(state.egress_id, None);
+    pipeline.shared_state.set_server_quota_blocked(false);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::None
     );
 }
 
@@ -865,7 +879,7 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
 }
 
 #[tokio::test]
-async fn bandwidth_cap_state_refresh_preserves_scheduled_speed_limit() {
+async fn download_block_refresh_preserves_scheduled_speed_limit() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -880,7 +894,7 @@ async fn bandwidth_cap_state_refresh_preserves_scheduled_speed_limit() {
 
     pipeline.scheduled_rate_limit = Some(131_072);
     pipeline.rate_limiter.set_rate(131_072);
-    pipeline.refresh_bandwidth_cap_window().unwrap();
+    pipeline.publish_download_block();
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
         131_072
@@ -899,8 +913,17 @@ async fn bandwidth_cap_state_refresh_preserves_scheduled_speed_limit() {
     );
 }
 
+fn global_speed(bytes_per_sec: u64) -> crate::bandwidth::ScheduleAction {
+    crate::bandwidth::ScheduleAction::SpeedLimit {
+        limits: vec![crate::bandwidth::SpeedLimitChange {
+            target: crate::bandwidth::SpeedTarget::Global,
+            bytes_per_sec,
+        }],
+    }
+}
+
 #[tokio::test]
-async fn clearing_scheduled_speed_limit_restores_latest_configured_limit() {
+async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
 
@@ -908,6 +931,7 @@ async fn clearing_scheduled_speed_limit_restores_latest_configured_limit() {
     pipeline
         .handle_command(SchedulerCommand::SetSpeedLimit {
             bytes_per_sec: 512 * 1024,
+            replaces_schedule: true,
             reply,
         })
         .await;
@@ -916,75 +940,70 @@ async fn clearing_scheduled_speed_limit_restores_latest_configured_limit() {
     let (reply, received) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: crate::bandwidth::ScheduleAction::SpeedLimit {
-                bytes_per_sec: 128 * 1024,
-            },
+            action: global_speed(128 * 1024),
             reply,
         })
         .await;
     received.await.unwrap();
     assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+
+    for action in [
+        crate::bandwidth::ScheduleAction::Pause,
+        crate::bandwidth::ScheduleAction::Resume,
+    ] {
+        let (reply, received) = oneshot::channel();
+        pipeline
+            .handle_command(SchedulerCommand::ApplyScheduleAction {
+                action: action.clone(),
+                reply,
+            })
+            .await;
+        received.await.unwrap();
+        assert_eq!(
+            pipeline.global_paused,
+            action == crate::bandwidth::ScheduleAction::Pause
+        );
+        assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+        assert_eq!(pipeline.scheduled_rate_limit, Some(128 * 1024));
+        assert_eq!(
+            pipeline.shared_state.download_block().scheduled_speed_limit,
+            128 * 1024
+        );
+    }
 
     let (reply, received) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::SetSpeedLimit {
             bytes_per_sec: 768 * 1024,
+            replaces_schedule: false,
             reply,
         })
         .await;
     received.await.unwrap();
+    // A reload records the saved limit but leaves the scheduled one in force.
     assert_eq!(pipeline.configured_rate_limit, 768 * 1024);
     assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
 
     let (reply, received) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::ClearScheduleAction { reply })
+        .handle_command(SchedulerCommand::ApplyScheduleAction {
+            action: crate::bandwidth::ScheduleAction::Pause,
+            reply,
+        })
         .await;
     received.await.unwrap();
-    assert_eq!(pipeline.scheduled_rate_limit, None);
-    assert_eq!(pipeline.rate_limiter.rate(), 768 * 1024);
-    assert_eq!(
-        pipeline.shared_state.download_block().scheduled_speed_limit,
-        0
-    );
-}
-
-#[tokio::test]
-async fn set_bandwidth_cap_policy_recomputes_current_window_usage_from_ledger() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
-
-    let now = chrono::Local::now();
-    let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
+    // Unlimited still means unlimited, even when the configured limit is nonzero.
+    let (reply, received) = oneshot::channel();
     pipeline
-        .db
-        .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 4096)
-        .unwrap();
-
-    pipeline
-        .apply_bandwidth_cap_policy(Some(crate::bandwidth::IspBandwidthCapConfig {
-            enabled: false,
-            period: crate::bandwidth::IspBandwidthCapPeriod::Daily,
-            limit_bytes: 10_000,
-            reset_time_minutes_local: reset_minutes,
-            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 1,
-        }))
-        .unwrap();
-
-    let block = pipeline.shared_state.download_block();
-    assert_eq!(block.used_bytes, 4096);
-    assert_eq!(block.remaining_bytes, 10_000 - 4096);
-    assert!(!block.cap_enabled);
+        .handle_command(SchedulerCommand::ApplyScheduleAction {
+            action: global_speed(0),
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert_eq!(pipeline.scheduled_rate_limit, Some(0));
+    assert_eq!(pipeline.rate_limiter.rate(), 0);
+    assert!(pipeline.global_paused);
 }
 
 #[tokio::test]
@@ -1780,13 +1799,13 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
     );
 }
 
-/// A probe that is still in flight when the last segment settles must not hold
-/// the completion checkpoint.
-///
-/// The probe estimates a release's health from a sample while bytes are still
-/// arriving. Once the download pass ends, the job's own terminal states are the
-/// answer, and waiting on the probe only postpones the checkpoint — and PAR2
-/// recovery promotion with it — for the probe's whole soft timeout.
+// A probe that is still in flight when the last segment settles must not hold
+// the completion checkpoint.
+//
+// The probe estimates a release's health from a sample while bytes are still
+// arriving. Once the download pass ends, the job's own terminal states are the
+// answer, and waiting on the probe only postpones the checkpoint — and PAR2
+// recovery promotion with it — for the probe's whole soft timeout.
 #[tokio::test]
 async fn drained_download_pass_retires_the_probe_instead_of_waiting_for_it() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2162,8 +2181,6 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     pipeline.active_downloads = 1;
     pipeline.active_download_passes.insert(job_id);
     pipeline.active_downloads_by_job.insert(job_id, 1);
-    pipeline.bandwidth_cap.reserve(256);
-    pipeline.bandwidth_reservations.insert(segment_id, 256);
     pipeline.rate_limit_reservations.insert(segment_id, 256);
     let lane_id = Pipeline::next_download_lane_id();
     pipeline.download_lane_owners.insert(
@@ -2212,7 +2229,6 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     assert_eq!(pipeline.active_downloads, 0);
     assert!(!pipeline.active_download_passes.contains(&job_id));
     assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
-    assert!(pipeline.bandwidth_reservations.is_empty());
     assert!(pipeline.rate_limit_reservations.is_empty());
 }
 
@@ -2799,4 +2815,48 @@ async fn deferral_survives_pause_resume_and_leaves_nothing_behind_on_delete() {
         "a removed job must not leave a wakeup behind"
     );
     assert!(pipeline.next_propagation_delay().is_none());
+}
+
+#[tokio::test]
+async fn an_operator_speed_limit_replaces_the_scheduled_one_until_the_next_rule_fires() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let apply = |action| {
+        let (reply, received) = oneshot::channel();
+        (
+            SchedulerCommand::ApplyScheduleAction { action, reply },
+            received,
+        )
+    };
+
+    let (command, received) = apply(global_speed(128 * 1024));
+    pipeline.handle_command(command).await;
+    received.await.unwrap();
+    assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+
+    // The operator sets a limit: it is in force at once.
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetSpeedLimit {
+            bytes_per_sec: 640 * 1024,
+            replaces_schedule: true,
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert_eq!(pipeline.scheduled_rate_limit, None);
+    assert_eq!(pipeline.configured_rate_limit, 640 * 1024);
+    assert_eq!(pipeline.rate_limiter.rate(), 640 * 1024);
+    assert_eq!(
+        pipeline.shared_state.download_block().scheduled_speed_limit,
+        0
+    );
+
+    // The next scheduled speed rule takes over again.
+    let (command, received) = apply(global_speed(256 * 1024));
+    pipeline.handle_command(command).await;
+    received.await.unwrap();
+    assert_eq!(pipeline.scheduled_rate_limit, Some(256 * 1024));
+    assert_eq!(pipeline.rate_limiter.rate(), 256 * 1024);
+    assert_eq!(pipeline.configured_rate_limit, 640 * 1024);
 }

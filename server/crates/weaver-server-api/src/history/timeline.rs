@@ -772,10 +772,10 @@ fn build_extraction_groups(
     (extraction_groups, extracting_spans)
 }
 
-/// The job's own Extracting status is extraction even when no member reports
-/// it — an unpack that ran alongside the download and is only finishing now
-/// has nothing to announce per member — so the lane is the union of member
-/// activity and the time the job spent in that status.
+// The job's own Extracting status is extraction even when no member reports
+// it — an unpack that ran alongside the download and is only finishing now
+// has nothing to announce per member — so the lane is the union of member
+// activity and the time the job spent in that status.
 fn merge_extracting_spans(
     member_spans: Vec<JobTimelineSpan>,
     stage_spans: Vec<JobTimelineSpan>,

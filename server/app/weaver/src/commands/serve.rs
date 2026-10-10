@@ -150,8 +150,13 @@ pub(crate) async fn run(
     let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
     let proxy_db = db.clone();
     let runtime_handle = tokio::runtime::Handle::current();
+    let proxy_policy = Arc::clone(&server_transfer_policy);
     let proxies = tokio::task::spawn_blocking(move || {
-        weaver_server_core::proxies::ProxyRuntime::new(proxy_db, runtime_handle)
+        weaver_server_core::proxies::ProxyRuntime::with_quota_policy(
+            proxy_db,
+            runtime_handle,
+            Some(proxy_policy),
+        )
     })
     .await??;
     let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy, &proxies)?;
@@ -204,6 +209,8 @@ pub(crate) async fn run(
         rss.clone(),
         restore_locator_dir.clone(),
     );
+    db.set_setting("last_started_version", env!("CARGO_PKG_VERSION"))?;
+    let auto_backup_scheduler = backup.start_background_auto_backup_scheduler();
     let jwt_secret = db.get_or_create_jwt_signing_secret()?;
     let auth_credentials = db.get_auth_credentials()?;
     let login_enabled = auth_credentials.is_some();
@@ -223,13 +230,30 @@ pub(crate) async fn run(
 
     // Load schedules from DB and spawn the schedule evaluator.
     let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules = {
-        let initial = db.list_schedules().unwrap_or_default();
+        let initial = db.list_schedules().unwrap_or_else(|error| {
+            error!(%error, "failed to load schedules; scheduled holds are unavailable until the settings are repaired");
+            Vec::new()
+        });
         std::sync::Arc::new(tokio::sync::RwLock::new(initial))
     };
-    weaver_server_core::bandwidth::schedule::spawn_evaluator_with_watch_folder(
-        handle.clone(),
-        shared_schedules.clone(),
-        Some(watch_folder.clone()),
+    let (schedule_task, schedules_replayed) =
+        weaver_server_core::bandwidth::schedule::spawn_evaluator_with_services(
+            handle.clone(),
+            shared_schedules.clone(),
+            weaver_server_core::bandwidth::schedule::ScheduleServices {
+                watch_folder: Some(watch_folder.clone()),
+                rss: Some(rss.clone()),
+                servers: Some(weaver_server_core::servers::service::ServersService::new(
+                    db.clone(),
+                    shared_config.clone(),
+                    handle.clone(),
+                )),
+                db: Some(db.clone()),
+            },
+        );
+    weaver_server_core::post_processing::scheduler::spawn_script_evaluator(
+        db.clone(),
+        shared_config.clone(),
     );
 
     let pipeline_config = shared_config.clone();
@@ -322,6 +346,13 @@ pub(crate) async fn run(
             .into());
         }
     };
+    // Scripts run on this host and call back on the address that was actually
+    // bound. An address that means "every interface" is not one to connect
+    // to, so loopback stands in for it.
+    match listener.local_addr() {
+        Ok(bound) => db.set_script_api_url(script_api_url(bound, &base_url)),
+        Err(error) => warn!(%error, "could not read the bound address; scripts cannot call back"),
+    }
     let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())?;
 
     // The in-application upgrade. The installation is classified once, here,
@@ -361,29 +392,32 @@ pub(crate) async fn run(
     }
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
-    let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
-        handle: handle.clone(),
-        scheduled_resume: scheduled_resume.clone(),
-        config: shared_config.clone(),
-        db: db.clone(),
-        server_transfer_policy: Arc::clone(&server_transfer_policy),
-        auth_cache: login_auth_cache.clone(),
-        api_key_cache: api_key_cache.clone(),
-        security: security.clone(),
-        rss: rss.clone(),
-        watch_folder: watch_folder.clone(),
-        update_check: update_check.clone(),
-        application_upgrade: application_upgrade.clone(),
-        schedules: shared_schedules,
-        log_buffer: log_ring_buffer,
-        system_runtime: weaver_server_api::SystemRuntimeContext {
-            profile: Arc::clone(&system_profile),
-            started_at,
+    let schema = weaver_server_api::context::build_schema_with_backup(
+        weaver_server_api::SchemaContext {
+            handle: handle.clone(),
+            scheduled_resume: scheduled_resume.clone(),
+            config: shared_config.clone(),
+            db: db.clone(),
+            server_transfer_policy: Arc::clone(&server_transfer_policy),
+            auth_cache: login_auth_cache.clone(),
+            api_key_cache: api_key_cache.clone(),
+            security: security.clone(),
+            rss: rss.clone(),
+            watch_folder: watch_folder.clone(),
+            update_check: update_check.clone(),
+            application_upgrade: application_upgrade.clone(),
+            schedules: shared_schedules.clone(),
+            log_buffer: log_ring_buffer,
+            system_runtime: weaver_server_api::SystemRuntimeContext {
+                profile: Arc::clone(&system_profile),
+                started_at,
+            },
+            nntp_pool: Some(nntp_pool.clone()),
+            spawn_history_delete_worker: true,
+            post_processing_executor: Some(post_processing_executor),
         },
-        nntp_pool: Some(nntp_pool.clone()),
-        spawn_history_delete_worker: true,
-        post_processing_executor: Some(post_processing_executor),
-    });
+        backup.clone(),
+    );
 
     let metrics_exporter = http::PrometheusMetricsExporter::new(
         handle.clone(),
@@ -392,13 +426,22 @@ pub(crate) async fn run(
         Arc::clone(&server_transfer_policy),
         shared_config.clone(),
         buffers,
-    );
+    )
+    .with_schedules(shared_schedules);
 
     let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
     });
     scheduled_resume.recover().await?;
 
+    // Intake pollers must not race the first PauseAll replay. The pipeline is
+    // running now, so every initial hold finishes before intake starts, including
+    // disabling servers that must not accept the first recovered download.
+    match schedules_replayed.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "initial schedule replay failed; evaluator will retry"),
+        Err(error) => error!(%error, "schedule evaluator stopped before initial replay"),
+    }
     let rss_task = rss.start_background_loop();
     let update_check_task = update_check.start_background_loop();
     watch_folder.reconcile_from_config().await?;
@@ -427,7 +470,7 @@ pub(crate) async fn run(
         db: db.clone(),
         auth_cache: login_auth_cache,
         api_key_cache,
-        backup,
+        backup: backup.clone(),
         rss: rss.clone(),
         watch_folder: watch_folder.clone(),
         metrics_exporter,
@@ -525,6 +568,9 @@ pub(crate) async fn run(
         _ = shutdown::wait_for_shutdown() => ServeStop::Signal,
         action = restart_controller.requested() => ServeStop::from(action),
         result = &mut pipeline_task => {
+            auto_backup_scheduler.abort();
+            let _ = auto_backup_scheduler.await;
+            tokio::join!(backup.shutdown(), schedule_task.shutdown());
             proxies.stop_all().await;
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
@@ -545,8 +591,11 @@ pub(crate) async fn run(
             return Err(error.into());
         }
         result = &mut server_task => {
+            auto_backup_scheduler.abort();
+            let _ = auto_backup_scheduler.await;
+            tokio::join!(backup.shutdown(), schedule_task.shutdown());
             proxies.stop_all().await;
-    handle.shutdown().await.ok();
+            handle.shutdown().await.ok();
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
             }
@@ -583,6 +632,9 @@ pub(crate) async fn run(
         }
     }
     update_check_task.abort();
+    auto_backup_scheduler.abort();
+    let _ = auto_backup_scheduler.await;
+    tokio::join!(backup.shutdown(), schedule_task.shutdown());
     proxies.stop_all().await;
     handle.shutdown().await.ok();
     if let Err(join_error) = pipeline_task.await {
@@ -624,9 +676,53 @@ pub(crate) async fn run(
     }
 }
 
-/// An explicit legacy migration may establish its first login with the startup
-/// code. Never infer that permission from missing credentials alone: a completed
-/// or unrecognized authenticated policy must continue to require recovery.
+// The GraphQL endpoint as a script on this host reaches it, given the address
+// the server bound and the path it is served under.
+fn script_api_url(bound: SocketAddr, base_url: &str) -> String {
+    let host = match bound.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
+        ip => ip,
+    };
+    format!(
+        "http://{}{base_url}/graphql",
+        SocketAddr::new(host, bound.port())
+    )
+}
+
+#[cfg(test)]
+mod script_api_url_tests {
+    use super::script_api_url;
+
+    #[test]
+    fn scripts_are_sent_to_an_address_they_can_connect_to() {
+        for (bound, base_url, expected) in [
+            ("127.0.0.1:6789", "", "http://127.0.0.1:6789/graphql"),
+            ("0.0.0.0:6789", "", "http://127.0.0.1:6789/graphql"),
+            (
+                "192.0.2.7:8080",
+                "/weaver",
+                "http://192.0.2.7:8080/weaver/graphql",
+            ),
+            ("[::]:6789", "", "http://[::1]:6789/graphql"),
+            (
+                "[2001:db8::7]:6789",
+                "/dl",
+                "http://[2001:db8::7]:6789/dl/graphql",
+            ),
+        ] {
+            assert_eq!(
+                script_api_url(bound.parse().unwrap(), base_url),
+                expected,
+                "{bound}"
+            );
+        }
+    }
+}
+
+// An explicit legacy migration may establish its first login with the startup
+// code. Never infer that permission from missing credentials alone: a completed
+// or unrecognized authenticated policy must continue to require recovery.
 fn prepare_credentialless_legacy_migration(
     db: &Database,
     explicit_migration: bool,
@@ -730,17 +826,17 @@ mod migration_tests {
     }
 }
 
-/// Why the serve loop is leaving a healthy process: a signal, or a restart the
-/// operator asked for. The teardown is identical; only the last step differs.
+// Why the serve loop is leaving a healthy process: a signal, or a restart the
+// operator asked for. The teardown is identical; only the last step differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeStop {
     Signal,
     Restart,
-    /// Shut down and stay down: an upgrade handed the installation to a helper
-    /// that needs these files released.
+    // Shut down and stay down: an upgrade handed the installation to a helper
+    // that needs these files released.
     ExitOnly,
-    /// Shut down with the code that asks the desktop wrapper to relaunch the
-    /// application from the bundle an upgrade just replaced.
+    // Shut down with the code that asks the desktop wrapper to relaunch the
+    // application from the bundle an upgrade just replaced.
     BundleRelaunch,
 }
 
@@ -766,11 +862,11 @@ impl ServeStop {
     }
 }
 
-/// Signal the event-persistence task to stop and await its final
-/// `flush_write_queue`, bounded so a stuck flush cannot hang process exit.
-/// Called after the pipeline task has completed (its broadcast sender dropped),
-/// so the only remaining reason the task is still running is the long-lived
-/// senders held by `SchedulerHandle` and its service clones.
+// Signal the event-persistence task to stop and await its final
+// `flush_write_queue`, bounded so a stuck flush cannot hang process exit.
+// Called after the pipeline task has completed (its broadcast sender dropped),
+// so the only remaining reason the task is still running is the long-lived
+// senders held by `SchedulerHandle` and its service clones.
 async fn finalize_event_persistence(
     task: tokio::task::JoinHandle<()>,
     shutdown: &Arc<tokio::sync::Notify>,

@@ -1,10 +1,10 @@
-//! Delivery claims, including terminal classifications written by older versions.
+// Delivery claims, including terminal classifications written by older versions.
 
 use super::*;
 use crate::jobs::model::TerminalDiscardKind;
 use crate::pipeline::SegmentTerminalState;
 
-/// A two-file payload: a canonical file and the collided repost beside it.
+// A two-file payload: a canonical file and the collided repost beside it.
 fn two_payload_files_spec(
     name: &str,
     canonical: (&str, &[u32]),
@@ -80,8 +80,8 @@ fn legacy_unfetchable_duplicate_terminal_records_remain_readable() {
     );
 }
 
-/// Real damage stays real. An unprotected file delivered short keeps its
-/// failure, and the job reports the honest fraction it delivered.
+// Real damage stays real. An unprotected file delivered short keeps its
+// failure, and the job reports the honest fraction it delivered.
 #[tokio::test]
 async fn an_unprotected_file_delivered_short_keeps_an_honest_partial_health() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -121,9 +121,9 @@ async fn an_unprotected_file_delivered_short_keeps_an_honest_partial_health() {
     assert!(reconciliation.discards.is_empty());
 }
 
-/// The reconciliation is bidirectional. Bytes that read complete while segments
-/// of theirs are terminally lost were completed by *something*, and if no
-/// verdict, proof or discard says what, the failure stays on the record.
+// The reconciliation is bidirectional. Bytes that read complete while segments
+// of theirs are terminally lost were completed by *something*, and if no
+// verdict, proof or discard says what, the failure stays on the record.
 #[tokio::test]
 async fn bytes_that_read_complete_without_a_claim_are_not_forgiven() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -164,9 +164,9 @@ async fn bytes_that_read_complete_without_a_claim_are_not_forgiven() {
     assert!(reconciliation.discards.is_empty());
 }
 
-/// The job-10220 pin. Every article of the payload and of its recovery set is
-/// missing, so nothing describes anything and nothing claims anything. A post
-/// that delivered none of itself must not archive as a success.
+// The job-10220 pin. Every article of the payload and of its recovery set is
+// missing, so nothing describes anything and nothing claims anything. A post
+// that delivered none of itself must not archive as a success.
 #[tokio::test]
 async fn a_post_whose_every_article_is_missing_is_refused_at_the_delivery_gate() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -215,11 +215,11 @@ async fn a_post_whose_every_article_is_missing_is_refused_at_the_delivery_gate()
     );
 }
 
-/// A dead file beside a real delivery, without the breaker's positive
-/// evidence: the duplicate's articles are simply missing everywhere. Nothing
-/// claims it, so its failure stays in the record — but a job that delivered
-/// its canonical payload completes with that honest damage rather than being
-/// refused over the hole beside it.
+// A dead file beside a real delivery, without the breaker's positive
+// evidence: the duplicate's articles are simply missing everywhere. Nothing
+// claims it, so its failure stays in the record — but a job that delivered
+// its canonical payload completes with that honest damage rather than being
+// refused over the hole beside it.
 #[tokio::test]
 async fn a_dead_duplicate_with_missing_articles_does_not_refuse_a_delivered_job() {
     let temp_dir = tempfile::tempdir().unwrap();

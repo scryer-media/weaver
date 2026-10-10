@@ -9,13 +9,13 @@ use crate::security::RuntimeSecurityConfig;
 
 const MAX_NZB_MEMBERS_PER_INPUT: usize = 256;
 const MAX_TOTAL_NZB_BYTES_PER_INPUT: u64 = 512 * 1024 * 1024;
-/// Largest end header a 7z input dropped into a watch folder may declare.
-/// The header is buffered whole before it can be parsed, and an input that
-/// carries NZBs describes at most a few hundred members.
+// Largest end header a 7z input dropped into a watch folder may declare.
+// The header is buffered whole before it can be parsed, and an input that
+// carries NZBs describes at most a few hundred members.
 const MAX_7Z_INPUT_END_HEADER_BYTES: u64 = 64 * 1024 * 1024;
-/// Largest decoder footprint a 7z input may ask for. 7-Zip's own `-mx9`
-/// writes a 64 MiB dictionary; this leaves room for an operator's hand-set
-/// one without letting a header allocate gigabytes.
+// Largest decoder footprint a 7z input may ask for. 7-Zip's own `-mx9`
+// writes a 64 MiB dictionary; this leaves room for an operator's hand-set
+// one without letting a header allocate gigabytes.
 const MAX_7Z_INPUT_DECODER_BYTES: u64 = 512 * 1024 * 1024;
 
 trait ReadSeek: Read + Seek + Send {}
@@ -52,12 +52,12 @@ impl IntakeOutput {
         Ok(output)
     }
 
-    /// Why a member of `len` bytes could not be accepted, if it could not.
-    ///
-    /// The same arithmetic [`Self::push_nzb`] enforces, asked before the bytes
-    /// exist so a member that cannot fit is never materialised into memory
-    /// just to be rejected. `push_nzb` stays the authority — this is an
-    /// optimisation in front of it, never a replacement for it.
+    // Why a member of `len` bytes could not be accepted, if it could not.
+    //
+    // The same arithmetic [`Self::push_nzb`] enforces, asked before the bytes
+    // exist so a member that cannot fit is never materialised into memory
+    // just to be rejected. `push_nzb` stays the authority — this is an
+    // optimisation in front of it, never a replacement for it.
     fn rejection_for(&self, len: u64, per_member_limit: u64) -> Option<String> {
         if self.nzbs.len() >= MAX_NZB_MEMBERS_PER_INPUT {
             return Some(format!(
@@ -682,9 +682,9 @@ fn archive_volume_number(role: &FileRole) -> u32 {
     }
 }
 
-/// A failure while reading an entry arrives as an I/O error wrapping the RAR
-/// error the crate raised. Unwrap it before classifying, so a missing volume
-/// is still the transient it is.
+// A failure while reading an entry arrives as an I/O error wrapping the RAR
+// error the crate raised. Unwrap it before classifying, so a missing volume
+// is still the transient it is.
 fn rar_entry_read_error(error: io::Error) -> IntakeError {
     match error.downcast::<unrar_rs::RarError>() {
         Ok(error) => rar_member_error(error),

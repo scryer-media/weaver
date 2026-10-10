@@ -1,5 +1,4 @@
 use crate::StateError;
-use crate::bandwidth::ScheduleEntry;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::record::SettingRecord;
@@ -39,12 +38,5 @@ impl Database {
             .map(|row| row.text("value"))
             .transpose()
         })
-    }
-
-    pub fn list_schedules(&self) -> Result<Vec<ScheduleEntry>, StateError> {
-        let json = self
-            .get_setting("schedules")?
-            .unwrap_or_else(|| "[]".into());
-        serde_json::from_str(&json).map_err(|e| StateError::Database(e.to_string()))
     }
 }

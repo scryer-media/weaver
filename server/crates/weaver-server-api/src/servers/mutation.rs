@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::LazyLock;
 
 use async_graphql::{Context, Object, Result};
 use base64::Engine;
@@ -16,8 +15,7 @@ use weaver_server_core::servers::{ServerConnectivityResult, ServerTlsDiagnostics
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{Database, SchedulerHandle};
 
-static SERVER_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+use weaver_server_core::servers::service::SERVER_MUTATION_GUARD;
 
 #[derive(Default)]
 pub(crate) struct ServersMutation;
@@ -40,11 +38,11 @@ impl ServersMutation {
             None => None,
         };
         let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
-            input.routing.clone().map(Into::into);
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?;
         let route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Server(0),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
         let normalized =
             NormalizedServerInput::from_input(input, None).map_err(async_graphql::Error::new)?;
@@ -125,11 +123,11 @@ impl ServersMutation {
             None => None,
         };
         let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
-            input.routing.clone().map(Into::into);
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?;
         let route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Server(id),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
 
         let existing =
@@ -244,6 +242,13 @@ impl ServersMutation {
             .await?;
         }
 
+        // Serialize schedule persistence and publication with schedule CRUD, so
+        // an earlier save cannot republish rules for this deleted server.
+        let mut schedules_guard =
+            match ctx.data_opt::<weaver_server_core::bandwidth::schedule::SharedSchedules>() {
+                Some(schedules) => Some(schedules.write().await),
+                None => None,
+            };
         {
             let db = db.clone();
             let deleted = spawn_blocking_db("servers.mutation.remove_server.persist", move || {
@@ -254,6 +259,18 @@ impl ServersMutation {
                 return Err(async_graphql::Error::new(format!("server {id} not found")));
             }
         }
+
+        // The delete took this server's rules and speed limits out of what is
+        // saved; publish that.
+        if let Some(schedules) = schedules_guard.as_mut() {
+            let db = db.clone();
+            **schedules =
+                spawn_blocking_db("servers.mutation.remove_server.schedules", move || {
+                    db.list_schedules()
+                })
+                .await?;
+        }
+        drop(schedules_guard);
 
         let remaining =
             with_timed_config_write(config, "servers.mutation.remove_server.apply", move |cfg| {
@@ -368,12 +385,13 @@ impl ServersMutation {
         let route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Server(0),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
         let normalized = match NormalizedServerInput::from_input(input, None) {
             Ok(normalized) => normalized,
             Err(message) => {
                 return Ok(TestConnectionResult {
+                    legs: Vec::new(),
                     success: false,
                     message,
                     latency_ms: None,
@@ -521,9 +539,9 @@ impl NormalizedServerInput {
     }
 }
 
-/// Hand a successful probe's first-byte latency to the download runtime, so a
-/// server the lanes have never fetched from starts at a depth that suits the
-/// distance instead of the shallowest rung.
+// Hand a successful probe's first-byte latency to the download runtime, so a
+// server the lanes have never fetched from starts at a depth that suits the
+// distance instead of the shallowest rung.
 fn note_probe_first_byte_latency(
     handle: &SchedulerHandle,
     server_id: u32,
@@ -534,44 +552,93 @@ fn note_probe_first_byte_latency(
     }
 }
 
-/// Probe an active server before it is saved. `None` means the server is
+struct RoutedProbe {
+    summary: ServerConnectivityResult,
+    legs: Vec<crate::servers::types::LegConnectionTest>,
+}
+impl std::ops::Deref for RoutedProbe {
+    type Target = ServerConnectivityResult;
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+impl From<RoutedProbe> for TestConnectionResult {
+    fn from(probe: RoutedProbe) -> Self {
+        let mut result = Self::from(probe.summary);
+        result.legs = probe.legs;
+        result
+    }
+}
+
+// Probe every draft leg without changing live selection or tunnel sessions.
 fn probe_through_route<'a>(
     server: &'a weaver_server_core::servers::ServerConfig,
-    route: Option<&'a std::sync::Arc<weaver_server_core::proxies::ConsumerRoute>>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<ServerConnectivityResult>> + Send + 'a>,
-> {
+    route: Option<&'a std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoutedProbe>> + Send + 'a>> {
     Box::pin(async move {
-        let proxy = match route {
-            Some(route) if !route.policy.is_direct() => {
-                Some(route.bridge().map_err(async_graphql::Error::new)?)
-            }
-            _ => None,
-        };
-        let result =
-            weaver_server_core::servers::probe_server_connection_with_proxy(server, proxy).await;
+        let mut results = Vec::new();
+        for position in 0..route.map_or(1, |route| route.leg_count()) {
+            let dialer = match route {
+                Some(route) => match route.nntp_dialer_for_leg(position, server.id) {
+                    Ok(dialer) => Some(dialer),
+                    Err(error) => {
+                        route.revoke().await;
+                        return Err(async_graphql::Error::new(error));
+                    }
+                },
+                None => None,
+            };
+            results.push(
+                weaver_server_core::servers::probe_server_connection_with_route(server, dialer)
+                    .await,
+            );
+        }
         if let Some(route) = route {
             route.revoke().await;
         }
-        Ok(result)
+        let legs = results
+            .iter()
+            .enumerate()
+            .map(
+                |(position, result)| crate::servers::types::LegConnectionTest {
+                    position,
+                    success: result.success,
+                    message: result.message.clone(),
+                    latency_ms: result.latency_ms,
+                },
+            )
+            .collect();
+        let selected = results
+            .iter()
+            .position(|result| result.success)
+            .unwrap_or(0);
+        if results.is_empty() {
+            return Err("route has no legs to test".into());
+        }
+        Ok(RoutedProbe {
+            summary: results.swap_remove(selected),
+            legs,
+        })
     })
 }
 
-/// Probe an active server before it is saved. `None` means the server is
-/// inactive and no probe ran, so previously learned facts are kept.
+// Probe an active server before it is saved. `None` means the server is
+// inactive and no probe ran, so previously learned facts are kept.
 async fn validate_server_before_save(
     input: &NormalizedServerInput,
-    route: Option<&std::sync::Arc<weaver_server_core::proxies::ConsumerRoute>>,
+    route: Option<&std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>>,
 ) -> Result<Option<ServerConnectivityResult>> {
     if !input.active
-        || route.is_some_and(|r| r.policy.proxy_ids.is_empty() && !r.policy.allow_direct)
+        || route.is_some_and(|r| {
+            r.policy.legs.is_empty() && r.policy.proxy_ids.is_empty() && !r.policy.allow_direct
+        })
     {
         return Ok(None);
     }
 
     let result = probe_through_route(&input.as_runtime_server_config(0), route).await?;
     if result.success {
-        Ok(Some(result))
+        Ok(Some(result.summary))
     } else {
         Err(async_graphql::Error::new(format!(
             "server connection test failed: {}",
@@ -580,9 +647,9 @@ async fn validate_server_before_save(
     }
 }
 
-/// Record what the save-time probe learned about this server's TLS suite.
-/// A TLS probe upserts the row, a plaintext probe clears it, and no probe
-/// (inactive server) leaves the stored facts untouched and returns them.
+// Record what the save-time probe learned about this server's TLS suite.
+// A TLS probe upserts the row, a plaintext probe clears it, and no probe
+// (inactive server) leaves the stored facts untouched and returns them.
 async fn persist_tls_diagnostics(
     db: &Database,
     server_id: u32,
@@ -688,7 +755,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
@@ -702,6 +768,7 @@ mod tests {
 
     fn inactive_server_input() -> ServerInput {
         ServerInput {
+            route: None,
             routing: None,
             host: "news.example.com".to_string(),
             port: 119,

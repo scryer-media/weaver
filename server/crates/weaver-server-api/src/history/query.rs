@@ -11,13 +11,13 @@ enum HistoryQueryPlan {
     Query(Box<weaver_server_core::HistoryFilter>),
 }
 
-/// Upper bound on job-event rows loaded for the polled detail snapshot. Large
-/// RAR jobs write ~5-7 event rows per extracted member, so an unbounded read of
-/// a big job's log can be thousands of rows re-fetched a few times a second
-/// while a tab is open. 2000 is a generous tail — enough to render every
-/// lifecycle/verification/repair marker plus recent extraction activity — while
-/// capping the per-poll cost. Only the detail-view read is bounded; callers that
-/// must see the full log use `get_job_events`.
+// Upper bound on job-event rows loaded for the polled detail snapshot. Large
+// RAR jobs write ~5-7 event rows per extracted member, so an unbounded read of
+// a big job's log can be thousands of rows re-fetched a few times a second
+// while a tab is open. 2000 is a generous tail — enough to render every
+// lifecycle/verification/repair marker plus recent extraction activity — while
+// capping the per-poll cost. Only the detail-view read is bounded; callers that
+// must see the full log use `get_job_events`.
 const JOB_DETAIL_EVENT_CAP: u32 = 2000;
 
 #[derive(Default)]
@@ -253,8 +253,8 @@ impl HistoryQuery {
     }
 }
 
-/// Host label per configured server id, for naming a job's contributing servers
-/// without denormalizing the host into every archived job.
+// Host label per configured server id, for naming a job's contributing servers
+// without denormalizing the host into every archived job.
 pub(crate) async fn server_hosts_by_id(config: &SharedConfig) -> HashMap<u32, String> {
     crate::observability::with_timed_config_read(
         config,
@@ -421,13 +421,13 @@ async fn load_history_page(
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))
 }
 
-/// Attach the per-row delete-operation and duplicate badges to a built page.
-///
-/// Delete-operation badges are only needed for the rows actually shown on this
-/// page. Load them for the page's job ids instead of issuing an `IN (…)` over
-/// every row in the history table. Every page-building path shares this tail so
-/// the response (page shape, counts, per-page delete states) is identical for
-/// identical data.
+// Attach the per-row delete-operation and duplicate badges to a built page.
+//
+// Delete-operation badges are only needed for the rows actually shown on this
+// page. Load them for the page's job ids instead of issuing an `IN (…)` over
+// every row in the history table. Every page-building path shares this tail so
+// the response (page shape, counts, per-page delete states) is identical for
+// identical data.
 fn attach_history_page_badges(
     db: &Database,
     mut page: HistoryPage,
@@ -451,11 +451,11 @@ fn attach_history_page_badges(
     Ok(page)
 }
 
-/// A History-page request whose semantics map exactly onto SQL filtering,
-/// ordering, counting, and pagination.
-///
-/// This is only constructed for requests with no free-text search and the
-/// default `completed_at DESC` ordering; see [`HistoryPageSqlPlan::for_input`].
+// A History-page request whose semantics map exactly onto SQL filtering,
+// ordering, counting, and pagination.
+//
+// This is only constructed for requests with no free-text search and the
+// default `completed_at DESC` ordering; see [`HistoryPageSqlPlan::for_input`].
 struct HistoryPageSqlPlan {
     status: HistoryStatusFilter,
     page_index: usize,
@@ -463,9 +463,9 @@ struct HistoryPageSqlPlan {
 }
 
 impl HistoryPageSqlPlan {
-    /// Returns a SQL plan when the request maps exactly onto SQL, or `None` when
-    /// the caller must fall back to the full-scan Rust path in
-    /// [`build_history_page`].
+    // Returns a SQL plan when the request maps exactly onto SQL, or `None` when
+    // the caller must fall back to the full-scan Rust path in
+    // [`build_history_page`].
     fn for_input(input: &HistoryPageInput) -> Option<Self> {
         // A search term uses Rust `to_lowercase().contains()` over computed
         // display titles; SQL LOWER/LIKE has ASCII-only + Unicode divergence and
@@ -501,13 +501,13 @@ impl HistoryPageSqlPlan {
     }
 }
 
-/// SQL statuses that map to the "success" bucket (state == Completed): exactly
-/// `complete`. Kept in lockstep with `history_state_from_row`.
+// SQL statuses that map to the "success" bucket (state == Completed): exactly
+// `complete`. Kept in lockstep with `history_state_from_row`.
 const HISTORY_SUCCESS_STATUSES: &[&str] = &["complete"];
-/// Statuses that are NEITHER success nor paused, i.e. the "failure" bucket
-/// (state == Failed): every status except `complete` and `paused`. Expressed as
-/// an exclusion because `history_state_from_row` maps every unknown status to
-/// Failed, so an inclusion list could not be exhaustive.
+// Statuses that are NEITHER success nor paused, i.e. the "failure" bucket
+// (state == Failed): every status except `complete` and `paused`. Expressed as
+// an exclusion because `history_state_from_row` maps every unknown status to
+// Failed, so an inclusion list could not be exhaustive.
 const HISTORY_NON_FAILURE_STATUSES: &[&str] = &["complete", "paused"];
 
 fn success_history_filter() -> weaver_server_core::HistoryFilter {
@@ -596,15 +596,15 @@ fn build_history_page_sql(
     })
 }
 
-/// Ids of the jobs the scheduler still owns, i.e. whose status is neither of
-/// the two terminal ones.
-///
-/// A job can have a history row while the scheduler still holds it: the row is
-/// written before the job leaves the scheduler, and a re-queued job keeps its
-/// old row. Such a row is not history — the job can still change state, and a
-/// caller that treats it as history will try to remove it and be told the job
-/// is still live. Every history read surface applies this same predicate so the
-/// single-item read, the lists, and the queue cannot disagree.
+// Ids of the jobs the scheduler still owns, i.e. whose status is neither of
+// the two terminal ones.
+//
+// A job can have a history row while the scheduler still holds it: the row is
+// written before the job leaves the scheduler, and a re-queued job keeps its
+// old row. Such a row is not history — the job can still change state, and a
+// caller that treats it as history will try to remove it and be told the job
+// is still live. Every history read surface applies this same predicate so the
+// single-item read, the lists, and the queue cannot disagree.
 pub(crate) fn live_job_ids(handle: &SchedulerHandle) -> HashSet<u64> {
     handle
         .list_jobs()
@@ -620,7 +620,7 @@ pub(crate) fn live_job_ids(handle: &SchedulerHandle) -> HashSet<u64> {
         .collect()
 }
 
-/// Drop the history rows whose job is still live (see [`live_job_ids`]).
+// Drop the history rows whose job is still live (see [`live_job_ids`]).
 pub(crate) fn exclude_live_rows(
     rows: Vec<JobHistoryRow>,
     live_jobs: &HashSet<u64>,
@@ -633,12 +633,12 @@ pub(crate) fn exclude_live_rows(
         .collect()
 }
 
-/// The subset of `live_jobs` that actually has a history row.
-///
-/// This is a point lookup over a handful of ids, not a scan: it answers whether
-/// the live/archived overlap is non-empty before a caller decides how much work
-/// the exclusion is worth. The overlap is normally empty, because a live job has
-/// not been archived yet.
+// The subset of `live_jobs` that actually has a history row.
+//
+// This is a point lookup over a handful of ids, not a scan: it answers whether
+// the live/archived overlap is non-empty before a caller decides how much work
+// the exclusion is worth. The overlap is normally empty, because a live job has
+// not been archived yet.
 fn live_jobs_in_history(
     db: &Database,
     live_jobs: &HashSet<u64>,
@@ -657,9 +657,9 @@ fn live_jobs_in_history(
         .collect())
 }
 
-/// How many of the rows `filter` counts belong to jobs the scheduler still
-/// owns (see [`live_job_ids`]). A point lookup over the live ids, narrowed to
-/// the filter's own id list when it has one.
+// How many of the rows `filter` counts belong to jobs the scheduler still
+// owns (see [`live_job_ids`]). A point lookup over the live ids, narrowed to
+// the filter's own id list when it has one.
 fn count_live_rows_matching(
     db: &Database,
     filter: &weaver_server_core::HistoryFilter,
@@ -725,7 +725,8 @@ fn history_query_plan(
                     statuses.push("cancelled".to_string());
                 }
                 QueueItemState::Paused => statuses.push("paused".to_string()),
-                QueueItemState::Queued
+                QueueItemState::AwaitingQueueScripts
+                | QueueItemState::Queued
                 | QueueItemState::Downloading
                 | QueueItemState::FetchingRepairData
                 | QueueItemState::FinalizingDownload
@@ -826,8 +827,8 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     }
 }
 
-/// Tally the rows per category, ordered by category so the response does not
-/// depend on hash iteration order.
+// Tally the rows per category, ordered by category so the response does not
+// depend on hash iteration order.
 fn count_history_categories(items: &[HistoryItem]) -> Vec<HistoryCategoryCount> {
     let mut counts: HashMap<&str, u32> = HashMap::new();
     for item in items {
@@ -876,11 +877,11 @@ fn history_matches_search(item: &HistoryItem, search: Option<&str>) -> bool {
     .any(|value| value.to_lowercase().contains(search))
 }
 
-/// Drop blank entries and an empty list, so a request that filters by nothing
-/// is indistinguishable from one that omits the filter.
-///
-/// A blank entry is not dropped: the empty string is how a caller asks for rows
-/// with no category, so it is trimmed but kept.
+// Drop blank entries and an empty list, so a request that filters by nothing
+// is indistinguishable from one that omits the filter.
+//
+// A blank entry is not dropped: the empty string is how a caller asks for rows
+// with no category, so it is trimmed but kept.
 fn normalize_history_categories(categories: Option<Vec<String>>) -> Option<Vec<String>> {
     let trimmed: Vec<String> = categories?
         .into_iter()
@@ -956,6 +957,7 @@ fn normalized_history_name(item: &HistoryItem) -> String {
 
 fn history_state_key(state: QueueItemState) -> &'static str {
     match state {
+        QueueItemState::AwaitingQueueScripts => "awaiting_queue_scripts",
         QueueItemState::Completed => "completed",
         QueueItemState::Failed => "failed",
         QueueItemState::Paused => "paused",
@@ -1139,9 +1141,9 @@ mod tests {
         assert_eq!(sql.items, rust.items, "page items mismatch");
     }
 
-    /// The bug this guards: a facet list built from the rows a filtered page
-    /// returned shows only the facet already selected, so there is no way back
-    /// to the others and no way to discover them in the first place.
+    // The bug this guards: a facet list built from the rows a filtered page
+    // returned shows only the facet already selected, so there is no way back
+    // to the others and no way to discover them in the first place.
     #[test]
     fn category_counts_survive_the_category_filter() {
         let db = Database::open_in_memory().unwrap();
@@ -1183,9 +1185,9 @@ mod tests {
         );
     }
 
-    /// A search is the one filter the counts do follow: it changes which rows
-    /// are on offer at all, so a facet's number has to answer for the search
-    /// the person typed.
+    // A search is the one filter the counts do follow: it changes which rows
+    // are on offer at all, so a facet's number has to answer for the search
+    // the person typed.
     #[test]
     fn category_counts_follow_the_search() {
         let db = Database::open_in_memory().unwrap();
@@ -1231,9 +1233,9 @@ mod tests {
         }
     }
 
-    /// A re-queued job's old row stays on the SQL path: the live ids are
-    /// excluded in SQL, and the page, its total and every bucket count match
-    /// the Rust path over the same rows with those ids removed.
+    // A re-queued job's old row stays on the SQL path: the live ids are
+    // excluded in SQL, and the page, its total and every bucket count match
+    // the Rust path over the same rows with those ids removed.
     #[test]
     fn sql_path_excludes_live_rows_and_matches_rust_path() {
         let db = Database::open_in_memory().unwrap();
@@ -1351,9 +1353,9 @@ mod tests {
         assert!(HistoryPageSqlPlan::for_input(&input).is_some());
     }
 
-    /// A scheduler handle that reports `jobs` as its resident job list. Nothing
-    /// here drives the pipeline; the reads under test go straight to the
-    /// published list.
+    // A scheduler handle that reports `jobs` as its resident job list. Nothing
+    // here drives the pipeline; the reads under test go straight to the
+    // published list.
     fn scheduler_with_jobs(jobs: Vec<JobInfo>) -> SchedulerHandle {
         let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1);
@@ -1367,7 +1369,7 @@ mod tests {
         )
     }
 
-    /// The scheduler's view of an already-archived job, in `status`.
+    // The scheduler's view of an already-archived job, in `status`.
     fn resident_job(row: &JobHistoryRow, status: weaver_server_core::JobStatus) -> JobInfo {
         let mut info = job_info_from_history_row(row);
         info.status = status;

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::Database;
 use crate::jobs::JobSpec;
@@ -164,16 +164,11 @@ pub fn nzb_to_submission_spec(
     category: Option<String>,
     metadata: Vec<(String, String)>,
 ) -> JobSpec {
-    let metadata = append_original_title_metadata(
-        metadata,
-        filename.and_then(|value| strip_nzb_source_suffix(value)),
-        nzb.meta.title.as_deref(),
-    );
+    // A name chosen by a scan script or a client carries no source suffix.
+    let title = filename.map(|value| strip_nzb_source_suffix(value).unwrap_or(value));
+    let metadata = append_original_title_metadata(metadata, title, nzb.meta.title.as_deref());
 
-    let name = derive_release_name(
-        filename.and_then(|value| strip_nzb_source_suffix(value)),
-        nzb.meta.title.as_deref(),
-    );
+    let name = derive_release_name(title, nzb.meta.title.as_deref());
 
     let password_path = filename
         .map(PathBuf::from)
@@ -495,6 +490,16 @@ async fn submit_prepared_nzb(
     }
 
     handle.note_job_submitted(options.origin, submitted_category.as_deref());
+    if submitted_summary
+        .metadata
+        .iter()
+        .any(|(key, value)| key == crate::post_processing::scan::ADD_TO_TOP_KEY && value == "1")
+        && let Err(error) = handle
+            .reorder_jobs(vec![(job_id, crate::QueueMoveTarget::Top)])
+            .await
+    {
+        warn!(job_id = job_id.0, %error, "submitted job could not be moved to top");
+    }
 
     info!(
         job_id = job_id.0,
@@ -515,9 +520,9 @@ async fn submit_prepared_nzb(
     })
 }
 
-/// Materializes a durable SCORE claim without re-entering normal duplicate
-/// admission. This keeps the candidate's reserved job ID/source stable across
-/// retry and creates no work directory until scheduler enqueue succeeds.
+// Materializes a durable SCORE claim without re-entering normal duplicate
+// admission. This keeps the candidate's reserved job ID/source stable across
+// retry and creates no work directory until scheduler enqueue succeeds.
 pub async fn materialize_semantic_promotion(
     db: &Database,
     handle: &SchedulerHandle,
@@ -654,9 +659,9 @@ pub async fn materialize_semantic_promotion(
     Ok(job_id)
 }
 
-/// Replays durable promotion claims after scheduler restoration. Claims whose
-/// job is already restored are completed without a duplicate enqueue; failed
-/// materializations are returned to parked state by the materializer.
+// Replays durable promotion claims after scheduler restoration. Claims whose
+// job is already restored are completed without a duplicate enqueue; failed
+// materializations are returned to parked state by the materializer.
 pub async fn reconcile_semantic_promotions(
     db: &Database,
     handle: &SchedulerHandle,
@@ -682,10 +687,10 @@ pub async fn reconcile_semantic_promotions(
     Ok(materialized)
 }
 
-/// Parses one ordered historical NZB page off the async and scheduler threads,
-/// then commits its fingerprints and checkpoint atomically. Missing or malformed
-/// payloads advance the cursor with a bounded count so startup recovery cannot
-/// loop forever on old broken history.
+// Parses one ordered historical NZB page off the async and scheduler threads,
+// then commits its fingerprints and checkpoint atomically. Missing or malformed
+// payloads advance the cursor with a bounded count so startup recovery cannot
+// loop forever on old broken history.
 pub async fn run_duplicate_fingerprint_backfill_batch(
     db: &Database,
 ) -> Result<DuplicateBackfillReport, SubmitNzbError> {
@@ -775,8 +780,8 @@ pub async fn run_duplicate_fingerprint_backfill_batch(
     })
 }
 
-/// Bounded startup catch-up. Subsequent starts resume from the durable cursor;
-/// a complete marker prevents any further scans.
+// Bounded startup catch-up. Subsequent starts resume from the durable cursor;
+// a complete marker prevents any further scans.
 pub async fn reconcile_duplicate_fingerprint_backfill(
     db: &Database,
     max_batches: usize,
@@ -833,6 +838,20 @@ pub async fn submit_nzb_bytes_with_options(
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let submit_started = Instant::now();
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata).await? {
+        let scanned = crate::post_processing::scan::scan_reader(
+            db,
+            config,
+            Cursor::new(nzb_bytes.to_vec()),
+            filename,
+            password.clone(),
+            category,
+            metadata,
+            options,
+        )
+        .await?;
+        return submit_scanned_nzb(db, handle, config, scanned, password, submit_started).await;
+    }
     let mut source = Cursor::new(nzb_bytes);
     let prepared = match persisted_nzb::persist_decoded_nzb_reader_to_zstd(&mut source) {
         Ok(prepared) => prepared,
@@ -936,11 +955,7 @@ where
             return Err(SubmitNzbError::Fetch("empty response body".into()));
         }
 
-        let nzb = weaver_nzb::parse_nzb(&nzb_bytes)?;
-        if nzb.files.is_empty() {
-            return Err(SubmitNzbError::Empty);
-        }
-
+        // Submission runs Scan scripts before parsing these fetched bytes.
         return Ok((nzb_bytes, filename));
     }
 
@@ -1021,6 +1036,20 @@ where
     R: Read + Send + 'static,
 {
     let submit_started = Instant::now();
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata).await? {
+        let scanned = crate::post_processing::scan::scan_reader(
+            db,
+            config,
+            source,
+            filename,
+            password.clone(),
+            category,
+            metadata,
+            options,
+        )
+        .await?;
+        return submit_scanned_nzb(db, handle, config, scanned, password, submit_started).await;
+    }
     let persist_result = tokio::task::spawn_blocking(move || {
         let mut source = source;
         super::persisted_nzb::persist_decoded_nzb_reader_to_zstd(&mut source)
@@ -1093,6 +1122,14 @@ pub async fn submit_staged_nzb_zstd_with_options(
     metadata: Vec<(String, String)>,
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata).await? {
+        let source = zstd::stream::read::Decoder::new(Cursor::new(nzb_zstd))
+            .map_err(SubmitNzbError::Save)?;
+        return submit_uploaded_nzb_reader_with_options(
+            db, handle, config, source, filename, password, category, metadata, options,
+        )
+        .await;
+    }
     let (nzb, raw_job_hash) = match persisted_nzb::parse_and_hash_persisted_nzb_bytes(&nzb_zstd) {
         Ok(parsed) => parsed,
         Err(persisted_nzb::PersistedNzbError::Io(error)) => {
@@ -1162,6 +1199,14 @@ async fn submit_staged_parsed_nzb_with_hash(
     metadata: Vec<(String, String)>,
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &metadata).await? {
+        let source = zstd::stream::read::Decoder::new(Cursor::new(nzb_zstd))
+            .map_err(SubmitNzbError::Save)?;
+        return submit_uploaded_nzb_reader_with_options(
+            db, handle, config, source, filename, password, category, metadata, options,
+        )
+        .await;
+    }
     submit_prepared_nzb(
         db,
         handle,
@@ -1193,6 +1238,24 @@ pub async fn submit_staged_prepared_nzb_with_options(
     options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let category = preparation.spec.category.clone();
+    if crate::post_processing::scan::enabled(db, category.as_deref(), &preparation.spec.metadata)
+        .await?
+    {
+        let source = zstd::stream::read::Decoder::new(Cursor::new(nzb_zstd))
+            .map_err(SubmitNzbError::Save)?;
+        return submit_uploaded_nzb_reader_with_options(
+            db,
+            handle,
+            config,
+            source,
+            filename,
+            preparation.spec.password,
+            category,
+            preparation.spec.metadata,
+            options,
+        )
+        .await;
+    }
     let raw_job_hash = preparation.evidence.raw_job_hash;
     submit_prepared_nzb(
         db,
@@ -1210,6 +1273,54 @@ pub async fn submit_staged_prepared_nzb_with_options(
         },
         options,
         Some(preparation),
+    )
+    .await
+}
+
+async fn submit_scanned_nzb(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    scanned: crate::post_processing::scan::ScannedSubmission,
+    password: Option<String>,
+    submit_started: Instant,
+) -> Result<SubmittedJob, SubmitNzbError> {
+    let crate::post_processing::scan::ScannedSubmission {
+        mut source,
+        scratch,
+        filename,
+        category,
+        metadata,
+        options,
+    } = scanned;
+    let prepared = tokio::task::spawn_blocking(move || {
+        let result = persisted_nzb::persist_decoded_nzb_reader_to_zstd(&mut source);
+        drop(source);
+        drop(scratch);
+        result
+    })
+    .await
+    .map_err(|error| SubmitNzbError::Save(std::io::Error::other(error)))?
+    .map_err(|error| match error {
+        persisted_nzb::PersistedNzbError::Io(error) => SubmitNzbError::Save(error),
+        persisted_nzb::PersistedNzbError::Parse(error) => SubmitNzbError::Parse(error),
+    })?;
+    submit_prepared_nzb(
+        db,
+        handle,
+        config,
+        Some(&prepared.nzb),
+        PreparedSubmission {
+            nzb_zstd: prepared.nzb_zstd,
+            raw_job_hash: prepared.raw_job_hash,
+            filename,
+            password,
+            category,
+            metadata,
+            submit_started,
+        },
+        options,
+        None,
     )
     .await
 }
@@ -1330,6 +1441,32 @@ mod tests {
         assert!(!bytes.is_empty());
         assert!(request.starts_with("GET /download.nzb HTTP/1.1"));
         assert!(request.contains(&format!("host: public.test:{}", addr.port())));
+    }
+
+    #[tokio::test]
+    async fn fetch_nzb_keeps_unparsed_payload_for_scan_scripts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = b"incomplete NZB awaiting scan repair";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(payload).await.unwrap();
+        });
+        let url = format!("http://public.test:{}/repairable.nzb", addr.port());
+        let (bytes, _) = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
+            Ok(pinned_target(url, addr))
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(bytes, payload);
+        assert!(weaver_nzb::parse_nzb(&bytes).is_err());
     }
 
     #[tokio::test]

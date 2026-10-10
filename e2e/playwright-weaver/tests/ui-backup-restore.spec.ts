@@ -301,9 +301,10 @@ async function createSourceMarkersThroughUI(
   const scheduleForm = page.getByRole("dialog", { name: "Add schedule", exact: true });
   await scheduleForm.getByLabel("Time", { exact: true }).fill("03:15");
   await scheduleForm.getByRole("textbox", { name: "Label", exact: true }).fill(matrix.scheduleName);
+  await scheduleForm.getByRole("switch", { name: "Enabled", exact: true }).click();
   await scheduleForm.getByRole("button", { name: "Save", exact: true }).click();
   await expect(scheduleForm).toBeHidden();
-  await expect(tableRow(page, "Schedules", matrix.scheduleName)).toBeVisible();
+  await expect(tableRow(page, "Downloads", matrix.scheduleName)).toBeVisible();
 
   await page.goto("/settings/servers");
   await page.getByRole("banner").getByRole("button", { name: "Add provider", exact: true }).click();
@@ -443,8 +444,9 @@ async function expectProductMarkers(
   if (present) await expect(categoryRow).toContainText(matrix.categoryPattern);
 
   await page.goto("/settings/schedules");
+  // The list heads only the groups that hold a rule, so the list itself is what loads.
   await expect(page.getByRole("region", { name: "Schedules", exact: true })).toBeVisible();
-  await expect(tableRow(page, "Schedules", matrix.scheduleName)).toHaveCount(present ? 1 : 0);
+  await expect(tableRow(page, "Downloads", matrix.scheduleName)).toHaveCount(present ? 1 : 0);
 
   await page.goto("/settings/servers");
   await expect(tableRow(page, "Servers", "nntp")).toBeVisible();

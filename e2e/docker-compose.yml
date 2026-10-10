@@ -145,6 +145,7 @@ services:
       WEAVER_NNTP_BACKUP_PORT: ${E2E_NNTP_BACKUP_CLIENT_PORT:-119}
       WEAVER_DATABASE_URL: "${E2E_WEAVER_DATABASE_URL:-}"
       WEAVER_E2E_MODE: "${E2E_WEAVER_MODE:-0}"
+      WEAVER_E2E_NETWORK_TIME_SCALE: "${E2E_WEAVER_NETWORK_TIME_SCALE:-1}"
       WEAVER_E2E_CLOCK_FILE: "${E2E_WEAVER_CLOCK_FILE:-}"
       WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-true}"
       WEAVER_BASE_URL: "${E2E_WEAVER_BASE_URL:-/}"
@@ -278,6 +279,9 @@ services:
         condition: service_healthy
     volumes:
       - weaver-data:/weaver-data
+      # Weaver's SQLite datastore lives beside its config; datastore
+      # assertions open it read-only.
+      - weaver-config:/weaver-config
       - weaver-downloads:/weaver-downloads:ro
       - weaver-e2e-clock:/e2e-clock
       - weaver-watch-folder:/watch-folder
@@ -306,6 +310,14 @@ services:
       E2E_WEAVER_RATE_LIMIT_STAGE: "${E2E_WEAVER_RATE_LIMIT_STAGE:-initial}"
       E2E_WEAVER_UI_STAGE: "${E2E_WEAVER_UI_STAGE:-initial}"
       E2E_WEAVER_CLOCK_FILE: "/e2e-clock/now"
+      # Set in Postgres phases so datastore assertions reach the same database.
+      E2E_WEAVER_DATABASE_URL: "${E2E_WEAVER_DATABASE_URL:-}"
+      # Staged flows (a Weaver restart between Playwright runs) name the stage
+      # here; a spec keeps its cross-stage state under /artifacts.
+      E2E_WEAVER_STAGE: "${E2E_WEAVER_STAGE:-initial}"
+      # Long-form scenarios (@extended) run only when the operator asks.
+      E2E_WEAVER_EXTENDED: "${E2E_WEAVER_EXTENDED:-0}"
+      E2E_WEAVER_TIMEZONE: "${E2E_WEAVER_TIMEZONE:-UTC}"
 
   # Nyuu — real usenet binary poster (yEnc encoding + NNTP posting + NZB generation)
   nyuu:

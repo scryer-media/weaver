@@ -207,22 +207,89 @@ impl ProxyProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingPolicy {
+    #[serde(default)]
     pub proxy_ids: Vec<u32>,
+    #[serde(default)]
     pub allow_direct: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legs: Vec<super::RouteLeg>,
+    #[serde(default)]
+    pub failover: super::Failover,
 }
 impl Default for RoutingPolicy {
     fn default() -> Self {
         Self {
             proxy_ids: Vec::new(),
             allow_direct: true,
+            legs: Vec::new(),
+            failover: super::Failover::Redistribute,
         }
     }
 }
 impl RoutingPolicy {
+    pub fn route(&self) -> super::Route {
+        if self.legs.is_empty() {
+            super::Route::from_legacy(self)
+        } else {
+            super::Route {
+                legs: self.legs.clone(),
+                failover: self.failover,
+            }
+        }
+    }
+
+    pub fn from_route(
+        route: super::Route,
+        pools: &std::collections::HashMap<u32, super::ProxyPool>,
+    ) -> Self {
+        let mut proxy_ids = Vec::new();
+        let allow_direct = match route.legs.first().map(|leg| &leg.path) {
+            Some(super::LegPath::Direct) => true,
+            Some(super::LegPath::Ladder {
+                rungs,
+                direct_fallback,
+            }) => {
+                for rung in rungs {
+                    match rung {
+                        super::Rung::Proxy { id } => proxy_ids.push(*id),
+                        super::Rung::Chain { ids } => proxy_ids.extend(ids),
+                        super::Rung::Pool { id } => {
+                            if let Some(pool) = pools.get(id) {
+                                proxy_ids.extend(&pool.member_ids);
+                            }
+                        }
+                    }
+                }
+                *direct_fallback
+            }
+            None => false,
+        };
+        Self {
+            proxy_ids,
+            allow_direct,
+            legs: route.legs,
+            failover: route.failover,
+        }
+    }
+
     pub fn is_direct(&self) -> bool {
-        self.proxy_ids.is_empty() && self.allow_direct
+        if self.legs.is_empty() {
+            self.proxy_ids.is_empty() && self.allow_direct
+        } else {
+            matches!(
+                self.legs.as_slice(),
+                [super::RouteLeg {
+                    egress_id: 0,
+                    path: super::LegPath::Direct,
+                    ..
+                }]
+            )
+        }
     }
     pub fn validate(&self) -> Result<(), String> {
+        if !self.legs.is_empty() {
+            return self.route().validate_shape();
+        }
         if self.proxy_ids.len() > 8 {
             return Err("a route supports at most eight proxies".into());
         }

@@ -151,19 +151,31 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::I64(job_id.0 as i64),
         SqlArg::OptText(history.server_attribution.clone()),
         SqlArg::I64(job_id.0 as i64),
+        SqlArg::I64(job_id.0 as i64),
     ]
 }
 
 async fn archive_job_sql(
     datastore: StoreDatastore,
     job_id: JobId,
-    args: Vec<SqlArg>,
+    history: history::JobHistoryRow,
     typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
 ) -> Result<Option<history::JobHistoryRow>, StateError> {
     let archived = SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
-        let args = args.clone();
+        let mut history = history.clone();
         Box::pin(async move {
+            tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
             lock_active_job_for_delete_tx(tx, job_id).await?;
+            if let Some(row) = tx.fetch_optional("SELECT state FROM script_job_state WHERE job_id = {}", &[SqlArg::I64(job_id.0 as i64)]).await? {
+                let effects: crate::post_processing::effects::JobScriptEffects = serde_json::from_str(&row.text("state")?).map_err(|error| StateError::Database(error.to_string()))?;
+                let mut parameters: Vec<(String, String)> = history.metadata.as_deref().map(serde_json::from_str).transpose().map_err(|error| StateError::Database(error.to_string()))?.unwrap_or_default();
+                effects.merge_parameters(&mut parameters);
+                history.metadata = Some(serde_json::to_string(&parameters).map_err(|error| StateError::Database(error.to_string()))?);
+                if history.status == "cancelled" && let Some(directory) = effects.directory {
+                    history.output_dir = Some(directory.to_string_lossy().into_owned());
+                }
+            }
+            let args = history_args(&history, job_id);
             let archived = tx
                 .fetch_optional(
                 "INSERT INTO job_history
@@ -171,7 +183,7 @@ async fn archive_job_sql(
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
                   created_at, completed_at, metadata,
-                  post_processing_summary, script_results_json, server_attribution)
+                  post_processing_summary, script_results_json, server_attribution, support_facts)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
@@ -179,7 +191,8 @@ async fn archive_job_sql(
                          {}, {}, {},
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
                          (SELECT script_results_json FROM active_jobs WHERE job_id = {}),
-                         COALESCE({}, (SELECT server_attribution FROM active_jobs WHERE job_id = {})))
+                         COALESCE({}, (SELECT server_attribution FROM active_jobs WHERE job_id = {})),
+                         (SELECT support_facts FROM active_jobs WHERE job_id = {}))
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
@@ -201,7 +214,9 @@ async fn archive_job_sql(
                     post_processing_summary = excluded.post_processing_summary,
                     script_results_json = excluded.script_results_json,
                     server_attribution =
-                        COALESCE(excluded.server_attribution, job_history.server_attribution)
+                        COALESCE(excluded.server_attribution, job_history.server_attribution),
+                    support_facts =
+                        COALESCE(excluded.support_facts, job_history.support_facts)
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
@@ -241,12 +256,12 @@ impl Database {
         history: &history::JobHistoryRow,
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
-        let args = history_args(history, job_id);
+        let history = history.clone();
         // Capture the cache generation before the archive read so a concurrent
         // history-delete that bumps the generation makes the re-cache a no-op
         // instead of resurrecting the just-deleted row.
         let observed_generation = self.job_history_cache_generation();
-        let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, args, None));
+        let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, history, None));
         if let Ok(Some(row)) = &result {
             self.cache_job_history_at(row.clone(), observed_generation);
         }
@@ -255,18 +270,26 @@ impl Database {
 
     pub fn delete_active_job(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        let db = self.clone();
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_active_job", |tx| {
                 Box::pin(async move {
+                    crate::post_processing::output::delete_script_state_tx(tx, job_id.0 as i64)
+                        .await?;
                     lock_active_job_for_delete_tx(tx, job_id).await?;
                     delete_active_job_rows(tx, job_id.0 as i64).await?;
                     Ok(())
                 })
             })
             .await?;
+            db.notify_script_events_changed();
             run_inline_incremental_vacuum(&datastore).await?;
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.forget_script_effects(job_id.0);
+        }
+        result
     }
 
     pub fn prune_orphan_active_state(&self) -> Result<OrphanActiveStateCounts, StateError> {
@@ -347,8 +370,7 @@ impl DatabaseWriterExecutor {
         history: &history::JobHistoryRow,
     ) -> Result<Option<history::JobHistoryRow>, StateError> {
         let datastore = self.datastore();
-        let args = history_args(history, job_id);
-        self.run_sql_blocking(archive_job_sql(datastore, job_id, args, None))
+        self.run_sql_blocking(archive_job_sql(datastore, job_id, history.clone(), None))
     }
 
     pub(crate) fn archive_job_with_terminal_cause(
@@ -358,11 +380,10 @@ impl DatabaseWriterExecutor {
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
     ) -> Result<Option<history::JobHistoryRow>, StateError> {
         let datastore = self.datastore();
-        let args = history_args(history, job_id);
         self.run_sql_blocking(archive_job_sql(
             datastore,
             job_id,
-            args,
+            history.clone(),
             typed_terminal_cause,
         ))
     }

@@ -62,8 +62,8 @@ async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
     port
 }
 
-/// Answers a BODY with nothing at all, holding the session open until the
-/// client gives up on it.
+// Answers a BODY with nothing at all, holding the session open until the
+// client gives up on it.
 async fn spawn_delayed_body_initial_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -87,8 +87,8 @@ async fn spawn_delayed_body_initial_server() -> u16 {
     port
 }
 
-/// Asks for re-authentication mid-session, then never answers the AUTHINFO,
-/// holding the session open until the client gives up on it.
+// Asks for re-authentication mid-session, then never answers the AUTHINFO,
+// holding the session open until the client gives up on it.
 async fn spawn_delayed_reauth_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -238,10 +238,10 @@ async fn spawn_probe_confirmation_server(head_response: &'static [u8]) -> u16 {
     port
 }
 
-/// A server on which STAT finds nothing, and which insists that the HEAD
-/// re-check arrive as one pipelined batch: the second HEAD has to be on the
-/// wire before the first is answered. Answers the first id as present and the
-/// second as missing.
+// A server on which STAT finds nothing, and which insists that the HEAD
+// re-check arrive as one pipelined batch: the second HEAD has to be on the
+// wire before the first is answered. Answers the first id as present and the
+// second as missing.
 async fn spawn_pipelined_head_recheck_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -297,9 +297,9 @@ async fn spawn_pipelined_head_recheck_server() -> u16 {
     port
 }
 
-/// Longer than any test runs. A script answers, closes or deliberately goes
-/// silent, so a connection's own timeouts only decide a test that sets them
-/// itself, never a slow runner.
+// Longer than any test runs. A script answers, closes or deliberately goes
+// silent, so a connection's own timeouts only decide a test that sets them
+// itself, never a slow runner.
 const UNREACHED_TIMEOUT: Duration = Duration::from_secs(3600);
 
 fn scripted_server(port: u16, group: usize) -> ServerPoolConfig {
@@ -638,6 +638,7 @@ async fn group_requirement_discovery_retries_the_decoded_batch_item() {
             0,
             None,
             None,
+            None,
             "<group-required@example.com>",
             DecodedBatchItem {
                 elapsed: Duration::ZERO,
@@ -866,12 +867,12 @@ fn probing_client(server: ServerPoolConfig) -> NntpClient {
 
 const READER_CAPABILITIES: &[u8] = b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
 
-/// A STAT batch that never got a connection must leave the server alone.
-///
-/// The deadline expired while the request was still queued behind our own
-/// connection semaphore, so nothing ever reached the server. Cooling it
-/// down here stalls every download behind a transient cooldown when only
-/// one server is configured.
+// A STAT batch that never got a connection must leave the server alone.
+//
+// The deadline expired while the request was still queued behind our own
+// connection semaphore, so nothing ever reached the server. Cooling it
+// down here stalls every download behind a transient cooldown when only
+// one server is configured.
 #[tokio::test]
 async fn stat_batch_that_never_got_a_connection_leaves_the_server_healthy() {
     let port = spawn_scripted_server(vec![
@@ -906,9 +907,9 @@ async fn stat_batch_that_never_got_a_connection_leaves_the_server_healthy() {
     drop(held);
 }
 
-/// A soft timeout on a live connection is still a transport failure: the
-/// command went out and the reply never came, so the server is implicated
-/// and keeps its cooldown.
+// A soft timeout on a live connection is still a transport failure: the
+// command went out and the reply never came, so the server is implicated
+// and keeps its cooldown.
 #[tokio::test]
 async fn stat_batch_that_stalls_mid_command_still_cools_the_server_down() {
     let port = spawn_shared_scripted_server(
@@ -1118,9 +1119,9 @@ fn transient_failure_recording_counts_soft_timeouts() {
     );
 }
 
-/// Failing to obtain a connection is local capacity, not a server fault:
-/// it is still retryable, but it must never cool the server down, and it
-/// carries no connection to discard.
+// Failing to obtain a connection is local capacity, not a server fault:
+// it is still retryable, but it must never cool the server down, and it
+// carries no connection to discard.
 #[test]
 fn acquire_timeout_is_capacity_not_transport() {
     assert!(is_transient(&NntpError::AcquireTimeout(15)));
@@ -1189,7 +1190,7 @@ fn from_pool_default_soft_timeout() {
     assert_eq!(client.soft_timeout, Duration::from_secs(15));
 }
 
-/// Build a multi-server client for testing server ordering.
+// Build a multi-server client for testing server ordering.
 fn multi_server_client(server_count: usize) -> NntpClient {
     let servers: Vec<ServerPoolConfig> = (0..server_count)
         .map(|i| ServerPoolConfig {
@@ -1257,7 +1258,7 @@ async fn build_server_order_excludes_servers() {
     assert!(order.contains(&2));
 }
 
-/// Servers: 0 = fill (group 0), 1 = fill (group 1), 2 = backfill (group 0).
+// Servers: 0 = fill (group 0), 1 = fill (group 1), 2 = backfill (group 0).
 fn tiered_client(backfill_flags: &[bool]) -> NntpClient {
     let servers: Vec<ServerPoolConfig> = backfill_flags
         .iter()
@@ -1419,13 +1420,13 @@ fn global_quota_predicate_requires_every_normal_fill_and_ignores_backfill() {
     assert!(!empty_pool.all_normal_fill_servers_quota_blocked());
 }
 
-/// A 430 in the middle of a pipelined batch must not dirty the batch.
-///
-/// The article-not-found answer is a complete, bodyless response: the
-/// reader stays in sync and the socket is reusable. Marking the batch dirty
-/// made the caller discard the connection and permanently block the
-/// server's pipelining proof, so a provider that legitimately does not
-/// carry some articles could never be pipelined.
+// A 430 in the middle of a pipelined batch must not dirty the batch.
+//
+// The article-not-found answer is a complete, bodyless response: the
+// reader stays in sync and the socket is reusable. Marking the batch dirty
+// made the caller discard the connection and permanently block the
+// server's pipelining proof, so a provider that legitimately does not
+// carry some articles could never be pipelined.
 #[tokio::test]
 async fn pipelined_article_not_found_keeps_the_batch_and_connection_clean() {
     let port = spawn_scripted_server(vec![
@@ -1773,10 +1774,10 @@ async fn cooling_fill_server_keeps_backfill_locked_and_order_empty() {
     );
 }
 
-/// A `Disabled` fill server never produces the 430 that would put it in
-/// `exclude`, so backfill has to unlock on the health state instead.
-/// Without this, an article the remaining fill servers do not have is
-/// pinned out of backfill for as long as the auth failure lasts.
+// A `Disabled` fill server never produces the 430 that would put it in
+// `exclude`, so backfill has to unlock on the health state instead.
+// Without this, an article the remaining fill servers do not have is
+// pinned out of backfill for as long as the auth failure lasts.
 #[tokio::test]
 async fn disabled_fill_server_unlocks_backfill() {
     let client = tiered_client(&[false, false, true]);
@@ -1796,8 +1797,8 @@ async fn disabled_fill_server_unlocks_backfill() {
     );
 }
 
-/// An outage disable heals on its own; it must wait like a cooldown, not
-/// spill the queue onto backfill.
+// An outage disable heals on its own; it must wait like a cooldown, not
+// spill the queue onto backfill.
 #[tokio::test]
 async fn outage_disabled_fill_server_keeps_backfill_locked_with_peers_excluded() {
     let client = tiered_client(&[false, false, true]);
@@ -1852,7 +1853,7 @@ async fn cooling_fill_server_keeps_backfill_locked_with_peers_excluded() {
     );
 }
 
-/// The owned blocking lane runs the same tiering rule off a `try_lock`.
+// The owned blocking lane runs the same tiering rule off a `try_lock`.
 #[tokio::test]
 async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
     let client = tiered_client(&[false, false, true]);
@@ -1885,8 +1886,8 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
     );
 }
 
-/// Contention is "ask again", not a tiering verdict: it must requeue on
-/// the owned fast path without being mistaken for capacity admission.
+// Contention is "ask again", not a tiering verdict: it must requeue on
+// the owned fast path without being mistaken for capacity admission.
 #[test]
 fn selection_contention_is_requeued_but_is_not_capacity_admission() {
     let contended = BlockingBodyLaneAcquireError::SelectionContended;
@@ -1904,11 +1905,11 @@ fn selection_contention_is_requeued_but_is_not_capacity_admission() {
     );
 }
 
-/// The dispatcher asks this question before it decides between an owned lane
-/// and the async path, and a momentary lock collision is not an answer about
-/// servers. Collapsing it into "no candidate" sent the batch to the async
-/// path — which then dialled its own connection while the owned lane sat on a
-/// warm one.
+// The dispatcher asks this question before it decides between an owned lane
+// and the async path, and a momentary lock collision is not an answer about
+// servers. Collapsing it into "no candidate" sent the batch to the async
+// path — which then dialled its own connection while the owned lane sat on a
+// warm one.
 #[tokio::test]
 async fn candidacy_separates_contention_from_having_no_candidate() {
     let client = NntpClient::new(NntpClientConfig {
@@ -1941,8 +1942,8 @@ async fn candidacy_separates_contention_from_having_no_candidate() {
     );
 }
 
-/// A held health mutex used to surface as `NoEligibleServer`, which reads
-/// as "no server can serve this" and pushed the work off the owned lane.
+// A held health mutex used to surface as `NoEligibleServer`, which reads
+// as "no server can serve this" and pushed the work off the owned lane.
 #[tokio::test]
 async fn contended_health_mutex_reports_contention_not_an_empty_tier() {
     let client = tiered_client(&[false]);
@@ -3119,10 +3120,10 @@ fn lane_config(tls: bool, starttls: bool, pinned_ca: bool) -> ServerConfig {
     }
 }
 
-/// Owned lanes are the one download engine, so every server gets one: there is
-/// no second path left for a config to fall to. Plaintext, implicit TLS with
-/// and without a pinned CA, STARTTLS, and an adopted name-mismatch certificate
-/// are all lane-served.
+// Owned lanes are the one download engine, so every server gets one: there is
+// no second path left for a config to fall to. Plaintext, implicit TLS with
+// and without a pinned CA, STARTTLS, and an adopted name-mismatch certificate
+// are all lane-served.
 #[test]
 fn every_server_arrangement_gets_an_owned_lane() {
     for tls in [false, true] {
@@ -3145,11 +3146,11 @@ fn adopted_name_mismatch_certificate_still_gets_an_owned_lane() {
     assert!(supports_blocking_body_lane(&config));
 }
 
-/// A 501 is a syntax error in the one request, not a server without STAT.
-///
-/// One message-id the server cannot parse must not retire STAT for the
-/// process: every later probe would then run HEAD per article, one round trip
-/// each, against a server that pipelines STAT perfectly well.
+// A 501 is a syntax error in the one request, not a server without STAT.
+//
+// One message-id the server cannot parse must not retire STAT for the
+// process: every later probe would then run HEAD per article, one round trip
+// each, against a server that pipelines STAT perfectly well.
 #[tokio::test]
 async fn a_501_to_one_stat_does_not_retire_stat_for_the_server() {
     let port = spawn_scripted_server(vec![
@@ -3189,8 +3190,8 @@ async fn a_501_to_one_stat_does_not_retire_stat_for_the_server() {
     );
 }
 
-/// With every usable server excluded there is nobody left to ask, and that is
-/// an answer for the caller — not an inconclusive batch, and not a dial.
+// With every usable server excluded there is nobody left to ask, and that is
+// an answer for the caller — not an inconclusive batch, and not a dial.
 #[tokio::test]
 async fn a_probe_with_every_server_excluded_has_nobody_to_ask() {
     // The script would fail on any command; the point is that no connection
@@ -3221,9 +3222,9 @@ async fn a_probe_with_every_server_excluded_has_nobody_to_ask() {
     );
 }
 
-/// The HEAD re-check of STAT's misses is one pipelined batch, not one
-/// failover fetch per article: N misses cost one round trip per server, and a
-/// missing article is exactly the case where every server has to be asked.
+// The HEAD re-check of STAT's misses is one pipelined batch, not one
+// failover fetch per article: N misses cost one round trip per server, and a
+// missing article is exactly the case where every server has to be asked.
 #[tokio::test]
 async fn the_head_recheck_of_stat_misses_is_one_pipelined_batch() {
     let port = spawn_pipelined_head_recheck_server().await;
@@ -3248,10 +3249,10 @@ async fn the_head_recheck_of_stat_misses_is_one_pipelined_batch() {
     );
 }
 
-/// The owned-lane candidacy probe asks whether any server could take work at
-/// all. It is not a dispatch, so it must leave a server's blocked signal
-/// exactly as the last real dispatch left it — the zero-byte question it
-/// asks fits any server with a byte of headroom.
+// The owned-lane candidacy probe asks whether any server could take work at
+// all. It is not a dispatch, so it must leave a server's blocked signal
+// exactly as the last real dispatch left it — the zero-byte question it
+// asks fits any server with a byte of headroom.
 #[test]
 fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
     let transfers = crate::transfer::ServerTransferRegistry::new();

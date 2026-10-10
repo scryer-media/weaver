@@ -6,12 +6,8 @@ import { NextRouteFallback } from "./shell/route-states";
 const basename = window.__WEAVER_BASE__ || "/";
 
 /**
- * The Next UI's own route table.
- *
- * It deliberately shares no route objects with the classic router: the two
- * interfaces are independent trees mounted by `App`, and only one of them ever
- * exists in a given document. The paths match the classic ones so a bookmarked
- * URL keeps working across the toggle.
+ * The interface's route table. Every screen loads on its own the first time it
+ * is visited.
  */
 function lazyRoute<TModule extends Record<string, unknown>, TKey extends keyof TModule>(
   importer: () => Promise<TModule>,
@@ -47,18 +43,27 @@ export const nextRouter = createBrowserRouter(
         },
         { path: "logs", ...lazyRoute(() => import("./pages/LogsPage"), "LogsPage") },
         {
+          path: "tools/nzb-analyzer",
+          ...lazyRoute(() => import("./pages/NzbAnalyzerPage"), "NzbAnalyzerPage"),
+        },
+        {
           path: "settings",
           children: [
             { index: true, element: <Navigate to="general" replace /> },
+            { path: "proxies", element: <Navigate to="/settings/networking/proxies" replace /> },
+            { path: "bandwidth", element: <Navigate to="/settings/networking/bandwidth" replace /> },
+            { path: "networking", element: <Navigate to="/settings/networking/overview" replace /> },
+            { path: "post-processing", element: <Navigate to="/settings/scripts/configuration" replace /> },
+            { path: "scripts", element: <Navigate to="/settings/scripts/configuration" replace /> },
             {
-              path: ":panel",
+              path: ":panel/*",
               ...lazyRoute(() => import("./pages/settings/SettingsPage"), "SettingsPage"),
             },
           ],
         },
-        // The classic UI has screens this one folds into others (the upload
-        // page, the standalone server and category editors). Anything
-        // unrecognised lands on Downloads rather than an error page.
+        // Older paths whose screens now live inside others (the upload page,
+        // the standalone server and category editors), and anything else
+        // unrecognised, land on Downloads rather than an error page.
         { path: "*", element: <Navigate to="/" replace /> },
       ],
     },

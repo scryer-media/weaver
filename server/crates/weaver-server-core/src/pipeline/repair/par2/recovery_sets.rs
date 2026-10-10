@@ -1,13 +1,13 @@
-//! Continuation of the `impl Pipeline` block from `repair/par2.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `repair/par2.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 
 impl Pipeline {
-    /// Read a completed PAR2 metadata candidate from disk. Recovery volumes
-    /// repeat enough critical packets to be valid metadata carriers, so an
-    /// indexless posting must not require an index-looking filename here.
+    // Read a completed PAR2 metadata candidate from disk. Recovery volumes
+    // repeat enough critical packets to be valid metadata carriers, so an
+    // indexless posting must not require an index-looking filename here.
     pub(crate) async fn try_load_par2_metadata(&mut self, job_id: JobId, file_id: NzbFileId) {
         let (filename, file_path) = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -317,9 +317,9 @@ impl Pipeline {
             .send(PipelineEvent::Par2MetadataLoaded { job_id });
     }
 
-    /// Select the compatibility view used by legacy single-set helpers.
-    /// Per-set sessions and byte-derived grid evidence survive this view change;
-    /// only an actual identity or byte mutation may retire them.
+    // Select the compatibility view used by legacy single-set helpers.
+    // Per-set sessions and byte-derived grid evidence survive this view change;
+    // only an actual identity or byte mutation may retire them.
     pub(super) async fn install_primary_recovery_set(
         &mut self,
         job_id: JobId,
@@ -334,7 +334,7 @@ impl Pipeline {
         self.install_recovery_set(job_id, new_set_id).await;
     }
 
-    /// Replay completed recovery volumes after a set's index becomes usable.
+    // Replay completed recovery volumes after a set's index becomes usable.
     pub(super) async fn install_recovery_set(
         &mut self,
         job_id: JobId,
@@ -375,8 +375,8 @@ impl Pipeline {
         }
     }
 
-    /// Record what a parsed set describes, so it can be weighed against the
-    /// others and its files recognized later.
+    // Record what a parsed set describes, so it can be weighed against the
+    // others and its files recognized later.
     pub(super) fn record_par2_set_summary(
         &mut self,
         job_id: JobId,
@@ -447,11 +447,11 @@ impl Pipeline {
         }
     }
 
-    /// Note every recovery set a PAR2 file's packets turned out to speak for.
-    ///
-    /// A set met only this way has no descriptions and can never be served — it
-    /// is recorded so its volumes are attributed away from the served set and
-    /// so the job can name it.
+    // Note every recovery set a PAR2 file's packets turned out to speak for.
+    //
+    // A set met only this way has no descriptions and can never be served — it
+    // is recorded so its volumes are attributed away from the served set and
+    // so the job can name it.
     pub(super) fn note_foreign_recovery_set_sightings(
         &mut self,
         job_id: JobId,
@@ -486,13 +486,13 @@ impl Pipeline {
         entry.recovery_set_id = learned;
     }
 
-    /// The recovery set worth serving: the one protecting the most payload,
-    /// ties broken by position in the posting.
-    ///
-    /// Both keys are properties of the posting rather than of this run, so a
-    /// job that is restarted, replayed from disk, or whose files arrive in a
-    /// different order reaches the same answer every time. A set known only
-    /// through somebody else's packets describes nothing and is not eligible.
+    // The recovery set worth serving: the one protecting the most payload,
+    // ties broken by position in the posting.
+    //
+    // Both keys are properties of the posting rather than of this run, so a
+    // job that is restarted, replayed from disk, or whose files arrive in a
+    // different order reaches the same answer every time. A set known only
+    // through somebody else's packets describes nothing and is not eligible.
     pub(super) fn select_primary_recovery_set(
         &self,
         job_id: JobId,
@@ -516,13 +516,13 @@ impl Pipeline {
             .map(|(set_id, _)| *set_id)
     }
 
-    /// Say once, after bounded discovery is exhausted, that this posting
-    /// carries recovery sets without enough critical metadata for a pass.
-    ///
-    /// The files those sets describe are still delivered; what is lost is the
-    /// repair they were entitled to, and that is worth exactly one line naming
-    /// every set and every file it covers. The caller invokes this only after
-    /// every observed carrier has had its turn; the latch then avoids repeats.
+    // Say once, after bounded discovery is exhausted, that this posting
+    // carries recovery sets without enough critical metadata for a pass.
+    //
+    // The files those sets describe are still delivered; what is lost is the
+    // repair they were entitled to, and that is worth exactly one line naming
+    // every set and every file it covers. The caller invokes this only after
+    // every observed carrier has had its turn; the latch then avoids repeats.
     pub(in crate::pipeline) fn warn_unservable_recovery_sets_once(&mut self, job_id: JobId) {
         let Some(runtime) = self.par2_runtime(job_id) else {
             return;
@@ -575,11 +575,11 @@ impl Pipeline {
         }
     }
 
-    /// Whether a PAR2 file's recovery blocks belong to one recovery set.
-    ///
-    /// Attribution is by validated packets. A job that has met fewer than two
-    /// sets needs no attribution; once two sets exist, an unread filename is no
-    /// evidence at all.
+    // Whether a PAR2 file's recovery blocks belong to one recovery set.
+    //
+    // Attribution is by validated packets. A job that has met fewer than two
+    // sets needs no attribution; once two sets exist, an unread filename is no
+    // evidence at all.
     pub(super) fn recovery_file_serves_set(
         &self,
         job_id: JobId,
@@ -613,10 +613,10 @@ impl Pipeline {
         false
     }
 
-    /// Whether an unread conventional recovery volume is named for a parsed set.
-    ///
-    /// This is a download-selection hint only. Packet evidence remains the sole
-    /// authority for recovery ownership and capacity.
+    // Whether an unread conventional recovery volume is named for a parsed set.
+    //
+    // This is a download-selection hint only. Packet evidence remains the sole
+    // authority for recovery ownership and capacity.
     pub(super) fn unread_recovery_file_is_named_for_set(
         &self,
         job_id: JobId,
@@ -661,8 +661,8 @@ impl Pipeline {
         par2_set_base_name(&file.filename).as_deref() == Some(base_name)
     }
 
-    /// When a PAR2 recovery volume completes, parse it and merge recovery
-    /// slices into the retained Par2FileSet (avoids re-reading at repair time).
+    // When a PAR2 recovery volume completes, parse it and merge recovery
+    // slices into the retained Par2FileSet (avoids re-reading at repair time).
     pub(crate) async fn try_merge_par2_recovery(&mut self, job_id: JobId, file_id: NzbFileId) {
         let (filename, file_path, is_par2_volume, is_complete) = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -935,23 +935,23 @@ impl Pipeline {
         }
     }
 
-    /// Read back the recovery packets that survived on every PAR2 volume of
-    /// this job that can no longer complete.
-    ///
-    /// Recovery otherwise merges only on file *completion*, so a volume one
-    /// article short of fifty contributed **zero** blocks to the arithmetic
-    /// that decides whether a job is repairable — with its intact packets
-    /// sitting on disk the whole time. Both reference downloaders read such a
-    /// volume packet by packet instead of writing it off, and the PAR2 format
-    /// is what makes that safe: every packet carries its own MD5, and the
-    /// scanner resynchronises on the packet magic, so a hole costs the packets
-    /// it lands on and nothing else.
-    ///
-    /// Only packets that validate are merged. An unvalidated merge would be
-    /// worse than no merge at all: the set keys recovery slices by exponent and
-    /// ignores repeats, so a packet read out of a hole would occupy its
-    /// exponent permanently and a later good copy of the same block could never
-    /// replace it.
+    // Read back the recovery packets that survived on every PAR2 volume of
+    // this job that can no longer complete.
+    //
+    // Recovery otherwise merges only on file *completion*, so a volume one
+    // article short of fifty contributed **zero** blocks to the arithmetic
+    // that decides whether a job is repairable — with its intact packets
+    // sitting on disk the whole time. Both reference downloaders read such a
+    // volume packet by packet instead of writing it off, and the PAR2 format
+    // is what makes that safe: every packet carries its own MD5, and the
+    // scanner resynchronises on the packet magic, so a hole costs the packets
+    // it lands on and nothing else.
+    //
+    // Only packets that validate are merged. An unvalidated merge would be
+    // worse than no merge at all: the set keys recovery slices by exponent and
+    // ignores repeats, so a packet read out of a hole would occupy its
+    // exponent permanently and a later good copy of the same block could never
+    // replace it.
     pub(in crate::pipeline) async fn salvage_partial_promoted_recovery_volumes(
         &mut self,
         job_id: JobId,
@@ -997,12 +997,12 @@ impl Pipeline {
         }
     }
 
-    /// Return the parsed recovery sets an unread volume can belong to.
-    ///
-    /// A packet observation settles attribution, including the deliberate
-    /// no-set result for a file that carries several recovery sets. Until then,
-    /// the same filename fallback used by recovery arithmetic identifies the
-    /// set to scan. A set without parsed metadata is never a candidate.
+    // Return the parsed recovery sets an unread volume can belong to.
+    //
+    // A packet observation settles attribution, including the deliberate
+    // no-set result for a file that carries several recovery sets. Until then,
+    // the same filename fallback used by recovery arithmetic identifies the
+    // set to scan. A set without parsed metadata is never a candidate.
     pub(super) fn recovery_sets_for_unread_file(
         &self,
         job_id: JobId,
@@ -1037,7 +1037,7 @@ impl Pipeline {
             .collect()
     }
 
-    /// How many bytes of this file have been committed to disk so far.
+    // How many bytes of this file have been committed to disk so far.
     pub(super) fn recovery_file_received_bytes(&self, job_id: JobId, file_index: u32) -> u64 {
         self.jobs
             .get(&job_id)
@@ -1046,11 +1046,11 @@ impl Pipeline {
             .unwrap_or(0)
     }
 
-    /// Whether any of this file's work is parked in the recovery queue.
-    ///
-    /// Parked work is not in flight, but it is not lost either: the completion
-    /// gate moves a promoted file's parked segments back onto the download queue
-    /// on its way in. A volume in that state is waiting, not stranded.
+    // Whether any of this file's work is parked in the recovery queue.
+    //
+    // Parked work is not in flight, but it is not lost either: the completion
+    // gate moves a promoted file's parked segments back onto the download queue
+    // on its way in. A volume in that state is waiting, not stranded.
     pub(super) fn recovery_file_has_parked_segments(&self, job_id: JobId, file_index: u32) -> bool {
         let file_id = NzbFileId { job_id, file_index };
         self.jobs.get(&job_id).is_some_and(|state| {
@@ -1061,8 +1061,8 @@ impl Pipeline {
         })
     }
 
-    /// Whether this file is a PAR2 recovery volume that has bytes on disk, will
-    /// never complete, and has nothing left in flight that could change that.
+    // Whether this file is a PAR2 recovery volume that has bytes on disk, will
+    // never complete, and has nothing left in flight that could change that.
     pub(super) fn recovery_volume_is_stranded(&self, job_id: JobId, file_index: u32) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
@@ -1091,6 +1091,17 @@ impl Pipeline {
             .and_then(|runtime| runtime.files.get(&file_index))
             .is_some_and(|entry| entry.promoted);
         if !promoted && file.received_bytes() == 0 {
+            return false;
+        }
+        // A metadata prefix is deliberately only a partial fetch. Its cold
+        // remainder is still available for recovery promotion. Do not freeze capacity at
+        // the few recovery packets that happened to fit in that prefix.
+        if !promoted
+            && self
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_index))
+                .is_some_and(|entry| !entry.discovery_probe_ordinals.is_empty())
+        {
             return false;
         }
         // A segment the servers have run out of answers for is the one fact that
@@ -1293,11 +1304,11 @@ impl Pipeline {
         }
     }
 
-    /// Forget that a recovery volume was ever read back short.
-    ///
-    /// Called where the file re-opens for download, so a volume that does
-    /// arrive after all merges through the ordinary completion path and reports
-    /// its whole block count.
+    // Forget that a recovery volume was ever read back short.
+    //
+    // Called where the file re-opens for download, so a volume that does
+    // arrive after all merges through the ordinary completion path and reports
+    // its whole block count.
     pub(in crate::pipeline) fn clear_par2_salvage_state_for_file(&mut self, file_id: NzbFileId) {
         if let Some(entry) = self
             .par2_runtime
@@ -1313,8 +1324,8 @@ impl Pipeline {
     }
 }
 
-/// A digest of a completed PAR2 file's bytes, or `None` when the file cannot
-/// be read — in which case the parse that follows reports the failure.
+// A digest of a completed PAR2 file's bytes, or `None` when the file cannot
+// be read — in which case the parse that follows reports the failure.
 fn par2_content_fingerprint(path: &Path) -> Option<[u8; 32]> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = blake3::Hasher::new();

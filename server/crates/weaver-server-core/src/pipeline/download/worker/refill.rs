@@ -1,46 +1,46 @@
-//! A live lane asking for its next articles.
-//!
-//! The worker owns the socket and the ring; the actor owns the queues. When
-//! a lane's pending tail runs low it sends one [`DownloadLaneRefillRequest`]
-//! and keeps reading the ring while the answer is on its way. The answer is
-//! one handout from the article scheduler — one job, at most `want` articles,
-//! chosen by the hot-job rule in `download/scheduler.rs` — booked onto the
-//! lane and sent back as a [`DownloadBatchLease`].
-//!
-//! A lane the scheduler has nothing for is not sent away at once. Idle is
-//! usually momentary — the hot job's next article is a decode away from being
-//! admitted, a spill job is about to be promoted — and an established
-//! connection is worth more than the round trip that re-dials it. The
-//! request is held in the actor and answered again on the next dispatch wake,
-//! for at most [`DOWNLOAD_REFILL_IDLE_HOLD`]; after that the lane parks on
-//! `NoWork`, keeps its socket cached, and the pool's idle loop takes over.
+// A live lane asking for its next articles.
+//
+// The worker owns the socket and the ring; the actor owns the queues. When
+// a lane's pending tail runs low it sends one [`DownloadLaneRefillRequest`]
+// and keeps reading the ring while the answer is on its way. The answer is
+// one handout from the article scheduler — one job, at most `want` articles,
+// chosen by the hot-job rule in `download/scheduler.rs` — booked onto the
+// lane and sent back as a [`DownloadBatchLease`].
+//
+// A lane the scheduler has nothing for is not sent away at once. Idle is
+// usually momentary — the hot job's next article is a decode away from being
+// admitted, a spill job is about to be promoted — and an established
+// connection is worth more than the round trip that re-dials it. The
+// request is held in the actor and answered again on the next dispatch wake,
+// for at most [`DOWNLOAD_REFILL_IDLE_HOLD`]; after that the lane parks on
+// `NoWork`, keeps its socket cached, and the pool's idle loop takes over.
 
 use super::*;
 use crate::pipeline::download::scheduler::{Handout, LaneShare, SaturationWake, YieldReason};
 
-/// How long a refill that found nothing waits in the actor before its lane is
-/// told to park. A fixed window: long enough to ride out a decode or a
-/// promotion, short enough that a truly idle lane frees its permit for a
-/// probe or another server's dial.
+// How long a refill that found nothing waits in the actor before its lane is
+// told to park. A fixed window: long enough to ride out a decode or a
+// promotion, short enough that a truly idle lane frees its permit for a
+// probe or another server's dial.
 pub(in crate::pipeline) const DOWNLOAD_REFILL_IDLE_HOLD: Duration = Duration::from_secs(2);
 
-/// A refill the scheduler could not fill yet, waiting for a wake.
+// A refill the scheduler could not fill yet, waiting for a wake.
 pub(crate) struct HeldDownloadRefill {
     request: DownloadLaneRefillRequest,
     since: Instant,
-    /// Set for a lane that was saturated rather than out of work: the request
-    /// is answered again once the lane has fetched down to the wake's count.
-    /// Such a lane is fetching, not idle, so its hold has no deadline.
+    // Set for a lane that was saturated rather than out of work: the request
+    // is answered again once the lane has fetched down to the wake's count.
+    // Such a lane is fetching, not idle, so its hold has no deadline.
     wake: Option<SaturationWake>,
 }
 
 impl Pipeline {
-    /// How many articles one refill hands a lane running at `depth`.
-    ///
-    /// The worker asks again once its pending tail falls to `2 * depth + 1`
-    /// (see `refill_deadline` beside the ring), so one more than that keeps
-    /// the cadence at one refill per ring turn without pre-leasing articles
-    /// that other lanes of the same job could be fetching now.
+    // How many articles one refill hands a lane running at `depth`.
+    //
+    // The worker asks again once its pending tail falls to `2 * depth + 1`
+    // (see `refill_deadline` beside the ring), so one more than that keeps
+    // the cadence at one refill per ring turn without pre-leasing articles
+    // that other lanes of the same job could be fetching now.
     pub(in crate::pipeline) fn download_refill_want(&self, lane_mode: DownloadLaneMode) -> usize {
         // A limited link activates its reservations after the lease is
         // finalized; single-article leases let every refill see the updated
@@ -51,7 +51,7 @@ impl Pipeline {
         2 * lane_mode.max_depth().max(1) + 2
     }
 
-    /// The depth a lane on `server_idx` should run at for its next batch.
+    // The depth a lane on `server_idx` should run at for its next batch.
     pub(in crate::pipeline) fn download_lane_mode_for_server(
         &self,
         server_idx: usize,
@@ -69,10 +69,10 @@ impl Pipeline {
             .unwrap_or(DownloadLaneMode::Sequential)
     }
 
-    /// The job, other than the hot one, that already has articles out on
-    /// `server_idx` — the one a spill must go back to rather than fan out
-    /// from. When more than one such job is in flight (the hot job changed
-    /// underneath them), the earliest in dispatch order is the one named.
+    // The job, other than the hot one, that already has articles out on
+    // `server_idx` — the one a spill must go back to rather than fan out
+    // from. When more than one such job is in flight (the hot job changed
+    // underneath them), the earliest in dispatch order is the one named.
     pub(in crate::pipeline) fn spill_job_in_flight_on(&self, server_idx: usize) -> Option<JobId> {
         let hot = self.current_hot_job();
         let mut chosen: Option<(usize, JobId)> = None;
@@ -103,9 +103,9 @@ impl Pipeline {
         self.answer_download_lane_refill(request, Instant::now(), None);
     }
 
-    /// Re-run every held refill against the queues. Called at the top of a
-    /// dispatch pass, which is where a wake lands, and from the periodic tick
-    /// so a hold expires even when nothing else wakes the actor.
+    // Re-run every held refill against the queues. Called at the top of a
+    // dispatch pass, which is where a wake lands, and from the periodic tick
+    // so a hold expires even when nothing else wakes the actor.
     pub(in crate::pipeline) fn service_held_download_refills(&mut self) {
         if self.held_download_refills.is_empty() {
             return;
@@ -145,14 +145,14 @@ impl Pipeline {
         }
     }
 
-    /// Articles `lane_id` has been handed and not yet produced a result for.
+    // Articles `lane_id` has been handed and not yet produced a result for.
     pub(in crate::pipeline) fn download_lane_holdings(&self, lane_id: u64) -> usize {
         self.download_lane_owners
             .get(&lane_id)
             .map_or(0, |owner| owner.outstanding.len())
     }
 
-    /// [`Self::download_lane_holdings`], counting only `job_id`'s articles.
+    // [`Self::download_lane_holdings`], counting only `job_id`'s articles.
     pub(in crate::pipeline) fn download_lane_holdings_of_job(
         &self,
         lane_id: u64,
@@ -167,8 +167,8 @@ impl Pipeline {
         })
     }
 
-    /// Every held refill is parked now. Used when the pool is reset and the
-    /// lanes those requests came from are gone.
+    // Every held refill is parked now. Used when the pool is reset and the
+    // lanes those requests came from are gone.
     pub(in crate::pipeline) fn drop_held_download_refills(&mut self) {
         for HeldDownloadRefill { request, .. } in std::mem::take(&mut self.held_download_refills) {
             let _ = request.response_tx.send(DownloadLaneRefillResponse {
@@ -199,16 +199,6 @@ impl Pipeline {
                 lease: None,
                 park_reason: LaneParkReason::Error,
             });
-            return;
-        }
-
-        let mut park_reason = None;
-        if let Err(error) = self.refresh_bandwidth_cap_window() {
-            error!(error = %error, "failed to refresh ISP bandwidth cap state for lane refill");
-            park_reason = Some(LaneParkReason::Error);
-        }
-        if let Some(reason) = park_reason {
-            self.park_download_lane_refill(request, reason, held_since, now);
             return;
         }
 
@@ -265,7 +255,6 @@ impl Pipeline {
                             .fetch_add(1, Ordering::Relaxed);
                         LaneParkReason::Pressure
                     }
-                    YieldReason::BandwidthCapExhausted => LaneParkReason::Pressure,
                     YieldReason::Paused
                     | YieldReason::RateLimited
                     | YieldReason::HandoffDraining => LaneParkReason::ProbeYield,
@@ -278,7 +267,7 @@ impl Pipeline {
         let Some(lease) = self.lease_for_handout(lane_id, server_idx, lane_mode, pressure, works)
         else {
             // The first article the scheduler handed out was refused by a
-            // reservation (durable lead, ISP cap) and is back in the queue.
+            // reservation (durable lead, download quota) and is back in the queue.
             // That clears the way it clears for an idle answer: on a wake.
             self.hold_or_park_idle_download_lane_refill(request, pressure, held_since, now);
             return;
@@ -334,9 +323,9 @@ impl Pipeline {
         self.update_queue_metrics();
     }
 
-    /// Turn a scheduler handout into a lease for `lane_id`: reserve each
-    /// article's bandwidth and durable lead, and return whatever could not be
-    /// reserved to its queue. `None` when nothing survived.
+    // Turn a scheduler handout into a lease for `lane_id`: reserve each
+    // article's bandwidth and durable lead, and return whatever could not be
+    // reserved to its queue. `None` when nothing survived.
     pub(in crate::pipeline) fn lease_for_handout(
         &mut self,
         lane_id: u64,
@@ -349,7 +338,7 @@ impl Pipeline {
         let mut reserved = Vec::with_capacity(works.len());
         let mut works = works.into_iter();
         for work in works.by_ref() {
-            match self.reserve_download_work_for_dispatch(job_id, work, false) {
+            match self.reserve_download_work_for_dispatch(job_id, work) {
                 Ok(Some(work)) => reserved.push(work),
                 // The helper has already returned the refused article; the
                 // rest of the handout follows it below so the batch keeps
@@ -389,11 +378,11 @@ impl Pipeline {
         })
     }
 
-    /// A refill nothing could be cut for right now. The lane keeps its
-    /// socket and waits in the actor for the next wake — unless another
-    /// server could serve queued work now, in which case the slot this lane
-    /// is holding is worth more to a dial there than to a wait here, or the
-    /// hold has already run its course.
+    // A refill nothing could be cut for right now. The lane keeps its
+    // socket and waits in the actor for the next wake — unless another
+    // server could serve queued work now, in which case the slot this lane
+    // is holding is worth more to a dial there than to a wait here, or the
+    // hold has already run its course.
     fn hold_or_park_idle_download_lane_refill(
         &mut self,
         request: DownloadLaneRefillRequest,
@@ -414,9 +403,9 @@ impl Pipeline {
         });
     }
 
-    /// Cut one lease for `server_idx` the way a dispatch pass would: one
-    /// scheduler handout, reserved and pinned to that server. `None` when the
-    /// scheduler had nothing for the server or nothing survived reservation.
+    // Cut one lease for `server_idx` the way a dispatch pass would: one
+    // scheduler handout, reserved and pinned to that server. `None` when the
+    // scheduler had nothing for the server or nothing survived reservation.
     #[cfg(test)]
     pub(in crate::pipeline) fn lease_for_server_for_test(
         &mut self,

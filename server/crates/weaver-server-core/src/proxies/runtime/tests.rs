@@ -1,4 +1,5 @@
 use super::*;
+use crate::proxies::{LegPath, RouteLeg, Rung};
 mod credentials;
 mod http3;
 mod review_regressions;
@@ -99,6 +100,7 @@ fn controlled_route() -> ControlledRoute {
             RoutingPolicy {
                 proxy_ids: vec![1, 2, 3],
                 allow_direct: false,
+                ..Default::default()
             },
             Duration::from_secs(1),
         )
@@ -173,6 +175,7 @@ async fn blocked_ladder_and_disabled_profile_never_dial_host_destination() {
         let policy = RoutingPolicy {
             proxy_ids: ids,
             allow_direct: false,
+            ..Default::default()
         };
         let route = runtime
             .draft_route(policy.clone(), Duration::from_millis(30))
@@ -206,6 +209,7 @@ async fn direct_fallback_is_only_used_when_permitted() {
             RoutingPolicy {
                 proxy_ids: vec![1],
                 allow_direct: true,
+                ..Default::default()
             },
             Duration::from_millis(30),
         )
@@ -240,7 +244,12 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
         host: addr.ip().to_string(),
         port: addr.port(),
         tls: false,
-        revocation: Some(registry.clone()),
+        dialer: Some(
+            runtime
+                .network
+                .nntp_dialer(1, 1, Duration::from_secs(30))
+                .unwrap(),
+        ),
         pipelining: weaver_nntp::PipeliningCapability::Known(false),
         ..Default::default()
     };
@@ -250,6 +259,7 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
         &RoutingPolicy {
             proxy_ids: vec![],
             allow_direct: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -272,6 +282,7 @@ async fn reload_preserves_unaffected_sessions_and_revokes_changed_profile() {
         &RoutingPolicy {
             proxy_ids: vec![1],
             allow_direct: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -309,6 +320,58 @@ async fn reload_preserves_unaffected_sessions_and_revokes_changed_profile() {
 }
 
 #[tokio::test]
+async fn reweighting_legs_keeps_the_legacy_route_and_its_sockets() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&server(1)).unwrap();
+    let legs = |weight| RoutingPolicy {
+        legs: vec![
+            RouteLeg {
+                egress_id: 0,
+                weight,
+                path: LegPath::Direct,
+            },
+            RouteLeg {
+                egress_id: 0,
+                weight: 100 - weight,
+                path: LegPath::Direct,
+            },
+        ],
+        ..Default::default()
+    };
+    db.save_proxy_routing_policy(Consumer::Server(1), &legs(50))
+        .unwrap();
+    let runtime = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let route = runtime
+        .route(Consumer::Server(1), Duration::from_secs(1))
+        .unwrap();
+    // A reweight is the network runtime's to apply in place; it must not
+    // rebuild the legacy route, which would close every socket it tracks.
+    db.save_proxy_routing_policy(Consumer::Server(1), &legs(80))
+        .unwrap();
+    runtime.reload().await.unwrap();
+    assert!(!route.is_revoked());
+    assert!(Arc::ptr_eq(
+        &route,
+        &runtime
+            .route(Consumer::Server(1), Duration::from_secs(1))
+            .unwrap()
+    ));
+    // Putting a proxy in front of the first leg changes the legacy
+    // projection, and that does rebuild the route.
+    db.save_proxy_profile(&profile(1)).unwrap();
+    let mut proxied = legs(80);
+    proxied.legs[0].path = LegPath::Ladder {
+        rungs: vec![Rung::Proxy { id: 1 }],
+        direct_fallback: false,
+    };
+    db.save_proxy_routing_policy(Consumer::Server(1), &proxied)
+        .unwrap();
+    runtime.reload().await.unwrap();
+    assert!(route.is_revoked());
+    runtime.stop_all().await;
+}
+
+#[tokio::test]
 async fn deleting_consumer_revokes_routes_and_releases_profile_reference() {
     let db = Database::open_in_memory().unwrap();
     db.insert_server(&server(1)).unwrap();
@@ -318,6 +381,7 @@ async fn deleting_consumer_revokes_routes_and_releases_profile_reference() {
         &RoutingPolicy {
             proxy_ids: vec![1],
             allow_direct: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -349,6 +413,7 @@ fn routing_validation_and_atomic_consumer_save_preserve_existing_policy() {
     let policy = RoutingPolicy {
         proxy_ids: vec![1],
         allow_direct: false,
+        ..Default::default()
     };
     db.insert_server_with_routing(&server, Some(&policy))
         .unwrap();
@@ -365,7 +430,8 @@ fn routing_validation_and_atomic_consumer_save_preserve_existing_policy() {
                 &server,
                 Some(&RoutingPolicy {
                     proxy_ids: ids,
-                    allow_direct: true
+                    allow_direct: true,
+                    ..Default::default()
                 })
             )
             .is_err()
@@ -430,6 +496,7 @@ fn backup_restores_encrypted_profiles_ordered_routes_and_host_trust() {
     let policy = RoutingPolicy {
         proxy_ids: vec![2, 1],
         allow_direct: false,
+        ..Default::default()
     };
     source
         .save_proxy_routing_policy(Consumer::Server(1), &policy)
@@ -550,4 +617,20 @@ fn ssh_profiles_require_a_valid_key_even_if_a_password_is_present() {
     p.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
     p.validate().unwrap();
     assert!(!format!("{:?}", p.ssh_spec()).contains("password-is-not-authentication"));
+}
+
+#[test]
+fn an_ssh_profile_is_stored_without_a_password() {
+    let db = Database::open_in_memory().unwrap();
+    let mut p = profile(1);
+    p.kind = ProxyKind::Ssh;
+    p.secrets.username = Some("operator".into());
+    p.secrets.password = Some("password-is-not-authentication".into());
+    p.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
+    let saved = db.save_proxy_profile(&p).unwrap();
+    assert_eq!(saved.secrets.password, None);
+    let stored = &db.list_proxy_profiles().unwrap()[0].secrets;
+    assert_eq!(stored.password, None);
+    assert_eq!(stored.username.as_deref(), Some("operator"));
+    assert!(stored.private_key.is_some());
 }

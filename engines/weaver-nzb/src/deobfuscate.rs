@@ -1,15 +1,15 @@
-//! Obfuscation detection and subject line deobfuscation for Usenet posts.
-//!
-//! Usenet posters randomize filenames to avoid DMCA takedowns. This module
-//! provides heuristics to detect obfuscated filenames and enhanced subject
-//! line parsing to recover real filenames from common posting formats.
+// Obfuscation detection and subject line deobfuscation for Usenet posts.
+//
+// Usenet posters randomize filenames to avoid DMCA takedowns. This module
+// provides heuristics to detect obfuscated filenames and enhanced subject
+// line parsing to recover real filenames from common posting formats.
 
-/// Returns `true` if the filename appears to be obfuscated (randomized hash,
-/// UUID-like, or otherwise meaningless).
-///
-/// Archive extensions (`.rar`, `.par2`, `.zip`, `.7z` with numeric suffixes)
-/// are stripped before checking — `a8f3b2c1d4e5.rar` is still obfuscated even
-/// though it has a valid extension.
+// Returns `true` if the filename appears to be obfuscated (randomized hash,
+// UUID-like, or otherwise meaningless).
+//
+// Archive extensions (`.rar`, `.par2`, `.zip`, `.7z` with numeric suffixes)
+// are stripped before checking — `a8f3b2c1d4e5.rar` is still obfuscated even
+// though it has a valid extension.
 pub fn is_obfuscated(filename: &str) -> bool {
     // Archive files with hash-like names are normal (obfuscated archives are still
     // valid — PAR2 rename handles them). Only flag non-archive files as obfuscated.
@@ -173,13 +173,13 @@ pub fn is_obfuscated(filename: &str) -> bool {
     false
 }
 
-/// Extract a filename from a Usenet subject line using three strategies.
-///
-/// Returns `Some((filename, confidence))` where confidence indicates how
-/// reliable the extraction is:
-/// - 1.0: extracted from quoted string
-/// - 0.8: extracted from PRiVATE format
-/// - 0.5: heuristic fallback
+// Extract a filename from a Usenet subject line using three strategies.
+//
+// Returns `Some((filename, confidence))` where confidence indicates how
+// reliable the extraction is:
+// - 1.0: extracted from quoted string
+// - 0.8: extracted from PRiVATE format
+// - 0.5: heuristic fallback
 pub fn extract_filename(subject: &str) -> Option<(String, f32)> {
     // Strategy 1: Quoted string — most common format
     // e.g. `[02/11] - "Some.Show.S01E18.mkv" yEnc(1/144)`
@@ -202,7 +202,7 @@ pub fn extract_filename(subject: &str) -> Option<(String, f32)> {
     None
 }
 
-/// Strategy 1: Extract filename from double-quoted string.
+// Strategy 1: Extract filename from double-quoted string.
 fn extract_quoted(subject: &str) -> Option<String> {
     let first = subject.find('"')?;
     let second = subject[first + 1..].find('"')?;
@@ -213,10 +213,10 @@ fn extract_quoted(subject: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Strategy 2: Extract filename from `[PRiVATE]` format.
-///
-/// Format: `[PRiVATE]-[GroupName]-[PATH/TO/FILENAME]-[SEGMENTS] - "" yEnc`
-/// The path and segments sections can appear in either order.
+// Strategy 2: Extract filename from `[PRiVATE]` format.
+//
+// Format: `[PRiVATE]-[GroupName]-[PATH/TO/FILENAME]-[SEGMENTS] - "" yEnc`
+// The path and segments sections can appear in either order.
 fn extract_private(subject: &str) -> Option<String> {
     let upper = subject.to_ascii_uppercase();
     let start = upper.find("[PRIVATE]-[")?;
@@ -259,10 +259,10 @@ fn extract_private(subject: &str) -> Option<String> {
     Some(extract_basename(&rest[..end]))
 }
 
-/// Strategy 3: Fallback heuristic for unquoted, non-PRiVATE subjects.
-///
-/// Strips ` yEnc...` suffix and ` (N/N)` part info, then takes the last
-/// whitespace-delimited token if it contains a dot.
+// Strategy 3: Fallback heuristic for unquoted, non-PRiVATE subjects.
+//
+// Strips ` yEnc...` suffix and ` (N/N)` part info, then takes the last
+// whitespace-delimited token if it contains a dot.
 fn extract_fallback(subject: &str) -> Option<String> {
     let mut s = subject;
 
@@ -303,8 +303,8 @@ fn extract_fallback(subject: &str) -> Option<String> {
     }
 }
 
-/// Check if a string looks like a segment marker (e.g. "1/10", "34/44")
-/// or a pure number (e.g. "24" — segment count without slash).
+// Check if a string looks like a segment marker (e.g. "1/10", "34/44")
+// or a pure number (e.g. "24" — segment count without slash).
 fn is_segment_marker(s: &str) -> bool {
     // N/N format
     let parts: Vec<&str> = s.split('/').collect();
@@ -318,7 +318,7 @@ fn is_segment_marker(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Extract the last path component (basename) from a path string.
+// Extract the last path component (basename) from a path string.
 fn extract_basename(path: &str) -> String {
     path.rsplit_once('/')
         .or_else(|| path.rsplit_once('\\'))
@@ -326,7 +326,7 @@ fn extract_basename(path: &str) -> String {
         .to_string()
 }
 
-/// Strip trailing ` (N/N)` part info from a string.
+// Strip trailing ` (N/N)` part info from a string.
 fn strip_trailing_part_info(s: &str) -> &str {
     let trimmed = s.trim_end();
     if let Some(open) = trimmed.rfind('(') {
@@ -343,11 +343,11 @@ fn strip_trailing_part_info(s: &str) -> &str {
     trimmed
 }
 
-/// Returns `true` if the filename clearly looks like a real title or release name
-/// rather than an obfuscated hash. Adapted from SABnzbd's explicit false-return rules.
-///
-/// Only triggers on names with word-like tokens (3+ alpha chars). Pure hex/digits
-/// with dots still fall through to the obfuscation checks.
+// Returns `true` if the filename clearly looks like a real title or release name
+// rather than an obfuscated hash. Adapted from SABnzbd's explicit false-return rules.
+//
+// Only triggers on names with word-like tokens (3+ alpha chars). Pure hex/digits
+// with dots still fall through to the obfuscation checks.
 fn is_clearly_named(stem: &str) -> bool {
     // Strip bracketed tags before tokenizing — [Group] tags shouldn't count as words.
     let without_brackets: String = {
@@ -403,8 +403,8 @@ fn is_clearly_named(stem: &str) -> bool {
     false
 }
 
-/// Returns `true` if the path is inside a DVD/Bluray structure that should
-/// never be renamed.
+// Returns `true` if the path is inside a DVD/Bluray structure that should
+// never be renamed.
 pub fn is_protected_media_structure(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
     s.contains("/VIDEO_TS/")
@@ -415,14 +415,14 @@ pub fn is_protected_media_structure(path: &std::path::Path) -> bool {
         || s.contains("\\BDMV\\")
 }
 
-/// Returns `true` if any component of `relative_path` names a disc-structure
-/// directory.
-///
-/// [`is_protected_media_structure`] answers the same question for an absolute
-/// path, where the directory name is always flanked by separators. A delivery
-/// is enumerated relative to its own root, so its first component has no
-/// leading separator and a one-file `BDMV/index.bdmv` delivery would slip past
-/// the substring form.
+// Returns `true` if any component of `relative_path` names a disc-structure
+// directory.
+//
+// [`is_protected_media_structure`] answers the same question for an absolute
+// path, where the directory name is always flanked by separators. A delivery
+// is enumerated relative to its own root, so its first component has no
+// leading separator and a one-file `BDMV/index.bdmv` delivery would slip past
+// the substring form.
 pub fn contains_protected_media_structure(relative_path: &str) -> bool {
     relative_path.split(['/', '\\']).any(|component| {
         PROTECTED_STRUCTURE_DIRS
@@ -433,7 +433,7 @@ pub fn contains_protected_media_structure(relative_path: &str) -> bool {
 
 const PROTECTED_STRUCTURE_DIRS: &[&str] = &["VIDEO_TS", "AUDIO_TS", "BDMV"];
 
-/// Strip known archive extensions to get the filename stem for obfuscation checks.
+// Strip known archive extensions to get the filename stem for obfuscation checks.
 fn strip_archive_extension(filename: &str) -> &str {
     let lower = filename.to_ascii_lowercase();
 

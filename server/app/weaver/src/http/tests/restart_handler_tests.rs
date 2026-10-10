@@ -1,8 +1,8 @@
 use super::*;
 use weaver_server_core::runtime::restart::{RestartCapability, RestartController};
 
-/// Long enough to cover the handler's response grace, so "nothing was
-/// requested" is a settled fact rather than a race.
+// Long enough to cover the handler's response grace, so "nothing was
+// requested" is a settled fact rather than a race.
 const NOT_REQUESTED_WINDOW: std::time::Duration = std::time::Duration::from_millis(750);
 
 fn restart_test_router(controller: RestartController, api_key_cache: ApiKeyCache) -> Router {

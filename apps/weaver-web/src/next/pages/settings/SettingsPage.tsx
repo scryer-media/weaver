@@ -1,13 +1,35 @@
-import { useCallback, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router";
+import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useNavigate, useParams } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
 import { NextShell } from "../../shell/NextShell";
 import { PanelListBlock } from "../../shell/rail-blocks";
 import { useNextData } from "../../data/next-data";
 import { BetaTag, EmptyState } from "../../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
-import { SettingsShellProvider, type PanelFlags } from "./framework";
-import { SETTINGS_PANELS, findPanel } from "./panels";
+import { SettingsPanelScope, SettingsShellProvider, type PanelFlags } from "./framework";
+import { findPanel, panelSearchTitle, SETTINGS_PANELS, settingsRail } from "./panels";
+import { SearchRegistry, searchOutcome } from "./search";
+
+const PANEL_SLUGS = SETTINGS_PANELS.map((entry) => entry.slug);
+
+/**
+ * The search's answer when no panel has a match: still loading, or nothing.
+ * The matches themselves draw under each panel's heading.
+ */
+function SearchOutcomeState({ search, registry }: { search: string; registry: SearchRegistry }) {
+  const t = useTranslate();
+  const state = useSyncExternalStore(
+    registry.subscribe,
+    () => searchOutcome(PANEL_SLUGS, (slug) => registry.panel(slug)).state,
+  );
+  if (state === "loading") {
+    return <EmptyState loading title={t("next.common.loading")} body={t("next.settings.searchLoadingBody")} />;
+  }
+  if (state === "empty") {
+    return <EmptyState title={t("next.settings.noMatch", { search })} body={t("next.settings.noMatchBody")} />;
+  }
+  return null;
+}
 
 /**
  * The settings shell.
@@ -17,17 +39,24 @@ import { SETTINGS_PANELS, findPanel } from "./panels";
  * what they act on through `usePanelState`. Panels that write immediately —
  * the list-shaped ones — simply never publish, and the two buttons stay in
  * their resting state, which is exactly what the handoff draws.
+ *
+ * The search box searches every panel, not only the open one: while it holds
+ * a query, each panel's matches show under that panel's heading, and clearing
+ * it returns to the open panel as it was left.
  */
 
 const CLEAN: PanelFlags = { dirty: false, busy: false, status: null, failed: false };
 
 export function SettingsPage() {
   const t = useTranslate();
-  const { panel: slug } = useParams();
+  const { panel: root, "*": nested } = useParams();
+  const slug = nested ? `${root}/${nested}` : root;
   const panel = findPanel(slug);
   const { providers } = useNextData();
 
+  const navigate = useNavigate();
   const [search, setSearch] = useState("");
+  const [registry] = useState(() => new SearchRegistry());
   const [flags, setFlagsState] = useState<PanelFlags>(CLEAN);
   const [controlsHost, setControlsHost] = useState<HTMLElement | null>(null);
   const actionsRef = useRef<{ save: () => void; revert: () => void } | null>(null);
@@ -45,23 +74,7 @@ export function SettingsPage() {
     );
   }, []);
 
-  const railItems = useMemo(
-    () =>
-      SETTINGS_PANELS.map((entry) => ({
-        to: `/settings/${entry.slug}`,
-        label: t(entry.label),
-        icon: entry.icon,
-        tag:
-          entry.tag === "beta"
-            ? t("next.settings.beta")
-            : entry.tag === "count:providers"
-              ? providers.length > 0
-                ? String(providers.length)
-                : undefined
-              : undefined,
-      })),
-    [providers.length, t],
-  );
+  const railItems = useMemo(() => settingsRail(t, providers.length), [providers.length, t]);
 
   const statusRight =
     flags.status ?? (flags.dirty ? t("next.settings.unsaved") : t("next.settings.allSaved"));
@@ -71,7 +84,10 @@ export function SettingsPage() {
       ? "text-wv-warn"
       : undefined;
 
-  const Panel = panel?.Component;
+  // A query searches every panel, so every panel mounts to answer it; without
+  // one only the open panel does.
+  const searching = search.trim() !== "";
+  const mounted = searching ? SETTINGS_PANELS : panel ? [panel] : [];
 
   return (
     <NextShell
@@ -130,15 +146,30 @@ export function SettingsPage() {
           actionsRef={actionsRef}
           setFlags={setFlags}
           controlsHost={controlsHost}
+          registry={registry}
         >
-          {Panel ? (
-            <Panel key={panel?.slug} />
-          ) : (
+          {/*
+            One list keyed by slug in both modes, so the open panel is the
+            same instance with or without a query and keeps its unsaved edits.
+          */}
+          {mounted.map((entry) => (
+            <SettingsPanelScope
+              key={entry.slug}
+              slug={entry.slug}
+              active={entry.slug === panel?.slug}
+              title={panelSearchTitle(t, entry)}
+              onOpen={() => navigate(`/settings/${entry.slug}`)}
+            >
+              <entry.Component />
+            </SettingsPanelScope>
+          ))}
+          {searching ? <SearchOutcomeState search={search.trim()} registry={registry} /> : null}
+          {!searching && !panel ? (
             <EmptyState
               title={t("next.settings.noPanel")}
               body={t("next.settings.noPanelBody")}
             />
-          )}
+          ) : null}
         </SettingsShellProvider>
       </div>
     </NextShell>

@@ -15,8 +15,8 @@ use crate::persistence::sql_runtime::{
 };
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 
-/// Submission values are always plaintext, even when they resemble our stored
-/// envelope prefix. Encrypt them once at the database boundary.
+// Submission values are always plaintext, even when they resemble our stored
+// envelope prefix. Encrypt them once at the database boundary.
 pub(super) fn encrypt_archive_password(
     key: Option<&crate::persistence::encryption::EncryptionKey>,
     password: Option<&str>,
@@ -35,7 +35,7 @@ pub(super) fn encrypt_archive_password(
         .map_err(StateError::Database)
 }
 
-pub(super) fn decrypt_archive_password(
+pub(crate) fn decrypt_archive_password(
     key: Option<&crate::persistence::encryption::EncryptionKey>,
     password: Option<String>,
 ) -> Result<Option<String>, StateError> {
@@ -390,13 +390,13 @@ async fn bulk_upsert_file_identities_tx(
     Ok(())
 }
 
-/// Update `active_files.filename` for each identity's `current_filename`, the
-/// sibling write [`Database::save_file_identity`] performs alongside the
-/// identity upsert. Rows whose `active_files` entry does not yet exist (file
-/// not completed) are simply not matched, exactly as the single-row path. Runs
-/// inside the caller's transaction: Postgres batches with `UPDATE ... FROM
-/// (VALUES ...)`, SQLite issues per-row updates (local to the serialized
-/// writer, so the extra statements are cheap).
+// Update `active_files.filename` for each identity's `current_filename`, the
+// sibling write [`Database::save_file_identity`] performs alongside the
+// identity upsert. Rows whose `active_files` entry does not yet exist (file
+// not completed) are simply not matched, exactly as the single-row path. Runs
+// inside the caller's transaction: Postgres batches with `UPDATE ... FROM
+// (VALUES ...)`, SQLite issues per-row updates (local to the serialized
+// writer, so the extra statements are cheap).
 async fn bulk_update_active_files_filenames_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -445,11 +445,11 @@ async fn bulk_update_active_files_filenames_tx(
     Ok(())
 }
 
-/// Build the Postgres autocommit statement that inserts `row_count` extracted
-/// members guarded by a `FOR KEY SHARE` lock on the owning job. `$1` is the
-/// guard `job_id`; each row then binds `(job_id, member_name, output_path,
-/// output_size)`. Explicit casts on the first VALUES row give Postgres the
-/// column types it cannot infer from all-parameter rows.
+// Build the Postgres autocommit statement that inserts `row_count` extracted
+// members guarded by a `FOR KEY SHARE` lock on the owning job. `$1` is the
+// guard `job_id`; each row then binds `(job_id, member_name, output_path,
+// output_size)`. Explicit casts on the first VALUES row give Postgres the
+// column types it cannot infer from all-parameter rows.
 fn build_extracted_members_pg_sql(row_count: usize) -> String {
     let mut values = String::new();
     for row in 0..row_count {
@@ -474,14 +474,14 @@ fn build_extracted_members_pg_sql(row_count: usize) -> String {
     )
 }
 
-/// How a persisted completed-file MD5 was obtained. Legacy rows predate this
-/// distinction (NULL in `active_files.md5_provenance`) and are never trusted
-/// for quick verification — they can identify a file, not certify it.
+// How a persisted completed-file MD5 was obtained. Legacy rows predate this
+// distinction (NULL in `active_files.md5_provenance`) and are never trusted
+// for quick verification — they can identify a file, not certify it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletedHashProvenance {
-    /// Folded from the decode pass over the downloaded bytes themselves.
+    // Folded from the decode pass over the downloaded bytes themselves.
     Streamed,
-    /// Confirmed by an actual PAR2 verification pass over the file.
+    // Confirmed by an actual PAR2 verification pass over the file.
     Verified,
 }
 
@@ -494,10 +494,10 @@ impl CompletedHashProvenance {
     }
 }
 
-/// Build the Postgres autocommit statement that upserts `row_count` completed
-/// files guarded by a `FOR KEY SHARE` lock on the owning job, mirroring the
-/// single-row [`Database::complete_file_with_optional_hash`] shape. `$1` is the
-/// guard `job_id`; each row then binds `(job_id, file_index, filename, md5)`.
+// Build the Postgres autocommit statement that upserts `row_count` completed
+// files guarded by a `FOR KEY SHARE` lock on the owning job, mirroring the
+// single-row [`Database::complete_file_with_optional_hash`] shape. `$1` is the
+// guard `job_id`; each row then binds `(job_id, file_index, filename, md5)`.
 fn build_complete_files_pg_sql(row_count: usize) -> String {
     let mut values = String::new();
     for row in 0..row_count {
@@ -621,9 +621,9 @@ impl Database {
         })
     }
 
-    /// Performs the inexpensive first half of SCORE materialization before a
-    /// pipeline creates a work directory. The transactional check below remains
-    /// authoritative; this keeps a known-stale submit from allocating anything.
+    // Performs the inexpensive first half of SCORE materialization before a
+    // pipeline creates a work directory. The transactional check below remains
+    // authoritative; this keeps a known-stale submit from allocating anything.
     pub(crate) fn semantic_materialization_is_current(
         &self,
         job_id: JobId,
@@ -646,8 +646,8 @@ impl Database {
         })
     }
 
-    /// Checks an owned promotion lease before the scheduler allocates a
-    /// working directory. The materialization transaction repeats this CAS.
+    // Checks an owned promotion lease before the scheduler allocates a
+    // working directory. The materialization transaction repeats this CAS.
     pub(crate) fn semantic_promotion_materialization_is_current(
         &self,
         job_id: JobId,
@@ -675,10 +675,10 @@ impl Database {
         })
     }
 
-    /// Atomically turns a reserved duplicate admission into an active job. A
-    /// SCORE caller supplies the generation it received at admission; parking
-    /// or superseding that candidate invalidates the generation before any
-    /// stale request can create scheduler work.
+    // Atomically turns a reserved duplicate admission into an active job. A
+    // SCORE caller supplies the generation it received at admission; parking
+    // or superseding that candidate invalidates the generation before any
+    // stale request can create scheduler work.
     pub(crate) fn materialize_active_job_with_file_identities(
         &self,
         job: &ActiveJob,
@@ -839,6 +839,32 @@ impl Database {
         })
     }
 
+    pub(crate) fn refresh_script_job_inputs(
+        &self,
+        job_id: u64,
+        facts: &mut crate::post_processing::runner::CompatibilityFacts,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let row = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT metadata, password FROM active_jobs WHERE job_id = {}",
+                &[SqlArg::I64(job_id as i64)],
+            )
+            .await
+        })?;
+        if let Some(row) = row {
+            facts.parameters = row
+                .opt_text("metadata")?
+                .map(|text| serde_json::from_str(&text).map_err(db_err))
+                .transpose()?
+                .unwrap_or_default();
+            facts.password =
+                decrypt_archive_password(self.encryption_key(), row.opt_text("password")?)?;
+        }
+        Ok(())
+    }
+
     pub fn update_active_job(&self, job_id: JobId, update: &JobUpdate) -> Result<(), StateError> {
         let datastore = self.datastore();
         let mut update = update.clone();
@@ -846,10 +872,13 @@ impl Database {
             *password = encrypt_archive_password(self.encryption_key(), Some(password))?
                 .expect("supplied password");
         }
-        self.run_sql_blocking(async move {
+        let _effects_writer = self.lock_script_effects_writer();
+        let rewritten_effects = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "update_active_job", |tx| {
                 let update = update.clone();
                 Box::pin(async move {
+                    tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
+                    let mut rewritten_effects = None;
                     match update.category {
                         FieldUpdate::Unchanged => {}
                         FieldUpdate::Clear => {
@@ -868,6 +897,17 @@ impl Database {
                         }
                     }
 
+                    if !matches!(update.metadata, FieldUpdate::Unchanged) {
+                        tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
+                        if let Some(row) = tx.fetch_optional("SELECT state FROM script_job_state WHERE job_id = {}", &[SqlArg::I64(job_id.0 as i64)]).await? {
+                            let mut effects: crate::post_processing::effects::JobScriptEffects = serde_json::from_str(&row.text("state")?).map_err(|error| StateError::Database(error.to_string()))?;
+                            let metadata = match &update.metadata { FieldUpdate::Set(values) => values.clone(), _ => Vec::new() };
+                            for value in effects.parameters.values_mut() { value.clear(); }
+                            effects.parameters.extend(metadata);
+                            tx.execute("UPDATE script_job_state SET state = {} WHERE job_id = {}", &[SqlArg::Text(serde_json::to_string(&effects).map_err(|error| StateError::Database(error.to_string()))?), SqlArg::I64(job_id.0 as i64)]).await?;
+                            rewritten_effects = Some(effects);
+                        }
+                    }
                     match update.metadata {
                         FieldUpdate::Unchanged => {}
                         FieldUpdate::Clear => {
@@ -909,16 +949,20 @@ impl Database {
                             .await?;
                         }
                     }
-                    Ok(())
+                    Ok(rewritten_effects)
                 })
             })
             .await
-        })
+        })?;
+        if let Some(effects) = rewritten_effects {
+            self.cache_script_effects(job_id.0, effects);
+        }
+        Ok(())
     }
 
-    /// Persist the manual queue order as one transaction. Positions are the
-    /// full current order (small: one row per queued job) so restores sort by
-    /// `queue_position` and land in the exact user-arranged sequence.
+    // Persist the manual queue order as one transaction. Positions are the
+    // full current order (small: one row per queued job) so restores sort by
+    // `queue_position` and land in the exact user-arranged sequence.
     pub fn update_active_job_queue_positions(
         &self,
         positions: &[(JobId, i64)],
@@ -983,8 +1027,48 @@ impl Database {
         paused_resume_download_state: Option<&str>,
         paused_resume_post_state: Option<&str>,
     ) -> Result<(), StateError> {
+        self.set_active_job_runtime_at(
+            job_id,
+            None,
+            status,
+            download_state,
+            post_state,
+            run_state,
+            error,
+            queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms,
+            paused_resume_status,
+            paused_resume_download_state,
+            paused_resume_post_state,
+        )
+    }
+
+    // [`Self::set_active_job_runtime`] that also moves the job's recorded
+    // output directory in the same statement, so a restart can never read the
+    // new runtime against the old location or the other way round. `None`
+    // keeps the directory already recorded.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "active job runtime is persisted as one atomic SQL update"
+    )]
+    pub fn set_active_job_runtime_at(
+        &self,
+        job_id: JobId,
+        output_dir: Option<&str>,
+        status: &str,
+        download_state: Option<&str>,
+        post_state: Option<&str>,
+        run_state: Option<&str>,
+        error: Option<&str>,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<&str>,
+        paused_resume_download_state: Option<&str>,
+        paused_resume_post_state: Option<&str>,
+    ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = vec![
+            SqlArg::OptText(output_dir.map(str::to_string)),
             SqlArg::Text(status.to_string()),
             SqlArg::OptText(download_state.map(str::to_string)),
             SqlArg::OptText(post_state.map(str::to_string)),
@@ -1005,7 +1089,8 @@ impl Database {
                         Box::pin(async move {
                             tx.execute(
                                 "UPDATE active_jobs
-                                 SET status = {},
+                                 SET output_dir = COALESCE({}, output_dir),
+                                     status = {},
                                      download_state = {},
                                      post_state = {},
                                      run_state = {},
@@ -1028,7 +1113,8 @@ impl Database {
                     SqlRuntime::execute(
                         datastore.read_exec(),
                         "UPDATE active_jobs
-                         SET status = {},
+                         SET output_dir = COALESCE({}, output_dir),
+                             status = {},
                              download_state = {},
                              post_state = {},
                              run_state = {},
@@ -1240,12 +1326,12 @@ impl Database {
         })
     }
 
-    /// Complete a batch of files for a single job, the bulk counterpart to
-    /// [`Self::complete_file_with_optional_hash`]. Each entry is
-    /// `(file_index, filename, optional md5)`; the guard semantics match the
-    /// single-file path (an absent `active_jobs` row inserts nothing). Postgres
-    /// runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
-    /// SQLite guards once inside a transaction then bulk-upserts in chunks.
+    // Complete a batch of files for a single job, the bulk counterpart to
+    // [`Self::complete_file_with_optional_hash`]. Each entry is
+    // `(file_index, filename, optional md5)`; the guard semantics match the
+    // single-file path (an absent `active_jobs` row inserts nothing). Postgres
+    // runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
+    // SQLite guards once inside a transaction then bulk-upserts in chunks.
     pub fn complete_files(
         &self,
         job_id: JobId,
@@ -1553,15 +1639,15 @@ impl Database {
         })
     }
 
-    /// Persist a batch of file identities for a single job in ONE transaction.
-    ///
-    /// This is the bulk counterpart to [`Self::save_file_identity`]: it upserts
-    /// every `active_file_identities` row via [`bulk_upsert_file_identities_tx`]
-    /// AND performs the sibling `active_files.filename` update that the bulk tx
-    /// helper omits, so callers converting a per-identity loop keep identical
-    /// semantics. Postgres runs one `UPDATE ... FROM (VALUES ...)` per chunk;
-    /// SQLite issues per-row `UPDATE`s inside the same transaction (cheap and
-    /// local to the serialized writer).
+    // Persist a batch of file identities for a single job in ONE transaction.
+    //
+    // This is the bulk counterpart to [`Self::save_file_identity`]: it upserts
+    // every `active_file_identities` row via [`bulk_upsert_file_identities_tx`]
+    // AND performs the sibling `active_files.filename` update that the bulk tx
+    // helper omits, so callers converting a per-identity loop keep identical
+    // semantics. Postgres runs one `UPDATE ... FROM (VALUES ...)` per chunk;
+    // SQLite issues per-row `UPDATE`s inside the same transaction (cheap and
+    // local to the serialized writer).
     pub fn save_file_identities(
         &self,
         job_id: JobId,
@@ -2026,16 +2112,16 @@ impl Database {
         )
     }
 
-    /// Persist a batch of extracted archive members for a single job.
-    ///
-    /// Each `output_path` is stat'd (blocking IO — callers run this via
-    /// `spawn_blocking`) to record its on-disk size; an entry whose stat fails
-    /// is skipped and logged rather than failing the whole batch, matching the
-    /// per-member error tolerance of the RAR extraction scheduler. Surviving
-    /// rows are inserted multi-row in bind-budget-sized chunks: Postgres runs
-    /// one autocommit statement per chunk guarded by a `FOR KEY SHARE` CTE on
-    /// `active_jobs`; SQLite guards once inside a transaction then bulk-inserts,
-    /// mirroring [`Self::save_rar_volume_facts`].
+    // Persist a batch of extracted archive members for a single job.
+    //
+    // Each `output_path` is stat'd (blocking IO — callers run this via
+    // `spawn_blocking`) to record its on-disk size; an entry whose stat fails
+    // is skipped and logged rather than failing the whole batch, matching the
+    // per-member error tolerance of the RAR extraction scheduler. Surviving
+    // rows are inserted multi-row in bind-budget-sized chunks: Postgres runs
+    // one autocommit statement per chunk guarded by a `FOR KEY SHARE` CTE on
+    // `active_jobs`; SQLite guards once inside a transaction then bulk-inserts,
+    // mirroring [`Self::save_rar_volume_facts`].
     pub fn add_extracted_members(
         &self,
         job_id: JobId,
@@ -2714,19 +2800,19 @@ impl Database {
         })
     }
 
-    /// Replaces the direct-store coverage checkpoint for one archive set.
-    ///
-    /// One statement, one row, one encoded blob — the whole checkpoint,
-    /// including every per-volume floor. A barrier must cost the same number of
-    /// round trips on a 2 000-volume set as on a single-volume one, which is
-    /// why nothing here is normalized per volume.
-    ///
-    /// **Single writer per (job, set).** This is an unconditional replace: the
-    /// generation counter lives inside the blob, not in the predicate, so a
-    /// stale writer would overwrite a newer checkpoint with older floors and
-    /// nothing would notice. Exactly one pipeline owns a job's archive sets,
-    /// which is what makes that unreachable; a second concurrent writer would
-    /// need a generation guard in this statement first.
+    // Replaces the direct-store coverage checkpoint for one archive set.
+    //
+    // One statement, one row, one encoded blob — the whole checkpoint,
+    // including every per-volume floor. A barrier must cost the same number of
+    // round trips on a 2 000-volume set as on a single-volume one, which is
+    // why nothing here is normalized per volume.
+    //
+    // **Single writer per (job, set).** This is an unconditional replace: the
+    // generation counter lives inside the blob, not in the predicate, so a
+    // stale writer would overwrite a newer checkpoint with older floors and
+    // nothing would notice. Exactly one pipeline owns a job's archive sets,
+    // which is what makes that unreachable; a second concurrent writer would
+    // need a generation guard in this statement first.
     pub fn save_direct_coverage(
         &self,
         job_id: JobId,
@@ -2779,9 +2865,9 @@ impl Database {
         })
     }
 
-    /// Retires one archive set's direct-store coverage checkpoint. Repair over
-    /// checkpoint-covered output deletes the row and lets the next barrier
-    /// recreate coverage from scratch.
+    // Retires one archive set's direct-store coverage checkpoint. Repair over
+    // checkpoint-covered output deletes the row and lets the next barrier
+    // recreate coverage from scratch.
     pub fn delete_direct_coverage(&self, job_id: JobId, set_name: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let set_name = set_name.to_string();

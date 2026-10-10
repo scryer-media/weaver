@@ -1,3 +1,4 @@
+mod archive_password;
 pub mod assembly;
 pub mod duplicate;
 pub mod duplicate_persistence;
@@ -14,6 +15,8 @@ pub mod repository;
 pub mod server_attribution;
 mod server_attribution_persistence;
 pub mod service;
+pub mod support_facts;
+mod support_facts_persistence;
 pub mod working_dir;
 
 pub use duplicate::{
@@ -32,10 +35,10 @@ pub use duplicate_persistence::{
 };
 pub use error::SchedulerError;
 pub use handle::{
-    AddJobOptions, DownloadBlockKind, DownloadBlockState, FINISHED_JOBS_RUNTIME_CAP,
-    HardwareProfileInForce, HistoryDeleteOutcome, JobInfo, NntpRuntimeActivation, QueueMoveTarget,
-    RestoreJobRequest, SchedulerCommand, SchedulerHandle, ServerTransportHealth,
-    SharedPipelineState,
+    AddJobOptions, DownloadBlockKind, DownloadBlockState, EgressQuotaBlock,
+    FINISHED_JOBS_RUNTIME_CAP, HardwareProfileInForce, HistoryDeleteOutcome, JobInfo,
+    NntpRuntimeActivation, QueueMoveTarget, RestoreJobRequest, SchedulerCommand, SchedulerHandle,
+    ServerTransportHealth, SharedPipelineState,
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{

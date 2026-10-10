@@ -488,3 +488,147 @@ kind = "sql"
 file = "migrations/0050_active_server_attribution/schema.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 51
+description = "scheduled quota metering"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0051_quota_metering/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0051_quota_metering/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 52
+description = "event script queues and retained output"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0052_script_events/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0052_script_events/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 53
+description = "egress interfaces and proxy pools"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0053_egress_interfaces/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0053_egress_interfaces/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_isp_cap_to_system_egress_v53"
+scope = "upgrade_only"
+
+[[migration]]
+version = 54
+description = "per-job demotion and article gap summary"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0054_job_support_facts/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0054_job_support_facts/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 55
+description = "script instances, their inputs, categories and feed attachments"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0055_script_instances/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0055_script_instances/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_script_wiring_to_instances_v55"
+scope = "upgrade_only"
+
+[[migration]]
+version = 56
+description = "default unwanted extension list for installs that never set one"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "default_unwanted_extensions_v56"
+scope = "upgrade_only"
+
+[[migration]]
+version = 57
+description = "post-processing entries whose turn has come, for resuming after a restart"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0057_post_processing_started/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0057_post_processing_started/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 58
+description = "post-processing outcome kept for a resumed pass, and a saved script concurrency below 32 raised to 32"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0058_post_processing_outcome/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0058_post_processing_outcome/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "raise_script_concurrency_v58"
+scope = "upgrade_only"

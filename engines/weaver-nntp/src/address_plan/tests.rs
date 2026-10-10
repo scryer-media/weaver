@@ -13,14 +13,14 @@ fn addr(last: u8) -> SocketAddr {
 
 enum Answer {
     Refuse,
-    /// Connect once the test sends on the paired sender.
+    // Connect once the test sends on the paired sender.
     ConnectWhenReleased(Receiver<()>),
-    /// Fail once with this error kind; the next dial connects.
+    // Fail once with this error kind; the next dial connects.
     Fail(io::ErrorKind),
 }
 
-/// A dialer that answers each address the way the test scripted it and
-/// remembers which addresses it was asked to dial.
+// A dialer that answers each address the way the test scripted it and
+// remembers which addresses it was asked to dial.
 struct ScriptedDialer {
     resolved: Mutex<Option<Vec<SocketAddr>>>,
     answers: Mutex<HashMap<SocketAddr, Answer>>,
@@ -90,8 +90,8 @@ fn plan() -> Arc<AddressPlan> {
     Arc::new(AddressPlan::new("news.example.test:563".into()))
 }
 
-/// Wait until the race's losing attempts to `addrs` have finished and been
-/// booked, so none of them lands in the middle of what the test does next.
+// Wait until the race's losing attempts to `addrs` have finished and been
+// booked, so none of them lands in the middle of what the test does next.
 fn settle(plan: &AddressPlan, addrs: &[SocketAddr]) {
     while plan
         .snapshot()
@@ -103,16 +103,16 @@ fn settle(plan: &AddressPlan, addrs: &[SocketAddr]) {
     }
 }
 
-/// Wait until every race thread has finished with `dialer`, which each does
-/// only after booking its attempt.
+// Wait until every race thread has finished with `dialer`, which each does
+// only after booking its attempt.
 fn settle_all(dialer: &Arc<ScriptedDialer>) {
     while Arc::strong_count(dialer) > 1 {
         std::thread::yield_now();
     }
 }
 
-/// Pin `winner` with a first race in which every other address is held until
-/// the race is over.
+// Pin `winner` with a first race in which every other address is held until
+// the race is over.
 fn pin(
     plan: &Arc<AddressPlan>,
     dialer: &Arc<ScriptedDialer>,
@@ -228,8 +228,10 @@ fn a_refused_pin_falls_over_to_the_candidate_that_connects_fastest() {
 
     assert_eq!(connected, faster);
     assert_eq!(dialer.take_dialled(), vec![pinned, faster]);
-    // One refusal is not yet a reason to move the pin.
-    assert_eq!(plan.snapshot().pinned, Some(pinned));
+    // The connect fell through the refused pin, so the pin moves to where
+    // the connections now are, as it does after a lease, instead of waiting
+    // for a race that no further connect may run while every lane is open.
+    assert_eq!(plan.snapshot().pinned, Some(faster));
 }
 
 #[test]
@@ -240,9 +242,10 @@ fn two_refusals_on_the_pin_race_again_even_while_the_server_is_busy() {
     pin(&plan, &dialer, pinned, &[other]);
     dialer.answer(pinned, Answer::Refuse);
 
+    // While no address connects, nothing moves the pin, but its refusals count.
     for _ in 0..SUSPECT_AFTER_FAILURES {
-        let (_, connected) = plan.connect(&dialer).unwrap();
-        assert_eq!(connected, other);
+        dialer.answer(other, Answer::Fail(io::ErrorKind::ConnectionRefused));
+        assert!(plan.connect(&dialer).is_err());
     }
     assert_eq!(plan.snapshot().pinned, Some(pinned));
 
@@ -349,7 +352,7 @@ fn a_first_race_with_nothing_resolved_fails_the_connect() {
 
     let error = plan.connect(&dialer).unwrap_err();
 
-    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+    assert_eq!(error.kind(), io::ErrorKind::Other);
     let snapshot = plan.snapshot();
     assert_eq!(snapshot.pinned, None);
     assert_eq!(snapshot.races_failed, 1);
@@ -402,19 +405,19 @@ fn body_latency_is_kept_only_for_known_addresses() {
     );
 }
 
-/// Wire time of one fetch on the pin in the delivery tests. Enough fetches to
-/// be [`DELIVERY_MIN_SAMPLES`] also add up to [`DELIVERY_MIN_WIRE`].
+// Wire time of one fetch on the pin in the delivery tests. Enough fetches to
+// be [`DELIVERY_MIN_SAMPLES`] also add up to [`DELIVERY_MIN_WIRE`].
 const PIN_WIRE: Duration = Duration::from_millis(1000);
 
-/// A challenger 25% faster than [`PIN_WIRE`], past [`DELIVERY_REPIN_RATIO`].
+// A challenger 25% faster than [`PIN_WIRE`], past [`DELIVERY_REPIN_RATIO`].
 const FASTER_WIRE: Duration = Duration::from_millis(800);
 
-/// A challenger about 11% faster than [`PIN_WIRE`], short of
-/// [`DELIVERY_REPIN_RATIO`].
+// A challenger about 11% faster than [`PIN_WIRE`], short of
+// [`DELIVERY_REPIN_RATIO`].
 const SLIGHTLY_FASTER_WIRE: Duration = Duration::from_millis(900);
 
-/// Book `samples` warm fetches of one megabyte each against `address`, each
-/// taking `wire`.
+// Book `samples` warm fetches of one megabyte each against `address`, each
+// taking `wire`.
 fn deliver(plan: &AddressPlan, address: SocketAddr, samples: u32, wire: Duration) {
     for _ in 0..samples {
         plan.record_delivery(address.ip(), 1_000_000, wire);
@@ -429,8 +432,8 @@ fn delivery_samples(plan: &AddressPlan, address: SocketAddr) -> u32 {
         .map_or(0, |candidate| candidate.delivery_samples)
 }
 
-/// Pin `winner`, then stop the plan's clock so every later age is the
-/// test's to set.
+// Pin `winner`, then stop the plan's clock so every later age is the
+// test's to set.
 fn pin_and_freeze(
     plan: &Arc<AddressPlan>,
     dialer: &Arc<ScriptedDialer>,
@@ -441,7 +444,7 @@ fn pin_and_freeze(
     plan.freeze_clock();
 }
 
-/// `count` connects that must all dial `expected` and nothing else.
+// `count` connects that must all dial `expected` and nothing else.
 fn connects_all_dial(
     plan: &Arc<AddressPlan>,
     dialer: &Arc<ScriptedDialer>,
@@ -570,7 +573,7 @@ fn a_challenger_short_of_the_least_wire_time_is_shadowed_again() {
     assert_eq!(delivery_samples(&plan, challenger), 0);
 }
 
-/// Let the next verdict come due and deliver the evidence it judges.
+// Let the next verdict come due and deliver the evidence it judges.
 fn verdict_with(
     plan: &AddressPlan,
     pinned: SocketAddr,
@@ -973,7 +976,7 @@ fn a_failed_first_race_with_nothing_resolved_fails_later_connects_without_dialli
 
     let error = plan.connect(&dialer).unwrap_err();
 
-    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+    assert_eq!(error.kind(), io::ErrorKind::Other);
     assert!(dialer.take_dialled().is_empty());
     assert_eq!(plan.snapshot().races_failed, 1);
 }
@@ -1027,8 +1030,8 @@ fn a_race_in_which_every_address_timed_out_books_the_timeouts() {
     );
 }
 
-/// Pin `pinned` and have two sessions on it connect and never hear from the
-/// server.
+// Pin `pinned` and have two sessions on it connect and never hear from the
+// server.
 fn pin_that_never_reaches_the_server(
     plan: &Arc<AddressPlan>,
     dialer: &Arc<ScriptedDialer>,
@@ -1104,4 +1107,20 @@ fn a_session_that_reaches_the_server_clears_the_pins_failed_setups() {
     assert_eq!(next, pinned);
     assert_eq!(dialer.take_dialled(), vec![pinned]);
     assert_eq!(plan.snapshot().races_won, 1);
+}
+
+#[test]
+fn unresolved_server_is_destination_evidence_even_without_cached_candidates() {
+    let dialer = ScriptedDialer::new(&[]);
+    dialer.resolve_to_nothing();
+    let plan = plan();
+    for _ in 0..2 {
+        let error = weaver_tunnel::pipe::DialError::destination(plan.connect(&dialer).unwrap_err());
+        assert!(matches!(
+            error,
+            weaver_tunnel::pipe::DialError::Destination(_)
+        ));
+        assert!(!error.is_path_evidence());
+    }
+    assert!(dialer.take_dialled().is_empty());
 }

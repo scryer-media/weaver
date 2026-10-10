@@ -1,32 +1,32 @@
-//! Continuation of the `impl Pipeline` block from `finalize/check.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `finalize/check.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 
 impl Pipeline {
-    /// Everything that happens after the repairer returns, for every path that
-    /// runs it.
-    ///
-    /// # Why it is shared
-    ///
-    /// Both repair call sites used to carry their own copy of this tail, and the
-    /// copies had drifted into different answers to the same question. One
-    /// re-read the installed output and judged *that*; the other trusted the
-    /// repairer's staged `outcome.verification` and never looked at what
-    /// actually landed on disk. A repair that does not verify what it installed
-    /// is not verified, so both now run the authoritative pass — which is also
-    /// where the direct-set damage adjustments and the volume-safety
-    /// recomputation live, so the path that skipped it was missing those too.
-    ///
-    /// # Ordering
-    ///
-    /// `RepairComplete` is emitted last: after canonical placement, post-repair
-    /// verification, identity reconciliation and durable persistence have all
-    /// succeeded. Any failure among them emits `RepairFailed` instead. Emitting
-    /// completion first produced the contradictory sequence this replaces —
-    /// `RepairComplete`, then the job failing a moment later, with nothing on
-    /// the event stream to say the repair had not held.
+    // Everything that happens after the repairer returns, for every path that
+    // runs it.
+    //
+    // # Why it is shared
+    //
+    // Both repair call sites used to carry their own copy of this tail, and the
+    // copies had drifted into different answers to the same question. One
+    // re-read the installed output and judged *that*; the other trusted the
+    // repairer's staged `outcome.verification` and never looked at what
+    // actually landed on disk. A repair that does not verify what it installed
+    // is not verified, so both now run the authoritative pass — which is also
+    // where the direct-set damage adjustments and the volume-safety
+    // recomputation live, so the path that skipped it was missing those too.
+    //
+    // # Ordering
+    //
+    // `RepairComplete` is emitted last: after canonical placement, post-repair
+    // verification, identity reconciliation and durable persistence have all
+    // succeeded. Any failure among them emits `RepairFailed` instead. Emitting
+    // completion first produced the contradictory sequence this replaces —
+    // `RepairComplete`, then the job failing a moment later, with nothing on
+    // the event stream to say the repair had not held.
     pub(in crate::pipeline) async fn finish_par2_repair(
         &mut self,
         job_id: JobId,
@@ -255,6 +255,15 @@ impl Pipeline {
         let adopted_numbered_parts = registration.numbered_parts;
         let registered_rar_outputs = registration.registered;
         self.invalidate_rar_plans_for_repaired_sets(job_id, registration.set_names);
+        // A file the repair rebuilt now holds conventional bytes on disk. A set
+        // admitted from volume headers that could have claimed it never will,
+        // and the conventional set that names it waits on the volumes that set
+        // holds virtually, so the header set hands them over.
+        let repaired_files =
+            self.par2_rewritten_job_files(job_id, &post_repair_verification, &rewritten);
+        let _ = self
+            .note_identity_repaired_files(job_id, &repaired_files)
+            .await;
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.refresh_topologies", stage_start);
         if let Err(error) = self
@@ -366,21 +375,21 @@ impl Pipeline {
         self.schedule_job_completion_check(job_id);
     }
 
-    /// Fail a job that was mid-repair, announcing it as a repair failure.
-    ///
-    /// Every non-success exit from [`Self::finish_par2_repair`] comes through
-    /// here, so a job can no longer fail silently after `RepairComplete` has
-    /// already told the UI that the repair held.
-    /// Remove what the repair left behind, now that the repair has been
-    /// accepted.
-    ///
-    /// On any failure these files remain as evidence, and cleanup is not reached.
-    ///
-    /// Only entries that *appeared during* the repair are candidates, and only
-    /// when they are neither an NZB entry under any of its names nor a file the
-    /// recovery set describes. A file the repair reconstructed from `Missing`
-    /// lands at a described name and is therefore never a candidate — the test
-    /// is membership, not a suffix convention borrowed from another crate.
+    // Fail a job that was mid-repair, announcing it as a repair failure.
+    //
+    // Every non-success exit from [`Self::finish_par2_repair`] comes through
+    // here, so a job can no longer fail silently after `RepairComplete` has
+    // already told the UI that the repair held.
+    // Remove what the repair left behind, now that the repair has been
+    // accepted.
+    //
+    // On any failure these files remain as evidence, and cleanup is not reached.
+    //
+    // Only entries that *appeared during* the repair are candidates, and only
+    // when they are neither an NZB entry under any of its names nor a file the
+    // recovery set describes. A file the repair reconstructed from `Missing`
+    // lands at a described name and is therefore never a candidate — the test
+    // is membership, not a suffix convention borrowed from another crate.
     pub(in crate::pipeline) fn purge_par2_repair_leftovers(&mut self, job_id: JobId) {
         let Some(before) = self.par2_pre_repair_dir_entries.remove(&job_id) else {
             return;
@@ -408,14 +417,14 @@ impl Pipeline {
         }
     }
 
-    /// The working-directory files a repair left behind, named by difference
-    /// against `before`, the directory listing taken before the first repair
-    /// touched it: an entry that was not there then, that no NZB file answers
-    /// to under any of its names, and that no servable set describes. This is
-    /// the one rule for what a leftover is; [`Self::purge_par2_repair_leftovers`]
-    /// removes them once the job has settled, and until then the extra scan of
-    /// every set keeps them out of its candidates. Sorted, so two calls over an
-    /// unchanged directory compare equal.
+    // The working-directory files a repair left behind, named by difference
+    // against `before`, the directory listing taken before the first repair
+    // touched it: an entry that was not there then, that no NZB file answers
+    // to under any of its names, and that no servable set describes. This is
+    // the one rule for what a leftover is; [`Self::purge_par2_repair_leftovers`]
+    // removes them once the job has settled, and until then the extra scan of
+    // every set keeps them out of its candidates. Sorted, so two calls over an
+    // unchanged directory compare equal.
     pub(in crate::pipeline) fn par2_repair_leftover_names(
         &self,
         job_id: JobId,
@@ -480,46 +489,46 @@ impl Pipeline {
         }
     }
 
-    /// After an *authoritative* post-repair verification, re-persist every
-    /// confirmed file's digest from the recovery set with `Verified`
-    /// provenance.
-    ///
-    /// Repair rewrites bytes in place, so a digest streamed before the
-    /// rewrite describes content that is gone; left standing, a restart
-    /// would load it as trusted and compare stale bytes' MD5 against the
-    /// recovery set forever. Persisting the description's digest is sound
-    /// here — and only here — because every `Complete` entry the caller hands
-    /// over is vouched by a pass that read the bytes off disk. The quick paths'
-    /// synthetic all-valid results, which read nothing, must never reach this
-    /// function.
-    ///
-    /// # The vouching is two passes, not one
-    ///
-    /// The post-repair result is a merge, and each half is proven by its own
-    /// read:
-    ///
-    /// - the files the repair **rewrote** are proven by the post-repair pass,
-    ///   which read them back after the repair installed them;
-    /// - the files it **did not touch** are proven by the pre-repair pass,
-    ///   which read them in this same flow — that pass is what decided they
-    ///   were complete, and being complete is exactly why the repair left them
-    ///   alone.
-    ///
-    /// Both halves are measured bytes; neither is a description standing in for
-    /// a read. What the merge accepts is a *window* rather than a gap in
-    /// evidence: an untouched file that some other writer corrupts between the
-    /// two passes still carries its earlier verdict. That is the same trust
-    /// class as an in-stream claim relied on across the same interval, and it
-    /// is stated at the merge site in
-    /// [`Pipeline::verify_repaired_par2_files_with_placement`].
-    ///
-    /// A `Verified` digest is attached only through an UNAMBIGUOUS identity:
-    /// every alias a name resolves to is kept (never first-wins), a
-    /// `Renamed` result prefers the actual verified path over the expected
-    /// description name, each verification entry must resolve to exactly one
-    /// assembly file, no two entries may claim the same file, and the file
-    /// on disk must measure exactly the described length. Anything short of
-    /// that keeps whatever digest state already exists.
+    // After an *authoritative* post-repair verification, re-persist every
+    // confirmed file's digest from the recovery set with `Verified`
+    // provenance.
+    //
+    // Repair rewrites bytes in place, so a digest streamed before the
+    // rewrite describes content that is gone; left standing, a restart
+    // would load it as trusted and compare stale bytes' MD5 against the
+    // recovery set forever. Persisting the description's digest is sound
+    // here — and only here — because every `Complete` entry the caller hands
+    // over is vouched by a pass that read the bytes off disk. The quick paths'
+    // synthetic all-valid results, which read nothing, must never reach this
+    // function.
+    //
+    // # The vouching is two passes, not one
+    //
+    // The post-repair result is a merge, and each half is proven by its own
+    // read:
+    //
+    // - the files the repair **rewrote** are proven by the post-repair pass,
+    //   which read them back after the repair installed them;
+    // - the files it **did not touch** are proven by the pre-repair pass,
+    //   which read them in this same flow — that pass is what decided they
+    //   were complete, and being complete is exactly why the repair left them
+    //   alone.
+    //
+    // Both halves are measured bytes; neither is a description standing in for
+    // a read. What the merge accepts is a *window* rather than a gap in
+    // evidence: an untouched file that some other writer corrupts between the
+    // two passes still carries its earlier verdict. That is the same trust
+    // class as an in-stream claim relied on across the same interval, and it
+    // is stated at the merge site in
+    // [`Pipeline::verify_repaired_par2_files_with_placement`].
+    //
+    // A `Verified` digest is attached only through an UNAMBIGUOUS identity:
+    // every alias a name resolves to is kept (never first-wins), a
+    // `Renamed` result prefers the actual verified path over the expected
+    // description name, each verification entry must resolve to exactly one
+    // assembly file, no two entries may claim the same file, and the file
+    // on disk must measure exactly the described length. Anything short of
+    // that keeps whatever digest state already exists.
     pub(crate) async fn refresh_authoritative_verified_hashes(
         &mut self,
         job_id: JobId,
@@ -701,9 +710,9 @@ impl Pipeline {
         .map_err(|error| format!("failed to refresh post-repair verified hashes: {error}"))
     }
 
-    /// `rewritten` is the repair's write set, empty on a pass that repaired
-    /// nothing. See
-    /// [`Self::verified_complete_archive_file_ids_needing_refresh`].
+    // `rewritten` is the repair's write set, empty on a pass that repaired
+    // nothing. See
+    // [`Self::verified_complete_archive_file_ids_needing_refresh`].
     pub(in crate::pipeline) async fn refresh_verified_complete_archive_topologies(
         &mut self,
         job_id: JobId,
@@ -740,7 +749,7 @@ impl Pipeline {
         file_ids.len()
     }
 
-    /// The RAR set names owning a list of the job's files, deduplicated.
+    // The RAR set names owning a list of the job's files, deduplicated.
     pub(in crate::pipeline) fn rar_set_names_for_files(
         &self,
         job_id: JobId,
@@ -764,25 +773,25 @@ impl Pipeline {
             .collect()
     }
 
-    /// Force a header-level plan rebuild for every set a repair touched, and
-    /// hold extraction until it lands.
-    ///
-    /// Registering the repaired volume's facts is not enough on its own. The
-    /// derived plan — the member chain, and with it the volume range extraction
-    /// opens — was computed while those volumes were missing, and nothing about
-    /// installing new facts retires it. Re-deriving from the facts alone would
-    /// not do either: the member chain comes from the volumes' *headers*, which
-    /// is exactly what the repair rewrote.
-    ///
-    /// [`RefreshReason::IdentityRebind`] is the existing reason for "the bytes
-    /// behind this set are not what the plan was built from". It marks the
-    /// refresh state `structure_dirty`, which is what makes
-    /// `rar_member_refresh_request` demand a rebuild before a member may start,
-    /// and it leaves the request `in_flight`, which is what
-    /// `job_has_pending_rar_refresh_for_current_sets` reports and the
-    /// `pending_rar_refresh` arm of the completion gate already defers on. No
-    /// new gate: the repaired set becomes pending in the one the extraction path
-    /// has always honoured.
+    // Force a header-level plan rebuild for every set a repair touched, and
+    // hold extraction until it lands.
+    //
+    // Registering the repaired volume's facts is not enough on its own. The
+    // derived plan — the member chain, and with it the volume range extraction
+    // opens — was computed while those volumes were missing, and nothing about
+    // installing new facts retires it. Re-deriving from the facts alone would
+    // not do either: the member chain comes from the volumes' *headers*, which
+    // is exactly what the repair rewrote.
+    //
+    // [`RefreshReason::IdentityRebind`] is the existing reason for "the bytes
+    // behind this set are not what the plan was built from". It marks the
+    // refresh state `structure_dirty`, which is what makes
+    // `rar_member_refresh_request` demand a rebuild before a member may start,
+    // and it leaves the request `in_flight`, which is what
+    // `job_has_pending_rar_refresh_for_current_sets` reports and the
+    // `pending_rar_refresh` arm of the completion gate already defers on. No
+    // new gate: the repaired set becomes pending in the one the extraction path
+    // has always honoured.
     pub(in crate::pipeline) fn invalidate_rar_plans_for_repaired_sets(
         &mut self,
         job_id: JobId,
@@ -814,25 +823,25 @@ impl Pipeline {
         }
     }
 
-    /// Retire the split topologies a verdict has already produced the output of.
-    ///
-    /// A plain split posting ships `<name>.001/.002/.003` while its recovery
-    /// data is computed over `<name>` — a file the posting never carries. The
-    /// recovery pass reads the parts as one file and installs `<name>` itself,
-    /// so by the time a verdict vouches for it the join has happened. Running
-    /// the joiner afterwards writes the parts' bytes back over the output that
-    /// was just verified, and waiting for every part to be whole fails a job
-    /// whose payload is already on disk and proven.
-    ///
-    /// The match is a plain key lookup: a split topology is named by
-    /// `archive_base_name` of its parts, which is exactly the joined-output
-    /// name, so a verdict naming the *parts* — the ordinary shape, where the
-    /// recovery set protects what the posting actually carries — finds no
-    /// topology and retires nothing.
-    ///
-    /// Paths are checked before use, as they are for rebuilt RAR volumes: a
-    /// PAR2 description names its own file, so an absolute path or one
-    /// containing `..` is refused rather than resolved.
+    // Retire the split topologies a verdict has already produced the output of.
+    //
+    // A plain split posting ships `<name>.001/.002/.003` while its recovery
+    // data is computed over `<name>` — a file the posting never carries. The
+    // recovery pass reads the parts as one file and installs `<name>` itself,
+    // so by the time a verdict vouches for it the join has happened. Running
+    // the joiner afterwards writes the parts' bytes back over the output that
+    // was just verified, and waiting for every part to be whole fails a job
+    // whose payload is already on disk and proven.
+    //
+    // The match is a plain key lookup: a split topology is named by
+    // `archive_base_name` of its parts, which is exactly the joined-output
+    // name, so a verdict naming the *parts* — the ordinary shape, where the
+    // recovery set protects what the posting actually carries — finds no
+    // topology and retires nothing.
+    //
+    // Paths are checked before use, as they are for rebuilt RAR volumes: a
+    // PAR2 description names its own file, so an absolute path or one
+    // containing `..` is refused rather than resolved.
     pub(super) fn retire_par2_joined_split_topologies(
         &mut self,
         job_id: JobId,
@@ -916,15 +925,15 @@ impl Pipeline {
         retired
     }
 
-    /// Whether a file is a posted part of a split set a verdict has already
-    /// joined.
-    ///
-    /// Such a part is a consumed input, not payload the job is short of: its
-    /// bytes are inside the output the recovery set vouched for, and there is
-    /// nothing left to download, repair or wait for. It therefore belongs in
-    /// none of the post-verdict incomplete buckets — which matters most for the
-    /// *first* part, whose 16 KiB prefix is the joined file's own, so PAR2
-    /// content identity answers the joined description with it.
+    // Whether a file is a posted part of a split set a verdict has already
+    // joined.
+    //
+    // Such a part is a consumed input, not payload the job is short of: its
+    // bytes are inside the output the recovery set vouched for, and there is
+    // nothing left to download, repair or wait for. It therefore belongs in
+    // none of the post-verdict incomplete buckets — which matters most for the
+    // *first* part, whose 16 KiB prefix is the joined file's own, so PAR2
+    // content identity answers the joined description with it.
     pub(in crate::pipeline) fn par2_join_consumed_split_part(
         &self,
         job_id: JobId,
@@ -947,7 +956,7 @@ impl Pipeline {
             .any(|parts| parts.contains(&current) || parts.contains(file.filename()))
     }
 
-    /// The parts of every split set a verdict has joined for this job.
+    // The parts of every split set a verdict has joined for this job.
     pub(in crate::pipeline) fn par2_joined_split_part_names(&self, job_id: JobId) -> Vec<String> {
         self.par2_joined_split_sets
             .get(&job_id)
@@ -955,8 +964,8 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
-    /// Every posted file a recovery verdict has spent: the parts of a joined
-    /// split set, and the damaged copies of outputs the verdict rebuilt.
+    // Every posted file a recovery verdict has spent: the parts of a joined
+    // split set, and the damaged copies of outputs the verdict rebuilt.
     pub(in crate::pipeline) fn par2_spent_input_names(&self, job_id: JobId) -> Vec<String> {
         let mut names = self.par2_joined_split_part_names(job_id);
         if let Some(unposted) = self.recovery_unposted_outputs.get(&job_id) {
@@ -970,8 +979,8 @@ impl Pipeline {
         names
     }
 
-    /// Whether a posted file is the damaged copy of an output a recovery
-    /// verdict has since delivered whole.
+    // Whether a posted file is the damaged copy of an output a recovery
+    // verdict has since delivered whole.
     pub(in crate::pipeline) fn recovery_superseded_source(
         &self,
         job_id: JobId,
@@ -982,10 +991,10 @@ impl Pipeline {
             .is_some_and(|unposted| unposted.superseded.contains(&file_id))
     }
 
-    /// Whether a recovery verdict delivered payload no posted file answers to.
-    ///
-    /// Furniture does not count, for the reason it never counts as a delivery:
-    /// a rebuilt `.nfo` is not something a payload can hide behind.
+    // Whether a recovery verdict delivered payload no posted file answers to.
+    //
+    // Furniture does not count, for the reason it never counts as a delivery:
+    // a rebuilt `.nfo` is not something a payload can hide behind.
     pub(in crate::pipeline) fn par2_verdict_delivered_unposted_payload(
         &self,
         job_id: JobId,
@@ -1001,22 +1010,22 @@ impl Pipeline {
             })
     }
 
-    /// Record the outputs a verdict proved complete that no posted file bound
-    /// to, and find the posted files they were rebuilt from.
-    ///
-    /// A posted file that lost the bytes its identity is read from cannot be
-    /// named, so the recovery set rebuilds the file it describes under the
-    /// described name and the posted copy is left beside it. Nothing about the
-    /// posted copy's name says which output it belongs to, and nothing should:
-    /// the claim is made only on content. A posted file is superseded when a
-    /// slice of it, at the offset the set describes, carries both checksums
-    /// the set holds for that slice of the rebuilt output.
-    ///
-    /// The probe is deliberately small. It runs only when a verdict left an
-    /// output no posted file answers to, only over incomplete files bound to no
-    /// set, and it hashes at most [`SUPERSEDED_PROBE_SLICES`] slices of each
-    /// before giving up. A slice of zeros is skipped unhashed — a hole where an
-    /// article never arrived matches nothing worth matching.
+    // Record the outputs a verdict proved complete that no posted file bound
+    // to, and find the posted files they were rebuilt from.
+    //
+    // A posted file that lost the bytes its identity is read from cannot be
+    // named, so the recovery set rebuilds the file it describes under the
+    // described name and the posted copy is left beside it. Nothing about the
+    // posted copy's name says which output it belongs to, and nothing should:
+    // the claim is made only on content. A posted file is superseded when a
+    // slice of it, at the offset the set describes, carries both checksums
+    // the set holds for that slice of the rebuilt output.
+    //
+    // The probe is deliberately small. It runs only when a verdict left an
+    // output no posted file answers to, only over incomplete files bound to no
+    // set, and it hashes at most [`SUPERSEDED_PROBE_SLICES`] slices of each
+    // before giving up. A slice of zeros is skipped unhashed — a hole where an
+    // article never arrived matches nothing worth matching.
     pub(in crate::pipeline) async fn note_recovery_unposted_outputs(
         &mut self,
         job_id: JobId,
@@ -1109,7 +1118,9 @@ impl Pipeline {
             } else {
                 candidates
                     .into_iter()
-                    .filter(|(_, path)| superseded_source_probe(path, slice_size, &present))
+                    .filter(|(_, path)| {
+                        superseded_source_probe(path, slice_size, &present, &working_dir)
+                    })
                     .map(|(file_id, _)| file_id)
                     .collect()
             };
@@ -1135,12 +1146,12 @@ impl Pipeline {
         unposted.superseded.extend(superseded);
     }
 
-    /// Delete the parts a verified join consumed, before finalization ships
-    /// them alongside the file they joined into.
-    ///
-    /// This is the same removal the post-extraction cleanups perform for the
-    /// sources of an archive that was extracted, on the same unconditional
-    /// terms: the join happened, so the parts are spent inputs.
+    // Delete the parts a verified join consumed, before finalization ships
+    // them alongside the file they joined into.
+    //
+    // This is the same removal the post-extraction cleanups perform for the
+    // sources of an archive that was extracted, on the same unconditional
+    // terms: the join happened, so the parts are spent inputs.
     pub(in crate::pipeline) async fn cleanup_par2_joined_split_parts(&mut self, job_id: JobId) {
         let parts = self.par2_spent_input_names(job_id);
         if parts.is_empty() {
@@ -1169,17 +1180,17 @@ impl Pipeline {
         );
     }
 
-    /// Register RAR volumes that PAR2 *rebuilt* and that the NZB never carried.
-    ///
-    /// Ported from release-0.7.9. A missing interior volume repaired from
-    /// recovery blocks lands on disk under a name the job's assembly has never
-    /// heard of, so extraction goes on believing the volume is absent and the
-    /// repair achieves nothing. This walks a clean verification result, keeps
-    /// the entries that are RAR volumes the job does not already know, and
-    /// persists their parsed facts against the set.
-    ///
-    /// Paths are checked before use: a PAR2 description names its own file, so
-    /// an absolute path or one containing `..` is refused rather than resolved.
+    // Register RAR volumes that PAR2 *rebuilt* and that the NZB never carried.
+    //
+    // Ported from release-0.7.9. A missing interior volume repaired from
+    // recovery blocks lands on disk under a name the job's assembly has never
+    // heard of, so extraction goes on believing the volume is absent and the
+    // repair achieves nothing. This walks a clean verification result, keeps
+    // the entries that are RAR volumes the job does not already know, and
+    // persists their parsed facts against the set.
+    //
+    // Paths are checked before use: a PAR2 description names its own file, so
+    // an absolute path or one containing `..` is refused rather than resolved.
     pub(crate) async fn register_verified_par2_rar_outputs(
         &mut self,
         job_id: JobId,
@@ -1229,6 +1240,15 @@ impl Pipeline {
                         &role,
                         number,
                     )? {
+                        registration.numbered_parts += 1;
+                    }
+                    continue;
+                }
+                // A whole container is its own part zero: rebuilt under the
+                // name the recovery set gives it, it is as absent from every
+                // topology as a rebuilt numbered part.
+                weaver_model::files::FileRole::SevenZipArchive => {
+                    if self.adopt_verified_par2_numbered_part(job_id, &file.filename, &role, 0)? {
                         registration.numbered_parts += 1;
                     }
                     continue;
@@ -1289,23 +1309,23 @@ impl Pipeline {
         Ok(registration)
     }
 
-    /// Adopt a numbered part the recovery set proved Complete into its set's
-    /// topology, when the NZB never carried it.
-    ///
-    /// The RAR arm of [`Self::register_verified_par2_rar_outputs`] persists
-    /// header facts and lets the plan rebuild from them. A numbered set has no
-    /// header chain: its topology is the numbering of the parts the assembly
-    /// registered, which is exactly what a part the NZB never carried is
-    /// missing from. So the part goes straight into the topology — its name
-    /// into `volume_map`, its number marked complete, and the expected count
-    /// raised when it lies past the end, since a withheld *last* part is one
-    /// the topology never counted. `archive_set_part_paths` then hands it to the
-    /// extractor off the same map.
-    ///
-    /// `Ok(false)` when the part belongs to no matching set this job knows, or the
-    /// set already lists it under this or an NZB file's current name. `Err`
-    /// when the verdict says Complete but the bytes are not where the
-    /// description puts them — the same refusal the RAR arm makes.
+    // Adopt a numbered part the recovery set proved Complete into its set's
+    // topology, when the NZB never carried it.
+    //
+    // The RAR arm of [`Self::register_verified_par2_rar_outputs`] persists
+    // header facts and lets the plan rebuild from them. A numbered set has no
+    // header chain: its topology is the numbering of the parts the assembly
+    // registered, which is exactly what a part the NZB never carried is
+    // missing from. So the part goes straight into the topology — its name
+    // into `volume_map`, its number marked complete, and the expected count
+    // raised when it lies past the end, since a withheld *last* part is one
+    // the topology never counted. `archive_set_part_paths` then hands it to the
+    // extractor off the same map.
+    //
+    // `Ok(false)` when the part belongs to no matching set this job knows, or the
+    // set already lists it under this or an NZB file's current name. `Err`
+    // when the verdict says Complete but the bytes are not where the
+    // description puts them — the same refusal the RAR arm makes.
     pub(super) fn adopt_verified_par2_numbered_part(
         &mut self,
         job_id: JobId,
@@ -1314,7 +1334,8 @@ impl Pipeline {
         number: u32,
     ) -> Result<bool, String> {
         let archive_type = match role {
-            weaver_model::files::FileRole::SevenZipSplit { .. } => {
+            weaver_model::files::FileRole::SevenZipSplit { .. }
+            | weaver_model::files::FileRole::SevenZipArchive => {
                 crate::jobs::assembly::ArchiveType::SevenZip
             }
             weaver_model::files::FileRole::SplitFile { .. } => {
@@ -1438,31 +1459,31 @@ impl Pipeline {
         Ok(true)
     }
 
-    /// The archive files whose topology must be rebuilt from what a verdict
-    /// proved about the disk.
-    ///
-    /// `rewritten` names the descriptions a repair just wrote — the write set of
-    /// [`par2_repair_write_set`], empty on every pass that repaired nothing.
-    /// Those files are included **unconditionally**, and that is the whole
-    /// reason the parameter exists.
-    ///
-    /// A repaired volume re-verifies as `Complete`, not `Renamed`, and its set
-    /// already carries a plan — one derived from cached headers back while the
-    /// volume was still missing. So neither of the two conditions that admit a
-    /// file here holds for precisely the files whose bytes just changed, and the
-    /// refresh walks past them: the plan a repair exists to correct is the one
-    /// left standing. A member chain that ended at the repaired volume keeps
-    /// ending there, extraction opens the truncated volume range, and the packed
-    /// data fails its CRC against bytes that are in fact perfect.
-    ///
-    /// `needs_refresh` asks whether a set has a plan *at all*, which is a
-    /// question about existence where this needs one about staleness. Repair is
-    /// the one place staleness is known rather than inferred — the repairer says
-    /// which descriptions it wrote — so the answer is threaded in rather than
-    /// re-derived from names here.
-    /// The refresh set without the rewritten flags — the shape the tests assert
-    /// against. Production reads
-    /// [`Self::verified_complete_archive_refresh_targets`], which keeps them.
+    // The archive files whose topology must be rebuilt from what a verdict
+    // proved about the disk.
+    //
+    // `rewritten` names the descriptions a repair just wrote — the write set of
+    // [`par2_repair_write_set`], empty on every pass that repaired nothing.
+    // Those files are included **unconditionally**, and that is the whole
+    // reason the parameter exists.
+    //
+    // A repaired volume re-verifies as `Complete`, not `Renamed`, and its set
+    // already carries a plan — one derived from cached headers back while the
+    // volume was still missing. So neither of the two conditions that admit a
+    // file here holds for precisely the files whose bytes just changed, and the
+    // refresh walks past them: the plan a repair exists to correct is the one
+    // left standing. A member chain that ended at the repaired volume keeps
+    // ending there, extraction opens the truncated volume range, and the packed
+    // data fails its CRC against bytes that are in fact perfect.
+    //
+    // `needs_refresh` asks whether a set has a plan *at all*, which is a
+    // question about existence where this needs one about staleness. Repair is
+    // the one place staleness is known rather than inferred — the repairer says
+    // which descriptions it wrote — so the answer is threaded in rather than
+    // re-derived from names here.
+    // The refresh set without the rewritten flags — the shape the tests assert
+    // against. Production reads
+    // [`Self::verified_complete_archive_refresh_targets`], which keeps them.
     #[cfg(test)]
     pub(crate) fn verified_complete_archive_file_ids_needing_refresh(
         &self,
@@ -1476,13 +1497,13 @@ impl Pipeline {
             .collect()
     }
 
-    /// The refresh set, each entry flagged with whether the repair rewrote it.
-    ///
-    /// The flag is what separates "rebuild this file's topology" from "this
-    /// file's set was built from bytes that no longer exist". Only the latter
-    /// may invalidate a set's plan: a rename or a first-time topology build is
-    /// ordinary progress, and forcing a header-level rebuild for those would
-    /// re-derive a plan from the same headers it already holds.
+    // The refresh set, each entry flagged with whether the repair rewrote it.
+    //
+    // The flag is what separates "rebuild this file's topology" from "this
+    // file's set was built from bytes that no longer exist". Only the latter
+    // may invalidate a set's plan: a rename or a first-time topology build is
+    // ordinary progress, and forcing a header-level rebuild for those would
+    // re-derive a plan from the same headers it already holds.
     pub(super) fn verified_complete_archive_refresh_targets(
         &self,
         job_id: JobId,
@@ -1612,6 +1633,53 @@ impl Pipeline {
             .is_some_and(|state| state.assembly.archive_topology_for(&set_name).is_none())
     }
 
+    // The job's files a repair rewrote, by NZB file index: every file whose
+    // name, under any identity it has carried, answers to a description in
+    // `rewritten`.
+    pub(super) fn par2_rewritten_job_files(
+        &self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+        rewritten: &HashSet<par2_rs::FileId>,
+    ) -> Vec<u32> {
+        if rewritten.is_empty() {
+            return Vec::new();
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        let mut by_name = HashMap::<String, (NzbFileId, bool)>::new();
+        for file in state.assembly.files() {
+            let file_id = file.file_id();
+            Self::insert_par2_name_candidates(&mut by_name, file.filename(), file_id, false);
+            if let Some(identity) = self.effective_file_identity(job_id, file_id) {
+                for name in [
+                    Some(identity.current_filename.as_str()),
+                    Some(identity.source_filename.as_str()),
+                    identity.canonical_filename.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    Self::insert_par2_name_candidates(&mut by_name, name, file_id, false);
+                }
+            }
+        }
+        let mut files: Vec<u32> = verification
+            .files
+            .iter()
+            .filter(|file| rewritten.contains(&file.file_id))
+            .filter_map(|file| {
+                Self::par2_verification_candidate_names(file)
+                    .into_iter()
+                    .find_map(|name| by_name.get(&name).map(|(id, _)| id.file_index))
+            })
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
+
     pub(super) fn insert_par2_name_candidates(
         by_name: &mut HashMap<String, (NzbFileId, bool)>,
         name: &str,
@@ -1655,24 +1723,25 @@ impl Pipeline {
     }
 }
 
-/// The most slices of one candidate the superseded-source probe will hash.
-///
-/// The first slice past a hole usually straddles the hole's edge and matches
-/// nothing; the one after it lies wholly inside what arrived. Three leaves room
-/// for a slice larger than an article without turning a probe into a read of
-/// the file.
+// The most slices of one candidate the superseded-source probe will hash.
+//
+// The first slice past a hole usually straddles the hole's edge and matches
+// nothing; the one after it lies wholly inside what arrived. Three leaves room
+// for a slice larger than an article without turning a probe into a read of
+// the file.
 const SUPERSEDED_PROBE_SLICES: usize = 3;
 
-/// Whether the file at `path` holds a slice of one of `outputs` at the offset
-/// the recovery set describes it.
-///
-/// Slices are compared index for index — a posted copy of a described file has
-/// its surviving bytes exactly where the description puts them — and a match
-/// needs both the CRC32 and the MD5 the set carries for that slice.
+// Whether the file at `path` holds a slice of one of `outputs` at the offset
+// the recovery set describes it.
+//
+// Slices are compared index for index — a posted copy of a described file has
+// its surviving bytes exactly where the description puts them — and a match
+// needs both the CRC32 and the MD5 the set carries for that slice.
 fn superseded_source_probe(
     path: &Path,
     slice_size: u64,
     outputs: &[(String, u64, Vec<par2_rs::SliceChecksum>)],
+    output_dir: &Path,
 ) -> bool {
     use std::io::Read;
 
@@ -1728,9 +1797,98 @@ fn superseded_source_probe(
             }
         }
         if filled < slice_len {
+            // A small split 7z can lose its tail before even one complete
+            // PAR2 slice survives. Compare its entire remaining part
+            // prefix with the already verified outputs, without inventing
+            // checksum padding. Only one matching output may claim the copy.
+            if index == 0 && filled >= 32 {
+                let mut expected = vec![0; filled];
+                let matches = outputs
+                    .iter()
+                    .filter(|(name, length, _)| {
+                        // Later split parts carry no start signature. Require a
+                        // verified split-archive description as well as matching
+                        // every surviving byte, not just a convenient sample.
+                        let split_sevenz = name.rsplit_once('.').is_some_and(|(base, number)| {
+                            base.to_ascii_lowercase().ends_with(".7z")
+                                && !number.is_empty()
+                                && number.bytes().all(|byte| byte.is_ascii_digit())
+                        });
+                        split_sevenz
+                            && *length > filled as u64
+                            && std::fs::File::open(output_dir.join(name)).is_ok_and(|mut output| {
+                                output.read_exact(&mut expected).is_ok()
+                                    && expected == buffer[..filled]
+                            })
+                    })
+                    .take(2)
+                    .count();
+                return matches == 1;
+            }
             return false;
         }
         index += 1;
     }
     false
+}
+
+#[cfg(test)]
+mod superseded_prefix_tests {
+    use super::superseded_source_probe;
+
+    #[test]
+    fn truncated_sevenz_prefix_requires_one_exact_verified_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut full: Vec<u8> = (0..256).map(|n| (n % 251) as u8).collect();
+        full[..6].copy_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
+        let source = directory.path().join("posted");
+        std::fs::write(&source, &full[..80]).unwrap();
+        std::fs::write(directory.path().join("archive.7z.001"), &full).unwrap();
+        let mut outputs = vec![("archive.7z.001".to_string(), full.len() as u64, Vec::new())];
+        assert!(superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+
+        let mut changed = full[..80].to_vec();
+        changed[70] ^= 1;
+        std::fs::write(&source, changed).unwrap();
+        assert!(!superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+
+        std::fs::write(&source, &full[..80]).unwrap();
+        std::fs::write(directory.path().join("other.7z.001"), &full).unwrap();
+        outputs.push(("other.7z.001".to_string(), full.len() as u64, Vec::new()));
+        assert!(!superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+
+        outputs.pop();
+        full[..6].copy_from_slice(b"part02");
+        std::fs::write(directory.path().join("archive.7z.001"), &full).unwrap();
+        std::fs::write(&source, &full[..80]).unwrap();
+        assert!(superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+
+        std::fs::write(&source, &full[..8]).unwrap();
+        assert!(!superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+    }
 }

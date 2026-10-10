@@ -34,11 +34,11 @@ fn record_member_crc32_value(
     }
 }
 
-/// Folds one volume's member headers into the checksum map. A member spanning
-/// volumes states its checksum on the header that ends it, so earlier volumes
-/// simply contribute nothing. Conflicting checksums for the same normalized
-/// delivery path make that path unusable instead of picking an iteration-order
-/// winner.
+// Folds one volume's member headers into the checksum map. A member spanning
+// volumes states its checksum on the header that ends it, so earlier volumes
+// simply contribute nothing. Conflicting checksums for the same normalized
+// delivery path make that path unusable instead of picking an iteration-order
+// winner.
 fn record_member_crc32(
     by_path: &mut HashMap<String, u32>,
     ambiguous_paths: &mut HashSet<String>,
@@ -57,8 +57,9 @@ fn record_member_crc32(
 
 #[derive(Debug)]
 struct UnacceptableExtensionMatch {
+    // Relative to the delivery, `/`-separated: the path the file would have
+    // been published under.
     relative_path: String,
-    pattern: String,
 }
 
 #[derive(Debug, Default)]
@@ -73,9 +74,9 @@ enum DeliveryPolicySource {
     Fixed(PostProcessingSettings),
 }
 
-/// Inspect exactly the entries the final move can publish, without following
-/// links. This one iterative walk both enforces the extension policy and
-/// supplies the byte totals used by move progress.
+// Inspect exactly the entries the final move can publish, without following
+// links. This one iterative walk both enforces the extension policy and
+// supplies the byte totals used by move progress.
 fn validate_delivery_sources(
     working_dir: &Path,
     staging_dir: Option<&Path>,
@@ -188,14 +189,12 @@ fn scan_delivery_root(
                 ));
             }
             let filename = path.file_name().unwrap_or_default().to_string_lossy();
-            if let Some(pattern) = settings.unacceptable_extension_match(&filename) {
+            if settings.unacceptable_extension_match(&filename).is_some() {
                 let rejection = UnacceptableExtensionMatch {
-                    relative_path: format!("{source_name}/{}", relative_path.display()),
-                    pattern: pattern.to_string(),
+                    relative_path: relative_path.to_string_lossy().replace('\\', "/"),
                 };
-                return Err(format!(
-                    "unacceptable extension '{}' matched '{}' before publication",
-                    rejection.pattern, rejection.relative_path
+                return Err(crate::post_processing::model::unwanted_extension_reason(
+                    &rejection.relative_path,
                 ));
             }
             entry_bytes = entry_bytes.saturating_add(metadata.len());
@@ -366,6 +365,39 @@ where
     }
 }
 
+async fn validate_script_move_destination(
+    db: crate::Database,
+    context: crate::post_processing::runner::JobExecutionContext,
+    expected: &std::path::Path,
+) -> Result<(), MoveToCompleteFailure> {
+    // A missing directory is an operational failure, not unsafe content.
+    if let Err(error) = tokio::fs::symlink_metadata(expected).await
+        && error.kind() == std::io::ErrorKind::NotFound
+    {
+        return Err(MoveToCompleteFailure::Operational(format!(
+            "script final directory {} does not exist",
+            expected.display()
+        )));
+    }
+    let path = expected.to_path_buf();
+    let validated = tokio::task::spawn_blocking(move || {
+        crate::post_processing::effects::validate_directory(&db, &context, &path)
+    })
+    .await
+    .map_err(|error| {
+        MoveToCompleteFailure::Operational(format!(
+            "script destination validation worker failed: {error}"
+        ))
+    })?
+    .map_err(MoveToCompleteFailure::Security)?;
+    if validated != expected {
+        return Err(MoveToCompleteFailure::Security(
+            "script final directory changed after reservation".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
@@ -418,12 +450,12 @@ async fn run_move_to_claimed_destination(
             tokio::task::spawn_blocking(move || database.post_processing_settings())
                 .await
                 .map_err(|error| {
-                    MoveToCompleteFailure::Security(format!(
+                    MoveToCompleteFailure::Operational(format!(
                         "could not load unacceptable extension policy: {error}"
                     ))
                 })?
                 .map_err(|error| {
-                    MoveToCompleteFailure::Security(format!(
+                    MoveToCompleteFailure::Operational(format!(
                         "could not load unacceptable extension policy: {error}"
                     ))
                 })?
@@ -431,15 +463,17 @@ async fn run_move_to_claimed_destination(
         #[cfg(test)]
         DeliveryPolicySource::Fixed(policy) => policy,
     };
+    let policy = Arc::new(policy);
     let validation = {
         let working_dir = working_dir.clone();
         let staging_dir = staging_dir.clone();
+        let policy = Arc::clone(&policy);
         tokio::task::spawn_blocking(move || {
             validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy)
         })
         .await
         .map_err(|error| {
-            MoveToCompleteFailure::Security(format!(
+            MoveToCompleteFailure::Operational(format!(
                 "delivery security scan worker failed: {error}"
             ))
         })?
@@ -612,7 +646,9 @@ async fn run_move_to_claimed_destination(
     // finishes before the move reports done — everything downstream of the
     // move sees only the final names.
     let renamed_members = match naming {
-        Some(naming) => deobfuscate::rename_obfuscated_members(job_id, &dest, &naming).await,
+        Some(naming) => {
+            deobfuscate::rename_obfuscated_members(job_id, &dest, &naming, &policy).await
+        }
         None => 0,
     };
 
@@ -750,6 +786,87 @@ mod category_destination_tests {
         assert!(collision.starts_with(complete));
     }
 
+    #[tokio::test]
+    async fn script_destination_worker_refuses_foreign_ownership_and_path_changes() {
+        use crate::post_processing::model::PipelineOutcome;
+        use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
+
+        let temp = tempfile::tempdir().unwrap();
+        let complete = temp.path().canonicalize().unwrap();
+        let source = complete.join("source");
+        let destination = complete.join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("payload.bin"), b"payload").unwrap();
+        let db = crate::Database::open_in_memory().unwrap();
+        let context = JobExecutionContext {
+            job_id: 1,
+            name: "destination-check".into(),
+            nzb_filename: "destination-check.nzb".into(),
+            category: None,
+            group: None,
+            source_url: None,
+            working_directory: source.clone(),
+            final_directory: destination.clone(),
+            pipeline_outcome: PipelineOutcome::Succeeded,
+            par_status: 0,
+            unpack_status: 0,
+            compatibility: CompatibilityFacts {
+                complete_dir: Some(complete.clone()),
+                ..Default::default()
+            },
+        };
+        validate_script_move_destination(db.clone(), context.clone(), &destination)
+            .await
+            .unwrap();
+        let missing = complete.join("missing");
+        let error = validate_script_move_destination(db.clone(), context.clone(), &missing)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MoveToCompleteFailure::Operational(message) if message.contains("does not exist"))
+        );
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(&complete, &destination, JobId(2))
+            .unwrap();
+        std::fs::write(destination.join("foreign.bin"), b"foreign").unwrap();
+        let error = validate_script_move_destination(db.clone(), context.clone(), &destination)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MoveToCompleteFailure::Security(message) if message.contains("foreign ownership marker"))
+        );
+        assert_eq!(
+            std::fs::read(source.join("payload.bin")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("foreign.bin")).unwrap(),
+            b"foreign"
+        );
+        assert!(!destination.join("payload.bin").exists());
+
+        #[cfg(unix)]
+        {
+            let actual = complete.join("actual");
+            let alias = complete.join("alias");
+            std::fs::create_dir(&actual).unwrap();
+            std::os::unix::fs::symlink(&actual, &alias).unwrap();
+            let error = validate_script_move_destination(db, context, &alias)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, MoveToCompleteFailure::Security(message) if message.contains("changed after reservation"))
+            );
+            assert!(actual.exists());
+            assert!(
+                std::fs::symlink_metadata(alias)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
     #[test]
     fn configured_destination_override_remains_trusted_admin_input() {
         let complete = std::path::Path::new("/downloads/complete");
@@ -780,10 +897,9 @@ impl Pipeline {
     async fn claim_complete_destination(
         &self,
         job_id: JobId,
-        job_name: &str,
+        dir_name: &str,
         category: Option<&str>,
     ) -> Result<PathBuf, String> {
-        let dir_name = crate::jobs::working_dir::sanitize_dirname(job_name);
         let parent = {
             let cfg = self.config.read().await;
             complete_parent_for_category(&self.complete_dir, &cfg.categories, category)?
@@ -794,7 +910,7 @@ impl Pipeline {
             .filter(|(reserved_job_id, _)| **reserved_job_id != job_id)
             .map(|(_, path)| path.clone())
             .collect();
-        claim_complete_destination_path(&parent, &dir_name, job_id, &reserved)
+        claim_complete_destination_path(&parent, dir_name, job_id, &reserved)
             .await
             .map_err(|error| {
                 format!(
@@ -804,13 +920,13 @@ impl Pipeline {
             })
     }
 
-    /// Resolves everything the delivery rename pass needs, on this task, before
-    /// the move worker is spawned.
-    ///
-    /// `None` disables the pass. The worker gets an owned plan rather than a
-    /// handle to pipeline state so the pass cannot reach back into the
-    /// orchestrator, and so the outbound lookup — the one step that can take
-    /// seconds — never runs on the orchestrator's own task.
+    // Resolves everything the delivery rename pass needs, on this task, before
+    // the move worker is spawned.
+    //
+    // `None` disables the pass. The worker gets an owned plan rather than a
+    // handle to pipeline state so the pass cannot reach back into the
+    // orchestrator, and so the outbound lookup — the one step that can take
+    // seconds — never runs on the orchestrator's own task.
     async fn delivery_naming_plan(
         &self,
         job_id: JobId,
@@ -846,15 +962,15 @@ impl Pipeline {
         })
     }
 
-    /// The CRC32 each archive header stated for its member, keyed by its
-    /// normalized, lowercased delivery-relative path.
-    ///
-    /// Read from two places because the two delivery routes keep the same facts
-    /// in different homes: extraction keeps a set's parsed headers in memory
-    /// until the job leaves the pipeline, while direct-store only ever writes
-    /// them to the durable facts table. Reading both makes the map route-blind.
-    /// A member the headers never stated a checksum for is simply absent, and
-    /// the lookup falls back to the job name for it.
+    // The CRC32 each archive header stated for its member, keyed by its
+    // normalized, lowercased delivery-relative path.
+    //
+    // Read from two places because the two delivery routes keep the same facts
+    // in different homes: extraction keeps a set's parsed headers in memory
+    // until the job leaves the pipeline, while direct-store only ever writes
+    // them to the durable facts table. Reading both makes the map route-blind.
+    // A member the headers never stated a checksum for is simply absent, and
+    // the lookup falls back to the job name for it.
     async fn member_crc32_by_path(&self, job_id: JobId) -> HashMap<String, u32> {
         let mut by_path = HashMap::new();
         let mut ambiguous_paths = HashSet::new();
@@ -890,17 +1006,26 @@ impl Pipeline {
         by_path
     }
 
-    /// Move extracted/completed files from the intermediate working directory
-    /// to the complete directory, organized by category.
-    ///
-    /// Layout: `{complete_dir}/[{category}/]{job_name}/`
-    /// On collision, appends `.#<job_id>` (and a numeric suffix if needed).
-    ///
-    /// Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
+    // Move extracted/completed files from the intermediate working directory
+    // to the complete directory, organized by category.
+    //
+    // Layout: `{complete_dir}/[{category}/]{release title}/`, the title as
+    // posted rather than the display name (see
+    // [`crate::ingest::completed_folder_name`]).
+    // On collision, appends `.#<job_id>` (and a numeric suffix if needed).
+    //
+    // Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
     pub(crate) async fn start_move_to_complete(&mut self, job_id: JobId) -> Result<(), String> {
         if self.inflight_moves.contains(&job_id) {
             return Ok(());
         }
+        if self.shared_state.is_post_processing_paused() {
+            if self.jobs.contains_key(&job_id) {
+                self.deferred_moves.insert(job_id);
+            }
+            return Ok(());
+        }
+        self.deferred_moves.remove(&job_id);
 
         // The last gate at which every settlement fact is still in hand, and
         // the last at which refusing costs nothing: nothing has moved yet. The
@@ -915,7 +1040,7 @@ impl Pipeline {
         // `weaver_verifications_total` entirely. No-op when a pass ruled.
         self.note_job_unverifiable_if_no_par2_set(job_id);
 
-        let (working_dir, staging_dir, job_name, category) = {
+        let (working_dir, staging_dir, job_name, folder_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return Err(format!("job {} not found for final move", job_id.0));
             };
@@ -923,18 +1048,56 @@ impl Pipeline {
                 state.working_dir.clone(),
                 state.staging_dir.clone(),
                 state.spec.name.clone(),
+                crate::ingest::completed_folder_name(&state.spec.name, &state.spec.metadata),
                 state.spec.category.clone(),
             )
         };
 
+        let requested = self
+            .db
+            .job_script_effects(job_id.0)
+            .map_err(|error| error.to_string())?
+            .final_directory;
+        let (dest, script_validation) = if let Some(path) = requested {
+            let event = self
+                .queue_script_context(
+                    job_id,
+                    crate::post_processing::model::QueueEvent::NzbDownloaded,
+                )
+                .ok_or("script job disappeared before final move")?;
+            let context = crate::post_processing::runner::JobExecutionContext {
+                job_id: job_id.0,
+                name: job_name.clone(),
+                nzb_filename: format!("{job_name}.nzb"),
+                category: category.clone(),
+                group: None,
+                source_url: None,
+                working_directory: working_dir.clone(),
+                final_directory: path.clone(),
+                pipeline_outcome: crate::post_processing::model::PipelineOutcome::Succeeded,
+                par_status: 0,
+                unpack_status: 0,
+                compatibility: event.facts,
+            };
+            if self
+                .reserved_complete_destinations
+                .iter()
+                .any(|(owner, reserved)| *owner != job_id && reserved == &path)
+            {
+                return Err("script final directory is reserved by another job".into());
+            }
+            (path, Some((self.db.clone(), context)))
+        } else {
+            (
+                self.claim_complete_destination(job_id, &folder_name, category.as_deref())
+                    .await?,
+                None,
+            )
+        };
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
         self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
-
-        let dest = self
-            .claim_complete_destination(job_id, &job_name, category.as_deref())
-            .await?;
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);
@@ -955,15 +1118,21 @@ impl Pipeline {
         );
         tokio::spawn(async move {
             let move_started = Instant::now();
-            let result = run_move_to_complete(
-                job_id,
-                working_dir,
-                staging_dir,
-                dest.clone(),
-                phase_counters,
-                naming,
-                policy_source,
-            )
+            let result = async {
+                if let Some((db, context)) = script_validation {
+                    validate_script_move_destination(db, context, &dest).await?;
+                }
+                run_move_to_complete(
+                    job_id,
+                    working_dir,
+                    staging_dir,
+                    dest.clone(),
+                    phase_counters,
+                    naming,
+                    policy_source,
+                )
+                .await
+            }
             .await;
             match &result {
                 Ok(outcome) => info!(
@@ -1046,25 +1215,36 @@ impl Pipeline {
         );
     }
 
-    /// Resolve the job's script list and, when it is non-empty, run it.
-    ///
-    /// Resolution happens here rather than at submission time: the list a job
-    /// runs is the one configured when it finishes, which is what both oracles
-    /// do and what removes the "edited while queued" race entirely.
+    // Resolve the job's script list and, when it is non-empty, run it.
+    //
+    // Resolution happens here rather than at submission time: the list a job
+    // runs is the one configured when it finishes, which is what both oracles
+    // do and what removes the "edited while queued" race entirely.
     pub(crate) fn start_terminal_post_processing_with_outcome(
         &mut self,
         job_id: JobId,
         pipeline_outcome: crate::post_processing::model::PipelineOutcome,
         primary_failure: Option<String>,
     ) {
+        let facts = self.fresh_post_processing_facts(job_id, pipeline_outcome);
+        self.start_terminal_post_processing_with_facts(job_id, facts, primary_failure);
+    }
+
+    // Resolve and run the job's script list, telling the scripts `facts`
+    // about how the download ended.
+    fn start_terminal_post_processing_with_facts(
+        &mut self,
+        job_id: JobId,
+        facts: crate::post_processing::model::PostProcessingFacts,
+        primary_failure: Option<String>,
+    ) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
         let category = state.spec.category.clone();
-        let metadata = state.spec.metadata.clone();
         let admission = match self
             .terminal_post_processing_executor
-            .admit_job_scripts(category.as_deref(), &metadata)
+            .admit_job_scripts(category.as_deref())
         {
             Ok(Some(admission)) => admission,
             Ok(None) => {
@@ -1108,35 +1288,18 @@ impl Pipeline {
             job_id,
             crate::operations::instrumentation::JobStageKind::PostProcess,
         );
-        self.launch_terminal_post_processing_run(
-            job_id,
-            admission,
-            pipeline_outcome,
-            primary_failure,
-        );
+        self.launch_terminal_post_processing_run(job_id, admission, facts, primary_failure, None);
     }
 
-    fn launch_terminal_post_processing_run(
-        &mut self,
+    // What the scripts of a pass beginning now are told about how the job's
+    // download ended. The PAR and unpack statuses come from what this run of
+    // weaver saw, which a restart loses, so they are kept with the outcome.
+    pub(crate) fn fresh_post_processing_facts(
+        &self,
         job_id: JobId,
-        admission: crate::post_processing::executor::PostProcessingJobAdmission,
-        pipeline_outcome: crate::post_processing::model::PipelineOutcome,
-        primary_failure: Option<String>,
-    ) {
-        // Scripts read health to decide whether the download is worth acting
-        // on, so they must be handed the settled figure — the one the terminal
-        // record will carry — and not the live wire counter the settlement has
-        // already answered.
-        let settled_health = self
-            .jobs
-            .get(&job_id)
-            .map(|state| state.spec.total_bytes)
-            .map(|total_bytes| self.terminal_record_figures(job_id, total_bytes).1);
-        let Some(state) = self.jobs.get(&job_id) else {
-            self.inflight_terminal_post_processing.remove(&job_id);
-            return;
-        };
-        let pipeline_failure_stage = match &pipeline_outcome {
+        outcome: crate::post_processing::model::PipelineOutcome,
+    ) -> crate::post_processing::model::PostProcessingFacts {
+        let pipeline_failure_stage = match &outcome {
             crate::post_processing::model::PipelineOutcome::Failed { stage, .. } => Some(*stage),
             crate::post_processing::model::PipelineOutcome::Succeeded => None,
         };
@@ -1167,6 +1330,30 @@ impl Pipeline {
         } else {
             0
         };
+        crate::post_processing::model::PostProcessingFacts {
+            outcome,
+            par_status,
+            unpack_status,
+        }
+    }
+
+    // The context a job's scripts are handed, told `facts` about how its
+    // download ended.
+    pub(crate) fn terminal_post_processing_context(
+        &self,
+        job_id: JobId,
+        facts: &crate::post_processing::model::PostProcessingFacts,
+    ) -> Option<crate::post_processing::runner::JobExecutionContext> {
+        // Scripts read health to decide whether the download is worth acting
+        // on, so they must be handed the settled figure — the one the terminal
+        // record will carry — and not the live wire counter the settlement has
+        // already answered.
+        let settled_health = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.spec.total_bytes)
+            .map(|total_bytes| self.terminal_record_figures(job_id, total_bytes).1);
+        let state = self.jobs.get(&job_id)?;
         let (data_dir, intermediate_dir, complete_dir) = self
             .config
             .try_read()
@@ -1188,13 +1375,13 @@ impl Pipeline {
                     self.complete_dir.clone(),
                 )
             });
-        let failure_message = match &pipeline_outcome {
+        let failure_message = match &facts.outcome {
             crate::post_processing::model::PipelineOutcome::Failed { message, .. } => {
                 Some(message.clone())
             }
             crate::post_processing::model::PipelineOutcome::Succeeded => None,
         };
-        let context = crate::post_processing::runner::JobExecutionContext {
+        Some(crate::post_processing::runner::JobExecutionContext {
             job_id: job_id.0,
             name: state.spec.name.clone(),
             nzb_filename: format!("{}.nzb", state.spec.name),
@@ -1203,9 +1390,9 @@ impl Pipeline {
             source_url: None,
             working_directory: state.working_dir.clone(),
             final_directory: state.working_dir.clone(),
-            pipeline_outcome,
-            par_status,
-            unpack_status,
+            pipeline_outcome: facts.outcome.clone(),
+            par_status: facts.par_status,
+            unpack_status: facts.unpack_status,
             compatibility: crate::post_processing::runner::CompatibilityFacts {
                 total_bytes: state.spec.total_bytes,
                 downloaded_bytes: state.downloaded_bytes,
@@ -1225,28 +1412,105 @@ impl Pipeline {
                     .ok()
                     .and_then(|path| path.parent().map(std::path::PathBuf::from)),
                 previous_script_status: Default::default(),
+                parameters: state.spec.metadata.clone(),
+                marked_bad: false,
+                final_directory_override: None,
             },
+        })
+    }
+
+    fn launch_terminal_post_processing_run(
+        &mut self,
+        job_id: JobId,
+        admission: crate::post_processing::executor::PostProcessingJobAdmission,
+        facts: crate::post_processing::model::PostProcessingFacts,
+        primary_failure: Option<String>,
+        resume: Option<crate::post_processing::model::PostProcessingResume>,
+    ) {
+        let Some(context) = self.terminal_post_processing_context(job_id, &facts) else {
+            self.inflight_terminal_post_processing.remove(&job_id);
+            return;
         };
+        // Kept on the job before anything records it as in post-processing,
+        // in the same ordered write lane, so a restart resumes the scripts
+        // telling them what the ones before it were told.
+        if let Err(error) =
+            self.db
+                .try_queue_job_write(job_id, "record_job_post_processing_facts", move |db| {
+                    db.record_job_post_processing_facts(job_id.0, &facts)
+                })
+        {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "could not queue the post-processing outcome write"
+            );
+        }
+        let delivered_dir = primary_failure
+            .is_none()
+            .then(|| context.working_directory.clone());
         self.transition_postprocessing_status(
             job_id,
             JobStatus::QueuedPostProcessing,
             Some("queued for post-processing scripts"),
         );
+        // A delivered job's output now lives only at its final location, and
+        // the scripts may wait on queue events before the executor records
+        // that they started. Make that fact durable first, in the job's
+        // ordered write lane, so a restart in that window resumes the scripts
+        // against the delivered output instead of re-finalizing a working
+        // directory the move already emptied. A failed job is recorded too:
+        // the outcome written above tells its restored scripts it failed.
+        self.persist_active_runtime_at(job_id, delivered_dir);
         self.publish_snapshot();
         let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
         self.terminal_post_processing_cancellations
             .insert(job_id, cancellation_tx);
         let executor = self.terminal_post_processing_executor.clone();
         let done_tx = self.terminal_post_processing_done_tx.clone();
+        let db = self.db.clone();
         tokio::spawn(async move {
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let execution = executor.execute_admitted_job(
-                job_id.0,
-                admission,
-                context,
-                Some(cancellation_rx),
-                Some(started_tx),
-            );
+            let execution = async {
+                let mut cancellation_wait = cancellation_rx.clone();
+                if !*cancellation_wait.borrow() {
+                    tokio::select! {
+                        result = crate::post_processing::events::wait_for_job_events(&db, job_id.0) => {
+                            // A queue event whose scripts could not run is recorded
+                            // with that run; it does not fail post-processing.
+                            if let Err(error) = result {
+                                tracing::warn!(job_id = job_id.0, %error, "queue scripts could not run before post-processing");
+                            }
+                        }
+                        _ = cancellation_wait.changed() => {},
+                    }
+                }
+                match resume {
+                    Some(resume) => {
+                        executor
+                            .resume_admitted_job(
+                                job_id.0,
+                                admission,
+                                context,
+                                Some(cancellation_rx),
+                                Some(started_tx),
+                                resume,
+                            )
+                            .await
+                    }
+                    None => {
+                        executor
+                            .execute_admitted_job(
+                                job_id.0,
+                                admission,
+                                context,
+                                Some(cancellation_rx),
+                                Some(started_tx),
+                            )
+                            .await
+                    }
+                }
+            };
             tokio::pin!(execution);
             tokio::pin!(started_rx);
             let result = tokio::select! {
@@ -1272,12 +1536,13 @@ impl Pipeline {
         });
     }
 
-    /// Finish a job that was restored while it sat in post-processing.
-    ///
-    /// The startup recovery scan already stamped `interrupted` on every such
-    /// job, so nothing is rerun here: a script that was mid-flight when weaver
-    /// stopped has unknown side effects, and running it again is worse than
-    /// reporting that it was interrupted.
+    // Finish a job that was restored while it sat in post-processing.
+    //
+    // The startup recovery scan already stamped `interrupted` on every such
+    // job. No script that had started is rerun: one that was mid-flight when
+    // weaver stopped has unknown side effects, and running it again is worse
+    // than reporting that it was interrupted. The scripts of the list that
+    // had not started still run, after the ones that had.
     pub(crate) fn recover_restored_terminal_post_processing(&mut self, job_id: JobId) -> bool {
         let is_terminal_post_processing = self.jobs.get(&job_id).is_some_and(|state| {
             matches!(
@@ -1289,6 +1554,20 @@ impl Pipeline {
             return false;
         }
         self.remove_pending_completion_check(job_id);
+        // What the job's scripts were told when its pass began. A job in
+        // post-processing does not carry its download's failure in its
+        // status, so a failed one's comes back from here.
+        let facts = match self.db.job_post_processing_facts(job_id.0) {
+            Ok(facts) => facts,
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "could not read how the restored job's download ended"
+                );
+                None
+            }
+        };
         let summary = self
             .db
             .job_post_processing_summary(job_id.0)
@@ -1301,7 +1580,16 @@ impl Pipeline {
                 job_id = job_id.0,
                 "resuming post-processing for a restored job whose scripts never started"
             );
-            self.start_terminal_post_processing(job_id);
+            match facts {
+                Some(facts) => {
+                    let primary_failure = facts.primary_failure();
+                    self.start_terminal_post_processing_with_facts(job_id, facts, primary_failure);
+                }
+                None => self.start_terminal_post_processing(job_id),
+            }
+            return true;
+        }
+        if self.resume_restored_terminal_post_processing(job_id, summary, facts.clone()) {
             return true;
         }
         let results = self
@@ -1311,7 +1599,8 @@ impl Pipeline {
         let primary_failure = self
             .jobs
             .get(&job_id)
-            .and_then(|state| state.failure_error.clone());
+            .and_then(|state| state.failure_error.clone())
+            .or_else(|| facts.as_ref().and_then(|facts| facts.primary_failure()));
         info!(
             job_id = job_id.0,
             summary = summary.as_str(),
@@ -1325,6 +1614,88 @@ impl Pipeline {
                 results,
             }),
         });
+        true
+    }
+
+    // Run the rest of an interrupted pass, or return false to finish the job
+    // with what it recorded. Only a pass cut off part way through resumes,
+    // and only when the job kept the list of entries that had started: a
+    // pass begun under an older weaver did not, and which of its scripts ran
+    // is unknown. A failed job resumes like a delivered one, its scripts
+    // told the outcome the pass began with; one whose pass began under a
+    // weaver that did not keep that outcome is finished as it stands.
+    fn resume_restored_terminal_post_processing(
+        &mut self,
+        job_id: JobId,
+        summary: crate::post_processing::model::PostProcessingSummary,
+        facts: Option<crate::post_processing::model::PostProcessingFacts>,
+    ) -> bool {
+        use crate::post_processing::model::PostProcessingSummary;
+        if !matches!(
+            summary,
+            PostProcessingSummary::Interrupted | PostProcessingSummary::Running
+        ) {
+            return false;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let facts = match facts {
+            Some(facts) => facts,
+            None if state.failure_error.is_some() => return false,
+            None => self.fresh_post_processing_facts(
+                job_id,
+                crate::post_processing::model::PipelineOutcome::Succeeded,
+            ),
+        };
+        let primary_failure = facts.primary_failure();
+        let category = state.spec.category.clone();
+        let resume = match self.db.job_post_processing_resume(job_id.0) {
+            Ok(Some(resume)) => resume,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "could not read which post-processing scripts had started"
+                );
+                return false;
+            }
+        };
+        let admission = match self
+            .terminal_post_processing_executor
+            .admit_job_scripts(category.as_deref())
+        {
+            Ok(Some(admission)) => admission,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "could not admit post-processing scripts; finishing without them"
+                );
+                return false;
+            }
+        };
+        if !self.inflight_terminal_post_processing.insert(job_id) {
+            return true;
+        }
+        info!(
+            job_id = job_id.0,
+            started = resume.started.len(),
+            "resuming post-processing with the scripts that had not started"
+        );
+        self.note_stage_started(
+            job_id,
+            crate::operations::instrumentation::JobStageKind::PostProcess,
+        );
+        self.launch_terminal_post_processing_run(
+            job_id,
+            admission,
+            facts,
+            primary_failure,
+            Some(resume),
+        );
         true
     }
 
@@ -1359,6 +1730,33 @@ impl Pipeline {
         // recreate or overwrite that cancelled job history.
         if !self.jobs.contains_key(&done.job_id) {
             return;
+        }
+        match self.db.job_script_effects(done.job_id.0) {
+            Ok(effects) => {
+                if let Some(state) = self.jobs.get_mut(&done.job_id) {
+                    effects.merge_parameters(&mut state.spec.metadata);
+                    if let Some(directory) = effects.directory {
+                        state.working_dir = directory;
+                    }
+                    if let Some(directory) = effects.final_directory {
+                        state.working_dir = directory;
+                    }
+                }
+                if effects.marked_bad {
+                    self.finalize_failed_job_after_terminal_post_processing(
+                        done.job_id,
+                        "FAILURE/BAD: marked bad by script".into(),
+                    );
+                    return;
+                }
+            }
+            Err(error) => {
+                self.finalize_failed_job_after_terminal_post_processing(
+                    done.job_id,
+                    format!("could not restore applied script directives: {error}"),
+                );
+                return;
+            }
         }
         if let Some(primary_failure) = done.primary_failure {
             match &done.result {

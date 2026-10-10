@@ -1,21 +1,21 @@
-//! The process-wide log filter, adjustable while the process runs.
-//!
-//! The binary owns the tracing subscriber, so it owns the filter too: at
-//! startup it installs a function that validates a directive string and swaps
-//! it into the live subscriber. This module keeps that function and the
-//! directives currently in force, so an operator surface can read and change
-//! the filter without a restart.
-//!
-//! A change lasts until the process exits. Nothing is persisted: a restart
-//! always comes back up on the directives it was started with.
+// The process-wide log filter, adjustable while the process runs.
+//
+// The binary owns the tracing subscriber, so it owns the filter too: at
+// startup it installs a function that validates a directive string and swaps
+// it into the live subscriber. This module keeps that function and the
+// directives currently in force, so an operator surface can read and change
+// the filter without a restart.
+//
+// A change lasts until the process exits. Nothing is persisted: a restart
+// always comes back up on the directives it was started with.
 
 use std::sync::{Mutex, OnceLock};
 
 use tracing::info;
 
-/// Validates a directive string and, if it parses, makes it the live filter.
-/// Returns the parse error as text otherwise, leaving the live filter as it
-/// was.
+// Validates a directive string and, if it parses, makes it the live filter.
+// Returns the parse error as text otherwise, leaving the live filter as it
+// was.
 pub type ApplyDirectives = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -26,14 +26,14 @@ pub enum LogFilterError {
     Invalid(String),
 }
 
-/// The directives in force and the ones the process started with.
+// The directives in force and the ones the process started with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogFilterState {
     pub directives: String,
     pub default_directives: String,
 }
 
-/// One adjustable filter: the apply function and what it last applied.
+// One adjustable filter: the apply function and what it last applied.
 pub struct LogFilterControl {
     apply: ApplyDirectives,
     default_directives: String,
@@ -56,8 +56,8 @@ impl LogFilterControl {
         }
     }
 
-    /// Makes `directives` the live filter. Blank input restores the startup
-    /// directives. Invalid input changes nothing.
+    // Makes `directives` the live filter. Blank input restores the startup
+    // directives. Invalid input changes nothing.
     pub fn set(&self, directives: &str) -> Result<LogFilterState, LogFilterError> {
         let requested = directives.trim();
         let requested = if requested.is_empty() {
@@ -86,20 +86,20 @@ impl LogFilterControl {
 
 static CONTROL: OnceLock<LogFilterControl> = OnceLock::new();
 
-/// Registers the process's filter. The first call wins; a later one (a second
-/// subscriber in a test, say) is ignored and returns `false`.
+// Registers the process's filter. The first call wins; a later one (a second
+// subscriber in a test, say) is ignored and returns `false`.
 pub fn install(default_directives: String, apply: ApplyDirectives) -> bool {
     CONTROL
         .set(LogFilterControl::new(default_directives, apply))
         .is_ok()
 }
 
-/// The directives in force, or `None` when no filter was installed.
+// The directives in force, or `None` when no filter was installed.
 pub fn current_directives() -> Option<LogFilterState> {
     CONTROL.get().map(LogFilterControl::state)
 }
 
-/// Replaces the live filter. See [`LogFilterControl::set`].
+// Replaces the live filter. See [`LogFilterControl::set`].
 pub fn set_directives(directives: &str) -> Result<LogFilterState, LogFilterError> {
     CONTROL
         .get()

@@ -1,11 +1,11 @@
-//! `weaver-tray`: the desktop wrapper around the Weaver server.
-//!
-//! The wrapper is not a second implementation of Weaver. It starts and stops
-//! the same `weaver` binary that ships beside it, and shows the same web UI a
-//! browser would — the app window and the browser can be pointed at the same
-//! running server at the same time. Everything portable about that lives in
-//! [`shared`]; the platform modules own only the window, the menu, and the
-//! system integration each platform requires.
+// `weaver-tray`: the desktop wrapper around the Weaver server.
+//
+// The wrapper is not a second implementation of Weaver. It starts and stops
+// the same `weaver` binary that ships beside it, and shows the same web UI a
+// browser would — the app window and the browser can be pointed at the same
+// running server at the same time. Everything portable about that lives in
+// [`shared`]; the platform modules own only the window, the menu, and the
+// system integration each platform requires.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 // The server→wrapper relaunch signal. Both binaries compile the same file, so

@@ -17,6 +17,7 @@ mod orchestrator;
 mod progress;
 mod repair;
 mod server_attribution;
+mod support_facts;
 
 pub(crate) use orchestrator::{
     close_cached_write_handles_under, release_cached_write_handle,
@@ -41,7 +42,7 @@ use tracing::{debug, error, info, warn};
 use crate::ActiveFileProgress;
 #[cfg(test)]
 use crate::RestoreJobRequest;
-use crate::bandwidth::service::BandwidthCapRuntime;
+use crate::bandwidth::service::BandwidthLedgerRuntime;
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::ExtractionReadiness;
 #[cfg(test)]
@@ -70,24 +71,24 @@ use self::extraction::{
     ExtractionLimits, ExtractionRoot, JobExtractionBudget, ProcessMemoryBudget,
 };
 
-/// Maximum number of retries for a single segment before giving up.
+// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
-/// Consecutive established-transport failures of one segment before its retry
-/// is held back past the server recovery backoff, so the next recovery probe
-/// carries different work.
+// Consecutive established-transport failures of one segment before its retry
+// is held back past the server recovery backoff, so the next recovery probe
+// carries different work.
 const SEGMENT_TRANSPORT_STREAK_HOLD: u32 = 2;
-/// Consecutive established-transport failures of one segment after which the
-/// fault is the article's, provided other segments downloaded meanwhile.
+// Consecutive established-transport failures of one segment after which the
+// fault is the article's, provided other segments downloaded meanwhile.
 const SEGMENT_TRANSPORT_STREAK_ARTICLE_LOCAL: u32 = 3;
-/// Longer than the longest server recovery backoff.
+// Longer than the longest server recovery backoff.
 const SEGMENT_TRANSPORT_HOLD_DELAY: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// A segment's run of established-transport failures.
+// A segment's run of established-transport failures.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TransportFailureStreak {
     pub(super) failures: u32,
-    /// `segments_downloaded` when the run began; any advance since proves the
-    /// servers were serving other articles while this one kept failing.
+    // `segments_downloaded` when the run began; any advance since proves the
+    // servers were serving other articles while this one kept failing.
     pub(super) downloaded_at_start: u64,
 }
 const DOWNLOAD_RESTART_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
@@ -115,9 +116,9 @@ fn health_milli(total: u64, failed_bytes: u64) -> u32 {
         .unwrap_or(1000) as u32
 }
 
-/// Password candidates carried by a persisted NZB: its `<meta
-/// type="password">` and the `{{password}}` convention in its file name, in
-/// harvest order. The spec's explicit password is not included.
+// Password candidates carried by a persisted NZB: its `<meta
+// type="password">` and the `{{password}}` convention in its file name, in
+// harvest order. The spec's explicit password is not included.
 pub(crate) fn persisted_nzb_password_candidates(
     nzb_path: &std::path::Path,
     nzb_zstd: &[u8],
@@ -131,20 +132,34 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Vec<ArchivePasswordCandidate> {
-        self.harvest_archive_password_candidates(job_id).0
+        let mut candidates = self.harvest_archive_password_candidates(job_id).0;
+        match self.db.global_archive_password_candidates() {
+            Ok(global) => {
+                for candidate in global {
+                    if !candidates
+                        .iter()
+                        .any(|existing| existing.value() == candidate.value())
+                    {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+            Err(_) => warn!(job_id = job_id.0, "could not load global archive passwords"),
+        }
+        candidates
     }
 
-    /// [`Self::archive_password_candidates_for_job`] plus whether the job's
-    /// persisted NZB was actually **read**.
-    ///
-    /// The harvest's two halves fail differently. `spec.password` is already in
-    /// memory and cannot fail; the NZB half is a database read followed by a
-    /// parse, and both of those warn-and-continue with an empty list. So an
-    /// empty result is two different facts — *"this job carries no password
-    /// anywhere"*, which is permanent, and *"the read failed this once"*, which
-    /// is not — and any caller that **memoizes** the harvest has to tell them
-    /// apart. `false` here means the second: nothing about the job was learned,
-    /// so nothing about it may be remembered.
+    // [`Self::archive_password_candidates_for_job`] plus whether the job's
+    // persisted NZB was actually **read**.
+    //
+    // The harvest's two halves fail differently. `spec.password` is already in
+    // memory and cannot fail; the NZB half is a database read followed by a
+    // parse, and both of those warn-and-continue with an empty list. So an
+    // empty result is two different facts — *"this job carries no password
+    // anywhere"*, which is permanent, and *"the read failed this once"*, which
+    // is not — and any caller that **memoizes** the harvest has to tell them
+    // apart. `false` here means the second: nothing about the job was learned,
+    // so nothing about it may be remembered.
     fn harvest_archive_password_candidates(
         &self,
         job_id: JobId,
@@ -167,11 +182,8 @@ impl Pipeline {
                 }
             };
 
-        if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password)
-            && !candidates
-                .iter()
-                .any(|candidate| candidate.value() == value.as_str())
-        {
+        if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password) {
+            candidates.retain(|candidate| candidate.value() != value);
             candidates.insert(
                 0,
                 ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, value),
@@ -181,8 +193,8 @@ impl Pipeline {
         (candidates, harvested)
     }
 
-    /// The NZB half of the harvest, read from the database: the candidates,
-    /// and whether the read and parse succeeded (`harvested`).
+    // The NZB half of the harvest, read from the database: the candidates,
+    // and whether the read and parse succeeded (`harvested`).
     fn load_nzb_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
         match self.db.load_active_job_persisted_nzb(job_id) {
             Ok(Some((nzb_path, Some(nzb_zstd)))) => {
@@ -258,16 +270,44 @@ impl Pipeline {
         let Some(selected_password) = selected_password else {
             return;
         };
-        let Some(candidate) = candidates
+        let candidate = candidates
             .iter()
             .find(|candidate| candidate.value() == selected_password)
             .cloned()
-        else {
-            return;
-        };
+            .unwrap_or_else(|| {
+                ArchivePasswordCandidate::new(
+                    ArchivePasswordSource::Explicit,
+                    selected_password.to_string(),
+                )
+            });
 
         self.archive_password_winners
             .insert((job_id, set_name.to_string()), candidate);
+        let sealed = match self.db.seal_validated_archive_password(selected_password) {
+            Ok(sealed) => sealed,
+            Err(_) => {
+                warn!(
+                    job_id = job_id.0,
+                    "could not store validated archive password"
+                );
+                return;
+            }
+        };
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            let key = crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY;
+            state.spec.metadata.retain(|(name, _)| name != key);
+            state.spec.metadata.push((key.to_string(), sealed));
+            let update = crate::jobs::JobUpdate {
+                metadata: crate::jobs::FieldUpdate::Set(state.spec.metadata.clone()),
+                ..Default::default()
+            };
+            if self.db.update_active_job(job_id, &update).is_err() {
+                warn!(
+                    job_id = job_id.0,
+                    "could not persist validated archive password"
+                );
+            }
+        }
     }
 }
 
@@ -275,8 +315,8 @@ pub(super) struct DownloadLaneOwner {
     job_id: JobId,
     mode: DownloadLaneMode,
     completion_critical: bool,
-    /// The server this lane is connected to, once a refill has told the
-    /// scheduler where the lane lives. `None` until the first refill.
+    // The server this lane is connected to, once a refill has told the
+    // scheduler where the lane lives. `None` until the first refill.
     server_idx: Option<usize>,
     connection: bool,
     outstanding: HashMap<SegmentId, DownloadWork>,
@@ -288,27 +328,27 @@ pub(super) struct DownloadBatchLease {
     pub(super) runtime_generation: u64,
     pub(super) lane_mode: DownloadLaneMode,
     pub(super) server_modes: Vec<(usize, DownloadLaneMode)>,
-    /// The class every work in this batch is counted under. A batch is cut
-    /// from one job and one class; the worker reports it back on park so the
-    /// class gauges are released against what was booked.
+    // The class every work in this batch is counted under. A batch is cut
+    // from one job and one class; the worker reports it back on park so the
+    // class gauges are released against what was booked.
     pub(super) completion_critical: bool,
-    /// The job's retention exclusions — the set server ordering and lane
-    /// acquisition use. Job-derived, so a server-config change applies without
-    /// rewriting queued work, and the same for every article on the lane:
-    /// each result unions it with its own work's failure ledger rather than
-    /// reporting this set alone.
+    // The job's retention exclusions — the set server ordering and lane
+    // acquisition use. Job-derived, so a server-config change applies without
+    // rewriting queued work, and the same for every article on the lane:
+    // each result unions it with its own work's failure ledger rather than
+    // reporting this set alone.
     pub(super) effective_exclude_servers: Vec<usize>,
-    /// The servers the lane's adopt or dial must not use. A batch is cut for
-    /// one server, so this is every other server: the connection goes where
-    /// the scheduler's answer was for. Kept apart from the excludes above,
-    /// which reach the failure ledger — a pin is not a failure.
+    // The servers the lane's adopt or dial must not use. A batch is cut for
+    // one server, so this is every other server: the connection goes where
+    // the scheduler's answer was for. Kept apart from the excludes above,
+    // which reach the failure ledger — a pin is not a failure.
     pub(super) dial_exclude_servers: Vec<usize>,
-    /// Immutable common-refinement geometry captured when this batch was
-    /// leased. Each response carries this same snapshot through durable commit
-    /// so grids admitted later cannot reinterpret old decoder output.
+    // Immutable common-refinement geometry captured when this batch was
+    // leased. Each response carries this same snapshot through durable commit
+    // so grids admitted later cannot reinterpret old decoder output.
     pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
-    /// Byte pressure at lease time. Carried onto every observation this lease
-    /// produces so the depth explorer can discard distorted samples.
+    // Byte pressure at lease time. Carried onto every observation this lease
+    // produces so the depth explorer can discard distorted samples.
     pub(super) pressure_clear: bool,
     pub(super) works: Vec<DownloadWork>,
 }
@@ -318,13 +358,13 @@ pub(super) struct DownloadLaneRefillRequest {
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
     pub(super) supports_pipelining: bool,
-    /// The mode the scheduler last **booked** this lane's depth gauge under —
-    /// not necessarily the one it is running. A lane started on a lease mode
-    /// of `Pipelined { depth: 2 }` that fell back to `Sequential` is still
-    /// counted at depth 2 until a refill moves it, so reporting the running
-    /// mode here decremented a gauge nothing had incremented and underflowed
-    /// `download_lanes_active{mode="sequential"}`. Lanes therefore carry the
-    /// booked mode forward and update it from each granted lease.
+    // The mode the scheduler last **booked** this lane's depth gauge under —
+    // not necessarily the one it is running. A lane started on a lease mode
+    // of `Pipelined { depth: 2 }` that fell back to `Sequential` is still
+    // counted at depth 2 until a refill moves it, so reporting the running
+    // mode here decremented a gauge nothing had incremented and underflowed
+    // `download_lanes_active{mode="sequential"}`. Lanes therefore carry the
+    // booked mode forward and update it from each granted lease.
     pub(super) current_mode: DownloadLaneMode,
     pub(super) response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
 }
@@ -353,10 +393,10 @@ pub(super) enum OwnedDownloadLaneEvent {
         results: Vec<DownloadResult>,
         unrequested_works: Vec<DownloadWork>,
         stats: weaver_nntp::blocking::BlockingLaneStats,
-        /// Present only on a lane's final event. Streamed per-article events
-        /// carry none: the bounded channel is their backpressure, and the
-        /// rendezvous exists to order this lane's results ahead of the park
-        /// message that follows on `parked_tx`.
+        // Present only on a lane's final event. Streamed per-article events
+        // carry none: the bounded channel is their backpressure, and the
+        // rendezvous exists to order this lane's results ahead of the park
+        // message that follows on `parked_tx`.
         ack: Option<std::sync::mpsc::SyncSender<()>>,
     },
 }
@@ -391,32 +431,32 @@ impl DownloadResultOrigin {
     }
 }
 
-/// Result of a download task.
+// Result of a download task.
 pub(super) struct DownloadResult {
     pub(super) lane_id: u64,
-    /// Job this article belongs to. Carried on the result itself so the
-    /// completion path never has to ask which job owns the lane it arrived on.
+    // Job this article belongs to. Carried on the result itself so the
+    // completion path never has to ask which job owns the lane it arrived on.
     pub(super) job_id: JobId,
     pub(super) segment_id: SegmentId,
     pub(super) runtime_generation: u64,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
     pub(super) attempts: Vec<weaver_nntp::client::FetchAttemptTrace>,
     pub(super) lane_observation: Option<DownloadLaneObservation>,
-    /// Server that successfully served this payload, if known.
+    // Server that successfully served this payload, if known.
     pub(super) source_server_idx: Option<usize>,
-    /// Scheduler attribution for metrics, warmup, and retry semantics.
+    // Scheduler attribution for metrics, warmup, and retry semantics.
     pub(super) origin: DownloadResultOrigin,
-    /// How many times this segment has been retried so far.
+    // How many times this segment has been retried so far.
     pub(super) retry_count: u32,
-    /// Servers intentionally excluded for this fetch attempt.
+    // Servers intentionally excluded for this fetch attempt.
     pub(super) exclude_servers: Vec<usize>,
-    /// Whether this result releases one NNTP connection dispatch slot.
+    // Whether this result releases one NNTP connection dispatch slot.
     pub(super) release_connection_slot: bool,
 }
 
-/// A delayed retry re-entering the download queue, tagged with the NNTP pool
-/// generation it was scheduled under so the orchestrator can drop stale
-/// `exclude_servers` indices after a `RebuildNntp` reshaped the pool.
+// A delayed retry re-entering the download queue, tagged with the NNTP pool
+// generation it was scheduled under so the orchestrator can drop stale
+// `exclude_servers` indices after a `RebuildNntp` reshaped the pool.
 pub(in crate::pipeline) struct RetryWork {
     pub(in crate::pipeline) scheduled_pool_generation: u64,
     pub(in crate::pipeline) infrastructure_retry: bool,
@@ -435,24 +475,24 @@ pub(super) struct DownloadLaneObservation {
     pub(super) server_idx: Option<usize>,
     pub(super) mode: DownloadLaneMode,
     pub(super) supports_pipelining: bool,
-    /// Command-to-status-line wait this one response measured, present only
-    /// when the lane could take an unbiased sample (nothing else outstanding
-    /// when the request went out).
+    // Command-to-status-line wait this one response measured, present only
+    // when the lane could take an unbiased sample (nothing else outstanding
+    // when the request went out).
     pub(super) latency_sample: Option<Duration>,
-    /// This response was its connection's first. Its timings carry setup
-    /// costs no later response repeats, so the depth explorer keeps it out
-    /// of the link model and the rung comparison.
+    // This response was its connection's first. Its timings carry setup
+    // costs no later response repeats, so the depth explorer keeps it out
+    // of the link model and the rung comparison.
     pub(super) cold: bool,
-    /// Status-line-to-terminator wait: what the article cost on the wire,
-    /// smoothed over the lane's warm responses.
+    // Status-line-to-terminator wait: what the article cost on the wire,
+    // smoothed over the lane's warm responses.
     pub(super) transfer: Option<Duration>,
-    /// Decoded payload of this one response, for the depth explorer's
-    /// throughput window.
+    // Decoded payload of this one response, for the depth explorer's
+    // throughput window.
     pub(super) payload_bytes: u64,
-    /// This response's elapsed time with deliberate throttle waits removed.
+    // This response's elapsed time with deliberate throttle waits removed.
     pub(super) policy_elapsed: Duration,
-    /// Whether byte pressure was clear when the batch was leased. Samples
-    /// taken under pressure say nothing about the depth under test.
+    // Whether byte pressure was clear when the batch was leased. Samples
+    // taken under pressure say nothing about the depth under test.
     pub(super) pressure_clear: bool,
     pub(super) batch_complete: bool,
     pub(super) batch_clean: bool,
@@ -633,15 +673,9 @@ impl DownloadFailure {
 #[derive(Debug, Clone)]
 pub(super) enum DownloadError {
     Fetch(DownloadFailure),
-    /// Local cache or resource failure; never evidence that an article is missing.
-    Local {
-        raw_size: u64,
-        error: String,
-    },
-    Decode {
-        raw_size: u64,
-        error: String,
-    },
+    // Local cache or resource failure; never evidence that an article is missing.
+    Local { raw_size: u64, error: String },
+    Decode { raw_size: u64, error: String },
 }
 
 impl DownloadError {
@@ -658,20 +692,20 @@ impl DownloadError {
         Self::Fetch(DownloadFailure::from_nntp(error))
     }
 
-    /// Whether this failure left the NNTP connection in a known-good state:
-    /// the server's response was read to completion and the socket can carry
-    /// the next BODY.
-    ///
-    /// `ArticleNotFound` (430) is a complete, bodyless server answer — it says
-    /// nothing about the connection. Treating it as a transport fault used to
-    /// QUIT the TLS session, abandon the rest of the leased batch, and block
-    /// the server's pipelining proof, all because one article lives on another
-    /// provider. `ServerQuota` / `Unrequested` are local policy outcomes where
-    /// no BODY was ever issued, so they are clean for the same reason (they
-    /// still park the lane, just without discarding it).
-    ///
-    /// Decode failures stay dirty: the yEnc decoder can fail on a body the
-    /// transport never finished delivering.
+    // Whether this failure left the NNTP connection in a known-good state:
+    // the server's response was read to completion and the socket can carry
+    // the next BODY.
+    //
+    // `ArticleNotFound` (430) is a complete, bodyless server answer — it says
+    // nothing about the connection. Treating it as a transport fault used to
+    // QUIT the TLS session, abandon the rest of the leased batch, and block
+    // the server's pipelining proof, all because one article lives on another
+    // provider. `ServerQuota` / `Unrequested` are local policy outcomes where
+    // no BODY was ever issued, so they are clean for the same reason (they
+    // still park the lane, just without discarding it).
+    //
+    // Decode failures stay dirty: the yEnc decoder can fail on a body the
+    // transport never finished delivering.
     pub(super) fn leaves_connection_clean(&self) -> bool {
         match self {
             Self::Fetch(failure) => matches!(
@@ -685,9 +719,9 @@ impl DownloadError {
     }
 }
 
-/// Whether a download outcome leaves the lane's connection reusable.
-///
-/// See [`DownloadError::leaves_connection_clean`].
+// Whether a download outcome leaves the lane's connection reusable.
+//
+// See [`DownloadError::leaves_connection_clean`].
 pub(super) fn download_outcome_keeps_connection(
     data: &std::result::Result<DownloadPayload, DownloadError>,
 ) -> bool {
@@ -697,7 +731,7 @@ pub(super) fn download_outcome_keeps_connection(
     }
 }
 
-/// Successful download payload waiting for decode scheduling.
+// Successful download payload waiting for decode scheduling.
 pub(super) struct PendingDecodeWork {
     pub(super) segment_id: SegmentId,
     pub(super) raw: Bytes,
@@ -705,26 +739,26 @@ pub(super) struct PendingDecodeWork {
     pub(super) exclude_servers: Vec<usize>,
 }
 
-/// Progress update from a health probe task.
+// Progress update from a health probe task.
 pub(super) struct ProbeUpdate {
     pub(super) job_id: JobId,
-    /// The probe round this result belongs to, as handed to the probe task by
-    /// `activate_health_probes`. A result whose round the job is no longer
-    /// waiting on is dropped.
+    // The probe round this result belongs to, as handed to the probe task by
+    // `activate_health_probes`. A result whose round the job is no longer
+    // waiting on is dropped.
     pub(super) probe_round: u32,
-    /// Probes answered authoritatively so far. The verdict is read over this
-    /// figure, not over the number of segments the round set out to sample.
+    // Probes answered authoritatively so far. The verdict is read over this
+    // figure, not over the number of segments the round set out to sample.
     pub(super) total: usize,
-    /// Number of missing articles found so far.
+    // Number of missing articles found so far.
     pub(super) missed: usize,
-    /// Probes a non-authoritative batch left unanswered. Coverage the round
-    /// lost, which qualifies the verdict without discarding it.
+    // Probes a non-authoritative batch left unanswered. Coverage the round
+    // lost, which qualifies the verdict without discarding it.
     pub(super) unverified: usize,
-    /// True when the probe is complete (final update).
+    // True when the probe is complete (final update).
     pub(super) done: bool,
-    /// True when probe confirmation answered for nothing at all and the round
-    /// has to be discarded. A round that answered for part of its sample is
-    /// conclusive over that part.
+    // True when probe confirmation answered for nothing at all and the round
+    // has to be discarded. A round that answered for part of its sample is
+    // conclusive over that part.
     pub(super) inconclusive: bool,
 }
 
@@ -791,15 +825,15 @@ pub(super) struct RarRefreshState {
     pub(super) refreshed_volumes: BTreeSet<u32>,
     pub(super) structure_dirty: bool,
     pub(super) last_error: Option<RarRefreshError>,
-    /// Fingerprint of (facts generation, fact volumes, plan volumes, plan
-    /// waits) at the last successful refresh completion. A coverage gap —
-    /// facts the plan has not absorbed — normally spawns a follow-up refresh,
-    /// but when a completed refresh lands on the same fingerprint as the one
-    /// before it, the follow-up would recompute the identical answer from
-    /// identical inputs: a gap the plan CANNOT close (a missing chain link,
-    /// say) would otherwise respawn itself forever at actor speed. Matching
-    /// fingerprints park the gap instead; any real change — a new fact, a
-    /// changed fact, plan progress — changes the fingerprint and re-arms it.
+    // Fingerprint of (facts generation, fact volumes, plan volumes, plan
+    // waits) at the last successful refresh completion. A coverage gap —
+    // facts the plan has not absorbed — normally spawns a follow-up refresh,
+    // but when a completed refresh lands on the same fingerprint as the one
+    // before it, the follow-up would recompute the identical answer from
+    // identical inputs: a gap the plan CANNOT close (a missing chain link,
+    // say) would otherwise respawn itself forever at actor speed. Matching
+    // fingerprints park the gap instead; any real change — a new fact, a
+    // changed fact, plan progress — changes the fingerprint and re-arms it.
     pub(super) last_completion_fingerprint: Option<u64>,
 }
 
@@ -807,13 +841,13 @@ pub(super) struct ComputedRarSetState {
     pub(super) plan: RarDerivedPlan,
     pub(super) headers: Vec<u8>,
     pub(super) rebuild_source: archive::topology::RarTopologyRebuildSource,
-    /// The volumes this refresh actually integrated into the header view.
-    ///
-    /// Not the plan's `complete_volumes`: that set is derived from the facts
-    /// ledger, and a restored job can hold volumes on disk that the ledger
-    /// never recorded. Refresh coverage has to measure what the refresh saw,
-    /// or a coverage demand it can never satisfy re-issues itself after every
-    /// completion.
+    // The volumes this refresh actually integrated into the header view.
+    //
+    // Not the plan's `complete_volumes`: that set is derived from the facts
+    // ledger, and a restored job can hold volumes on disk that the ledger
+    // never recorded. Refresh coverage has to measure what the refresh saw,
+    // or a coverage demand it can never satisfy re-issues itself after every
+    // completion.
     pub(super) integrated_volumes: BTreeSet<u32>,
 }
 
@@ -872,7 +906,7 @@ impl From<unrar_rs::RarError> for RarPasswordAttemptError {
     }
 }
 
-/// Result of a background extraction task.
+// Result of a background extraction task.
 pub(super) struct BatchExtractionOutcome {
     pub(super) extracted: Vec<String>,
     pub(super) failed: Vec<(String, String)>,
@@ -886,11 +920,11 @@ pub(super) struct FullSetExtractionOutcome {
     pub(super) selected_password: Option<String>,
 }
 
-/// Bounded metadata-discovery progress for one PAR2 candidate.
-///
-/// This is deliberately separate from `promoted`: probing an indexless
-/// volume queues only its leading article, while promotion means the whole
-/// volume is eligible to move out of the recovery queue.
+// Bounded metadata-discovery progress for one PAR2 candidate.
+//
+// This is deliberately separate from `promoted`: probing an indexless
+// volume queues only its leading article, while promotion means the whole
+// volume is eligible to move out of the recovery queue.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) enum Par2DiscoveryState {
     #[default]
@@ -941,255 +975,255 @@ impl Par2DiscoveryState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Par2FileRuntime {
     pub(super) filename: String,
-    /// How many recovery blocks this file *claims* to carry: the count spelled
-    /// out in a `volNN+CC` name, or an estimate derived from its encoded size.
-    ///
-    /// An advertisement, never evidence. A volume that lost an article
-    /// advertises exactly what an intact one does, so this may decide what is
-    /// worth fetching and may never decide whether a repair can go ahead.
+    // How many recovery blocks this file *claims* to carry: the count spelled
+    // out in a `volNN+CC` name, or an estimate derived from its encoded size.
+    //
+    // An advertisement, never evidence. A volume that lost an article
+    // advertises exactly what an intact one does, so this may decide what is
+    // worth fetching and may never decide whether a repair can go ahead.
     pub(super) recovery_blocks: u32,
-    /// How many recovery blocks this file has *proven* it carries: packets that
-    /// were read and whose own MD5 checked out, whether on completion or by
-    /// reading back past a hole.
-    ///
-    /// Kept apart from the advertised count because the two disagree for
-    /// exactly the volumes where it matters — a volume that stranded holding
-    /// three of its twenty-four blocks. Crediting it with the other twenty-one
-    /// leaves the arithmetic believing a repair is affordable while nothing is
-    /// left to download, which is a job that waits forever.
+    // How many recovery blocks this file has *proven* it carries: packets that
+    // were read and whose own MD5 checked out, whether on completion or by
+    // reading back past a hole.
+    //
+    // Kept apart from the advertised count because the two disagree for
+    // exactly the volumes where it matters — a volume that stranded holding
+    // three of its twenty-four blocks. Crediting it with the other twenty-one
+    // leaves the arithmetic believing a repair is affordable while nothing is
+    // left to download, which is a job that waits forever.
     pub(super) validated_recovery_blocks: u32,
-    /// A completed parse or read-back reached a final answer for this file's
-    /// recovery capacity.  Once set, even zero is authoritative: a malformed
-    /// or metadata-only carrier must never fall back to its filename claim.
+    // A completed parse or read-back reached a final answer for this file's
+    // recovery capacity.  Once set, even zero is authoritative: a malformed
+    // or metadata-only carrier must never fall back to its filename claim.
     pub(super) recovery_capacity_accounted: bool,
     pub(super) promoted: bool,
-    /// Recovery packets were read back off a volume that can no longer
-    /// complete, and `validated_recovery_blocks` is how many of them validated.
-    /// Set only when at least one block was recovered, because it is also what
-    /// makes the file count toward the recovery available to a repair.
+    // Recovery packets were read back off a volume that can no longer
+    // complete, and `validated_recovery_blocks` is how many of them validated.
+    // Set only when at least one block was recovered, because it is also what
+    // makes the file count toward the recovery available to a repair.
     pub(super) salvaged: bool,
-    /// The file's `received_bytes()` when it was last read back, or `None` if it
-    /// never was.
-    ///
-    /// One read-back per generation of bytes, not one ever: nothing about a
-    /// volume changes between completion-gate entries while it sits still, and
-    /// the gate is entered many times per job — but a volume that strands, is
-    /// read back short, and then takes more articles before stranding again has
-    /// more on disk than the first read saw.
+    // The file's `received_bytes()` when it was last read back, or `None` if it
+    // never was.
+    //
+    // One read-back per generation of bytes, not one ever: nothing about a
+    // volume changes between completion-gate entries while it sits still, and
+    // the gate is entered many times per job — but a volume that strands, is
+    // read back short, and then takes more articles before stranding again has
+    // more on disk than the first read saw.
     pub(super) salvaged_at_received_bytes: Option<u64>,
-    /// A read-back of this volume has already been reported as failed.
-    ///
-    /// A read that cannot be parsed leaves no `salvaged_at_received_bytes`
-    /// mark — deliberately, so the next articles to land bring the volume back
-    /// for another look rather than writing it off. The gate is re-entered on
-    /// a timer, though, so the same unparseable volume is looked at again and
-    /// again with nothing having changed. The attempt still repeats; only its
-    /// report is latched to the first one.
+    // A read-back of this volume has already been reported as failed.
+    //
+    // A read that cannot be parsed leaves no `salvaged_at_received_bytes`
+    // mark — deliberately, so the next articles to land bring the volume back
+    // for another look rather than writing it off. The gate is re-entered on
+    // a timer, though, so the same unparseable volume is looked at again and
+    // again with nothing having changed. The attempt still repeats; only its
+    // report is latched to the first one.
     pub(super) readback_failure_reported: bool,
-    /// How many validated recovery blocks this file contributed to each set it
-    /// carries packets for.
-    ///
-    /// A file whose packets all answer to one set is described by
-    /// `validated_recovery_blocks` alone. One carrying several sets' packets has
-    /// no single answer, and its blocks are nonetheless merged into each of
-    /// those sets — so the arithmetic that decides whether a repair is possible
-    /// has to be able to see the same blocks the repairer already holds.
+    // How many validated recovery blocks this file contributed to each set it
+    // carries packets for.
+    //
+    // A file whose packets all answer to one set is described by
+    // `validated_recovery_blocks` alone. One carrying several sets' packets has
+    // no single answer, and its blocks are nonetheless merged into each of
+    // those sets — so the arithmetic that decides whether a repair is possible
+    // has to be able to see the same blocks the repairer already holds.
     pub(super) recovery_blocks_by_set: HashMap<par2_rs::RecoverySetId, u32>,
-    /// Which recovery set this PAR2 file speaks for, once its packets have
-    /// actually been read. A file carrying packets for more than one set stays
-    /// `None`, because no single set owns it.
+    // Which recovery set this PAR2 file speaks for, once its packets have
+    // actually been read. A file carrying packets for more than one set stays
+    // `None`, because no single set owns it.
     pub(super) recovery_set_id: Option<par2_rs::RecoverySetId>,
-    /// Whether packets have been read from this file. A packet-read file with
-    /// no single set ID is deliberately not grouped by filename.
+    // Whether packets have been read from this file. A packet-read file with
+    // no single set ID is deliberately not grouped by filename.
     pub(super) recovery_set_packets_read: bool,
-    /// Explicit progress through index/indexless metadata discovery.
+    // Explicit progress through index/indexless metadata discovery.
     pub(super) discovery: Par2DiscoveryState,
-    /// This file was admitted as a PAR2 candidate from a structurally valid
-    /// header despite its NZB filename not being PAR2-shaped. Full packet
-    /// parsing remains required before it contributes metadata or recovery.
+    // This file was admitted as a PAR2 candidate from a structurally valid
+    // header despite its NZB filename not being PAR2-shaped. Full packet
+    // parsing remains required before it contributes metadata or recovery.
     pub(super) signature_candidate: bool,
-    /// `MetadataCarrierQueued` is also used by the ordinary explicit-index
-    /// bootstrap. Keep its provenance separate so only completion-driven
-    /// metadata work receives completion-critical scheduling and UI state.
+    // `MetadataCarrierQueued` is also used by the ordinary explicit-index
+    // bootstrap. Keep its provenance separate so only completion-driven
+    // metadata work receives completion-critical scheduling and UI state.
     pub(super) metadata_carrier_completion_critical: bool,
-    /// Set-specific full-file metadata attempts. This prevents a completed
-    /// carrier from being selected repeatedly when it contains valid packets
-    /// but not enough critical metadata to construct that set.
+    // Set-specific full-file metadata attempts. This prevents a completed
+    // carrier from being selected repeatedly when it contains valid packets
+    // but not enough critical metadata to construct that set.
     pub(super) metadata_targets_attempted: HashSet<par2_rs::RecoverySetId>,
-    /// Article ordinals already used for bounded prefix probing. Full-carrier
-    /// escalation skips them because their decoded bytes are already retained.
+    // Article ordinals already used for bounded prefix probing. Full-carrier
+    // escalation skips them because their decoded bytes are already retained.
     pub(super) discovery_probe_ordinals: HashSet<u32>,
-    /// Digest of the bytes the last completed metadata parse of this file
-    /// read. A re-finalisation that leaves the bytes unchanged skips the parse.
+    // Digest of the bytes the last completed metadata parse of this file
+    // read. A re-finalisation that leaves the bytes unchanged skips the parse.
     pub(super) metadata_parse_fingerprint: Option<[u8; 32]>,
 }
 
-/// What a job knows about one recovery set it has encountered.
-///
-/// A posting may carry several independent recovery sets, each describing its
-/// own files and sharing no bytes with the others. Only one of them is served,
-/// so the rest have to be remembered rather than forgotten: their volumes must
-/// not be mistaken for the served set's capacity, and the files they describe
-/// must not be reported as if nothing ever protected them.
+// What a job knows about one recovery set it has encountered.
+//
+// A posting may carry several independent recovery sets, each describing its
+// own files and sharing no bytes with the others. Only one of them is served,
+// so the rest have to be remembered rather than forgotten: their volumes must
+// not be mistaken for the served set's capacity, and the files they describe
+// must not be reported as if nothing ever protected them.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Par2SetSummary {
-    /// Whether an index of this set was actually parsed.
-    ///
-    /// A set first met through a foreign packet inside somebody else's volume
-    /// is *known* but has no descriptions at all, so it can never be served —
-    /// it exists here to be named in the warning and to attribute that volume.
+    // Whether an index of this set was actually parsed.
+    //
+    // A set first met through a foreign packet inside somebody else's volume
+    // is *known* but has no descriptions at all, so it can never be served —
+    // it exists here to be named in the warning and to attribute that volume.
     pub(super) describes: bool,
-    /// The file whose packets described this set, and its position in the
-    /// posting. The position orders independent verification passes regardless
-    /// of arrival order.
+    // The file whose packets described this set, and its position in the
+    // posting. The position orders independent verification passes regardless
+    // of arrival order.
     pub(super) index_filename: String,
     pub(super) index_file_index: u32,
-    /// The index name with its `.par2` and any `.volNNN+CCC` part removed —
-    /// what groups a never-parsed volume onto this set by name alone.
+    // The index name with its `.par2` and any `.volNNN+CCC` part removed —
+    // what groups a never-parsed volume onto this set by name alone.
     pub(super) base_name: Option<String>,
-    /// Sanitized names of the files this set protects.
+    // Sanitized names of the files this set protects.
     pub(super) described_filenames: Vec<String>,
-    /// How much payload this set protects. Retained for diagnostics and for
-    /// compatibility selection before the completion gate takes over.
+    // How much payload this set protects. Retained for diagnostics and for
+    // compatibility selection before the completion gate takes over.
     pub(super) described_bytes: u64,
-    /// Files whose packets were observed to belong to this set.
+    // Files whose packets were observed to belong to this set.
     pub(super) volume_file_indices: HashSet<u32>,
 }
 
 #[derive(Default)]
 pub(super) struct RecoveryUnpostedOutputs {
-    /// Described names a verdict proved complete on disk while no posted file
-    /// bound to them. A posting whose files carry no usable name reaches the
-    /// job this way: the recovery set rebuilds the described file beside a
-    /// posted one it cannot identify.
+    // Described names a verdict proved complete on disk while no posted file
+    // bound to them. A posting whose files carry no usable name reaches the
+    // job this way: the recovery set rebuilds the described file beside a
+    // posted one it cannot identify.
     pub(super) outputs: HashSet<String>,
-    /// Posted files holding bytes of a rebuilt output at the offset the set
-    /// describes them. Each is the damaged copy of a file a recovery set has
-    /// since delivered whole, so it is a spent input rather than payload.
+    // Posted files holding bytes of a rebuilt output at the offset the set
+    // describes them. Each is the damaged copy of a file a recovery set has
+    // since delivered whole, so it is a spent input rather than payload.
     pub(super) superseded: HashSet<NzbFileId>,
 }
 
 #[derive(Default)]
 pub(super) struct Par2SetRuntime {
-    /// The parsed recovery set. `None` until an index of this set was parsed.
+    // The parsed recovery set. `None` until an index of this set was parsed.
     pub(super) set: Option<Arc<Par2FileSet>>,
-    /// The completion gate has reached a final answer for this recovery set.
-    ///
-    /// A later index can add a different set and reopen the job aggregate, but
-    /// it must not make this set read the same bytes again.  Its own verdict
-    /// and reconciliation latch therefore live with the set rather than with
-    /// the job.
+    // The completion gate has reached a final answer for this recovery set.
+    //
+    // A later index can add a different set and reopen the job aggregate, but
+    // it must not make this set read the same bytes again.  Its own verdict
+    // and reconciliation latch therefore live with the set rather than with
+    // the job.
     pub(super) settled: bool,
-    /// Integrity was deferred to archive extraction instead of a PAR2 hash pass.
+    // Integrity was deferred to archive extraction instead of a PAR2 hash pass.
     pub(in crate::pipeline) settled_via_strong_decode: bool,
-    /// A final answer that could not verify or repair this set.  The gate keeps
-    /// processing later sets before turning these failures into the job result.
+    // A final answer that could not verify or repair this set.  The gate keeps
+    // processing later sets before turning these failures into the job result.
     pub(super) failure: Option<String>,
-    /// A native recoverability verdict can permit another format to try. I/O,
-    /// cancellation and other unclassified failures keep this empty.
+    // A native recoverability verdict can permit another format to try. I/O,
+    // cancellation and other unclassified failures keep this empty.
     pub(in crate::pipeline) alternate_repair: Option<repair::backend::AlternateRepairReason>,
-    /// Damage observed while deciding this set.  The aggregate reports one
-    /// job-level verification metric after every servable set has settled.
+    // Damage observed while deciding this set.  The aggregate reports one
+    // job-level verification metric after every servable set has settled.
     pub(super) missing_blocks: u32,
-    /// Whether any pass for this set required repair.  A clean post-repair pass
-    /// does not erase that fact from the aggregate verification result.
+    // Whether any pass for this set required repair.  A clean post-repair pass
+    // does not erase that fact from the aggregate verification result.
     pub(super) needed_repair: bool,
-    /// What this set describes and which volumes spoke for it.
+    // What this set describes and which volumes spoke for it.
     pub(super) summary: Par2SetSummary,
-    /// Stateful assessment/repair engine. It intentionally owns no open file
-    /// handles, and is invalidated before payload paths are rewritten.
+    // Stateful assessment/repair engine. It intentionally owns no open file
+    // handles, and is invalidated before payload paths are rewritten.
     pub(super) session: Option<par2_rs::Par2RepairSession>,
-    /// Last time the retained session was taken or restored, for global LRU
-    /// eviction when the shared retained-state budget is exceeded.
+    // Last time the retained session was taken or restored, for global LRU
+    // eviction when the shared retained-state budget is exceeded.
     pub(super) session_last_used: Option<Instant>,
-    /// Scan state carried between repairer passes over this set: the carry the
-    /// last completed `Par2Repairer` pass returned, or one built from this
-    /// module's own authoritative verification. Seeded into the next repairer
-    /// run's options so an analysis or repair does not re-read bytes a
-    /// previous pass already hashed. par2-rs validates a consumed carry
-    /// against per-file stat fingerprints and re-checks bytes before any
-    /// mutating request, so a stale stash costs nothing but the seed.
+    // Scan state carried between repairer passes over this set: the carry the
+    // last completed `Par2Repairer` pass returned, or one built from this
+    // module's own authoritative verification. Seeded into the next repairer
+    // run's options so an analysis or repair does not re-read bytes a
+    // previous pass already hashed. par2-rs validates a consumed carry
+    // against per-file stat fingerprints and re-checks bytes before any
+    // mutating request, so a stale stash costs nothing but the seed.
     pub(super) scan_carry: Option<std::sync::Arc<par2_rs::ScanCarry>>,
-    /// The extra-scan exclusion list the stashed carry was produced under.
-    ///
-    /// A carry is a complete account of the tree only for a pass that was
-    /// allowed to look at the same files, and its locations may name a file
-    /// that has since become excluded — bytes the next pass has just been told
-    /// belong to something else. So the stash is seeded only when the current
-    /// exclusion list matches this one, and discarded otherwise.
+    // The extra-scan exclusion list the stashed carry was produced under.
+    //
+    // A carry is a complete account of the tree only for a pass that was
+    // allowed to look at the same files, and its locations may name a file
+    // that has since become excluded — bytes the next pass has just been told
+    // belong to something else. So the stash is seeded only when the current
+    // exclusion list matches this one, and discarded otherwise.
     pub(super) scan_carry_exclusions: Vec<std::path::PathBuf>,
-    /// Completed files whose current identity/checksum evidence was admitted
-    /// to the retained session.
+    // Completed files whose current identity/checksum evidence was admitted
+    // to the retained session.
     pub(super) session_evidence_file_ids: HashSet<NzbFileId>,
-    /// Completion-gate entries that found protected files still incomplete
-    /// *after* the job's PAR2 verdict was settled — a state only a
-    /// reconciliation defect of ours can produce. One retry is allowed; the
-    /// second entry fails the job with a named bug report rather than
-    /// re-reading the whole recovery set on every lap forever. Reset wherever
-    /// a verdict is taken or reopened.
+    // Completion-gate entries that found protected files still incomplete
+    // *after* the job's PAR2 verdict was settled — a state only a
+    // reconciliation defect of ours can produce. One retry is allowed; the
+    // second entry fails the job with a named bug report rather than
+    // re-reading the whole recovery set on every lap forever. Reset wherever
+    // a verdict is taken or reopened.
     pub(super) post_verdict_reconcile_attempts: u32,
-    /// The damaged-path verdict this set parked on while its targeted recovery
-    /// downloaded, so the entry that finds the recovery landed can repair on it
-    /// instead of paying for the same authoritative read again.
-    ///
-    /// In-memory only, and deliberately so: a restart has no analysis to stand
-    /// on and takes the ordinary path.
+    // The damaged-path verdict this set parked on while its targeted recovery
+    // downloaded, so the entry that finds the recovery landed can repair on it
+    // instead of paying for the same authoritative read again.
+    //
+    // In-memory only, and deliberately so: a restart has no analysis to stand
+    // on and takes the ordinary path.
     pub(super) pending_repair: Option<PendingPar2Repair>,
 }
 
-/// A "repair required" verdict held across the wait for targeted recovery.
-///
-/// The analysis that produced it read every damaged file and named every
-/// damaged slice. Recovery arriving afterwards cannot change any of that — a
-/// recovery volume carries no source bytes — so the only number the next pass
-/// would learn is how much recovery is now available, which the repair pass
-/// computes from the merged set itself. Holding the verdict is what lets that
-/// pass be the repair rather than a second read of the same files.
-///
-/// The identity fields are the guard: the verdict describes *this* recovery set
-/// over *these* described files at *this* slice size, and is refused the moment
-/// any of them moves. It says nothing about the bytes on disk, and does not
-/// need to — par2-rs re-proves every repair input against its own scan-time
-/// fingerprints and falls back to a fresh scan when one has drifted, so a
-/// verdict trusted here can cost a re-read but never a wrong repair.
+// A "repair required" verdict held across the wait for targeted recovery.
+//
+// The analysis that produced it read every damaged file and named every
+// damaged slice. Recovery arriving afterwards cannot change any of that — a
+// recovery volume carries no source bytes — so the only number the next pass
+// would learn is how much recovery is now available, which the repair pass
+// computes from the merged set itself. Holding the verdict is what lets that
+// pass be the repair rather than a second read of the same files.
+//
+// The identity fields are the guard: the verdict describes *this* recovery set
+// over *these* described files at *this* slice size, and is refused the moment
+// any of them moves. It says nothing about the bytes on disk, and does not
+// need to — par2-rs re-proves every repair input against its own scan-time
+// fingerprints and falls back to a fresh scan when one has drifted, so a
+// verdict trusted here can cost a re-read but never a wrong repair.
 pub(super) struct PendingPar2Repair {
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
     pub(super) slice_size: u64,
-    /// Files the set described when the verdict was reached. A metadata merge
-    /// that adds or drops a description invalidates the verdict.
+    // Files the set described when the verdict was reached. A metadata merge
+    // that adds or drops a description invalidates the verdict.
     pub(super) described_file_ids: Vec<par2_rs::FileId>,
-    /// Recovery blocks the repair needs, and the damage it answers.
+    // Recovery blocks the repair needs, and the damage it answers.
     pub(super) blocks_needed: u32,
     pub(super) damaged: u32,
-    /// The analysis result the repair pass is owed: it decides what the repair
-    /// is allowed to leave parked, and which files the post-repair read-back
-    /// has to re-read rather than carry.
+    // The analysis result the repair pass is owed: it decides what the repair
+    // is allowed to leave parked, and which files the post-repair read-back
+    // has to re-read rather than carry.
     pub(super) verification: par2_rs::VerificationResult,
 }
 
-/// A positive authoritative binding whose PAR2 slice CRCs make streamed MD5
-/// unnecessary. It is rebuilt only after metadata or identity changes.
+// A positive authoritative binding whose PAR2 slice CRCs make streamed MD5
+// unnecessary. It is rebuilt only after metadata or identity changes.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Par2Md5SubstitutionBinding {
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
     pub(super) par2_file_id: par2_rs::FileId,
 }
 
-/// One direct-store post-repair read-back owned by the post-processing lane.
-///
-/// The PAR grid and direct provider are snapshotted before submission. The
-/// pipeline actor retains only this generation fence and applies the terminal
-/// verdict after the worker returns.
+// One direct-store post-repair read-back owned by the post-processing lane.
+//
+// The PAR grid and direct provider are snapshotted before submission. The
+// pipeline actor retains only this generation fence and applies the terminal
+// verdict after the worker returns.
 pub(super) struct DirectPostRepairWork {
     pub(super) work_id: u64,
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
-    /// Which shape of the pass this is: the read of what a repair rewrote, or
-    /// the pre-repair read of what the grid could not claim.
+    // Which shape of the pass this is: the read of what a repair rewrote, or
+    // the pre-repair read of what the grid could not claim.
     pub(super) post_repair: bool,
-    /// When this ticket was handed to the detached task, so the completion
-    /// handler can log how long the read-back actually took. The gap between
-    /// submission and completion is exactly the window that once produced an
-    /// unexplained multi-second stall with nothing in the logs to explain it.
+    // When this ticket was handed to the detached task, so the completion
+    // handler can log how long the read-back actually took. The gap between
+    // submission and completion is exactly the window that once produced an
+    // unexplained multi-second stall with nothing in the logs to explain it.
     pub(super) submitted_at: std::time::Instant,
 }
 
@@ -1201,43 +1235,43 @@ pub(super) struct DirectPostRepairWorkDone {
     pub(super) result: Result<par2_rs::VerificationResult, String>,
 }
 
-/// One direct set's tolerated-member extraction, detached from the actor.
-///
-/// The tolerance no longer caps a member's size, so the decode it runs at
-/// finalization can be as long as any conventional extraction — and it reads
-/// the set's virtual volumes, which is disk I/O the pipeline task must not sit
-/// on. The virtual provider, the targets and the budget are snapshotted at
-/// submission; the actor keeps only this fence and picks the result up on the
-/// next finalization pass, exactly the way [`DirectPostRepairWork`] does.
+// One direct set's tolerated-member extraction, detached from the actor.
+//
+// The tolerance no longer caps a member's size, so the decode it runs at
+// finalization can be as long as any conventional extraction — and it reads
+// the set's virtual volumes, which is disk I/O the pipeline task must not sit
+// on. The virtual provider, the targets and the budget are snapshotted at
+// submission; the actor keeps only this fence and picks the result up on the
+// next finalization pass, exactly the way [`DirectPostRepairWork`] does.
 pub(super) struct DirectToleratedWork {
     pub(super) work_id: u64,
     pub(super) set_index: usize,
     pub(super) submitted_at: std::time::Instant,
 }
 
-/// A coverage barrier between its prepare and its commit: the checkpoint the
-/// pipeline task captured and the destination syncs running off it.
-///
-/// The syncs are the barrier's only slow step — an fsync of up to a batch's
-/// worth of dirty bytes per destination — and awaiting them on the pipeline
-/// task stopped every lane for as long as the disk took.
-///
-/// The outcomes come back on their own channel, sent **before** the done
-/// message is offered: a demanded barrier that cannot wait for the message
-/// joins the flight through `outcomes`, and that join must not depend on the
-/// done channel having room — the pipeline task is the one that drains it,
-/// and it is the one doing the joining.
+// A coverage barrier between its prepare and its commit: the checkpoint the
+// pipeline task captured and the destination syncs running off it.
+//
+// The syncs are the barrier's only slow step — an fsync of up to a batch's
+// worth of dirty bytes per destination — and awaiting them on the pipeline
+// task stopped every lane for as long as the disk took.
+//
+// The outcomes come back on their own channel, sent **before** the done
+// message is offered: a demanded barrier that cannot wait for the message
+// joins the flight through `outcomes`, and that join must not depend on the
+// done channel having room — the pipeline task is the one that drains it,
+// and it is the one doing the joining.
 pub(super) struct DirectBarrierFlight {
-    /// Names this flight to its done message. A flight joined by a demand
-    /// leaves its message queued, and the set may have a newer flight out by
-    /// the time it arrives; the message must not settle that one.
+    // Names this flight to its done message. A flight joined by a demand
+    // leaves its message queued, and the set may have a newer flight out by
+    // the time it arrives; the message must not settle that one.
     pub(super) id: u64,
     pub(super) prepared: direct_store::barrier::PreparedBarrier,
     pub(super) outcomes: tokio::sync::oneshot::Receiver<Vec<std::io::Result<()>>>,
-    /// The set's dirty bytes at the prepare, for the barrier's perf probes.
+    // The set's dirty bytes at the prepare, for the barrier's perf probes.
     pub(super) dirty_bytes: u64,
-    /// The destinations being synced, relative name and absolute path, in
-    /// the order the task reports them.
+    // The destinations being synced, relative name and absolute path, in
+    // the order the task reports them.
     pub(super) touched: Vec<(String, PathBuf)>,
 }
 
@@ -1247,36 +1281,38 @@ pub(super) struct DirectBarrierDone {
     pub(super) flight_id: u64,
 }
 
-/// Spans waiting for their destination writes to return, and what produced
-/// them.
+// Spans waiting for their destination writes to return, and what produced
+// them.
 pub(super) struct DirectPlacement {
     pub(super) spans: Vec<direct_store::router::RoutedSpan>,
     pub(super) kind: DirectPlacementKind,
-    /// Counted into the resident write backlog while the placement waits, so
-    /// a slow destination slows dispatch the way a slow conventional write does.
+    // Counted into the resident write backlog while the placement waits, so
+    // a slow destination slows dispatch the way a slow conventional write does.
     pub(super) buffered_len: usize,
 }
 
-/// What a placement's spans came out of, which decides what its landing does.
+// What a placement's spans came out of, which decides what its landing does.
 pub(super) enum DirectPlacementKind {
-    /// A routed article. It is held, not copied: the spans are refcounted
-    /// views of its buffers, and the segment itself is what the commit reads
-    /// its CRC facts from — or what the conventional path takes back if the
-    /// placement fails.
+    // A routed article. It is held, not copied: the spans are refcounted
+    // views of its buffers, and the segment itself is what the commit reads
+    // its CRC facts from — or what the conventional path takes back if the
+    // placement fails.
     Article {
         segment: BufferedDecodedSegment,
         volume_index: u32,
         file_offset: u64,
     },
-    /// A completed volume's trailing region, which the confirming parse
-    /// released from the holds. Its landing finishes the volume's completion:
-    /// the set may not finalize, and delete its envelopes, before these bytes
-    /// are its coverage.
-    VolumeTail { volume_index: u32 },
+    // A completed volume's trailing region, which the confirming parse
+    // released from the holds. Its landing finishes the volume's completion:
+    // the set may not finalize, and delete its envelopes, before these bytes
+    // are its coverage.
+    VolumeTail {
+        volume_index: u32,
+    },
 }
 
 impl DirectPlacement {
-    /// The routed article this placement carries, if it carries one.
+    // The routed article this placement carries, if it carries one.
     pub(super) fn article(&self) -> Option<SegmentId> {
         match &self.kind {
             DirectPlacementKind::Article { segment, .. } => Some(segment.segment_id),
@@ -1285,40 +1321,40 @@ impl DirectPlacement {
     }
 }
 
-/// Where a placement flight's writes are.
+// Where a placement flight's writes are.
 pub(super) enum DirectPlacementFlightState {
-    /// Writing on a task of its own.
+    // Writing on a task of its own.
     Pending(tokio::sync::oneshot::Receiver<DirectPlacementOutcome>),
-    /// The writes returned and a join collected the outcome; the done message
-    /// applies it.
+    // The writes returned and a join collected the outcome; the done message
+    // applies it.
     Resolved(DirectPlacementOutcome),
-    /// Being applied right now, further up the pipeline task's own stack.
+    // Being applied right now, further up the pipeline task's own stack.
     Applying,
 }
 
-/// What a placement task reports: the destinations it created (for the
-/// once-per-job preparation cache) and whether every write returned.
+// What a placement task reports: the destinations it created (for the
+// once-per-job preparation cache) and whether every write returned.
 pub(super) struct DirectPlacementOutcome {
     pub(super) prepared: Vec<PathBuf>,
     pub(super) result: Result<(), direct_store::wiring::DirectPlacementError>,
 }
 
-/// A set's placements between routing and commit.
-///
-/// The destination writes of a routed article used to be awaited on the
-/// pipeline task, so a destination that took seconds to answer stopped every
-/// lane of every job for those seconds. Routing still happens on the task —
-/// it is what decides where the bytes go — but the writes run on a task of
-/// their own, and the commit is applied when the done message comes back.
-///
-/// At most one flight per set is out at a time. Articles routed while it is
-/// out queue behind it and leave together as the next flight, so the set's
-/// commits keep their routing order, and a destination is only ever prepared
-/// by one task at a time.
+// A set's placements between routing and commit.
+//
+// The destination writes of a routed article used to be awaited on the
+// pipeline task, so a destination that took seconds to answer stopped every
+// lane of every job for those seconds. Routing still happens on the task —
+// it is what decides where the bytes go — but the writes run on a task of
+// their own, and the commit is applied when the done message comes back.
+//
+// At most one flight per set is out at a time. Articles routed while it is
+// out queue behind it and leave together as the next flight, so the set's
+// commits keep their routing order, and a destination is only ever prepared
+// by one task at a time.
 pub(super) struct DirectPlacementFlight {
-    /// Names this flight to its done message, as a barrier flight's id does.
+    // Names this flight to its done message, as a barrier flight's id does.
     pub(super) id: u64,
-    /// The set this flight was routed into, checked again before it commits.
+    // The set this flight was routed into, checked again before it commits.
     pub(super) set_name: String,
     pub(super) state: DirectPlacementFlightState,
     pub(super) placements: VecDeque<DirectPlacement>,
@@ -1336,14 +1372,14 @@ pub(super) struct DirectPlacementDone {
     pub(super) flight_id: u64,
 }
 
-/// The re-read of a set's restart-seeded coverage, detached from the actor.
-///
-/// Restart restores a set's floors from its checkpoint but not the bytes'
-/// checksums, so before the member gates can compose, every seeded run is
-/// read back and hashed — the whole pre-restart download, which on a slow
-/// disk is minutes. The plan the read was made from rides along: a plan that
-/// moved while the read ran (a repair, a migration) makes its checksums stale,
-/// and the pass is simply made again.
+// The re-read of a set's restart-seeded coverage, detached from the actor.
+//
+// Restart restores a set's floors from its checkpoint but not the bytes'
+// checksums, so before the member gates can compose, every seeded run is
+// read back and hashed — the whole pre-restart download, which on a slow
+// disk is minutes. The plan the read was made from rides along: a plan that
+// moved while the read ran (a repair, a migration) makes its checksums stale,
+// and the pass is simply made again.
 pub(super) struct DirectRearmDone {
     pub(super) job_id: JobId,
     pub(super) set_index: usize,
@@ -1358,26 +1394,26 @@ pub(super) struct DirectToleratedWorkDone {
     pub(super) result: Result<direct_store::wiring::ToleratedExtraction, String>,
 }
 
-/// One recovery set's filesystem damaged-path analysis, detached from the actor.
-///
-/// The analysis is a whole-directory authoritative read: it hashes every
-/// described file and rolling-scans whatever else the directory holds. Awaited
-/// inline it held the pipeline task for its entire duration — seconds on a
-/// small job, minutes on a multi-set release — during which no other job's
-/// articles were dispatched, no decode result was processed, and no newly
-/// submitted NZB was even parsed. Everything the read needs is snapshotted at
-/// submission (including the retained session, which travels with the ticket
-/// and comes back with the done message); the actor keeps only this fence and
-/// picks the verdict up when the completion check re-enters.
-///
-/// One ticket per job. The set it belongs to is part of the fence because a
-/// verdict describes one recovery set's files by path, and a job that re-binds
-/// its files while the read is running must not repair on what the read saw.
+// One recovery set's filesystem damaged-path analysis, detached from the actor.
+//
+// The analysis is a whole-directory authoritative read: it hashes every
+// described file and rolling-scans whatever else the directory holds. Awaited
+// inline it held the pipeline task for its entire duration — seconds on a
+// small job, minutes on a multi-set release — during which no other job's
+// articles were dispatched, no decode result was processed, and no newly
+// submitted NZB was even parsed. Everything the read needs is snapshotted at
+// submission (including the retained session, which travels with the ticket
+// and comes back with the done message); the actor keeps only this fence and
+// picks the verdict up when the completion check re-enters.
+//
+// One ticket per job. The set it belongs to is part of the fence because a
+// verdict describes one recovery set's files by path, and a job that re-binds
+// its files while the read is running must not repair on what the read saw.
 pub(super) struct Par2AnalysisWork {
     pub(super) work_id: u64,
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
-    /// When the ticket was handed to the detached task, so the completion
-    /// handler can report how long the read actually took.
+    // When the ticket was handed to the detached task, so the completion
+    // handler can report how long the read actually took.
     pub(super) submitted_at: std::time::Instant,
 }
 
@@ -1388,8 +1424,8 @@ pub(super) struct Par2AnalysisWorkDone {
     pub(super) outcome: completion::finalize::check::Par2AnalysisTicketOutcome,
 }
 
-/// Native outcomes share the existing repair completion queue. Dispatch occurs
-/// once per operation; block reads and native evidence stay format-specific.
+// Native outcomes share the existing repair completion queue. Dispatch occurs
+// once per operation; block reads and native evidence stay format-specific.
 #[expect(
     clippy::large_enum_variant,
     reason = "keep the existing PAR2 result inline without adding a per-operation allocation"
@@ -1399,48 +1435,48 @@ pub(super) enum RepairWorkDone {
     Par3(Box<repair::par3::work::WorkDone>),
 }
 
-/// One demoted set's reconstruction sweep, detached from the actor.
-///
-/// The sweep reads every volume of the set out of the overlay and writes it to
-/// disk: on a large archive that is gigabytes of I/O, and it used to run inside
-/// the demotion — which the actor reaches from the decode of the very article
-/// that triggered it, so the job's every other article waited behind a
-/// materialization it had nothing to do with. Everything the sweep needs is
-/// snapshotted at submission and everything the *reconciliation* needs travels
-/// with the ticket, so the actor keeps only this fence and applies the durable
-/// bookkeeping when the ticket lands.
-///
-/// One ticket per demoted set rather than per job: a job can demote two sets,
-/// and neither may wait on the other's I/O.
+// One demoted set's reconstruction sweep, detached from the actor.
+//
+// The sweep reads every volume of the set out of the overlay and writes it to
+// disk: on a large archive that is gigabytes of I/O, and it used to run inside
+// the demotion — which the actor reaches from the decode of the very article
+// that triggered it, so the job's every other article waited behind a
+// materialization it had nothing to do with. Everything the sweep needs is
+// snapshotted at submission and everything the *reconciliation* needs travels
+// with the ticket, so the actor keeps only this fence and applies the durable
+// bookkeeping when the ticket lands.
+//
+// One ticket per demoted set rather than per job: a job can demote two sets,
+// and neither may wait on the other's I/O.
 pub(super) struct DirectDemotionWork {
     pub(super) work_id: u64,
     pub(super) submitted_at: std::time::Instant,
-    /// The reconciliation's half of the snapshot — the volume targets, their
-    /// article geometry, and the articles the decode seam took ownership of at
-    /// the demotion instant. Owned by the ticket; the per-volume handbacks
-    /// consume it target by target, and the finish takes what is left.
+    // The reconciliation's half of the snapshot — the volume targets, their
+    // article geometry, and the articles the decode seam took ownership of at
+    // the demotion instant. Owned by the ticket; the per-volume handbacks
+    // consume it target by target, and the finish takes what is left.
     pub(super) plan: direct_store::wiring::DemotedSweepPlan,
-    /// How many of the plan's targets the sweep has reported and the actor
-    /// has handed back, in target order.
+    // How many of the plan's targets the sweep has reported and the actor
+    // has handed back, in target order.
     pub(super) handed_back: usize,
-    /// File indices of the volumes already handed back to the conventional
-    /// path. A file named here is no longer sweep-owned: its articles are
-    /// dispatched, written and completed like any other file's, even though
-    /// the ticket stays open until the sweep has finished its siblings.
+    // File indices of the volumes already handed back to the conventional
+    // path. A file named here is no longer sweep-owned: its articles are
+    // dispatched, written and completed like any other file's, even though
+    // the ticket stays open until the sweep has finished its siblings.
     pub(super) released: HashSet<u32>,
-    /// The running account of the handback, totalled for the ticket's final
-    /// log line and metrics.
+    // The running account of the handback, totalled for the ticket's final
+    // log line and metrics.
     pub(super) summary: direct_store::wiring::ReconstructionSummary,
 }
 
-/// One message from a demotion sweep to the actor.
-///
-/// Streamed per volume rather than batched, because the sweep is bounded only
-/// by the archive and every volume it has not finished is held out of
-/// dispatch: a batch would hold the whole set — on a large archive over a slow
-/// working directory, the whole job — for the entire sweep. Each volume's
-/// floor, rows and requeue land as its outcome arrives; the set's coverage row,
-/// which is one row for the set, is retired by the finish.
+// One message from a demotion sweep to the actor.
+//
+// Streamed per volume rather than batched, because the sweep is bounded only
+// by the archive and every volume it has not finished is held out of
+// dispatch: a batch would hold the whole set — on a large archive over a slow
+// working directory, the whole job — for the entire sweep. Each volume's
+// floor, rows and requeue land as its outcome arrives; the set's coverage row,
+// which is one row for the set, is retired by the finish.
 pub(super) struct DirectDemotionWorkDone {
     pub(super) job_id: JobId,
     pub(super) work_id: u64,
@@ -1449,32 +1485,32 @@ pub(super) struct DirectDemotionWorkDone {
 }
 
 pub(super) enum DirectDemotionProgress {
-    /// The next volume, in the order the plan's targets name them.
+    // The next volume, in the order the plan's targets name them.
     Volume(direct_store::reconstruct::ReconstructedVolume),
-    /// The sweep returned. `panicked` means some targets never got an outcome;
-    /// each of those is handed back as a volume that kept nothing.
+    // The sweep returned. `panicked` means some targets never got an outcome;
+    // each of those is handed back as a volume that kept nothing.
     Finished { panicked: bool },
 }
 
-/// The pre-repair verdict and the repair's own write set, carried across a
-/// direct-store repair so the post-repair read-back can be selective instead
-/// of re-reading the whole recovery set.
-///
-/// This is the direct-store mirror of what
-/// [`Pipeline::verify_repaired_par2_files_with_placement`] does for a
-/// conventional set: that function is handed `pre_repair` by its caller,
-/// which still has the verification in a local variable a few lines above.
-/// The direct-store gate has no such luxury — the pre-repair verdict is
-/// computed in [`Pipeline::resolve_direct_sets_before_par2_repairer_for_set`],
-/// the repair runs, and the job re-enters the gate on a **later** completion
-/// check to read the result back, by which point the local variable is long
-/// gone. This struct is what stands in for it across that gap.
-///
-/// Keyed by job rather than by recovery set: a job serves one recovery set
-/// through this gate at a time (see [`Pipeline::direct_sets_repaired_in_place`]),
-/// so one carry is all a job ever needs, and `recovery_set_id` is kept
-/// alongside it so a consumer can tell a fresh carry from a stale one instead
-/// of trusting the map key alone.
+// The pre-repair verdict and the repair's own write set, carried across a
+// direct-store repair so the post-repair read-back can be selective instead
+// of re-reading the whole recovery set.
+//
+// This is the direct-store mirror of what
+// [`Pipeline::verify_repaired_par2_files_with_placement`] does for a
+// conventional set: that function is handed `pre_repair` by its caller,
+// which still has the verification in a local variable a few lines above.
+// The direct-store gate has no such luxury — the pre-repair verdict is
+// computed in [`Pipeline::resolve_direct_sets_before_par2_repairer_for_set`],
+// the repair runs, and the job re-enters the gate on a **later** completion
+// check to read the result back, by which point the local variable is long
+// gone. This struct is what stands in for it across that gap.
+//
+// Keyed by job rather than by recovery set: a job serves one recovery set
+// through this gate at a time (see [`Pipeline::direct_sets_repaired_in_place`]),
+// so one carry is all a job ever needs, and `recovery_set_id` is kept
+// alongside it so a consumer can tell a fresh carry from a stale one instead
+// of trusting the map key alone.
 pub(super) struct DirectPostRepairCarry {
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
     pub(super) pre_repair: par2_rs::VerificationResult,
@@ -1484,34 +1520,34 @@ pub(super) struct DirectPostRepairCarry {
 #[derive(Default)]
 pub(super) struct Par2RuntimeState {
     pub(super) scan_budget: Option<Arc<std::sync::Mutex<repair::par2::Par2ScanBudget>>>,
-    /// Every recovery set this job has met. Each parsed, described entry gets
-    /// its own completion-gate pass; entries without an index remain only for
-    /// attribution and an operator warning.
+    // Every recovery set this job has met. Each parsed, described entry gets
+    // its own completion-gate pass; entries without an index remain only for
+    // attribution and an operator warning.
     pub(super) sets: HashMap<par2_rs::RecoverySetId, Par2SetRuntime>,
-    /// The set currently exposed through the compatibility helpers while its
-    /// own gate pass is running.
+    // The set currently exposed through the compatibility helpers while its
+    // own gate pass is running.
     pub(super) served: Option<par2_rs::RecoverySetId>,
     pub(super) files: HashMap<u32, Par2FileRuntime>,
-    /// Completion-time checksums retained only long enough to seed a session
-    /// opened after a payload file finished downloading.
+    // Completion-time checksums retained only long enough to seed a session
+    // opened after a payload file finished downloading.
     pub(super) completed_checksums: HashMap<NzbFileId, CompletedFileChecksum>,
-    /// Positive bindings only: an absent entry keeps streaming MD5 without
-    /// retrying a recovery-set scan for every decoded article.
+    // Positive bindings only: an absent entry keeps streaming MD5 without
+    // retrying a recovery-set scan for every decoded article.
     pub(super) md5_substitution_bindings: HashMap<NzbFileId, Par2Md5SubstitutionBinding>,
-    /// Monotonic parsed-grid admission and its immutable lease snapshot.
-    /// Rebuilt only when parsed metadata changes, never while leasing work.
+    // Monotonic parsed-grid admission and its immutable lease snapshot.
+    // Rebuilt only when parsed metadata changes, never while leasing work.
     pub(super) admitted_checkpoint_sizes: BTreeSet<u64>,
     pub(super) checkpoint_plan: Option<weaver_yenc::CheckpointPlan>,
-    /// Monotonic lease gate: every declared explicit index is parsed or
-    /// exhausted. Indexless discovery remains completion-bounded.
+    // Monotonic lease gate: every declared explicit index is parsed or
+    // exhausted. Indexless discovery remains completion-bounded.
     pub(super) explicit_index_bootstrap_closed: bool,
-    /// Whether the job has already named its indexless recovery sets. Cleared
-    /// whenever a set is newly met so a changed picture is reported once.
+    // Whether the job has already named its indexless recovery sets. Cleared
+    // whenever a set is newly met so a changed picture is reported once.
     pub(super) unserved_sets_warned: bool,
-    /// Whether the job has already reported that every PAR2 metadata candidate
-    /// it could promote is finished. The completion gate asks for metadata on
-    /// every entry, and the answer stops changing once the last candidate has
-    /// settled, so the operator hears it once rather than on every lap.
+    // Whether the job has already reported that every PAR2 metadata candidate
+    // it could promote is finished. The completion gate asks for metadata on
+    // every entry, and the answer stops changing once the last candidate has
+    // settled, so the operator hears it once rather than on every lap.
     pub(super) metadata_exhausted_warned: bool,
 }
 
@@ -1546,8 +1582,8 @@ impl Par2RuntimeState {
         self.sets.entry(set_id).or_default()
     }
 
-    /// Returns recovery set IDs in the deterministic order later per-set
-    /// iteration relies on.
+    // Returns recovery set IDs in the deterministic order later per-set
+    // iteration relies on.
     pub(super) fn ordered_set_ids(&self) -> Vec<par2_rs::RecoverySetId> {
         let mut set_ids = self.sets.keys().copied().collect::<Vec<_>>();
         set_ids.sort_by_key(|set_id| {
@@ -1564,14 +1600,14 @@ impl Par2RuntimeState {
 }
 
 pub(super) enum ExtractionDone {
-    /// Batch extraction of specific members completed.
+    // Batch extraction of specific members completed.
     Batch {
         job_id: JobId,
         set_name: String,
         attempted: Vec<String>,
         result: Result<BatchExtractionOutcome, String>,
     },
-    /// Full set extraction completed (all volumes present).
+    // Full set extraction completed (all volumes present).
     FullSet {
         job_id: JobId,
         set_name: String,
@@ -1582,12 +1618,12 @@ pub(super) enum ExtractionDone {
 #[derive(Debug)]
 pub(super) struct MoveToCompleteResult {
     pub(super) moved_entries: u32,
-    /// Delivered files the deobfuscation pass renamed on the way out.
+    // Delivered files the deobfuscation pass renamed on the way out.
     pub(super) renamed_members: u32,
 }
 
-/// A final-move refusal that must never enter terminal post-processing versus
-/// an ordinary move failure, whose legacy script handling remains intact.
+// A final-move refusal that must never enter terminal post-processing versus
+// an ordinary move failure, whose legacy script handling remains intact.
 #[derive(Debug)]
 pub(super) enum MoveToCompleteFailure {
     Security(String),
@@ -1609,6 +1645,10 @@ pub(super) struct MoveToCompleteDone {
 }
 
 pub(super) enum TerminalPostProcessingEvent {
+    HistoryDeleteDone(orchestrator::HistoryDeleteDone),
+    QueueAdmitted(JobId),
+    QueueDone(JobId, Result<(), crate::StateError>),
+    AddedScriptsDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),
 }
@@ -1622,28 +1662,28 @@ pub(super) struct TerminalPostProcessingDone {
     >,
 }
 
-/// Map a yEnc CRC outcome onto the pipeline's `crc_valid` flag.
-///
-/// `crc_valid` here means "not known bad", which is what the CRC-error metric
-/// and the segment event are counting. An article whose `=yend` carried no
-/// usable `crc32=`/`pcrc32=` is *unverifiable*, not corrupt, and must not be
-/// reported as a CRC failure — use [`weaver_yenc::CrcVerification::Verified`]
-/// directly wherever real verification is the question.
+// Map a yEnc CRC outcome onto the pipeline's `crc_valid` flag.
+//
+// `crc_valid` here means "not known bad", which is what the CRC-error metric
+// and the segment event are counting. An article whose `=yend` carried no
+// usable `crc32=`/`pcrc32=` is *unverifiable*, not corrupt, and must not be
+// reported as a CRC failure — use [`weaver_yenc::CrcVerification::Verified`]
+// directly wherever real verification is the question.
 pub(super) fn crc_not_mismatched(status: weaver_yenc::CrcVerification) -> bool {
     status != weaver_yenc::CrcVerification::Mismatch
 }
 
-/// Whether an article that could not be checked also carries evidence that its
-/// body was cut short.
-///
-/// An unverifiable article is ordinarily accepted: absent a checksum there is
-/// nothing to fail it on. But a missing `=yend` — or a length the headers
-/// themselves disagree about — is evidence the response ended early, and
-/// silently accepting those bytes writes a hole into the file that no later
-/// stage can see. Such an article is worth asking another server for.
-///
-/// A verified checksum always wins: it proves the bytes whatever the size
-/// fields say. A mismatch keeps its own handling.
+// Whether an article that could not be checked also carries evidence that its
+// body was cut short.
+//
+// An unverifiable article is ordinarily accepted: absent a checksum there is
+// nothing to fail it on. But a missing `=yend` — or a length the headers
+// themselves disagree about — is evidence the response ended early, and
+// silently accepting those bytes writes a hole into the file that no later
+// stage can see. Such an article is worth asking another server for.
+//
+// A verified checksum always wins: it proves the bytes whatever the size
+// fields say. A mismatch keeps its own handling.
 pub(super) fn yenc_truncation_suspected(result: &weaver_yenc::DecodeResult) -> bool {
     if result.crc_status != weaver_yenc::CrcVerification::Unverified {
         return false;
@@ -1666,34 +1706,34 @@ pub(super) fn yenc_truncation_suspected(result: &weaver_yenc::DecodeResult) -> b
         || (!result.has_trailer && !length_confirmed)
 }
 
-/// How a segment was encoded on the wire, and therefore what evidence it
-/// carries into the pipeline.
-///
-/// This is not cosmetic. A yEnc article declares where its bytes belong and
-/// what they check to, and the whole zero-I/O verification story is built on
-/// that. A uuencode article declares neither, so several stages that are
-/// correct for yEnc are unsound for uuencode and gate on this.
+// How a segment was encoded on the wire, and therefore what evidence it
+// carries into the pipeline.
+//
+// This is not cosmetic. A yEnc article declares where its bytes belong and
+// what they check to, and the whole zero-I/O verification story is built on
+// that. A uuencode article declares neither, so several stages that are
+// correct for yEnc are unsound for uuencode and gate on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SegmentEncoding {
-    /// yEnc: per-part offsets and CRC, block-aligned CRC segments.
+    // yEnc: per-part offsets and CRC, block-aligned CRC segments.
     Yenc,
-    /// uuencode: decoded bytes and a segment index, nothing more.
+    // uuencode: decoded bytes and a segment index, nothing more.
     Uu(UuSegmentFacts),
 }
 
-/// The only things a uuencode article establishes beyond its bytes.
+// The only things a uuencode article establishes beyond its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct UuSegmentFacts {
-    /// A line in this part failed to decode. Its bytes are kept regardless —
-    /// PAR2 adjudicates, not the decoder — but the file is no longer clean.
+    // A line in this part failed to decode. Its bytes are kept regardless —
+    // PAR2 adjudicates, not the decoder — but the file is no longer clean.
     pub(super) damaged: bool,
-    /// This part carried the uuencode `end` marker, so it ends the file.
+    // This part carried the uuencode `end` marker, so it ends the file.
     pub(super) ended: bool,
 }
 
 impl SegmentEncoding {
-    /// uuencode segments cannot be placed from the article itself, so they are
-    /// assembled sequentially rather than by declared offset.
+    // uuencode segments cannot be placed from the article itself, so they are
+    // assembled sequentially rather than by declared offset.
     pub(super) fn is_uu(self) -> bool {
         matches!(self, Self::Uu(_))
     }
@@ -1706,11 +1746,11 @@ impl SegmentEncoding {
     }
 }
 
-/// Storage for a uuencode part waiting for its prefix.
-///
-/// Disk-backed entries retain their trusted decoded length alongside the
-/// temporary path. The spool file's metadata is never used for allocation or
-/// validation when the part is released.
+// Storage for a uuencode part waiting for its prefix.
+//
+// Disk-backed entries retain their trusted decoded length alongside the
+// temporary path. The spool file's metadata is never used for allocation or
+// validation when the part is released.
 enum UuParkedEntry {
     Memory(DecodedChunk),
     Spilled {
@@ -1732,8 +1772,8 @@ impl UuParkedEntry {
     }
 }
 
-/// Remove every stale child of the transient UU spool root without following
-/// links outside it. UU assembly checkpoints are not restored after restart.
+// Remove every stale child of the transient UU spool root without following
+// links outside it. UU assembly checkpoints are not restored after restart.
 pub(super) fn clear_stale_uu_park_root(root: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -1763,10 +1803,10 @@ pub(super) fn clear_stale_uu_park_root(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Remove a job's spool directory once its final transient file is gone.
-///
-/// An occupied directory belongs to another still-parked part, and a missing
-/// one means a prior cleanup already won the race; neither is an error.
+// Remove a job's spool directory once its final transient file is gone.
+//
+// An occupied directory belongs to another still-parked part, and a missing
+// one means a prior cleanup already won the race; neither is an error.
 pub(super) fn remove_empty_uu_park_dir(root: &Path, job_id: JobId) {
     let path = root.join(job_id.0.to_string());
     if let Err(error) = std::fs::remove_dir(&path)
@@ -1782,53 +1822,53 @@ pub(super) fn remove_empty_uu_park_dir(root: &Path, job_id: JobId) {
     }
 }
 
-/// Sequential-assembly state for one uuencode file.
-///
-/// A uuencode part's position is the cumulative *decoded* length of every part
-/// before it, which is only knowable once that whole prefix has arrived. So
-/// assembly is strictly sequential: a part that arrives early has to wait, and
-/// it has to wait until its prefix provides an offset.
-/// That is the structural difference from yEnc, whose out-of-order parts can be
-/// persisted immediately at the offset their own header declares.
+// Sequential-assembly state for one uuencode file.
+//
+// A uuencode part's position is the cumulative *decoded* length of every part
+// before it, which is only knowable once that whole prefix has arrived. So
+// assembly is strictly sequential: a part that arrives early has to wait, and
+// it has to wait until its prefix provides an offset.
+// That is the structural difference from yEnc, whose out-of-order parts can be
+// persisted immediately at the offset their own header declares.
 #[derive(Default)]
 pub(super) struct UuFileAssembly {
-    /// The next segment ordinal the cursor will place.
+    // The next segment ordinal the cursor will place.
     pub(super) next_index: u32,
-    /// The decoded byte offset that ordinal will be placed at.
+    // The decoded byte offset that ordinal will be placed at.
     pub(super) next_offset: u64,
-    /// Parts that arrived ahead of the cursor, keyed by ordinal.
-    ///
-    /// Bounded by the same per-file limit the write reorder buffer uses; see
-    /// the admission check at the placement seam for what happens on overflow.
+    // Parts that arrived ahead of the cursor, keyed by ordinal.
+    //
+    // Bounded by the same per-file limit the write reorder buffer uses; see
+    // the admission check at the placement seam for what happens on overflow.
     parked: BTreeMap<u32, UuParkedEntry>,
-    /// A part decoded with damage, or a gap was closed by shifting later parts
-    /// down over a part that never arrived.
+    // A part decoded with damage, or a gap was closed by shifting later parts
+    // down over a part that never arrived.
     pub(super) damaged: bool,
-    /// The uuencode `end` marker was seen on some part.
+    // The uuencode `end` marker was seen on some part.
     pub(super) saw_end: bool,
-    /// The name from the uuencode `begin` header, from whichever part carried
-    /// it. First non-empty wins.
-    ///
-    /// yEnc repeats `name=` on every article, so the article that completes a
-    /// file always carries the name to the identity seam. uuencode states it
-    /// once, on the part that opens the body — which is normally the first
-    /// part, and is emphatically not the last. Both reference decoders apply
-    /// the name whichever part it arrives on, so it is retained here rather
-    /// than read off the completing article.
+    // The name from the uuencode `begin` header, from whichever part carried
+    // it. First non-empty wins.
+    //
+    // yEnc repeats `name=` on every article, so the article that completes a
+    // file always carries the name to the identity seam. uuencode states it
+    // once, on the part that opens the body — which is normally the first
+    // part, and is emphatically not the last. Both reference decoders apply
+    // the name whichever part it arrives on, so it is retained here rather
+    // than read off the completing article.
     pub(super) filename: Option<String>,
-    /// The file completed and this entry is a tombstone: `parked` has been
-    /// released and the completion warning has already been issued.
-    ///
-    /// The entry outlives completion on purpose. It is what
-    /// [`Pipeline::note_file_progress_floor`] reads to keep a restart
-    /// checkpoint from ever being written for a uuencode file, and that
-    /// suppression has to hold for the final write of the file as much as for
-    /// every write before it.
+    // The file completed and this entry is a tombstone: `parked` has been
+    // released and the completion warning has already been issued.
+    //
+    // The entry outlives completion on purpose. It is what
+    // [`Pipeline::note_file_progress_floor`] reads to keep a restart
+    // checkpoint from ever being written for a uuencode file, and that
+    // suppression has to hold for the final write of the file as much as for
+    // every write before it.
     pub(super) finished: bool,
 }
 
 impl UuFileAssembly {
-    /// Resident bytes held for parts waiting on their prefix.
+    // Resident bytes held for parts waiting on their prefix.
     pub(super) fn parked_memory_bytes(&self) -> usize {
         self.parked
             .values()
@@ -1837,7 +1877,7 @@ impl UuFileAssembly {
             .sum()
     }
 
-    /// Disk-backed bytes held for parts waiting on their prefix.
+    // Disk-backed bytes held for parts waiting on their prefix.
     pub(super) fn parked_spooled_bytes(&self) -> usize {
         self.parked
             .values()
@@ -1854,41 +1894,41 @@ impl UuFileAssembly {
     }
 }
 
-/// The window a PAR2 file description's `hash_16k` covers.
-///
-/// SPEC TRAP, and it is the whole reason this constant is a `min` rather than a
-/// length: a description shorter than this hashes its **whole file**, with no
-/// zero padding to 16 KiB. par2-rs writes it that way
-/// (`&file_data[..file_data.len().min(16384)]`), so a matcher that padded — or
-/// that skipped short descriptions — would silently refuse to bind exactly the
-/// small files an obfuscated set is most likely to open with.
+// The window a PAR2 file description's `hash_16k` covers.
+//
+// SPEC TRAP, and it is the whole reason this constant is a `min` rather than a
+// length: a description shorter than this hashes its **whole file**, with no
+// zero padding to 16 KiB. par2-rs writes it that way
+// (`&file_data[..file_data.len().min(16384)]`), so a matcher that padded — or
+// that skipped short descriptions — would silently refuse to bind exactly the
+// small files an obfuscated set is most likely to open with.
 pub(super) const PAR2_HASH_16K_BYTES: usize = 16 * 1024;
 
-/// Result of a decode task.
+// Result of a decode task.
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
     pub(super) raw_size: u64,
-    /// How the article was encoded. Everything below that reads like a
-    /// declared placement or a checksum is meaningful only for
-    /// [`SegmentEncoding::Yenc`].
+    // How the article was encoded. Everything below that reads like a
+    // declared placement or a checksum is meaningful only for
+    // [`SegmentEncoding::Yenc`].
     pub(super) encoding: SegmentEncoding,
     pub(super) yenc_layout: YencLayoutAssertions,
     pub(super) crc_valid: bool,
-    /// Evidence the body was cut short, with no checksum to say so. Such an
-    /// article is written but never counted as coverage: another server is
-    /// asked for it first. See [`yenc_truncation_suspected`].
+    // Evidence the body was cut short, with no checksum to say so. Such an
+    // article is written but never counted as coverage: another server is
+    // asked for it first. See [`yenc_truncation_suspected`].
     pub(super) truncation_suspected: bool,
     pub(super) part_crc_verified: bool,
     pub(super) part_crc: u32,
     pub(super) expected_file_crc: Option<u32>,
     pub(super) data: DecodedChunk,
-    /// Original filename from the yEnc header (for swap detection observability).
+    // Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
-    /// Geometry actually applied by the decoder for this response.
+    // Geometry actually applied by the decoder for this response.
     pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
-    /// The decode pass's CRC32 segments, cut at PAR2 block boundaries when the
-    /// recovery set's block size was known to the decoder. [`Self::part_crc`] is
-    /// their fold, so they add evidence without changing any verdict.
+    // The decode pass's CRC32 segments, cut at PAR2 block boundaries when the
+    // recovery set's block size was known to the decoder. [`Self::part_crc`] is
+    // their fold, so they add evidence without changing any verdict.
     pub(super) segments: Vec<weaver_yenc::Segment>,
 }
 
@@ -1901,10 +1941,10 @@ pub(super) struct YencLayoutAssertions {
     pub(super) end: Option<u64>,
 }
 
-/// Whether a filename is a numeric split fragment of the described filename.
-///
-/// A fragment begins with the complete described name, so its first 16 KiB can
-/// match the joined file even though the fragment cannot stand in for it.
+// Whether a filename is a numeric split fragment of the described filename.
+//
+// A fragment begins with the complete described name, so its first 16 KiB can
+// match the joined file even though the fragment cannot stand in for it.
 pub(in crate::pipeline) fn is_split_fragment_of(
     candidate_name: &str,
     described_name: &str,
@@ -1931,8 +1971,8 @@ pub(super) struct FileCrcRecoveryState {
     pub(super) last_actual_crc: u32,
 }
 
-/// Completion of a decode task, including explicit failures so backlog
-/// accounting is always drained.
+// Completion of a decode task, including explicit failures so backlog
+// accounting is always drained.
 pub(super) enum DecodeDone {
     Success {
         result: DecodeResult,
@@ -2093,15 +2133,12 @@ impl Default for CompletedFileChecksumState {
 
 pub(super) enum DecodedChunk {
     Contiguous(Bytes),
-    Batches {
-        chunks: Vec<Bytes>,
-        len: usize,
-    },
+    Batches { chunks: Vec<Bytes>, len: usize },
     Shared(Arc<download::repeated::SharedArticle>),
-    /// Decoded straight into a pool slot and carried to the writer as-is, so
-    /// the article never needs a second heap allocation for its decoded
-    /// bytes. Dropping it returns the slot to the pool instead of freeing on
-    /// whichever thread finished with it.
+    // Decoded straight into a pool slot and carried to the writer as-is, so
+    // the article never needs a second heap allocation for its decoded
+    // bytes. Dropping it returns the slot to the pool instead of freeing on
+    // whichever thread finished with it.
     Pooled(BufferHandle),
 }
 
@@ -2148,14 +2185,14 @@ impl DecodedChunk {
         }
     }
 
-    /// This chunk's payload as refcounted views of the decoder's own buffers,
-    /// in order. No byte is copied: every piece either shares the decoded
-    /// allocation or borrows the pool slot, which stays out of the pool until
-    /// the last view drops.
-    ///
-    /// The direct-store router keeps these for the life of a hold, so the
-    /// article's buffer is the only copy of its bytes anywhere between the
-    /// decode and the write syscall.
+    // This chunk's payload as refcounted views of the decoder's own buffers,
+    // in order. No byte is copied: every piece either shares the decoded
+    // allocation or borrows the pool slot, which stays out of the pool until
+    // the last view drops.
+    //
+    // The direct-store router keeps these for the life of a hold, so the
+    // article's buffer is the only copy of its bytes anywhere between the
+    // decode and the write syscall.
     pub(super) fn pieces(&self) -> Vec<Bytes> {
         let mut out = Vec::new();
         self.push_pieces(&mut out);
@@ -2184,8 +2221,8 @@ impl DecodedChunk {
         }
     }
 
-    /// Appends this chunk's slices, in order, for a vectored write that
-    /// covers several contiguous chunks with one syscall.
+    // Appends this chunk's slices, in order, for a vectored write that
+    // covers several contiguous chunks with one syscall.
     pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
         match self {
             Self::Contiguous(bytes) => out.push(std::io::IoSlice::new(bytes)),
@@ -2199,10 +2236,10 @@ impl DecodedChunk {
 }
 
 impl Pipeline {
-    /// Publishes one per-article event on the segment stream rather than the
-    /// job-level broadcast, so the always-on job-level subscribers are not
-    /// woken several times per article to discard it. The event is built only
-    /// when someone is listening.
+    // Publishes one per-article event on the segment stream rather than the
+    // job-level broadcast, so the always-on job-level subscribers are not
+    // woken several times per article to discard it. The event is built only
+    // when someone is listening.
     pub(crate) fn send_segment_event(&self, event: impl FnOnce() -> PipelineEvent) {
         self.shared_state.publish_segment_event(event);
     }
@@ -2237,41 +2274,41 @@ impl From<Vec<Box<[u8]>>> for DecodedChunk {
 pub(super) struct RetainedArticleDamage {
     pub(super) source: SegmentSource,
     pub(super) status: weaver_yenc::CrcVerification,
-    /// Retained because the body looks cut short rather than because a
-    /// checksum failed. The two want different words in the log.
+    // Retained because the body looks cut short rather than because a
+    // checksum failed. The two want different words in the log.
     pub(super) truncation_suspected: bool,
-    /// The end the article's own header declared for its range, when it
-    /// declared a usable one. Carried so the record survives a demotion reset
-    /// that re-notes this damage at the durable handoff.
+    // The end the article's own header declared for its range, when it
+    // declared a usable one. Carried so the record survives a demotion reset
+    // that re-notes this damage at the durable handoff.
     pub(super) declared_end: Option<u64>,
-    /// Payload-relative spans, resolved against live ownership at disk handoff.
+    // Payload-relative spans, resolved against live ownership at disk handoff.
     pub(super) write_spans: Vec<std::ops::Range<usize>>,
 }
 
 pub(super) struct BufferedDecodedSegment {
     pub(super) segment_id: SegmentId,
-    /// Unresolved damage is written before retrying. Retain the actual CRC
-    /// status so a missing checksum is never reported as a mismatch.
+    // Unresolved damage is written before retrying. Retain the actual CRC
+    // status so a missing checksum is never reported as a mismatch.
     pub(super) damaged_source: Option<Box<RetainedArticleDamage>>,
     pub(super) decoded_size: u32,
-    /// Carried from the decoder so the durability seam can tell whether this
-    /// segment is allowed to feed the dual-CRC grid.
+    // Carried from the decoder so the durability seam can tell whether this
+    // segment is allowed to feed the dual-CRC grid.
     pub(super) encoding: SegmentEncoding,
-    /// Immutable geometry snapshot captured before this article was decoded.
-    /// Durable commit must never reinterpret its segments against grids that
-    /// were admitted only after the response was already in flight.
+    // Immutable geometry snapshot captured before this article was decoded.
+    // Durable commit must never reinterpret its segments against grids that
+    // were admitted only after the response was already in flight.
     pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
     pub(super) data: DecodedChunk,
     pub(super) part_crc: u32,
     pub(super) part_crc_verified: bool,
-    /// The whole-file length this article's yEnc header declares. Carried so
-    /// a segment parked in the write buffer still states its file's length
-    /// when it is replayed later, which is the only thing a byte-split
-    /// container needs before it can place anything.
+    // The whole-file length this article's yEnc header declares. Carried so
+    // a segment parked in the write buffer still states its file's length
+    // when it is replayed later, which is the only thing a byte-split
+    // container needs before it can place anything.
     pub(super) declared_file_len: u64,
     pub(super) yenc_name: String,
-    /// Block-aligned CRC32 segments carried from the decoder to the evidence
-    /// collector, which runs after the bytes are durable.
+    // Block-aligned CRC32 segments carried from the decoder to the evidence
+    // collector, which runs after the bytes are durable.
     pub(super) segments: Vec<weaver_yenc::Segment>,
 }
 
@@ -2348,184 +2385,189 @@ impl DeferredFileHashChunk {
     }
 }
 
-/// The one way a segment can stop being outstanding without arriving.
-///
-/// A segment reaches exactly one of these, exactly once, and the job's
-/// `failed_bytes` is the sum of the *declared* sizes of the segments that hold
-/// one. Delivery is the fourth terminal state and is recorded where it already
-/// was — the assembly bitmap — so a delivered segment never appears here at
-/// all.
-///
-/// The distinction between the variants is diagnostic; every one of them
-/// contributes the same declared bytes. What matters is that there is one
-/// place a segment can acquire a state and no place at all where bytes are
-/// added without one.
+// The one way a segment can stop being outstanding without arriving.
+//
+// A segment reaches exactly one of these, exactly once, and the job's
+// `failed_bytes` is the sum of the *declared* sizes of the segments that hold
+// one. Delivery is the fourth terminal state and is recorded where it already
+// was — the assembly bitmap — so a delivered segment never appears here at
+// all.
+//
+// The distinction between the variants is diagnostic; every one of them
+// contributes the same declared bytes. What matters is that there is one
+// place a segment can acquire a state and no place at all where bytes are
+// added without one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) enum SegmentTerminalState {
-    /// Every configured server refused the article.
+    // Every configured server refused the article.
     Missing,
-    /// The download retry budget ran out without a usable body.
+    // The download retry budget ran out without a usable body.
     RetriesExhausted,
-    /// Bodies arrived but no attempt decoded into the declared placement.
+    // Bodies arrived but no attempt decoded into the declared placement.
     DecodeExhausted,
 }
 
-/// What the settlement concluded a delivered job actually delivered.
-///
-/// Built once, from the claim census, at the last gate before the payload
-/// leaves the working directory — while every settlement fact that decided the
-/// job is still in hand. The terminal record is written from this rather than
-/// from the live wire counters, which know only what the download layer saw and
-/// nothing about what repair, verification or a discard did with it afterwards.
+// What the settlement concluded a delivered job actually delivered.
+//
+// Built once, from the claim census, at the last gate before the payload
+// leaves the working directory — while every settlement fact that decided the
+// job is still in hand. The terminal record is written from this rather than
+// from the live wire counters, which know only what the download layer saw and
+// nothing about what repair, verification or a discard did with it afterwards.
 #[derive(Debug, Clone, Default)]
 pub(in crate::pipeline) struct TerminalReconciliation {
-    /// Declared bytes of the delivered files that really are short.
+    // Declared bytes of the delivered files that really are short.
     pub(in crate::pipeline) failed_bytes: u64,
-    /// Health over the delivered files alone, 0-1000.
+    // Health over the delivered files alone, 0-1000.
     pub(in crate::pipeline) health: u32,
-    /// Files that left the accounting, and why.
+    // Files that left the accounting, and why.
     pub(in crate::pipeline) discards: Vec<crate::jobs::model::TerminalDiscard>,
 }
 
-/// The pipeline engine. Owns the scheduler loop and drives work through
-/// download → decode → commit → verify → repair → extract stages.
+// The pipeline engine. Owns the scheduler loop and drives work through
+// download → decode → commit → verify → repair → extract stages.
 pub struct Pipeline {
-    /// Receives commands from SchedulerHandle.
+    // Receives commands from SchedulerHandle.
     pub(super) cmd_rx: mpsc::Receiver<SchedulerCommand>,
-    /// Broadcasts pipeline events to subscribers (API, journal, etc).
+    // Broadcasts pipeline events to subscribers (API, journal, etc).
     pub(super) event_tx: broadcast::Sender<PipelineEvent>,
-    /// NNTP client for fetching articles.
+    // NNTP client for fetching articles.
     pub(super) nntp: Arc<NntpClient>,
-    /// Buffer pool used as decode scratch space only.
+    // Buffer pool used as decode scratch space only.
     pub(super) buffers: Arc<BufferPool>,
-    /// Runtime tuner for adaptive concurrency.
+    // Runtime tuner for adaptive concurrency.
     pub(super) tuner: RuntimeTuner,
-    /// The operator's hardware profile, or the recommendation standing in
-    /// for one never chosen. In force whenever no schedule rule is.
+    // The operator's hardware profile, or the recommendation standing in
+    // for one never chosen. In force whenever no schedule rule is.
     pub(super) configured_hardware_profile: crate::runtime::HardwareProfile,
-    /// The profile the schedule has in force over the operator's choice, as
-    /// the schedule asked for it. It governs only while this machine can
-    /// honour it.
+    // The profile the schedule has in force over the operator's choice, as
+    // the schedule asked for it. It governs only while this machine can
+    // honour it.
     pub(super) scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
-    /// Shared atomic metrics.
+    // Shared atomic metrics.
     pub(super) metrics: Arc<PipelineMetrics>,
-    /// Per-job state.
+    // Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
-    /// Typed terminal provenance retained until the ordered history archive has
-    /// durably updated duplicate-promotion eligibility.
+    // Typed terminal provenance retained until the ordered history archive has
+    // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
-    /// Winning archive password candidate per job/RAR set, kept process-local and redacted.
+    // Winning archive password candidate per job/RAR set, kept process-local and redacted.
     pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
-    /// Job dispatch order (FIFO by submission). First Downloading job is active.
+    // Job dispatch order (FIFO by submission). First Downloading job is active.
     pub(super) job_order: Vec<JobId>,
-    /// Number of in-flight article downloads (primary + recovery).
+    // Number of in-flight article downloads (primary + recovery).
     pub(super) active_downloads: usize,
-    /// Number of NNTP connection tasks currently fetching articles.
+    // Number of NNTP connection tasks currently fetching articles.
     pub(super) active_download_connections: usize,
-    /// Active connection lanes carrying completion-critical PAR2 work.
+    // Active connection lanes carrying completion-critical PAR2 work.
     pub(super) active_completion_critical_connections: usize,
-    /// Number of in-flight recovery downloads (subset of active_downloads).
+    // Number of in-flight recovery downloads (subset of active_downloads).
     pub(super) active_recovery: usize,
-    /// Runtime-only per-server BODY depth explorers. Seeded from the persisted
-    /// depth on first observation; the measurements themselves never persist.
+    // Runtime-only per-server BODY depth explorers. Seeded from the persisted
+    // depth on first observation; the measurements themselves never persist.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
-    /// Refill requests the scheduler had nothing for yet, waiting for the
-    /// next wake or for their hold to run out.
+    // Refill requests the scheduler had nothing for yet, waiting for the
+    // next wake or for their hold to run out.
     pub(super) held_download_refills: Vec<HeldDownloadRefill>,
-    /// A lane parked and its connection slot came back; the run loop owes a
-    /// dispatch pass.
-    ///
-    /// The loop turns once per pipeline event and dispatches at the top of the
-    /// turn, so a park observed part-way through a turn used to wait out the
-    /// rest of it — up to `DOWNLOAD_RESULTS_PER_TURN` awaited result ingests,
-    /// which measured as a median 340 ms and a worst case of 2.3 s before the
-    /// freed connection was handed back out. Setting this makes the park
-    /// itself the wake, with no timer to poll.
+    // A lane parked and its connection slot came back; the run loop owes a
+    // dispatch pass.
+    //
+    // The loop turns once per pipeline event and dispatches at the top of the
+    // turn, so a park observed part-way through a turn used to wait out the
+    // rest of it — up to `DOWNLOAD_RESULTS_PER_TURN` awaited result ingests,
+    // which measured as a median 340 ms and a worst case of 2.3 s before the
+    // freed connection was handed back out. Setting this makes the park
+    // itself the wake, with no timer to poll.
     pub(super) download_dispatch_wake: bool,
-    /// A `RebuildNntp` has activated a new pool whose predecessor still holds
-    /// sockets at the provider. Fresh dials wait until the old generation has
-    /// drained: the provider counts both generations against one allowance,
-    /// so a dial now would be refused as over the limit and park the new pool
-    /// — a healthy server — for the whole holdoff window.
+    // A `RebuildNntp` has activated a new pool whose predecessor still holds
+    // sockets at the provider. Fresh dials wait until the old generation has
+    // drained: the provider counts both generations against one allowance,
+    // so a dial now would be refused as over the limit and park the new pool
+    // — a healthy server — for the whole holdoff window.
     pub(super) nntp_handoff_draining: bool,
-    /// Jobs currently inside an active article download pass.
+    // Jobs currently inside an active article download pass.
     pub(super) active_download_passes: HashSet<JobId>,
-    /// Jobs that still have decode/write pipeline work after network downloads finished.
+    // Jobs that still have decode/write pipeline work after network downloads finished.
     pub(super) jobs_finalizing_download: HashSet<JobId>,
-    /// Released download results waiting to be committed into decode/write state.
+    // Released download results waiting to be committed into decode/write state.
     pub(super) pending_released_download_results_by_job: HashMap<JobId, usize>,
-    /// Estimated decoded/raw bytes held by released results that are not committed yet.
+    // Estimated decoded/raw bytes held by released results that are not committed yet.
     pub(super) pending_released_download_result_bytes_by_job: HashMap<JobId, u64>,
-    /// In-flight article download count per job.
+    // In-flight article download count per job.
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
-    /// In-flight NNTP connection task count per job.
+    // In-flight NNTP connection task count per job.
     pub(super) active_download_connections_by_job: HashMap<JobId, usize>,
-    /// Completion-critical connection lanes per job. Kept separately from
-    /// article counts because pipelined lanes can carry several articles.
+    // Completion-critical connection lanes per job. Kept separately from
+    // article counts because pipelined lanes can carry several articles.
     pub(super) active_completion_critical_connections_by_job: HashMap<JobId, usize>,
-    /// In-flight article download count per file.
+    // In-flight article download count per file.
     pub(super) active_downloads_by_file: HashMap<NzbFileId, usize>,
-    /// In-flight decode task count per job.
+    // In-flight decode task count per job.
     pub(super) active_decodes_by_job: HashMap<JobId, usize>,
-    /// In-flight decode task count per file.
+    // In-flight decode task count per file.
     pub(super) active_decodes_by_file: HashMap<NzbFileId, usize>,
-    /// Raw article bytes reserved until the actor consumes each decode result.
+    // Raw article bytes reserved until the actor consumes each decode result.
     pub(super) active_decode_bytes: HashMap<SegmentId, u64>,
-    /// Last time a job made observable progress in the download stage.
+    // Last time a job made observable progress in the download stage.
     pub(super) job_last_download_activity: HashMap<JobId, Instant>,
-    /// Delayed retry tasks that have been scheduled but not yet re-queued.
+    // Delayed retry tasks that have been scheduled but not yet re-queued.
     pub(super) pending_retries_by_job: HashMap<JobId, usize>,
-    /// Delayed retry tasks by exact segment.
+    // Delayed retry tasks by exact segment.
     pub(super) pending_retries_by_segment: HashMap<SegmentId, usize>,
-    /// Runs of established-transport failures by exact segment. Transport
-    /// faults keep the article retry budget, so an article that breaks every
-    /// connection it is fetched on would otherwise retry forever — and, as the
-    /// highest-priority work, be every recovery probe of its server.
+    // Runs of established-transport failures by exact segment. Transport
+    // faults keep the article retry budget, so an article that breaks every
+    // connection it is fetched on would otherwise retry forever — and, as the
+    // highest-priority work, be every recovery probe of its server.
     pub(super) transport_failure_streaks: HashMap<SegmentId, TransportFailureStreak>,
     pub(super) download_wait_by_job: HashMap<JobId, DownloadWaitStatus>,
-    /// The one terminal state each segment reached, and the only thing the
-    /// per-job failed-byte ledger is derived from.
+    // The one terminal state each segment reached, and the only thing the
+    // per-job failed-byte ledger is derived from.
     pub(in crate::pipeline) segment_terminal_states: HashMap<SegmentId, SegmentTerminalState>,
-    /// What the claim census concluded for a job on its way out, keyed until
-    /// the terminal record has been written from it.
+    // What the claim census concluded for a job on its way out, keyed until
+    // the terminal record has been written from it.
     pub(in crate::pipeline) terminal_reconciliations: HashMap<JobId, TerminalReconciliation>,
-    /// Files already counted into `weaver_files_missing_total`. A completion
-    /// check re-enters many times per job; this keeps the counter per-file
-    /// rather than per-check. Per-file, so the set is bounded by the job's
-    /// file count and never touched from a per-segment path.
+    // Files already counted into `weaver_files_missing_total`. A completion
+    // check re-enters many times per job; this keeps the counter per-file
+    // rather than per-check. Per-file, so the set is bounded by the job's
+    // file count and never touched from a per-segment path.
     pub(in crate::pipeline) files_counted_missing: HashSet<NzbFileId>,
-    /// Work parked specifically on per-server quota capacity or policy changes.
+    // Work parked specifically on per-server quota capacity or policy changes.
     pub(super) server_quota_parked: HashSet<SegmentId>,
-    /// Directory for active downloads (per-job subdirectories).
+    // The egress each piece of work in `server_quota_parked` waits on, when
+    // an egress download quota rather than a server quota parked it.
+    pub(super) egress_quota_parked: HashMap<SegmentId, u32>,
+    // Directory for active downloads (per-job subdirectories).
     pub(super) intermediate_dir: PathBuf,
-    /// Directory for completed downloads (category subdirectories).
+    // Directory for completed downloads (category subdirectories).
     pub(super) complete_dir: PathBuf,
-    /// Legacy logical NZB path base retained for compatibility with existing rows and tests.
+    // Legacy logical NZB path base retained for compatibility with existing rows and tests.
     pub(super) nzb_dir: PathBuf,
-    /// Per-file contiguous write floors awaiting persistence.
+    // Per-file contiguous write floors awaiting persistence.
     pub(super) pending_file_progress: HashMap<NzbFileId, u64>,
-    /// Jobs whose provider shares have moved since the last checkpoint.
+    // Jobs whose provider shares have moved since the last checkpoint.
     pub(super) dirty_server_attribution: HashSet<JobId>,
+    // Jobs whose support facts changed since the last checkpoint.
+    pub(super) dirty_support_facts: HashSet<JobId>,
     pub(super) server_attribution_checkpoint_at: Instant,
-    /// Last queued/persisted contiguous write floor per file.
+    // Last queued/persisted contiguous write floor per file.
     pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,
-    /// Streaming checksum state for files whose decoded bytes have been observed in order.
+    // Streaming checksum state for files whose decoded bytes have been observed in order.
     pub(super) file_hash_states: HashMap<NzbFileId, CompletedFileChecksumState>,
-    /// In-stream PAR2 block CRC32s assembled from the decode pass's segments.
-    /// See [`crate::pipeline::integrity`] for the verification policy.
+    // In-stream PAR2 block CRC32s assembled from the decode pass's segments.
+    // See [`crate::pipeline::integrity`] for the verification policy.
     pub(super) block_crcs: crate::pipeline::integrity::BlockCrcCollector,
-    /// Decoded bytes for out-of-order persisted ranges waiting to be replayed into the streaming checksum.
+    // Decoded bytes for out-of-order persisted ranges waiting to be replayed into the streaming checksum.
     pub(super) deferred_file_hash_data: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashChunk>>,
     pub(super) deferred_file_hash_data_bytes: usize,
-    /// Out-of-order persisted ranges waiting to be replayed into the streaming checksum.
+    // Out-of-order persisted ranges waiting to be replayed into the streaming checksum.
     pub(super) deferred_file_hash_ranges: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashRange>>,
-    /// Expected whole-file yEnc CRC32 values observed from multipart `=yend crc32`.
+    // Expected whole-file yEnc CRC32 values observed from multipart `=yend crc32`.
     pub(super) expected_file_crcs: HashMap<NzbFileId, u32>,
-    /// Files whose parts disagreed about the whole-file CRC32. Some posters
-    /// write a running value, or zeros, on every part but the last, so the
-    /// field proves nothing for those files and every later value is ignored.
+    // Files whose parts disagreed about the whole-file CRC32. Some posters
+    // write a running value, or zeros, on every part but the last, so the
+    // field proves nothing for those files and every later value is ignored.
     pub(super) untrusted_file_crcs: HashSet<NzbFileId>,
-    /// Files that need a one-time disk reread because out-of-order persistence broke the stream.
+    // Files that need a one-time disk reread because out-of-order persistence broke the stream.
     pub(super) file_hash_reread_required: HashSet<NzbFileId>,
     #[cfg(test)]
     pub(super) try_update_archive_topology_calls: usize,
@@ -2533,126 +2575,126 @@ pub struct Pipeline {
     pub(super) par2_lower_bound_preflight_calls: usize,
     #[cfg(test)]
     pub(super) par2_authoritative_verify_calls: usize,
-    /// Post-repair passes, which read only the files the repair rewrote.
-    /// Counted apart from the whole-set passes above so a test can still say
-    /// "no full verification happened here" now that every repair path ends
-    /// in a selective re-read of what it installed.
+    // Post-repair passes, which read only the files the repair rewrote.
+    // Counted apart from the whole-set passes above so a test can still say
+    // "no full verification happened here" now that every repair path ends
+    // in a selective re-read of what it installed.
     #[cfg(test)]
     pub(super) par2_selective_verify_calls: usize,
-    /// Passes that concluded from evidence already in hand, reading nothing.
-    /// The counters above can only say a whole-set read did *not* happen; this
-    /// is what lets a test say the quick pass is what answered instead.
+    // Passes that concluded from evidence already in hand, reading nothing.
+    // The counters above can only say a whole-set read did *not* happen; this
+    // is what lets a test say the quick pass is what answered instead.
     #[cfg(test)]
     pub(super) par2_quick_verify_calls: usize,
     #[cfg(test)]
     pub(super) par2_quick_partial_verify_calls: usize,
-    /// Repairer runs that were seeded with a stashed scan carry — a previous
-    /// pass's returned carry or a host-verification one.
+    // Repairer runs that were seeded with a stashed scan carry — a previous
+    // pass's returned carry or a host-verification one.
     #[cfg(test)]
     pub(super) par2_scan_carry_seeded_calls: usize,
-    /// Repairer runs whose returned scan carry was stashed for the next pass.
+    // Repairer runs whose returned scan carry was stashed for the next pass.
     #[cfg(test)]
     pub(super) par2_scan_carry_stashed_calls: usize,
-    /// Host-verification carries built from a damaged authoritative pass.
+    // Host-verification carries built from a damaged authoritative pass.
     #[cfg(test)]
     pub(super) par2_host_carry_builds: usize,
-    /// Forces the PAR2 ignore-extension list for a test, so the "override
-    /// disables it" case can be exercised without mutating a process-global
-    /// environment variable while other tests are running.
+    // Forces the PAR2 ignore-extension list for a test, so the "override
+    // disables it" case can be exercised without mutating a process-global
+    // environment variable while other tests are running.
     #[cfg(test)]
     pub(super) par2_ignore_extensions_override: Option<Vec<String>>,
-    /// Read-backs of a recovery volume that can no longer complete. The
-    /// one-shot latch is what keeps this off the gate's hot path, so a test can
-    /// pin it.
+    // Read-backs of a recovery volume that can no longer complete. The
+    // one-shot latch is what keeps this off the gate's hot path, so a test can
+    // pin it.
     #[cfg(test)]
     pub(super) par2_recovery_salvage_scans: usize,
-    /// Times a job announced that it carries recovery sets it does not serve.
-    /// The announcement is latched, so a test can pin that a gate entered many
-    /// times says it once.
+    // Times a job announced that it carries recovery sets it does not serve.
+    // The announcement is latched, so a test can pin that a gate entered many
+    // times says it once.
     #[cfg(test)]
     pub(super) par2_unserved_set_warnings: usize,
     #[cfg(test)]
     pub(super) par2_repairer_analyze_calls: usize,
     #[cfg(test)]
     pub(super) par2_repairer_execute_calls: usize,
-    /// Bytes each damaged-job authoritative analysis actually read, in order.
-    /// The shipped build reports this through the pass's own outcome log line
-    /// and a perf probe; a test needs it as a number it can bound.
+    // Bytes each damaged-job authoritative analysis actually read, in order.
+    // The shipped build reports this through the pass's own outcome log line
+    // and a perf probe; a test needs it as a number it can bound.
     #[cfg(test)]
     pub(super) par2_authoritative_bytes_read: Vec<u64>,
-    /// Retained PAR2 sessions this pipeline has opened. One session per set for
-    /// a whole verify/repair ladder is the point of retaining them at all, and
-    /// this is the only number that says whether a ladder actually got one.
+    // Retained PAR2 sessions this pipeline has opened. One session per set for
+    // a whole verify/repair ladder is the point of retaining them at all, and
+    // this is the only number that says whether a ladder actually got one.
     #[cfg(test)]
     pub(super) par2_session_opens: usize,
-    /// The largest `source_scan_passes` any retained session has reported.
-    /// Together with [`Self::par2_session_opens`] this bounds how many times a
-    /// ladder read its sources: one open reporting one pass is one read.
+    // The largest `source_scan_passes` any retained session has reported.
+    // Together with [`Self::par2_session_opens`] this bounds how many times a
+    // ladder read its sources: one open reporting one pass is one read.
     #[cfg(test)]
     pub(super) par2_session_source_scan_passes: u32,
-    /// Landed recovery volumes merged into a retained session rather than
-    /// rebuilding it, which is what keeps a parked analysis alive across the
-    /// wait for targeted recovery.
+    // Landed recovery volumes merged into a retained session rather than
+    // rebuilding it, which is what keeps a parked analysis alive across the
+    // wait for targeted recovery.
     #[cfg(test)]
     pub(super) par2_session_recovery_merges: usize,
-    /// Repairs that ran on a parked damaged-path verdict instead of analysing
-    /// the set again.
+    // Repairs that ran on a parked damaged-path verdict instead of analysing
+    // the set again.
     #[cfg(test)]
     pub(super) par2_repairs_from_parked_verdict: usize,
-    /// Forces the retained-session gate on or off for a test, so a
-    /// differential can run both arms without mutating a process-global
-    /// environment variable while other tests are running.
+    // Forces the retained-session gate on or off for a test, so a
+    // differential can run both arms without mutating a process-global
+    // environment variable while other tests are running.
     #[cfg(test)]
     pub(super) stateful_par2_session_forced: Option<bool>,
-    /// Times the retained session, rather than the read-and-verify pass,
-    /// produced a direct set's verdict. A differential needs this to tell
-    /// "the session agreed" from "the session refused and fell back".
+    // Times the retained session, rather than the read-and-verify pass,
+    // produced a direct set's verdict. A differential needs this to tell
+    // "the session agreed" from "the session refused and fell back".
     #[cfg(test)]
     pub(super) direct_session_pass_calls: usize,
-    /// `(files stood in for, files read)` for every direct read-and-verify
-    /// pass, in the order they ran. The whole point of feeding the grid from
-    /// the direct seam is that the second number shrinks, and only a per-pass
-    /// record can show it: a repair retires the job's block state and
-    /// re-verifies, so a cumulative count would blend a pass that stood in for
-    /// two volumes with a later one that could stand in for none.
+    // `(files stood in for, files read)` for every direct read-and-verify
+    // pass, in the order they ran. The whole point of feeding the grid from
+    // the direct seam is that the second number shrinks, and only a per-pass
+    // record can show it: a repair retires the job's block state and
+    // re-verifies, so a cumulative count would blend a pass that stood in for
+    // two volumes with a later one that could stand in for none.
     #[cfg(test)]
     pub(super) direct_verify_read_splits: Vec<(usize, usize)>,
-    /// `(files carried, files read)` for every post-repair PAR2 pass, in the
-    /// order they ran. Same shape and same purpose as
-    /// `direct_verify_read_splits`: the selective post-repair pass exists so the
-    /// second number is only what the repair rewrote, and only a per-pass record
-    /// can show that — a job can repair more than once.
+    // `(files carried, files read)` for every post-repair PAR2 pass, in the
+    // order they ran. Same shape and same purpose as
+    // `direct_verify_read_splits`: the selective post-repair pass exists so the
+    // second number is only what the repair rewrote, and only a per-pass record
+    // can show that — a job can repair more than once.
     #[cfg(test)]
     pub(super) par2_post_repair_read_splits: Vec<(usize, usize)>,
-    /// `(files composed from wire CRCs, files read from disk)` for every SFV
-    /// verification pass, in the order they ran. Same shape and same purpose as
-    /// the two above: the zero-I/O arm exists so the second number is only the
-    /// files the wire could not vouch for, and only a per-pass record can show
-    /// which arm actually answered.
+    // `(files composed from wire CRCs, files read from disk)` for every SFV
+    // verification pass, in the order they ran. Same shape and same purpose as
+    // the two above: the zero-I/O arm exists so the second number is only the
+    // files the wire could not vouch for, and only a per-pass record can show
+    // which arm actually answered.
     #[cfg(test)]
     pub(super) sfv_verify_read_splits: Vec<(usize, usize)>,
-    /// `(files claimed, files read)` for every quiet direct pass that ran
-    /// **after** a repair-while-direct, in order.
-    ///
-    /// Separate from `direct_verify_read_splits`, which records every quiet
-    /// pass: the post-repair pass has a rule of its own — it may claim nothing
-    /// and must read everything — and only a record that says which passes were
-    /// post-repair can pin it.
+    // `(files claimed, files read)` for every quiet direct pass that ran
+    // **after** a repair-while-direct, in order.
+    //
+    // Separate from `direct_verify_read_splits`, which records every quiet
+    // pass: the post-repair pass has a rule of its own — it may claim nothing
+    // and must read everything — and only a record that says which passes were
+    // post-repair can pin it.
     #[cfg(test)]
     pub(super) direct_post_repair_read_splits: Vec<(usize, usize)>,
-    /// The verdict of the most recent quiet direct pass. The pipeline runs
-    /// that pass itself, mid-assembly, while live state is still intact — a
-    /// test that calls the pass afterwards observes a different situation
-    /// entirely, so the differential reads what actually happened.
+    // The verdict of the most recent quiet direct pass. The pipeline runs
+    // that pass itself, mid-assembly, while live state is still intact — a
+    // test that calls the pass afterwards observes a different situation
+    // entirely, so the differential reads what actually happened.
     #[cfg(test)]
     pub(super) last_direct_verdict: Option<par2_rs::VerificationResult>,
-    /// Downloaded article bodies waiting for decode scheduling.
+    // Downloaded article bodies waiting for decode scheduling.
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
-    /// Jobs that should re-enter completion/post-processing on the next loop pass.
+    // Jobs that should re-enter completion/post-processing on the next loop pass.
     pub(super) pending_completion_checks: VecDeque<JobId>,
-    /// Presence gates every attempt to resume a partially restored job.
+    // Presence gates every attempt to resume a partially restored job.
     pub(crate) blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
-    /// Channels for pipeline stage results.
+    // Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
     pub(super) download_refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
@@ -2664,69 +2706,77 @@ pub struct Pipeline {
     pub(super) owned_download_lane_pool: download::owned_lane::OwnedDownloadLanePool,
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
     pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
-    /// Channel through which due retries re-enter the pipeline loop.
+    // Channel through which due retries re-enter the pipeline loop.
     pub(in crate::pipeline) retry_tx: mpsc::Sender<RetryWork>,
     pub(in crate::pipeline) retry_rx: mpsc::Receiver<RetryWork>,
-    /// Pipeline-owned infrastructure retries, drained in deadline batches.
+    // Pipeline-owned infrastructure retries, drained in deadline batches.
     pub(in crate::pipeline) infrastructure_retries:
         infrastructure_retry::InfrastructureRetryQueue<RetryWork>,
-    /// Monotonic NNTP pool generation, bumped on every `RebuildNntp`. Server
-    /// indices in `DownloadWork::exclude_servers` are only meaningful within
-    /// the generation they were computed under; delayed retries carry the
-    /// generation they were scheduled under so stale indices can be dropped
-    /// when they re-enter after a rebuild.
+    // Monotonic NNTP pool generation, bumped on every `RebuildNntp`. Server
+    // indices in `DownloadWork::exclude_servers` are only meaningful within
+    // the generation they were computed under; delayed retries carry the
+    // generation they were scheduled under so stale indices can be dropped
+    // when they re-enter after a rebuild.
     pub(super) pool_generation: u64,
-    /// Per-server article attempt counters for the active NNTP generation,
-    /// indexed by runtime `server_idx`.
-    ///
-    /// Held as a plain `Vec` with no lock: the completion path indexes it
-    /// directly and only ever does `Relaxed` `fetch_add`s through the `Arc`s.
-    /// It is rebuilt exactly when a new NNTP generation is activated, from
-    /// `metrics.server_metrics`, which re-uses the counters of any stable
-    /// server id it has already seen so lifetime totals survive a config
-    /// reload. A stale generation may hand us an out-of-range index; the
-    /// completion path bounds-checks and skips.
+    // Per-server article attempt counters for the active NNTP generation,
+    // indexed by runtime `server_idx`.
+    //
+    // Held as a plain `Vec` with no lock: the completion path indexes it
+    // directly and only ever does `Relaxed` `fetch_add`s through the `Arc`s.
+    // It is rebuilt exactly when a new NNTP generation is activated, from
+    // `metrics.server_metrics`, which re-uses the counters of any stable
+    // server id it has already seen so lifetime totals survive a config
+    // reload. A stale generation may hand us an out-of-range index; the
+    // completion path bounds-checks and skips.
     pub(super) server_counters: Vec<Arc<crate::operations::instrumentation::ServerCounters>>,
-    /// Wall-clock start of each in-flight job stage, keyed by `(job, stage)`.
-    ///
-    /// Per-job, not per-segment: a job passes through each stage at most a
-    /// handful of times, so a `HashMap` here costs nothing measurable and never
-    /// appears on an article path.
+    // Wall-clock start of each in-flight job stage, keyed by `(job, stage)`.
+    //
+    // Per-job, not per-segment: a job passes through each stage at most a
+    // handful of times, so a `HashMap` here costs nothing measurable and never
+    // appears on an article path.
     pub(super) job_stage_started_at:
         HashMap<(JobId, crate::operations::instrumentation::JobStageKind), Instant>,
-    /// Channel for health probe results: (job_id, total_probes, missed_count).
+    // Channel for health probe results: (job_id, total_probes, missed_count).
     pub(super) probe_result_tx: mpsc::Sender<ProbeUpdate>,
     pub(super) probe_result_rx: mpsc::Receiver<ProbeUpdate>,
-    /// The generation whose predecessor pool finished draining; see
-    /// `nntp_handoff_draining`.
+    // The generation whose predecessor pool finished draining; see
+    // `nntp_handoff_draining`.
     pub(super) nntp_handoff_drained_tx: mpsc::Sender<u64>,
     pub(super) nntp_handoff_drained_rx: mpsc::Receiver<u64>,
-    /// Channel for background extraction results.
+    // Channel for background extraction results.
     pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
-    /// Channel for background RAR topology refresh results.
+    // Channel for background RAR topology refresh results.
     pub(super) rar_refresh_done_tx: mpsc::Sender<RarRefreshDone>,
     pub(super) rar_refresh_done_rx: mpsc::Receiver<RarRefreshDone>,
-    /// Channel for delayed RAR capacity-pressure refresh/extraction wakeups.
+    // Channel for delayed RAR capacity-pressure refresh/extraction wakeups.
     pub(in crate::pipeline) rar_capacity_retry_tx: mpsc::Sender<RarCapacityRetry>,
     pub(in crate::pipeline) rar_capacity_retry_rx: mpsc::Receiver<RarCapacityRetry>,
-    /// Channel for background final-move results.
+    // Channel for background final-move results.
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
     pub(super) terminal_post_processing_done_tx: mpsc::Sender<TerminalPostProcessingEvent>,
     pub(super) terminal_post_processing_done_rx: mpsc::Receiver<TerminalPostProcessingEvent>,
+    pub(super) script_effects_rx: tokio::sync::watch::Receiver<()>,
     pub(super) terminal_post_processing_executor:
         crate::post_processing::executor::PostProcessingExecutor,
     pub(super) inflight_terminal_post_processing: HashSet<JobId>,
+    pub(super) queue_script_waiters: HashSet<JobId>,
+    pub(super) queue_scripts_completed: HashSet<JobId>,
+    // Jobs kept from downloading while a blocking instance runs on their
+    // arrival.
+    pub(super) added_script_holds: HashSet<JobId>,
+    pub(super) script_data_dir: PathBuf,
+    pub(super) pending_history_deletions: HashSet<JobId>,
     pub(super) terminal_post_processing_cancellations:
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
-    /// Cooperative cancellation tokens for PAR2 verification and repair work.
+    // Cooperative cancellation tokens for PAR2 verification and repair work.
     pub(super) par2_cancellations: HashMap<JobId, par2_rs::CancellationToken>,
-    /// Monotonic fence for direct post-repair tickets detached from the actor.
+    // Monotonic fence for direct post-repair tickets detached from the actor.
     pub(super) next_direct_post_repair_work_id: u64,
-    /// At most one direct post-repair read-back runs for a job.
+    // At most one direct post-repair read-back runs for a job.
     pub(super) direct_post_repair_in_flight: HashMap<JobId, DirectPostRepairWork>,
-    /// Terminal verdicts awaiting the completion gate that submitted them.
+    // Terminal verdicts awaiting the completion gate that submitted them.
     pub(super) direct_post_repair_results: HashMap<
         JobId,
         (
@@ -2735,22 +2785,22 @@ pub struct Pipeline {
             Result<par2_rs::VerificationResult, String>,
         ),
     >,
-    /// The bounded lane reports only terminal post-repair verdicts.
+    // The bounded lane reports only terminal post-repair verdicts.
     pub(super) direct_post_repair_done_tx: mpsc::Sender<DirectPostRepairWorkDone>,
     pub(super) direct_post_repair_done_rx: mpsc::Receiver<DirectPostRepairWorkDone>,
-    /// The pre-repair verdict a direct-store repair leaves behind for the
-    /// post-repair pass to read selectively instead of re-reading the whole
-    /// recovery set. Cleared once consumed, on demotion, and by
-    /// [`Pipeline::clear_par2_runtime_state`] — see [`DirectPostRepairCarry`].
+    // The pre-repair verdict a direct-store repair leaves behind for the
+    // post-repair pass to read selectively instead of re-reading the whole
+    // recovery set. Cleared once consumed, on demotion, and by
+    // [`Pipeline::clear_par2_runtime_state`] — see [`DirectPostRepairCarry`].
     pub(super) direct_post_repair_carry: HashMap<JobId, DirectPostRepairCarry>,
-    /// Monotonic fence for direct tolerated-extraction tickets detached from
-    /// the actor.
+    // Monotonic fence for direct tolerated-extraction tickets detached from
+    // the actor.
     pub(super) next_direct_tolerated_work_id: u64,
-    /// At most one tolerated extraction runs for a job; a second ready set of
-    /// the same job waits for the first to finalize.
+    // At most one tolerated extraction runs for a job; a second ready set of
+    // the same job waits for the first to finalize.
     pub(super) direct_tolerated_in_flight: HashMap<JobId, DirectToleratedWork>,
-    /// Finished tolerated extractions awaiting the finalization pass that
-    /// submitted them, keyed by job and tagged with the set they belong to.
+    // Finished tolerated extractions awaiting the finalization pass that
+    // submitted them, keyed by job and tagged with the set they belong to.
     pub(super) direct_tolerated_results: HashMap<
         JobId,
         (
@@ -2760,47 +2810,47 @@ pub struct Pipeline {
     >,
     pub(super) direct_tolerated_done_tx: mpsc::Sender<DirectToleratedWorkDone>,
     pub(super) direct_tolerated_done_rx: mpsc::Receiver<DirectToleratedWorkDone>,
-    /// At most one barrier in flight per set; see [`DirectBarrierFlight`].
+    // At most one barrier in flight per set; see [`DirectBarrierFlight`].
     pub(super) direct_barrier_flights: HashMap<(JobId, usize), DirectBarrierFlight>,
-    /// Monotonic; stamps each flight and its done message.
+    // Monotonic; stamps each flight and its done message.
     pub(super) next_direct_barrier_flight_id: u64,
     pub(super) direct_barrier_done_tx: mpsc::Sender<DirectBarrierDone>,
     pub(super) direct_barrier_done_rx: mpsc::Receiver<DirectBarrierDone>,
-    /// Routed articles whose destination writes are out or queued, per set;
-    /// see [`DirectPlacementFlight`].
+    // Routed articles whose destination writes are out or queued, per set;
+    // see [`DirectPlacementFlight`].
     pub(super) direct_placement_lanes: HashMap<(JobId, usize), DirectPlacementLane>,
-    /// Jobs whose completion check ran while a placement was out. The check
-    /// cannot judge them until it lands, and the landing re-queues it.
+    // Jobs whose completion check ran while a placement was out. The check
+    // cannot judge them until it lands, and the landing re-queues it.
     pub(super) completion_checks_awaiting_placements: HashSet<JobId>,
-    /// Direct sets whose PAR3 images were held back because a placement was
-    /// out. Nothing else is bound to publish them once it lands, so the
-    /// landing does.
+    // Direct sets whose PAR3 images were held back because a placement was
+    // out. Nothing else is bound to publish them once it lands, so the
+    // landing does.
     pub(super) par3_publications_awaiting_placements: HashSet<(JobId, usize)>,
-    /// Monotonic; stamps each placement flight and its done message.
+    // Monotonic; stamps each placement flight and its done message.
     pub(super) next_direct_placement_flight_id: u64,
     pub(super) direct_placement_done_tx: mpsc::Sender<DirectPlacementDone>,
     pub(super) direct_placement_done_rx: mpsc::Receiver<DirectPlacementDone>,
-    /// Holds every placement task at its first step until a permit is added,
-    /// so a test can keep a destination write open for as long as it likes.
+    // Holds every placement task at its first step until a permit is added,
+    // so a test can keep a destination write open for as long as it likes.
     #[cfg(test)]
     pub(super) direct_placement_hold: Option<std::sync::Arc<tokio::sync::Semaphore>>,
-    /// Test hook: a placement task panics once it is past the hold.
+    // Test hook: a placement task panics once it is past the hold.
     #[cfg(test)]
     pub(super) direct_placement_panics: bool,
-    /// Sets whose restart-seeded re-read is running; see [`DirectRearmDone`].
+    // Sets whose restart-seeded re-read is running; see [`DirectRearmDone`].
     pub(super) direct_rearm_in_flight: HashSet<(JobId, usize)>,
     pub(super) direct_rearm_done_tx: mpsc::Sender<DirectRearmDone>,
     pub(super) direct_rearm_done_rx: mpsc::Receiver<DirectRearmDone>,
-    /// Monotonic fence for the detached PAR2 damaged-path analysis tickets.
+    // Monotonic fence for the detached PAR2 damaged-path analysis tickets.
     pub(super) next_par2_analysis_work_id: u64,
-    /// At most one damaged-path analysis runs per job. While the entry is
-    /// present the completion check refuses to judge the job: the verdict it
-    /// would judge on is exactly what the ticket is computing.
+    // At most one damaged-path analysis runs per job. While the entry is
+    // present the completion check refuses to judge the job: the verdict it
+    // would judge on is exactly what the ticket is computing.
     pub(super) par2_analysis_in_flight: HashMap<JobId, Par2AnalysisWork>,
-    /// A finished analysis waiting for the completion check that submitted it,
-    /// keyed by job and tagged with the recovery set it describes. A pass that
-    /// finds a result tagged for another set puts it back rather than reading
-    /// another set's verdict as its own.
+    // A finished analysis waiting for the completion check that submitted it,
+    // keyed by job and tagged with the recovery set it describes. A pass that
+    // finds a result tagged for another set puts it back rather than reading
+    // another set's verdict as its own.
     pub(super) par2_analysis_results: HashMap<
         JobId,
         (
@@ -2810,393 +2860,422 @@ pub struct Pipeline {
     >,
     pub(super) repair_work_done_tx: mpsc::Sender<RepairWorkDone>,
     pub(super) repair_work_done_rx: mpsc::Receiver<RepairWorkDone>,
-    /// Monotonic fence for demotion sweeps detached from the actor.
+    // Monotonic fence for demotion sweeps detached from the actor.
     pub(super) next_direct_demotion_work_id: u64,
-    /// The demotion sweeps a job has outstanding, keyed by the set each one
-    /// belongs to. Keyed by job at the top so the completion gate — which must
-    /// not judge a job whose volumes are still materializing — answers in one
-    /// lookup.
+    // The demotion sweeps a job has outstanding, keyed by the set each one
+    // belongs to. Keyed by job at the top so the completion gate — which must
+    // not judge a job whose volumes are still materializing — answers in one
+    // lookup.
     pub(super) direct_demotion_in_flight: HashMap<JobId, HashMap<usize, DirectDemotionWork>>,
     pub(super) direct_demotion_done_tx: mpsc::Sender<DirectDemotionWorkDone>,
     pub(super) direct_demotion_done_rx: mpsc::Receiver<DirectDemotionWorkDone>,
-    /// Whether all downloads are globally paused.
+    // Whether all downloads are globally paused.
     pub(super) global_paused: bool,
-    /// Whether the active global pause came from a bandwidth schedule rather
-    /// than an operator action. Only meaningful while `global_paused` is true;
-    /// it selects the Scheduled vs ManualPause download-block presentation.
+    // Whether the active global pause came from a bandwidth schedule rather
+    // than an operator action. Only meaningful while `global_paused` is true;
+    // it selects the Scheduled vs ManualPause download-block presentation.
     pub(super) scheduled_pause: bool,
-    /// ISP bandwidth cap runtime state.
-    pub(crate) bandwidth_cap: BandwidthCapRuntime,
-    /// Conservative byte reservations for in-flight downloads used to enforce the
-    /// ISP bandwidth cap before actual payload bytes are known.
-    pub(crate) bandwidth_reservations: HashMap<SegmentId, u64>,
-    /// Estimated bytes charged to the speed limiter for in-flight downloads.
+    // The per-minute download ledger behind the bandwidth graph.
+    pub(crate) bandwidth_ledger: BandwidthLedgerRuntime,
+    // Estimated bytes charged to the speed limiter for in-flight downloads.
     pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
-    /// Persisted/general speed limit restored when no schedule speed action is active.
+    // Persisted/general speed limit restored when no schedule speed action is active.
     pub(super) configured_rate_limit: u64,
-    /// Active schedule speed action, if any.
+    // Active schedule speed action, if any.
     pub(super) scheduled_rate_limit: Option<u64>,
-    /// Effective bandwidth rate limiter.
+    // Effective bandwidth rate limiter.
     pub(super) rate_limiter: TokenBucket,
-    /// Max pending segments per write reorder buffer (memory-adaptive).
+    // Max pending segments per write reorder buffer (memory-adaptive).
     pub(super) write_buf_max_pending: usize,
-    /// Max in-memory raw article bytes queued or active for decode.
+    // Max in-memory raw article bytes queued or active for decode.
     pub(super) decode_backlog_budget_bytes: usize,
-    /// Max in-memory decoded backlog before degrading to direct offset writes.
+    // Max in-memory decoded backlog before degrading to direct offset writes.
     pub(super) write_backlog_budget_bytes: usize,
-    /// Whether raw decode backlog is in a hard-pressure drain cycle.
+    // Whether raw decode backlog is in a hard-pressure drain cycle.
     pub(super) download_decode_hard_pressure_latched: bool,
-    /// Whether decoded write backlog is in a hard-pressure drain cycle.
+    // Whether decoded write backlog is in a hard-pressure drain cycle.
     pub(super) download_write_hard_pressure_latched: bool,
-    /// Start time of the current hard pressure stall, if downloads are blocked.
+    // Start time of the current hard pressure stall, if downloads are blocked.
     pub(super) download_pressure_hard_stall_started_at: Option<Instant>,
-    /// Next time soft byte pressure may issue a replacement article.
+    // Next time soft byte pressure may issue a replacement article.
     pub(super) download_pressure_soft_dispatch_after: Option<Instant>,
-    /// When the job snapshot was last rebuilt and published.
+    // When the job snapshot was last rebuilt and published.
     pub(super) snapshot_published_at: Option<Instant>,
-    /// Whether a debounced snapshot publish is owed once the window reopens.
+    // Whether a debounced snapshot publish is owed once the window reopens.
     pub(super) snapshot_publish_pending: bool,
-    /// Per-job delay after restart-durable-lead throttling parks primary work.
+    // Whether anything the job snapshot shows may have changed since it was
+    // last published. A turn woken only by a periodic tick leaves it clear,
+    // so an idle pipeline never rebuilds the snapshot.
+    pub(super) snapshot_dirty: bool,
+    // Whether the footprint gauges were last taken before the most recent
+    // state change, so the next tick must take them again.
+    pub(super) footprint_metrics_stale: bool,
+    // Whether the last dispatch pass was held back by a gate that lifts with
+    // time alone (a schedule window, the rate limiter, a download quota,
+    // byte pressure) or found eligible work it could not place, so the idle
+    // tick must try again. Without it nothing would wake dispatch when such
+    // a gate lifts.
+    pub(super) download_dispatch_retry: bool,
+    // Whether the last metrics refresh still showed a non-zero rate. The
+    // rate windows only move when sampled, so the fast tick runs until the
+    // gauges read zero.
+    pub(super) metrics_rates_moving: bool,
+    // Entries in `phase_progress` for a phase other than the download,
+    // kept so liveness is a comparison rather than a walk of every job's
+    // phases.
+    pub(super) post_download_phases: usize,
+    // Whether nothing has happened since the last state reconcile, so the
+    // next one would find exactly what the last one did.
+    pub(super) reconcile_clean: bool,
+    // What each reconcile candidate looked like when its completion check
+    // was last scheduled by the reconcile; an unchanged job is not checked
+    // again.
+    pub(super) reconcile_signatures: HashMap<JobId, (u64, u64, u64, usize, usize, bool)>,
+    // Per-job delay after restart-durable-lead throttling parks primary work.
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
-    /// The one over-limit article reserved until its result is processed or returned.
+    // The one over-limit article reserved until its result is processed or returned.
     pub(super) checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
     pub(super) download_lane_owners: HashMap<u64, DownloadLaneOwner>,
-    /// When each deferred job's articles become old enough to fetch.
-    ///
-    /// Absent means the question has not been asked yet or was answered
-    /// "eligible" — see [`Pipeline::propagation_hold_until`], which is where the
-    /// answer is computed and cached as a monotonic deadline plus a stable
-    /// epoch-millisecond timestamp for clients. The dispatch gate and run-loop
-    /// sleep use the monotonic deadline, so eligibility wakes without polling.
+    // When each deferred job's articles become old enough to fetch.
+    //
+    // Absent means the question has not been asked yet or was answered
+    // "eligible" — see [`Pipeline::propagation_hold_until`], which is where the
+    // answer is computed and cached as a monotonic deadline plus a stable
+    // epoch-millisecond timestamp for clients. The dispatch gate and run-loop
+    // sleep use the monotonic deadline, so eligibility wakes without polling.
     pub(super) propagation_ready_at: HashMap<JobId, (Instant, i64)>,
-    /// Last visible holds, used to notify subscribers after publishing a snapshot.
+    // Last visible holds, used to notify subscribers after publishing a snapshot.
     pub(super) published_propagation_holds: HashMap<JobId, i64>,
-    /// Configured minimum post age, updated through the scheduler command channel.
+    // Configured minimum post age, updated through the scheduler command channel.
     pub(super) propagation_delay: Duration,
     #[cfg(test)]
     pub(super) propagation_delay_forced: Option<Duration>,
-    /// Last time we logged a queued/no-active-download liveness stall.
+    // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
-    /// Retry-storm window: when it opened, and the retry and download counts
-    /// it opened with. A pipeline that retries without ever finishing an
-    /// article is as stalled as one with no active downloads, but it looks
-    /// busy from every gauge the stall log reads, so it gets its own window.
+    // Retry-storm window: when it opened, and the retry and download counts
+    // it opened with. A pipeline that retries without ever finishing an
+    // article is as stalled as one with no active downloads, but it looks
+    // busy from every gauge the stall log reads, so it gets its own window.
     pub(super) download_retry_storm_window: Option<(Instant, u64, u64)>,
-    /// Rate limiter, per job, for the owned blocking lane acquire warning.
+    // Rate limiter, per job, for the owned blocking lane acquire warning.
     pub(super) owned_lane_acquire_failure_log_throttle: download::JobLogThrottle,
-    /// Rate limiter, per job, for the "a pass found this job ineligible"
-    /// warning. Every dispatch wake re-visits every job, so this one fires as
-    /// fast as the actor is woken until the job leaves the phase it is in.
+    // Rate limiter, per job, for the "a pass found this job ineligible"
+    // warning. Every dispatch wake re-visits every job, so this one fires as
+    // fast as the actor is woken until the job leaves the phase it is in.
     pub(super) dispatch_ineligible_log_throttle: download::JobLogThrottle,
-    /// Rate limiter, per file, for the "an article arrived that the file
-    /// already holds" warning. Duplicates arrive in bursts when something
-    /// requeues work the assembly already has.
+    // Rate limiter, per file, for the "an article arrived that the file
+    // already holds" warning. Duplicates arrive in bursts when something
+    // requeues work the assembly already has.
     pub(super) duplicate_arrival_log_throttle: download::KeyedLogThrottle<NzbFileId>,
-    /// Last time an owned blocking lane failed to be acquired at all, warned
-    /// about or not. The under-cap report below is gated on it: lanes below
-    /// their cap are only a fault when a lane actually failed to open.
+    // Last time an owned blocking lane failed to be acquired at all, warned
+    // about or not. The under-cap report below is gated on it: lanes below
+    // their cap are only a fault when a lane actually failed to open.
     pub(super) last_owned_lane_acquire_failure_at: Option<Instant>,
-    /// When the servers were first seen below their configured connection cap
-    /// while work was queued, and the last time that was reported. Cleared as
-    /// soon as a pass finds the lanes filled, so only a *sustained* underfill
-    /// is ever logged.
+    // When the servers were first seen below their configured connection cap
+    // while work was queued, and the last time that was reported. Cleared as
+    // soon as a pass finds the lanes filled, so only a *sustained* underfill
+    // is ever logged.
     pub(super) download_lanes_under_cap_since: Option<Instant>,
     pub(super) last_download_lanes_under_cap_log_at: Option<Instant>,
-    /// Current in-memory decoded backlog retained for sequential write ordering.
+    // Current in-memory decoded backlog retained for sequential write ordering.
     pub(super) write_buffered_bytes: usize,
-    /// Current in-memory decoded segment count retained for sequential write ordering.
+    // Current in-memory decoded segment count retained for sequential write ordering.
     pub(super) write_buffered_segments: usize,
-    /// Disk-backed uuencode parts waiting for their missing prefix.
+    // Disk-backed uuencode parts waiting for their missing prefix.
     pub(super) uu_spooled_bytes: usize,
-    /// Disk-backed uuencode segment count waiting for their missing prefix.
+    // Disk-backed uuencode segment count waiting for their missing prefix.
     pub(super) uu_spooled_segments: usize,
-    /// Every UU part held ahead of its cursor, regardless of storage form.
-    ///
-    /// This bounds map and temporary-path overhead even when decoded bytes are
-    /// tiny.
+    // Every UU part held ahead of its cursor, regardless of storage form.
+    //
+    // This bounds map and temporary-path overhead even when decoded bytes are
+    // tiny.
     pub(super) uu_parked_segments: usize,
-    /// Reserved transient spool root below the configured intermediate directory.
+    // Reserved transient spool root below the configured intermediate directory.
     pub(super) uu_spool_root: PathBuf,
-    /// Aggregate disk-backed UU byte admission limit.
+    // Aggregate disk-backed UU byte admission limit.
     pub(super) uu_spool_max_bytes: usize,
-    /// Aggregate ahead-of-cursor UU entry admission limit.
+    // Aggregate ahead-of-cursor UU entry admission limit.
     pub(super) uu_spool_max_segments: usize,
-    /// Per-file bound on the uuencode reorder park. A uuencode file is placed
-    /// strictly in ordinal order, and with several lanes each fetching its
-    /// own run of the file the parts furthest from the cursor arrive first
-    /// and stay parked until every lane behind them has drained. That is the
-    /// aggregate spool's budget to hold, so the bound is the same number; it
-    /// must never be the yEnc reorder depth, which is sized for a window of a
-    /// few articles and displaces a long file's tail on every pass.
+    // Per-file bound on the uuencode reorder park. A uuencode file is placed
+    // strictly in ordinal order, and with several lanes each fetching its
+    // own run of the file the parts furthest from the cursor arrive first
+    // and stay parked until every lane behind them has drained. That is the
+    // aggregate spool's budget to hold, so the bound is the same number; it
+    // must never be the yEnc reorder depth, which is sized for a window of a
+    // few articles and displaces a long file's tail on every pass.
     pub(super) uu_park_max_segments: usize,
-    /// Free space preserved on the intermediate filesystem while spilling UU.
+    // Free space preserved on the intermediate filesystem while spilling UU.
     pub(super) uu_spool_min_free_bytes: u64,
-    /// The spool filesystem's latest free-space reading, from the
-    /// intermediate root's sampler. Never probes on the pipeline task.
+    // The spool filesystem's latest free-space reading, from the
+    // intermediate root's sampler. Never probes on the pipeline task.
     pub(super) uu_spool_capacity: crate::operations::CapacityReader,
-    /// Spills admitted against the current reading, so a burst between
-    /// refreshes cannot each see the same headroom.
+    // Spills admitted against the current reading, so a burst between
+    // refreshes cannot each see the same headroom.
     pub(super) uu_spool_debits: crate::operations::CapacityDebits,
-    /// One background free-space sampler per configured root. Everything on
-    /// the pipeline that gates work on free space reads these readings.
+    // One background free-space sampler per configured root. Everything on
+    // the pipeline that gates work on free space reads these readings.
     pub(super) storage_capacity: Arc<crate::operations::StorageCapacity>,
-    /// Largest refused UU spill. Dispatch preserves cursor progress until
-    /// this many bytes can be parked in memory or admitted to the spool.
+    // Largest refused UU spill. Dispatch preserves cursor progress until
+    // this many bytes can be parked in memory or admitted to the spool.
     pub(super) uu_spool_blocked_spill_bytes: Option<usize>,
     #[cfg(test)]
-    /// Test-only free-space reading; `Some(None)` exercises a filesystem that
-    /// has never produced a reading.
+    // Test-only free-space reading; `Some(None)` exercises a filesystem that
+    // has never produced a reading.
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
-    /// Per-file write reorder buffers for decoded segments waiting on write order.
+    // Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
-    /// The first [`PAR2_HASH_16K_BYTES`] decoded bytes of each file, anchored at
-    /// offset 0, for binding an **obfuscated** file to its PAR2 description by
-    /// content when its name matches nothing.
-    ///
-    /// Bounded twice over: 16 KiB per file, and only files whose first article
-    /// has landed have an entry at all. Dropped with the rest of the job's
-    /// per-file runtime.
+    // The first [`PAR2_HASH_16K_BYTES`] decoded bytes of each file, anchored at
+    // offset 0, for binding an **obfuscated** file to its PAR2 description by
+    // content when its name matches nothing.
+    //
+    // Bounded twice over: 16 KiB per file, and only files whose first article
+    // has landed have an entry at all. Dropped with the rest of the job's
+    // per-file runtime.
     pub(super) file_prefix_16k: HashMap<NzbFileId, Vec<u8>>,
-    /// The PAR2 content fingerprint (`hash_16k`, length) an identity roster
-    /// already proved for a file whose [`Self::file_prefix_16k`] capture did
-    /// not survive a restart.
-    ///
-    /// A restored set's files routed their offset-zero articles before the
-    /// restart, so a prefix is captured again only when one of those articles
-    /// is delivered a second time; the roster binding the checkpoint kept is
-    /// the evidence instead. Its hash is consulted only where no prefix
-    /// exists; its length stands even beside a prefix captured again, because
-    /// the file's own count after a restart does not. It
-    /// is dropped with the rest of the job's per-file runtime.
+    // The PAR2 content fingerprint (`hash_16k`, length) an identity roster
+    // already proved for a file whose [`Self::file_prefix_16k`] capture did
+    // not survive a restart.
+    //
+    // A restored set's files routed their offset-zero articles before the
+    // restart, so a prefix is captured again only when one of those articles
+    // is delivered a second time; the roster binding the checkpoint kept is
+    // the evidence instead. Its hash is consulted only where no prefix
+    // exists; its length stands even beside a prefix captured again, because
+    // the file's own count after a restart does not. It
+    // is dropped with the rest of the job's per-file runtime.
     pub(super) file_proven_par2_fingerprint: HashMap<NzbFileId, ([u8; 16], u64)>,
-    /// First non-zero decoded size declared by a yEnc header for each file.
-    ///
-    /// This is independent evidence about the file the poster intended to
-    /// send. A later article cannot revise an earlier declaration.
+    // First non-zero decoded size declared by a yEnc header for each file.
+    //
+    // This is independent evidence about the file the poster intended to
+    // send. A later article cannot revise an earlier declaration.
     pub(super) file_declared_size: HashMap<NzbFileId, u64>,
-    /// Sequential-assembly state for uuencode files, created on the first
-    /// uuencode part of a file and dropped with that file's write buffer.
+    // Sequential-assembly state for uuencode files, created on the first
+    // uuencode part of a file and dropped with that file's write buffer.
     pub(super) uu_files: HashMap<NzbFileId, UuFileAssembly>,
-    /// How often each uuencode segment has been displaced by park pressure and
-    /// requeued while its file's cursor stood still, paired with the cursor
-    /// position that count was taken at. Purely a livelock bound — deliberately
-    /// NOT the decode-failure counter, because park pressure is an ordering
-    /// condition and must never spend a segment's retry budget; and the count
-    /// restarts whenever the cursor has moved, because a displacement behind a
-    /// moving cursor is progress, not a cycle.
+    // How often each uuencode segment has been displaced by park pressure and
+    // requeued while its file's cursor stood still, paired with the cursor
+    // position that count was taken at. Purely a livelock bound — deliberately
+    // NOT the decode-failure counter, because park pressure is an ordering
+    // condition and must never spend a segment's retry budget; and the count
+    // restarts whenever the cursor has moved, because a displacement behind a
+    // moving cursor is progress, not a cycle.
     pub(super) uu_park_requeues: HashMap<SegmentId, (u32, u32)>,
-    /// Articles that declared no usable start and arrived before the ordinal
-    /// they follow, held decoded until that ordinal is placed. Their bytes are
-    /// charged to the write-buffer ledger while they wait.
+    // Articles that declared no usable start and arrived before the ordinal
+    // they follow, held decoded until that ordinal is placed. Their bytes are
+    // charged to the write-buffer ledger while they wait.
     pub(super) unanchored_parked: HashMap<NzbFileId, BTreeMap<u32, (DecodeResult, SegmentSource)>>,
-    /// How often each article that declared no usable start has been sent back
-    /// for the ordinal before it because the park above had no room for it,
-    /// paired with how many ordinals of its file were placed when that count
-    /// was taken. Like the park counter above, a livelock bound and never a
-    /// retry budget: the bytes are not at fault, and the count restarts
-    /// whenever the file has placed another part.
+    // How often each article that declared no usable start has been sent back
+    // for the ordinal before it because the park above had no room for it,
+    // paired with how many ordinals of its file were placed when that count
+    // was taken. Like the park counter above, a livelock bound and never a
+    // retry budget: the bytes are not at fault, and the count restarts
+    // whenever the file has placed another part.
     pub(super) unanchored_requeues: HashMap<SegmentId, (u32, usize)>,
-    /// Ordinals that reached a terminal state while their damaged bytes stayed
-    /// on disk, and that something parked above is waiting to start after.
-    /// Booking a terminal state cannot write a part, so the release runs at the
-    /// next seam that can.
+    // Ordinals that reached a terminal state while their damaged bytes stayed
+    // on disk, and that something parked above is waiting to start after.
+    // Booking a terminal state cannot write a part, so the release runs at the
+    // next seam that can.
     pub(super) pending_unanchored_release: Vec<SegmentId>,
-    /// Authoritative PAR2 runtime state per job.
+    // Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
-    /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.
+    // Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.
     par3_runtime: Option<Box<repair::par3::work::Coordinator>>,
-    /// Bounded archive framing probes, retired with each job and rebuilt on restore.
+    // Bounded archive framing probes, retired with each job and rebuilt on restore.
     par3_inside_probes: repair::par3::inside::Probes,
     #[cfg(test)]
     pub(super) par2_binding_resolver_calls: std::sync::atomic::AtomicU64,
-    /// Direct-store routing state: admitted archive sets, their routers and
-    /// their coverage barriers. Inert while the gate is off.
+    // Direct-store routing state: admitted archive sets, their routers and
+    // their coverage barriers. Inert while the gate is off.
     pub(super) direct_store: direct_store::wiring::DirectStoreRuntime,
-    /// Direct-unpack state: 7z sets being decoded while they download. Inert
-    /// while the gate is off.
+    // Direct-unpack state: 7z sets being decoded while they download. Inert
+    // while the gate is off.
     pub(super) direct_unpack: direct_unpack::wiring::DirectUnpackRuntime,
-    /// RAR members already extracted per job (for incremental RAR extraction).
+    // RAR members already extracted per job (for incremental RAR extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
-    /// Archives whose extraction has completed successfully (by archive name).
-    /// For RAR this is the set name; for 7z/zip/tar/gz it's the archive name.
+    // Archives whose extraction has completed successfully (by archive name).
+    // For RAR this is the set name; for 7z/zip/tar/gz it's the archive name.
     pub(super) extracted_archives: HashMap<JobId, HashSet<String>>,
-    /// Archive sets a missing-volumes failure has already been dispatched for.
-    /// Such a set has live claimants, no runtime state and nothing on disk, so
-    /// extraction can only report the same failure again; the first report is
-    /// the one that fails the job, and this stops a completion check that
-    /// re-runs before it lands from queueing a second doomed extraction.
+    // Archive sets a missing-volumes failure has already been dispatched for.
+    // Such a set has live claimants, no runtime state and nothing on disk, so
+    // extraction can only report the same failure again; the first report is
+    // the one that fails the job, and this stops a completion check that
+    // re-runs before it lands from queueing a second doomed extraction.
     pub(super) missing_volume_archive_sets: HashMap<JobId, HashSet<String>>,
-    /// Tracks decode failure retries per segment. When yEnc decode fails (CRC/size
-    /// mismatch), the segment is re-downloaded. After `MAX_SEGMENT_RETRIES` decode
-    /// failures, the segment is marked permanently failed.
+    // Tracks decode failure retries per segment. When yEnc decode fails (CRC/size
+    // mismatch), the segment is re-downloaded. After `MAX_SEGMENT_RETRIES` decode
+    // failures, the segment is marked permanently failed.
     pub(super) decode_retries: HashMap<SegmentId, u32>,
-    /// Successfully decoded segments whose yEnc part CRC was absent. These are
-    /// targeted for replacement only if the completed file CRC proves corruption.
+    // Successfully decoded segments whose yEnc part CRC was absent. These are
+    // targeted for replacement only if the completed file CRC proves corruption.
     pub(super) unverified_segments: HashMap<NzbFileId, HashMap<u32, SegmentSource>>,
-    /// Completed files currently replacing unverified segments after a whole-file
-    /// CRC mismatch. Final verification waits for the entire batch.
+    // Completed files currently replacing unverified segments after a whole-file
+    // CRC mismatch. Final verification waits for the entire batch.
     pub(super) file_crc_recoveries: HashMap<NzbFileId, FileCrcRecoveryState>,
-    /// Archives with in-flight extraction tasks (spawned but not yet completed).
-    /// Prevents duplicate spawns and ensures cleanup waits for extraction to finish.
+    // Archives with in-flight extraction tasks (spawned but not yet completed).
+    // Prevents duplicate spawns and ensures cleanup waits for extraction to finish.
     pub(super) inflight_extractions: HashMap<JobId, HashSet<String>>,
-    /// Transient byte-progress state for active user-visible phases.
+    // Transient byte-progress state for active user-visible phases.
     pub(super) phase_progress: HashMap<(JobId, JobPhase), progress::JobPhaseRuntime>,
-    /// Last sampled phase-progress snapshots projected into JobInfo.
+    // Last sampled phase-progress snapshots projected into JobInfo.
     pub(super) phase_progress_snapshots: HashMap<JobId, Vec<JobPhaseProgress>>,
-    /// Per-job queue-event coalescing state for sampled phase progress.
+    // Per-job queue-event coalescing state for sampled phase progress.
     pub(super) phase_publish_state: HashMap<JobId, progress::PhasePublishState>,
-    /// Cached per-job retention exclusions (pool server indices whose
-    /// retention window is older than the job). TTL'd; cleared on NNTP
-    /// client rebuilds and job removal.
+    // Cached per-job retention exclusions (pool server indices whose
+    // retention window is older than the job). TTL'd; cleared on NNTP
+    // client rebuilds and job removal.
     pub(super) job_retention_exclude_cache: HashMap<JobId, (Instant, Arc<Vec<usize>>)>,
-    /// Rate limiter, per job, for the "no eligible news server" warning.
+    // Rate limiter, per job, for the "no eligible news server" warning.
     pub(super) no_eligible_server_warn_throttle: download::JobLogThrottle,
-    /// Rate limiter, per job, for BODY work waiting on local lane capacity.
-    ///
-    /// Kept apart from the warning above: the two answer different questions,
-    /// and one window shared between them let the benign report hide the one
-    /// that says the servers are unusable.
+    // Rate limiter, per job, for BODY work waiting on local lane capacity.
+    //
+    // Kept apart from the warning above: the two answer different questions,
+    // and one window shared between them let the benign report hide the one
+    // that says the servers are unusable.
     pub(super) body_lane_capacity_log_throttle: download::JobLogThrottle,
-    /// Rate limiter, per job, for representative NNTP BODY fetch failures at
-    /// info level.
+    // Rate limiter, per job, for representative NNTP BODY fetch failures at
+    // info level.
     pub(super) body_fetch_failure_log_throttle: download::JobLogThrottle,
-    /// Jobs currently performing their final move into the complete directory.
+    // Jobs currently performing their final move into the complete directory.
     pub(super) inflight_moves: HashSet<JobId>,
-    /// Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
+    // Final moves admitted after the post-processing hold is lifted.
+    pub(super) deferred_moves: HashSet<JobId>,
+    // Jobs whose post-processing admission was refused by the global hold.
+    pub(super) deferred_post_processing: HashSet<JobId>,
+    // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
     pub(super) reserved_complete_destinations: HashMap<JobId, PathBuf>,
-    /// Members whose incremental extraction failed (corrupt volume, CRC error, etc).
-    /// Prevents immediate retry during download; cleared after PAR2 repair so
-    /// the post-repair extraction path can re-extract them.
+    // Members whose incremental extraction failed (corrupt volume, CRC error, etc).
+    // Prevents immediate retry during download; cleared after PAR2 repair so
+    // the post-repair extraction path can re-extract them.
     pub(super) failed_extractions: HashMap<JobId, HashSet<String>>,
-    /// Archive sets whose source bytes are already known to be wrong, before
-    /// any recovery set has ruled — keyed by job, holding the set names for
-    /// telemetry.
-    ///
-    /// Read by `archive_extraction_held_for_known_damage`. The two things it
-    /// buys are the same fact seen from opposite ends: extraction must not
-    /// open a set that is known damaged, and the authoritative PAR2 pass must
-    /// not be skipped for it on a *type* claim (a stored RAR set's
-    /// `StrongDecode`, whose whole premise is that nothing yet contradicts a
-    /// clean decode). Both of those need evidence rather than a demotion
-    /// label, so this is recorded by the fact — see
-    /// `DemotionReason::is_source_damage` — and any future seam that learns a
-    /// volume's bytes are wrong records here instead of growing a second,
-    /// near-identical predicate.
-    ///
-    /// Job-keyed on purpose: the verdicts that release it (`par2_verified`,
-    /// `par2_bypassed`) are job-scoped too, so a per-set record would have to
-    /// be released by a job-scoped answer anyway. Cleared with them in
-    /// `clear_job_extraction_runtime`.
+    // Archive sets whose source bytes are already known to be wrong, before
+    // any recovery set has ruled — keyed by job, holding the set names for
+    // telemetry.
+    //
+    // Read by `archive_extraction_held_for_known_damage`. The two things it
+    // buys are the same fact seen from opposite ends: extraction must not
+    // open a set that is known damaged, and the authoritative PAR2 pass must
+    // not be skipped for it on a *type* claim (a stored RAR set's
+    // `StrongDecode`, whose whole premise is that nothing yet contradicts a
+    // clean decode). Both of those need evidence rather than a demotion
+    // label, so this is recorded by the fact — see
+    // `DemotionReason::is_source_damage` — and any future seam that learns a
+    // volume's bytes are wrong records here instead of growing a second,
+    // near-identical predicate.
+    //
+    // Job-keyed on purpose: the verdicts that release it (`par2_verified`,
+    // `par2_bypassed`) are job-scoped too, so a per-set record would have to
+    // be released by a job-scoped answer anyway. Cleared with them in
+    // `clear_job_extraction_runtime`.
     pub(super) known_damaged_archive_sets: HashMap<JobId, HashSet<String>>,
-    /// Filenames eagerly deleted per job after CRC-verified extraction.
-    /// Used to distinguish truly-missing files from intentionally-deleted ones
-    /// during PAR2 verification.
+    // Filenames eagerly deleted per job after CRC-verified extraction.
+    // Used to distinguish truly-missing files from intentionally-deleted ones
+    // during PAR2 verification.
     pub(super) eagerly_deleted: HashMap<JobId, HashSet<String>>,
-    /// Pipeline-owned RAR scheduling state derived from immutable completed-volume facts.
+    // Pipeline-owned RAR scheduling state derived from immutable completed-volume facts.
     rar_sets: HashMap<(JobId, String), RarSetState>,
-    /// Runtime-only coalescing state for background RAR topology refreshes.
+    // Runtime-only coalescing state for background RAR topology refreshes.
     rar_refresh_state: HashMap<(JobId, String), RarRefreshState>,
-    /// Jobs whose queued RAR volume work needs unlock-priority recomputation.
+    // Jobs whose queued RAR volume work needs unlock-priority recomputation.
     rar_unlock_priority_dirty_jobs: HashSet<JobId>,
-    /// Files currently boosted for opportunistic RAR member unlock scheduling.
+    // Files currently boosted for opportunistic RAR member unlock scheduling.
     rar_unlock_boosted_files: HashMap<JobId, HashSet<NzbFileId>>,
-    /// Runtime-only coalescing state for delayed RAR capacity-pressure retries.
+    // Runtime-only coalescing state for delayed RAR capacity-pressure retries.
     pub(in crate::pipeline) pending_rar_capacity_retries:
         HashSet<(JobId, String, RarCapacityRetryKind)>,
-    /// Members currently blocked on future RAR volumes. Used to emit stable
-    /// waiting-started / waiting-finished events without relying on log text.
+    // Members currently blocked on future RAR volumes. Used to emit stable
+    // waiting-started / waiting-finished events without relying on log text.
     pub(super) rar_waiting_members: HashMap<(JobId, String, String), usize>,
-    /// Jobs that have already attempted normalization retry (one-shot guard).
+    // Jobs that have already attempted normalization retry (one-shot guard).
     pub(super) normalization_retried: HashSet<JobId>,
-    /// Members where extraction CRC passed and chunks are in the DB, but the
-    /// output file isn't fully concatenated yet.  Separate from `extracted_members`
-    /// to prevent `try_delete_volumes` from treating them as fully extracted.
+    // Members where extraction CRC passed and chunks are in the DB, but the
+    // output file isn't fully concatenated yet.  Separate from `extracted_members`
+    // to prevent `try_delete_volumes` from treating them as fully extracted.
     pub(super) pending_concat: HashMap<JobId, HashSet<String>>,
-    /// Jobs where all archive members extracted with CRC pass — PAR2
-    /// verification/repair is unnecessary.
+    // Jobs where all archive members extracted with CRC pass — PAR2
+    // verification/repair is unnecessary.
     pub(super) par2_bypassed: HashSet<JobId>,
-    /// Jobs whose wait for PAR2 metadata discovery has been logged. The
-    /// completion check comes round again for as long as discovery is open,
-    /// and the wait is news once.
+    // Jobs whose wait for PAR2 metadata discovery has been logged. The
+    // completion check comes round again for as long as discovery is open,
+    // and the wait is news once.
     pub(super) par2_discovery_wait_logged: HashSet<JobId>,
-    /// Jobs that have reported a posted article name disagreeing with its
-    /// file. Obfuscated posts do this for every file; the job says so once and
-    /// each file's detail stays at debug.
+    // Jobs that have reported a posted article name disagreeing with its
+    // file. Obfuscated posts do this for every file; the job says so once and
+    // each file's detail stays at debug.
     pub(super) posted_name_disagreement_logged: HashSet<JobId>,
-    /// Jobs whose PAR2 set has already validated the current payload bytes.
+    // Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
-    /// Split sets a recovery set has already answered for, keyed by set name,
-    /// with the posted parts that join into it.
-    ///
-    /// A posting of `<name>.001/.002/.003` whose recovery data is computed over
-    /// `<name>` describes a file nothing in the posting is called. The recovery
-    /// pass reads the parts as one file and installs `<name>` itself, so the
-    /// join has already happened: the split topology that would run it again
-    /// is retired here, and the parts it names become consumed inputs rather
-    /// than payload the job is still short of.
+    // Split sets a recovery set has already answered for, keyed by set name,
+    // with the posted parts that join into it.
+    //
+    // A posting of `<name>.001/.002/.003` whose recovery data is computed over
+    // `<name>` describes a file nothing in the posting is called. The recovery
+    // pass reads the parts as one file and installs `<name>` itself, so the
+    // join has already happened: the split topology that would run it again
+    // is retired here, and the parts it names become consumed inputs rather
+    // than payload the job is still short of.
     pub(super) par2_joined_split_sets: HashMap<JobId, HashMap<String, HashSet<String>>>,
-    /// What a recovery verdict put on disk that no posted file answers to, and
-    /// the posted files proven to be the damaged copies it was built from.
+    // What a recovery verdict put on disk that no posted file answers to, and
+    // the posted files proven to be the damaged copies it was built from.
     pub(super) recovery_unposted_outputs: HashMap<JobId, RecoveryUnpostedOutputs>,
-    /// Working-directory entry names as they stood immediately before a repair
-    /// ran, per job.
-    ///
-    /// A repair leaves artefacts behind — par2-rs renames the damaged original
-    /// aside before installing the repaired file, and only purges it when asked
-    /// — and finalization relocates the whole directory, so anything still
-    /// sitting there ships. `Par2RepairOutcome` does not report those paths, so
-    /// the only way to name them without guessing at a suffix convention is to
-    /// know what was there first. Consumed once the repair is accepted; dropped
-    /// unread when it fails, which is what leaves the evidence in place.
+    // Working-directory entry names as they stood immediately before a repair
+    // ran, per job.
+    //
+    // A repair leaves artefacts behind — par2-rs renames the damaged original
+    // aside before installing the repaired file, and only purges it when asked
+    // — and finalization relocates the whole directory, so anything still
+    // sitting there ships. `Par2RepairOutcome` does not report those paths, so
+    // the only way to name them without guessing at a suffix convention is to
+    // know what was there first. Consumed once the repair is accepted; dropped
+    // unread when it fails, which is what leaves the evidence in place.
     pub(super) par2_pre_repair_dir_entries: HashMap<JobId, HashSet<String>>,
-    /// Jobs the SFV fallback has already ruled on (one-shot guard). The
-    /// completion gate is re-entered many times per job and the fallback's
-    /// disk arm reads the whole payload, so it runs once.
+    // Jobs the SFV fallback has already ruled on (one-shot guard). The
+    // completion gate is re-entered many times per job and the fallback's
+    // disk arm reads the whole payload, so it runs once.
     pub(super) sfv_checked: HashSet<JobId>,
-    /// Jobs that have already contributed a row to `weaver_verifications_total`.
-    /// Claimed by the first verdict a job produces, so the `unverifiable`
-    /// fallback recorded when a job ends with no PAR2 set can never
-    /// double-count a job an actual pass already ruled on.
+    // Jobs that have already contributed a row to `weaver_verifications_total`.
+    // Claimed by the first verdict a job produces, so the `unverifiable`
+    // fallback recorded when a job ends with no PAR2 set can never
+    // double-count a job an actual pass already ruled on.
     pub(in crate::pipeline) jobs_with_verification_outcome: HashSet<JobId>,
-    /// Promoted PAR2 recovery segments that can no longer be fetched or decoded.
+    // Promoted PAR2 recovery segments that can no longer be fetched or decoded.
     pub(super) unavailable_promoted_recovery_segments: HashSet<SegmentId>,
-    /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
-    pub(super) finished_jobs: Vec<JobInfo>,
-    /// Shared state for control plane reads (API handlers read without channel round-trip).
+    // Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
+    pub(super) finished_jobs: orchestrator::FinishedJobs,
+    // Shared state for control plane reads (API handlers read without channel round-trip).
     pub(super) shared_state: SharedPipelineState,
-    /// SQLite database for durable history.
+    // SQLite database for durable history.
     pub(super) db: crate::Database,
-    /// Tracks detached `db_fire_and_forget` writes so shutdown `drain` can join
-    /// them (bounded) instead of dropping in-flight writes. `db_fire_and_forget`
-    /// only has `&self`, so the JoinSet lives behind a shared mutex; the lock is
-    /// only ever held to spawn/drain, never across an await.
+    // Tracks detached `db_fire_and_forget` writes so shutdown `drain` can join
+    // them (bounded) instead of dropping in-flight writes. `db_fire_and_forget`
+    // only has `&self`, so the JoinSet lives behind a shared mutex; the lock is
+    // only ever held to spawn/drain, never across an await.
     pub(super) fire_and_forget_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
-    /// Shared config for runtime category lookups (dest_dir overrides).
+    // Shared config for runtime category lookups (dest_dir overrides).
     pub(super) config: crate::settings::SharedConfig,
-    /// Dedicated low-priority rayon thread pool for post-processing
-    /// (extraction, PAR2 verify/repair). Niced on Unix so the OS scheduler
-    /// prefers download/decode threads when CPU is contended.
+    // Dedicated low-priority rayon thread pool for post-processing
+    // (extraction, PAR2 verify/repair). Niced on Unix so the OS scheduler
+    // prefers download/decode threads when CPU is contended.
     pub(super) pp_pool: Arc<rayon::ThreadPool>,
-    /// Environment-derived, always-on extraction ceilings.
+    // Environment-derived, always-on extraction ceilings.
     pub(super) extraction_limits: Arc<ExtractionLimits>,
-    /// Scheduling metadata retained by admitted jobs.
+    // Scheduling metadata retained by admitted jobs.
     pub(super) job_scheduling_memory: HashMap<JobId, ProcessMemoryPermit>,
     pub(super) repeated_articles: HashMap<JobId, Arc<download::repeated::RepeatedArticles>>,
-    /// Shared allowance for scheduling, repair metadata, and extraction decoders.
+    // Shared allowance for scheduling, repair metadata, and extraction decoders.
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
-    /// The post-processing pool again, for direct-unpack chases only.
-    ///
-    /// A chase runs its decode inside `install`, which occupies one worker
-    /// thread for as long as the closure runs — and a chase's closure parks,
-    /// sometimes for the whole of a download and a repair. Sharing `pp_pool`
-    /// meant enough parked chases exhausted the post-processing pool and no
-    /// extraction of any kind could start. Chases contend only with each other
-    /// here.
+    // The post-processing pool again, for direct-unpack chases only.
+    //
+    // A chase runs its decode inside `install`, which occupies one worker
+    // thread for as long as the closure runs — and a chase's closure parks,
+    // sometimes for the whole of a download and a repair. Sharing `pp_pool`
+    // meant enough parked chases exhausted the post-processing pool and no
+    // extraction of any kind could start. Chases contend only with each other
+    // here.
     pub(super) chase_pool: Arc<rayon::ThreadPool>,
-    /// One shared output budget per job, retained across nested extraction layers.
+    // One shared output budget per job, retained across nested extraction layers.
     pub(super) extraction_budgets: HashMap<JobId, Arc<JobExtractionBudget>>,
-    /// A job's normalized unacceptable-extension policy is fixed at its first
-    /// archive extraction and reused by every subsequent RAR set and retry.
+    // A job's normalized unacceptable-extension policy is fixed at its first
+    // archive extraction and reused by every subsequent RAR set and retry.
     pub(super) unacceptable_extension_policies: HashMap<JobId, Arc<PostProcessingSettings>>,
 }
 

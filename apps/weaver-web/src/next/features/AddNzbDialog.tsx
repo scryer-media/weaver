@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
-import { submissionStatusCanForceRetry } from "@/features/duplicates/duplicate-presentation";
-import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-upload-nzb";
-import { NZB_UPLOAD_ACCEPT } from "@/features/upload/upload-file-types";
+import { submissionStatusCanForceRetry } from "@/next/features/duplicates/duplicate-presentation";
+import { useUploadNzb, type UploadNzbEntry } from "@/next/features/upload/use-upload-nzb";
+import { NZB_UPLOAD_ACCEPT } from "@/next/features/upload/upload-file-types";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/next/components/ConfirmDialog";
 import { Dialog } from "@/next/components/Dialog";

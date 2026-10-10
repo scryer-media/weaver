@@ -77,7 +77,8 @@ impl SystemSubscription {
         let initial_metrics = handle.get_metrics();
 
         Ok(async_stream::stream! {
-            yield build_system_metrics_snapshot(&handle, &config, initial_metrics).await;
+            let mut last = build_system_metrics_snapshot(&handle, &config, initial_metrics).await;
+            yield last.clone();
 
             let mut interval = tokio::time::interval(METRICS_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -85,7 +86,14 @@ impl SystemSubscription {
             loop {
                 interval.tick().await;
                 let metrics = handle.get_metrics();
-                yield build_system_metrics_snapshot(&handle, &config, metrics).await;
+                let snapshot = build_system_metrics_snapshot(&handle, &config, metrics).await;
+                // An idle server's gauges sit still; a tick that would send
+                // the client exactly what it already has sends nothing.
+                if snapshot == last {
+                    continue;
+                }
+                last = snapshot.clone();
+                yield snapshot;
             }
         })
     }
@@ -127,7 +135,7 @@ async fn build_system_metrics_snapshot(
     }
 }
 
-/// A few atomic loads per server, the same counts `serverHealth` reports.
+// A few atomic loads per server, the same counts `serverHealth` reports.
 fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConnections> {
     pool.server_configs()
         .iter()
@@ -148,7 +156,7 @@ fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConne
         .collect()
 }
 
-/// One atomic load per server; empty in the steady state.
+// One atomic load per server; empty in the steady state.
 fn provider_holdoffs(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderHoldoff> {
     pool.server_configs()
         .iter()

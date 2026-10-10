@@ -918,10 +918,10 @@ pub(super) unsafe fn sse2_mask64(vectors: [std::arch::x86_64::__m128i; 4], byte:
     a | (b << 16) | (c << 32) | (d << 48)
 }
 
-/// The four per-lane `=` compares of a 64-byte block plus the 64-bit `=` mask
-/// they reduce to. Keeping the compare vectors alive is what lets the escape
-/// offsets be selected straight off them ([`sse_decode_isolated_escapes`])
-/// instead of rebuilding a byte mask from `escaped` through memory.
+// The four per-lane `=` compares of a 64-byte block plus the 64-bit `=` mask
+// they reduce to. Keeping the compare vectors alive is what lets the escape
+// offsets be selected straight off them ([`sse_decode_isolated_escapes`])
+// instead of rebuilding a byte mask from `escaped` through memory.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -944,16 +944,16 @@ unsafe fn sse_eq_compares(
     (cmp, mask)
 }
 
-/// Isolated-escape decode for the four 16-byte lanes of a 64-byte block — the
-/// case `escaped == (eq << 1) | esc_first`, i.e. no consecutive-`=` run. The
-/// escaped lanes are exactly the `=` compares shifted one byte, so they come
-/// straight out of the compare vectors (the shape [`sse_raw_body`] already
-/// uses); lane 0's cross-block carry rides in through `yenc_offset` byte 0 (the
-/// oracle's `-42-64` trick). No mask→memory round-trip anywhere.
-///
-/// `BLEND_ADD` picks the SSE4.1 `pblendvb` offset select; the SSSE3 tier adds
-/// the `-64` marker onto `-42` instead. Both need SSSE3 (`palignr`) for the
-/// lane-to-lane escape carry, so this is never instantiated for plain SSE2.
+// Isolated-escape decode for the four 16-byte lanes of a 64-byte block — the
+// case `escaped == (eq << 1) | esc_first`, i.e. no consecutive-`=` run. The
+// escaped lanes are exactly the `=` compares shifted one byte, so they come
+// straight out of the compare vectors (the shape [`sse_raw_body`] already
+// uses); lane 0's cross-block carry rides in through `yenc_offset` byte 0 (the
+// oracle's `-42-64` trick). No mask→memory round-trip anywhere.
+//
+// `BLEND_ADD` picks the SSE4.1 `pblendvb` offset select; the SSSE3 tier adds
+// the `-64` marker onto `-42` instead. Both need SSSE3 (`palignr`) for the
+// lane-to-lane escape carry, so this is never instantiated for plain SSE2.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -999,10 +999,10 @@ unsafe fn sse_decode_isolated_escapes<const BLEND_ADD: bool>(
     decoded
 }
 
-/// Line-aware 64-byte-block driver for the pre-AVX2 tiers in the portable
-/// binary: consult the caller's line-length hint, try the fast whole-line
-/// path first, and fall back to the generic 64-byte block decode. Mirrors the
-/// AVX-512/VBMI2 line-aware kernel structure with SSSE3-width vectors.
+// Line-aware 64-byte-block driver for the pre-AVX2 tiers in the portable
+// binary: consult the caller's line-length hint, try the fast whole-line
+// path first, and fall back to the generic 64-byte block decode. Mirrors the
+// AVX-512/VBMI2 line-aware kernel structure with SSSE3-width vectors.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 pub(super) unsafe fn decode_kernel_simd64_ssse3_line_aware(
@@ -1084,11 +1084,11 @@ pub(super) unsafe fn decode_kernel_simd64_ssse3_line_aware(
     })
 }
 
-/// Whole-line fast path for the SSSE3 tier: decode one complete yEnc line
-/// (hint-length plus CRLF) in a single pass when the window holds it, bailing
-/// to the block path on escapes at boundaries, stuffed dots, or short input.
-/// Same guards and bail conditions as `try_decode_avx512_vbmi2_line`, with
-/// 4x16-byte vectors instead of one 512-bit vector.
+// Whole-line fast path for the SSSE3 tier: decode one complete yEnc line
+// (hint-length plus CRLF) in a single pass when the window holds it, bailing
+// to the block path on escapes at boundaries, stuffed dots, or short input.
+// Same guards and bail conditions as `try_decode_avx512_vbmi2_line`, with
+// 4x16-byte vectors instead of one 512-bit vector.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 #[allow(clippy::too_many_arguments)]
@@ -1245,7 +1245,7 @@ pub(super) unsafe fn compact_store_16_ssse3(
     *dst += keep;
 }
 
-/// SSE2 implementation: process 16 bytes at a time.
+// SSE2 implementation: process 16 bytes at a time.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 pub(super) unsafe fn decode_normal_run_sse2(
@@ -1337,9 +1337,9 @@ pub(super) unsafe fn decode_normal_run_avx(
 // per tier. Mirrors the STRUCTURE of `decode_kernel_avx2_raw`.
 // ---------------------------------------------------------------------------
 
-/// SSE2 unshuffle table for [`sse_compact_vect`]: row `k` holds `k` leading
-/// `0xff` bytes then `0x00`, so a byte-blend removes lane byte `k`. Ports the
-/// oracle's `unshufMask` (only the 16 rows a 16-bit lane mask can index).
+// SSE2 unshuffle table for [`sse_compact_vect`]: row `k` holds `k` leading
+// `0xff` bytes then `0x00`, so a byte-blend removes lane byte `k`. Ports the
+// oracle's `unshufMask` (only the 16 rows a 16-bit lane mask can index).
 #[cfg(target_arch = "x86_64")]
 fn sse2_unshuf_table() -> &'static [[u8; 16]; 16] {
     use std::sync::OnceLock;
@@ -1356,10 +1356,10 @@ fn sse2_unshuf_table() -> &'static [[u8; 16]; 16] {
     })
 }
 
-/// SSE2 vector compaction: remove the lane bytes flagged in the low 16 bits of
-/// `mask16`, packing the survivors toward byte 0. Literal port of the oracle's
-/// `sse2_compact_vect`; iterates set bits HIGH-to-LOW so removing a higher byte
-/// index never invalidates a lower one.
+// SSE2 vector compaction: remove the lane bytes flagged in the low 16 bits of
+// `mask16`, packing the survivors toward byte 0. Literal port of the oracle's
+// `sse2_compact_vect`; iterates set bits HIGH-to-LOW so removing a higher byte
+// index never invalidates a lower one.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1385,12 +1385,12 @@ unsafe fn sse_compact_vect(
     data
 }
 
-/// Escaped-byte offset application, SSE2-only body (loadu + add), used by the
-/// collision path across all tiers. Produces `-42` on ordinary bytes and
-/// `-106` (= -42-64) on escaped bytes — byte-identical to the oracle's
-/// `yencOffset` + `eqAdd` LUT combination. `escaped` bit 0 already carries the
-/// pending inter-window escape, so no separate `yenc_offset` byte-0 patch is
-/// needed here.
+// Escaped-byte offset application, SSE2-only body (loadu + add), used by the
+// collision path across all tiers. Produces `-42` on ordinary bytes and
+// `-106` (= -42-64) on escaped bytes — byte-identical to the oracle's
+// `yencOffset` + `eqAdd` LUT combination. `escaped` bit 0 already carries the
+// pending inter-window escape, so no separate `yenc_offset` byte-0 patch is
+// needed here.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -1410,10 +1410,10 @@ unsafe fn sse_escape_decode(
     _mm_add_epi8(block, off)
 }
 
-/// Generic 128-bit raw-decode body. Inline-only (no `#[target_feature]` of its
-/// own) so the tier wrappers supply the ISA and the SSSE3/SSE4.1 intrinsics in
-/// the `FAST_MATCH`/`BLEND_ADD` branches compile at the wrapper's feature level
-/// while the dead branches are const-folded away for the lower tiers.
+// Generic 128-bit raw-decode body. Inline-only (no `#[target_feature]` of its
+// own) so the tier wrappers supply the ISA and the SSSE3/SSE4.1 intrinsics in
+// the `FAST_MATCH`/`BLEND_ADD` branches compile at the wrapper's feature level
+// while the dead branches are const-folded away for the lower tiers.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]

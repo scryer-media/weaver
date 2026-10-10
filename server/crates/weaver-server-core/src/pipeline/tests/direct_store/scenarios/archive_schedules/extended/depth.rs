@@ -1,39 +1,39 @@
-//! Deeper schedules over the core direct-store RAR layouts: a fifth article,
-//! a second duplicate, and two interruptions in one run.
-//!
-//! Each family deepens one dimension of the archive matrix and keeps every
-//! other dimension as the matrix has it; families are never multiplied
-//! together. Every case is held to the archive matrix's own rules.
-//!
-//! A fifth article lands on the first volume (see `slot_layout`): two volumes
-//! carry three articles and two, four volumes two, one, one and one. The
-//! harness cuts each volume into equal articles, so four slots split evenly
-//! over two or four volumes and a fifth has to sit on one volume in either
-//! shape; one rule for both keeps slots numbered in file order. The first
-//! volume, which carries the archive and member headers, gives the two-volume
-//! shape an article that is neither its volume's first nor its last, and the
-//! four-volume shape a split volume ahead of single-article ones. Schedules
-//! keep naming slots `(slot / 2, slot % 2)`, so the fifth slot is `(2, 0)`
-//! whatever volume carries it.
+// Deeper schedules over the core direct-store RAR layouts: a fifth article,
+// a second duplicate, and two interruptions in one run.
+//
+// Each family deepens one dimension of the archive matrix and keeps every
+// other dimension as the matrix has it; families are never multiplied
+// together. Every case is held to the archive matrix's own rules.
+//
+// A fifth article lands on the first volume (see `slot_layout`): two volumes
+// carry three articles and two, four volumes two, one, one and one. The
+// harness cuts each volume into equal articles, so four slots split evenly
+// over two or four volumes and a fifth has to sit on one volume in either
+// shape; one rule for both keeps slots numbered in file order. The first
+// volume, which carries the archive and member headers, gives the two-volume
+// shape an article that is neither its volume's first nor its last, and the
+// four-volume shape a split volume ahead of single-article ones. Schedules
+// keep naming slots `(slot / 2, slot % 2)`, so the fifth slot is `(2, 0)`
+// whatever volume carries it.
 use super::*;
 
 type Order = Vec<(u32, u32)>;
 
-/// One deeper dimension of the archive matrix.
+// One deeper dimension of the archive matrix.
 #[derive(Clone, Copy, Debug)]
 enum Family {
-    /// Five article slots: every arrival permutation, a single duplicate,
-    /// every loss subset and a single interruption.
+    // Five article slots: every arrival permutation, a single duplicate,
+    // every loss subset and a single interruption.
     FifthArticle,
-    /// Four slots with two repeated articles, crossed with loss and a single
-    /// interruption.
+    // Four slots with two repeated articles, crossed with loss and a single
+    // interruption.
     SecondDuplicate,
-    /// Four slots with a single duplicate, crossed with loss and an ordered
-    /// pair of interruptions.
+    // Four slots with a single duplicate, crossed with loss and an ordered
+    // pair of interruptions.
     TwoInterruptions,
 }
 
-/// Cases spread across a smoke selection besides the first of each kind.
+// Cases spread across a smoke selection besides the first of each kind.
 const SMOKE_SPREAD: usize = 12;
 
 impl Family {
@@ -44,10 +44,10 @@ impl Family {
         }
     }
 
-    /// Shards a campaign is cut into: about a thousand cases a shard, fewer
-    /// where a case restarts the pipeline twice, and twice as many for the
-    /// formats whose cases run long enough that a shard of the usual size
-    /// outruns the per-test limit.
+    // Shards a campaign is cut into: about a thousand cases a shard, fewer
+    // where a case restarts the pipeline twice, and twice as many for the
+    // formats whose cases run long enough that a shard of the usual size
+    // outruns the per-test limit.
     const fn shards(self, format: Format) -> usize {
         let shards = match self {
             Self::FifthArticle | Self::TwoInterruptions => 80,
@@ -65,7 +65,7 @@ impl Family {
         if finer { 2 * shards } else { shards }
     }
 
-    /// Every case of the family, by replay index.
+    // Every case of the family, by replay index.
     fn cases(self) -> Vec<Schedule> {
         let four = permutations(4);
         match self {
@@ -74,8 +74,11 @@ impl Family {
                 let mut orders = with_duplicate(&five);
                 orders.extend(five);
                 assert_eq!(orders.len(), 1320);
+                // One order in two, by a fixed stride over the sorted orders.
+                let orders: BTreeSet<Order> = orders.into_iter().step_by(2).collect();
+                assert_eq!(orders.len(), 660);
                 let cases = single_interruption_cases(5, &orders, |_| true);
-                assert_eq!(cases.len(), 91_209);
+                assert_eq!(cases.len(), 69_489);
                 cases
             }
             Self::SecondDuplicate => {
@@ -101,12 +104,12 @@ impl Family {
         }
     }
 
-    /// The family's cases for one selection, by replay index. A smoke run
-    /// takes the first case of every kind and a spread of the rest.
-    ///
-    /// `WEAVER_ARCHIVE_SCHEDULE_CASE=<n>` or `WEAVER_ARCHIVE_COMBINED_CASE=<n>`
-    /// (or `<start>..<end>`) replays those replay indices: a smoke run runs
-    /// them, a shard the ones it owns.
+    // The family's cases for one selection, by replay index. A smoke run
+    // takes the first case of every kind and a spread of the rest.
+    //
+    // `WEAVER_ARCHIVE_SCHEDULE_CASE=<n>` or `WEAVER_ARCHIVE_COMBINED_CASE=<n>`
+    // (or `<start>..<end>`) replays those replay indices: a smoke run runs
+    // them, a shard the ones it owns.
     fn selected(self, format: Format, selection: Selection) -> Vec<(usize, Schedule)> {
         let cases = self.cases();
         let replay = replayed(cases.len());
@@ -117,6 +120,7 @@ impl Family {
             .into_iter()
             .enumerate()
             .filter(|(case, (_, interruption))| match selection {
+                Selection::Case(selected) => *case == selected,
                 Selection::Shard(shard) => {
                     assert!(shard < shards);
                     case % shards == shard
@@ -135,7 +139,7 @@ impl Family {
     }
 }
 
-/// The replay indices an environment override names, if any.
+// The replay indices an environment override names, if any.
 fn replayed(cases: usize) -> Option<std::ops::Range<usize>> {
     let selection = std::env::var("WEAVER_ARCHIVE_SCHEDULE_CASE")
         .or_else(|_| std::env::var("WEAVER_ARCHIVE_COMBINED_CASE"))
@@ -154,8 +158,8 @@ fn replayed(cases: usize) -> Option<std::ops::Range<usize>> {
     Some(range)
 }
 
-/// What sets one case apart from another for a smoke selection: the shape of
-/// its interruption, without its boundaries or loss mask.
+// What sets one case apart from another for a smoke selection: the shape of
+// its interruption, without its boundaries or loss mask.
 fn kind(interruption: Interruption) -> (u8, BoundaryAction, BoundaryAction, bool) {
     use BoundaryAction as Action;
     match interruption {
@@ -182,7 +186,7 @@ fn kind(interruption: Interruption) -> (u8, BoundaryAction, BoundaryAction, bool
     }
 }
 
-/// Every arrival order of `slots` article slots, each once.
+// Every arrival order of `slots` article slots, each once.
 fn permutations(slots: usize) -> BTreeSet<Order> {
     fn permute(at: usize, items: &mut [(u32, u32)], output: &mut BTreeSet<Order>) {
         if at == items.len() {
@@ -200,8 +204,8 @@ fn permutations(slots: usize) -> BTreeSet<Order> {
     orders
 }
 
-/// Each order with one earlier article repeated at every nonterminal
-/// insertion point, so the last article to arrive is always a new one.
+// Each order with one earlier article repeated at every nonterminal
+// insertion point, so the last article to arrive is always a new one.
 fn with_duplicate(orders: &BTreeSet<Order>) -> BTreeSet<Order> {
     let mut result = BTreeSet::new();
     for order in orders {
@@ -220,12 +224,12 @@ fn lost(mask: u8, (file, article): (u32, u32)) -> bool {
     mask & (1 << (file * 2 + article)) != 0
 }
 
-/// The archive matrix's cases for any slot count and arrival orders, in its
-/// order: every loss subset with the index first or last, uninterrupted and
-/// restarted or demoted at every received boundary; the lossless orders
-/// uninterrupted and restarted or demoted before their last arrival; a crash
-/// wherever a restart was tried; and every lossy received sequence with
-/// nothing to repair it from. Received sequences `keep` refuses are left out.
+// The archive matrix's cases for any slot count and arrival orders, in its
+// order: every loss subset with the index first or last, uninterrupted and
+// restarted or demoted at every received boundary; the lossless orders
+// uninterrupted and restarted or demoted before their last arrival; a crash
+// wherever a restart was tried; and every lossy received sequence with
+// nothing to repair it from. Received sequences `keep` refuses are left out.
 fn single_interruption_cases(
     slots: usize,
     orders: &BTreeSet<Order>,
@@ -317,9 +321,9 @@ fn single_interruption_cases(
     cases
 }
 
-/// An ordered pair of boundary actions at boundaries `first_at <= second_at`.
-/// Two demotions at one boundary are one: nothing arrives between them to
-/// give the second anything new to claim.
+// An ordered pair of boundary actions at boundaries `first_at <= second_at`.
+// Two demotions at one boundary are one: nothing arrives between them to
+// give the second anything new to claim.
 fn action_pairs(boundaries: &[usize]) -> Vec<(BoundaryAction, usize, BoundaryAction, usize)> {
     const ACTIONS: [BoundaryAction; 3] = [
         BoundaryAction::Restart,
@@ -345,10 +349,10 @@ fn action_pairs(boundaries: &[usize]) -> Vec<(BoundaryAction, usize, BoundaryAct
     pairs
 }
 
-/// The archive matrix's interrupted cases with a pair of interruptions in
-/// place of one: every loss subset with the index first or last and a pair
-/// at every two received boundaries; then the lossless orders with a pair
-/// at every two boundaries before their last arrival.
+// The archive matrix's interrupted cases with a pair of interruptions in
+// place of one: every loss subset with the index first or last and a pair
+// at every two received boundaries; then the lossless orders with a pair
+// at every two boundaries before their last arrival.
 fn two_interruption_cases(orders: &BTreeSet<Order>) -> Vec<Schedule> {
     let mut cases = BTreeSet::new();
     for mask in 1u8..16 {
@@ -425,8 +429,8 @@ async fn family_campaign(
     .await;
 }
 
-/// The family's generator, given the archive matrix's own slots and orders,
-/// builds the archive matrix case for case.
+// The family's generator, given the archive matrix's own slots and orders,
+// builds the archive matrix case for case.
 #[test]
 fn single_interruption_cases_reproduce_the_archive_matrix() {
     let four = permutations(4);

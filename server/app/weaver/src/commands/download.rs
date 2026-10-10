@@ -58,8 +58,13 @@ pub(crate) async fn run(
     let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
     let proxy_db = db.clone();
     let runtime_handle = tokio::runtime::Handle::current();
+    let proxy_policy = std::sync::Arc::clone(&server_transfer_policy);
     let proxies = tokio::task::spawn_blocking(move || {
-        weaver_server_core::proxies::ProxyRuntime::new(proxy_db, runtime_handle)
+        weaver_server_core::proxies::ProxyRuntime::with_quota_policy(
+            proxy_db,
+            runtime_handle,
+            Some(proxy_policy),
+        )
     })
     .await??;
     let nntp = wiring::build_nntp_client(config, &profile, &server_transfer_policy, &proxies)?;
@@ -358,12 +363,12 @@ async fn wait_for_job_terminal(
     }
 }
 
-/// Drain the database writer queue before the standalone `download` command
-/// exits. The pipeline it runs enqueues durable writes onto that queue
-/// (job-history archival via `try_queue_archive_job`, active-runtime state via
-/// `try_queue_write`); unlike `serve`, this path has no event-persistence task
-/// to run the final flush, so it must flush here or those writes can be dropped
-/// at process exit. Bounded so a stuck flush cannot hang the CLI.
+// Drain the database writer queue before the standalone `download` command
+// exits. The pipeline it runs enqueues durable writes onto that queue
+// (job-history archival via `try_queue_archive_job`, active-runtime state via
+// `try_queue_write`); unlike `serve`, this path has no event-persistence task
+// to run the final flush, so it must flush here or those writes can be dropped
+// at process exit. Bounded so a stuck flush cannot hang the CLI.
 async fn flush_writer_queue_on_exit(db: &Database) {
     const WRITER_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     match tokio::time::timeout(WRITER_FLUSH_TIMEOUT, db.flush_write_queue()).await {

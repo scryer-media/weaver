@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
+use crate::bandwidth::QuotaWeekday;
 use crate::categories::CategoryConfig;
 use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, StoreDatastore};
@@ -665,10 +665,10 @@ fn normalize_sqlite_index_expression(_table: &str, column: &str, collation: &str
     }
 }
 
-/// Append a canonical descending marker so both dialects encode index sort
-/// direction identically. Postgres only prints the non-default `DESC` in
-/// `pg_indexes.indexdef` (ascending is implicit), so ascending columns carry no
-/// suffix on either side and descending columns become `"<expr> desc"`.
+// Append a canonical descending marker so both dialects encode index sort
+// direction identically. Postgres only prints the non-default `DESC` in
+// `pg_indexes.indexdef` (ascending is implicit), so ascending columns carry no
+// suffix on either side and descending columns become `"<expr> desc"`.
 fn normalize_index_direction(expression: &str, descending: bool) -> String {
     if descending {
         format!("{} desc", expression.trim())
@@ -677,11 +677,11 @@ fn normalize_index_direction(expression: &str, descending: bool) -> String {
     }
 }
 
-/// Split a trailing Postgres sort-direction clause off an index-column
-/// expression, returning the bare expression plus whether it is descending. A
-/// default `NULLS FIRST/LAST` clause (which Postgres omits from `indexdef`) is
-/// dropped as well so it does not create spurious drift against SQLite, which
-/// never surfaces one.
+// Split a trailing Postgres sort-direction clause off an index-column
+// expression, returning the bare expression plus whether it is descending. A
+// default `NULLS FIRST/LAST` clause (which Postgres omits from `indexdef`) is
+// dropped as well so it does not create spurious drift against SQLite, which
+// never surfaces one.
 fn split_postgres_index_direction(expression: &str) -> (String, bool) {
     let mut rest = expression.trim();
     if let Some(stripped) = strip_trailing_keyword(rest, "nulls first")
@@ -698,9 +698,9 @@ fn split_postgres_index_direction(expression: &str) -> (String, bool) {
     (rest.to_string(), false)
 }
 
-/// Strip a whitespace-delimited trailing keyword (case-insensitive), returning
-/// the prefix when the keyword is present and preceded by whitespace (so column
-/// names ending in the keyword's letters, like `foodesc`, are not matched).
+// Strip a whitespace-delimited trailing keyword (case-insensitive), returning
+// the prefix when the keyword is present and preceded by whitespace (so column
+// names ending in the keyword's letters, like `foodesc`, are not matched).
 fn strip_trailing_keyword<'a>(value: &'a str, keyword: &str) -> Option<&'a str> {
     let trimmed = value.trim_end();
     let prefix = trimmed.get(..trimmed.len().checked_sub(keyword.len())?)?;
@@ -1163,9 +1163,9 @@ async fn try_queue_write_full_queue_resend_is_covered_by_flush() {
     );
 }
 
-/// Drives the Postgres lane writer directly. The ops below never touch the
-/// database, so an in-memory SQLite handle stands in for the one they receive;
-/// what is under test is only when each op is allowed to run.
+// Drives the Postgres lane writer directly. The ops below never touch the
+// database, so an in-memory SQLite handle stands in for the one they receive;
+// what is under test is only when each op is allowed to run.
 fn spawn_lane_writer(
     db: &Database,
     concurrency: usize,
@@ -1231,7 +1231,7 @@ fn push_lane_log(log: &LaneLog, entry: &'static str) {
     log.lock().unwrap().push(entry);
 }
 
-/// An op that blocks until `release` fires, then logs `entry`.
+// An op that blocks until `release` fires, then logs `entry`.
 fn gated_lane_op(
     log: &LaneLog,
     entry: &'static str,
@@ -1401,8 +1401,8 @@ async fn postgres_lanes_finish_every_taken_write_when_the_queue_closes() {
     assert_eq!(*log.lock().unwrap(), vec!["job1", "job1-after"]);
 }
 
-/// An op that reports it started, then blocks until `release` fires and logs
-/// `entry`.
+// An op that reports it started, then blocks until `release` fires and logs
+// `entry`.
 fn announced_gated_lane_op(
     log: &LaneLog,
     entry: &'static str,
@@ -1796,11 +1796,11 @@ async fn postgres_bulk_hot_paths_when_configured() {
     admin_pool.close().await;
 }
 
-/// Exercise the write ops whose Postgres arms today run as guarded autocommit
-/// statements (converted from `run_in_transaction`) plus the bulk primitives, so
-/// those pg-only code paths — unreachable on the sqlite-default suite — are
-/// validated end to end against a real Postgres. Row effects are asserted with
-/// reads after each step so a failure localizes to the offending op.
+// Exercise the write ops whose Postgres arms today run as guarded autocommit
+// statements (converted from `run_in_transaction`) plus the bulk primitives, so
+// those pg-only code paths — unreachable on the sqlite-default suite — are
+// validated end to end against a real Postgres. Row effects are asserted with
+// reads after each step so a failure localizes to the offending op.
 #[tokio::test]
 async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
     let Some((admin_pool, schema, target_url)) =
@@ -2615,7 +2615,7 @@ async fn postgres_runtime_smoke_when_configured() {
                 limit_bytes: 20_000_000,
                 period: crate::servers::ServerDownloadQuotaPeriod::Weekly,
                 reset_time_minutes_local: 120,
-                weekly_reset_weekday: IspBandwidthCapWeekday::Thu,
+                weekly_reset_weekday: QuotaWeekday::Thu,
                 monthly_reset_day: 10,
             },
             tls_ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
@@ -2633,14 +2633,6 @@ async fn postgres_runtime_smoke_when_configured() {
         }),
         max_download_speed: Some(12_345),
         cleanup_after_extract: Some(false),
-        isp_bandwidth_cap: Some(IspBandwidthCapConfig {
-            enabled: true,
-            period: IspBandwidthCapPeriod::Weekly,
-            limit_bytes: 9_999_999,
-            reset_time_minutes_local: 6 * 60,
-            weekly_reset_weekday: IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 7,
-        }),
         propagation_delay_secs: Some(0),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -2657,13 +2649,6 @@ async fn postgres_runtime_smoke_when_configured() {
     assert_eq!(loaded_config.complete_dir, config.complete_dir);
     assert_eq!(loaded_config.max_download_speed, config.max_download_speed);
     assert_eq!(loaded_config.cleanup_after_extract, Some(false));
-    assert_eq!(
-        loaded_config
-            .isp_bandwidth_cap
-            .as_ref()
-            .map(|cap| cap.period),
-        Some(IspBandwidthCapPeriod::Weekly)
-    );
     assert_eq!(loaded_config.servers.len(), 1);
     assert_eq!(loaded_config.servers[0].host, "news.example.com");
     assert_eq!(loaded_config.servers[0].max_download_speed, 3_000_000);
@@ -2747,6 +2732,7 @@ async fn postgres_runtime_smoke_when_configured() {
     assert!(!db.delete_server_tls_diagnostics(8).unwrap());
 
     let rss_feed = RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "Feed 1".to_string(),
         url: "https://example.com/feed.xml".to_string(),
@@ -2901,10 +2887,10 @@ async fn postgres_runtime_smoke_when_configured() {
     admin_pool.close().await;
 }
 
-/// The direct-store coverage checkpoint is one replaced row per
-/// archive set. This is the Postgres twin of the sqlite roundtrip in
-/// `jobs::repository::tests`, so both engines are proven to upsert, read back
-/// and delete through the same three statements.
+// The direct-store coverage checkpoint is one replaced row per
+// archive set. This is the Postgres twin of the sqlite roundtrip in
+// `jobs::repository::tests`, so both engines are proven to upsert, read back
+// and delete through the same three statements.
 #[tokio::test]
 async fn postgres_direct_coverage_roundtrip_when_configured() {
     let Some((admin_pool, schema, target_url)) =
@@ -2999,36 +2985,102 @@ async fn postgres_post_processing_roundtrip_when_configured() {
     assert_eq!(db.post_processing_settings().unwrap(), settings);
 
     let script = crate::post_processing::model::ScriptName::new("notify.sh").unwrap();
-    let mut lists = crate::post_processing::model::ScriptLists {
-        global: crate::post_processing::model::ScriptList::new(vec![
-            crate::post_processing::model::ScriptListEntry::new(script.clone()),
-        ])
-        .unwrap(),
-        ..Default::default()
-    };
-    lists.categories.insert(
-        "movies".into(),
-        crate::post_processing::model::ScriptList::new(vec![]).unwrap(),
-    );
-    db.save_post_processing_script_lists(&lists).unwrap();
-    assert_eq!(db.post_processing_script_lists().unwrap(), lists);
-
-    let options = vec![crate::post_processing::model::ResolvedOption::new(
-        crate::post_processing::model::OptionName::new("Token").unwrap(),
-        crate::post_processing::model::OptionValue::Secret(
-            crate::post_processing::model::SecretOptionValue::from_admin_input("hunter2"),
-        ),
-    )];
-    db.save_post_processing_script_options(&script, &options)
+    let token = db.create_secret("Notify token", "hunter2").unwrap();
+    let instance = db
+        .create_script_instance(
+            crate::post_processing::instances::ScriptInstanceDraft::new(
+                script.clone(),
+                crate::post_processing::instances::InstanceTrigger::Queue(
+                    crate::post_processing::model::QueueEvent::NzbAdded,
+                ),
+            )
+            .named("Notify")
+            .input("Server", "example.test")
+            .secret_input("Token", &token.id)
+            .sealed_input("Password", "hunter3")
+            .category("movies")
+            .fire_and_forget()
+            .timeout(90),
+        )
         .unwrap();
-    let raw = db
-        .get_setting("post_processing.script_options.v1")
+    assert_eq!(
+        db.script_instances().unwrap(),
+        std::slice::from_ref(&instance)
+    );
+    // A secret is never handed back with the instance.
+    assert_eq!(
+        instance
+            .inputs
+            .iter()
+            .map(|input| (
+                input.name.as_str(),
+                input.value.as_str(),
+                input.secret.as_ref().map(|secret| secret.name.as_str()),
+                input.sealed
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("Server", "example.test", None, false),
+            ("Token", "", Some("Notify token"), false),
+            ("Password", "", None, true)
+        ]
+    );
+    assert!(matches!(
+        db.delete_secret(&token.id),
+        Err(crate::post_processing::secrets::SecretError::InUse(_))
+    ));
+    let run_inputs = db
+        .script_instance_run_inputs(&instance.id)
         .unwrap()
         .unwrap();
-    assert!(!raw.contains("hunter2"));
-    let loaded = db.post_processing_script_options(&script).unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert!(loaded[0].value().is_secret());
+    assert_eq!(run_inputs.len(), 3);
+    assert!(run_inputs[1].value().is_secret());
+    assert!(matches!(
+        run_inputs[2].value(),
+        crate::post_processing::model::OptionValue::Secret(value)
+            if value.expose_for_execution() == "hunter3"
+    ));
+    // Saved back as it was read, the instance keeps its own secret sealed.
+    let kept = db
+        .update_script_instance(
+            &instance.id,
+            crate::post_processing::instances::ScriptInstanceDraft::from_instance(&instance),
+        )
+        .unwrap();
+    assert_eq!(kept.inputs, instance.inputs);
+    assert!(matches!(
+        db.script_instance_run_inputs(&instance.id).unwrap().unwrap()[2].value(),
+        crate::post_processing::model::OptionValue::Secret(value)
+            if value.expose_for_execution() == "hunter3"
+    ));
+    db.validate_encrypted_credentials(db.encryption_key().unwrap())
+        .unwrap();
+    let feed_instance = db
+        .create_script_instance(crate::post_processing::instances::ScriptInstanceDraft::new(
+            script.clone(),
+            crate::post_processing::instances::InstanceTrigger::Feed,
+        ))
+        .unwrap();
+    db.set_feed_script_instances(7, std::slice::from_ref(&feed_instance.id))
+        .unwrap();
+    assert_eq!(
+        db.feed_script_instance_ids(7).unwrap(),
+        std::slice::from_ref(&feed_instance.id)
+    );
+    db.reorder_script_instances(&[feed_instance.id.clone(), instance.id.clone()])
+        .unwrap();
+    assert_eq!(
+        db.script_instances()
+            .unwrap()
+            .iter()
+            .map(|saved| saved.id.clone())
+            .collect::<Vec<_>>(),
+        [feed_instance.id.clone(), instance.id.clone()]
+    );
+    assert!(db.delete_script_instance(&feed_instance.id).unwrap());
+    assert!(db.feed_script_instance_ids(7).unwrap().is_empty());
+    assert!(db.delete_script_instance(&instance.id).unwrap());
+    assert!(db.script_instances().unwrap().is_empty());
 
     let job_id = 4242;
     db.insert_job_history(&crate::history::JobHistoryRow {
@@ -3054,11 +3106,16 @@ async fn postgres_post_processing_roundtrip_when_configured() {
     .unwrap();
     let results = vec![crate::post_processing::model::ScriptResult {
         script,
+        instance_id: Some("instance".into()),
+        instance_name: Some("Notify".into()),
+        event: Default::default(),
         adapter: crate::post_processing::model::ScriptAdapter::Nzbget,
         status: crate::post_processing::model::ScriptStatus::Succeeded,
         exit_code: Some(93),
         duration_ms: 5,
         output_tail: "postgres-log".into(),
+        output_id: None,
+        background: false,
         output_truncated: true,
         error_message: None,
         finished_at_epoch_ms: 3,

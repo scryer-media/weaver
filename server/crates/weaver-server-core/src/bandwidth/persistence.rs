@@ -15,6 +15,18 @@ impl Database {
         &self,
         entries: &[(i64, u64)],
     ) -> Result<(), StateError> {
+        self.add_metered_bandwidth_usage_minutes(
+            &entries
+                .iter()
+                .map(|&(minute, bytes)| (minute, true, bytes))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub(crate) fn add_metered_bandwidth_usage_minutes(
+        &self,
+        entries: &[(i64, bool, u64)],
+    ) -> Result<(), StateError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -29,14 +41,15 @@ impl Database {
                         |tx| {
                             let entries = entries.clone();
                             Box::pin(async move {
-                                for (bucket_epoch_minute, payload_bytes) in entries {
+                                for (bucket_epoch_minute, metered, payload_bytes) in entries {
                                     tx.execute(
-                                        "INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
-                                         VALUES ({}, {})
-                                         ON CONFLICT(bucket_epoch_minute)
+                                        "INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, metered, payload_bytes)
+                                         VALUES ({}, {}, {})
+                                         ON CONFLICT(bucket_epoch_minute, metered)
                                          DO UPDATE SET payload_bytes = bandwidth_usage_minute_buckets.payload_bytes + excluded.payload_bytes",
                                         &[
                                             SqlArg::I64(bucket_epoch_minute),
+                                            SqlArg::I64(i64::from(metered)),
                                             SqlArg::I64(payload_bytes as i64),
                                         ],
                                     )
@@ -50,18 +63,19 @@ impl Database {
                 }
                 SqlEngine::Postgres => {
                     let started = std::time::Instant::now();
-                    let placeholders = vec!["({}, {})"; entries.len()].join(", ");
-                    let mut args = Vec::with_capacity(entries.len() * 2);
-                    for (bucket_epoch_minute, payload_bytes) in entries {
+                    let placeholders = vec!["({}, {}, {})"; entries.len()].join(", ");
+                    let mut args = Vec::with_capacity(entries.len() * 3);
+                    for (bucket_epoch_minute, metered, payload_bytes) in entries {
                         args.push(SqlArg::I64(bucket_epoch_minute));
+                        args.push(SqlArg::I64(i64::from(metered)));
                         args.push(SqlArg::I64(payload_bytes as i64));
                     }
                     let result = SqlRuntime::execute(
                         datastore.read_exec(),
                         &format!(
-                            "INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
+                            "INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, metered, payload_bytes)
                              VALUES {placeholders}
-                             ON CONFLICT(bucket_epoch_minute)
+                             ON CONFLICT(bucket_epoch_minute, metered)
                              DO UPDATE SET payload_bytes = bandwidth_usage_minute_buckets.payload_bytes + excluded.payload_bytes"
                         ),
                         &args,

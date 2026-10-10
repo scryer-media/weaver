@@ -27,7 +27,7 @@ async fn attribution_checkpoint_survives_repeated_active_job_restores() {
     pipeline.db.flush_write_queue().await.unwrap();
     assert!(pipeline.dirty_server_attribution.is_empty());
     assert!(pipeline.pending_file_progress.is_empty());
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
 
     for round in 0..2 {
         let (mut restored, _, _) = new_direct_pipeline(&temp).await;
@@ -77,6 +77,7 @@ async fn attribution_checkpoint_survives_repeated_active_job_restores() {
                 .wire_bytes,
             150 + round * 50
         );
+        retire_pipeline_database(restored).await;
     }
 }
 

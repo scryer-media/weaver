@@ -30,24 +30,24 @@ struct RestoreSkipPlan {
     stats: RestoreSkipStats,
 }
 
-/// Whole segments that a contiguous byte floor covers, and the floor those
-/// segments actually account for.
+// Whole segments that a contiguous byte floor covers, and the floor those
+// segments actually account for.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FloorCoveredSegments {
     pub(crate) segments: Vec<SegmentId>,
-    /// Never a partial segment: the end offset of the last segment lying
-    /// entirely below the requested floor.
+    // Never a partial segment: the end offset of the last segment lying
+    // entirely below the requested floor.
     pub(crate) floor: u64,
 }
 
-/// Walks `segments` in NZB order and returns every segment lying entirely below
-/// `floor`, together with the contiguous byte floor those whole segments
-/// account for.
-///
-/// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
-/// to the declared file size and the partial file's on-disk length before
-/// calling. Direct-store coverage floors deliberately do not: for a direct set
-/// the source volume has no file at all, and file length never implies coverage.
+// Walks `segments` in NZB order and returns every segment lying entirely below
+// `floor`, together with the contiguous byte floor those whole segments
+// account for.
+//
+// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
+// to the declared file size and the partial file's on-disk length before
+// calling. Direct-store coverage floors deliberately do not: for a direct set
+// the source volume has no file at all, and file length never implies coverage.
 pub(crate) fn segments_covered_by_floor(
     file_id: NzbFileId,
     segments: &[crate::jobs::model::SegmentSpec],
@@ -623,6 +623,7 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
+        self.queue_scripts_completed.remove(&job_id);
 
         let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
         if let Some(generation) = options.semantic_materialization_generation {
@@ -852,6 +853,7 @@ impl Pipeline {
             early_recovery_requested_blocks: 0,
             last_health_probe_failed_bytes: 0,
             next_health_probe_failed_bytes: 1,
+            support_facts: Default::default(),
             detected_archives: HashMap::new(),
             file_identities,
             held_segments: Vec::new(),
@@ -869,6 +871,7 @@ impl Pipeline {
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
+        self.raise_added_script_event(job_id);
 
         crate::runtime::perf_probe::record(
             "pipeline.add_job.runtime_state_inserted",
@@ -885,18 +888,18 @@ impl Pipeline {
         Ok(())
     }
 
-    /// How many of a job's payload files lead with their first article.
-    /// Recovery volumes are never sampled, so they do not count toward it:
-    /// counted by file index, a post that lists its recovery first would
-    /// sample few payload files or none, and the gate could never run.
-    ///
-    /// The wave exists to sample the post, not to reshape the job. A bounded
-    /// number of leading files answers "is this post still on the server" as
-    /// well as every file would, and every extra file in the wave costs the
-    /// direct store: the head of a later volume arrives long before the
-    /// sequential frontier reaches it, so it sits in a hold for the whole
-    /// stretch of volumes ahead of it. Thirty-two holds is a sample; a hold
-    /// per volume of a large set is a second copy of the download.
+    // How many of a job's payload files lead with their first article.
+    // Recovery volumes are never sampled, so they do not count toward it:
+    // counted by file index, a post that lists its recovery first would
+    // sample few payload files or none, and the gate could never run.
+    //
+    // The wave exists to sample the post, not to reshape the job. A bounded
+    // number of leading files answers "is this post still on the server" as
+    // well as every file would, and every extra file in the wave costs the
+    // direct store: the head of a later volume arrives long before the
+    // sequential frontier reaches it, so it sits in a hold for the whole
+    // stretch of volumes ahead of it. Thirty-two holds is a sample; a hold
+    // per volume of a large set is a second copy of the download.
     const FIRST_ARTICLE_SAMPLE_FILES: usize = 32;
 
     pub(crate) fn build_job_assembly(
@@ -1086,10 +1089,23 @@ impl Pipeline {
         (assembly, download_queue, recovery_queue)
     }
 
+    #[cfg(test)]
     pub(crate) async fn reprocess_job(
         &mut self,
         job_id: JobId,
     ) -> Result<(), crate::SchedulerError> {
+        self.reprocess_job_with_password(job_id, None).await
+    }
+
+    pub(crate) async fn reprocess_job_with_password(
+        &mut self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), crate::SchedulerError> {
+        if password.is_some() {
+            self.archive_password_winners
+                .retain(|(id, _), _| *id != job_id);
+        }
         let in_jobs = self.jobs.contains_key(&job_id);
 
         if in_jobs {
@@ -1102,82 +1118,94 @@ impl Pipeline {
             }
         } else {
             let history_row = self.load_history_row(job_id).await?;
-            let (nzb, nzb_path, nzb_hash, category, metadata, output_dir, downloaded_bytes) =
-                if let Some(row) = history_row.as_ref() {
-                    let status = crate::job_status_from_persisted_str(
-                        &row.status,
-                        row.error_message.as_deref(),
-                    );
-                    if !Self::is_restartable_terminal_status(&status) {
-                        return Err(crate::SchedulerError::Conflict(format!(
-                            "job {} is not complete or failed",
-                            job_id.0
-                        )));
-                    }
+            let (
+                nzb,
+                nzb_path,
+                nzb_zstd,
+                nzb_hash,
+                category,
+                metadata,
+                output_dir,
+                downloaded_bytes,
+            ) = if let Some(row) = history_row.as_ref() {
+                let status =
+                    crate::job_status_from_persisted_str(&row.status, row.error_message.as_deref());
+                if !Self::is_restartable_terminal_status(&status) {
+                    return Err(crate::SchedulerError::Conflict(format!(
+                        "job {} is not complete or failed",
+                        job_id.0
+                    )));
+                }
 
-                    let metadata = row
-                        .metadata
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
-                        .unwrap_or_default();
+                let metadata = row
+                    .metadata
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
+                    .unwrap_or_default();
 
-                    let (preferred_nzb_path, nzb_zstd) = self
-                        .db
-                        .load_history_job_persisted_nzb(job_id.0)
-                        .map_err(crate::SchedulerError::State)?
-                        .unwrap_or_else(|| {
-                            (self.persisted_nzb_path_for_job(job_id, Some(row)), None)
-                        });
-                    let (nzb, nzb_path, nzb_zstd) =
-                        self.load_restart_nzb(job_id, &preferred_nzb_path, nzb_zstd)?;
-                    let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
-                    (
-                        nzb,
-                        nzb_path,
-                        nzb_hash,
-                        row.category.clone(),
-                        metadata,
-                        row.output_dir.clone(),
-                        row.downloaded_bytes,
-                    )
-                } else {
-                    let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
-                    let Some(info) = history_entry else {
-                        return Err(crate::SchedulerError::JobNotFound(job_id));
-                    };
-                    if !Self::is_restartable_terminal_status(&info.status) {
-                        return Err(crate::SchedulerError::Conflict(format!(
-                            "job {} is not complete or failed",
-                            job_id.0
-                        )));
-                    }
-
-                    let (nzb_path, nzb_zstd) = self
-                        .db
-                        .load_history_job_persisted_nzb(job_id.0)
-                        .map_err(crate::SchedulerError::State)?
-                        .unwrap_or_else(|| {
-                            (
-                                self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
-                                None,
-                            )
-                        });
-                    let (nzb, nzb_path, nzb_zstd) =
-                        self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-                    let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
-
-                    (
-                        nzb,
-                        nzb_path,
-                        nzb_hash,
-                        info.category.clone(),
-                        info.metadata.clone(),
-                        info.output_dir.clone(),
-                        info.downloaded_bytes,
-                    )
+                let (preferred_nzb_path, nzb_zstd) = self
+                    .db
+                    .load_history_job_persisted_nzb(job_id.0)
+                    .map_err(crate::SchedulerError::State)?
+                    .unwrap_or_else(|| (self.persisted_nzb_path_for_job(job_id, Some(row)), None));
+                let (nzb, nzb_path, nzb_zstd) =
+                    self.load_restart_nzb(job_id, &preferred_nzb_path, nzb_zstd)?;
+                let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
+                (
+                    nzb,
+                    nzb_path,
+                    nzb_zstd,
+                    nzb_hash,
+                    row.category.clone(),
+                    metadata,
+                    row.output_dir.clone(),
+                    row.downloaded_bytes,
+                )
+            } else {
+                let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
+                let Some(info) = history_entry else {
+                    return Err(crate::SchedulerError::JobNotFound(job_id));
                 };
+                if !Self::is_restartable_terminal_status(&info.status) {
+                    return Err(crate::SchedulerError::Conflict(format!(
+                        "job {} is not complete or failed",
+                        job_id.0
+                    )));
+                }
 
-            let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+                let (nzb_path, nzb_zstd) = self
+                    .db
+                    .load_history_job_persisted_nzb(job_id.0)
+                    .map_err(crate::SchedulerError::State)?
+                    .unwrap_or_else(|| {
+                        (
+                            self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
+                            None,
+                        )
+                    });
+                let (nzb, nzb_path, nzb_zstd) =
+                    self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
+                let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
+
+                (
+                    nzb,
+                    nzb_path,
+                    nzb_zstd,
+                    nzb_hash,
+                    info.category.clone(),
+                    info.metadata.clone(),
+                    info.output_dir.clone(),
+                    info.downloaded_bytes,
+                )
+            };
+
+            let mut spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+            if let Some(password) = password.as_ref() {
+                spec.password = Some(password.clone());
+            }
+            spec.metadata.retain(|(key, _)| {
+                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+            });
             let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
 
             let working_dir = output_dir
@@ -1196,6 +1224,27 @@ impl Pipeline {
                     "failed to stamp reprocessed working directory as Weaver-owned"
                 );
             }
+
+            self.db
+                .create_active_job(&crate::ActiveJob {
+                    job_id,
+                    nzb_hash,
+                    nzb_path,
+                    nzb_zstd,
+                    output_dir: working_dir.clone(),
+                    created_at: (crate::jobs::model::epoch_ms_now() / 1000.0) as u64,
+                    category: spec.category.clone(),
+                    metadata: spec.metadata.clone(),
+                    status: "downloading",
+                    download_state: "downloading",
+                    post_state: "idle",
+                    run_state: "active",
+                    paused_resume_status: None,
+                    paused_resume_download_state: None,
+                    paused_resume_post_state: None,
+                    password_override: Some(spec.password.clone().unwrap_or_default()),
+                })
+                .map_err(crate::SchedulerError::State)?;
 
             let all_segments = Self::all_segment_ids(job_id, &spec);
             let (assembly, download_queue, recovery_queue) =
@@ -1245,6 +1294,7 @@ impl Pipeline {
                 early_recovery_requested_blocks: 0,
                 last_health_probe_failed_bytes: 0,
                 next_health_probe_failed_bytes: 1,
+                support_facts: Default::default(),
                 detected_archives: HashMap::new(),
                 file_identities,
                 held_segments: Vec::new(),
@@ -1296,6 +1346,24 @@ impl Pipeline {
             self.persist_file_identities(job_id, &file_identities).await;
         }
 
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            let mut metadata = state.spec.metadata.clone();
+            metadata.retain(|(key, _)| {
+                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+            });
+            let update = crate::jobs::JobUpdate {
+                password: password
+                    .map(crate::jobs::FieldUpdate::Set)
+                    .unwrap_or_default(),
+                metadata: crate::jobs::FieldUpdate::Set(metadata),
+                ..Default::default()
+            };
+            self.db
+                .update_active_job(job_id, &update)
+                .map_err(crate::SchedulerError::State)?;
+            update.apply_to_spec(&mut state.spec);
+        }
+        self.queue_scripts_completed.remove(&job_id);
         self.delete_failed_history_entry(job_id).await;
         // Reprocess replaces the assembly and file identities wholesale, so a
         // chase describing the old ones has to go with them.
@@ -1316,10 +1384,23 @@ impl Pipeline {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn redownload_job(
         &mut self,
         job_id: JobId,
     ) -> Result<(), crate::SchedulerError> {
+        self.redownload_job_with_password(job_id, None).await
+    }
+
+    pub(crate) async fn redownload_job_with_password(
+        &mut self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), crate::SchedulerError> {
+        if password.is_some() {
+            self.archive_password_winners
+                .retain(|(id, _), _| *id != job_id);
+        }
         if let Some(state) = self.jobs.get(&job_id) {
             if !Self::is_restartable_terminal_status(&state.status) {
                 return Err(crate::SchedulerError::Conflict(format!(
@@ -1338,8 +1419,14 @@ impl Pipeline {
                 .map_err(crate::SchedulerError::State)?
                 .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
             let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-            let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+            let mut spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
 
+            if let Some(password) = password.clone() {
+                spec.password = Some(password);
+            }
+            spec.metadata.retain(|(key, _)| {
+                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+            });
             self.remove_redownload_artifacts(job_id, &working_dir, staging_dir.as_deref())
                 .await;
             self.purge_terminal_job_runtime(job_id);
@@ -1382,7 +1469,14 @@ impl Pipeline {
                 .as_deref()
                 .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
                 .unwrap_or_default();
-            let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, row.category.clone(), metadata);
+            let mut spec =
+                crate::ingest::nzb_to_spec(&nzb, &nzb_path, row.category.clone(), metadata);
+            if let Some(password) = password.clone() {
+                spec.password = Some(password);
+            }
+            spec.metadata.retain(|(key, _)| {
+                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+            });
             let working_dir = row
                 .output_dir
                 .as_deref()
@@ -1430,12 +1524,18 @@ impl Pipeline {
                 )
             });
         let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-        let spec = crate::ingest::nzb_to_spec(
+        let mut spec = crate::ingest::nzb_to_spec(
             &nzb,
             &nzb_path,
             info.category.clone(),
             info.metadata.clone(),
         );
+        if let Some(password) = password.clone() {
+            spec.password = Some(password);
+        }
+        spec.metadata.retain(|(key, _)| {
+            key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+        });
         let working_dir = history_row
             .as_ref()
             .and_then(|row| row.output_dir.as_ref())
@@ -1576,6 +1676,13 @@ impl Pipeline {
                 tracing::warn!(%error, job_id = job_id.0, "could not load blocked job attribution");
                 Default::default()
             });
+        let support_facts = self
+            .db_blocking(move |db| db.load_job_support_facts(job_id))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, job_id = job_id.0, "could not load blocked job support facts");
+                Default::default()
+            });
         let resume = request.paused_resume_status.clone().unwrap_or_else(|| {
             if matches!(request.status, JobStatus::Paused) {
                 JobStatus::Downloading
@@ -1649,6 +1756,7 @@ impl Pipeline {
             early_recovery_requested_blocks: 0,
             last_health_probe_failed_bytes: 0,
             next_health_probe_failed_bytes: 1,
+            support_facts,
             detected_archives: request.detected_archives.clone(),
             file_identities: identities,
             held_segments: Vec::new(),
@@ -1937,6 +2045,9 @@ impl Pipeline {
         let server_attribution = self
             .db_blocking(move |db| db.load_active_server_attribution(job_id))
             .await?;
+        let support_facts = self
+            .db_blocking(move |db| db.load_job_support_facts(job_id))
+            .await?;
         // One read and parse of the persisted NZB per restored job, off the
         // pipeline thread, instead of one per archive file. Anything short of
         // a parsed NZB leaves the harvest to read the row itself, as before.
@@ -1981,6 +2092,9 @@ impl Pipeline {
                 &recovery_queue,
             ),
             post_state: post_state.unwrap_or(match &status {
+                JobStatus::AwaitingQueueScripts => {
+                    crate::jobs::model::PostState::AwaitingQueueScripts
+                }
                 JobStatus::Queued => crate::jobs::model::PostState::Idle,
                 JobStatus::Verifying => crate::jobs::model::PostState::Verifying,
                 JobStatus::QueuedRepair => crate::jobs::model::PostState::QueuedRepair,
@@ -2054,6 +2168,7 @@ impl Pipeline {
             early_recovery_requested_blocks: 0,
             last_health_probe_failed_bytes: 0,
             next_health_probe_failed_bytes: 1,
+            support_facts,
             detected_archives: HashMap::new(),
             file_identities,
             held_segments: Vec::new(),

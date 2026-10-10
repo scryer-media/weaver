@@ -1,11 +1,11 @@
-//! Shared per-server BODY transfer policy.
-//!
-//! A [`ServerTransferRegistry`] is intentionally independent from an
-//! [`NntpClient`](crate::client::NntpClient). Keeping it alive across client
-//! rebuilds preserves rate-limit debt, quota reservations, and byte counters.
+// Shared per-server BODY transfer policy.
+//
+// A [`ServerTransferRegistry`] is intentionally independent from an
+// [`NntpClient`](crate::client::NntpClient). Keeping it alive across client
+// rebuilds preserves rate-limit debt, quota reservations, and byte counters.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -13,40 +13,53 @@ use tokio::sync::watch;
 
 use crate::error::NntpError;
 
-const RATE_BURST_MICROS: u64 = 1_000_000;
+// Credit an idle or starved schedule may spend at once before pacing
+// resumes. It is small on purpose: a configured limit is a promise about
+// every second, not just the long-run average, so a stall must not be
+// followed by a second that reads far above the limit.
+const RATE_BURST_MICROS: u64 = 50_000;
 const RATE_SCHEDULE_EPOCH_SHIFT: u32 = 48;
 const RATE_SCHEDULE_TARGET_MASK: u64 = (1_u64 << RATE_SCHEDULE_EPOCH_SHIFT) - 1;
 
-/// Durable server identifier supplied by the application database.
+// Durable server identifier supplied by the application database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StableServerId(pub u32);
 
-/// Runtime quota window calculated by the application calendar policy.
+// What a transfer control meters: one server, or one egress shared by every
+// server routed over it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TransferScope {
+    #[default]
+    Server,
+    Egress,
+}
+
+// Runtime quota window calculated by the application calendar policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuotaRuntimeConfig {
     pub limit_bytes: u64,
-    /// Changes on a scheduled rollover or explicit usage reset.
+    // Changes on a scheduled rollover or explicit usage reset.
     pub generation: u64,
-    /// Monotonic wake deadline for recurring quotas. `None` means manual-only.
+    // Monotonic wake deadline for recurring quotas. `None` means manual-only.
     pub retry_at: Option<Instant>,
 }
 
-/// Live transfer policy for one server.
+// Live transfer policy for one server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServerTransferConfig {
-    /// Aggregate BODY payload bytes per second. Zero means unlimited.
+    // Aggregate BODY payload bytes per second. Zero means unlimited.
     pub rate_bytes_per_sec: u64,
     pub quota: Option<QuotaRuntimeConfig>,
 }
 
-/// Durable counters restored before download workers start.
+// Durable counters restored before download workers start.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServerTransferInitialState {
     pub lifetime_body_bytes: u64,
     pub quota_used_bytes: u64,
 }
 
-/// Authoritative live view of one server's transfer policy and counters.
+// Authoritative live view of one server's transfer policy and counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerTransferSnapshot {
     pub stable_server_id: StableServerId,
@@ -59,18 +72,18 @@ pub struct ServerTransferSnapshot {
     pub quota_remaining_bytes: u64,
     pub quota_blocked: bool,
     pub quota_generation: u64,
-    /// Monotonic revision for admission-capacity increases and config changes.
+    // Monotonic revision for admission-capacity increases and config changes.
     pub capacity_revision: u64,
     pub retry_at: Option<Instant>,
     pub throttle_wait: Duration,
 }
 
-/// Per-BODY elapsed-time budget that excludes deliberate local rate-limit waits.
-///
-/// Kept as a deadline (`started + limit + excluded wait`) rather than as an
-/// elapsed-time subtraction, so a check is one clock read and a compare, and
-/// the read loop can share that clock read between the budget check and the
-/// read timeout it derives next.
+// Per-BODY elapsed-time budget that excludes deliberate local rate-limit waits.
+//
+// Kept as a deadline (`started + limit + excluded wait`) rather than as an
+// elapsed-time subtraction, so a check is one clock read and a compare, and
+// the read loop can share that clock read between the budget check and the
+// read timeout it derives next.
 #[derive(Debug)]
 pub(crate) struct ActiveTransferBudget {
     limit: Duration,
@@ -78,8 +91,8 @@ pub(crate) struct ActiveTransferBudget {
     deadline: Instant,
 }
 
-/// Far enough that an unrepresentable deadline never expires within the life
-/// of a connection, while staying well inside `Instant`'s range.
+// Far enough that an unrepresentable deadline never expires within the life
+// of a connection, while staying well inside `Instant`'s range.
 const UNBOUNDED_DEADLINE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 impl ActiveTransferBudget {
@@ -104,7 +117,7 @@ impl ActiveTransferBudget {
         self.remaining_at(Instant::now())
     }
 
-    /// Budget left as of a clock reading the caller already took.
+    // Budget left as of a clock reading the caller already took.
     pub(crate) fn remaining_at(&self, now: Instant) -> Duration {
         self.deadline.saturating_duration_since(now)
     }
@@ -125,8 +138,8 @@ pub(crate) fn active_transfer_read_timeout(
     active_transfer_read_timeout_at(Instant::now(), command_timeout, budget)
 }
 
-/// [`active_transfer_read_timeout`] against a clock reading the caller took
-/// for its budget check, so a read turn costs one clock read, not two.
+// [`active_transfer_read_timeout`] against a clock reading the caller took
+// for its budget check, so a read turn costs one clock read, not two.
 pub(crate) fn active_transfer_read_timeout_at(
     now: Instant,
     command_timeout: Duration,
@@ -142,33 +155,36 @@ pub(crate) fn active_transfer_read_timeout_at(
     Ok((command_timeout.min(remaining), remaining <= command_timeout))
 }
 
-/// Admission failure for a BODY request.
+// Admission failure for a BODY request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaRejection {
+    // Whether a server or an egress turned the request away.
+    pub scope: TransferScope,
+    // The server or egress id, as `scope` says.
     pub stable_server_id: StableServerId,
     pub requested_body_bytes: u64,
     pub capacity_revision: u64,
-    /// Registry-wide revision captured while selecting quota-blocked servers.
+    // Registry-wide revision captured while selecting quota-blocked servers.
     pub registry_capacity_revision: u64,
     pub retry_at: Option<Instant>,
     pub snapshot: Box<ServerTransferSnapshot>,
 }
 
-/// Result returned when a BODY permit is explicitly completed.
+// Result returned when a BODY permit is explicitly completed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BodyTransferReceipt {
     pub body_bytes: u64,
     pub throttle_wait: Duration,
 }
 
-/// Per-response accounting selected at BODY admission. The unlimited variant
-/// carries no allocation, reference-count operation, reservation, or lock.
+// Per-response accounting selected at BODY admission. The unlimited variant
+// carries no allocation, reference-count operation, reservation, or lock.
 pub(crate) enum BodyTransferAccounting {
     Unlimited,
     Tracked(BodyTransferPermit),
 }
 
-/// Stable-ID registry shared by every runtime client generation.
+// Stable-ID registry shared by every runtime client generation.
 struct RegistryCapacitySignal {
     revision: AtomicU64,
     changed: watch::Sender<u64>,
@@ -205,16 +221,21 @@ impl RegistryCapacitySignal {
 }
 
 pub struct ServerTransferRegistry {
+    scope: TransferScope,
     controls: RwLock<HashMap<StableServerId, Arc<ServerTransferControl>>>,
     capacity: Arc<RegistryCapacitySignal>,
+    // Whether quotas count bytes; new controls start with it.
+    quota_metering: AtomicBool,
+    // Holders whose metering was set on its own, which the registry-wide
+    // setting leaves alone. Removing a holder drops its setting, so a later
+    // holder given the same id follows the registry-wide setting; dropping
+    // every control at once with [`Self::clear`] keeps them.
+    quota_metering_overrides: RwLock<HashMap<StableServerId, bool>>,
 }
 
 impl Default for ServerTransferRegistry {
     fn default() -> Self {
-        Self {
-            controls: RwLock::new(HashMap::new()),
-            capacity: Arc::new(RegistryCapacitySignal::default()),
-        }
+        Self::with_scope(TransferScope::Server)
     }
 }
 
@@ -223,18 +244,46 @@ impl ServerTransferRegistry {
         Self::default()
     }
 
-    /// Monotonic revision for capacity changes in any registered server.
+    // An empty registry whose controls meter `scope`.
+    pub fn with_scope(scope: TransferScope) -> Self {
+        Self {
+            scope,
+            controls: RwLock::new(HashMap::new()),
+            capacity: Arc::new(RegistryCapacitySignal::default()),
+            quota_metering: AtomicBool::new(true),
+            quota_metering_overrides: RwLock::new(HashMap::new()),
+        }
+    }
+
+    // An empty registry for `scope` that shares this one's capacity signal,
+    // so a capacity change in either is a change in both. A selection parked
+    // on one revision then wakes for a server or an egress alike.
+    pub fn sibling(&self, scope: TransferScope) -> Self {
+        Self {
+            scope,
+            controls: RwLock::new(HashMap::new()),
+            capacity: Arc::clone(&self.capacity),
+            quota_metering: AtomicBool::new(true),
+            quota_metering_overrides: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn scope(&self) -> TransferScope {
+        self.scope
+    }
+
+    // Monotonic revision for capacity changes in any registered server.
     pub fn capacity_revision(&self) -> u64 {
         self.capacity.revision()
     }
 
-    /// Subscribe before checking a parked selection's revision so capacity
-    /// changes racing selection cannot be missed.
+    // Subscribe before checking a parked selection's revision so capacity
+    // changes racing selection cannot be missed.
     pub fn subscribe_capacity_changes(&self) -> watch::Receiver<u64> {
         self.capacity.subscribe()
     }
 
-    /// Return an existing durable control without creating one.
+    // Return an existing durable control without creating one.
     pub fn get(&self, id: StableServerId) -> Option<Arc<ServerTransferControl>> {
         self.controls
             .read()
@@ -243,22 +292,90 @@ impl ServerTransferRegistry {
             .map(Arc::clone)
     }
 
-    /// Get or create the durable control for `id`.
+    // Get or create the durable control for `id`.
     pub fn control(&self, id: StableServerId) -> Arc<ServerTransferControl> {
         if let Some(control) = self.get(id) {
             return control;
         }
 
         let capacity = Arc::clone(&self.capacity);
+        let scope = self.scope;
         let mut controls = self.controls.write().expect("transfer registry poisoned");
-        Arc::clone(
-            controls
-                .entry(id)
-                .or_insert_with(|| Arc::new(ServerTransferControl::new(id, capacity))),
-        )
+        Arc::clone(controls.entry(id).or_insert_with(|| {
+            let control = ServerTransferControl::new(id, scope, capacity);
+            control
+                .quota_metering
+                .store(self.quota_metering_of(id), Ordering::Release);
+            Arc::new(control)
+        }))
     }
 
-    /// Apply a live policy update while preserving counters and reservations.
+    // Start or stop quotas counting bytes on every control, present and
+    // future, except those set on their own with
+    // [`Self::set_quota_metering_for`]. While stopped, bytes still count
+    // toward lifetime totals but not toward any quota, and no quota turns
+    // work away. Usage already counted in a window is kept.
+    pub fn set_quota_metering(&self, enabled: bool) {
+        self.quota_metering.store(enabled, Ordering::Release);
+        let overrides = self
+            .quota_metering_overrides
+            .read()
+            .expect("transfer registry poisoned")
+            .clone();
+        let controls = self
+            .controls
+            .read()
+            .expect("transfer registry poisoned")
+            .iter()
+            .filter(|(id, _)| !overrides.contains_key(id))
+            .map(|(_, control)| Arc::clone(control))
+            .collect::<Vec<_>>();
+        for control in controls {
+            control.set_quota_metering(enabled);
+        }
+    }
+
+    // Start or stop one holder's quota counting bytes, whatever the
+    // registry-wide setting is now or is set to later.
+    pub fn set_quota_metering_for(&self, id: StableServerId, enabled: bool) {
+        self.quota_metering_overrides
+            .write()
+            .expect("transfer registry poisoned")
+            .insert(id, enabled);
+        if let Some(control) = self.get(id) {
+            control.set_quota_metering(enabled);
+        }
+    }
+
+    // Hand one holder's quota counting back to the registry-wide setting.
+    pub fn clear_quota_metering_for(&self, id: StableServerId) {
+        let removed = self
+            .quota_metering_overrides
+            .write()
+            .expect("transfer registry poisoned")
+            .remove(&id)
+            .is_some();
+        if removed && let Some(control) = self.get(id) {
+            control.set_quota_metering(self.quota_metering.load(Ordering::Acquire));
+        }
+    }
+
+    // The registry-wide setting, which holders without their own follow.
+    pub fn quota_metering(&self) -> bool {
+        self.quota_metering.load(Ordering::Acquire)
+    }
+
+    // Whether `id`'s quota counts bytes.
+    pub fn quota_metering_of(&self, id: StableServerId) -> bool {
+        self.quota_metering_overrides
+            .read()
+            .expect("transfer registry poisoned")
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| self.quota_metering.load(Ordering::Acquire))
+    }
+
+    // Apply a live policy update while preserving counters and reservations.
     pub fn configure(
         &self,
         id: StableServerId,
@@ -269,10 +386,10 @@ impl ServerTransferRegistry {
         control
     }
 
-    /// Restore durable counters and apply the initial live policy.
-    ///
-    /// This is intended for startup before workers receive the control. Later
-    /// calls never reduce the lifetime counter.
+    // Restore durable counters and apply the initial live policy.
+    //
+    // This is intended for startup before workers receive the control. Later
+    // calls never reduce the lifetime counter.
     pub fn restore(
         &self,
         id: StableServerId,
@@ -302,9 +419,13 @@ impl ServerTransferRegistry {
         snapshots
     }
 
-    /// Remove an inactive server control. Existing lanes keep their `Arc` and
-    /// remain safe until they drain.
+    // Remove an inactive server control, and the quota metering set on its
+    // own. Existing lanes keep their `Arc` and remain safe until they drain.
     pub fn remove(&self, id: StableServerId) -> Option<Arc<ServerTransferControl>> {
+        self.quota_metering_overrides
+            .write()
+            .expect("transfer registry poisoned")
+            .remove(&id);
         let removed = self
             .controls
             .write()
@@ -316,7 +437,7 @@ impl ServerTransferRegistry {
         removed
     }
 
-    /// Remove every registered control. Existing lane-held `Arc`s remain valid.
+    // Remove every registered control. Existing lane-held `Arc`s remain valid.
     pub fn clear(&self) {
         let had_controls = {
             let mut controls = self.controls.write().expect("transfer registry poisoned");
@@ -330,9 +451,10 @@ impl ServerTransferRegistry {
     }
 }
 
-/// Shared transfer state for one durable server.
+// Shared transfer state for one durable server.
 pub struct ServerTransferControl {
     id: StableServerId,
+    scope: TransferScope,
     pub(crate) socket_budget: Arc<crate::socket_budget::SocketBudget>,
     pub(crate) recovery: Arc<crate::recovery::RecoveryGate>,
     state: Mutex<TransferState>,
@@ -347,6 +469,8 @@ pub struct ServerTransferControl {
     rate_origin: Instant,
     rate_wait_lock: Mutex<()>,
     rate_changed: Condvar,
+    // False while quota metering is suspended.
+    quota_metering: AtomicBool,
     #[cfg(test)]
     path_counters: TransferPathCounters,
     #[cfg(test)]
@@ -359,12 +483,12 @@ struct TransferState {
     config: ServerTransferConfig,
     quota_used_bytes: u64,
     quota_reserved_bytes: u64,
-    /// Sticky signal that a BODY reservation was refused for quota. Conservative
-    /// reservation reserves the estimate and reconciles down to the smaller
-    /// actual, so `quota_used_bytes` stays strictly below the limit in steady
-    /// state and `used >= limit` almost never latches. This records the real
-    /// "refusing work" condition instead. Set when a reservation-sized request
-    /// is rejected, cleared when one is admitted or the window/config resets.
+    // Sticky signal that a BODY reservation was refused for quota. Conservative
+    // reservation reserves the estimate and reconciles down to the smaller
+    // actual, so `quota_used_bytes` stays strictly below the limit in steady
+    // state and `used >= limit` almost never latches. This records the real
+    // "refusing work" condition instead. Set when a reservation-sized request
+    // is rejected, cleared when one is admitted or the window/config resets.
     quota_saturated: bool,
     quota_epoch: u64,
     capacity_revision: u64,
@@ -412,10 +536,15 @@ fn rate_cost_micros(bytes: u64, rate_bytes_per_sec: u64) -> u64 {
 }
 
 impl ServerTransferControl {
-    fn new(id: StableServerId, registry_capacity: Arc<RegistryCapacitySignal>) -> Self {
+    fn new(
+        id: StableServerId,
+        scope: TransferScope,
+        registry_capacity: Arc<RegistryCapacitySignal>,
+    ) -> Self {
         let (capacity_changed, _) = watch::channel(1);
         Self {
             id,
+            scope,
             socket_budget: crate::socket_budget::SocketBudget::new(0),
             recovery: Arc::default(),
             state: Mutex::new(TransferState {
@@ -438,6 +567,7 @@ impl ServerTransferControl {
             rate_origin: Instant::now(),
             rate_wait_lock: Mutex::new(()),
             rate_changed: Condvar::new(),
+            quota_metering: AtomicBool::new(true),
             #[cfg(test)]
             path_counters: TransferPathCounters::default(),
             #[cfg(test)]
@@ -449,8 +579,25 @@ impl ServerTransferControl {
         self.id
     }
 
+    pub fn scope(&self) -> TransferScope {
+        self.scope
+    }
+
     pub fn update_config(&self, config: ServerTransferConfig) {
         self.configure(config, None);
+    }
+
+    fn set_quota_metering(&self, enabled: bool) {
+        if self.quota_metering.swap(enabled, Ordering::AcqRel) == enabled {
+            return;
+        }
+        let revision = {
+            let mut state = self.state.lock().expect("server transfer state poisoned");
+            state.quota_saturated = false;
+            state.capacity_revision = state.capacity_revision.wrapping_add(1).max(1);
+            state.capacity_revision
+        };
+        self.publish_capacity_change(revision);
     }
 
     fn configure(&self, config: ServerTransferConfig, initial: Option<ServerTransferInitialState>) {
@@ -478,10 +625,17 @@ impl ServerTransferControl {
             if quota_epoch_changed {
                 state.quota_epoch = state.quota_epoch.wrapping_add(1).max(1);
             }
+            // A changed allowance in the same window keeps its usage but may
+            // fit work it turned away.
+            let limit_changed = matches!(
+                (state.config.quota, config.quota),
+                (Some(previous), Some(next)) if previous.limit_bytes != next.limit_bytes
+            );
             // A window rollover, manual reset, or quota edit all bump the
             // generation (or drop the quota); either way the refusal condition
             // no longer holds, so the server is free to take work again.
-            if quota_epoch_changed || !state.initialized || config.quota.is_none() {
+            if quota_epoch_changed || limit_changed || !state.initialized || config.quota.is_none()
+            {
                 state.quota_saturated = false;
             }
 
@@ -506,7 +660,7 @@ impl ServerTransferControl {
         self.blocking_changed.notify_all();
     }
 
-    /// Check BODY admission atomically without reserving capacity.
+    // Check BODY admission atomically without reserving capacity.
     pub fn quota_rejection_for(&self, requested_body_bytes: u64) -> Option<QuotaRejection> {
         if self.quota_epoch.load(Ordering::Acquire) == 0 {
             return None;
@@ -519,13 +673,13 @@ impl ServerTransferControl {
         self.quota_rejection_locked(&state, requested_body_bytes)
     }
 
-    /// Check BODY admission for a dispatch that is choosing its server.
-    ///
-    /// An owned lane picks its server before it reserves, so a request that
-    /// does not fit is skipped here and never reaches `try_reserve`. That skip
-    /// is the moment this server turns the work away, and it latches
-    /// `quota_blocked` exactly as a refused reservation does; a request that
-    /// fits clears the latch the way an admitted reservation does.
+    // Check BODY admission for a dispatch that is choosing its server.
+    //
+    // An owned lane picks its server before it reserves, so a request that
+    // does not fit is skipped here and never reaches `try_reserve`. That skip
+    // is the moment this server turns the work away, and it latches
+    // `quota_blocked` exactly as a refused reservation does; a request that
+    // fits clears the latch the way an admitted reservation does.
     pub fn quota_rejection_for_dispatch(
         &self,
         requested_body_bytes: u64,
@@ -556,15 +710,45 @@ impl ServerTransferControl {
             .map(BodyTransferAccounting::Tracked)
     }
 
-    /// Record BODY bytes for an admission proven to have neither rate nor
-    /// quota policy. This is the production unlimited marker's only hot-path
-    /// operation and intentionally performs one relaxed atomic update.
+    // Record BODY bytes for an admission proven to have neither rate nor
+    // quota policy. This is the production unlimited marker's only hot-path
+    // operation and intentionally performs one relaxed atomic update.
     #[doc(hidden)]
     pub fn record_unlimited_body_bytes(&self, bytes: usize) {
         self.record_lifetime_bytes(bytes as u64);
     }
 
-    /// Reserve the estimated raw BODY payload before issuing `BODY`.
+    // Read-path pacing without quota admission, shared by all connections on an egress.
+    pub async fn pace_read_async(&self, bytes: usize) -> Duration {
+        self.record_lifetime_bytes(bytes as u64);
+        match self.reserve_rate(bytes as u64) {
+            Some(ticket) => self.wait_async(ticket).await,
+            None => Duration::ZERO,
+        }
+    }
+    pub fn pace_read_blocking(&self, bytes: usize) -> Duration {
+        self.record_lifetime_bytes(bytes as u64);
+        match self.reserve_rate(bytes as u64) {
+            Some(ticket) => self.wait_blocking(ticket),
+            None => Duration::ZERO,
+        }
+    }
+    pub fn pace_read_without_wait(&self, bytes: usize) {
+        self.record_lifetime_bytes(bytes as u64);
+        let _ = self.reserve_rate(bytes as u64);
+    }
+
+    // Read-path pacing without quota admission, reserved but not yet waited
+    // for. See [`RateCharge`].
+    pub(crate) fn charge_read(self: &Arc<Self>, bytes: usize) -> Option<RateCharge> {
+        self.record_lifetime_bytes(bytes as u64);
+        self.reserve_rate(bytes as u64).map(|ticket| RateCharge {
+            control: Arc::clone(self),
+            ticket,
+        })
+    }
+
+    // Reserve the estimated raw BODY payload before issuing `BODY`.
     pub fn try_reserve(
         self: &Arc<Self>,
         estimated_body_bytes: u64,
@@ -647,12 +831,12 @@ impl ServerTransferControl {
         }
     }
 
-    /// Subscribe before checking admission state to avoid missing a release.
+    // Subscribe before checking admission state to avoid missing a release.
     pub fn subscribe_capacity_changes(&self) -> watch::Receiver<u64> {
         self.capacity_changed.subscribe()
     }
 
-    /// Wait until a quota config/reset update, reservation release, or rate change.
+    // Wait until a quota config/reset update, reservation release, or rate change.
     pub async fn changed(&self) {
         let mut changed = self.subscribe_capacity_changes();
         let _ = changed.changed().await;
@@ -714,7 +898,8 @@ impl ServerTransferControl {
             } else {
                 u64::MAX
             },
-            quota_blocked: quota.is_some_and(|_| projected >= limit || state.quota_saturated),
+            quota_blocked: self.quota_metering.load(Ordering::Acquire)
+                && quota.is_some_and(|_| projected >= limit || state.quota_saturated),
             quota_generation: quota.map_or(0, |value| value.generation),
             capacity_revision: state.capacity_revision,
             retry_at: quota.and_then(|value| value.retry_at),
@@ -728,6 +913,9 @@ impl ServerTransferControl {
         requested_body_bytes: u64,
     ) -> Option<QuotaRejection> {
         let quota = state.config.quota?;
+        if !self.quota_metering.load(Ordering::Acquire) {
+            return None;
+        }
         let projected = state
             .quota_used_bytes
             .saturating_add(state.quota_reserved_bytes);
@@ -738,6 +926,7 @@ impl ServerTransferControl {
         }
         let snapshot = Box::new(self.snapshot_locked(state));
         Some(QuotaRejection {
+            scope: self.scope,
             stable_server_id: self.id,
             requested_body_bytes,
             capacity_revision: snapshot.capacity_revision,
@@ -758,6 +947,10 @@ impl ServerTransferControl {
     }
 
     fn reserve_rate(&self, bytes: u64) -> Option<RateTicket> {
+        self.reserve_rate_with_clock(bytes, || self.rate_now_micros())
+    }
+
+    fn reserve_rate_with_clock(&self, bytes: u64, now: impl Fn() -> u64) -> Option<RateTicket> {
         if bytes == 0 {
             return None;
         }
@@ -782,7 +975,7 @@ impl ServerTransferControl {
             }
             let epoch = current >> RATE_SCHEDULE_EPOCH_SHIFT;
             let previous_target = current & RATE_SCHEDULE_TARGET_MASK;
-            let now = self.rate_now_micros();
+            let now = now();
             let base = previous_target.max(now.saturating_sub(RATE_BURST_MICROS));
             let cost = rate_cost_micros(bytes, rate);
             let target_micros = base.saturating_add(cost).min(RATE_SCHEDULE_TARGET_MASK);
@@ -818,9 +1011,9 @@ impl ServerTransferControl {
             .min(RATE_SCHEDULE_TARGET_MASK)
     }
 
-    /// The instant, on the same scale as [`Self::rate_now_micros`], that the
-    /// last reservation scheduled. Tests compare reservations and waits
-    /// against this rather than against wall-clock durations.
+    // The instant, on the same scale as [`Self::rate_now_micros`], that the
+    // last reservation scheduled. Tests compare reservations and waits
+    // against this rather than against wall-clock durations.
     #[cfg(test)]
     fn rate_schedule_target_micros(&self) -> u64 {
         self.rate_schedule.load(Ordering::Acquire) & RATE_SCHEDULE_TARGET_MASK
@@ -979,6 +1172,12 @@ impl ServerTransferControl {
             (projected_before, projected_after),
             (Some(before), Some(after)) if after < before
         ) {
+            // Nothing dispatches to an egress that reads as blocked, so freed
+            // allowance has to lift the refusal itself; the next body that
+            // still does not fit sets it again.
+            if self.scope == TransferScope::Egress {
+                state.quota_saturated = false;
+            }
             state.capacity_revision = state.capacity_revision.wrapping_add(1).max(1);
             Some(state.capacity_revision)
         } else {
@@ -991,10 +1190,39 @@ impl ServerTransferControl {
     }
 }
 
-/// RAII admission permit for exactly one BODY response.
-///
-/// Dropping it refunds any unused estimate. Bytes already reported remain
-/// charged, including bytes received before a decode or transport failure.
+// A read's rate cost on one control, reserved but not yet waited for.
+//
+// A read through an egress to a provider is paced by both. Reserving every
+// level's charge before waiting on any makes the read wait until the latest
+// of their deadlines, so it runs at the lowest of the rates. Waiting on one
+// level before reserving on the next would add the waits instead, and hold
+// the read below every limit that applies to it.
+pub(crate) struct RateCharge {
+    control: Arc<ServerTransferControl>,
+    ticket: RateTicket,
+}
+
+impl RateCharge {
+    // When this level lets the read go on.
+    #[cfg(test)]
+    fn deadline(&self) -> Instant {
+        self.control.rate_origin
+            + Duration::from_micros(self.ticket.target_micros.saturating_sub(RATE_BURST_MICROS))
+    }
+
+    pub(crate) async fn wait_async(self) -> Duration {
+        self.control.wait_async(self.ticket).await
+    }
+
+    pub(crate) fn wait_blocking(self) -> Duration {
+        self.control.wait_blocking(self.ticket)
+    }
+}
+
+// RAII admission permit for exactly one BODY response.
+//
+// Dropping it refunds any unused estimate. Bytes already reported remain
+// charged, including bytes received before a decode or transport failure.
 pub struct BodyTransferPermit {
     control: Arc<ServerTransferControl>,
     reserved_quota_bytes: u64,
@@ -1018,7 +1246,7 @@ impl BodyTransferPermit {
         self.throttle_wait
     }
 
-    /// Charge bytes and wait on the shared async aggregate limiter.
+    // Charge bytes and wait on the shared async aggregate limiter.
     pub async fn record_async(&mut self, bytes: usize) -> Duration {
         let bytes = bytes as u64;
         self.record_bytes(bytes);
@@ -1031,14 +1259,14 @@ impl BodyTransferPermit {
         waited
     }
 
-    /// Charge received bytes and preserve rate debt without delaying cleanup.
+    // Charge received bytes and preserve rate debt without delaying cleanup.
     pub(crate) fn record_without_wait(&mut self, bytes: usize) {
         let bytes = bytes as u64;
         self.record_bytes(bytes);
         let _ = self.control.reserve_rate(bytes);
     }
 
-    /// Charge bytes and wait on the shared blocking aggregate limiter.
+    // Charge bytes and wait on the shared blocking aggregate limiter.
     pub fn record_blocking(&mut self, bytes: usize) -> Duration {
         let bytes = bytes as u64;
         self.record_bytes(bytes);
@@ -1051,11 +1279,27 @@ impl BodyTransferPermit {
         waited
     }
 
+    // Charge bytes and reserve their rate cost without waiting. The caller
+    // waits on the charge and credits the wait with
+    // [`Self::add_throttle_wait`].
+    pub(crate) fn charge(&mut self, bytes: usize) -> Option<RateCharge> {
+        let bytes = bytes as u64;
+        self.record_bytes(bytes);
+        self.control.reserve_rate(bytes).map(|ticket| RateCharge {
+            control: Arc::clone(&self.control),
+            ticket,
+        })
+    }
+
+    pub(crate) fn add_throttle_wait(&mut self, waited: Duration) {
+        self.throttle_wait = self.throttle_wait.saturating_add(waited);
+    }
+
     fn record_bytes(&mut self, bytes: u64) {
         self.control.record_lifetime_bytes(bytes);
         self.body_bytes = self.body_bytes.saturating_add(bytes);
         let quota_epoch = self.control.current_quota_epoch();
-        if quota_epoch == 0 {
+        if quota_epoch == 0 || !self.control.quota_metering.load(Ordering::Acquire) {
             return;
         }
         if self.quota_epoch != quota_epoch {
@@ -1128,8 +1372,8 @@ mod tests {
         ));
     }
 
-    /// The deadline is the budget: excluded waits push it out, and a check
-    /// against a caller-supplied clock reading agrees with the arithmetic.
+    // The deadline is the budget: excluded waits push it out, and a check
+    // against a caller-supplied clock reading agrees with the arithmetic.
     #[test]
     fn active_transfer_budget_deadline_moves_with_excluded_waits() {
         let mut budget = ActiveTransferBudget::new(Duration::from_secs(10));
@@ -1172,8 +1416,8 @@ mod tests {
         assert!(!unbounded.remaining().is_zero());
     }
 
-    /// Wait until a spawned rate waiter is parked on its wake-up: it
-    /// subscribes to capacity changes only once it has a ticket to wait on.
+    // Wait until a spawned rate waiter is parked on its wake-up: it
+    // subscribes to capacity changes only once it has a ticket to wait on.
     async fn wait_for_rate_waiter(control: &ServerTransferControl) {
         while control.capacity_changed.receiver_count() == 0 {
             tokio::task::yield_now().await;
@@ -1292,6 +1536,40 @@ mod tests {
     }
 
     #[test]
+    fn a_raised_quota_lifts_the_refusal_and_keeps_the_usage() {
+        let registry = ServerTransferRegistry::new();
+        let control = registry.configure(StableServerId(13), quota(1_000, 1));
+        let mut permit = control.try_reserve(800).unwrap();
+        permit.record_blocking(650);
+        drop(permit);
+        assert!(control.try_reserve(800).is_err());
+        assert!(control.snapshot().quota_blocked);
+
+        registry.configure(StableServerId(13), quota(5_000, 1));
+        let snapshot = control.snapshot();
+        assert!(!snapshot.quota_blocked);
+        assert_eq!(snapshot.quota_used_bytes, 650);
+    }
+
+    #[test]
+    fn freed_egress_quota_lifts_the_refusal_without_a_new_reservation() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let control = registry.configure(StableServerId(14), quota(1_000, 1));
+        let mut in_flight = control.try_reserve(800).unwrap();
+        // The second body does not fit beside the first one's estimate.
+        assert!(control.try_reserve(250).is_err());
+        assert!(control.snapshot().quota_blocked);
+
+        // The first body comes in well under its estimate.
+        in_flight.record_blocking(300);
+        drop(in_flight);
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.quota_used_bytes, 300);
+        assert!(!snapshot.quota_blocked);
+        assert!(control.try_reserve(250).is_ok());
+    }
+
+    #[test]
     fn rollover_keeps_outstanding_reservations_in_new_generation() {
         let registry = ServerTransferRegistry::new();
         let control = registry.configure(StableServerId(9), quota(1_000, 1));
@@ -1342,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_rate_tickets_share_one_second_of_burst_credit() {
+    fn aggregate_rate_tickets_share_the_burst_credit() {
         let registry = ServerTransferRegistry::new();
         let control = registry.configure(
             StableServerId(30),
@@ -1352,15 +1630,42 @@ mod tests {
             },
         );
 
-        let warmup = control.reserve_rate(100).unwrap();
-        assert!(warmup.target_micros <= control.rate_now_micros());
-        let first = control.reserve_rate(50).expect("burst credit is exhausted");
-        let second = control.reserve_rate(50).expect("aggregate debt is shared");
+        // Exactly the burst credit's worth of bytes schedules without a wait.
+        let now = || RATE_BURST_MICROS;
+        let warmup = control.reserve_rate_with_clock(5, now).unwrap();
+        assert_eq!(warmup.target_micros, now());
+        let first = control
+            .reserve_rate_with_clock(50, now)
+            .expect("burst credit is exhausted");
+        let second = control
+            .reserve_rate_with_clock(50, now)
+            .expect("aggregate debt is shared");
         // Each ticket is scheduled after the one before it, by its own cost:
         // the burst credit went to the warmup and the debt is shared. The
         // targets are compared with each other, not with the clock.
         assert_eq!(first.target_micros - warmup.target_micros, 500_000);
         assert_eq!(second.target_micros - first.target_micros, 500_000);
+    }
+
+    #[test]
+    fn low_rates_sustain_the_configured_throughput_after_the_initial_burst() {
+        for rate in [1, 10, 100, 1024] {
+            let registry = ServerTransferRegistry::new();
+            let control = registry.configure(
+                StableServerId(1),
+                ServerTransferConfig {
+                    rate_bytes_per_sec: rate,
+                    quota: None,
+                },
+            );
+            for second in 0..20 {
+                let now = RATE_BURST_MICROS + second * 1_000_000;
+                let ticket = control.reserve_rate_with_clock(rate, || now).unwrap();
+                // One second's bytes costs one second on the shared ledger,
+                // even when the burst allowance is smaller than one byte.
+                assert_eq!(ticket.target_micros, (second + 1) * 1_000_000);
+            }
+        }
     }
 
     #[test]
@@ -1431,8 +1736,9 @@ mod tests {
                 quota: None,
             },
         );
+        // Spend exactly the burst credit so both waiters below are paced.
         let mut warmup = control.try_reserve(0).unwrap();
-        assert_eq!(warmup.record_async(20_000).await, Duration::ZERO);
+        assert_eq!(warmup.record_async(1_000).await, Duration::ZERO);
         let scheduled_before = control.rate_schedule_target_micros();
 
         // Each waiter reports the schedule clock it saw on return, so the
@@ -1533,14 +1839,14 @@ mod tests {
             },
         );
 
-        // Only one second of credit at the new rate survives: 100 of the 150
-        // bytes, so the ticket lands half a second past the clock reading
-        // taken before it was reserved.
+        // Only the burst credit at the new rate survives: 5 of the 150 bytes,
+        // so the ticket lands 1.45 s past the clock reading taken before it
+        // was reserved.
         let before = control.rate_now_micros();
         let ticket = control.reserve_rate(150).expect("a rate is configured");
         assert!(
-            ticket.target_micros >= before + 500_000,
-            "target {} is less than half a second past {before}",
+            ticket.target_micros >= before + 1_450_000,
+            "target {} is less than 1.45 s past {before}",
             ticket.target_micros
         );
     }
@@ -2008,5 +2314,176 @@ mod tests {
         wait_for_rate_waiter(&control).await;
         registry.configure(StableServerId(11), ServerTransferConfig::default());
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn suspended_metering_neither_counts_nor_refuses_and_keeps_window_usage() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let control = registry.configure(StableServerId(3), quota(1_000, 1));
+        let mut permit = control.try_reserve(600).unwrap();
+        permit.record_blocking(600);
+        drop(permit);
+        let rejection = control.try_reserve(500).err().unwrap();
+        assert_eq!(rejection.scope, TransferScope::Egress);
+        assert!(control.snapshot().quota_blocked);
+
+        registry.set_quota_metering(false);
+        assert!(!control.snapshot().quota_blocked);
+        let mut permit = control.try_reserve(500).unwrap();
+        permit.record_blocking(500);
+        drop(permit);
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.lifetime_body_bytes, 1_100);
+        assert_eq!(snapshot.quota_used_bytes, 600);
+        // A control made while metering is off starts off too.
+        let later = registry.configure(StableServerId(4), quota(1, 1));
+        assert!(later.try_reserve(10).is_ok());
+
+        registry.set_quota_metering(true);
+        assert!(control.try_reserve(500).is_err());
+        assert!(control.try_reserve(400).is_ok());
+    }
+
+    #[test]
+    fn one_egress_quota_metering_wins_over_the_setting_for_every_egress() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let own = registry.configure(StableServerId(1), quota(1, 1));
+        let other = registry.configure(StableServerId(2), quota(1, 1));
+
+        registry.set_quota_metering_for(StableServerId(1), false);
+        assert!(own.try_reserve(10).is_ok());
+        assert!(other.try_reserve(10).is_err());
+
+        // Every egress's setting leaves the one set on its own alone, either way.
+        registry.set_quota_metering(true);
+        assert!(own.try_reserve(10).is_ok());
+        registry.set_quota_metering(false);
+        assert!(other.try_reserve(10).is_ok());
+        registry.set_quota_metering_for(StableServerId(1), true);
+        assert!(own.try_reserve(10).is_err());
+        assert!(other.try_reserve(10).is_ok());
+
+        // A holder made again under a removed one's id follows every
+        // egress's setting, not the removed one's own.
+        registry.remove(StableServerId(1));
+        let reused = registry.configure(StableServerId(1), quota(1, 1));
+        assert!(reused.try_reserve(10).is_ok());
+        assert!(!registry.quota_metering_of(StableServerId(1)));
+        registry.set_quota_metering(true);
+        assert!(reused.try_reserve(10).is_err());
+    }
+
+    #[test]
+    fn clearing_one_egress_quota_metering_hands_it_back_to_every_egress() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let own = registry.configure(StableServerId(1), quota(1, 1));
+        registry.set_quota_metering(false);
+        registry.set_quota_metering_for(StableServerId(1), true);
+        assert!(own.try_reserve(10).is_err());
+
+        registry.clear_quota_metering_for(StableServerId(1));
+        assert!(own.try_reserve(10).is_ok());
+        assert!(!registry.quota_metering_of(StableServerId(1)));
+        registry.set_quota_metering(true);
+        assert!(own.try_reserve(10).is_err());
+    }
+
+    #[test]
+    fn dropping_every_control_keeps_one_egress_quota_metering() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        registry.configure(StableServerId(1), quota(1, 1));
+        registry.set_quota_metering_for(StableServerId(1), false);
+        registry.clear();
+        let restored = registry.configure(StableServerId(1), quota(1, 1));
+        assert!(restored.try_reserve(10).is_ok());
+    }
+
+    // An egress and a provider pacing the same reads. The rates are a few
+    // bytes a second against reads of thousands of bytes, so each charge is
+    // minutes of schedule and every later charge chains onto the one before
+    // it however slowly the test runs.
+    fn paced_pair(
+        egress_rate: u64,
+        server_rate: u64,
+    ) -> (Arc<ServerTransferControl>, Arc<ServerTransferControl>) {
+        let servers = ServerTransferRegistry::new();
+        let egresses = servers.sibling(TransferScope::Egress);
+        let rate = |rate_bytes_per_sec| ServerTransferConfig {
+            rate_bytes_per_sec,
+            quota: None,
+        };
+        (
+            egresses.configure(StableServerId(1), rate(egress_rate)),
+            servers.configure(StableServerId(2), rate(server_rate)),
+        )
+    }
+
+    // When each read of `reads` bytes may go on: the latest deadline of the
+    // levels it was charged on, both charged before either is waited for.
+    fn read_deadlines(
+        egress: &Arc<ServerTransferControl>,
+        server: &Arc<ServerTransferControl>,
+        reads: &[usize],
+    ) -> Vec<(Instant, Option<Instant>, Option<Instant>)> {
+        let mut permit = server.try_reserve(0).unwrap();
+        reads
+            .iter()
+            .map(|&bytes| {
+                let egress = egress.charge_read(bytes).map(|charge| charge.deadline());
+                let server = permit.charge(bytes).map(|charge| charge.deadline());
+                let read = egress.into_iter().chain(server).max().unwrap();
+                (read, egress, server)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_provider_faster_than_its_egress_is_held_to_the_egress_rate() {
+        let (egress, server) = paced_pair(2, 8);
+        let reads = read_deadlines(&egress, &server, &[1_000; 4]);
+        for (read, egress, server) in &reads {
+            assert_eq!(Some(*read), *egress);
+            assert!(server.unwrap() < *read);
+        }
+        // 1000 bytes at 2 bytes a second is 500 seconds a read.
+        for pair in reads.windows(2) {
+            assert_eq!(pair[1].0 - pair[0].0, Duration::from_secs(500));
+        }
+    }
+
+    #[test]
+    fn an_egress_faster_than_its_provider_is_held_to_the_provider_rate() {
+        let (egress, server) = paced_pair(8, 2);
+        let reads = read_deadlines(&egress, &server, &[1_000; 4]);
+        for (read, _, server) in &reads {
+            assert_eq!(Some(*read), *server);
+        }
+        for pair in reads.windows(2) {
+            assert_eq!(pair[1].0 - pair[0].0, Duration::from_secs(500));
+        }
+    }
+
+    #[test]
+    fn raising_the_provider_above_its_egress_changes_nothing() {
+        let spacing = |server_rate| {
+            let (egress, server) = paced_pair(2, server_rate);
+            let reads = read_deadlines(&egress, &server, &[1_000; 3]);
+            reads
+                .windows(2)
+                .map(|pair| pair[1].0 - pair[0].0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spacing(4), spacing(4_000));
+        assert_eq!(spacing(4), vec![Duration::from_secs(500); 2]);
+    }
+
+    #[test]
+    fn no_limit_at_one_level_leaves_the_other_in_charge() {
+        let (egress, server) = paced_pair(0, 2);
+        let reads = read_deadlines(&egress, &server, &[1_000; 3]);
+        for (read, egress, server) in &reads {
+            assert_eq!(*egress, None);
+            assert_eq!(Some(*read), *server);
+        }
     }
 }

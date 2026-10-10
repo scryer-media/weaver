@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
   DELETE_PROXY_MUTATION,
@@ -9,11 +9,18 @@ import {
 } from "@/graphql/proxies";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
-import { parseWireguardConfig, stripConfigAssignment } from "@/lib/wireguard-config";
+import { cn } from "@/lib/utils";
+import {
+  WIREGUARD_KEY,
+  parseWireguardConfig,
+  stripConfigAssignment,
+  wireguardConfigProblems,
+  type WireguardConfigProblem,
+} from "@/lib/wireguard-config";
 import { BetaNotice, BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton, TextArea, TextField } from "../../../components/controls";
+import { PrimaryButton, SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import {
@@ -30,8 +37,10 @@ import {
  * Secrets are write-only — the daemon reports only whether it holds one — so
  * every secret field is blank on open and an untouched field is never sent. A
  * stored optional secret can be cleared, which sends `null` for it.
- * WireGuard profiles accept a pasted configuration file, which is how anyone
- * actually has these details to hand.
+ * A WireGuard profile starts from a configuration file, uploaded or pasted,
+ * which is how anyone actually has these details to hand, or from an empty
+ * form. SSH signs in with an Ed25519 key and nothing else, so it has no
+ * password.
  */
 
 const SECRET_KEYS = ["username", "password", "privateKey", "passphrase", "presharedKey"] as const;
@@ -69,7 +78,10 @@ const MTU_DEFAULT = 1280;
 /** The daemon accepts a connect timeout of 1–300 seconds. */
 const TIMEOUT_MAX = 300;
 const KEEPALIVE_DEFAULT = 25;
-const WIREGUARD_KEY = /^[A-Za-z0-9+/]{43}=$/;
+/** The largest configuration read: no real one comes near it. */
+const CONFIG_MAX = 65536;
+/** Where a WireGuard profile's details come from. */
+type WireguardStart = "upload" | "paste" | "manual";
 const CONFIG_KEYS = {
   privateKey: ["privatekey"],
   presharedKey: ["presharedkey"],
@@ -184,6 +196,11 @@ function wireguardProblem(t: Translate, form: ProxyForm, profile: ProxyProfile |
 }
 
 function proxyInput(form: ProxyForm) {
+  const secrets = { ...form.secrets };
+  if (form.kind === "SSH") {
+    // Typed while the profile was still another type; SSH takes none.
+    delete secrets.password;
+  }
   return {
     name: form.name.trim(),
     kind: form.kind,
@@ -196,7 +213,7 @@ function proxyInput(form: ProxyForm) {
     mtu: Number(form.mtu || MTU_DEFAULT),
     keepaliveSeconds: Number(form.keepaliveSeconds || KEEPALIVE_DEFAULT),
     timeoutSeconds: form.timeoutSeconds,
-    ...form.secrets,
+    ...secrets,
   };
 }
 
@@ -205,25 +222,165 @@ export function ProxiesPanel() {
   const [{ data, fetching }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
     query: PROXY_PROFILES_QUERY,
   });
-  const [, saveProxy] = useMutation(SAVE_PROXY_MUTATION);
-  const [, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
-  const [, resetTrust] = useMutation(RESET_PROXY_TRUST_MUTATION);
   const [, testProxy] = useMutation(TEST_PROXY_MUTATION);
 
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
-  const [form, setForm] = useState<ProxyForm>(NEW_PROXY);
-  const [configText, setConfigText] = useState("");
-  const [note, setNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   const [health, setHealth] = useState<Record<number, string>>({});
-  const [confirmRemove, setConfirmRemove] = useState<ProxyProfile | null>(null);
-  const [confirmTrust, setConfirmTrust] = useState<ProxyProfile | null>(null);
 
   const profiles = data?.proxyProfiles ?? [];
   const editing = typeof editingId === "number"
     ? (profiles.find((profile) => profile.id === editingId) ?? null)
     : null;
+
+  const runTest = async (profile: ProxyProfile) => {
+    setHealth((current) => ({ ...current, [profile.id]: t("next.proxies.testing") }));
+    const result = await testProxy({ id: profile.id });
+    const outcome = result.data?.testProxyProfile;
+    setHealth((current) => ({
+      ...current,
+      [profile.id]: outcome ? (outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")))
+        : (result.error?.message ?? t("next.proxies.failed")),
+    }));
+  };
+
+  const blocks: SettingsBlock[] = [
+    {
+      kind: "table",
+      id: "proxies",
+      title: t("next.settings.panel.proxies"),
+      tag: <BetaTag />,
+      note: t("next.proxies.tableNote"),
+      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 82px",
+      headers: [
+        t("next.proxies.name"),
+        t("next.proxies.type"),
+        t("next.proxies.endpoint"),
+        t("next.proxies.lastTest"),
+        "",
+      ],
+      empty: t("next.proxies.empty"),
+      emptyAction: { label: t("next.proxies.add"), onClick: () => setEditingId("new") },
+      onRowClick: (id) => {
+        const profile = profiles.find((entry) => String(entry.id) === id);
+        if (profile) {
+          setEditingId(profile.id);
+        }
+      },
+      rows: profiles.map((profile) => ({
+        id: String(profile.id),
+        searchText: `${profile.name} ${proxyLabels[profile.kind]} ${profile.host}`,
+        cells: [
+          <span key="name" className="flex min-w-0 items-center gap-[10px]">
+            <Square color={profile.enabled ? WV.accent : WV.inert} />
+            <span className="min-w-0 truncate">{profile.name}</span>
+          </span>,
+          <Cell key="kind" className="text-wv-secondary">
+            {proxyLabels[profile.kind]}
+          </Cell>,
+          <Cell key="host" mono className="text-wv-muted">
+            {profile.host}:{profile.port}
+          </Cell>,
+          <Cell key="health" mono className="text-wv-muted">
+            {health[profile.id] ?? "—"}
+          </Cell>,
+          <span key="test" onClick={(event) => event.stopPropagation()}>
+            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
+              {t("next.proxies.test")}
+            </SecondaryButton>
+          </span>,
+        ],
+      })),
+    },
+  ];
+
+  return (
+    <>
+      <PanelControls>
+        <PrimaryButton icon="add" onClick={() => setEditingId("new")}>{t("next.proxies.add")}</PrimaryButton>
+      </PanelControls>
+
+      <BetaNotice>{t("next.proxies.betaNotice")}</BetaNotice>
+
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
+
+      {editingId === null ? null : (
+        <ProxyEditor
+          key={editingId}
+          id={editingId}
+          profile={editing}
+          onClose={() => setEditingId(null)}
+          onChanged={() => void reexecute({ requestPolicy: "network-only" })}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * A stored proxy's editor, opened by its id from outside the proxies table:
+ * a proxy picked in the network flow. It reads the profiles itself, because
+ * an editor needs more of a profile than a diagram does.
+ */
+export function ProxyEditorFor({
+  id,
+  onClose,
+  onChanged,
+}: {
+  id: number;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [{ data }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({ query: PROXY_PROFILES_QUERY });
+  const profile = data?.proxyProfiles.find((candidate) => candidate.id === id);
+  return profile ? (
+    <ProxyEditor
+      id={id}
+      profile={profile}
+      onClose={onClose}
+      onChanged={() => {
+        void reexecute({ requestPolicy: "network-only" });
+        onChanged();
+      }}
+    />
+  ) : null;
+}
+
+/**
+ * One proxy in its editor, mounted while it is open: a stored profile's, or a
+ * new one's.
+ */
+export function ProxyEditor({
+  id: editingId,
+  profile: editing,
+  onClose,
+  onChanged,
+}: {
+  id: number | "new";
+  /** The stored profile, or null for a proxy that has not been saved yet. */
+  profile: ProxyProfile | null;
+  onClose: () => void;
+  /** A save, a removal, or a forgotten host key has landed. */
+  onChanged: () => void;
+}) {
+  const t = useTranslate();
+  const [, saveProxy] = useMutation(SAVE_PROXY_MUTATION);
+  const [, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
+  const [, resetTrust] = useMutation(RESET_PROXY_TRUST_MUTATION);
+
+  const [form, setForm] = useState<ProxyForm>(() => (editing ? formFor(editing) : NEW_PROXY));
+  // A stored profile opens on its details; a new one on the file most people have them in.
+  const [start, setStart] = useState<WireguardStart>(editing ? "manual" : "upload");
+  const [dragging, setDragging] = useState(false);
+  const fileNameId = useId();
+  const [configText, setConfigText] = useState("");
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [fileProblems, setFileProblems] = useState<string[]>([]);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState<ProxyProfile | null>(null);
+  const [confirmTrust, setConfirmTrust] = useState<ProxyProfile | null>(null);
 
   const patch = (next: Partial<ProxyForm>) => setForm((current) => ({ ...current, ...next }));
   const setSecret = (key: SecretKey, value: string) =>
@@ -291,32 +448,39 @@ export function ProxiesPanel() {
   const storedHelp = (key: SecretKey) =>
     form.secrets[key] === null ? t("next.proxies.storedCleared") : t("next.proxies.storedKeep");
 
-  const open = (profile: ProxyProfile | null) => {
-    setError(null);
-    setNote(null);
-    setConfigText("");
-    setForm(profile ? formFor(profile) : NEW_PROXY);
-    setEditingId(profile ? profile.id : "new");
+  const describeProblem = (problem: WireguardConfigProblem) =>
+    problem.kind === "missing"
+      ? t("next.proxies.configMissing", { key: problem.key, section: problem.section })
+      : problem.kind === "key"
+        ? t("next.proxies.configBadKey", { key: problem.key })
+        : problem.kind === "number"
+          ? t("next.proxies.configBadNumber", { key: problem.key })
+          : t("next.proxies.configBadEndpoint");
+
+  /** Everything wrong with a configuration, in the order its keys are written. */
+  const configProblems = (text: string): string[] => {
+    if (text.length > CONFIG_MAX) {
+      return [t("next.proxies.configTooLarge")];
+    }
+    const parsed = parseWireguardConfig(text);
+    return parsed ? wireguardConfigProblems(parsed).map(describeProblem) : [t("next.proxies.configNotWireguard")];
   };
 
   /**
-   * Fill the form from a pasted `wg-quick` file.
+   * Fill the form from a `wg-quick` configuration that has nothing wrong with
+   * it, and open the form for it to be checked.
    *
-   * Only what the file names is written, so a fragment never blanks a field
-   * that was typed by hand, and whatever the file carried that a tunnel proxy
-   * has no use for is reported rather than silently dropped.
+   * Only what the file names is written, so what it leaves out keeps what the
+   * form held, and whatever the file carried that a tunnel proxy has no use
+   * for is reported rather than silently dropped.
    */
-  const applyConfig = () => {
-    if (configText.length > 65536) {
-      setError(t("next.proxies.configTooLarge"));
-      return;
-    }
-    const parsed = parseWireguardConfig(configText);
+  const applyConfig = (text: string) => {
+    const parsed = parseWireguardConfig(text);
     if (!parsed) {
-      setError(t("next.proxies.configNotWireguard"));
       return;
     }
     const endpoint = parsed.endpoint ? splitEndpoint(parsed.endpoint) : null;
+    const keepalive = /^off$/i.test(parsed.tunnelKeepaliveSeconds) ? "0" : parsed.tunnelKeepaliveSeconds;
     setError(null);
     setForm((current) => ({
       ...current,
@@ -327,8 +491,7 @@ export function ProxiesPanel() {
       dns: parsed.tunnelDnsServers || current.dns,
       peerPublicKey: parsed.peerPublicKey || current.peerPublicKey,
       mtu: digits(parsed.tunnelMtu, CONFIG_KEYS.mtu) || current.mtu,
-      keepaliveSeconds:
-        digits(parsed.tunnelKeepaliveSeconds, CONFIG_KEYS.keepalive) || current.keepaliveSeconds,
+      keepaliveSeconds: digits(keepalive, CONFIG_KEYS.keepalive) || current.keepaliveSeconds,
       secrets: {
         ...current.secrets,
         ...(parsed.privateKey ? { privateKey: parsed.privateKey } : {}),
@@ -345,7 +508,35 @@ export function ProxiesPanel() {
       ].join(" "),
     );
     setConfigText("");
+    setFileName(null);
+    setFileProblems([]);
+    setStart("manual");
   };
+
+  const readFile = async (file: File) => {
+    setFileName(file.name);
+    setFileProblems([]);
+    if (file.size > CONFIG_MAX) {
+      setFileProblems([t("next.proxies.configTooLarge")]);
+      return;
+    }
+    let content: string;
+    try {
+      content = await file.text();
+    } catch {
+      setFileProblems([t("next.proxies.configUnreadable")]);
+      return;
+    }
+    const problems = configProblems(content);
+    if (problems.length > 0) {
+      setFileProblems(problems);
+      return;
+    }
+    applyConfig(content);
+  };
+
+  const pasteProblems = configText.trim() ? configProblems(configText) : [];
+  const pasteReady = configText.trim() !== "" && pasteProblems.length === 0;
 
   const save = async () => {
     const clean = normalized(form);
@@ -374,22 +565,34 @@ export function ProxiesPanel() {
       setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
       return;
     }
-    setEditingId(null);
-    void reexecute({ requestPolicy: "network-only" });
-  };
-
-  const runTest = async (profile: ProxyProfile) => {
-    setHealth((current) => ({ ...current, [profile.id]: t("next.proxies.testing") }));
-    const result = await testProxy({ id: profile.id });
-    const outcome = result.data?.testProxyProfile;
-    setHealth((current) => ({
-      ...current,
-      [profile.id]: outcome ? (outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")))
-        : (result.error?.message ?? t("next.proxies.failed")),
-    }));
+    onClose();
+    onChanged();
   };
 
   const isWireguard = form.kind === "WIRE_GUARD";
+  const isSsh = form.kind === "SSH";
+  /** A WireGuard profile's details stay shut until it is known where they come from. */
+  const detailsOpen = !isWireguard || start === "manual";
+
+  const endpointFields: FieldSpec[] = [
+    {
+      id: "host",
+      label: isWireguard ? t("next.proxies.endpoint") : t("next.proxies.host"),
+      help: isWireguard ? t("next.proxies.endpointHelp") : undefined,
+      control: { kind: "text", value: form.host, onChange: (next) => patch({ host: next }) },
+    },
+    {
+      id: "port",
+      label: t("next.proxies.port"),
+      control: {
+        kind: "number",
+        value: form.port,
+        min: 1,
+        max: 65535,
+        onChange: (next) => patch({ port: next }),
+      },
+    },
+  ];
 
   const connectionFields: FieldSpec[] = [
     {
@@ -417,23 +620,8 @@ export function ProxiesPanel() {
               patch({ kind: next as ProxyKind, port: DEFAULT_PORTS[next as ProxyKind] }),
           },
     },
-    {
-      id: "host",
-      label: isWireguard ? t("next.proxies.endpoint") : t("next.proxies.host"),
-      help: isWireguard ? t("next.proxies.endpointHelp") : undefined,
-      control: { kind: "text", value: form.host, onChange: (next) => patch({ host: next }) },
-    },
-    {
-      id: "port",
-      label: t("next.proxies.port"),
-      control: {
-        kind: "number",
-        value: form.port,
-        min: 1,
-        max: 65535,
-        onChange: (next) => patch({ port: next }),
-      },
-    },
+    // A WireGuard endpoint is one of the details its configuration carries, so it sits with them.
+    ...(isWireguard ? [] : endpointFields),
     {
       id: "timeoutSeconds",
       label: t("next.proxies.timeout"),
@@ -456,6 +644,7 @@ export function ProxiesPanel() {
 
   const credentialFields: FieldSpec[] = isWireguard
     ? [
+        ...endpointFields,
         {
           id: "privateKey",
           label: t("next.proxies.privateKey"),
@@ -539,7 +728,9 @@ export function ProxiesPanel() {
         {
           id: "username",
           label: t("next.proxies.username"),
-          help: editing?.hasUsername ? storedHelp("username") : t("next.proxies.optional"),
+          help: editing?.hasUsername
+            ? storedHelp("username")
+            : isSsh ? undefined : t("next.proxies.optional"),
           control: editing?.hasUsername
             ? storedSecret("username", t("next.proxies.username"))
             : {
@@ -549,25 +740,32 @@ export function ProxiesPanel() {
                 onChange: (next) => setSecret("username", next),
               },
         },
-        {
-          id: "password",
-          label: t("next.proxies.password"),
-          help: editing?.hasPassword ? storedHelp("password") : t("next.proxies.optional"),
-          control: editing?.hasPassword
-            ? storedSecret("password", t("next.proxies.password"), { password: true })
-            : {
-                kind: "text",
-                type: "password",
-                value: form.secrets.password ?? "",
-                onChange: (next) => setSecret("password", next),
+        // SSH signs in with its key alone: there is no password to give it.
+        ...(isSsh
+          ? []
+          : [
+              {
+                id: "password",
+                label: t("next.proxies.password"),
+                help: editing?.hasPassword ? storedHelp("password") : t("next.proxies.optional"),
+                control: editing?.hasPassword
+                  ? storedSecret("password", t("next.proxies.password"), { password: true })
+                  : {
+                      kind: "text" as const,
+                      type: "password" as const,
+                      value: form.secrets.password ?? "",
+                      onChange: (next: string) => setSecret("password", next),
+                    },
               },
-        },
-        ...(form.kind === "SSH"
+            ]),
+        ...(isSsh
           ? [
               {
                 id: "privateKey",
                 label: t("next.proxies.privateKey"),
-                help: editing?.hasPrivateKey ? storedHelp("privateKey") : t("next.proxies.sshKeyHelp"),
+                help: editing?.hasPrivateKey
+                  ? `${t("next.proxies.sshKeyHelp")} ${storedHelp("privateKey")}`
+                  : t("next.proxies.sshKeyHelp"),
                 control: editing?.hasPrivateKey
                   ? storedSecret("privateKey", t("next.proxies.privateKey"), { multiline: true })
                   : {
@@ -595,79 +793,128 @@ export function ProxiesPanel() {
           : []),
       ];
 
+  const problemList = (problems: readonly string[]) =>
+    problems.length === 0 ? null : (
+      <ul role="alert" className="flex flex-col gap-1 text-[12.5px] leading-[1.5] text-wv-error-text">
+        {problems.map((problem) => (
+          <li key={problem}>{problem}</li>
+        ))}
+      </ul>
+    );
+
+  const startBody = (
+    <div className="flex flex-none flex-col gap-3 border-b border-wv-hairline px-4 py-4 sm:px-6">
+      <Segmented
+        label={t("next.proxies.wgStart")}
+        value={start}
+        className="w-full [&>button]:flex-1 [&>button]:justify-center"
+        options={[
+          { value: "upload", label: t("next.proxies.wgUpload") },
+          { value: "paste", label: t("next.proxies.wgPaste") },
+          { value: "manual", label: t("next.proxies.wgManual") },
+        ]}
+        onChange={(next) => setStart(next as WireguardStart)}
+      />
+      {start === "upload" ? (
+        <>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".conf,.txt,text/plain"
+            aria-label={t("next.proxies.configLabel")}
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              // Cleared so the same file, corrected, can be chosen again.
+              event.target.value = "";
+              if (file) {
+                void readFile(file);
+              }
+            }}
+          />
+          <button
+            type="button"
+            // The file last read is described, not named, so the target keeps one name.
+            aria-label={t("next.proxies.wgDropZone")}
+            aria-describedby={fileName === null ? undefined : fileNameId}
+            onClick={() => fileRef.current?.click()}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(event) => {
+              event.preventDefault();
+              setDragging(false);
+              const file = event.dataTransfer.files[0];
+              if (file) {
+                void readFile(file);
+              }
+            }}
+            className={cn(
+              "flex h-[104px] flex-none cursor-pointer flex-col items-center justify-center gap-2 border border-dashed px-4 text-[13px]",
+              dragging
+                ? "border-wv-accent bg-wv-selected text-wv-strong"
+                : "border-wv-control bg-wv-input text-wv-muted hover:border-wv-control-hover-strong",
+            )}
+          >
+            <span className="font-medium text-wv-fg">{t("next.proxies.wgDropZone")}</span>
+            {fileName === null ? null : (
+              <span id={fileNameId} className="max-w-full truncate font-wv-mono text-[11px] text-wv-faint">
+                {fileName}
+              </span>
+            )}
+          </button>
+          {problemList(fileProblems)}
+        </>
+      ) : null}
+      {start === "paste" ? (
+        <>
+          <TextArea
+            label={t("next.proxies.configLabel")}
+            value={configText}
+            rows={9}
+            secret
+            className="w-full"
+            placeholder={"[Interface]\nPrivateKey = …\nAddress = 10.6.0.2/32\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820"}
+            onChange={setConfigText}
+          />
+          {problemList(pasteProblems)}
+          <div className="flex justify-end">
+            <SecondaryButton icon="inspectFile" onClick={() => applyConfig(configText)} disabled={!pasteReady}>
+              {t("next.proxies.parse")}
+            </SecondaryButton>
+          </div>
+        </>
+      ) : null}
+      {start === "manual" && note !== null ? (
+        <div className="text-[12px] leading-[1.45] text-wv-muted">{note}</div>
+      ) : null}
+    </div>
+  );
+
   const sections: EditorSection[] = [
     { id: "connection", title: t("next.proxies.connection"), tag: <BetaTag />, fields: connectionFields },
-    {
-      id: "credentials",
-      title: isWireguard ? t("next.proxies.tunnel") : t("next.proxies.credentials"),
-      tag: <BetaTag />,
-      note: t("next.proxies.secretsNote"),
-      fields: credentialFields,
-    },
-  ];
-
-  const blocks: SettingsBlock[] = [
-    {
-      kind: "table",
-      id: "proxies",
-      title: t("next.settings.panel.proxies"),
-      tag: <BetaTag />,
-      note: t("next.proxies.tableNote"),
-      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 82px",
-      headers: [
-        t("next.proxies.name"),
-        t("next.proxies.type"),
-        t("next.proxies.endpoint"),
-        t("next.proxies.lastTest"),
-        "",
-      ],
-      empty: t("next.proxies.empty"),
-      emptyAction: { label: t("next.proxies.add"), onClick: () => open(null) },
-      onRowClick: (id) => {
-        const profile = profiles.find((entry) => String(entry.id) === id);
-        if (profile) {
-          open(profile);
-        }
-      },
-      rows: profiles.map((profile) => ({
-        id: String(profile.id),
-        searchText: `${profile.name} ${proxyLabels[profile.kind]} ${profile.host}`,
-        cells: [
-          <span key="name" className="flex min-w-0 items-center gap-[10px]">
-            <Square color={profile.enabled ? WV.accent : WV.inert} />
-            <span className="min-w-0 truncate">{profile.name}</span>
-          </span>,
-          <Cell key="kind" className="text-wv-secondary">
-            {proxyLabels[profile.kind]}
-          </Cell>,
-          <Cell key="host" mono className="text-wv-muted">
-            {profile.host}:{profile.port}
-          </Cell>,
-          <Cell key="health" mono className="text-wv-muted">
-            {health[profile.id] ?? "—"}
-          </Cell>,
-          <span key="test" onClick={(event) => event.stopPropagation()}>
-            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
-              {t("next.proxies.test")}
-            </SecondaryButton>
-          </span>,
-        ],
-      })),
-    },
+    ...(isWireguard
+      ? [{ id: "start", title: t("next.proxies.wgStart"), tag: <BetaTag />, fields: [], body: startBody }]
+      : []),
+    ...(detailsOpen
+      ? [
+          {
+            id: "credentials",
+            title: isWireguard ? t("next.proxies.tunnel") : t("next.proxies.credentials"),
+            tag: <BetaTag />,
+            note: t("next.proxies.secretsNote"),
+            fields: credentialFields,
+          },
+        ]
+      : []),
   ];
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>{t("next.proxies.add")}</PrimaryButton>
-      </PanelControls>
-
-      <BetaNotice>{t("next.proxies.betaNotice")}</BetaNotice>
-
-      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
-
       <RecordEditor
-        open={editingId !== null}
+        open
         title={editingId === "new" ? t("next.proxies.add") : (editing?.name ?? t("next.proxies.proxy"))}
         note={
           <span className="inline-flex items-center gap-2">
@@ -679,8 +926,9 @@ export function ProxiesPanel() {
         sections={sections}
         error={error}
         busy={busy}
+        saveDisabled={!detailsOpen}
         onSave={() => void save()}
-        onDismiss={() => setEditingId(null)}
+        onDismiss={onClose}
         onDelete={editing ? () => setConfirmRemove(editing) : undefined}
         deleteLabel={t("next.proxies.remove")}
         extraActions={
@@ -690,32 +938,7 @@ export function ProxiesPanel() {
             </SecondaryButton>
           ) : null
         }
-      >
-        {isWireguard ? (
-          <div className="flex flex-none flex-col gap-2 border-t border-wv-hairline px-4 sm:px-6 py-4">
-            <div className="text-[12.5px] text-wv-muted">
-              {t("next.proxies.pasteNote")}
-            </div>
-            <TextArea
-              label={t("next.proxies.configLabel")}
-              value={configText}
-              rows={4}
-              secret
-              className="w-full"
-              placeholder={"[Interface]\nPrivateKey = …\nAddress = 10.6.0.2/32\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820"}
-              onChange={setConfigText}
-            />
-            <div className="flex items-center justify-end gap-4">
-              {note === null ? null : (
-                <div className="min-w-0 flex-1 text-[12px] leading-[1.45] text-wv-muted">{note}</div>
-              )}
-              <SecondaryButton icon="inspectFile" onClick={applyConfig} disabled={!configText.trim()}>
-                {t("next.proxies.readConfig")}
-              </SecondaryButton>
-            </div>
-          </div>
-        ) : null}
-      </RecordEditor>
+      />
 
       <ConfirmDialog
         open={confirmRemove !== null}
@@ -728,8 +951,8 @@ export function ProxiesPanel() {
           if (confirmRemove) {
             void deleteProxy({ id: confirmRemove.id }).then(() => {
               setConfirmRemove(null);
-              setEditingId(null);
-              void reexecute({ requestPolicy: "network-only" });
+              onClose();
+              onChanged();
             });
           }
         }}
@@ -747,7 +970,7 @@ export function ProxiesPanel() {
           if (confirmTrust) {
             void resetTrust({ id: confirmTrust.id }).then(() => {
               setConfirmTrust(null);
-              void reexecute({ requestPolicy: "network-only" });
+              onChanged();
             });
           }
         }}

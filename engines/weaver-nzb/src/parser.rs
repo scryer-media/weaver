@@ -31,7 +31,7 @@ const DEFAULT_LIMITS: ParserLimits = ParserLimits {
 };
 
 impl ParserLimits {
-    /// Read once per submission, before any job or network work is created.
+    // Read once per submission, before any job or network work is created.
     fn from_env() -> Result<Self, NzbError> {
         fn limit<T: std::str::FromStr>(name: &str, default: T) -> Result<T, NzbError> {
             match std::env::var(name) {
@@ -58,27 +58,76 @@ impl ParserLimits {
     }
 }
 
-/// Parse an NZB XML document from bytes.
+// Parse an NZB XML document from bytes.
 pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
     parse_nzb_reader(Cursor::new(xml))
 }
 
+// What the parser dropped, repaired, or reordered on its way to an [`Nzb`].
+//
+// The parsed document is the clean view the pipeline downloads from; these
+// counts are the part of the original document that view no longer shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParseDiagnostics {
+    // `<file>` elements dropped because no segment survived.
+    pub files_without_segments: u32,
+    // `<file>` elements whose `date` attribute did not parse.
+    pub invalid_dates: u32,
+    // Malformed segments inside the dropped files, which have no entry in
+    // `files`.
+    pub malformed_segments_in_dropped_files: u32,
+    // One entry per file in [`Nzb::files`], in the same order.
+    pub files: Vec<FileParseDiagnostics>,
+}
+
+// Per-file parse findings, aligned with [`Nzb::files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileParseDiagnostics {
+    // Segments skipped for a missing or invalid number, size, or message-ID.
+    pub malformed_segments: u32,
+    // Segments skipped because their number was already listed.
+    pub duplicate_segment_numbers: u32,
+    // Segments skipped because their message-ID was already listed.
+    pub duplicate_message_ids: u32,
+    // The document listed a segment number lower than one before it.
+    pub out_of_order: bool,
+}
+
+// Parse an NZB XML document from bytes, keeping what the parse dropped.
+pub fn parse_nzb_with_diagnostics(xml: &[u8]) -> Result<(Nzb, ParseDiagnostics), NzbError> {
+    let mut diagnostics = ParseDiagnostics::default();
+    let nzb = parse_nzb_reader_limited(
+        Cursor::new(xml),
+        ParserLimits::from_env()?,
+        &mut diagnostics,
+    )?;
+    Ok((nzb, diagnostics))
+}
+
 #[cfg(test)]
 fn parse_nzb_with_limits(xml: &[u8], limits: ParserLimits) -> Result<Nzb, NzbError> {
-    parse_nzb_reader_limited(Cursor::new(xml), limits)
+    parse_nzb_reader_limited(Cursor::new(xml), limits, &mut ParseDiagnostics::default())
 }
 
-/// Parse an NZB XML document incrementally from a buffered reader.
+// Parse an NZB XML document incrementally from a buffered reader.
 pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
-    parse_nzb_reader_limited(reader, ParserLimits::from_env()?)
+    parse_nzb_reader_limited(
+        reader,
+        ParserLimits::from_env()?,
+        &mut ParseDiagnostics::default(),
+    )
 }
 
-fn parse_nzb_reader_limited<R: BufRead>(reader: R, limits: ParserLimits) -> Result<Nzb, NzbError> {
+fn parse_nzb_reader_limited<R: BufRead>(
+    reader: R,
+    limits: ParserLimits,
+    diagnostics: &mut ParseDiagnostics,
+) -> Result<Nzb, NzbError> {
     let read_limit = limits.max_xml_bytes.checked_add(1).ok_or_else(|| {
         NzbError::ResourceLimit("XML byte cap is too large to enforce".to_string())
     })?;
     let mut reader = reader.take(u64::try_from(read_limit).unwrap_or(u64::MAX));
-    let result = parse_nzb_reader_with_limits(&mut reader, limits);
+    let result = parse_nzb_reader_with_limits(&mut reader, limits, diagnostics);
     if reader.limit() == 0 {
         return Err(NzbError::ResourceLimit(format!(
             "XML document exceeds {} bytes",
@@ -91,6 +140,7 @@ fn parse_nzb_reader_limited<R: BufRead>(reader: R, limits: ParserLimits) -> Resu
 fn parse_nzb_reader_with_limits<R: BufRead>(
     reader: R,
     limits: ParserLimits,
+    diagnostics: &mut ParseDiagnostics,
 ) -> Result<Nzb, NzbError> {
     let mut reader = Reader::from_reader(reader);
     reader.config_mut().trim_text(true);
@@ -100,6 +150,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     // Meta accumulation
     let mut meta_title: Option<String> = None;
     let mut meta_password: Option<String> = None;
+    let mut meta_passwords = Vec::new();
     let mut meta_tags: Vec<(String, String)> = Vec::new();
 
     // File accumulation
@@ -134,6 +185,9 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             }
                         }
                         text_buf.clear();
+                        reader
+                            .config_mut()
+                            .trim_text(current_meta_type.as_deref() != Some("password"));
                     }
                     "file" => {
                         let mut poster = None;
@@ -158,6 +212,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                                 value = %val,
                                                 "invalid NZB file date; defaulting to 0"
                                             );
+                                            diagnostics.invalid_dates =
+                                                diagnostics.invalid_dates.saturating_add(1);
                                             date = Some(0);
                                         }
                                     }
@@ -189,6 +245,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             segment_numbers: HashSet::new(),
                             message_ids: HashSet::new(),
                             duplicates: DuplicateSegmentTally::default(),
+                            notes: FileParseDiagnostics::default(),
+                            last_number: None,
                         });
                     }
                     "groups" if current_file.is_some() => in_groups = true,
@@ -245,10 +303,20 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                 match local {
                     "head" => in_head = false,
                     "meta" if in_head => {
+                        reader.config_mut().trim_text(true);
                         if let Some(key) = current_meta_type.take() {
                             match key.as_str() {
                                 "title" => meta_title = Some(text_buf.clone()),
-                                "password" => meta_password = Some(text_buf.clone()),
+                                "password" => {
+                                    if !text_buf.trim().is_empty()
+                                        && !meta_passwords.contains(&text_buf)
+                                    {
+                                        if meta_password.is_none() {
+                                            meta_password = Some(text_buf.clone());
+                                        }
+                                        meta_passwords.push(text_buf.clone());
+                                    }
+                                }
                                 _ => meta_tags.push((key, text_buf.clone())),
                             }
                         }
@@ -272,6 +340,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 .trim_end_matches('>')
                                 .to_owned();
                             if let Some(reason) = seg.skip_reason(&message_id) {
+                                f.notes.malformed_segments =
+                                    f.notes.malformed_segments.saturating_add(1);
                                 tracing::warn!(
                                     subject = %f.subject,
                                     message_id = %message_id,
@@ -281,11 +351,19 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             } else {
                                 let number = seg.number.expect("validated segment number");
                                 let bytes = seg.bytes.expect("validated segment byte count");
+                                if f.last_number.is_some_and(|last| number < last) {
+                                    f.notes.out_of_order = true;
+                                }
+                                f.last_number = Some(number);
 
                                 if f.segment_numbers.contains(&number) {
                                     f.duplicates.note_number(&message_id);
+                                    f.notes.duplicate_segment_numbers =
+                                        f.notes.duplicate_segment_numbers.saturating_add(1);
                                 } else if f.message_ids.contains(&message_id) {
                                     f.duplicates.note_message_id(&message_id);
+                                    f.notes.duplicate_message_ids =
+                                        f.notes.duplicate_message_ids.saturating_add(1);
                                 } else {
                                     f.segment_numbers.insert(number);
                                     f.message_ids.insert(message_id.clone());
@@ -323,6 +401,11 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                         if let Some(f) = current_file.take() {
                             f.duplicates.report(&f.subject);
                             if f.segments.is_empty() {
+                                diagnostics.files_without_segments =
+                                    diagnostics.files_without_segments.saturating_add(1);
+                                diagnostics.malformed_segments_in_dropped_files = diagnostics
+                                    .malformed_segments_in_dropped_files
+                                    .saturating_add(f.notes.malformed_segments);
                                 tracing::warn!(
                                     subject = %f.subject,
                                     "skipping file with no segments"
@@ -336,6 +419,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 }
                                 let mut segments = f.segments;
                                 segments.sort_by_key(|s| s.number);
+                                diagnostics.files.push(f.notes);
                                 files.push(NzbFile {
                                     poster: f.poster,
                                     subject: f.subject,
@@ -352,9 +436,39 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
 
             Ok(Event::Text(e)) => {
                 let decoded = e.xml_content(XmlVersion::Implicit1_0);
-                text_buf = quick_xml::escape::unescape(&decoded)
-                    .map_err(|e| NzbError::Xml(e.to_string()))?
-                    .into_owned();
+                let text = quick_xml::escape::unescape(&decoded)
+                    .map_err(|e| NzbError::Xml(e.to_string()))?;
+                if current_meta_type.as_deref() == Some("password") {
+                    text_buf.push_str(&text);
+                } else {
+                    text_buf = text.into_owned();
+                }
+            }
+
+            Ok(Event::GeneralRef(e)) if current_meta_type.as_deref() == Some("password") => {
+                if let Some(value) = e
+                    .resolve_char_ref()
+                    .map_err(|_| NzbError::Xml("invalid password character reference".into()))?
+                {
+                    text_buf.push(value);
+                } else {
+                    let value = match e.as_ref() {
+                        "amp" => '&',
+                        "lt" => '<',
+                        "gt" => '>',
+                        "quot" => '"',
+                        "apos" => '\'',
+                        _ => {
+                            return Err(NzbError::Xml(
+                                "unsupported password entity reference".into(),
+                            ));
+                        }
+                    };
+                    text_buf.push(value);
+                }
+            }
+            Ok(Event::CData(e)) if current_meta_type.as_deref() == Some("password") => {
+                text_buf.push_str(&e.xml_content(XmlVersion::Implicit1_0));
             }
 
             Err(e) => return Err(NzbError::Xml(e.to_string())),
@@ -389,13 +503,14 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
         meta: NzbMeta {
             title: meta_title,
             password: meta_password,
+            passwords: meta_passwords,
             tags: meta_tags,
         },
         files,
     })
 }
 
-/// Strip namespace prefix from an element name (e.g. `nzb:file` -> `file`).
+// Strip namespace prefix from an element name (e.g. `nzb:file` -> `file`).
 fn local_name(name: &str) -> &str {
     match name.find(':') {
         Some(pos) => &name[pos + 1..],
@@ -412,14 +527,16 @@ struct FileBuilder {
     segment_numbers: HashSet<u32>,
     message_ids: HashSet<String>,
     duplicates: DuplicateSegmentTally,
+    notes: FileParseDiagnostics,
+    last_number: Option<u32>,
 }
 
-/// The duplicate segments skipped while one file's `<segments>` were read.
-///
-/// A posting whose segment list repeats itself does not repeat it once: the
-/// same file arrives with tens of thousands of duplicates, and a line each
-/// buries every other thing the log had to say. They are counted here and
-/// reported once, when the file ends.
+// The duplicate segments skipped while one file's `<segments>` were read.
+//
+// A posting whose segment list repeats itself does not repeat it once: the
+// same file arrives with tens of thousands of duplicates, and a line each
+// buries every other thing the log had to say. They are counted here and
+// reported once, when the file ends.
 #[derive(Debug, Default)]
 struct DuplicateSegmentTally {
     numbers: u64,
@@ -448,7 +565,7 @@ impl DuplicateSegmentTally {
         self.numbers.saturating_add(self.message_ids)
     }
 
-    /// Emit the one warning this file's duplicates are worth, if any.
+    // Emit the one warning this file's duplicates are worth, if any.
     fn report(&self, subject: &str) {
         if self.total() == 0 {
             return;
@@ -503,6 +620,24 @@ mod tests {
 
     use super::*;
     use weaver_model::files::FileRole;
+
+    #[test]
+    fn repeated_password_metadata_preserves_literals_and_redacts_debug() {
+        let input = std::str::from_utf8(MINIMAL_NZB).unwrap().replace(
+            "  <file",
+            r#"  <head>
+          <meta type="password"> </meta>
+          <meta type="password">1</meta>
+          <meta type="password">tr&#117;e</meta>
+          <meta type="password">  synthetic &amp; <![CDATA[<key>]]> Ω  </meta>
+          <meta type="password">1</meta>
+        </head><file"#,
+        );
+        let nzb = parse_nzb(input.as_bytes()).unwrap();
+        assert_eq!(nzb.meta.password.as_deref(), Some("1"));
+        assert_eq!(nzb.meta.passwords, ["1", "true", "  synthetic & <key> Ω  "]);
+        assert!(!format!("{:?}", nzb.meta).contains("synthetic"));
+    }
 
     const MINIMAL_NZB: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
@@ -879,8 +1014,8 @@ mod tests {
         assert_eq!(segments[1].message_id, "next-id");
     }
 
-    /// A file whose segment list repeats itself is worth one line, not one
-    /// line per repeat: the tally is what the single warning reports.
+    // A file whose segment list repeats itself is worth one line, not one
+    // line per repeat: the tally is what the single warning reports.
     #[test]
     fn duplicate_segments_are_reported_once_per_file() {
         let mut tally = DuplicateSegmentTally::default();
@@ -907,8 +1042,8 @@ mod tests {
         );
     }
 
-    /// The parse itself keeps one segment per duplicated id, however many
-    /// copies the document carries.
+    // The parse itself keeps one segment per duplicated id, however many
+    // copies the document carries.
     #[test]
     fn duplicate_segment_message_ids_collapse_to_one_segment() {
         let mut xml = String::from(
@@ -1098,6 +1233,7 @@ mod tests {
                 max_xml_bytes: 3,
                 ..test_limits()
             },
+            &mut ParseDiagnostics::default(),
         )
         .unwrap_err();
         assert!(matches!(err, NzbError::ResourceLimit(_)));
@@ -1110,11 +1246,19 @@ mod tests {
             max_xml_bytes: xml.len(),
             ..test_limits()
         };
-        assert!(parse_nzb_reader_limited(Cursor::new(xml), limits).is_ok());
+        assert!(
+            parse_nzb_reader_limited(Cursor::new(xml), limits, &mut ParseDiagnostics::default())
+                .is_ok()
+        );
 
         let mut oversized = xml.to_vec();
         oversized.push(b' ');
-        let err = parse_nzb_reader_limited(Cursor::new(oversized), limits).unwrap_err();
+        let err = parse_nzb_reader_limited(
+            Cursor::new(oversized),
+            limits,
+            &mut ParseDiagnostics::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, NzbError::ResourceLimit(_)));
     }
 
@@ -1261,7 +1405,7 @@ mod tests {
         assert!(matches!(err, NzbError::ResourceLimit(_)));
     }
 
-    /// Helper to create an NzbFile with just a subject for filename/role tests.
+    // Helper to create an NzbFile with just a subject for filename/role tests.
     fn make_file(subject: &str) -> NzbFile {
         NzbFile {
             poster: String::new(),

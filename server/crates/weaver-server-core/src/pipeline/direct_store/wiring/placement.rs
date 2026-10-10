@@ -1,6 +1,6 @@
-//! Direct-store placements off the pipeline task: a routed article's
-//! destination writes run on a task of their own, and its commit is applied
-//! when they return. See [`crate::pipeline::DirectPlacementFlight`].
+// Direct-store placements off the pipeline task: a routed article's
+// destination writes run on a task of their own, and its commit is applied
+// when they return. See [`crate::pipeline::DirectPlacementFlight`].
 
 use super::commit::prepare_direct_destination_paths;
 use super::*;
@@ -9,9 +9,9 @@ use crate::pipeline::{
     DirectPlacementKind, DirectPlacementLane, DirectPlacementOutcome,
 };
 
-/// Collects a placement task's outcome. A task that went away without
-/// answering (a panic) reports a failed write: nothing it wrote is known to
-/// have landed.
+// Collects a placement task's outcome. A task that went away without
+// answering (a panic) reports a failed write: nothing it wrote is known to
+// have landed.
 async fn collect_placement_outcome(
     outcome: tokio::sync::oneshot::Receiver<DirectPlacementOutcome>,
 ) -> DirectPlacementOutcome {
@@ -23,14 +23,14 @@ async fn collect_placement_outcome(
     })
 }
 
-/// Whether a lane holds a placement still waiting for its writes or its
-/// commit.
-///
-/// A flight being applied has already taken the placement it is committing
-/// off its list, and that placement's coverage is recorded before its commit
-/// runs. Counting it would make the commit's own follow-on — a volume
-/// completing, a set finalizing, the completion check after it — wait on
-/// itself.
+// Whether a lane holds a placement still waiting for its writes or its
+// commit.
+//
+// A flight being applied has already taken the placement it is committing
+// off its list, and that placement's coverage is recorded before its commit
+// runs. Counting it would make the commit's own follow-on — a volume
+// completing, a set finalizing, the completion check after it — wait on
+// itself.
 fn lane_has_placements(lane: &DirectPlacementLane) -> bool {
     !lane.queued.is_empty()
         || lane.flight.as_ref().is_some_and(|flight| {
@@ -40,8 +40,8 @@ fn lane_has_placements(lane: &DirectPlacementLane) -> bool {
 }
 
 impl Pipeline {
-    /// Whether a completed volume's trailing region is still waiting to land
-    /// in this set. Until it has, the set's coverage is short of its volumes.
+    // Whether a completed volume's trailing region is still waiting to land
+    // in this set. Until it has, the set's coverage is short of its volumes.
     pub(in crate::pipeline) fn direct_set_has_pending_volume_tail(
         &self,
         job_id: JobId,
@@ -60,22 +60,22 @@ impl Pipeline {
             })
     }
 
-    /// Whether any placement of this job is still waiting for its
-    /// destination writes or its commit; see [`lane_has_placements`].
+    // Whether any placement of this job is still waiting for its
+    // destination writes or its commit; see [`lane_has_placements`].
     pub(crate) fn has_direct_placements(&self, job_id: JobId) -> bool {
         self.direct_placement_lanes
             .iter()
             .any(|((owner, _), lane)| *owner == job_id && lane_has_placements(lane))
     }
 
-    /// Whether this set has a placement whose bytes are, or may already be,
-    /// on disk without being in its coverage: queued, writing, or written
-    /// and waiting for its done message to apply it.
-    ///
-    /// Nothing that snapshots the set's coverage may stand while this holds.
-    /// The routing retired the set's PAR3 images before these writes left,
-    /// and their commit does not retire them again, so an image taken now
-    /// would report the bytes missing for as long as it is published.
+    // Whether this set has a placement whose bytes are, or may already be,
+    // on disk without being in its coverage: queued, writing, or written
+    // and waiting for its done message to apply it.
+    //
+    // Nothing that snapshots the set's coverage may stand while this holds.
+    // The routing retired the set's PAR3 images before these writes left,
+    // and their commit does not retire them again, so an image taken now
+    // would report the bytes missing for as long as it is published.
     pub(in crate::pipeline) fn direct_set_has_placements(
         &self,
         job_id: JobId,
@@ -86,11 +86,11 @@ impl Pipeline {
             .is_some_and(lane_has_placements)
     }
 
-    /// Re-queues a completion check that ran while this job had a placement
-    /// out, once it has none. The drain sequence re-runs only once the
-    /// download stage is idle; a check a placement's own commit ran inline —
-    /// the one after a set finalizes — can defer while other downloads are
-    /// still queued, and nothing else would run it again.
+    // Re-queues a completion check that ran while this job had a placement
+    // out, once it has none. The drain sequence re-runs only once the
+    // download stage is idle; a check a placement's own commit ran inline —
+    // the one after a set finalizes — can defer while other downloads are
+    // still queued, and nothing else would run it again.
     fn wake_completion_check_awaiting_placements(&mut self, job_id: JobId) {
         if self.has_direct_placements(job_id)
             || !self.completion_checks_awaiting_placements.remove(&job_id)
@@ -100,8 +100,8 @@ impl Pipeline {
         self.schedule_job_completion_check(job_id);
     }
 
-    /// Queues a routed article's placement behind its set, sending it at once
-    /// when the set has nothing writing.
+    // Queues a routed article's placement behind its set, sending it at once
+    // when the set has nothing writing.
     pub(super) fn enqueue_direct_placement(
         &mut self,
         job_id: JobId,
@@ -122,14 +122,14 @@ impl Pipeline {
         }
     }
 
-    /// Sends everything queued behind a set as one flight. Everything here is
-    /// bookkeeping — grouping the spans into per-destination batches of
-    /// refcounted views, and naming the destinations not yet created — and
-    /// the task spawned at the end does all of the I/O.
-    ///
-    /// A flight with no span to write — articles that went wholly into the
-    /// holds while an earlier one was writing — starts out resolved, and the
-    /// caller applies it.
+    // Sends everything queued behind a set as one flight. Everything here is
+    // bookkeeping — grouping the spans into per-destination batches of
+    // refcounted views, and naming the destinations not yet created — and
+    // the task spawned at the end does all of the I/O.
+    //
+    // A flight with no span to write — articles that went wholly into the
+    // holds while an earlier one was writing — starts out resolved, and the
+    // caller applies it.
     fn launch_direct_placement_flight(&mut self, job_id: JobId, set_index: usize) {
         let key = (job_id, set_index);
         let Some(set_name) = self
@@ -233,8 +233,8 @@ impl Pipeline {
         }
     }
 
-    /// A placement task's writes returned: apply them, then send whatever
-    /// queued behind them.
+    // A placement task's writes returned: apply them, then send whatever
+    // queued behind them.
     pub(in crate::pipeline) async fn handle_direct_placement_done(
         &mut self,
         done: DirectPlacementDone,
@@ -280,9 +280,9 @@ impl Pipeline {
         self.relieve_latched_write_backlog().await;
     }
 
-    /// Waits for the writes of a set's flight, if one is out, and keeps the
-    /// outcome for the done message to apply. For anything that must not run
-    /// alongside those writes but does not need their commits.
+    // Waits for the writes of a set's flight, if one is out, and keeps the
+    // outcome for the done message to apply. For anything that must not run
+    // alongside those writes but does not need their commits.
     pub(in crate::pipeline) async fn await_direct_placement_io(
         &mut self,
         job_id: JobId,
@@ -317,8 +317,8 @@ impl Pipeline {
         }
     }
 
-    /// Applies a resolved flight and sends the next, until the set has a
-    /// flight writing or nothing left.
+    // Applies a resolved flight and sends the next, until the set has a
+    // flight writing or nothing left.
     async fn advance_direct_placements(&mut self, job_id: JobId, set_index: usize) {
         let key = (job_id, set_index);
         loop {
@@ -363,9 +363,9 @@ impl Pipeline {
         }
     }
 
-    /// Whether a set can still commit a placement: the job is here, the set
-    /// is the one the placement was routed into, and it has neither demoted
-    /// nor finalized.
+    // Whether a set can still commit a placement: the job is here, the set
+    // is the one the placement was routed into, and it has neither demoted
+    // nor finalized.
     fn direct_set_takes_placements(
         &self,
         job_id: JobId,
@@ -380,14 +380,14 @@ impl Pipeline {
             })
     }
 
-    /// Commits a flight whose writes all returned, one article at a time in
-    /// routing order; or, for one whose writes did not, runs the placement
-    /// failure policy and hands every article behind the set back.
-    ///
-    /// Articles are taken off the flight one by one rather than all at once,
-    /// so a commit that demotes the set — a volume whose CRC disagrees, say —
-    /// finds the rest still on the lane, where the demotion collects them as
-    /// handoffs before it plans its sweep.
+    // Commits a flight whose writes all returned, one article at a time in
+    // routing order; or, for one whose writes did not, runs the placement
+    // failure policy and hands every article behind the set back.
+    //
+    // Articles are taken off the flight one by one rather than all at once,
+    // so a commit that demotes the set — a volume whose CRC disagrees, say —
+    // finds the rest still on the lane, where the demotion collects them as
+    // handoffs before it plans its sweep.
     async fn apply_direct_placement_flight(
         &mut self,
         job_id: JobId,
@@ -481,9 +481,9 @@ impl Pipeline {
         }
     }
 
-    /// Takes every placement behind a set off its lane — the flight's and the
-    /// queue's, in routing order — and releases their backlog. Does not wait
-    /// for a flight's writes; see [`Self::take_direct_placements`].
+    // Takes every placement behind a set off its lane — the flight's and the
+    // queue's, in routing order — and releases their backlog. Does not wait
+    // for a flight's writes; see [`Self::take_direct_placements`].
     fn take_lane_placements(&mut self, key: (JobId, usize)) -> Vec<DirectPlacement> {
         let Some(lane) = self.direct_placement_lanes.remove(&key) else {
             return Vec::new();
@@ -500,10 +500,10 @@ impl Pipeline {
         placements
     }
 
-    /// Takes every placement behind a set, after the flight's writes have
-    /// returned. A demotion calls this before anything else: its sweep
-    /// deletes the destinations those writes target, and the articles become
-    /// the demotion's handoffs.
+    // Takes every placement behind a set, after the flight's writes have
+    // returned. A demotion calls this before anything else: its sweep
+    // deletes the destinations those writes target, and the articles become
+    // the demotion's handoffs.
     pub(super) async fn take_direct_placements(
         &mut self,
         job_id: JobId,
@@ -513,10 +513,10 @@ impl Pipeline {
         self.take_lane_placements((job_id, set_index))
     }
 
-    /// Placements whose set stopped taking them. A finalized set's are
-    /// duplicates of articles it already committed and are discarded, as the
-    /// decode seam discards one; any other set's go back to the conventional
-    /// path, like a failed placement.
+    // Placements whose set stopped taking them. A finalized set's are
+    // duplicates of articles it already committed and are discarded, as the
+    // decode seam discards one; any other set's go back to the conventional
+    // path, like a failed placement.
     async fn retire_stale_direct_placements(
         &mut self,
         job_id: JobId,
@@ -543,12 +543,12 @@ impl Pipeline {
         self.hand_back_direct_placements(placements).await;
     }
 
-    /// Hands routed articles to the conventional path, exactly as the decode
-    /// seam hands back one whose set demoted under it.
-    ///
-    /// A volume's trailing region carries no article to hand back; the
-    /// demotion that let it go owns those bytes, as it owns any the set had
-    /// not recorded as coverage.
+    // Hands routed articles to the conventional path, exactly as the decode
+    // seam hands back one whose set demoted under it.
+    //
+    // A volume's trailing region carries no article to hand back; the
+    // demotion that let it go owns those bytes, as it owns any the set had
+    // not recorded as coverage.
     pub(super) async fn hand_back_direct_placements(&mut self, placements: Vec<DirectPlacement>) {
         for placement in placements {
             let DirectPlacementKind::Article {
@@ -585,10 +585,10 @@ impl Pipeline {
         }
     }
 
-    /// Drives a set's placements to empty — applying every flight, sending
-    /// and applying what queued behind it — for a demanded barrier that must
-    /// describe them. Returns early when a frame further up is applying the
-    /// set's flight: the writes of that flight have already returned.
+    // Drives a set's placements to empty — applying every flight, sending
+    // and applying what queued behind it — for a demanded barrier that must
+    // describe them. Returns early when a frame further up is applying the
+    // set's flight: the writes of that flight have already returned.
     pub(in crate::pipeline) async fn settle_direct_placements(
         &mut self,
         job_id: JobId,
@@ -611,8 +611,8 @@ impl Pipeline {
         }
     }
 
-    /// [`Self::settle_direct_placements`] for every set with anything out.
-    /// The shutdown drain's last word on routed articles.
+    // [`Self::settle_direct_placements`] for every set with anything out.
+    // The shutdown drain's last word on routed articles.
     pub(crate) async fn settle_all_direct_placements(&mut self) {
         let keys: Vec<(JobId, usize)> = self.direct_placement_lanes.keys().copied().collect();
         for (job_id, set_index) in keys {
@@ -620,9 +620,9 @@ impl Pipeline {
         }
     }
 
-    /// Forgets a removed job's placements. Their tasks run to the end on
-    /// their own, and a close of the job's roots waits for them
-    /// ([`crate::pipeline::close_cached_write_handles_under`]).
+    // Forgets a removed job's placements. Their tasks run to the end on
+    // their own, and a close of the job's roots waits for them
+    // ([`crate::pipeline::close_cached_write_handles_under`]).
     pub(crate) fn drop_direct_placements_for_job(&mut self, job_id: JobId) {
         self.completion_checks_awaiting_placements.remove(&job_id);
         self.par3_publications_awaiting_placements

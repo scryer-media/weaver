@@ -101,10 +101,10 @@ pub(super) async fn job_nzb_download_handler(
     }
 }
 
-/// The browser's own download of an output file: a plain navigation, so the
-/// bytes stream to disk instead of through a blob the tab has to hold. A GET
-/// carries no CSRF header, which is why the form POST below still exists for
-/// callers that already send one.
+// The browser's own download of an output file: a plain navigation, so the
+// bytes stream to disk instead of through a blob the tab has to hold. A GET
+// carries no CSRF header, which is why the form POST below still exists for
+// callers that already send one.
 pub(super) async fn job_output_file_download_get_handler(
     Path(job_id): Path<u64>,
     Extension(handle): Extension<SchedulerHandle>,

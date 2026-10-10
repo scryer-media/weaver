@@ -1,23 +1,23 @@
 use super::*;
 
-/// A segmented spec whose file streams the *running* file hash on every commit.
-///
-/// A `Standalone` file that declares a whole-file CRC32 takes the deferred
-/// CRC-metadata arm instead, which is keyed by offset and so never consults the
-/// running offset at all. Only the streaming arm can observe a duplicate being
-/// fed twice, and a RAR volume in a set with no PAR2 is the ordinary shape that
-/// reaches it.
+// A segmented spec whose file streams the *running* file hash on every commit.
+//
+// A `Standalone` file that declares a whole-file CRC32 takes the deferred
+// CRC-metadata arm instead, which is keyed by offset and so never consults the
+// running offset at all. Only the streaming arm can observe a duplicate being
+// fed twice, and a RAR volume in a set with no PAR2 is the ordinary shape that
+// reaches it.
 fn streaming_hash_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobSpec {
     let mut spec = segmented_job_spec(name, filename, segment_sizes);
     spec.files[0].role = FileRole::RarVolume { volume_number: 0 };
     spec
 }
 
-/// Submit one uuencode part.
-///
-/// Every argument is in DECODED units except the job spec's declared sizes,
-/// which stay encoded exactly as an NZB would carry them — that mismatch is the
-/// whole point of these tests.
+// Submit one uuencode part.
+//
+// Every argument is in DECODED units except the job spec's declared sizes,
+// which stay encoded exactly as an NZB would carry them — that mismatch is the
+// whole point of these tests.
 async fn submit_uu_segment(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
@@ -38,10 +38,10 @@ async fn submit_uu_segment(
     .await;
 }
 
-/// Submit one uuencode part, stating what its `begin` header called the file.
-///
-/// A real post states the name exactly once, on the part that opens the body,
-/// and continuation parts carry none at all — which is what `""` means here.
+// Submit one uuencode part, stating what its `begin` header called the file.
+//
+// A real post states the name exactly once, on the part that opens the body,
+// and continuation parts carry none at all — which is what `""` means here.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn submit_uu_segment_named(
     pipeline: &mut Pipeline,
@@ -86,8 +86,8 @@ pub(super) async fn submit_uu_segment_named(
         .await;
 }
 
-/// A job whose declared segment sizes are uuencode-encoded (~1.38x the decoded
-/// bytes), which is what an NZB really carries for a uuencode post.
+// A job whose declared segment sizes are uuencode-encoded (~1.38x the decoded
+// bytes), which is what an NZB really carries for a uuencode post.
 fn uu_job_spec(decoded_sizes: &[usize]) -> JobSpec {
     let declared: Vec<u32> = decoded_sizes
         .iter()
@@ -109,7 +109,7 @@ fn uu_job_spec(decoded_sizes: &[usize]) -> JobSpec {
     spec
 }
 
-/// Number of segments queued for download on a job.
+// Number of segments queued for download on a job.
 fn queued_segment_count(pipeline: &Pipeline, job_id: JobId) -> usize {
     pipeline
         .jobs
@@ -118,10 +118,10 @@ fn queued_segment_count(pipeline: &Pipeline, job_id: JobId) -> usize {
         .unwrap_or(0)
 }
 
-/// A job carrying both encodings: yEnc files whose declared segment sizes run
-/// ~1.03x their decoded bytes, and one uuencode file whose declared sizes run
-/// ~1.38x — exactly as the two encodings appear in a real NZB, since the
-/// `<segment bytes>` attribute is always the ENCODED figure.
+// A job carrying both encodings: yEnc files whose declared segment sizes run
+// ~1.03x their decoded bytes, and one uuencode file whose declared sizes run
+// ~1.38x — exactly as the two encodings appear in a real NZB, since the
+// `<segment bytes>` attribute is always the ENCODED figure.
 fn mixed_encoding_job_spec(
     yenc_files: &[(&str, &[usize])],
     uu_file: (&str, &[usize]),
@@ -186,11 +186,11 @@ fn mixed_encoding_job_spec(
     (spec, yenc_indices, uu_index)
 }
 
-/// A job holding one file under `posted_name`, with a recovery set describing
-/// `described` files by their real names, and `prefix` captured for file 0.
-///
-/// The posted name and the described names are deliberately free to disagree:
-/// that disagreement is what an obfuscated post *is*.
+// A job holding one file under `posted_name`, with a recovery set describing
+// `described` files by their real names, and `prefix` captured for file 0.
+//
+// The posted name and the described names are deliberately free to disagree:
+// that disagreement is what an obfuscated post *is*.
 async fn obfuscated_binding_fixture(
     temp_dir: &tempfile::TempDir,
     job_id: JobId,
@@ -218,8 +218,8 @@ async fn obfuscated_binding_fixture(
     (pipeline, file_id)
 }
 
-/// A payload whose first 16 KiB are distinctive, so a content match is a real
-/// match rather than an accident of everything being zeros.
+// A payload whose first 16 KiB are distinctive, so a content match is a real
+// match rather than an accident of everything being zeros.
 fn binding_payload(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))

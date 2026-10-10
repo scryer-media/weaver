@@ -43,8 +43,8 @@ use crate::tls::{
     selected_blocking_tls_backend, tls_backend_for_preference,
 };
 use crate::transfer::{
-    ActiveTransferBudget, BodyTransferAccounting, ServerTransferControl, StableServerId,
-    active_transfer_read_timeout, active_transfer_timeout,
+    ActiveTransferBudget, BodyTransferAccounting, QuotaRejection, ServerTransferControl,
+    StableServerId, active_transfer_read_timeout, active_transfer_timeout,
 };
 use crate::types::{ArticleId, Capabilities, Response};
 
@@ -91,10 +91,10 @@ struct BlockingS2nStream {
     stats: BlockingLaneStats,
 }
 
-/// Blocking rustls transport for the owned BODY lane. Mirrors the async
-/// `ManualTls` read shape — large buffered ciphertext reads decrypted in bulk
-/// through the shared `RustlsSession` engine — so throughput economics match
-/// the s2n lane rather than a per-record `rustls::StreamOwned` loop.
+// Blocking rustls transport for the owned BODY lane. Mirrors the async
+// `ManualTls` read shape — large buffered ciphertext reads decrypted in bulk
+// through the shared `RustlsSession` engine — so throughput economics match
+// the s2n lane rather than a per-record `rustls::StreamOwned` loop.
 struct BlockingManualTlsStream {
     tcp: BlockingSocket,
     session: RustlsSession,
@@ -119,47 +119,47 @@ struct RawS2nConnection {
     ptr: NonNull<s2n::s2n_connection>,
 }
 
-/// One BODY command written to the wire whose response has not been read yet.
+// One BODY command written to the wire whose response has not been read yet.
 struct BodyRingRequest {
     message_id: String,
-    /// The ring was empty when this went out, so the wait for its status line
-    /// is a clean round-trip sample rather than time spent queued behind
-    /// another article's payload.
+    // The ring was empty when this went out, so the wait for its status line
+    // is a clean round-trip sample rather than time spent queued behind
+    // another article's payload.
     issued_alone: bool,
 }
 
-/// What [`BlockingBodyLane::ring_issue`] did with a request.
+// What [`BlockingBodyLane::ring_issue`] did with a request.
 pub enum RingIssueOutcome {
-    /// The command is on the ring; its response is owed.
+    // The command is on the ring; its response is owed.
     Issued,
-    /// Nothing was written and the lane is still healthy — the caller owns the
-    /// trace as this article's outcome and may keep reading the ring, but must
-    /// not issue again.
+    // Nothing was written and the lane is still healthy — the caller owns the
+    // trace as this article's outcome and may keep reading the ring, but must
+    // not issue again.
     Rejected(Box<DecodedBodyTrace>),
-    /// The write failed and the connection is poisoned. Everything still on the
-    /// ring is unanswerable.
+    // The write failed and the connection is poisoned. Everything still on the
+    // ring is unanswerable.
     Failed(Box<DecodedBodyTrace>),
 }
 
-/// A lane's outstanding BODY commands, driven one at a time by the caller.
-///
-/// [`BlockingBodyLane::fetch_decoded_pipeline_with_estimates`] writes a whole
-/// batch and then reads it back, which empties the pipe at every batch edge:
-/// the last response of one batch is read before the first command of the next
-/// is written, so the server sits idle for a round trip. The ring lets the
-/// caller top the pipe up while responses are still arriving, and keep topping
-/// it up across a batch boundary.
+// A lane's outstanding BODY commands, driven one at a time by the caller.
+//
+// [`BlockingBodyLane::fetch_decoded_pipeline_with_estimates`] writes a whole
+// batch and then reads it back, which empties the pipe at every batch edge:
+// the last response of one batch is read before the first command of the next
+// is written, so the server sits idle for a round trip. The ring lets the
+// caller top the pipe up while responses are still arriving, and keep topping
+// it up across a batch boundary.
 #[derive(Default)]
 struct BodyRing {
     outstanding: VecDeque<BodyRingRequest>,
-    /// Requests written but not yet pushed to the wire. Batching the flush
-    /// keeps a top-up of several commands in one segment, as the batch writer
-    /// did.
+    // Requests written but not yet pushed to the wire. Batching the flush
+    // keeps a top-up of several commands in one segment, as the batch writer
+    // did.
     unflushed: usize,
-    /// The connection faulted; nothing still on the ring will ever be answered.
+    // The connection faulted; nothing still on the ring will ever be answered.
     closed: bool,
-    /// Depth the caller last issued at, and the size of the judging window that
-    /// depth opens.
+    // Depth the caller last issued at, and the size of the judging window that
+    // depth opens.
     current_depth: usize,
     window_depth: usize,
     window_responses: u64,
@@ -173,37 +173,38 @@ pub struct BlockingBodyLane {
     stable_server_id: StableServerId,
     remote_ip: Option<IpAddr>,
     mode: BodyLaneMode,
-    /// Command-to-status-line wait. Only sampled when no other request was
-    /// outstanding, so pipelined batches cannot report it as near zero.
+    // Command-to-status-line wait. Only sampled when no other request was
+    // outstanding, so pipelined batches cannot report it as near zero.
     latency_ewma: Option<Duration>,
-    /// Status-line-to-terminator wait: what the article itself cost on the
-    /// wire, independent of how far away the server is.
+    // Status-line-to-terminator wait: what the article itself cost on the
+    // wire, independent of how far away the server is.
     transfer_ewma: Option<Duration>,
-    /// Successful responses this connection has produced. The first one is
-    /// cold: see [`Self::take_response_sample`].
+    // Successful responses this connection has produced. The first one is
+    // cold: see [`Self::take_response_sample`].
     responses_completed: u64,
-    /// What the latest successful response measured, until the caller takes
-    /// it.
+    // What the latest successful response measured, until the caller takes
+    // it.
     last_sample: ResponseSample,
     soft_timeout: Duration,
-    /// Outstanding pipelined BODY commands, when the caller drives the lane
-    /// request-by-request instead of batch-by-batch.
+    // Outstanding pipelined BODY commands, when the caller drives the lane
+    // request-by-request instead of batch-by-batch.
     ring: BodyRing,
     idle_since: std::sync::Mutex<Option<Instant>>,
     _permit: BlockingConnectionPermit,
 }
 
 pub struct BlockingNntpConnection {
+    pub route_path: Option<weaver_tunnel::pipe::DialPath>,
+    egress_control: Option<Arc<ServerTransferControl>>,
     route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
-    _route_socket: Option<Arc<socket2::Socket>>,
     transport: BlockingTransport,
     codec: NntpCodec,
     read_buf: BytesMut,
     read_scratch: Vec<u8>,
     buffer_profile: NntpBufferProfile,
     capabilities: Capabilities,
-    /// The configured endpoint, kept so a requirement learned here is
-    /// recorded against the server rather than the resolved address.
+    // The configured endpoint, kept so a requirement learned here is
+    // recorded against the server rather than the resolved address.
     host: String,
     port: u16,
     remote_addr: Option<SocketAddr>,
@@ -213,21 +214,24 @@ pub struct BlockingNntpConnection {
     poisoned: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
-    /// Immutable geometry the next decoded article's CRC pass checkpoints at.
-    /// Set per fetch by the lane; never inherited from a prior job.
+    // The egress's accounting for each outstanding BODY, in step with
+    // `body_accounting`. Empty when the connection has no egress control.
+    egress_accounting: VecDeque<BodyTransferAccounting>,
+    // Immutable geometry the next decoded article's CRC pass checkpoints at.
+    // Set per fetch by the lane; never inherited from a prior job.
     checkpoint_plan: CheckpointPlan,
-    /// How long the last decoded article waited for its status line. The lane
-    /// takes this to separate distance from transfer cost.
+    // How long the last decoded article waited for its status line. The lane
+    // takes this to separate distance from transfer cost.
     last_response_line_wait: Duration,
-    /// Armed when session setup declined to select a group this caller
-    /// offered, because the server has never been shown to need one. See
-    /// [`crate::server_caps`].
+    // Armed when session setup declined to select a group this caller
+    // offered, because the server has never been shown to need one. See
+    // [`crate::server_caps`].
     group_probe_armed: bool,
 }
 
 impl BlockingBodyLane {
-    /// Apply the batch's immutable geometry before every decoded response, so
-    /// a lane reused by another job cannot carry previous checkpoint state.
+    // Apply the batch's immutable geometry before every decoded response, so
+    // a lane reused by another job cannot carry previous checkpoint state.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
     }
@@ -261,6 +265,10 @@ impl BlockingBodyLane {
             groups.first().map(String::as_str),
         )?;
         conn.set_transfer_control(transfer_control);
+        permit.socket_slot.set_path(conn.route_path.as_ref());
+        permit
+            .socket_slot
+            .observe_outcome(conn.route_outcome.as_ref());
         // A body lane only ever fetches by message-id, which RFC 3977 serves
         // without a selected group. Walking the candidate groups costs a round
         // trip each before the first article can be asked for, so it runs only
@@ -336,14 +344,14 @@ impl BlockingBodyLane {
         }
     }
 
-    /// Point an established lane at another job's newsgroups.
-    ///
-    /// A body lane fetches by message-id, which needs no selected group on
-    /// most servers, so on those this costs nothing. A server that has proven
-    /// it insists on one gets the same GROUP walk a fresh connect runs, on
-    /// the socket already open — which is the point: a job boundary no longer
-    /// costs the lane its connection. Call it only between leases, with no
-    /// BODY outstanding.
+    // Point an established lane at another job's newsgroups.
+    //
+    // A body lane fetches by message-id, which needs no selected group on
+    // most servers, so on those this costs nothing. A server that has proven
+    // it insists on one gets the same GROUP walk a fresh connect runs, on
+    // the socket already open — which is the point: a job boundary no longer
+    // costs the lane its connection. Call it only between leases, with no
+    // BODY outstanding.
     pub fn adopt_groups(&mut self, groups: &[String]) -> Result<()> {
         if !self.conn.needs_group_prologue() || groups.is_empty() {
             return Ok(());
@@ -351,9 +359,7 @@ impl BlockingBodyLane {
         // A GROUP written behind an unread BODY response would read that
         // article's payload as its own status line; a poisoned socket cannot
         // be re-pointed at all. Either way the lane is not worth keeping.
-        if self.conn.poisoned
-            || !self.ring.outstanding.is_empty()
-            || !self.conn.body_accounting.is_empty()
+        if self.conn.poisoned || !self.ring.outstanding.is_empty() || self.conn.bodies_outstanding()
         {
             return Err(NntpError::ConnectionClosed);
         }
@@ -382,6 +388,16 @@ impl BlockingBodyLane {
         self.stable_server_id
     }
 
+    // Whether the egress this connection leaves through would turn away a
+    // BODY of `requested_body_bytes` now. A connection on an egress that is
+    // out of quota cannot carry work until the quota resets, while the route
+    // may have other egresses that can.
+    pub fn egress_quota_rejection(&self, requested_body_bytes: u64) -> Option<QuotaRejection> {
+        self.conn
+            .egress_transfer_control()
+            .and_then(|control| control.quota_rejection_for(requested_body_bytes))
+    }
+
     pub fn remote_ip(&self) -> Option<IpAddr> {
         self.remote_ip
     }
@@ -406,17 +422,17 @@ impl BlockingBodyLane {
         self.conn.stats()
     }
 
-    /// Whether this lane's connection can still be used or parked.
+    // Whether this lane's connection can still be used or parked.
     pub fn is_healthy(&self) -> bool {
         !self.conn.poisoned
     }
 
-    /// Whether the server has closed its side of the connection.
-    ///
-    /// Inspect only between leases, through TLS where applicable. Partial
-    /// records remain in the transport and inspection never waits for input.
+    // Whether the server has closed its side of the connection.
+    //
+    // Inspect only between leases, through TLS where applicable. Partial
+    // records remain in the transport and inspection never waits for input.
     pub fn peer_closed(&mut self) -> bool {
-        if !self.ring.outstanding.is_empty() || !self.conn.body_accounting.is_empty() {
+        if !self.ring.outstanding.is_empty() || self.conn.bodies_outstanding() {
             return false;
         }
         if !self.accepts_new_work() {
@@ -460,18 +476,18 @@ impl BlockingBodyLane {
     }
 
     pub fn accepts_new_work(&self) -> bool {
-        self._permit.health_lease.0.current() && !self._permit.socket_slot.retiring()
+        self._permit.health_lease.0.current() && self._permit.socket_slot.claim_reuse()
     }
 
-    /// Answer an existence probe on this lane's connection.
-    ///
-    /// The lane must be between leases: the ring is checked rather than
-    /// assumed, because a probe written behind an unread BODY response would
-    /// read that article's payload as its own status line.
-    ///
-    /// `inconclusive` carries the same meaning as it does for the async
-    /// client — nothing here may be reported as a missing article unless the
-    /// server actually said so.
+    // Answer an existence probe on this lane's connection.
+    //
+    // The lane must be between leases: the ring is checked rather than
+    // assumed, because a probe written behind an unread BODY response would
+    // read that article's payload as its own status line.
+    //
+    // `inconclusive` carries the same meaning as it does for the async
+    // client — nothing here may be reported as a missing article unless the
+    // server actually said so.
     pub fn probe_exists(&mut self, message_ids: &[String]) -> ProbeBatchResult {
         if message_ids.is_empty() {
             return ProbeBatchResult {
@@ -479,9 +495,7 @@ impl BlockingBodyLane {
                 inconclusive: false,
             };
         }
-        if !self.ring.outstanding.is_empty()
-            || !self.conn.body_accounting.is_empty()
-            || self.conn.poisoned
+        if !self.ring.outstanding.is_empty() || self.conn.bodies_outstanding() || self.conn.poisoned
         {
             return ProbeBatchResult {
                 exists: vec![false; message_ids.len()],
@@ -658,15 +672,18 @@ impl BlockingBodyLane {
         }
 
         if let Some((quota_idx, source)) = quota_rejection {
+            // Revalidate the tail against whichever control refused the head.
+            let refusing_control = match source.scope {
+                crate::transfer::TransferScope::Server => self.conn.transfer_control.clone(),
+                crate::transfer::TransferScope::Egress => self.conn.egress_transfer_control(),
+            };
             for (tail_idx, message_id) in
                 message_ids.iter().enumerate().take(offered).skip(quota_idx)
             {
                 let estimate = estimated_body_bytes.get(tail_idx).copied().unwrap_or(0);
                 let error = if tail_idx == quota_idx {
                     NntpError::QuotaBlocked(source.clone())
-                } else if let Some(rejection) = self
-                    .conn
-                    .transfer_control
+                } else if let Some(rejection) = refusing_control
                     .as_ref()
                     .and_then(|control| control.quota_rejection_for(estimate))
                 {
@@ -700,23 +717,23 @@ impl BlockingBodyLane {
         out
     }
 
-    /// BODY commands written to this lane whose responses have not been read.
+    // BODY commands written to this lane whose responses have not been read.
     pub fn ring_outstanding(&self) -> usize {
         self.ring.outstanding.len()
     }
 
-    /// The ring faulted: every request still on it is unanswerable and the
-    /// connection must be discarded rather than parked.
+    // The ring faulted: every request still on it is unanswerable and the
+    // connection must be discarded rather than parked.
     pub fn ring_is_closed(&self) -> bool {
         self.ring.closed
     }
 
-    /// Write one more BODY onto the ring at `depth`.
-    ///
-    /// The command is buffered, not flushed; [`Self::ring_read_next`] pushes it
-    /// before it waits, so a caller that tops the ring up by several requests
-    /// still spends one write on them. `depth` is the pipeline depth in force,
-    /// and sizes the window the lane judges its responses over.
+    // Write one more BODY onto the ring at `depth`.
+    //
+    // The command is buffered, not flushed; [`Self::ring_read_next`] pushes it
+    // before it waits, so a caller that tops the ring up by several requests
+    // still spends one write on them. `depth` is the pipeline depth in force,
+    // and sizes the window the lane judges its responses over.
     pub fn ring_issue(
         &mut self,
         message_id: &str,
@@ -775,14 +792,14 @@ impl BlockingBodyLane {
         RingIssueOutcome::Issued
     }
 
-    /// Read the response to the oldest request on the ring, or `None` when the
-    /// ring is empty.
-    ///
-    /// The trace meta is judged over rolling windows of the issuing depth, so
-    /// a caller that never lets the ring drain still gets the same
-    /// `batch_complete` / `batch_clean` verdicts the batch API produced per
-    /// batch. A fault closes the window immediately and reports everything
-    /// still on the ring as unresolved.
+    // Read the response to the oldest request on the ring, or `None` when the
+    // ring is empty.
+    //
+    // The trace meta is judged over rolling windows of the issuing depth, so
+    // a caller that never lets the ring drain still gets the same
+    // `batch_complete` / `batch_clean` verdicts the batch API produced per
+    // batch. A fault closes the window immediately and reports everything
+    // still on the ring as unresolved.
     pub fn ring_read_next(&mut self) -> Option<(DecodedBodyTrace, BodyLaneTraceMeta)> {
         let request = self.ring.outstanding.pop_front()?;
         if self.ring.unflushed > 0 && !self.ring.closed {
@@ -850,9 +867,9 @@ impl BlockingBodyLane {
         Some((trace, meta))
     }
 
-    /// Give up on everything still outstanding. The connection is poisoned:
-    /// responses to those commands are still in the socket, so it can never be
-    /// handed back to the pool.
+    // Give up on everything still outstanding. The connection is poisoned:
+    // responses to those commands are still in the socket, so it can never be
+    // handed back to the pool.
     pub fn ring_abandon(&mut self) -> usize {
         let dropped = self.ring.outstanding.len();
         if dropped > 0 || self.ring.unflushed > 0 {
@@ -887,7 +904,7 @@ impl BlockingBodyLane {
     pub fn park(mut self) {
         // An unread response still in the socket makes QUIT meaningless: the
         // reply read back would be the tail of an article, not the server's.
-        if self.conn.body_accounting.is_empty()
+        if !self.conn.bodies_outstanding()
             && self.ring.outstanding.is_empty()
             && !self.conn.poisoned
         {
@@ -988,6 +1005,7 @@ impl BlockingBodyLane {
 
         DecodedBodyTrace {
             attempts: vec![FetchAttemptTrace {
+                route_feedback: self.conn.route_outcome.clone(),
                 connection_health: Some(Arc::clone(&self._permit.health_lease.0)),
                 server_idx: self.server_id.0,
                 remote_ip: self.remote_ip,
@@ -999,17 +1017,17 @@ impl BlockingBodyLane {
         }
     }
 
-    /// Book one successful response: its status-line wait when the request
-    /// went out alone, and the wire time of its article.
-    ///
-    /// The connection's first response is only recorded as the sample the
-    /// caller can take; it does not move the lane's averages. That response
-    /// carries costs no later one repeats — a session that still has to
-    /// re-authenticate or select a group answers its first BODY late, and a
-    /// socket still in slow start delivers its first article slowly — and on
-    /// a pipelined lane it is also the only request ever issued alone, so
-    /// without this rule the lane's idea of the server's distance would be
-    /// that one cold sample for as long as the connection lived.
+    // Book one successful response: its status-line wait when the request
+    // went out alone, and the wire time of its article.
+    //
+    // The connection's first response is only recorded as the sample the
+    // caller can take; it does not move the lane's averages. That response
+    // carries costs no later one repeats — a session that still has to
+    // re-authenticate or select a group answers its first BODY late, and a
+    // socket still in slow start delivers its first article slowly — and on
+    // a pipelined lane it is also the only request ever issued alone, so
+    // without this rule the lane's idea of the server's distance would be
+    // that one cold sample for as long as the connection lived.
     fn book_response(&mut self, latency: Option<Duration>, transfer: Duration) {
         let cold = self.responses_completed == 0;
         let settled = self.responses_completed >= SETTLED_AFTER_RESPONSES;
@@ -1028,34 +1046,34 @@ impl BlockingBodyLane {
         self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, transfer));
     }
 
-    /// What the latest successful response measured, taken once. A response
-    /// that failed leaves nothing to take.
+    // What the latest successful response measured, taken once. A response
+    // that failed leaves nothing to take.
     pub fn take_response_sample(&mut self) -> ResponseSample {
         std::mem::take(&mut self.last_sample)
     }
 }
 
-/// What one successful response on a lane measured.
+// What one successful response on a lane measured.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResponseSample {
-    /// Command-to-status-line wait, present only when the request went out
-    /// with nothing else outstanding on the connection.
+    // Command-to-status-line wait, present only when the request went out
+    // with nothing else outstanding on the connection.
     pub latency: Option<Duration>,
-    /// The response was the connection's first. Its timings include setup
-    /// costs no later response repeats, so it describes the connection's
-    /// start, not the link.
+    // The response was the connection's first. Its timings include setup
+    // costs no later response repeats, so it describes the connection's
+    // start, not the link.
     pub cold: bool,
-    /// The connection had already answered [`SETTLED_AFTER_RESPONSES`]
-    /// requests, so its congestion window has had the round trips it needs
-    /// to open and this response's wire rate is the address's, not the
-    /// socket's ramp. Implies `!cold`.
+    // The connection had already answered [`SETTLED_AFTER_RESPONSES`]
+    // requests, so its congestion window has had the round trips it needs
+    // to open and this response's wire rate is the address's, not the
+    // socket's ramp. Implies `!cold`.
     pub settled: bool,
 }
 
-/// Responses a connection answers before its wire rate is taken as the
-/// address's. The first response is cold; the next few are still read
-/// through a window that doubles each round trip, and on a link with a long
-/// round trip and large articles that ramp outlasts several of them.
+// Responses a connection answers before its wire rate is taken as the
+// address's. The first response is cold; the next few are still read
+// through a window that doubles each round trip, and on a link with a long
+// round trip and large articles that ramp outlasts several of them.
 pub const SETTLED_AFTER_RESPONSES: u64 = 4;
 
 fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
@@ -1066,27 +1084,27 @@ fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
 }
 
 impl BlockingNntpConnection {
-    /// Declare immutable checkpoint geometry for subsequent decoded articles.
+    // Declare immutable checkpoint geometry for subsequent decoded articles.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
     }
 
-    /// Consume the last article's status-line wait, so a lane cannot credit
-    /// one response's latency to the next.
+    // Consume the last article's status-line wait, so a lane cannot credit
+    // one response's latency to the next.
     fn take_response_line_wait(&mut self) -> Duration {
         std::mem::replace(&mut self.last_response_line_wait, Duration::ZERO)
     }
 
-    /// Connect to the first resolved address that answers.
+    // Connect to the first resolved address that answers.
     pub fn connect(config: &ServerConfig) -> Result<Self> {
         Self::connect_for_group(config, None, None)
     }
 
-    /// Connect and, on a server known to pipeline, select `initial_group`
-    /// inside the session-setup write. An unselectable group is not an
-    /// error here; the lane walks its candidate list afterwards. A direct
-    /// connection dials the address `route`'s plan picks, or the first
-    /// resolved address that answers when there is no route.
+    // Connect and, on a server known to pipeline, select `initial_group`
+    // inside the session-setup write. An unselectable group is not an
+    // error here; the lane walks its candidate list afterwards. A direct
+    // connection dials the address `route`'s plan picks, or the first
+    // resolved address that answers when there is no route.
     pub fn connect_for_group(
         config: &ServerConfig,
         route: Option<&AddressRoute>,
@@ -1095,28 +1113,37 @@ impl BlockingNntpConnection {
         Self::connect_with_backend(config, route, None, initial_group)
     }
 
-    /// `backend_override` bypasses env/platform backend selection; tests use
-    /// it to exercise a specific TLS transport deterministically.
+    // `backend_override` bypasses env/platform backend selection; tests use
+    // it to exercise a specific TLS transport deterministically.
     fn connect_with_backend(
         config: &ServerConfig,
         route: Option<&AddressRoute>,
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
-        if let Some(registry) = &config.revocation {
-            registry.check()?;
-        }
-        if config.proxy.is_some() {
-            let (tcp, outcome) = crate::proxy::connect_blocking(config)?;
-            return Self::from_tcp(
+        if let Some(dialer) = &config.dialer {
+            let dialed = dialer.runtime.block_on(dialer.dial(config))?;
+            let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
+            let socket = dialer.blocking_stream(dialed.stream, config)?;
+            let mut result = Self::from_tcp(
                 config,
-                tcp,
-                None,
+                socket,
+                remote_addr,
                 backend_override,
                 initial_group,
-                Some(outcome),
+                Some(dialed.outcome),
                 None,
+                dialed.setup,
             );
+            if let Ok(connection) = &mut result {
+                connection.egress_control = Some(
+                    dialer
+                        .egress_controls
+                        .control(crate::transfer::StableServerId(dialed.path.egress)),
+                );
+                connection.route_path = Some(dialed.path);
+            }
+            return result;
         }
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
         let (tcp, addr) = match route {
@@ -1140,18 +1167,19 @@ impl BlockingNntpConnection {
             initial_group,
             None,
             setup,
+            None,
         )
     }
 
-    /// The TLS backend that carries this server's bytes on an owned lane.
-    ///
-    /// Total by construction, because every server is lane-served: a backend
-    /// that cannot build trust for this config yields to the rustls lane,
-    /// which verifies against the platform's webpki roots and so needs no
-    /// per-server trust material. That covers the s2n lane without a pinned
-    /// CA PEM and an environment override that does not parse. An explicit
-    /// `backend_override` is honoured as given — it exists so a test can pin
-    /// one transport, and silently swapping it would make the test meaningless.
+    // The TLS backend that carries this server's bytes on an owned lane.
+    //
+    // Total by construction, because every server is lane-served: a backend
+    // that cannot build trust for this config yields to the rustls lane,
+    // which verifies against the platform's webpki roots and so needs no
+    // per-server trust material. That covers the s2n lane without a pinned
+    // CA PEM and an environment override that does not parse. An explicit
+    // `backend_override` is honoured as given — it exists so a test can pin
+    // one transport, and silently swapping it would make the test meaningless.
     fn blocking_tls_backend(
         config: &ServerConfig,
         backend_override: Option<NntpTlsBackend>,
@@ -1171,9 +1199,9 @@ impl BlockingNntpConnection {
         backend
     }
 
-    /// Hand a connected socket to the TLS backend. The same wrapping serves
-    /// the implicit-TLS dial and the STARTTLS upgrade: both arrive here with a
-    /// socket whose next byte is the start of a handshake.
+    // Hand a connected socket to the TLS backend. The same wrapping serves
+    // the implicit-TLS dial and the STARTTLS upgrade: both arrive here with a
+    // socket whose next byte is the start of a handshake.
     fn wrap_tls(
         config: &ServerConfig,
         tcp: BlockingSocket,
@@ -1200,6 +1228,7 @@ impl BlockingNntpConnection {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_tcp(
         config: &ServerConfig,
         tcp: impl Into<BlockingSocket>,
@@ -1208,14 +1237,9 @@ impl BlockingNntpConnection {
         initial_group: Option<&str>,
         route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
         mut setup: Option<crate::address_plan::SetupWatch>,
+        mut pipe_setup: Option<weaver_tunnel::pipe::SetupHandle>,
     ) -> Result<Self> {
         let tcp = tcp.into();
-        let route_socket = config
-            .revocation
-            .as_ref()
-            .zip(tcp.tcp())
-            .map(|(r, tcp)| r.track(socket2::SockRef::from(tcp)))
-            .transpose()?;
         // Implicit TLS handshakes before the greeting is read; STARTTLS keeps
         // the socket plain until the greeting has arrived and the server has
         // answered 382, and is upgraded below.
@@ -1227,8 +1251,9 @@ impl BlockingNntpConnection {
 
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
         let mut conn = Self {
+            route_path: None,
+            egress_control: None,
             route_outcome,
-            _route_socket: route_socket,
             transport,
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
@@ -1249,12 +1274,29 @@ impl BlockingNntpConnection {
             poisoned: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            egress_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
             group_probe_armed: false,
         };
 
-        let greeting = conn.read_response()?;
+        // The route's setup evidence is whether the server answered over this
+        // connection, as on the asynchronous path: a greeting that arrived is
+        // a reached server, whatever the session makes of it afterwards. A
+        // session that the server drops after greeting it is not an address,
+        // proxy, or pool member that fails to answer.
+        let greeting = match conn.read_response() {
+            Ok(greeting) => greeting,
+            Err(error) => {
+                if let Some(setup) = pipe_setup.take() {
+                    setup.complete(false);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(setup) = pipe_setup.take() {
+            setup.complete(true);
+        }
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received blocking NNTP greeting");
         let upgrades = config.starttls && matches!(conn.transport, BlockingTransport::Plain(_));
         if (!upgrades || !matches!(greeting.code.raw(), 200 | 201))
@@ -1363,13 +1405,13 @@ impl BlockingNntpConnection {
         self.current_group.as_deref()
     }
 
-    /// Session setup for a server known to pipeline. AUTHINFO goes first and
-    /// on its own: RFC 4643 forbids pipelining it, and a provider that
-    /// enforces that answers the whole batch with 480s or drops the
-    /// connection. A GROUP this server has proven it needs then leaves in one
-    /// flush and is answered in order (RFC 4644) — usually there is nothing at
-    /// all to send, which is the point: the lane reaches its first BODY in
-    /// four round trips.
+    // Session setup for a server known to pipeline. AUTHINFO goes first and
+    // on its own: RFC 4643 forbids pipelining it, and a provider that
+    // enforces that answers the whole batch with 480s or drops the
+    // connection. A GROUP this server has proven it needs then leaves in one
+    // flush and is answered in order (RFC 4644) — usually there is nothing at
+    // all to send, which is the point: the lane reaches its first BODY in
+    // four round trips.
     fn pipelined_session_setup(
         &mut self,
         config: &ServerConfig,
@@ -1541,7 +1583,7 @@ impl BlockingNntpConnection {
         self.reserve_body(estimated_body_bytes)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
         if let Err(error) = self.write_command_frame(&cmd) {
-            self.body_accounting.pop_back();
+            self.unreserve_last_body();
             return Err(error);
         }
         Ok(())
@@ -1552,6 +1594,18 @@ impl BlockingNntpConnection {
         self.transfer_control = control;
     }
 
+    // The egress control this connection's route leaves through, if any.
+    pub(crate) fn egress_transfer_control(&self) -> Option<Arc<ServerTransferControl>> {
+        self.egress_control.clone()
+    }
+
+    // Whether any BODY is admitted and not yet finished or aborted.
+    fn bodies_outstanding(&self) -> bool {
+        !self.body_accounting.is_empty() || !self.egress_accounting.is_empty()
+    }
+
+    // Admit one BODY against the server, then against the egress. A refusal
+    // from either leaves nothing reserved and names who refused.
     fn reserve_body(&mut self, estimated_body_bytes: u64) -> Result<()> {
         if let Some(control) = &self.transfer_control {
             self.body_accounting.push_back(
@@ -1560,23 +1614,80 @@ impl BlockingNntpConnection {
                     .map_err(NntpError::quota_blocked)?,
             );
         }
+        if let Some(control) = &self.egress_control {
+            match control.start_body(estimated_body_bytes) {
+                Ok(accounting) => self.egress_accounting.push_back(accounting),
+                Err(rejection) => {
+                    if self.transfer_control.is_some() {
+                        self.body_accounting.pop_back();
+                    }
+                    return Err(NntpError::quota_blocked(rejection));
+                }
+            }
+        }
         Ok(())
     }
 
+    // Undo the last `reserve_body`, for a BODY that was never sent.
+    fn unreserve_last_body(&mut self) {
+        if self.transfer_control.is_some() {
+            self.body_accounting.pop_back();
+        }
+        if self.egress_control.is_some() {
+            self.egress_accounting.pop_back();
+        }
+    }
+
     fn charge_active_body(&mut self, bytes: usize) -> Duration {
-        match self.body_accounting.front_mut() {
+        if let Some(outcome) = &self.route_outcome {
+            outcome.read(bytes);
+        }
+        // Both levels are charged before either is waited on, so the read
+        // waits for the later deadline: the lower of the two rates.
+        let egress_charge = match (self.egress_accounting.front_mut(), &self.egress_control) {
+            (Some(BodyTransferAccounting::Tracked(permit)), _) => permit.charge(bytes),
+            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
+                control.record_unlimited_body_bytes(bytes);
+                None
+            }
+            (None, Some(control)) => control.charge_read(bytes),
+            (_, None) => None,
+        };
+        let server_charge = match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
                 if let Some(control) = &self.transfer_control {
                     control.record_unlimited_body_bytes(bytes);
                 }
-                Duration::ZERO
+                None
             }
-            Some(BodyTransferAccounting::Tracked(permit)) => permit.record_blocking(bytes),
-            None => Duration::ZERO,
+            Some(BodyTransferAccounting::Tracked(permit)) => permit.charge(bytes),
+            None => None,
+        };
+        let egress_wait = egress_charge.map_or(Duration::ZERO, |charge| charge.wait_blocking());
+        let server_wait = server_charge.map_or(Duration::ZERO, |charge| charge.wait_blocking());
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.egress_accounting.front_mut() {
+            permit.add_throttle_wait(egress_wait);
         }
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.body_accounting.front_mut() {
+            permit.add_throttle_wait(server_wait);
+        }
+        egress_wait.saturating_add(server_wait)
     }
 
     fn charge_active_body_without_wait(&mut self, bytes: usize) {
+        if let Some(outcome) = &self.route_outcome {
+            outcome.read(bytes);
+        }
+        match (self.egress_accounting.front_mut(), &self.egress_control) {
+            (Some(BodyTransferAccounting::Tracked(permit)), _) => {
+                permit.record_without_wait(bytes);
+            }
+            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
+                control.record_unlimited_body_bytes(bytes);
+            }
+            (None, Some(control)) => control.pace_read_without_wait(bytes),
+            (_, None) => {}
+        }
         match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
                 if let Some(control) = &self.transfer_control {
@@ -1594,14 +1705,19 @@ impl BlockingNntpConnection {
         if let Some(BodyTransferAccounting::Tracked(permit)) = self.body_accounting.pop_front() {
             permit.finish();
         }
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.egress_accounting.pop_front() {
+            permit.finish();
+        }
     }
 
     fn abort_active_body(&mut self) {
         self.body_accounting.pop_front();
+        self.egress_accounting.pop_front();
     }
 
     fn abort_all_bodies(&mut self) {
         self.body_accounting.clear();
+        self.egress_accounting.clear();
     }
 
     fn fail_body_pipeline(&mut self) {
@@ -1649,16 +1765,16 @@ impl BlockingNntpConnection {
         }
     }
 
-    /// Learn, from the first response after session setup, whether this server
-    /// insists on a selected group the connection did not select.
-    ///
-    /// 412 is the only code that can mean this, and only on a connection that
-    /// was offered a group and declined to spend the round trip on it. The
-    /// connection is poisoned rather than repaired in place: the caller's
-    /// command has already been refused, and a pipelined batch may have more
-    /// refusals behind it. Discarding the socket lets the ordinary retry open
-    /// a fresh one, which now selects the group — so only the first connection
-    /// to such a server pays for the discovery.
+    // Learn, from the first response after session setup, whether this server
+    // insists on a selected group the connection did not select.
+    //
+    // 412 is the only code that can mean this, and only on a connection that
+    // was offered a group and declined to spend the round trip on it. The
+    // connection is poisoned rather than repaired in place: the caller's
+    // command has already been refused, and a pipelined batch may have more
+    // refusals behind it. Discarding the socket lets the ordinary retry open
+    // a fresh one, which now selects the group — so only the first connection
+    // to such a server pays for the discovery.
     fn observe_group_requirement(&mut self, response: &Response) {
         if !std::mem::take(&mut self.group_probe_armed) {
             return;
@@ -1677,8 +1793,8 @@ impl BlockingNntpConnection {
         self.poisoned = true;
     }
 
-    /// Whether this server has proven it refuses message-id fetches without a
-    /// selected group. Lanes skip the GROUP round trip unless it has.
+    // Whether this server has proven it refuses message-id fetches without a
+    // selected group. Lanes skip the GROUP round trip unless it has.
     pub fn needs_group_prologue(&self) -> bool {
         crate::server_caps::requires_group_selection(&self.host, self.port)
     }
@@ -1728,21 +1844,21 @@ impl BlockingNntpConnection {
         }
     }
 
-    /// Existence for a batch of message-ids, on this already-open connection.
-    ///
-    /// This is what lets the health probe ride a warm owned lane instead of
-    /// prising a connection permit away from one and dialling its own socket:
-    /// that dial is TCP, TLS, greeting and AUTHINFO — about four and a half
-    /// round trips — paid once per probe batch, which at a hundred milliseconds
-    /// of distance dwarfs the batch itself.
-    ///
-    /// STAT leaves in a single pipelined write where the server supports it,
-    /// so the batch costs one round trip rather than one per article. Every
-    /// article STAT calls missing is then re-asked with HEAD, also in one
-    /// write, because a provider's STAT index can lag its spool. A server that
-    /// implements neither command cannot settle the batch, and says so with
-    /// [`NntpError::CommandNotRecognized`] rather than a list of false
-    /// missing verdicts.
+    // Existence for a batch of message-ids, on this already-open connection.
+    //
+    // This is what lets the health probe ride a warm owned lane instead of
+    // prising a connection permit away from one and dialling its own socket:
+    // that dial is TCP, TLS, greeting and AUTHINFO — about four and a half
+    // round trips — paid once per probe batch, which at a hundred milliseconds
+    // of distance dwarfs the batch itself.
+    //
+    // STAT leaves in a single pipelined write where the server supports it,
+    // so the batch costs one round trip rather than one per article. Every
+    // article STAT calls missing is then re-asked with HEAD, also in one
+    // write, because a provider's STAT index can lag its spool. A server that
+    // implements neither command cannot settle the batch, and says so with
+    // [`NntpError::CommandNotRecognized`] rather than a list of false
+    // missing verdicts.
     pub fn probe_exists(&mut self, message_ids: &[String]) -> Result<Vec<bool>> {
         if message_ids.is_empty() {
             return Ok(Vec::new());
@@ -1802,8 +1918,8 @@ impl BlockingNntpConnection {
         Ok(exists)
     }
 
-    /// One pipelined STAT batch. Every response is read even after a refusal,
-    /// so the socket is left exactly where the next command expects it.
+    // One pipelined STAT batch. Every response is read even after a refusal,
+    // so the socket is left exactly where the next command expects it.
     fn stat_batch(&mut self, message_ids: &[String]) -> Result<Vec<bool>> {
         let pipelined = self.capabilities.supports_pipelining();
         if pipelined {
@@ -1831,11 +1947,11 @@ impl BlockingNntpConnection {
         }
     }
 
-    /// One pipelined HEAD batch, used to second-guess a STAT miss.
-    ///
-    /// A 221 carries headers that have to be drained before the next status
-    /// line can be read, so the multi-line body is consumed and discarded in
-    /// place; only its arrival matters.
+    // One pipelined HEAD batch, used to second-guess a STAT miss.
+    //
+    // A 221 carries headers that have to be drained before the next status
+    // line can be read, so the multi-line body is consumed and discarded in
+    // place; only its arrival matters.
     fn head_batch(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
         let pipelined = self.capabilities.supports_pipelining();
         if pipelined {
@@ -1875,11 +1991,11 @@ impl BlockingNntpConnection {
         }
     }
 
-    /// Write one probe command per id and flush them together.
-    ///
-    /// A half-written batch leaves the peer expecting bytes that will never
-    /// arrive, so any failure here poisons the connection rather than letting
-    /// the lane read a reply to a command it did not finish sending.
+    // Write one probe command per id and flush them together.
+    //
+    // A half-written batch leaves the peer expecting bytes that will never
+    // arrive, so any failure here poisons the connection rather than letting
+    // the lane read a reply to a command it did not finish sending.
     fn write_probe_batch<'a>(
         &mut self,
         message_ids: impl Iterator<Item = &'a str>,
@@ -1899,11 +2015,11 @@ impl BlockingNntpConnection {
         Ok(())
     }
 
-    /// Turn one STAT status line into an existence verdict.
-    ///
-    /// A 500/501 is the server saying it does not implement STAT. That is an
-    /// answer about the command, not a fault on the socket: it is recorded so
-    /// the probe switches to HEAD, and the connection stays healthy.
+    // Turn one STAT status line into an existence verdict.
+    //
+    // A 500/501 is the server saying it does not implement STAT. That is an
+    // answer about the command, not a fault on the socket: it is recorded so
+    // the probe switches to HEAD, and the connection stays healthy.
     fn classify_stat_response(&mut self, response: &Response) -> Result<bool> {
         match response.code.raw() {
             223 => Ok(true),
@@ -1950,12 +2066,12 @@ impl BlockingNntpConnection {
         self.stream_yenc_article_with_estimate(message_id, 0)
     }
 
-    /// [`Self::stream_yenc_article`], calling `on_chunk` with each decoded
-    /// batch as it is produced rather than only once the article is complete.
-    ///
-    /// The batches handed to `on_chunk` are exactly the ones that end up in
-    /// [`FusedYencArticle::chunks`], in the same order, so a caller can hash or
-    /// write incrementally and still fall back to the buffered article.
+    // [`Self::stream_yenc_article`], calling `on_chunk` with each decoded
+    // batch as it is produced rather than only once the article is complete.
+    //
+    // The batches handed to `on_chunk` are exactly the ones that end up in
+    // [`FusedYencArticle::chunks`], in the same order, so a caller can hash or
+    // write incrementally and still fall back to the buffered article.
     pub fn stream_yenc_article_with_chunks<F>(
         &mut self,
         message_id: &str,
@@ -2047,8 +2163,8 @@ impl BlockingNntpConnection {
         self.stream_next_yenc_article_inner(None, |_| Ok(()))
     }
 
-    /// [`Self::stream_next_yenc_article`] with per-batch delivery; see
-    /// [`Self::stream_yenc_article_with_chunks`].
+    // [`Self::stream_next_yenc_article`] with per-batch delivery; see
+    // [`Self::stream_yenc_article_with_chunks`].
     pub fn stream_next_yenc_article_with_chunks<F>(
         &mut self,
         on_chunk: F,
@@ -2281,8 +2397,8 @@ impl BlockingNntpConnection {
     }
 }
 
-/// Whether the peer has closed an otherwise idle TCP stream, without
-/// blocking and without consuming anything it may have sent.
+// Whether the peer has closed an otherwise idle TCP stream, without
+// blocking and without consuming anything it may have sent.
 pub(crate) fn tcp_peer_closed(tcp: &TcpStream) -> bool {
     if tcp.set_nonblocking(true).is_err() {
         return true;
@@ -2353,7 +2469,7 @@ impl BlockingTransport {
         }
     }
 
-    /// The direct TCP socket under this transport, if it is not tunnelled.
+    // The direct TCP socket under this transport, if it is not tunnelled.
     fn tcp(&self) -> Option<&TcpStream> {
         match self {
             BlockingTransport::Plain(tcp) => tcp.tcp(),
@@ -2999,7 +3115,7 @@ fn nntp_error_to_io(error: NntpError) -> io::Error {
     }
 }
 
-/// Connect to the first of `host`'s resolved addresses that answers.
+// Connect to the first of `host`'s resolved addresses that answers.
 fn connect_first_answering(
     host: &str,
     port: u16,
@@ -3007,7 +3123,7 @@ fn connect_first_answering(
 ) -> Result<(TcpStream, SocketAddr)> {
     let mut last_error = None;
     for addr in (host, port).to_socket_addrs().map_err(NntpError::Io)? {
-        match TcpStream::connect_timeout(&addr, timeout) {
+        match crate::egress::SocketEgress::System.connect_blocking(addr, timeout) {
             Ok(tcp) => return Ok((tcp, addr)),
             Err(error) => last_error = Some(error),
         }
@@ -3080,6 +3196,7 @@ fn profile_cpu_timings_enabled() -> bool {
 
 fn clone_nntp_error(error: &NntpError) -> NntpError {
     match error {
+        NntpError::Route(error) => NntpError::Route(error.clone()),
         NntpError::Timeout => NntpError::Timeout,
         NntpError::ConnectionClosed => NntpError::ConnectionClosed,
         NntpError::TruncatedMultilineBody => NntpError::TruncatedMultilineBody,
@@ -3127,18 +3244,18 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
     }
 }
 
-/// Whether a decoded BODY outcome left the connection fully consumed and
-/// reusable for the rest of the pipelined batch.
-///
-/// A 430 is a complete server response with no body to drain, so it neither
-/// desynchronises the response stream nor says anything about the socket. It
-/// must therefore not mark the batch dirty — doing so tore down the TLS
-/// session and permanently blocked the server's pipelining proof over a
-/// perfectly ordinary "this article lives on another provider".
-///
-/// Decode failures are deliberately *not* treated as clean here: the yEnc
-/// decoder can fail on a body the transport never finished delivering, and
-/// keeping a possibly mid-body socket is not worth the saved reconnect.
+// Whether a decoded BODY outcome left the connection fully consumed and
+// reusable for the rest of the pipelined batch.
+//
+// A 430 is a complete server response with no body to drain, so it neither
+// desynchronises the response stream nor says anything about the socket. It
+// must therefore not mark the batch dirty — doing so tore down the TLS
+// session and permanently blocked the server's pipelining proof over a
+// perfectly ordinary "this article lives on another provider".
+//
+// Decode failures are deliberately *not* treated as clean here: the yEnc
+// decoder can fail on a body the transport never finished delivering, and
+// keeping a possibly mid-body socket is not worth the saved reconnect.
 fn decoded_result_keeps_connection(
     result: &std::result::Result<DecodedBody, DecodedBodyError>,
 ) -> bool {

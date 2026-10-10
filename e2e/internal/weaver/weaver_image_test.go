@@ -201,6 +201,42 @@ func TestWeaverImagePlanDockerfilePublishedShape(t *testing.T) {
 			t.Fatalf("published dockerfile is missing cache optimization %q:\n%s", fragment, dockerfile)
 		}
 	}
+	// The post-processing script flows run .py and .go scripts inside weaver.
+	if !strings.Contains(runtime, "python3") || !strings.Contains(runtime, "COPY --from="+weaverImageGoToolchain+" /usr/local/go /usr/local/go") {
+		t.Fatalf("the runtime image must carry python3 and a pinned Go toolchain:\n%s", dockerfile)
+	}
+	for _, fragment := range []string{
+		"@sha256:",
+	} {
+		if !strings.Contains(dockerfile, fragment) {
+			t.Fatalf("published dockerfile is missing cache optimization %q:\n%s", fragment, dockerfile)
+		}
+	}
+}
+
+func TestWeaverImagePlanScopesTheCargoTargetCachePerCheckout(t *testing.T) {
+	one := weaverImagePlan{Toolchain: "1.97.1", CacheScope: cacheScopeForRoot("/repos/weaver")}
+	two := weaverImagePlan{Toolchain: "1.97.1", CacheScope: cacheScopeForRoot("/repos/weaver/.worktrees/other")}
+	if one.CacheScope == "" || one.CacheScope == two.CacheScope {
+		t.Fatalf("checkouts must not share a cargo target cache: %q vs %q", one.CacheScope, two.CacheScope)
+	}
+	if again := cacheScopeForRoot("/repos/weaver/"); again != one.CacheScope {
+		t.Fatalf("cache scope must be stable for one checkout: %q vs %q", again, one.CacheScope)
+	}
+	want := "--mount=type=cache,id=weaver-e2e-cargo-target-" + one.CacheScope + ",target=/app/target,sharing=locked"
+	if !strings.Contains(one.dockerfile(), want) {
+		t.Fatalf("dockerfile does not mount the checkout's own cargo target cache:\n%s", one.dockerfile())
+	}
+	if strings.Contains(two.dockerfile(), want) {
+		t.Fatal("a second checkout mounted the first checkout's cargo target cache")
+	}
+}
+
+func TestWeaverLocalImageTagCarriesTheFingerprint(t *testing.T) {
+	tag := weaverLocalImageTag("abcdef0123456789deadbeef")
+	if tag != "weaver-e2e-weaver:abcdef012345" {
+		t.Fatalf("image tag must be the repository plus the short fingerprint: %q", tag)
+	}
 }
 
 func TestWeaverImagePlanBuildArgs(t *testing.T) {

@@ -1,6 +1,20 @@
+import { closedPath, directLeg, routeInput, type NetworkRoute } from "./networking.ts";
 export type ProxyKind = "HTTP_CONNECT" | "HTTP3_CONNECT" | "SOCKS5" | "SSH" | "WIRE_GUARD";
 export const proxyLabels: Record<ProxyKind, string> = { HTTP_CONNECT: "HTTP CONNECT", HTTP3_CONNECT: "HTTP/3 CONNECT", SOCKS5: "SOCKS5", SSH: "SSH", WIRE_GUARD: "WireGuard" };
-export type RoutingPolicy = { proxyIds: number[]; allowDirect: boolean };
+export type RoutingPolicy = { proxyIds: number[]; allowDirect: boolean; legs?: NetworkRoute["legs"]; failover?: NetworkRoute["failover"] };
+export function policyAsRoute(policy: RoutingPolicy): NetworkRoute {
+  return {failover:policy.failover??"REDISTRIBUTE",legs:policy.legs??[{...directLeg(),path:policy.proxyIds.length===0&&policy.allowDirect?directLeg().path:{kind:"LADDER",directFallback:policy.allowDirect,rungs:policy.proxyIds.map(id=>({kind:"PROXY",proxyId:id,poolId:null,chainIds:[]}))}}]};
+}
+/** The kill switch: no proxy to go through, and no going direct, so nothing leaves. */
+export const blockedRouting: RoutingPolicy = { proxyIds: [], allowDirect: false };
+/**
+ * A consumer's route as its input names it. A route's ladder needs a rung, so
+ * only the older `routing` field can say that nothing may leave.
+ */
+export function routeFields(policy: RoutingPolicy) {
+  const route=policyAsRoute(policy);
+  return route.legs.length===1&&closedPath(route.legs[0]!.path)?{routing:blockedRouting}:{route:routeInput(route)};
+}
 export type RoutingStatus = { state: string; selectedProxyId: number | null; failures: { proxyId: number; message: string }[] };
 export const directRouting: RoutingPolicy = { proxyIds: [], allowDirect: true };
 /** The daemon accepts at most this many proxy routes in one policy. */
@@ -22,3 +36,16 @@ export type ProxyProfile = {
   mtu: number; keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
   hasUsername: boolean; hasPassword: boolean; hasPrivateKey: boolean; hasPassphrase: boolean; hasPresharedKey: boolean;
 };
+/**
+ * The proxies a chain's hop can use. WireGuard and HTTP/3 need UDP, which only
+ * the egress or a WireGuard hop beneath them carries, and only WireGuard can
+ * ride a WireGuard hop. The hop's saved choice always stays listed.
+ */
+export function chainHopProfiles<T extends Pick<ProxyProfile, "id" | "kind">>(profiles: T[], chainIds: number[], hop: number): T[] {
+  if (hop === 0) return profiles;
+  const beneath = profiles.find((profile) => profile.id === chainIds[hop - 1])?.kind;
+  return profiles.filter((profile) =>
+    profile.id === chainIds[hop]
+    || (profile.kind !== "WIRE_GUARD" && profile.kind !== "HTTP3_CONNECT")
+    || (profile.kind === "WIRE_GUARD" && beneath === "WIRE_GUARD"));
+}

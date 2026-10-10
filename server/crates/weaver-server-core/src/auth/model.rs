@@ -31,9 +31,9 @@ impl CachedLoginAuth {
     }
 }
 
-/// Wakes long-lived sessions whenever the credentials they authenticated with
-/// may have been revoked. Requests re-check on every call; an open socket only
-/// knows to look again when told.
+// Wakes long-lived sessions whenever the credentials they authenticated with
+// may have been revoked. Requests re-check on every call; an open socket only
+// knows to look again when told.
 #[derive(Debug, Clone)]
 struct RevocationSignal(Arc<watch::Sender<()>>);
 
@@ -81,7 +81,7 @@ impl LoginAuthCache {
         self.changes.notify();
     }
 
-    /// Resolves after every credential or signing-secret replacement.
+    // Resolves after every credential or signing-secret replacement.
     pub fn subscribe(&self) -> watch::Receiver<()> {
         self.changes.subscribe()
     }
@@ -143,7 +143,7 @@ impl ApiKeyCache {
         self.changes.notify();
     }
 
-    /// Resolves after every removal or wholesale replacement of the key set.
+    // Resolves after every removal or wholesale replacement of the key set.
     pub fn subscribe(&self) -> watch::Receiver<()> {
         self.changes.subscribe()
     }
@@ -155,6 +155,10 @@ pub enum CallerScope {
     Read,
     Control,
     Admin,
+    // A running script calling with its run's token. The API limits its
+    // queries to an explicit allowlist and its changes to its own run.
+    // It is neither control nor admin anywhere.
+    ScriptRun,
 }
 
 impl CallerScope {

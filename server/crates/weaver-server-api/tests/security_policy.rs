@@ -1,6 +1,6 @@
-//! The browser-admission and bind-address surface: who may read or change it,
-//! and which combinations the server refuses outright rather than storing a
-//! setting the next start will reject.
+// The browser-admission and bind-address surface: who may read or change it,
+// and which combinations the server refuses outright rather than storing a
+// setting the next start will reject.
 
 mod common;
 
@@ -20,9 +20,9 @@ const SET_ACCESS_POLICY: &str = r#"mutation { setAccessPolicy(mode: "login_requi
 
 const SET_BIND_ADDRESS: &str = r#"mutation { setHttpBindAddress(address: "127.0.0.1") }"#;
 
-/// `RuntimeSecurityConfig` keeps its trusted-network list private behind a
-/// shared lock, so `..default()` update syntax is unavailable outside that
-/// crate; the public fields are assigned instead.
+// `RuntimeSecurityConfig` keeps its trusted-network list private behind a
+// shared lock, so `..default()` update syntax is unavailable outside that
+// crate; the public fields are assigned instead.
 fn strict_security() -> RuntimeSecurityConfig {
     let mut security = RuntimeSecurityConfig::default();
     security.strict_security = true;

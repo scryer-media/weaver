@@ -47,8 +47,8 @@ pub struct SchemaContext {
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
     pub api_key_cache: ApiKeyCache,
-    /// The security settings the process actually started with, so resolvers
-    /// can report the running bind address rather than re-deriving it.
+    // The security settings the process actually started with, so resolvers
+    // can report the running bind address rather than re-deriving it.
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
     pub rss: RssService,
     pub watch_folder: WatchFolderService,
@@ -57,26 +57,26 @@ pub struct SchemaContext {
     pub schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
     pub system_runtime: SystemRuntimeContext,
-    /// Live NNTP pool for per-server health metrics. `None` in contexts without a pool (tests).
+    // Live NNTP pool for per-server health metrics. `None` in contexts without a pool (tests).
     pub nntp_pool: Option<Arc<NntpPool>>,
-    /// Whether to spawn the background history-delete worker. Always `true` in
-    /// production; tests that assert on a freshly-seeded QUEUED delete operation
-    /// set this `false` so the worker cannot claim the operation out from under
-    /// the assertion. The `HistoryDeleteManager` is still wired into the schema
-    /// so on-demand delete mutations work regardless.
+    // Whether to spawn the background history-delete worker. Always `true` in
+    // production; tests that assert on a freshly-seeded QUEUED delete operation
+    // set this `false` so the worker cannot claim the operation out from under
+    // the assertion. The `HistoryDeleteManager` is still wired into the schema
+    // so on-demand delete mutations work regardless.
     pub spawn_history_delete_worker: bool,
-    /// Production passes the pipeline-owned executor so automatic runs and API
-    /// reruns share concurrency and cancellation state.
+    // Production passes the pipeline-owned executor so automatic runs and API
+    // reruns share concurrency and cancellation state.
     pub post_processing_executor:
         Option<weaver_server_core::post_processing::executor::PostProcessingExecutor>,
 }
 
-/// Render the GraphQL SDL for the public API without constructing any runtime
-/// state. The release gate exports this into `api/graphql/schema.graphql` and
-/// diffs it against the previous release, so it must stay free of database,
-/// scheduler, or network dependencies. The query guards applied in
-/// [`build_schema`] only bound complexity/depth and introspection, none of
-/// which change the emitted SDL.
+// Render the GraphQL SDL for the public API without constructing any runtime
+// state. The release gate exports this into `api/graphql/schema.graphql` and
+// diffs it against the previous release, so it must stay free of database,
+// scheduler, or network dependencies. The query guards applied in
+// [`build_schema`] only bound complexity/depth and introspection, none of
+// which change the emitted SDL.
 pub fn export_schema_sdl() -> String {
     let sdl = Schema::build(
         QueryRoot::default(),
@@ -98,6 +98,20 @@ pub fn export_schema_sdl() -> String {
 }
 
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
+    let backup = crate::BackupService::new(
+        context.handle.clone(),
+        context.config.clone(),
+        context.db.clone(),
+        context.rss.clone(),
+        std::path::PathBuf::new(),
+    );
+    build_schema_with_backup(context, backup)
+}
+
+pub fn build_schema_with_backup(
+    context: SchemaContext,
+    backup: crate::BackupService,
+) -> WeaverSchema {
     let replay = QueueEventReplay::default();
     replay.spawn_producer(context.handle.clone(), context.config.clone());
     let history_delete_manager = crate::history::delete_ops::HistoryDeleteManager::new(
@@ -122,7 +136,6 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
     let post_processing_executor = context.post_processing_executor.clone().unwrap_or_else(|| {
-        let settings = context.db.post_processing_settings().unwrap_or_default();
         // Only reached in tests: production hands over the pipeline's executor.
         let data_dir = context
             .config
@@ -136,7 +149,6 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         weaver_server_core::post_processing::executor::PostProcessingExecutor::new(
             context.db.clone(),
             script_directory,
-            usize::from(settings.concurrency),
         )
     });
 
@@ -145,6 +157,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         MutationRoot::default(),
         SubscriptionRoot::default(),
     ))
+    .data(backup)
     .data(context.handle)
     .data(context.scheduled_resume)
     .data(context.config)

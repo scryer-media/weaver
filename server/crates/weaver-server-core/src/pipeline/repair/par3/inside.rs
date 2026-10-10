@@ -1,4 +1,4 @@
-//! Embedded carrier discovery and explicit staged container self-repair.
+// Embedded carrier discovery and explicit staged container self-repair.
 
 use super::*;
 use par3_rs::inside::{ContainerLimits, SelfRepairPlan};
@@ -27,9 +27,9 @@ impl Probes {
     }
 }
 
-/// Container framing supplies a scan hint, never authentication. Ordinary
-/// archives require only bounded framing reads; admitted packets are hashed by
-/// the retained scanner using committed source ranges.
+// Container framing supplies a scan hint, never authentication. Ordinary
+// archives require only bounded framing reads; admitted packets are hashed by
+// the retained scanner using committed source ranges.
 pub(super) fn probe(path: PathBuf) -> EngineResult<Option<u64>> {
     let options = execution_options();
     let _reservation = assessment::ViewReservation::acquire(66 << 10)?;
@@ -133,6 +133,7 @@ pub(super) fn repair(
     session: &mut par3_rs::Par3RepairSession,
     matrix: par3_rs::Fingerprint,
     output: &Path,
+    virtual_carrier: bool,
     options: &ExecutionOptions,
 ) -> EngineResult<SessionRepairReport> {
     let layout = session
@@ -154,13 +155,22 @@ pub(super) fn repair(
         return Err(EngineError::Unsupported("embedded destination path"));
     }
     let destination = output.join(&file.path);
-    if !std::fs::symlink_metadata(&destination)?
-        .file_type()
-        .is_file()
-    {
-        return Err(EngineError::Unsupported(
-            "embedded destination is not a regular file",
-        ));
+    // A carrier read off a direct set's image is replaced at a name nothing
+    // holds yet; anything already there belongs to something else.
+    match std::fs::symlink_metadata(&destination) {
+        Err(error) if virtual_carrier && error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) if virtual_carrier => {
+            return Err(EngineError::Unsupported(
+                "embedded destination of a direct volume already exists",
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(EngineError::Unsupported(
+                "embedded destination is not a regular file",
+            ));
+        }
+        Err(error) => return Err(error.into()),
     }
     let plan = SelfRepairPlan::replacement(session, matrix, &[], ContainerLimits::default())?;
     // The job's private scratch tree is excluded from final delivery and

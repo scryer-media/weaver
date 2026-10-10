@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use async_graphql::{Context, Object, Result, UploadValue};
 use base64::Engine;
 
-use crate::auth::{CallerIdentity, ControlGuard, graphql_error};
+use crate::auth::{CallerIdentity, ControlGuard, ReadGuard, graphql_error};
 use crate::history::types::{
     AcceptHistoryDeleteInput, HistoryCommandResult, HistoryDeleteAcceptance, HistoryItem,
     history_delete_row_state_from_core, history_item_from_row,
@@ -22,12 +22,14 @@ use weaver_server_core::ingest::{
     ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError,
     SubmittedJob, fetch_nzb_from_url, materialize_semantic_promotion,
     normalize_archive_password_candidate, submit_nzb_bytes_with_options,
-    submit_staged_prepared_nzb_with_options, submit_uploaded_nzb_reader_with_options,
+    submit_staged_nzb_zstd_with_options, submit_staged_prepared_nzb_with_options,
+    submit_uploaded_nzb_reader_with_options,
 };
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{
     CallerScopedIdempotency, DuplicateAction, DuplicateMode, SemanticDuplicate, SubmissionOrigin,
 };
+use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{
     Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
@@ -61,6 +63,18 @@ fn upsert_metadata_entry(metadata: &mut Vec<(String, String)>, key: &str, value:
 
 #[Object]
 impl JobsMutation {
+    /// Analyze an NZB without submitting it. Reads nothing and changes
+    /// nothing, so read access suffices; it is a mutation only because file
+    /// uploads travel as mutations.
+    #[graphql(guard = "ReadGuard")]
+    async fn analyze_nzb(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::jobs::support_report::AnalyzeNzbInput,
+    ) -> Result<crate::jobs::support_report::SupportReport> {
+        crate::jobs::support_report::resolve_analyze_nzb(ctx, input).await
+    }
+
     /// Submit an NZB for download through the public integration facade.
     #[graphql(guard = "ControlGuard")]
     async fn submit_nzb(
@@ -89,8 +103,29 @@ impl JobsMutation {
             }
         };
 
+        let db = ctx.data::<Database>()?.clone();
+        let scan_before_parse = tokio::task::spawn_blocking(move || {
+            let settings = db.post_processing_settings()?;
+            Ok::<_, weaver_server_core::StateError>(
+                settings.execution_enabled
+                    && !weaver_server_core::post_processing::executor::strict_security_enabled()
+                    && weaver_server_core::post_processing::listing::list_scripts(
+                        &db.post_processing_script_directory()?,
+                    )
+                    .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
+                    .scripts
+                    .iter()
+                    .any(|script| {
+                        script
+                            .manifest
+                            .kinds()
+                            .contains(&weaver_server_core::post_processing::model::ScriptKind::Scan)
+                    }),
+            )
+        })
+        .await??;
         match manager
-            .stage_upload(caller_identity, upload, input.filename)
+            .stage_upload(caller_identity, upload, input.filename, scan_before_parse)
             .await
         {
             Ok(staged) => Ok(StagedNzbUploadResult {
@@ -98,8 +133,8 @@ impl JobsMutation {
                 staged_upload_id: Some(staged.staged_upload_id),
                 filename: Some(staged.filename),
                 display_name: Some(staged.display_name),
-                total_files: Some(staged.total_files),
-                total_bytes: Some(staged.total_bytes),
+                total_files: staged.total_files,
+                total_bytes: staged.total_bytes,
                 error: None,
             }),
             Err(error) => Ok(rejected_stage_upload_result(filename, error.to_string())),
@@ -184,7 +219,8 @@ impl JobsMutation {
                     .find(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
                     .cloned()
             });
-            let Some(mut preparation) = entry.preparation.take() else {
+            let mut preparation = entry.preparation.take();
+            if preparation.is_none() && !entry.scan_before_parse {
                 manager.restore_entry(entry);
                 results.push(StagedNzbSubmissionResult {
                     staged_upload_id,
@@ -196,34 +232,52 @@ impl JobsMutation {
                     error: Some("staged upload is unavailable; re-add file".to_string()),
                 });
                 continue;
-            };
-            preparation.spec.password = normalize_archive_password_candidate(password.as_deref())
-                .or(preparation.spec.password);
-            preparation.spec.category = category.clone();
-            preparation.spec.metadata = metadata.clone();
-            if !preparation
-                .spec
-                .metadata
-                .iter()
-                .any(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
-                && let Some(original_title) = original_title
-            {
-                preparation.spec.metadata.push(original_title);
+            }
+            if let Some(preparation) = &mut preparation {
+                preparation.spec.password =
+                    normalize_archive_password_candidate(password.as_deref())
+                        .or(preparation.spec.password.take());
+                preparation.spec.category = category.clone();
+                preparation.spec.metadata = metadata.clone();
+                if !preparation
+                    .spec
+                    .metadata
+                    .iter()
+                    .any(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)
+                    && let Some(original_title) = original_title
+                {
+                    preparation.spec.metadata.push(original_title);
+                }
             }
             let nzb_zstd = std::mem::take(&mut entry.nzb_zstd);
             let restore_nzb_zstd = nzb_zstd.clone();
 
-            match submit_staged_prepared_nzb_with_options(
-                db,
-                handle,
-                config,
-                preparation,
-                nzb_zstd,
-                Some(entry.filename.clone()),
-                options,
-            )
-            .await
-            {
+            let submitted = if let Some(preparation) = preparation {
+                submit_staged_prepared_nzb_with_options(
+                    db,
+                    handle,
+                    config,
+                    preparation,
+                    nzb_zstd,
+                    Some(entry.filename.clone()),
+                    options,
+                )
+                .await
+            } else {
+                submit_staged_nzb_zstd_with_options(
+                    db,
+                    handle,
+                    config,
+                    nzb_zstd,
+                    Some(entry.filename.clone()),
+                    password.clone(),
+                    category.clone(),
+                    metadata.clone(),
+                    options,
+                )
+                .await
+            };
+            match submitted {
                 Ok(submitted) => {
                     let result = submission_result_from_submitted(
                         handle,
@@ -318,16 +372,30 @@ impl JobsMutation {
     }
     /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     #[graphql(guard = "ControlGuard")]
-    async fn reprocess_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+    async fn reprocess_job(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        password: Option<String>,
+    ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.reprocess_job(JobId(id)).await?;
+        handle
+            .reprocess_job_with_password(JobId(id), password)
+            .await?;
         Ok(true)
     }
     /// Re-download a completed or failed job from its persisted NZB under the same job ID.
     #[graphql(guard = "ControlGuard")]
-    async fn redownload_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+    async fn redownload_job(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        password: Option<String>,
+    ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.redownload_job(JobId(id)).await?;
+        handle
+            .redownload_job_with_password(JobId(id), password)
+            .await?;
         Ok(true)
     }
     /// Delete completed/failed/cancelled jobs from history.
@@ -373,10 +441,12 @@ impl JobsMutation {
     #[graphql(guard = "ControlGuard")]
     async fn mark_duplicate_good(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.mark_semantic_candidate_good(JobId(id)))
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+        tokio::task::spawn_blocking(move || {
+            weaver_server_core::post_processing::hooks::mark_history_good(&db, JobId(id))
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
 
     #[graphql(guard = "ControlGuard")]
@@ -670,9 +740,18 @@ impl JobsMutation {
     }
     /// Reprocess a failed queue item.
     #[graphql(guard = "ControlGuard")]
-    async fn reprocess_queue_item(&self, ctx: &Context<'_>, id: u64) -> Result<QueueCommandResult> {
+    async fn reprocess_queue_item(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        password: Option<String>,
+    ) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        map_scheduler_result(handle.reprocess_job(JobId(id)).await)?;
+        map_scheduler_result(
+            handle
+                .reprocess_job_with_password(JobId(id), password)
+                .await,
+        )?;
         let item = handle
             .get_job(JobId(id))
             .ok()
@@ -690,9 +769,14 @@ impl JobsMutation {
         &self,
         ctx: &Context<'_>,
         id: u64,
+        password: Option<String>,
     ) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        map_scheduler_result(handle.redownload_job(JobId(id)).await)?;
+        map_scheduler_result(
+            handle
+                .redownload_job_with_password(JobId(id), password)
+                .await,
+        )?;
         let item = handle
             .get_job(JobId(id))
             .ok()
@@ -854,6 +938,7 @@ fn caller_idempotency_scope(caller: &CallerIdentity) -> String {
         CallerIdentity::Local(value) => format!("graphql:local:{}", hex::encode(value)),
         CallerIdentity::Jwt(value) => format!("graphql:jwt:{}", hex::encode(value)),
         CallerIdentity::ApiKey(value) => format!("graphql:api-key:{}", hex::encode(value)),
+        CallerIdentity::ScriptRun(run_id) => format!("graphql:script-run:{run_id}"),
     }
 }
 
@@ -1038,6 +1123,7 @@ async fn submit_from_facade_input(
     let db = ctx.data::<Database>()?;
     let config = ctx.data::<SharedConfig>()?;
     let caller = caller_identity(ctx)?;
+    let source_url = input.url.clone();
     let (nzb_bytes, upload, filename) = match (input.nzb_base64, input.url, input.nzb_upload) {
         (Some(b64), None, None) => {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -1047,9 +1133,12 @@ async fn submit_from_facade_input(
         }
         (None, Some(url), None) => {
             let client = ctx.data::<reqwest::Client>()?;
-            let (bytes, url_filename) = fetch_nzb_from_url(client, &url)
-                .await
-                .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+            let fetched = fetch_nzb_from_url(client, &url).await;
+            if fetched.is_err() {
+                raise_url_completed(db, &url, input.category.as_deref(), UrlStatus::Failure).await;
+            }
+            let (bytes, url_filename) =
+                fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
             (Some(bytes), None, input.filename.or(url_filename))
         }
         (None, None, Some(upload)) => {
@@ -1070,6 +1159,7 @@ async fn submit_from_facade_input(
 
     let client_request_id = input.client_request_id.clone();
     let category = input.category.clone();
+    let url_event = source_url.clone().map(|url| (url, category.clone()));
     let options = graphql_submission_options(
         &caller,
         client_request_id.as_deref(),
@@ -1079,8 +1169,14 @@ async fn submit_from_facade_input(
         input.dupe_score,
         input.dupe_mode,
     );
-    let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
+    let mut metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+    if let Some(url) = source_url {
+        metadata.push((
+            weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
+            url,
+        ));
+    }
 
     let submitted = if let Some(upload) = upload {
         submit_uploaded_nzb(
@@ -1109,6 +1205,15 @@ async fn submit_from_facade_input(
         )
         .await
     };
+    // The URL outcome is known only once its NZB has been accepted or refused.
+    if let Some((url, category)) = url_event {
+        let status = if submitted.is_ok() {
+            UrlStatus::Success
+        } else {
+            UrlStatus::ScanFailure
+        };
+        raise_url_completed(db, &url, category.as_deref(), status).await;
+    }
 
     match submitted {
         Ok(submitted) => {
@@ -1116,6 +1221,14 @@ async fn submit_from_facade_input(
         }
         Err(error) => submission_result_from_error(client_request_id, error)
             .map_err(|e| graphql_error("INVALID_INPUT", e.to_string())),
+    }
+}
+
+async fn raise_url_completed(db: &Database, url: &str, category: Option<&str>, status: UrlStatus) {
+    if let Err(error) =
+        weaver_server_core::post_processing::hooks::url_completed(db, url, category, status).await
+    {
+        tracing::warn!(%error, "could not raise URL script event");
     }
 }
 
@@ -1145,11 +1258,11 @@ async fn submit_uploaded_nzb(
     .await
 }
 
-/// The full remaining history listing returned by the delete mutations.
-///
-/// This is the same read surface as the `historyItems` query, so it applies the
-/// same exclusion: a job the scheduler still owns is not history, however it
-/// came to have a row.
+// The full remaining history listing returned by the delete mutations.
+//
+// This is the same read surface as the `historyItems` query, so it applies the
+// same exclusion: a job the scheduler still owns is not history, however it
+// came to have a row.
 async fn history_items_from_db(db: Database, live_jobs: HashSet<u64>) -> Result<Vec<HistoryItem>> {
     tokio::task::spawn_blocking(move || {
         let rows = crate::history::query::exclude_live_rows(

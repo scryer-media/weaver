@@ -105,12 +105,12 @@ impl LoginRateLimiter {
     }
 }
 
-/// The address login attempts are metered against.
-///
-/// Resolved the same way trust is, so a deployment behind a configured proxy
-/// meters each browser separately instead of pooling every attempt under the
-/// proxy's own address. Headers are believed only from a configured proxy; a
-/// direct peer is metered on its socket address exactly as before.
+// The address login attempts are metered against.
+//
+// Resolved the same way trust is, so a deployment behind a configured proxy
+// meters each browser separately instead of pooling every attempt under the
+// proxy's own address. Headers are believed only from a configured proxy; a
+// direct peer is metered on its socket address exactly as before.
 fn login_client_id(
     security: &RuntimeSecurityConfig,
     headers: &HeaderMap,
@@ -166,8 +166,8 @@ fn canonical_browser_origin(headers: &HeaderMap) -> Result<String, StatusCode> {
     Ok(url.origin().ascii_serialization())
 }
 
-/// Same-origin GETs normally omit Origin. Use their Referer to keep session
-/// discovery consistent with the mandatory Origin check on browser writes.
+// Same-origin GETs normally omit Origin. Use their Referer to keep session
+// discovery consistent with the mandatory Origin check on browser writes.
 fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> bool {
     if headers.contains_key(header::ORIGIN) {
         return canonical_browser_origin(headers).ok().as_deref() == Some(session_origin);
@@ -193,10 +193,10 @@ fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> 
         && url.origin().ascii_serialization() == session_origin
 }
 
-/// Whether a canonical browser origin names the same host and port as the
-/// request's authority. Either side may leave out the scheme's default port,
-/// so both are compared as the port the origin's scheme would actually use:
-/// another page on the same host is a different origin.
+// Whether a canonical browser origin names the same host and port as the
+// request's authority. Either side may leave out the scheme's default port,
+// so both are compared as the port the origin's scheme would actually use:
+// another page on the same host is a different origin.
 fn origin_host_matches(origin: &str, host: &weaver_server_core::security::HttpAuthority) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else {
         return false;
@@ -232,7 +232,7 @@ fn hash_to_hex(hash: [u8; 32]) -> String {
     encoded
 }
 
-/// Extract the `weaver_jwt` cookie value from request headers.
+// Extract the `weaver_jwt` cookie value from request headers.
 pub(super) fn extract_jwt_cookie(headers: &HeaderMap) -> Option<String> {
     extract_cookie(headers, JWT_COOKIE_NAME)
 }
@@ -319,9 +319,9 @@ pub(super) async fn lookup_api_key_auth(
     Ok(Some(cached))
 }
 
-/// Debounce interval for `api_keys.last_used_at` writes. *arr pollers hit the
-/// API every few seconds; persisting a timestamp that granular is pointless and
-/// on Postgres it is a write round-trip + WAL flush per request.
+// Debounce interval for `api_keys.last_used_at` writes. *arr pollers hit the
+// API every few seconds; persisting a timestamp that granular is pointless and
+// on Postgres it is a write round-trip + WAL flush per request.
 const API_KEY_TOUCH_MIN_INTERVAL_MS: i64 = 60_000;
 const API_KEY_TOUCH_MAX_KEYS: usize = 4096;
 
@@ -365,16 +365,16 @@ pub(super) struct ResolvedCaller {
     pub(super) identity: CallerIdentity,
 }
 
-/// Browser session cookies are accepted only on browser-facing routes whose
-/// immediate socket peer has been explicitly trusted by the operator.
+// Browser session cookies are accepted only on browser-facing routes whose
+// immediate socket peer has been explicitly trusted by the operator.
 #[derive(Clone, Copy)]
 pub(super) enum BrowserSessionPolicy {
     TrustedPeer(Option<SocketAddr>),
     Denied,
 }
 
-/// Resolve the caller scope and stable request identity from persistent API
-/// key headers, a login JWT cookie, or a trusted-peer browser session cookie.
+// Resolve the caller scope and stable request identity from persistent API
+// key headers, a login JWT cookie, or a trusted-peer browser session cookie.
 pub(super) async fn resolve_caller(
     db: &Database,
     auth_cache: &LoginAuthCache,
@@ -465,7 +465,35 @@ pub(super) async fn resolve_caller(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Resolve the caller scope with an explicit browser-session policy.
+// A running script calling back with the token its run was handed. `None`
+// when the request carries no such token or the run it names has ended, in
+// which case the request is whatever its other credentials make it.
+//
+// Only the GraphQL endpoint asks this: the token is no credential anywhere
+// else, and it is never kept past the request it came with.
+pub(super) async fn resolve_script_run(
+    db: &Database,
+    headers: &HeaderMap,
+) -> Option<ResolvedCaller> {
+    let token = explicit_api_key(headers).ok()??;
+    // Checked before anything is read, so that an API key or a login token
+    // costs nothing here.
+    if !jwt::service::is_script_run_token_shape(&token) {
+        return None;
+    }
+    let db = db.clone();
+    let run = tokio::task::spawn_blocking(move || db.script_run_for_token(&token))
+        .await
+        .ok()??;
+    Some(ResolvedCaller {
+        // A script may read what an administrator may, but may change
+        // nothing beyond what its own run allows it to ask for.
+        scope: CallerScope::ScriptRun,
+        identity: CallerIdentity::ScriptRun(run.run_id),
+    })
+}
+
+// Resolve the caller scope with an explicit browser-session policy.
 pub(super) async fn resolve_scope(
     db: &Database,
     auth_cache: &LoginAuthCache,
@@ -510,8 +538,8 @@ pub(super) async fn enforce_browser_csrf(
     next.run(request).await
 }
 
-/// Validate the browser binding for a state-changing cookie request. API-key
-/// callers do not carry the browser session cookie and bypass this adapter.
+// Validate the browser binding for a state-changing cookie request. API-key
+// callers do not carry the browser session cookie and bypass this adapter.
 pub(super) async fn validate_browser_csrf(
     db: &Database,
     security: &RuntimeSecurityConfig,
@@ -692,15 +720,15 @@ pub(super) struct SetupRequest {
     trusted_networks: Option<Vec<String>>,
 }
 
-/// Complete first-run setup from the browser: pick an access mode, optionally
-/// create the login, optionally widen the binding.
-///
-/// This is the wizard's endpoint, and its whole reason to exist is that every
-/// peer product does setup in the browser while Weaver used to demand
-/// environment variables. It is callable exactly once — while no credentials
-/// are stored — and only from loopback or an already-trusted peer, which is
-/// the same trust argument the loopback bind default rests on: the first
-/// browser to reach a fresh instance from the machine itself is the operator.
+// Complete first-run setup from the browser: pick an access mode, optionally
+// create the login, optionally widen the binding.
+//
+// This is the wizard's endpoint, and its whole reason to exist is that every
+// peer product does setup in the browser while Weaver used to demand
+// environment variables. It is callable exactly once — while no credentials
+// are stored — and only from loopback or an already-trusted peer, which is
+// the same trust argument the loopback bind default rests on: the first
+// browser to reach a fresh instance from the machine itself is the operator.
 #[expect(
     clippy::too_many_arguments,
     reason = "Axum extracts independent request and application state"
@@ -1352,9 +1380,9 @@ pub(super) async fn logout_handler(
 
 const FRESH_ADMIN_TTL_SECS: i64 = 15 * 60;
 
-/// Resolves the current caller and requires a recent password check for a
-/// durable browser session. Persistent administrator API keys deliberately
-/// retain their documented machine-to-machine capability.
+// Resolves the current caller and requires a recent password check for a
+// durable browser session. Persistent administrator API keys deliberately
+// retain their documented machine-to-machine capability.
 pub(super) async fn require_fresh_admin(
     request_auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
@@ -1781,6 +1809,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_script_is_a_caller_only_while_its_own_run_goes_on() {
+        use weaver_server_core::post_processing::model::ScriptEventLabel;
+        use weaver_server_core::post_processing::runner::RunIdentity;
+
+        fn bearer(value: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {value}").parse().unwrap(),
+            );
+            headers
+        }
+        fn run_of(instance: &str) -> RunIdentity {
+            RunIdentity {
+                run_id: "run-1".into(),
+                instance_id: instance.into(),
+                ..Default::default()
+            }
+        }
+
+        let db = Database::open_in_memory().unwrap();
+        let event = ScriptEventLabel::PostProcessing;
+
+        // A run that starts before the server is listening is handed nothing
+        // to call back with.
+        let mut early = run_of("instance-1");
+        drop(db.open_script_run(&mut early, Some(7), &event, None, false));
+        assert_eq!((early.api_url, early.token), (None, None));
+
+        db.set_script_api_url("http://127.0.0.1:6789/graphql");
+        let mut identity = run_of("instance-1");
+        let requests = db.open_script_run(&mut identity, Some(7), &event, None, false);
+        assert_eq!(
+            identity.api_url.as_deref(),
+            Some("http://127.0.0.1:6789/graphql")
+        );
+        let token = identity.token.clone().unwrap();
+
+        // With its token a script is its run: it may read what an
+        // administrator may, and change only what its run allows.
+        let mut by_key_header = HeaderMap::new();
+        by_key_header.insert("x-api-key", token.parse().unwrap());
+        for headers in [bearer(&token), by_key_header] {
+            let caller = resolve_script_run(&db, &headers).await.unwrap();
+            assert!(matches!(caller.scope, CallerScope::ScriptRun));
+            assert!(!caller.scope.is_admin() && !caller.scope.can_control());
+            assert!(matches!(caller.identity, CallerIdentity::ScriptRun(run) if run == "run-1"));
+        }
+
+        // Nothing else is taken for one: no credential at all, an API key, a
+        // login token signed with the same secret, or a token changed after
+        // it was signed.
+        let secret = db.get_or_create_jwt_signing_secret().unwrap();
+        let login = jwt::create_jwt("admin", &secret, JWT_TTL_SECS);
+        db.insert_api_key("admin", &hash_api_key("an-admin-key"), "admin")
+            .unwrap();
+        let mut tampered = token.clone();
+        tampered.push('A');
+        assert!(resolve_script_run(&db, &HeaderMap::new()).await.is_none());
+        for other in ["an-admin-key", login.as_str(), tampered.as_str()] {
+            assert!(
+                resolve_script_run(&db, &bearer(other)).await.is_none(),
+                "{other}"
+            );
+        }
+
+        // Only the endpoint that expects a script takes the token. Everywhere
+        // else it is a key nobody issued.
+        let security = RuntimeSecurityConfig::default();
+        security.apply_stored_access_policy_revision(None, None, false);
+        let elsewhere = resolve_caller(
+            &db,
+            &LoginAuthCache::default(),
+            &ApiKeyCache::default(),
+            "shared-token",
+            &security,
+            BrowserSessionPolicy::TrustedPeer(Some("127.0.0.1:54321".parse().unwrap())),
+            &bearer(&token),
+        )
+        .await;
+        assert!(matches!(elsewhere, Err(StatusCode::UNAUTHORIZED)));
+
+        // The token ends with the run, whatever date it carries.
+        drop(requests);
+        assert!(resolve_script_run(&db, &bearer(&token)).await.is_none());
+
+        // And a later run does not bring it back, even one that happens to
+        // have the same id.
+        let mut later = run_of("instance-2");
+        let _later = db.open_script_run(&mut later, Some(7), &event, None, false);
+        assert!(resolve_script_run(&db, &bearer(&token)).await.is_none());
+        assert!(
+            resolve_script_run(&db, &bearer(later.token.as_deref().unwrap()))
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_token_is_turned_away_without_reading_the_database() {
+        use weaver_server_core::post_processing::model::ScriptEventLabel;
+        use weaver_server_core::post_processing::runner::RunIdentity;
+
+        fn bearer(value: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {value}").parse().unwrap(),
+            );
+            headers
+        }
+        const SIGNING_SECRET: &str = "auth.jwt_signing_secret";
+
+        // A fresh database has no signing secret until something asks for
+        // one, and asking is the only way into it from here: one still
+        // missing afterwards means nothing was read.
+        let db = Database::open_in_memory().unwrap();
+        let login = jwt::create_jwt("admin", &[9; 32], JWT_TTL_SECS);
+        assert!(jwt::service::is_signed_token_shape(&login));
+        assert!(resolve_script_run(&db, &bearer(&login)).await.is_none());
+        assert_eq!(db.get_setting(SIGNING_SECRET).unwrap(), None);
+
+        // A run's token is still read and verified.
+        db.set_script_api_url("http://127.0.0.1:6789/graphql");
+        let mut identity = RunIdentity {
+            run_id: "run-1".into(),
+            instance_id: "instance-1".into(),
+            ..Default::default()
+        };
+        let _run = db.open_script_run(&mut identity, None, &ScriptEventLabel::Scan, None, false);
+        let caller = resolve_script_run(&db, &bearer(identity.token.as_deref().unwrap()))
+            .await
+            .unwrap();
+        assert!(matches!(caller.identity, CallerIdentity::ScriptRun(run) if run == "run-1"));
+    }
+
+    #[tokio::test]
     async fn logout_requires_csrf_and_revokes_only_the_current_browser() {
         let db = Database::open_in_memory().unwrap();
         let security = RuntimeSecurityConfig::default();
@@ -1961,9 +2126,9 @@ mod tests {
         assert_eq!(login_client_id(&security, &headers, None), "198.51.100.10");
     }
 
-    /// Metering follows the same resolution trust does: a browser behind a
-    /// configured proxy is rate-limited on its own address, so one attacker
-    /// cannot lock out every other browser sharing that proxy.
+    // Metering follows the same resolution trust does: a browser behind a
+    // configured proxy is rate-limited on its own address, so one attacker
+    // cannot lock out every other browser sharing that proxy.
     #[test]
     fn login_client_id_meters_the_client_behind_a_configured_proxy() {
         let mut security = RuntimeSecurityConfig::default();

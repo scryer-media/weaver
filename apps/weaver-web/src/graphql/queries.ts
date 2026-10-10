@@ -172,7 +172,7 @@ export const PARSED_RELEASE_FIELDS = `
 
 const SERVER_FIELDS = `
   fragment ServerFields on Server {
-    routing { proxyIds allowDirect }
+    routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
     routingStatus { state selectedProxyId failures { proxyId message } }
     id
     host
@@ -208,7 +208,7 @@ const SERVER_FIELDS = `
 
 const SERVER_DETAILS_FIELDS = `
   fragment ServerDetailsFields on ServerDetails {
-    routing { proxyIds allowDirect }
+    routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
     routingStatus { state selectedProxyId failures { proxyId message } }
     id
     host
@@ -438,9 +438,6 @@ const GENERAL_SETTINGS_FIELDS = `
       articleSet
       normalizedName
     }
-    ispBandwidthCap {
-      ...IspBandwidthCapFields
-    }
     watchFolder {
       mode
       path
@@ -452,30 +449,19 @@ const GENERAL_SETTINGS_FIELDS = `
   }
 `;
 
-const ISP_BANDWIDTH_CAP_FIELDS = `
-  fragment IspBandwidthCapFields on IspBandwidthCapSettings {
-    enabled
-    period
-    limitBytes
-    resetTimeMinutesLocal
-    weeklyResetWeekday
-    monthlyResetDay
-  }
-`;
-
 const DOWNLOAD_BLOCK_FIELDS = `
   fragment DownloadBlockFields on DownloadBlock {
     kind
-    capEnabled
-    period
+    egressId
+    egressName
     usedBytes
     limitBytes
     remainingBytes
-    reservedBytes
     windowStartsAtEpochMs
     windowEndsAtEpochMs
     timezoneName
     scheduledSpeedLimit
+    scheduleHoldReason
   }
 `;
 
@@ -590,13 +576,14 @@ const RSS_RULE_FIELDS = `
 
 const RSS_FEED_FIELDS = `
   fragment RssFeedFields on RssFeed {
-    routing { proxyIds allowDirect }
+    routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
     routingStatus { state selectedProxyId failures { proxyId message } }
     id
     name
     url
     enabled
     pollIntervalSecs
+    scriptInstanceIds
     username
     hasPassword
     defaultCategory
@@ -968,14 +955,14 @@ export const CANCEL_JOB_MUTATION = gql`
 `;
 
 export const REPROCESS_JOB_MUTATION = gql`
-  mutation ReprocessJob($id: Int!) {
-    reprocessJob(id: $id)
+  mutation ReprocessJob($id: Int!, $password: String) {
+    reprocessJob(id: $id, password: $password)
   }
 `;
 
 export const REDOWNLOAD_JOB_MUTATION = gql`
-  mutation RedownloadJob($id: Int!) {
-    redownloadJob(id: $id)
+  mutation RedownloadJob($id: Int!, $password: String) {
+    redownloadJob(id: $id, password: $password)
   }
 `;
 
@@ -1354,7 +1341,6 @@ export const SETTINGS_QUERY = gql`
     }
   }
   ${GENERAL_SETTINGS_FIELDS}
-  ${ISP_BANDWIDTH_CAP_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
@@ -1365,7 +1351,6 @@ export const UPDATE_SETTINGS_MUTATION = gql`
     }
   }
   ${GENERAL_SETTINGS_FIELDS}
-  ${ISP_BANDWIDTH_CAP_FIELDS}
 `;
 
 // --- Hardware profile ---
@@ -1656,6 +1641,13 @@ export const RSS_SETTINGS_QUERY = gql`
     categories {
       ...CategoryFields
     }
+    scriptInstances {
+      id
+      name
+      script
+      trigger
+      enabled
+    }
   }
   ${RSS_RULE_FIELDS}
   ${RSS_FEED_FIELDS}
@@ -1801,7 +1793,17 @@ export const SCHEDULES_QUERY = gql`
       days
       time
       actionType
-      speedLimitBytes
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      quotaMeteringEnabled
+      quotaEgressId
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
     }
   }
@@ -1816,7 +1818,17 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
-      speedLimitBytes
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      quotaMeteringEnabled
+      quotaEgressId
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
     }
   }
@@ -1831,7 +1843,17 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
-      speedLimitBytes
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      quotaMeteringEnabled
+      quotaEgressId
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
     }
   }
@@ -1846,7 +1868,17 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
-      speedLimitBytes
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      quotaMeteringEnabled
+      quotaEgressId
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
     }
   }
@@ -1861,7 +1893,17 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
-      speedLimitBytes
+      track
+      times
+      everyHourAtMinute
+      serverId
+      serverActive
+      quotaMeteringEnabled
+      quotaEgressId
+      pruneFailed { deleteFiles }
+      pruneCompleted { deleteFiles }
+      pruneCancelled { deleteFiles }
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
     }
   }
@@ -1872,27 +1914,77 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     scriptDirectory
     executionEnabled
     concurrency
+    eventScriptTimeoutSeconds
+    fileDownloadedEventInterval
+    scriptOutputRunsPerJob
+    scriptOutputFailedRunsPerJob
     terminationGraceSeconds
     pythonInterpreter
     powershellInterpreter
     batchInterpreter
+    goInterpreter
     unacceptableExtensions
     strictSecurityRefusesExecution
-    lists {
-      global {
-        script
-        enabled
-        timeoutSeconds
-      }
-      categories {
-        category
-        entries {
-          script
-          enabled
-          timeoutSeconds
-        }
+    globalScriptsRun
+  }
+`;
+
+const SCRIPT_INSTANCE_FIELDS = gql`
+  fragment ScriptInstanceFields on ScriptInstance {
+    id
+    name
+    script
+    trigger
+    queueEvent
+    inputs {
+      name
+      value
+      sealed
+      secret {
+        id
+        name
       }
     }
+    categories
+    enabled
+    blocking
+    timeoutSeconds
+    schedule {
+      days
+      times
+      runAtStartup
+    }
+    runOrder
+    scriptProblem
+    headerDrift
+  }
+`;
+
+const SCRIPT_TEST_RUN_FIELDS = gql`
+  fragment ScriptTestRunFields on ScriptTestRun {
+    id
+    instanceId
+    instanceName
+    script
+    event
+    kind
+    adapter
+    startedAtEpochMs
+    timeoutSeconds
+    running
+    status
+    exitCode
+    durationMs
+    errorMessage
+    log
+    logTruncated
+    inputs {
+      name
+      value
+    }
+    arguments
+    commands
+    commandsTruncated
   }
 `;
 
@@ -1901,11 +1993,43 @@ export const POST_PROCESSING_SETTINGS_QUERY = gql`
     postProcessingSettings {
       ...PostProcessingSettingsFields
     }
-    scripts {
+  }
+  ${POST_PROCESSING_SETTINGS_FIELDS}
+`;
+
+/** What runs, and the categories an instance can be narrowed to. */
+export const SCRIPT_INSTANCES_QUERY = gql`
+  query ScriptInstances {
+    postProcessingSettings {
+      scriptDirectory
+      globalScriptsRun
+    }
+    scriptInstances {
+      ...ScriptInstanceFields
+    }
+    categories {
+      id
+      name
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+/**
+ * What the scripts directory holds. Asked for on its own: a directory that
+ * cannot be listed fails this query and nothing else, so the instances that
+ * are saved stay on screen.
+ */
+export const DISCOVERED_SCRIPTS_QUERY = gql`
+  query DiscoveredScripts {
+    discoveredScripts {
       scripts {
         name
         displayName
         adapter
+        kinds
+        queueEvents
+        taskTimes
         version
         options {
           name
@@ -1916,7 +2040,18 @@ export const POST_PROCESSING_SETTINGS_QUERY = gql`
           select
           required
           defaultValue
-          value
+        }
+        preset {
+          triggers {
+            trigger
+            queueEvent
+          }
+          taskTimes
+          inputs {
+            name
+            value
+            secret
+          }
         }
       }
       problems {
@@ -1924,12 +2059,7 @@ export const POST_PROCESSING_SETTINGS_QUERY = gql`
         message
       }
     }
-    categories {
-      id
-      name
-    }
   }
-  ${POST_PROCESSING_SETTINGS_FIELDS}
 `;
 
 export const SET_POST_PROCESSING_SETTINGS_MUTATION = gql`
@@ -1950,36 +2080,125 @@ export const SET_POST_PROCESSING_SCRIPT_DIRECTORY_MUTATION = gql`
   ${POST_PROCESSING_SETTINGS_FIELDS}
 `;
 
-export const SET_SCRIPT_LISTS_MUTATION = gql`
-  mutation SetScriptLists($input: ScriptListsInput!) {
-    setScriptLists(input: $input) {
-      global {
-        script
-        enabled
-        timeoutSeconds
-      }
-      categories {
-        category
-        entries {
-          script
-          enabled
-          timeoutSeconds
-        }
-      }
+export const CREATE_SCRIPT_INSTANCE_MUTATION = gql`
+  mutation CreateScriptInstance($input: ScriptInstanceInput!) {
+    createScriptInstance(input: $input) {
+      ...ScriptInstanceFields
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const UPDATE_SCRIPT_INSTANCE_MUTATION = gql`
+  mutation UpdateScriptInstance($id: String!, $input: ScriptInstanceInput!) {
+    updateScriptInstance(id: $id, input: $input) {
+      ...ScriptInstanceFields
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+const SECRET_FIELDS = gql`
+  fragment SecretFields on Secret {
+    id
+    name
+    createdAt
+    updatedAt
+    usedBy {
+      id
+      name
     }
   }
 `;
 
-export const SET_SCRIPT_OPTIONS_MUTATION = gql`
-  mutation SetScriptOptions($script: String!, $options: [ScriptOptionInput!]!) {
-    setScriptOptions(script: $script, options: $options) {
-      name
-      options {
-        name
-        optionType
-        value
-      }
+/** Every named secret, with the instances that link it. Values never come back. */
+export const SECRETS_QUERY = gql`
+  query Secrets {
+    secrets {
+      ...SecretFields
     }
+  }
+  ${SECRET_FIELDS}
+`;
+
+export const CREATE_SECRET_MUTATION = gql`
+  mutation CreateSecret($name: String!, $value: String!) {
+    createSecret(name: $name, value: $value) {
+      ...SecretFields
+    }
+  }
+  ${SECRET_FIELDS}
+`;
+
+export const UPDATE_SECRET_MUTATION = gql`
+  mutation UpdateSecret($id: String!, $name: String, $value: String) {
+    updateSecret(id: $id, name: $name, value: $value) {
+      ...SecretFields
+    }
+  }
+  ${SECRET_FIELDS}
+`;
+
+export const DELETE_SECRET_MUTATION = gql`
+  mutation DeleteSecret($id: String!) {
+    deleteSecret(id: $id)
+  }
+`;
+
+export const DELETE_SCRIPT_INSTANCE_MUTATION = gql`
+  mutation DeleteScriptInstance($id: String!) {
+    deleteScriptInstance(id: $id)
+  }
+`;
+
+export const REORDER_SCRIPT_INSTANCES_MUTATION = gql`
+  mutation ReorderScriptInstances($trigger: ScriptKind!, $ids: [String!]!) {
+    reorderScriptInstances(trigger: $trigger, ids: $ids) {
+      ...ScriptInstanceFields
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const SET_UP_SCRIPT_FROM_HEADER_MUTATION = gql`
+  mutation SetUpScriptFromHeader($script: String!) {
+    setUpScriptFromHeader(script: $script) {
+      ...ScriptInstanceFields
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const REAPPLY_SCRIPT_HEADER_MUTATION = gql`
+  mutation ReapplyScriptHeader($id: String!) {
+    reapplyScriptHeader(id: $id) {
+      ...ScriptInstanceFields
+    }
+  }
+  ${SCRIPT_INSTANCE_FIELDS}
+`;
+
+export const TEST_SCRIPT_INSTANCE_MUTATION = gql`
+  mutation TestScriptInstance($id: String!) {
+    testScriptInstance(id: $id) {
+      ...ScriptTestRunFields
+    }
+  }
+  ${SCRIPT_TEST_RUN_FIELDS}
+`;
+
+export const SCRIPT_TEST_RUN_QUERY = gql`
+  query ScriptTestRun($id: String!) {
+    scriptTestRun(id: $id) {
+      ...ScriptTestRunFields
+    }
+  }
+  ${SCRIPT_TEST_RUN_FIELDS}
+`;
+
+export const CANCEL_SCRIPT_TEST_MUTATION = gql`
+  mutation CancelScriptTest($id: String!) {
+    cancelScriptTest(id: $id)
   }
 `;
 
@@ -1987,14 +2206,60 @@ export const POST_PROCESSING_RESULTS_QUERY = gql`
   query PostProcessingResults($jobId: Int!) {
     postProcessingResults(jobId: $jobId) {
       script
+      instanceId
+      instanceName
+      event
       adapter
       status
       exitCode
       durationMs
       outputTail
+      outputId
+      outputRetained
       outputTruncated
       errorMessage
       finishedAtEpochMs
+      background
+    }
+  }
+`;
+
+export const SCRIPT_RUNS_QUERY = gql`
+  query ScriptRuns(
+    $limit: Int
+    $before: String
+    $kind: ScriptKind
+    $script: String
+    $jobId: Int
+    $status: ScriptStatusGql
+  ) {
+    scriptRuns(limit: $limit, before: $before, kind: $kind, script: $script, jobId: $jobId, status: $status) {
+      runs {
+        id
+        jobId
+        jobName
+        script
+        instanceId
+        instanceName
+        event
+        kind
+        background
+        adapter
+        status
+        exitCode
+        durationMs
+        outputTail
+        outputTruncated
+        outputRetained
+        errorMessage
+        finishedAtEpochMs
+      }
+      nextBefore
+      total
+      statusCounts {
+        status
+        count
+      }
     }
   }
 `;
@@ -2008,5 +2273,59 @@ export const RERUN_POST_PROCESSING_MUTATION = gql`
 export const CANCEL_JOB_POST_PROCESSING_MUTATION = gql`
   mutation CancelJobPostProcessing($jobId: Int!) {
     cancelJobPostProcessing(jobId: $jobId)
+  }
+`;
+
+export const BACKUP_LIBRARY_QUERY = gql`
+  query BackupLibrary {
+    backups { filename sizeBytes createdAt formatVersion sourceWeaverVersion sourceEngine encrypted rowCounts trigger status error }
+    backupSettings { customBackupPath backupPath }
+    autoBackupSettings { enabled dailyTimeLocal autoBackupKeyPresent nextRunAt }
+  }
+`;
+export const UPDATE_BACKUP_SETTINGS_MUTATION = gql`mutation UpdateBackupSettings($path: String) { updateBackupSettings(customBackupPath: $path) { customBackupPath backupPath } }`;
+export const UPDATE_AUTO_BACKUP_SETTINGS_MUTATION = gql`mutation UpdateAutoBackupSettings($input: AutoBackupSettingsInput!) { updateAutoBackupSettings(input: $input) { enabled dailyTimeLocal autoBackupKeyPresent nextRunAt } }`;
+export const DELETE_BACKUP_MUTATION = gql`mutation DeleteBackup($filename: String!) { deleteBackup(filename: $filename) }`;
+export const BACKUP_DOWNLOAD_TOKEN_MUTATION = gql`mutation BackupDownloadToken($filename: String!) { createBackupDownloadToken(filename: $filename) }`;
+
+export const JOB_SUPPORT_REPORT_QUERY = gql`
+  query JobSupportReport($jobId: Int!) {
+    jobSupportReport(jobId: $jobId) {
+      text
+      json
+    }
+  }
+`;
+
+export const ANALYZE_NZB_MUTATION = gql`
+  mutation AnalyzeNzb($input: AnalyzeNzbInput!) {
+    analyzeNzb(input: $input) {
+      text
+      json
+    }
+  }
+`;
+
+export const ARCHIVE_PASSWORD_SETTINGS_QUERY = gql`
+  query ArchivePasswordSettings {
+    archivePasswordSettings {
+      hasPasswords
+      passwordFile
+    }
+  }
+`;
+
+export const UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION = gql`
+  mutation UpdateArchivePasswordSettings($passwords: [String!], $passwordFile: String) {
+    updateArchivePasswordSettings(passwords: $passwords, passwordFile: $passwordFile) {
+      hasPasswords
+      passwordFile
+    }
+  }
+`;
+
+export const VALIDATED_ARCHIVE_PASSWORD_QUERY = gql`
+  query ValidatedArchivePassword($id: Int!) {
+    validatedArchivePassword(id: $id)
   }
 `;

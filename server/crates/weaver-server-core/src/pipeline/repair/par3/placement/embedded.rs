@@ -1,4 +1,4 @@
-//! Identity matching for the protected stream of an embedded carrier.
+// Identity matching for the protected stream of an embedded carrier.
 
 use super::*;
 use par3_rs::layout::BlockLayout;

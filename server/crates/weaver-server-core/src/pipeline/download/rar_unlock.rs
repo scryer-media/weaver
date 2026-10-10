@@ -372,11 +372,11 @@ impl Pipeline {
         selected
     }
 
-    /// Sequential-prefix selection for a set with no computed plan: walk
-    /// volumes from 0 upward, skip completed and in-flight ones, and boost
-    /// queued volumes until the known prefix breaks or the cap is reached.
-    /// Volume 0 leads because it carries the archive headers that unlock the
-    /// first real plan.
+    // Sequential-prefix selection for a set with no computed plan: walk
+    // volumes from 0 upward, skip completed and in-flight ones, and boost
+    // queued volumes until the known prefix breaks or the cap is reached.
+    // Volume 0 leads because it carries the archive headers that unlock the
+    // first real plan.
     fn select_bootstrap_rar_unlock_files(
         set_name: &str,
         volume_files: &HashMap<(String, u32), RarUnlockVolumeFile>,

@@ -125,6 +125,9 @@ async fn async_main() {
     let Cli {
         log_file: log_file_override,
         log_format: log_format_override,
+        skip_upgrade_backup,
+        require_upgrade_backup,
+        reset_automatic_backup_settings,
         command,
         ..
     } = cli;
@@ -139,6 +142,10 @@ async fn async_main() {
         std::env::var_os("NO_COLOR").is_some(),
     );
     let command = command.unwrap_or_else(Command::default_serve);
+    // Ahead of logging, so stdout carries the report alone and can be piped.
+    if let Command::Nzb { command } = command {
+        std::process::exit(commands::nzb::run(command).await);
+    }
 
     let log_ring_buffer =
         weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity();
@@ -257,6 +264,7 @@ async fn async_main() {
         error!("invalid Weaver e2e clock: {error}");
         std::process::exit(1);
     }
+    install_e2e_network_time_scale();
 
     let restore_locator_dir =
         weaver_server_core::persistence::setup::default_data_dir_for_config_path(&config_path);
@@ -271,6 +279,42 @@ async fn async_main() {
         )),
         _ => None,
     };
+    if command.opens_database() {
+        if reset_automatic_backup_settings
+            && let Err(error) =
+                weaver_server_core::operations::backup::reset_automatic_backup_settings(
+                    &config_path,
+                )
+                .await
+        {
+            error!("failed to reset automatic-backup settings before startup: {error}");
+            std::process::exit(1);
+        }
+        let backup_result = if skip_upgrade_backup {
+            tracing::error!(
+                "operator skipped the pre-migration backup; this startup has no new rollback copy; remove --skip-upgrade-backup from persistent service configuration after recovery"
+            );
+            weaver_server_core::operations::backup::skip_upgrade_backup(&config_path).await
+        } else {
+            weaver_server_core::operations::backup::prepare_upgrade_backup(&config_path).await
+        };
+        if let Err(error) = backup_result {
+            if args::upgrade_backup_required(
+                require_upgrade_backup,
+                std::env::var("WEAVER_REQUIRE_UPGRADE_BACKUP")
+                    .ok()
+                    .as_deref(),
+            ) {
+                error!(
+                    "pre-migration backup preparation failed; refusing migration because backup protection is required: {error}"
+                );
+                std::process::exit(1);
+            }
+            error!(
+                "pre-migration backup preparation failed; continuing startup without a new rollback copy and retaining the retry marker: {error}. Set --require-upgrade-backup or WEAVER_REQUIRE_UPGRADE_BACKUP=true to refuse migration on backup failure"
+            );
+        }
+    }
     let db = match bootstrap::open_database(&config_path) {
         Ok(db) => db,
         Err(error) => {
@@ -286,6 +330,11 @@ async fn async_main() {
                 std::process::exit(1);
             }
         };
+    if matches!(&command, Command::Serve { .. })
+        && let Err(error) = weaver_server_core::operations::backup::record_started_version(&db)
+    {
+        error!("could not record the running version after database startup: {error}");
+    }
     // Restoring can upgrade the restored database too, so the page stays up
     // through it. It must be down before the real server binds the port.
     if let Some(splash) = upgrade_splash {
@@ -426,6 +475,7 @@ async fn async_main() {
             }
         }
         Command::Par2 { .. } => unreachable!("par2 command handled before config startup"),
+        Command::Nzb { .. } => unreachable!("nzb command handled before logging starts"),
     }
 }
 
@@ -439,6 +489,39 @@ fn load_dotenv_path(path: &Path) -> Result<bool, dotenvy::Error> {
         Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+// In e2e mode only, divides the connection plans' timers by
+// `WEAVER_E2E_NETWORK_TIME_SCALE` so a harness need not wait them out in real
+// time. Without e2e mode, or without a scale above 1, nothing is installed and
+// the process runs on production timing.
+fn install_e2e_network_time_scale() {
+    if !weaver_server_core::e2e_clock::e2e_mode_enabled() {
+        return;
+    }
+    let Some(scale) = std::env::var("WEAVER_E2E_NETWORK_TIME_SCALE")
+        .ok()
+        .and_then(|value| value.trim().parse::<std::num::NonZeroU32>().ok())
+        .filter(|scale| scale.get() > 1)
+    else {
+        return;
+    };
+    let timing = weaver_nntp::plan_timing::PlanTiming::scaled(scale);
+    if weaver_nntp::plan_timing::install(timing).is_err() {
+        error!("e2e network time scale {scale}: plan timing was already in use before startup");
+        std::process::exit(1);
+    }
+    tracing::info!(
+        scale = scale.get(),
+        delivery_verdict_interval = ?timing.delivery_verdict_interval,
+        shadow_interval = ?timing.shadow_interval,
+        shadow_min_pin_age = ?timing.shadow_min_pin_age,
+        route_cooldown = ?timing.route_cooldown,
+        leg_cooldown_initial = ?timing.leg_cooldown_initial,
+        rung_cooldown = ?timing.rung_cooldown,
+        replan_interval = ?timing.replan_interval,
+        "e2e network time scale installed"
+    );
 }
 
 fn install_panic_hook() {
@@ -514,7 +597,7 @@ fn default_windows_log_file_path() -> Option<PathBuf> {
     }
 }
 
-/// Adapter that lets `tracing_subscriber` write to a [`LogRingBuffer`].
+// Adapter that lets `tracing_subscriber` write to a [`LogRingBuffer`].
 #[derive(Clone)]
 struct LogBufferWriter(weaver_server_core::runtime::log_buffer::LogRingBuffer);
 

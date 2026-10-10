@@ -56,6 +56,7 @@ fn interrupted_repair_preserves_installations_before_spill_handback() {
         }),
         outputs: Ok(Vec::new()),
         embedded_replacement: false,
+        embedded_source: None,
         _reservation: None,
     };
     let mut coordinator = settle_result(

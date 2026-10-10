@@ -30,8 +30,8 @@ impl Pipeline {
         true
     }
 
-    /// Whether a full-set extraction failed on its archive's bytes, which a
-    /// repair can still change, rather than on something no repair reaches.
+    // Whether a full-set extraction failed on its archive's bytes, which a
+    // repair can still change, rather than on something no repair reaches.
     pub(in crate::pipeline) fn is_recoverable_full_set_extraction_error(error: &str) -> bool {
         if error.starts_with(
             crate::pipeline::completion::finalize::extract::SEVENZ_BLOCK_DATA_ERROR_PREFIX,
@@ -39,19 +39,25 @@ impl Pipeline {
             return true;
         }
         let lower = error.to_ascii_lowercase();
-        lower.contains("checksum") || lower.contains("crc mismatch")
+        lower.contains("checksum")
+            || lower.contains("crc mismatch")
+            || lower.contains("crcmismatch")
+            || lower.contains("no crc-valid start header")
+            || lower.contains("truncated header at offset")
+            || lower.contains("not a rar archive (bad signature)")
+            || lower.contains("failed to fill whole buffer")
     }
 
-    /// Refusals raised while *opening* the archive, about its structure rather
-    /// than any member's bytes: two members that sanitize to one destination,
-    /// or a member path that escapes the output root. Both come from
-    /// `ensure_unique_sanitized_rar_member_paths` before a single member is
-    /// read, and nothing a retry can bring — a re-download, a PAR2 verdict, a
-    /// header refresh — changes the answer, because the names are the archive.
-    ///
-    /// Matched on the exact message prefixes those two checks produce, and on
-    /// nothing looser: this classification ends the job, so it must never
-    /// catch a member-level failure that a repair could still turn around.
+    // Refusals raised while *opening* the archive, about its structure rather
+    // than any member's bytes: two members that sanitize to one destination,
+    // or a member path that escapes the output root. Both come from
+    // `ensure_unique_sanitized_rar_member_paths` before a single member is
+    // read, and nothing a retry can bring — a re-download, a PAR2 verdict, a
+    // header refresh — changes the answer, because the names are the archive.
+    //
+    // Matched on the exact message prefixes those two checks produce, and on
+    // nothing looser: this classification ends the job, so it must never
+    // catch a member-level failure that a repair could still turn around.
     pub(in crate::pipeline) fn is_terminal_archive_structure_error(error: &str) -> bool {
         error.starts_with("RAR archive contains colliding sanitized member path: ")
             || error.starts_with("unsafe RAR member path: ")
@@ -174,37 +180,37 @@ impl Pipeline {
         })
     }
 
-    /// Whether PAR2 can still deliver a verdict on this job's archives.
-    ///
-    /// Keyed on a **loaded** set, not on the NZB declaring one. A job can
-    /// declare a `.par2` whose articles never arrive — routine, since recovery
-    /// volumes often sit on a different retention tier — and keying on the
-    /// declaration would latch a failed member out while waiting for a verdict
-    /// that can never come.
-    ///
-    /// A clean verdict releases it. 0.7.9 drops that clause so a member that
-    /// fails *after* verification stays latched; 0.8 does not need to, because
-    /// it already re-opens the completion gate for that job by another route,
-    /// and holding the latch as well would keep the member out with no verdict
-    /// left to come.
+    // Whether PAR2 can still deliver a verdict on this job's archives.
+    //
+    // Keyed on a **loaded** set, not on the NZB declaring one. A job can
+    // declare a `.par2` whose articles never arrive — routine, since recovery
+    // volumes often sit on a different retention tier — and keying on the
+    // declaration would latch a failed member out while waiting for a verdict
+    // that can never come.
+    //
+    // A clean verdict releases it. 0.7.9 drops that clause so a member that
+    // fails *after* verification stays latched; 0.8 does not need to, because
+    // it already re-opens the completion gate for that job by another route,
+    // and holding the latch as well would keep the member out with no verdict
+    // left to come.
     pub(crate) fn par2_is_authoritative_for_extraction(&self, job_id: JobId) -> bool {
         self.par2_set(job_id).is_some() && !self.par2_bypassed.contains(&job_id)
     }
 
-    /// Whether a RAR extraction has failed for this job and PAR2 has not yet
-    /// had its say about why.
-    ///
-    /// This is the recovery latch. A member that failed to extract will fail
-    /// the same way against the same bytes, so re-scheduling it before PAR2
-    /// has decided whether those bytes can be repaired is a spin: extract,
-    /// fail, re-schedule, extract. The failed-extraction marker is the only
-    /// state involved — it is already recorded, already persisted, and already
-    /// cleared by the paths that resolve a failure
-    /// ([`Self::clear_failed_extraction_member`] after a repair,
-    /// `replace_failed_extraction_members` when the set is retried).
-    ///
-    /// "No worker still running" matters: while one is, the job's inputs can
-    /// still change under it, and the failure is not settled.
+    // Whether a RAR extraction has failed for this job and PAR2 has not yet
+    // had its say about why.
+    //
+    // This is the recovery latch. A member that failed to extract will fail
+    // the same way against the same bytes, so re-scheduling it before PAR2
+    // has decided whether those bytes can be repaired is a spin: extract,
+    // fail, re-schedule, extract. The failed-extraction marker is the only
+    // state involved — it is already recorded, already persisted, and already
+    // cleared by the paths that resolve a failure
+    // ([`Self::clear_failed_extraction_member`] after a repair,
+    // `replace_failed_extraction_members` when the set is retried).
+    //
+    // "No worker still running" matters: while one is, the job's inputs can
+    // still change under it, and the failure is not settled.
     pub(crate) fn par2_recovery_evaluation_pending(&self, job_id: JobId) -> bool {
         if !self.par2_is_authoritative_for_extraction(job_id) {
             return false;
@@ -477,6 +483,10 @@ impl Pipeline {
     }
 
     async fn try_batch_extraction(&mut self, job_id: JobId) {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return;
+        }
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
@@ -821,12 +831,14 @@ impl Pipeline {
                                         budget: Some(Arc::clone(&budget)),
                                     },
                                 )?;
-                            if let Some((member, pattern)) =
+                            if let Some(member) =
                                 Self::blocked_rar_member(&selection.archive, &policy_for_task)
                             {
-                                return Err(budget.reject_content_policy(format!(
-                                    "unacceptable extension '{pattern}' matched RAR member '{member}' before extraction"
-                                )));
+                                return Err(budget.reject_content_policy(
+                                    crate::post_processing::model::unwanted_extension_reason(
+                                        &member,
+                                    ),
+                                ));
                             }
                             let _memory_permit =
                                 budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
@@ -1782,6 +1794,18 @@ impl Pipeline {
                             &set_name,
                             RarCapacityRetryKind::FullSetExtraction,
                         );
+                        return;
+                    }
+                    // A set with no first volume never opened, so nothing about
+                    // its bytes is known to be wrong: it is short a volume.
+                    // Parked as waiting on it, it takes the missing-volume
+                    // route — repair when recovery data can rebuild it, a
+                    // failure naming the volumes seen when nothing can.
+                    if crate::pipeline::archive::topology::is_missing_first_rar_volume_error(&e)
+                        && self.park_rar_set_waiting_for_first_volume(job_id, &set_name)
+                    {
+                        self.phase_end_extracting_if_idle(job_id);
+                        self.check_job_completion(job_id).await;
                         return;
                     }
                     self.purge_empty_rar_set_if_idle(job_id, &set_name);

@@ -27,6 +27,11 @@
       "oracle": "browser"
     },
     {
+      "path": "/tools/nzb-analyzer",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
       "path": "/system-info",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
@@ -42,7 +47,7 @@
       "oracle": "browser"
     },
     {
-      "path": "/settings/bandwidth",
+      "path": "/settings/networking/bandwidth",
       "owner": "ui-settings-crud",
       "oracle": "browser"
     },
@@ -57,7 +62,22 @@
       "oracle": "browser"
     },
     {
-      "path": "/settings/proxies",
+      "path": "/settings/networking/proxies",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/networking/overview",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/networking/egress",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/networking/routes",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
     },
@@ -72,7 +92,22 @@
       "oracle": "browser"
     },
     {
-      "path": "/settings/post-processing",
+      "path": "/settings/scripts/configuration",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/scripts/list",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/scripts/secrets",
+      "owner": "ui-post-processing",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/scripts/runs",
       "owner": "ui-post-processing",
       "oracle": "browser"
     },
@@ -93,6 +128,31 @@
     }
   ],
   "mutations": [
+    {
+      "name": "analyzeNzb",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "createBackupDownloadToken",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "deleteBackup",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "updateBackupSettings",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "previewRssFeed",
+      "owner": "event-scripts",
+      "oracle": "api-metrics"
+    },
     {
       "name": "saveProxyProfile",
       "owner": "proxy-routing",
@@ -311,9 +371,43 @@
     },
     {
       "name": "cancelJobPostProcessing",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "Cancelling mid-script needs a job that is still executing; the browser flow asserts completed script results instead."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "cancelScriptTest",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "createSecret",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "createScriptInstance",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "deleteSecret",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "deleteScriptInstance",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "reapplyScriptHeader",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "reorderScriptInstances",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "reprocessJob",
@@ -349,14 +443,29 @@
       "oracle": "browser"
     },
     {
-      "name": "setScriptLists",
-      "owner": "ui-post-processing",
-      "oracle": "browser"
+      "name": "scriptRun",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
-      "name": "setScriptOptions",
-      "owner": "ui-post-processing",
-      "oracle": "browser"
+      "name": "setUpScriptFromHeader",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "testScriptInstance",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "updateSecret",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "updateScriptInstance",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "acceptHistoryDelete",
@@ -537,6 +646,56 @@
       "name": "updateSettings",
       "owner": "ui-settings-crud",
       "oracle": "browser"
+    },
+    {
+      "name": "updateAutoBackupSettings",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "createEgressInterface",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "updateEgressInterface",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "deleteEgressInterface",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "createProxyPool",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "updateProxyPool",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "deleteProxyPool",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "saveNetworkRoute",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "testEgressInterface",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "testProxyPool",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
     }
   ],
   "behaviors": [
@@ -574,6 +733,96 @@
       "name": "transport-chaos",
       "owner": "existing-download-pipeline",
       "oracle": "existing-pipeline"
+    },
+    {
+      "name": "egress-legs-ladders-pools-and-sessions",
+      "owner": "advanced-networking",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-hold-and-one-shot-evaluators",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-action-contract-and-refusals",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-hold-matrix-every-action",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-track-independence-and-overlap",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-operator-overrides",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-one-shot-occurrences",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-catch-up-across-restart",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "automatic-and-upgrade-backups",
+      "owner": "scheduling",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "nzbget-and-sab-script-adapters",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-exit-codes-and-job-outcome",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-secret-redaction",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-run-token-allowlist",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-output-ring-and-retention",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-interpreters",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-order-and-categories",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-concurrency-after-restart",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "nzbget-facade-script-status",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     }
   ]
 }

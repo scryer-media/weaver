@@ -521,8 +521,8 @@ fn build_plan_blocks_delete_for_missing_start_continuation_spans() {
     assert!(!decision.ownership_eligible);
 }
 
-/// Build a 5-volume RAR set with a single member spanning all volumes.
-/// Used to test gap scenarios where volumes arrive out of order.
+// Build a 5-volume RAR set with a single member spanning all volumes.
+// Used to test gap scenarios where volumes arrive out of order.
 fn build_single_member_five_volume_rar_set() -> Vec<(String, Vec<u8>)> {
     let payload = b"abcdefghijklmnopqrstuvwxy"; // 25 bytes
     let payload_crc = checksum::crc32(payload);

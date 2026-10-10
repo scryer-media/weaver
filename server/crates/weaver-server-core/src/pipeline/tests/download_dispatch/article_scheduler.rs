@@ -1,10 +1,10 @@
-//! The global per-server article scheduler.
-//!
-//! Two promises are under test together, because either one alone is easy and
-//! useless: a server is never sent away empty while some runnable job holds an
-//! article it may fetch, and every article a server is given comes from one
-//! job at a time so that job finishes instead of creeping alongside nine
-//! others.
+// The global per-server article scheduler.
+//
+// Two promises are under test together, because either one alone is easy and
+// useless: a server is never sent away empty while some runnable job holds an
+// article it may fetch, and every article a server is given comes from one
+// job at a time so that job finishes instead of creeping alongside nine
+// others.
 
 use super::*;
 use crate::pipeline::download::scheduler::{Handout, LaneShare, SaturationWake, YieldReason};
@@ -12,7 +12,7 @@ use crate::pipeline::download::scheduler::{Handout, LaneShare, SaturationWake, Y
 const SERVER_A: usize = 0;
 const SERVER_B: usize = 1;
 
-/// Ask the scheduler for work, taking the pressure sample a caller would.
+// Ask the scheduler for work, taking the pressure sample a caller would.
 fn ask(
     pipeline: &mut Pipeline,
     server_idx: usize,
@@ -23,7 +23,7 @@ fn ask(
     pipeline.next_works(server_idx, want, spill_in_flight, pressure)
 }
 
-/// The articles of a handout that must not be a yield.
+// The articles of a handout that must not be a yield.
 fn taken(handout: Handout) -> Vec<DownloadWork> {
     match handout {
         Handout::Works(works) => works,
@@ -35,7 +35,7 @@ fn taken(handout: Handout) -> Vec<DownloadWork> {
     }
 }
 
-/// A lane booked as holding `holds` of `job_id`'s articles, at `depth`.
+// A lane booked as holding `holds` of `job_id`'s articles, at `depth`.
 fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usize) -> LaneShare {
     let lane_id = Pipeline::next_download_lane_id();
     let outstanding = (0..holds)
@@ -76,7 +76,7 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
     LaneShare { lane_id, depth }
 }
 
-/// Ask as `lane`.
+// Ask as `lane`.
 fn ask_as_lane(
     pipeline: &mut Pipeline,
     server_idx: usize,
@@ -87,8 +87,8 @@ fn ask_as_lane(
     pipeline.next_works_for_lane(server_idx, want, Some(lane), None, pressure)
 }
 
-/// The job every article in a handout came from, proving a handout never
-/// spans jobs.
+// The job every article in a handout came from, proving a handout never
+// spans jobs.
 fn single_job(works: &[DownloadWork]) -> JobId {
     let job_id = works[0].segment_id.file_id.job_id;
     assert!(
@@ -100,7 +100,7 @@ fn single_job(works: &[DownloadWork]) -> JobId {
     job_id
 }
 
-/// Articles handed out per job over `calls` asks on one server.
+// Articles handed out per job over `calls` asks on one server.
 fn article_counts(
     pipeline: &mut Pipeline,
     server_idx: usize,
@@ -122,10 +122,10 @@ fn queued(pipeline: &Pipeline, job_id: JobId) -> usize {
     pipeline.jobs.get(&job_id).unwrap().download_queue.len()
 }
 
-/// Hold a job's payload behind the restart checkpoint: an enforced durable
-/// lead with a progress article already in flight refuses every non-recovery
-/// article until the pipeline catches up. `false` when the job has no payload
-/// left to hold back.
+// Hold a job's payload behind the restart checkpoint: an enforced durable
+// lead with a progress article already in flight refuses every non-recovery
+// article until the pipeline catches up. `false` when the job has no payload
+// left to hold back.
 fn try_block_on_checkpoint(pipeline: &mut Pipeline, job_id: JobId) -> bool {
     let Some(segment_id) = pipeline
         .jobs
@@ -167,7 +167,7 @@ fn unblock_checkpoint(pipeline: &mut Pipeline, job_id: JobId) {
         .remove(&job_id);
 }
 
-/// Rewrite a job's whole queue through `edit`, keeping it in the same queue.
+// Rewrite a job's whole queue through `edit`, keeping it in the same queue.
 fn rewrite_queue(pipeline: &mut Pipeline, job_id: JobId, mut edit: impl FnMut(&mut DownloadWork)) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let mut works = state.download_queue.drain_all();
@@ -179,13 +179,13 @@ fn rewrite_queue(pipeline: &mut Pipeline, job_id: JobId, mut edit: impl FnMut(&m
     }
 }
 
-/// A job of `segments` equal-sized articles, appended to the dispatch order.
+// A job of `segments` equal-sized articles, appended to the dispatch order.
 async fn add_job(pipeline: &mut Pipeline, job_id: JobId, name: &str, segments: usize) {
     let spec = segmented_job_spec(name, "payload.bin", &vec![512u32; segments]);
     insert_active_job(pipeline, job_id, spec).await;
 }
 
-/// [`add_job`] with a submitted dispatch priority.
+// [`add_job`] with a submitted dispatch priority.
 async fn add_job_with_priority(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -221,7 +221,7 @@ fn idle_with_servable(pipeline: &Pipeline) -> u64 {
         .load(Ordering::Relaxed)
 }
 
-/// Rule 2: while the hot job can serve this server, nothing else is touched.
+// Rule 2: while the hot job can serve this server, nothing else is touched.
 #[tokio::test]
 async fn hot_job_takes_every_handout_while_it_can_serve_the_server() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -242,8 +242,8 @@ async fn hot_job_takes_every_handout_while_it_can_serve_the_server() {
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
-/// Rule 1: the link is never left idle. Once the hot job runs out the calls
-/// keep being answered, from the next job in order, and no third job opens.
+// Rule 1: the link is never left idle. Once the hot job runs out the calls
+// keep being answered, from the next job in order, and no third job opens.
 #[tokio::test]
 async fn the_next_job_takes_over_the_moment_the_hot_job_runs_dry() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -265,8 +265,8 @@ async fn the_next_job_takes_over_the_moment_the_hot_job_runs_dry() {
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
-/// Rule 3: the restart checkpoint is one of the per-job blocks, and a blocked
-/// hot job hands the server to the next job only — not to the one after it.
+// Rule 3: the restart checkpoint is one of the per-job blocks, and a blocked
+// hot job hands the server to the next job only — not to the one after it.
 #[tokio::test]
 async fn a_checkpoint_held_hot_job_passes_the_server_to_the_next_job_only() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -294,9 +294,9 @@ async fn a_checkpoint_held_hot_job_passes_the_server_to_the_next_job_only() {
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
-/// Rule 1 outranks "the next job only": the walk keeps going past a second
-/// blocked job. A spill job with articles out on the server then keeps it
-/// until that ring drains; only then does the earlier job take over.
+// Rule 1 outranks "the next job only": the walk keeps going past a second
+// blocked job. A spill job with articles out on the server then keeps it
+// until that ring drains; only then does the earlier job take over.
 #[tokio::test]
 async fn the_walk_passes_two_blocked_jobs_and_a_spill_in_flight_keeps_its_server() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -334,8 +334,8 @@ async fn the_walk_passes_two_blocked_jobs_and_a_spill_in_flight_keeps_its_server
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
-/// Rule 3: blocked is per server. The same call answers differently on two
-/// servers of the same pool in the same actor state.
+// Rule 3: blocked is per server. The same call answers differently on two
+// servers of the same pool in the same actor state.
 #[tokio::test]
 async fn a_retention_excluded_hot_job_is_blocked_on_that_server_alone() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -356,8 +356,8 @@ async fn a_retention_excluded_hot_job_is_blocked_on_that_server_alone() {
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
-/// Rule 5: a short hot job is a short handout, never a handout topped up from
-/// the job behind it.
+// Rule 5: a short hot job is a short handout, never a handout topped up from
+// the job behind it.
 #[tokio::test]
 async fn a_handout_stops_at_the_hot_jobs_last_article() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -376,10 +376,10 @@ async fn a_handout_stops_at_the_hot_jobs_last_article() {
     assert_eq!(handouts_spill(&pipeline), 0);
 }
 
-/// Rule 6: the completion-critical class orders work inside a job and only
-/// inside it. Another job's promoted recovery does not pre-empt the hot job's
-/// ordinary payload, and the hot job's own critical heap leads its ordinary
-/// one.
+// Rule 6: the completion-critical class orders work inside a job and only
+// inside it. Another job's promoted recovery does not pre-empt the hot job's
+// ordinary payload, and the hot job's own critical heap leads its ordinary
+// one.
 #[tokio::test]
 async fn completion_critical_work_orders_a_job_but_never_outranks_the_hot_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -427,8 +427,8 @@ async fn completion_critical_work_orders_a_job_but_never_outranks_the_hot_job() 
     );
 }
 
-/// Rule 7: soft byte pressure narrows the field to the hot job and clamps the
-/// handout to a single article, with no spill while memory drains.
+// Rule 7: soft byte pressure narrows the field to the hot job and clamps the
+// handout to a single article, with no spill while memory drains.
 #[tokio::test]
 async fn soft_pressure_clamps_to_one_article_of_the_hot_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -462,8 +462,81 @@ async fn soft_pressure_clamps_to_one_article_of_the_hot_job() {
     );
 }
 
-/// The whole-link gates, each reported as itself. These are the only reasons
-/// a slot may be left empty while a job has servable work.
+#[tokio::test(start_paused = true)]
+async fn only_a_failed_pause_or_server_disable_holds_admission() {
+    use crate::bandwidth::schedule::{ScheduleServices, spawn_evaluator_with_services};
+    use crate::bandwidth::{ScheduleAction, ScheduleEntry};
+    use crate::jobs::handle::DownloadBlockKind;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    add_job(&mut pipeline, JobId(71080), "Schedule Gate", 200).await;
+    let (commands, _) = tokio::sync::mpsc::channel(1);
+    let (events, _) = tokio::sync::broadcast::channel(1);
+    let handle = crate::SchedulerHandle::new(commands, events, pipeline.shared_state.clone());
+    let rule = |active| ScheduleEntry {
+        id: "server-rule".into(),
+        enabled: true,
+        label: "Backup server".into(),
+        days: vec![],
+        time: "00:00".into(),
+        times: vec![],
+        every_hour_at_minute: None,
+        action: ScheduleAction::SetServerActive {
+            server_id: 42,
+            active,
+        },
+    };
+    // No servers service is wired, so every server rule fails to apply.
+    let schedules = Arc::new(tokio::sync::RwLock::new(vec![rule(true)]));
+    let (task, ready) = spawn_evaluator_with_services(
+        handle.clone(),
+        schedules.clone(),
+        ScheduleServices::default(),
+    );
+
+    // A server that failed to come online leaves the others downloading.
+    assert!(ready.await.unwrap().is_err());
+    assert!(!pipeline.shared_state.schedule_replay_paused());
+    assert_eq!(handle.get_download_block().kind, DownloadBlockKind::None);
+    assert!(!taken(ask(&mut pipeline, SERVER_A, 8, None)).is_empty());
+
+    // A server that failed to go offline holds new downloads, and says why.
+    *schedules.write().await = vec![rule(false)];
+    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    while !pipeline.shared_state.schedule_replay_paused() {
+        tokio::task::yield_now().await;
+    }
+    let block = handle.get_download_block();
+    assert_eq!(block.kind, DownloadBlockKind::Scheduled);
+    assert!(
+        block
+            .schedule_hold_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Backup server")),
+        "{block:?}"
+    );
+    assert!(!pipeline.global_paused);
+    assert!(!pipeline.shared_state.is_paused());
+    assert!(matches!(
+        ask(&mut pipeline, SERVER_A, 8, None),
+        Handout::Yield(YieldReason::Paused)
+    ));
+
+    // Removing the rule releases the hold.
+    schedules.write().await.clear();
+    tokio::time::advance(crate::e2e_clock::schedule_poll_interval()).await;
+    while pipeline.shared_state.schedule_replay_paused() {
+        tokio::task::yield_now().await;
+    }
+    let block = handle.get_download_block();
+    assert_eq!(block.kind, DownloadBlockKind::None);
+    assert_eq!(block.schedule_hold_reason, None);
+    assert!(!taken(ask(&mut pipeline, SERVER_A, 8, None)).is_empty());
+    task.shutdown().await;
+}
+
+// The whole-link gates, each reported as itself. These are the only reasons
+// a slot may be left empty while a job has servable work.
 #[tokio::test]
 async fn every_whole_link_gate_yields_under_its_own_name() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -498,36 +571,14 @@ async fn every_whole_link_gate_yields_under_its_own_name() {
         .write_buffered_bytes
         .store(0, Ordering::Relaxed);
 
-    let now = chrono::Local::now();
-    let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
-    pipeline
-        .db
-        .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 4096)
-        .unwrap();
-    pipeline
-        .apply_bandwidth_cap_policy(Some(crate::bandwidth::IspBandwidthCapConfig {
-            enabled: true,
-            period: crate::bandwidth::IspBandwidthCapPeriod::Daily,
-            limit_bytes: 512,
-            reset_time_minutes_local: reset_minutes,
-            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 1,
-        }))
-        .unwrap();
-    assert!(matches!(
-        ask(&mut pipeline, SERVER_A, 8, None),
-        Handout::Yield(YieldReason::BandwidthCapExhausted)
-    ));
-    pipeline.apply_bandwidth_cap_policy(None).unwrap();
-
     // Nothing was taken from the queue while the gates were shut.
     assert_eq!(queued(&pipeline, hot), 200);
     assert_eq!(handouts_hot(&pipeline), 0);
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
-/// Rule 3: the work's own exclusions and rotation hint are per server, and a
-/// job whose whole queue refuses this server is blocked on it.
+// Rule 3: the work's own exclusions and rotation hint are per server, and a
+// job whose whole queue refuses this server is blocked on it.
 #[tokio::test]
 async fn per_article_exclusions_decide_which_server_a_job_is_blocked_on() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -559,8 +610,8 @@ async fn per_article_exclusions_decide_which_server_a_job_is_blocked_on() {
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
-/// Rule 2: the hot job is recomputed on every call, so a higher-priority job
-/// submitted later takes the link on the next ask.
+// Rule 2: the hot job is recomputed on every call, so a higher-priority job
+// submitted later takes the link on the next ask.
 #[tokio::test]
 async fn a_higher_priority_job_becomes_hot_on_the_next_call() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -580,7 +631,7 @@ async fn a_higher_priority_job_becomes_hot_on_the_next_call() {
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 
-/// A small deterministic sequence, so a shuffled run reproduces exactly.
+// A small deterministic sequence, so a shuffled run reproduces exactly.
 struct Lcg(u64);
 
 impl Lcg {
@@ -597,9 +648,9 @@ impl Lcg {
     }
 }
 
-/// The guard counters: over a shuffled multi-job, multi-server run the
-/// scheduler never answers "nothing to do" while a job could have been
-/// served, and every handout it made is accounted for as hot or spill.
+// The guard counters: over a shuffled multi-job, multi-server run the
+// scheduler never answers "nothing to do" while a job could have been
+// served, and every handout it made is accounted for as hot or spill.
 #[tokio::test]
 async fn the_guard_counters_account_for_a_shuffled_multi_server_run() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -672,9 +723,9 @@ async fn the_guard_counters_account_for_a_shuffled_multi_server_run() {
     );
 }
 
-/// Rule 7: a lane holds its share of a job. One hundred connections asking
-/// for a runway each would reserve a six-hundred-article job among the first
-/// twenty; the share holds each of them to the job divided over the link.
+// Rule 7: a lane holds its share of a job. One hundred connections asking
+// for a runway each would reserve a six-hundred-article job among the first
+// twenty; the share holds each of them to the job divided over the link.
 #[tokio::test]
 async fn a_small_job_is_shared_over_every_connection() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -749,9 +800,9 @@ async fn a_small_job_is_shared_over_every_connection() {
     assert_eq!(works.len(), 9);
 }
 
-/// A lane already at its share is reported busy, not sent on to the next
-/// job — the link must not open a second job while the hot one still has
-/// work for other lanes.
+// A lane already at its share is reported busy, not sent on to the next
+// job — the link must not open a second job while the hot one still has
+// work for other lanes.
 #[tokio::test]
 async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -807,9 +858,9 @@ async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
     }
 }
 
-/// The share is measured against the job's unfetched articles, queued and
-/// out on lanes alike, so it is the same for the last lane to ask as for the
-/// first instead of shrinking as the queue drains.
+// The share is measured against the job's unfetched articles, queued and
+// out on lanes alike, so it is the same for the last lane to ask as for the
+// first instead of shrinking as the queue drains.
 #[tokio::test]
 async fn the_share_counts_articles_already_out_on_lanes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -827,8 +878,8 @@ async fn the_share_counts_articles_already_out_on_lanes() {
     );
 }
 
-/// A large job's share is beyond any runway, so its lanes are served exactly
-/// as before: the full ask, every time.
+// A large job's share is beyond any runway, so its lanes are served exactly
+// as before: the full ask, every time.
 #[tokio::test]
 async fn a_large_job_hands_out_the_whole_runway() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -843,9 +894,9 @@ async fn a_large_job_hands_out_the_whole_runway() {
     assert_eq!(works.len(), 18);
 }
 
-/// The share is measured against the job that would serve the lane. A lane at
-/// its share of a job it cannot fetch from — retention rules this server out
-/// — is not held on that job's account: the walk goes on, as rule 3 says.
+// The share is measured against the job that would serve the lane. A lane at
+// its share of a job it cannot fetch from — retention rules this server out
+// — is not held on that job's account: the walk goes on, as rule 3 says.
 #[tokio::test]
 async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -886,8 +937,8 @@ async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
     assert_eq!(handouts_spill(&pipeline), 1);
 }
 
-/// A lane's share is a floor of a full pipe plus one even for a job with a
-/// handful of articles, so a tiny job still fills a pipelined socket.
+// A lane's share is a floor of a full pipe plus one even for a job with a
+// handful of articles, so a tiny job still fills a pipelined socket.
 #[tokio::test]
 async fn the_share_never_starves_a_pipe() {
     let temp_dir = tempfile::tempdir().unwrap();

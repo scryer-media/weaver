@@ -48,16 +48,17 @@ impl Pipeline {
                 origin,
                 reply,
             } => {
-                let semantic_cancel_is_safe = self.jobs.get(&job_id).is_some_and(|state| {
-                    matches!(
-                        (state.download_state, state.post_state),
-                        (
-                            crate::jobs::model::DownloadState::Queued
-                                | crate::jobs::model::DownloadState::Downloading,
-                            crate::jobs::model::PostState::Idle
+                let semantic_cancel_is_safe = !self.awaiting_queue_script_barrier(job_id)
+                    && self.jobs.get(&job_id).is_some_and(|state| {
+                        matches!(
+                            (state.download_state, state.post_state),
+                            (
+                                crate::jobs::model::DownloadState::Queued
+                                    | crate::jobs::model::DownloadState::Downloading,
+                                crate::jobs::model::PostState::Idle
+                            )
                         )
-                    )
-                });
+                    });
                 let result = if !matches!(origin, crate::jobs::handle::CancellationOrigin::User)
                     && !semantic_cancel_is_safe
                 {
@@ -70,6 +71,14 @@ impl Pipeline {
                         "cancel is not supported while the final move is running".to_string(),
                     ))
                 } else if self.jobs.contains_key(&job_id) {
+                    self.db.cancel_event_scripts(job_id.0);
+                    if matches!(origin, crate::jobs::handle::CancellationOrigin::User) {
+                        self.raise_queue_script_event(
+                            job_id,
+                            crate::post_processing::model::QueueEvent::NzbDeleted,
+                            Some("MANUAL"),
+                        );
+                    }
                     // Normal job cancellation must also interrupt terminal
                     // post-processing. The pipeline-level signal covers a run
                     // waiting for admission; the executor-level signal covers a
@@ -150,9 +159,20 @@ impl Pipeline {
                         // row is the only place left to say so.
                         server_attribution: state.server_attribution.to_storage_json(),
                     };
+                    let support_facts = state.support_facts.to_storage_json();
                     let archive_result = self
                         .db_blocking({
                             move |db| {
+                                // Ahead of the archive, which copies them from the
+                                // active row.
+                                if let Some(json) = support_facts {
+                                    db.save_active_support_facts(vec![(job_id, Some(json))])
+                                        .map_err(|e| {
+                                            format!(
+                                                "failed to save cancelled job support facts: {e}"
+                                            )
+                                        })?;
+                                }
                                 db.archive_job(job_id, &row)
                                     .map_err(|e| format!("failed to archive cancelled job: {e}"))?;
                                 Ok::<(), String>(())
@@ -230,6 +250,7 @@ impl Pipeline {
 
                         let working_dir = state.working_dir.clone();
                         let staging_dir = state.staging_dir.clone();
+                        let cleanup_db = self.db.clone();
                         tokio::spawn(async move {
                             // Let a cancelled post-processing script leave its
                             // process group before its working directory is
@@ -244,35 +265,15 @@ impl Pipeline {
                                 })
                                 .await;
                             }
-                            // Close cached write handles first: the working-dir
-                            // path may be reused verbatim by a re-added job, and a
-                            // stale handle would swallow its writes. The staging
-                            // root gets the same treatment — direct-store writes
-                            // member payload there through the same pool, and its
-                            // path is deterministic per job id, so a re-added job
-                            // can reuse that one verbatim too.
-                            crate::pipeline::close_cached_write_handles_under(&working_dir).await;
-                            if let Some(staging) = staging_dir.as_deref() {
-                                crate::pipeline::close_cached_write_handles_under(staging).await;
-                            }
-                            if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
-                                && e.kind() != std::io::ErrorKind::NotFound
+                            if let Err(error) = Self::cleanup_cancelled_job_directories(
+                                &cleanup_db,
+                                job_id,
+                                &working_dir,
+                                staging_dir.as_deref(),
+                            )
+                            .await
                             {
-                                tracing::warn!(
-                                    dir = %working_dir.display(),
-                                    error = %e,
-                                    "failed to clean up cancelled job directory"
-                                );
-                            }
-                            if let Some(staging) = staging_dir
-                                && let Err(e) = tokio::fs::remove_dir_all(&staging).await
-                                && e.kind() != std::io::ErrorKind::NotFound
-                            {
-                                tracing::warn!(
-                                    dir = %staging.display(),
-                                    error = %e,
-                                    "failed to clean up cancelled job staging directory"
-                                );
+                                tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
                             }
                         });
 
@@ -409,7 +410,7 @@ impl Pipeline {
                 self.download_restart_durable_lead_retry_after.clear();
                 self.shared_state.set_paused(true);
                 self.shared_state.set_download_block(
-                    self.bandwidth_cap
+                    self.bandwidth_ledger
                         .to_download_block_state(self.global_pause()),
                 );
                 if let Err(e) = self
@@ -425,7 +426,7 @@ impl Pipeline {
                 self.global_paused = false;
                 self.scheduled_pause = false;
                 self.shared_state.set_paused(false);
-                let _ = self.refresh_bandwidth_cap_window();
+                self.publish_download_block();
                 if let Err(e) = self
                     .db_blocking(move |db| db.set_setting("global_paused", "false"))
                     .await
@@ -435,14 +436,61 @@ impl Pipeline {
                 let _ = self.event_tx.send(PipelineEvent::GlobalResumed);
                 let _ = reply.send(());
             }
-            SchedulerCommand::PausePostProcessing { reply } => {
+            SchedulerCommand::PausePostProcessing { reply }
+            | SchedulerCommand::ApplyScheduleAction {
+                action: crate::bandwidth::ScheduleAction::PausePostProcessing,
+                reply,
+            } => {
                 self.terminal_post_processing_executor.pause();
                 self.shared_state.set_post_processing_paused(true);
+                if let Some(runtime) = self.par3_runtime.as_mut() {
+                    runtime.admission_paused = true;
+                }
                 let _ = reply.send(());
             }
-            SchedulerCommand::ResumePostProcessing { reply } => {
+            SchedulerCommand::ResumePostProcessing { reply }
+            | SchedulerCommand::ApplyScheduleAction {
+                action: crate::bandwidth::ScheduleAction::ResumePostProcessing,
+                reply,
+            } => {
+                if !self.shared_state.is_post_processing_paused() {
+                    let _ = reply.send(());
+                    return;
+                }
                 self.terminal_post_processing_executor.resume();
                 self.shared_state.set_post_processing_paused(false);
+                if let Some(runtime) = self.par3_runtime.as_mut() {
+                    runtime.admission_paused = false;
+                    if let Err(error) = runtime.dispatch() {
+                        error!(%error, "PAR3 dispatch failed on post-processing resume");
+                    }
+                }
+                let deferred_moves: Vec<_> = self.deferred_moves.drain().collect();
+                for job_id in deferred_moves {
+                    if self.jobs.get(&job_id).is_some_and(|state| {
+                        !matches!(
+                            state.status,
+                            JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                        )
+                    }) && let Err(error) = self.start_move_to_complete(job_id).await
+                    {
+                        self.fail_job(job_id, error);
+                    }
+                }
+                self.promote_queued_repairs();
+                self.promote_queued_extractions();
+                let jobs: Vec<_> = self.deferred_post_processing.drain().collect();
+                for job_id in jobs {
+                    let Some(state) = self.jobs.get(&job_id) else {
+                        continue;
+                    };
+                    let files: Vec<_> = state.assembly.files().map(|file| file.file_id()).collect();
+                    for file_id in files {
+                        self.try_arm_direct_unpack_for_file(job_id, file_id);
+                    }
+                    self.try_rar_extraction(job_id).await;
+                    self.schedule_job_completion_check(job_id);
+                }
                 let _ = reply.send(());
             }
             SchedulerCommand::CancelPostProcessing { job_id, reply } => {
@@ -464,9 +512,15 @@ impl Pipeline {
             }
             SchedulerCommand::SetSpeedLimit {
                 bytes_per_sec,
+                replaces_schedule,
                 reply,
             } => {
                 self.configured_rate_limit = bytes_per_sec;
+                if replaces_schedule && self.scheduled_rate_limit.take().is_some() {
+                    // The schedule's rate gives way until its next rule fires.
+                    self.publish_download_block();
+                    info!(bytes_per_sec, "speed limit set over the scheduled one");
+                }
                 if self.scheduled_rate_limit.is_none() {
                     self.rate_limiter.set_rate(bytes_per_sec);
                 }
@@ -482,12 +536,7 @@ impl Pipeline {
                 }
                 let _ = reply.send(());
             }
-            SchedulerCommand::SetBandwidthCapPolicy { policy, reply } => {
-                let result = self.apply_bandwidth_cap_policy(policy);
-                let _ = reply.send(result);
-            }
-            // A profile rule is its own track: it never ends a scheduled pause
-            // or speed limit, so it is taken before the code below that does.
+            // Profile commands use the profile activation path.
             SchedulerCommand::ApplyScheduleAction {
                 action: crate::bandwidth::ScheduleAction::HardwareProfile { profile },
                 reply,
@@ -497,64 +546,85 @@ impl Pipeline {
             }
             SchedulerCommand::ApplyScheduleAction { action, reply } => {
                 use crate::bandwidth::ScheduleAction;
-                if !matches!(&action, ScheduleAction::SpeedLimit { .. }) {
-                    self.scheduled_rate_limit = None;
-                    self.rate_limiter.set_rate(self.configured_rate_limit);
-                }
                 match action {
-                    ScheduleAction::Pause => {
+                    ScheduleAction::Pause | ScheduleAction::PauseAll => {
                         self.global_paused = true;
                         self.scheduled_pause = true;
                         self.shared_state.set_paused(true);
                         // The Scheduled kind now falls out of global_pause(), so
                         // any later block-state refresh keeps reporting it
                         // instead of reclassifying the pause as manual.
-                        self.shared_state.set_download_block(
-                            self.bandwidth_cap
-                                .to_download_block_state(self.global_pause()),
-                        );
+                        self.publish_download_block();
                         info!("schedule: paused downloads");
                     }
                     ScheduleAction::Resume => {
                         self.global_paused = false;
                         self.scheduled_pause = false;
                         self.shared_state.set_paused(false);
-                        let _ = self.refresh_bandwidth_cap_window();
+                        self.publish_download_block();
                         info!("schedule: resumed downloads");
                     }
-                    ScheduleAction::SpeedLimit { bytes_per_sec } => {
-                        self.scheduled_rate_limit = Some(bytes_per_sec);
-                        self.rate_limiter.set_rate(bytes_per_sec);
-                        let mut block = self
-                            .bandwidth_cap
-                            .to_download_block_state(self.global_pause());
-                        block.scheduled_speed_limit = bytes_per_sec;
-                        self.shared_state.set_download_block(block);
-                        info!(bytes_per_sec, "schedule: set speed limit");
+                    ScheduleAction::SpeedLimit { limits } => {
+                        // Only the global limit lives here; an egress or
+                        // provider limit is that holder's own rate.
+                        match limits
+                            .iter()
+                            .rev()
+                            .find(|limit| limit.target == crate::bandwidth::SpeedTarget::Global)
+                        {
+                            Some(limit) => {
+                                let bytes_per_sec = limit.bytes_per_sec;
+                                self.scheduled_rate_limit = Some(bytes_per_sec);
+                                self.rate_limiter.set_rate(bytes_per_sec);
+                                let mut block = self
+                                    .bandwidth_ledger
+                                    .to_download_block_state(self.global_pause());
+                                block.scheduled_speed_limit = bytes_per_sec;
+                                self.shared_state.set_download_block(block);
+                                info!(bytes_per_sec, "schedule: set speed limit");
+                            }
+                            None => warn!(
+                                ?limits,
+                                "an egress or provider speed limit reached download pipeline"
+                            ),
+                        }
+                    }
+                    ScheduleAction::SetQuotaMetering { enabled, target } => {
+                        // Metering off suspends an egress's download quota:
+                        // bytes still reach the ledger, tagged unmetered, but
+                        // that egress does not count them or refuse work.
+                        match target {
+                            crate::bandwidth::QuotaTarget::AllEgresses => {
+                                self.bandwidth_ledger.set_metering_enabled(enabled);
+                                if let Some(policy) = self.shared_state.server_transfer_policy() {
+                                    policy.set_egress_quota_metering(enabled);
+                                }
+                            }
+                            crate::bandwidth::QuotaTarget::Egress(egress_id) => {
+                                if let Some(policy) = self.shared_state.server_transfer_policy() {
+                                    policy.set_one_egress_quota_metering(egress_id, enabled);
+                                }
+                            }
+                        }
+                        self.publish_download_block();
                     }
                     ScheduleAction::PauseWatchFolderScanning
-                    | ScheduleAction::ResumeWatchFolderScanning => {
-                        let _ = self.refresh_bandwidth_cap_window();
+                    | ScheduleAction::ResumeWatchFolderScanning
+                    | ScheduleAction::PauseRss
+                    | ScheduleAction::ResumeRss
+                    | ScheduleAction::SetServerActive { .. }
+                    | ScheduleAction::PruneHistory { .. } => {
+                        self.publish_download_block();
                         warn!(
                             action = ?action,
-                            "watch folder schedule action reached download pipeline"
+                            "service schedule action reached download pipeline"
                         );
                     }
                     // Taken by the arm above.
-                    ScheduleAction::HardwareProfile { .. } => {}
+                    ScheduleAction::HardwareProfile { .. }
+                    | ScheduleAction::PausePostProcessing
+                    | ScheduleAction::ResumePostProcessing => {}
                 }
-                let _ = reply.send(());
-            }
-            SchedulerCommand::ClearScheduleAction { reply } => {
-                if self.global_paused {
-                    self.global_paused = false;
-                    self.shared_state.set_paused(false);
-                }
-                self.scheduled_pause = false;
-                self.scheduled_rate_limit = None;
-                self.rate_limiter.set_rate(self.configured_rate_limit);
-                let _ = self.refresh_bandwidth_cap_window();
-                info!("schedule: cleared scheduled action");
                 let _ = reply.send(());
             }
             SchedulerCommand::SetHardwareProfile { profile, reply } => {
@@ -680,15 +750,35 @@ impl Pipeline {
                     });
                 let _ = reply.send(result);
             }
-            SchedulerCommand::ReprocessJob { job_id, reply } => {
-                let result = self.reprocess_job(job_id).await;
+            SchedulerCommand::ReprocessJob {
+                job_id,
+                password,
+                reply,
+            } => {
+                if self.pending_history_deletions.contains(&job_id) {
+                    let _ = reply.send(Err(SchedulerError::Conflict(
+                        "history deletion is still running".into(),
+                    )));
+                    return;
+                }
+                let result = self.reprocess_job_with_password(job_id, password).await;
                 if result.is_ok() {
                     self.publish_snapshot();
                 }
                 let _ = reply.send(result);
             }
-            SchedulerCommand::RedownloadJob { job_id, reply } => {
-                let result = self.redownload_job(job_id).await;
+            SchedulerCommand::RedownloadJob {
+                job_id,
+                password,
+                reply,
+            } => {
+                if self.pending_history_deletions.contains(&job_id) {
+                    let _ = reply.send(Err(SchedulerError::Conflict(
+                        "history deletion is still running".into(),
+                    )));
+                    return;
+                }
+                let result = self.redownload_job_with_password(job_id, password).await;
                 if result.is_ok() {
                     self.publish_snapshot();
                 }
@@ -699,6 +789,12 @@ impl Pipeline {
                 delete_files,
                 reply,
             } => {
+                if self.pending_history_deletions.contains(&job_id) {
+                    let _ = reply.send(Err(SchedulerError::Conflict(
+                        "history deletion is still running".into(),
+                    )));
+                    return;
+                }
                 let history_cleanup_dirs = match self.history_cleanup_dirs_for_job(job_id).await {
                     Ok(dirs) => dirs,
                     Err(error) => {
@@ -745,22 +841,22 @@ impl Pipeline {
                         return;
                     }
                 }
-                if self.jobs.contains_key(&job_id) {
-                    self.purge_terminal_job_runtime(job_id);
-                }
-                self.finished_jobs.retain(|job| job.job_id != job_id);
-                self.publish_snapshot();
-                self.spawn_history_file_cleanup(
+                self.start_history_delete_cleanup(
                     history_cleanup_dirs,
                     output_dir.into_iter().collect(),
-                    reply,
-                    |left_in_place| crate::HistoryDeleteOutcome { left_in_place },
+                    super::history::HistoryDeleteReply::One(reply),
                 );
             }
             SchedulerCommand::DeleteAllHistory {
                 delete_files,
                 reply,
             } => {
+                if !self.pending_history_deletions.is_empty() {
+                    let _ = reply.send(Err(SchedulerError::Conflict(
+                        "history deletion is still running".into(),
+                    )));
+                    return;
+                }
                 let history_cleanup_dirs = match self.all_history_cleanup_dirs().await {
                     Ok(dirs) => dirs,
                     Err(error) => {
@@ -797,19 +893,11 @@ impl Pipeline {
                         return;
                     }
                 }
-                let terminal_job_ids: Vec<JobId> = self
-                    .jobs
-                    .iter()
-                    .filter_map(|(job_id, state)| {
-                        is_terminal_status(&state.status).then_some(*job_id)
-                    })
-                    .collect();
-                for job_id in terminal_job_ids {
-                    self.purge_terminal_job_runtime(job_id);
-                }
-                self.finished_jobs.clear();
-                self.publish_snapshot();
-                self.spawn_history_file_cleanup(history_cleanup_dirs, output_dirs, reply, |_| ());
+                self.start_history_delete_cleanup(
+                    history_cleanup_dirs,
+                    output_dirs,
+                    super::history::HistoryDeleteReply::All(reply),
+                );
             }
             SchedulerCommand::PipelineDiagnostics { reply } => {
                 let _ = reply.send(Box::new(self.diagnostics_snapshot()));
@@ -820,12 +908,41 @@ impl Pipeline {
 }
 
 impl Pipeline {
-    /// The pool replaced by generation `generation` has drained its sockets,
-    /// so the new pool may dial without competing for the provider allowance.
-    ///
-    /// A drain that finishes after a further rebuild is stale: only the newest
-    /// generation's own drain re-opens dispatch, which keeps the overlap rule
-    /// intact across back-to-back settings saves.
+    pub(crate) async fn cleanup_cancelled_job_directories(
+        db: &crate::Database,
+        job_id: JobId,
+        working_dir: &std::path::Path,
+        staging_dir: Option<&std::path::Path>,
+    ) -> Result<(), crate::StateError> {
+        // Deletion scripts still need this cwd after archival. A cancelled
+        // queue run must also leave its process group before files disappear.
+        crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0).await?;
+        // A re-added job may reuse either path, so release cached handles before
+        // removing its previous working and direct-store staging directories.
+        crate::pipeline::close_cached_write_handles_under(working_dir).await;
+        if let Some(staging) = staging_dir {
+            crate::pipeline::close_cached_write_handles_under(staging).await;
+        }
+        if let Err(error) = tokio::fs::remove_dir_all(working_dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %working_dir.display(), %error, "failed to clean up cancelled job directory");
+        }
+        if let Some(staging) = staging_dir
+            && let Err(error) = tokio::fs::remove_dir_all(staging).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %staging.display(), %error, "failed to clean up cancelled job staging directory");
+        }
+        Ok(())
+    }
+
+    // The pool replaced by generation `generation` has drained its sockets,
+    // so the new pool may dial without competing for the provider allowance.
+    //
+    // A drain that finishes after a further rebuild is stale: only the newest
+    // generation's own drain re-opens dispatch, which keeps the overlap rule
+    // intact across back-to-back settings saves.
     pub(crate) fn handle_nntp_handoff_drained(&mut self, generation: u64) {
         if generation != self.pool_generation {
             debug!(

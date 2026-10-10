@@ -13,103 +13,70 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { PrimaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
-import { formatRate } from "../../../data/format";
+import { SCHEDULE_TRACKS, type ScheduleTrack } from "../../../data/schedule-tracks";
 import {
   profileName,
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
-import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
+import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
+import { scheduleActionFields, scheduleActionHelp, scheduleSpeedSections, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
+import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
- * the hardware profile.
+ * a setting. Scripts keep their run times on their own jobs and never show here.
  *
  * Weekdays are a set rather than a list of rules, so the editor draws them as
  * seven toggling chips — the one control in the design system that repeats
  * horizontally — and "no day selected" means every day.
  */
 
-interface Schedule {
+interface Schedule extends ScheduleOptions {
   id: string;
   enabled: boolean;
   label: string | null;
   days: string[];
   time: string;
   actionType: string;
-  speedLimitBytes: number | null;
+  track: ScheduleTrack;
   hardwareProfile: HardwareProfileName | null;
 }
 
 interface ScheduleForm {
+  options: ScheduleOptionsForm;
   enabled: boolean;
   label: string;
   days: string[];
   time: string;
   actionType: string;
-  speedMib: string;
-  speedUnlimited: boolean;
   /** Null until one is picked; the editor then offers the recommendation. */
   hardwareProfile: HardwareProfileName | null;
 }
 
-const MIB = 1024 * 1024;
-
-/** Labels are translation keys, resolved when the panel renders. */
-const DAYS = [
-  { key: "mon", label: "next.weekday.monShort" },
-  { key: "tue", label: "next.weekday.tueShort" },
-  { key: "wed", label: "next.weekday.wedShort" },
-  { key: "thu", label: "next.weekday.thuShort" },
-  { key: "fri", label: "next.weekday.friShort" },
-  { key: "sat", label: "next.weekday.satShort" },
-  { key: "sun", label: "next.weekday.sunShort" },
-];
-
-const ACTIONS: { value: string; label: string }[] = [
-  { value: "pause", label: "next.schedules.pause" },
-  { value: "resume", label: "next.schedules.resume" },
-  { value: "speed_limit", label: "next.schedules.setLimit" },
-  { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
-  { value: "resume_watch_folder_scanning", label: "next.schedules.resumeWatchFolder" },
-  { value: "hardware_profile", label: "next.schedules.setProfile" },
-];
-
 const NEW_SCHEDULE: ScheduleForm = {
+  options: NEW_SCHEDULE_OPTIONS,
   enabled: true,
   label: "",
   days: [],
   time: "08:00",
   actionType: "pause",
-  speedMib: "5",
-  speedUnlimited: false,
   hardwareProfile: null,
 };
 
-function actionLabel(t: Translate, schedule: Schedule): string {
-  if (schedule.actionType === "speed_limit") {
-    return schedule.speedLimitBytes
-      ? t("next.schedules.limitTo", { rate: formatRate(schedule.speedLimitBytes) })
-      : t("next.schedules.removeLimit");
-  }
+function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets): string {
+  const details = scheduleActionDetails(t, schedule, targets);
+  if (details) return details;
   if (schedule.actionType === "hardware_profile" && schedule.hardwareProfile) {
     return t("next.schedules.profileTo", { profile: profileName(t, schedule.hardwareProfile) });
   }
-  const action = ACTIONS.find((option) => option.value === schedule.actionType);
+  const action = SCHEDULE_ACTIONS.find((option) => option.value === schedule.actionType);
   return action ? t(action.label) : schedule.actionType;
-}
-
-function daysLabel(t: Translate, days: string[]): string {
-  if (days.length === 0 || days.length === DAYS.length) {
-    return t("next.schedules.everyDay");
-  }
-  return DAYS.filter((day) => days.includes(day.key))
-    .map((day) => t(day.label))
-    .join(" ");
 }
 
 export function SchedulesPanel() {
   const t = useTranslate();
+  const targets = useScheduleTargets();
   const [{ data, fetching }, reexecute] = useQuery<{ schedules: Schedule[] }>({ query: SCHEDULES_QUERY });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
@@ -122,11 +89,14 @@ export function SchedulesPanel() {
   const [editingId, setEditingId] = useState<string | "new" | null>(null);
   const [form, setForm] = useState<ScheduleForm>(NEW_SCHEDULE);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<Schedule | null>(null);
 
   const schedules = data?.schedules ?? [];
   const editing = schedules.find((entry) => entry.id === editingId) ?? null;
+
+  usePanelStatus(error ?? status, error !== null);
 
   // A rule may only name a profile this machine can honour.
   const offeredProfiles = profileData?.hardwareProfile.available ?? [];
@@ -139,6 +109,7 @@ export function SchedulesPanel() {
 
   const open = (schedule: Schedule | null) => {
     setError(null);
+    setStatus(null);
     setForm(
       schedule
         ? {
@@ -147,10 +118,8 @@ export function SchedulesPanel() {
             days: schedule.days,
             time: schedule.time,
             actionType: schedule.actionType,
-            speedUnlimited:
-              schedule.actionType === "speed_limit" && !schedule.speedLimitBytes,
-            speedMib: schedule.speedLimitBytes ? String(schedule.speedLimitBytes / MIB) : "5",
             hardwareProfile: schedule.hardwareProfile,
+            options: optionsFromSchedule(schedule),
           }
         : NEW_SCHEDULE,
     );
@@ -158,6 +127,18 @@ export function SchedulesPanel() {
   };
 
   const save = async () => {
+    if (form.actionType === "speed_limit") {
+      // What is wrong with a rate, or a rule that sets nothing, is said before saving.
+      const typed = Object.values(form.options.speeds);
+      if (typed.some((text) => speedProblem(text) !== null)) {
+        setError(t("next.schedules.speedInvalid"));
+        return;
+      }
+      if (typed.every((text) => text.trim() === "")) {
+        setError(t("next.schedules.speedNeeded"));
+        return;
+      }
+    }
     setBusy(true);
     const input: Record<string, unknown> = {
       time: form.time,
@@ -165,12 +146,8 @@ export function SchedulesPanel() {
       days: form.days.length > 0 ? form.days : null,
       label: form.label.trim() || null,
       enabled: form.enabled,
+      ...optionsInput(form.options, form.actionType, editing?.speedLimits ?? []),
     };
-    if (form.actionType === "speed_limit") {
-      input.speedLimitBytes = form.speedUnlimited
-        ? 0
-        : Math.round(Number.parseFloat(form.speedMib || "0") * MIB);
-    }
     if (form.actionType === "hardware_profile") {
       input.hardwareProfile = formProfile;
     }
@@ -183,6 +160,7 @@ export function SchedulesPanel() {
       setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
       return;
     }
+    setError(null);
     setEditingId(null);
     void reexecute({ requestPolicy: "network-only" });
   };
@@ -192,20 +170,61 @@ export function SchedulesPanel() {
       return;
     }
     setBusy(true);
-    await deleteSchedule({ id: confirmRemove.id });
+    const result = await deleteSchedule({ id: confirmRemove.id });
     setBusy(false);
     setConfirmRemove(null);
+    if (result.error) {
+      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      return;
+    }
+    setError(null);
     setEditingId(null);
     void reexecute({ requestPolicy: "network-only" });
   };
 
+  const toggle = async (schedule: Schedule, enabled: boolean) => {
+    setStatus(null);
+    const result = await toggleSchedule({ id: schedule.id, enabled });
+    setError(result.error ? (result.error.graphQLErrors[0]?.message ?? result.error.message) : null);
+    void reexecute({ requestPolicy: "network-only" });
+  };
+
+  const row = (schedule: Schedule) => ({
+    id: schedule.id,
+    searchText: `${scheduleTimeLabel(schedule)} ${scheduleDaysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""}`,
+    cells: [
+      <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
+        {scheduleTimeLabel(schedule)}
+      </Cell>,
+      <Cell key="days" mono className="text-wv-secondary">
+        {scheduleDaysLabel(t, schedule.days)}
+      </Cell>,
+      <Cell key="action" title={actionLabel(t, schedule, targets)}>
+        {actionLabel(t, schedule, targets)}
+      </Cell>,
+      <Cell key="label" className="text-wv-muted">
+        {schedule.label || "—"}
+      </Cell>,
+      <span key="enabled" onClick={(event) => event.stopPropagation()}>
+        <Toggle
+          size="table"
+          checked={schedule.enabled}
+          label={t("next.schedules.enabledAria", { time: schedule.time })}
+          onChange={(next) => void toggle(schedule, next)}
+        />
+      </span>,
+    ],
+  });
+
+  // One list of every rule. Rules that replace one another sit together under
+  // their group's heading, because a rule holds until the next one in its group.
   const blocks: SettingsBlock[] = [
     {
       kind: "table",
       id: "schedules",
       title: t("next.settings.panel.schedules"),
-      note: t("next.schedules.note"),
-      columns: "84px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr) 44px",
+      note: t("next.schedules.trackNote"),
+      columns: "96px minmax(0, 0.8fr) minmax(0, 1.6fr) minmax(0, 1fr) 44px",
       headers: [
         t("next.schedules.time"),
         t("next.schedules.days"),
@@ -214,43 +233,33 @@ export function SchedulesPanel() {
         "",
       ],
       empty: t("next.schedules.empty"),
-      emptyAction: { label: t("next.schedules.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const schedule = schedules.find((entry) => entry.id === id);
         if (schedule) {
           open(schedule);
         }
       },
-      rows: schedules.map((schedule) => ({
-        id: schedule.id,
-        searchText: `${schedule.time} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule)} ${schedule.label ?? ""}`,
-        cells: [
-          <Cell key="time" mono className="text-wv-fg">
-            {schedule.time}
-          </Cell>,
-          <Cell key="days" mono className="text-wv-secondary">
-            {daysLabel(t, schedule.days)}
-          </Cell>,
-          <Cell key="action">{actionLabel(t, schedule)}</Cell>,
-          <Cell key="label" className="text-wv-muted">
-            {schedule.label || "—"}
-          </Cell>,
-          <span key="enabled" onClick={(event) => event.stopPropagation()}>
-            <Toggle
-              size="table"
-              checked={schedule.enabled}
-              label={t("next.schedules.enabledAria", { time: schedule.time })}
-              onChange={(next) => {
-                void toggleSchedule({ id: schedule.id, enabled: next }).then(() =>
-                  reexecute({ requestPolicy: "network-only" }),
-                );
-              }}
-            />
-          </span>,
-        ],
+      rows: [],
+      groups: SCHEDULE_TRACKS.map((track) => ({
+        id: track.value,
+        title: t(track.label),
+        // The one group whose rules do not hold says so in place of the list's note.
+        note: track.value === "ONE_SHOT" ? t("next.schedules.oneShotNote") : undefined,
+        rows: schedules
+          .filter((schedule) => schedule.track === track.value)
+          .map((schedule) => row(schedule)),
       })),
     },
   ];
+
+  const optionFields = {
+    t,
+    action: form.actionType,
+    value: form.options,
+    onChange: (options: ScheduleOptionsForm) => setForm((current) => ({ ...current, options })),
+  };
+  // The editor says how long a rule lasts in the words its group uses in the list.
+  const runsOnce = isOneShot(form.actionType);
 
   return (
     <>
@@ -267,7 +276,7 @@ export function SchedulesPanel() {
             ? t("next.schedules.add")
             : editing?.label || editing?.time || t("next.schedules.schedule")
         }
-        note={editingId === "new" ? t("next.schedules.newNote") : daysLabel(t, editing?.days ?? [])}
+        note={editingId === "new" ? t("next.schedules.newNote") : scheduleDaysLabel(t, editing?.days ?? [])}
         error={error}
         busy={busy}
         onSave={() => void save()}
@@ -278,17 +287,18 @@ export function SchedulesPanel() {
           {
             id: "when",
             title: t("next.schedules.when"),
+            note: t(runsOnce ? "next.schedules.oneShotNote" : "next.schedules.trackNote"),
             fields: [
               {
                 id: "time",
                 label: t("next.schedules.time"),
-                help: t("next.schedules.timeHelp"),
                 control: {
                   kind: "time",
                   value: form.time,
-                  onChange: (next) => setForm((current) => ({ ...current, time: next })),
+                  onChange: (next: string) => setForm((current) => ({ ...current, time: next })),
                 },
               },
+              ...scheduleTimingFields(optionFields),
               {
                 id: "days",
                 label: t("next.schedules.days"),
@@ -296,8 +306,8 @@ export function SchedulesPanel() {
                 control: {
                   kind: "custom",
                   control: (
-                    <div className="flex flex-wrap justify-end gap-1.5">
-                      {DAYS.map((day) => {
+                    <div role="group" aria-label={t("next.schedules.days")} className="flex flex-wrap justify-end gap-1.5">
+                      {SCHEDULE_DAYS.map((day) => {
                         const active = form.days.includes(day.key);
                         return (
                           <button
@@ -335,44 +345,15 @@ export function SchedulesPanel() {
               {
                 id: "actionType",
                 label: t("next.schedules.action"),
+                help: scheduleActionHelp(t, form.actionType),
                 control: {
                   kind: "select",
                   value: form.actionType,
-                  options: ACTIONS.map((option) => ({ ...option, label: t(option.label) })),
+                  options: SCHEDULE_ACTIONS.map((option) => ({ value: option.value, label: t(option.label) })),
                   onChange: (next) => setForm((current) => ({ ...current, actionType: next })),
                 },
               },
-              ...(form.actionType === "speed_limit"
-                ? [
-                    {
-                      id: "speedUnlimited",
-                      label: t("next.schedules.removeLimitInstead"),
-                      help: t("next.schedules.removeLimitInsteadHelp"),
-                      control: {
-                        kind: "toggle" as const,
-                        value: form.speedUnlimited,
-                        onChange: (next: boolean) =>
-                          setForm((current) => ({ ...current, speedUnlimited: next })),
-                      },
-                    },
-                    ...(form.speedUnlimited
-                      ? []
-                      : [
-                          {
-                            id: "speedMib",
-                            label: t("next.schedules.speedLimit"),
-                            help: t("next.schedules.speedLimitHelp"),
-                            control: {
-                              kind: "text" as const,
-                              value: form.speedMib,
-                              className: "w-[110px]",
-                              onChange: (next: string) =>
-                                setForm((current) => ({ ...current, speedMib: next })),
-                            },
-                          },
-                        ]),
-                  ]
-                : []),
+              ...scheduleActionFields({ ...optionFields, targets }),
               ...(form.actionType === "hardware_profile"
                 ? [
                     {
@@ -418,6 +399,17 @@ export function SchedulesPanel() {
               },
             ],
           },
+          ...(form.actionType === "speed_limit"
+            ? scheduleSpeedSections({
+                ...optionFields,
+                targets,
+                // A rate typed after a refused save takes back what was said about it.
+                onChange: (options) => {
+                  setError(null);
+                  optionFields.onChange(options);
+                },
+              })
+            : []),
         ]}
       />
 

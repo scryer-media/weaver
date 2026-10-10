@@ -258,11 +258,7 @@ export default defineConfig(({ mode }) => ({
             return "graphql-vendor";
           }
 
-          if (
-            id.includes("/radix-ui/") ||
-            id.includes("/lucide-react/") ||
-            id.includes("/next-themes/")
-          ) {
+          if (id.includes("/lucide-react/")) {
             return "ui-vendor";
           }
 

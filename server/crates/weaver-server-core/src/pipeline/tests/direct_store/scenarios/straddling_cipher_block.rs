@@ -1,33 +1,33 @@
-//! A cipher block straddling a held neighbour
-//!
-//! An encrypted member split across volumes has cipher blocks that straddle a
-//! volume boundary. When the earlier volume's share of such a block is held —
-//! its own first block chains from a predecessor lost on the wire — the later
-//! volume's drain still resolves the block and places its own share, so the
-//! coverage map claims those bytes. Serving them in posted space means
-//! re-encrypting the whole block, and the held share's plaintext is not in the
-//! partial. These sets lose the tail of the second volume, which holds the
-//! whole of the third, and whether the fourth volume's head block is resolved
-//! before or after that depends on nothing but the order the articles land in.
-//! So the orders are listed as data, and every one of them must repair in
-//! place, with the provider serving every byte the coverage map claims.
+// A cipher block straddling a held neighbour
+//
+// An encrypted member split across volumes has cipher blocks that straddle a
+// volume boundary. When the earlier volume's share of such a block is held —
+// its own first block chains from a predecessor lost on the wire — the later
+// volume's drain still resolves the block and places its own share, so the
+// coverage map claims those bytes. Serving them in posted space means
+// re-encrypting the whole block, and the held share's plaintext is not in the
+// partial. These sets lose the tail of the second volume, which holds the
+// whole of the third, and whether the fourth volume's head block is resolved
+// before or after that depends on nothing but the order the articles land in.
+// So the orders are listed as data, and every one of them must repair in
+// place, with the provider serving every byte the coverage map claims.
 
 use super::*;
 
-/// Articles per volume, in volume order. The last volume is one article.
+// Articles per volume, in volume order. The last volume is one article.
 const ARTICLES: [usize; 4] = [11, 11, 11, 1];
 
-/// The articles the posting lost: the tail of the second volume.
+// The articles the posting lost: the tail of the second volume.
 const LOST: [(u32, u32); 3] = [(1, 8), (1, 9), (1, 10)];
 
-/// Volume ordinal at each NZB file index after the PAR2 index at index 0: the
-/// order the posting lists them in.
+// Volume ordinal at each NZB file index after the PAR2 index at index 0: the
+// order the posting lists them in.
 const NZB_ORDER: [usize; 4] = [0, 1, 3, 2];
 
 const PASSWORD: &str = "weaver-e2e-direct-password";
 
-/// `(volume ordinal, article)` arrival orders. Every order holds every article,
-/// the lost ones included; those are skipped where they would have landed.
+// `(volume ordinal, article)` arrival orders. Every order holds every article,
+// the lost ones included; those are skipped where they would have landed.
 #[rustfmt::skip]
 const ARRIVAL_ORDERS: [&[(u32, u32)]; 24] = [
     // order 0
@@ -80,10 +80,10 @@ const ARRIVAL_ORDERS: [&[(u32, u32)]; 24] = [
     &[(0, 6), (2, 0), (1, 7), (0, 7), (1, 6), (2, 3), (1, 1), (0, 10), (0, 3), (2, 6), (2, 9), (2, 10), (0, 4), (1, 0), (0, 8), (3, 0), (2, 5), (2, 8), (0, 0), (2, 7), (2, 1), (0, 9), (0, 5), (2, 2), (1, 9), (1, 4), (2, 4), (1, 3), (1, 8), (0, 2), (1, 5), (1, 2), (0, 1), (1, 10)],
 ];
 
-/// One encryption shape: the posted volumes, the PAR2 set that describes
-/// them, and the digest of the member they carry. Built here, over bytes the
-/// test posts itself, so a straddling block is a straddling block of *these*
-/// volumes.
+// One encryption shape: the posted volumes, the PAR2 set that describes
+// them, and the digest of the member they carry. Built here, over bytes the
+// test posts itself, so a straddling block is a straddling block of *these*
+// volumes.
 struct StraddleFixture {
     name: &'static str,
     member: &'static str,
@@ -92,8 +92,8 @@ struct StraddleFixture {
     expected_blake3: String,
 }
 
-/// Enough recovery to rebuild the lost tail of the second volume, with slack
-/// for the slices it only partly covers.
+// Enough recovery to rebuild the lost tail of the second volume, with slack
+// for the slices it only partly covers.
 const RECOVERY_BLOCKS: usize = 16;
 
 fn straddle_fixture(
@@ -114,7 +114,7 @@ fn straddle_fixture(
     }
 }
 
-/// Runs one arrival order to its end. `Err` names what went wrong.
+// Runs one arrival order to its end. `Err` names what went wrong.
 async fn run_straddle_order(
     fixture: &StraddleFixture,
     order_index: usize,
@@ -331,13 +331,13 @@ async fn a_straddling_block_behind_a_held_volume_repairs_in_place_rar4_encryptio
     .await;
 }
 
-/// Every article of the volume after the lost tail lands behind the cipher
-/// block that tail took with it, so each one is held and none is placed. A
-/// held article writes no destination, yet it is posted bytes the volume's
-/// PAR3 image serves. The image published before it landed must not stand:
-/// the last article to arrive, like every other, owes the volume a fresh
-/// publication, and the assessment over it counts that article's blocks as
-/// present rather than lost.
+// Every article of the volume after the lost tail lands behind the cipher
+// block that tail took with it, so each one is held and none is placed. A
+// held article writes no destination, yet it is posted bytes the volume's
+// PAR3 image serves. The image published before it landed must not stand:
+// the last article to arrive, like every other, owes the volume a fresh
+// publication, and the assessment over it counts that article's blocks as
+// present rather than lost.
 #[tokio::test]
 async fn a_held_only_article_republishes_its_par3_image() {
     const ARTICLES_EACH: usize = 11;

@@ -32,8 +32,8 @@ macro_rules! table {
     };
 }
 
-/// Exhaustive policy for every application-owned table. Database engine tables
-/// such as `sqlite_sequence` are filtered before catalog validation.
+// Exhaustive policy for every application-owned table. Database engine tables
+// such as `sqlite_sequence` are filtered before catalog validation.
 pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("_sqlx_migrations", Ignore, Replace),
     table!("schema_version", Ignore, Replace),
@@ -42,6 +42,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("servers", Export, Replace),
     table!("proxy_profiles", Export, RequireEmpty),
     table!("proxy_routes", Export, RequireEmpty),
+    table!("egress_interfaces", Export, Replace),
+    table!("egress_download_usage", Export, RequireZeroUsage),
+    table!("proxy_pools", Export, RequireEmpty),
     table!("server_download_usage", Export, RequireZeroUsage),
     table!("server_tls_diagnostics", Export, Replace),
     table!("categories", Export, Replace),
@@ -57,6 +60,21 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("job_history", Export, RequireEmpty),
     table!("job_history_attributes", Export, RequireEmpty),
     table!("job_events", Export, RequireEmpty),
+    // Execution queues and output caches cannot be resumed from a logical
+    // configuration backup. History keeps its result excerpts.
+    table!("script_event_queue", ResetOnRestore, RequireEmpty),
+    table!("script_job_state", ResetOnRestore, RequireEmpty),
+    table!("script_outputs", ResetOnRestore, Replace),
+    table!("script_output_state", Rebuild, Replace),
+    // An instance is configuration: the script it names, its trigger, and
+    // what the operator typed into it.
+    table!("script_instances", Export, Replace),
+    // Named secrets travel encrypted, under the same key as every other
+    // credential in the bundle.
+    table!("secrets", Export, Replace),
+    table!("script_instance_inputs", Export, Replace),
+    table!("script_instance_categories", Export, Replace),
+    table!("feed_scripts", Export, RequireEmpty),
     table!("duplicate_job_snapshots", Export, RequireEmpty),
     table!("job_fingerprints", Export, RequireEmpty),
     table!("duplicate_admission_claims", Export, RequireEmpty),

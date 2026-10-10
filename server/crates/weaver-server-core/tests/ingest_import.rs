@@ -18,6 +18,30 @@ fn nzb_to_spec_extracts_password_from_filename() {
 }
 
 #[test]
+fn password_candidates_preserve_literals_and_metadata_order() {
+    let nzb = Nzb {
+        meta: NzbMeta {
+            password: Some("1".into()),
+            passwords: vec!["1".into(), "true".into(), " spaced ".into(), "1".into()],
+            ..Default::default()
+        },
+        files: vec![],
+    };
+    let candidates = weaver_server_core::ingest::nzb_password_candidates(
+        &nzb,
+        Path::new("fixture.{{filename}}.nzb"),
+        Some("explicit"),
+    );
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.value())
+            .collect::<Vec<_>>(),
+        ["explicit", "1", "true", " spaced ", "filename"]
+    );
+}
+
+#[test]
 fn nzb_to_spec_extracts_password_from_meta() {
     let path = Path::new("/downloads/normal.nzb");
     let nzb = Nzb {

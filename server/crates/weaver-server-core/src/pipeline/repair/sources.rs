@@ -1,5 +1,5 @@
-//! Published byte coverage for the PAR3 engine. Filesystem sparse extents are
-//! never evidence of arrival; only committed assembly/direct-store ranges are.
+// Published byte coverage for the PAR3 engine. Filesystem sparse extents are
+// never evidence of arrival; only committed assembly/direct-store ranges are.
 
 use par3_rs::runtime::{EngineError, EngineResult};
 use par3_rs::source::{SourceAccess, SourceId, SourceSnapshot};
@@ -34,10 +34,10 @@ struct Registry {
     ranges: usize,
 }
 
-/// A clone shares publication state, so a retained session sees later arrivals
-/// and changed generations without reopening clean sources. Publication belongs
-/// after the writer/direct-store barrier. Replacing existing bytes MUST use
-/// `replace`; `arrive` asserts that every previously published byte is unchanged.
+// A clone shares publication state, so a retained session sees later arrivals
+// and changed generations without reopening clean sources. Publication belongs
+// after the writer/direct-store barrier. Replacing existing bytes MUST use
+// `replace`; `arrive` asserts that every previously published byte is unchanged.
 #[derive(Clone, Default)]
 pub(in crate::pipeline) struct PublishedSources(Arc<RwLock<Registry>>);
 
@@ -62,9 +62,9 @@ impl PublishedSources {
         self.publish(source, access, len, ranges, PublicationMode::Arrival)
     }
 
-    /// Extend visibility only if both generations still match at publication.
-    /// Unlike a writer's `arrive` assertion, this cannot accept changed backing
-    /// bytes between the caller's continuity check and this registry update.
+    // Extend visibility only if both generations still match at publication.
+    // Unlike a writer's `arrive` assertion, this cannot accept changed backing
+    // bytes between the caller's continuity check and this registry update.
     pub(in crate::pipeline) fn arrive_unchanged(
         &self,
         source: SourceId,
@@ -167,9 +167,9 @@ impl PublishedSources {
         Ok(snapshot)
     }
 
-    /// Compare an existing publication after the caller independently checked
-    /// the same backing identity. A withdrawn source has a newer logical
-    /// generation and can never match its previous publication.
+    // Compare an existing publication after the caller independently checked
+    // the same backing identity. A withdrawn source has a newer logical
+    // generation and can never match its previous publication.
     pub(in crate::pipeline) fn matches_publication(
         &self,
         source: SourceId,
@@ -198,9 +198,9 @@ impl PublishedSources {
         Ok(self.entry(source)?.map(|entry| entry.revision))
     }
 
-    /// Fence readers before a write or rebinding becomes observable. Keep the
-    /// generation tombstone so later publication cannot resurrect old evidence.
-    /// This only changes registry state; it performs no filesystem operations.
+    // Fence readers before a write or rebinding becomes observable. Keep the
+    // generation tombstone so later publication cannot resurrect old evidence.
+    // This only changes registry state; it performs no filesystem operations.
     pub(in crate::pipeline) fn withdraw(&self, source: SourceId) -> EngineResult<()> {
         let mut registry = self
             .0
@@ -240,8 +240,8 @@ impl PublishedSources {
             .cloned())
     }
 
-    /// Release a fenced image during disk spill without losing its generation.
-    /// The tombstone has no readable ranges and can supply no evidence.
+    // Release a fenced image during disk spill without losing its generation.
+    // The tombstone has no readable ranges and can supply no evidence.
     pub(in crate::pipeline) fn release_withdrawn_image(
         &self,
         source: SourceId,

@@ -1,7 +1,23 @@
+use async_graphql::parser::types::OperationType;
 use async_graphql::{Context, Error, ErrorExtensions, Guard, Result};
 
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::CallerScope;
+
+// The only general queries exposed to run credentials. The unguarded
+// `scriptRun` field separately checks the live run and scopes its callbacks.
+fn script_run_verdict(ctx: &Context<'_>) -> Result<()> {
+    if ctx.query_env.operation.node.ty != OperationType::Query
+        || !matches!(ctx.field().name(), "queueItems" | "historyItems")
+    {
+        Err(graphql_error(
+            "NOT_ALLOWED_FOR_SCRIPT_RUN",
+            "a script run's token may only read queueItems, historyItems and its own scriptRun",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 pub struct ReadGuard;
 
@@ -10,6 +26,9 @@ impl Guard for ReadGuard {
         let scope = ctx
             .data::<CallerScope>()
             .map_err(|_| internal_error("missing caller scope"))?;
+        if *scope == CallerScope::ScriptRun {
+            return script_run_verdict(ctx);
+        }
         if scope.can_read() {
             Ok(())
         } else {
@@ -25,6 +44,9 @@ impl Guard for AdminGuard {
         let scope = ctx
             .data::<CallerScope>()
             .map_err(|_| internal_error("missing caller scope"))?;
+        if *scope == CallerScope::ScriptRun {
+            return script_run_verdict(ctx);
+        }
         if scope.is_admin() {
             Ok(())
         } else {
@@ -49,6 +71,7 @@ impl Guard for FreshAdminGuard {
         let identity = ctx
             .data::<CallerIdentity>()
             .map_err(|_| internal_error("missing caller identity"))?;
+        // A machine credential has no password to have typed recently.
         if matches!(identity, CallerIdentity::ApiKey(_)) {
             return Ok(());
         }
@@ -84,6 +107,9 @@ impl Guard for ControlGuard {
         let scope = ctx
             .data::<CallerScope>()
             .map_err(|_| internal_error("missing caller scope"))?;
+        if *scope == CallerScope::ScriptRun {
+            return script_run_verdict(ctx);
+        }
         if scope.can_control() {
             Ok(())
         } else {

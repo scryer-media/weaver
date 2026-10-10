@@ -1,4 +1,4 @@
-//! Published direct-store source views for a RAR chase.
+// Published direct-store source views for a RAR chase.
 
 use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};

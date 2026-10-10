@@ -4,26 +4,26 @@ use super::*;
 #[path = "layout_compatibility_tests.rs"]
 mod compatibility_tests;
 
-/// What the NZB can honestly say about one segment.
-///
-/// The NZB's `<segment bytes>` attribute is the **yEnc-encoded** size, roughly
-/// 3% larger than the bytes an article decodes to (measured on real fixtures:
-/// a 85,698,538-byte file is declared as 88,426,989). So the NZB cannot supply
-/// a decoded offset or a decoded size — it can only *bound* them. Treating its
-/// numbers as decoded truth rejects every real article, and writing at the
-/// offsets it implies would leave a gap between every pair of segments.
-///
-/// These fields are therefore ceilings, not values, and only the envelope the
-/// NZB *can* prove — never a rejection criterion on their own, because the
-/// segment list can skip numbers and the byte counts can be understated:
-/// * `max_decoded_size` — the segment's declared size. It can only raise the
-///   absolute per-article ceiling, never lower it.
-/// * `max_file_offset` — the encoded prefix sum up to this segment, valid only
-///   when the NZB listed every segment of the file.
-/// * `max_file_size` — the encoded total, the same bound applied to the file.
-///
-/// `part`/`total` identify the scheduled work for diagnostics. Poster metadata
-/// can be stale, so it cannot override a bounded decoded placement.
+// What the NZB can honestly say about one segment.
+//
+// The NZB's `<segment bytes>` attribute is the **yEnc-encoded** size, roughly
+// 3% larger than the bytes an article decodes to (measured on real fixtures:
+// a 85,698,538-byte file is declared as 88,426,989). So the NZB cannot supply
+// a decoded offset or a decoded size — it can only *bound* them. Treating its
+// numbers as decoded truth rejects every real article, and writing at the
+// offsets it implies would leave a gap between every pair of segments.
+//
+// These fields are therefore ceilings, not values, and only the envelope the
+// NZB *can* prove — never a rejection criterion on their own, because the
+// segment list can skip numbers and the byte counts can be understated:
+// * `max_decoded_size` — the segment's declared size. It can only raise the
+//   absolute per-article ceiling, never lower it.
+// * `max_file_offset` — the encoded prefix sum up to this segment, valid only
+//   when the NZB listed every segment of the file.
+// * `max_file_size` — the encoded total, the same bound applied to the file.
+//
+// `part`/`total` identify the scheduled work for diagnostics. Poster metadata
+// can be stale, so it cannot override a bounded decoded placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ExpectedSegmentLayout {
     pub(super) max_file_offset: u64,
@@ -43,35 +43,35 @@ pub(super) enum AuthoritativeLayoutError {
     InvalidPartNumber,
 }
 
-/// Largest decoded payload a single article may produce.
-///
-/// The NZB's per-segment byte count cannot serve as this bound: it is
-/// indexer-supplied and routinely understated, and rejecting on it abandons
-/// articles that decode perfectly. What is needed here is only a sanity
-/// ceiling — a value no ordinary post reaches — so a hostile article cannot
-/// claim an unbounded length. Reference decoders refuse at the same figure.
-/// A segment the NZB itself declares to be larger raises it rather than being
-/// refused by it.
+// Largest decoded payload a single article may produce.
+//
+// The NZB's per-segment byte count cannot serve as this bound: it is
+// indexer-supplied and routinely understated, and rejecting on it abandons
+// articles that decode perfectly. What is needed here is only a sanity
+// ceiling — a value no ordinary post reaches — so a hostile article cannot
+// claim an unbounded length. Reference decoders refuse at the same figure.
+// A segment the NZB itself declares to be larger raises it rather than being
+// refused by it.
 pub(super) const MAX_ARTICLE_DECODED_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Largest whole-file length an article's own `=ybegin size=` may assert
-/// before that assertion stops being usable as a placement envelope.
+// Largest whole-file length an article's own `=ybegin size=` may assert
+// before that assertion stops being usable as a placement envelope.
 pub(super) const MAX_DECLARED_FILE_BYTES: u64 = 500 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::pipeline) enum YencLayoutMismatch {
-    /// Decoded more bytes than any honest article can carry.
+    // Decoded more bytes than any honest article can carry.
     DecodedSizeAboveCeiling,
     InvalidBegin,
-    /// The claimed offset is past the encoded prefix sum, i.e. further into the
-    /// file than this segment could possibly begin, and the article declared no
-    /// usable file size of its own to justify it.
+    // The claimed offset is past the encoded prefix sum, i.e. further into the
+    // file than this segment could possibly begin, and the article declared no
+    // usable file size of its own to justify it.
     BeginAboveDeclaredPrefix,
-    /// The claimed range ends past every envelope that could contain it.
+    // The claimed range ends past every envelope that could contain it.
     EndAboveDeclaredFileSize,
-    /// The article declared no usable start of its own, and the ordinal before
-    /// it has not been placed yet, so there is nothing to lay it after. This is
-    /// an ordering condition, not damage: the article comes back unchanged.
+    // The article declared no usable start of its own, and the ordinal before
+    // it has not been placed yet, so there is nothing to lay it after. This is
+    // an ordering condition, not damage: the article comes back unchanged.
     PredecessorNotPlaced,
 }
 
@@ -109,25 +109,25 @@ pub(super) fn expected_segment_layout(
     })
 }
 
-/// Bound the article's own claims by what the NZB can prove, and return the
-/// decoded offset the segment may be written at.
-///
-/// The offset comes from the article (`begin - 1`) because nothing else knows
-/// it. An article that declares no usable start is laid immediately after the
-/// ordinal before it (`sequential_anchor`), which is the only thing left that
-/// knows where its bytes go; encoded NZB prefixes cannot place multipart
-/// decoded bytes.
-///
-/// The NZB envelope is a bound, not a verdict. Segment ordinals are dense, so
-/// an NZB that skips a segment number gives every later article a prefix sum
-/// below its true offset, and its `bytes` attribute can simply be understated.
-/// A placement is therefore accepted when it fits the NZB envelope **or** the
-/// article's own declared `=ybegin size=`, with absolute ceilings above both so
-/// neither source can claim an unbounded range.
-///
-/// This is defence in depth, not the integrity guarantee: misplaced or corrupt
-/// bytes still require placement coverage and checksum/repair verification, and
-/// `placement_conflict` is what protects bytes already accepted.
+// Bound the article's own claims by what the NZB can prove, and return the
+// decoded offset the segment may be written at.
+//
+// The offset comes from the article (`begin - 1`) because nothing else knows
+// it. An article that declares no usable start is laid immediately after the
+// ordinal before it (`sequential_anchor`), which is the only thing left that
+// knows where its bytes go; encoded NZB prefixes cannot place multipart
+// decoded bytes.
+//
+// The NZB envelope is a bound, not a verdict. Segment ordinals are dense, so
+// an NZB that skips a segment number gives every later article a prefix sum
+// below its true offset, and its `bytes` attribute can simply be understated.
+// A placement is therefore accepted when it fits the NZB envelope **or** the
+// article's own declared `=ybegin size=`, with absolute ceilings above both so
+// neither source can claim an unbounded range.
+//
+// This is defence in depth, not the integrity guarantee: misplaced or corrupt
+// bytes still require placement coverage and checksum/repair verification, and
+// `placement_conflict` is what protects bytes already accepted.
 #[inline]
 pub(super) fn validate_yenc_layout(
     expected: ExpectedSegmentLayout,
@@ -171,14 +171,14 @@ pub(super) fn validate_yenc_layout(
     Ok(file_offset)
 }
 
-/// The layout boundary this article declares for itself, when it declares a
-/// usable one that fits the same envelopes a placement is bounded by.
-///
-/// This is where the *next* ordinal starts, and it is knowable even when the
-/// article's own bytes are damaged: the poster described the range, the decoder
-/// only failed to reproduce all of it. Bounding it here means a damaged part
-/// cannot hand the part behind it an offset further into the file than either
-/// the article's own declared length or the NZB envelope could contain.
+// The layout boundary this article declares for itself, when it declares a
+// usable one that fits the same envelopes a placement is bounded by.
+//
+// This is where the *next* ordinal starts, and it is knowable even when the
+// article's own bytes are damaged: the poster described the range, the decoder
+// only failed to reproduce all of it. Bounding it here means a damaged part
+// cannot hand the part behind it an offset further into the file than either
+// the article's own declared length or the NZB envelope could contain.
 #[inline]
 pub(super) fn declared_part_end(
     expected: ExpectedSegmentLayout,
@@ -246,8 +246,8 @@ mod tests {
         )
     }
 
-    /// A header that claims exactly the declared ceiling — the shape a fixture
-    /// produces when it declares decoded sizes rather than encoded ones.
+    // A header that claims exactly the declared ceiling — the shape a fixture
+    // produces when it declares decoded sizes rather than encoded ones.
     fn assertions(expected: ExpectedSegmentLayout) -> YencLayoutAssertions {
         YencLayoutAssertions {
             file_size: expected.max_file_size,
@@ -298,10 +298,10 @@ mod tests {
         );
     }
 
-    /// The case the equality contract could not express: a real NZB declares
-    /// yEnc-*encoded* sizes, so every article decodes to fewer bytes than its
-    /// segment claims and lands at a lower offset than the declared prefix sum.
-    /// Measured on a real fixture: 88,426,989 declared for 85,698,538 true.
+    // The case the equality contract could not express: a real NZB declares
+    // yEnc-*encoded* sizes, so every article decodes to fewer bytes than its
+    // segment claims and lands at a lower offset than the declared prefix sum.
+    // Measured on a real fixture: 88,426,989 declared for 85,698,538 true.
     #[test]
     fn accepts_a_real_article_that_decodes_smaller_than_its_declared_size() {
         // ~3% yEnc overhead on two 1000-byte payloads.
@@ -388,9 +388,9 @@ mod tests {
         }
     }
 
-    /// An NZB that omits a segment number still lists dense ordinals, so every
-    /// later article's prefix-sum ceiling sits below its true offset. The
-    /// article's own declared file size is what places it.
+    // An NZB that omits a segment number still lists dense ordinals, so every
+    // later article's prefix-sum ceiling sits below its true offset. The
+    // article's own declared file size is what places it.
     #[test]
     fn sparse_segment_list_places_later_articles_at_their_true_offsets() {
         // A five-article file whose NZB lists only four segments.
@@ -415,7 +415,7 @@ mod tests {
         }
     }
 
-    /// The `bytes` attribute is indexer-supplied and can simply be too small.
+    // The `bytes` attribute is indexer-supplied and can simply be too small.
     #[test]
     fn understated_declared_bytes_yield_to_a_truthful_article_size() {
         let file = assembly(&[10, 10]);

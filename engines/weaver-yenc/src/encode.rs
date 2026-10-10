@@ -1,9 +1,9 @@
 use crate::crc::Crc32;
 use crate::error::YencError;
 
-/// Encode `input` bytes into a complete single-part yEnc article, appending to `output`.
-///
-/// Produces `=ybegin` header, encoded data lines, and `=yend` trailer with CRC32.
+// Encode `input` bytes into a complete single-part yEnc article, appending to `output`.
+//
+// Produces `=ybegin` header, encoded data lines, and `=yend` trailer with CRC32.
 pub fn encode(
     input: &[u8],
     output: &mut Vec<u8>,
@@ -34,7 +34,7 @@ pub fn encode(
     Ok(())
 }
 
-/// Encode `input` bytes into a complete multi-part yEnc article, appending to `output`.
+// Encode `input` bytes into a complete multi-part yEnc article, appending to `output`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_part(
     input: &[u8],
@@ -78,8 +78,8 @@ pub fn encode_part(
     Ok(())
 }
 
-/// Encode raw data bytes into yEnc format (no headers), appending to `output`.
-/// Inserts CRLF line breaks at approximately `line_length` encoded characters.
+// Encode raw data bytes into yEnc format (no headers), appending to `output`.
+// Inserts CRLF line breaks at approximately `line_length` encoded characters.
 fn encode_data(input: &[u8], output: &mut Vec<u8>, line_length: usize) {
     let mut col = 0usize;
 

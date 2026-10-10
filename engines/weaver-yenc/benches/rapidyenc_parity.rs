@@ -1,12 +1,12 @@
-//! Side-by-side parity bench against rapidyenc (RQ2's parity harness).
-//!
-//! Gated on `WEAVER_RAPIDYENC_LIB` pointing at a rapidyenc shared library
-//! (e.g. `librapidyenc.dylib` / `librapidyenc.so` from a cmake build of
-//! <https://github.com/animetosho/rapidyenc>). Without it the bench registers
-//! nothing and prints a skip note, so `cargo bench` stays green everywhere.
-//!
-//! Before timing anything it asserts byte-for-byte decode parity and CRC
-//! parity between weaver-yenc and rapidyenc on the shared fixture.
+// Side-by-side parity bench against rapidyenc (RQ2's parity harness).
+//
+// Gated on `WEAVER_RAPIDYENC_LIB` pointing at a rapidyenc shared library
+// (e.g. `librapidyenc.dylib` / `librapidyenc.so` from a cmake build of
+// <https://github.com/animetosho/rapidyenc>). Without it the bench registers
+// nothing and prints a skip note, so `cargo bench` stays green everywhere.
+//
+// Before timing anything it asserts byte-for-byte decode parity and CRC
+// parity between weaver-yenc and rapidyenc on the shared fixture.
 
 use std::env;
 use std::ffi::c_void;
@@ -85,8 +85,8 @@ impl Rapidyenc {
     }
 }
 
-/// Column-accurate yEnc encoding at 128 encoded columns (same shape as
-/// rapidyenc's own bench article and real Usenet posts).
+// Column-accurate yEnc encoding at 128 encoded columns (same shape as
+// rapidyenc's own bench article and real Usenet posts).
 fn real_yenc_128col_body() -> Vec<u8> {
     let mut body = Vec::with_capacity(800 * 1024);
     let mut col = 0usize;
@@ -122,17 +122,17 @@ fn real_yenc_128col_body() -> Vec<u8> {
 
 const DECODED_TARGET: usize = 768_000;
 
-/// M-phase fixture: no specials at all. One giant line of `'@'` (0x40, which is
-/// not `= \r \n` and decodes to 0x16); no CRLF, no escapes, no dots. Isolates
-/// pure fast-path + driver overhead — weaver and rapidyenc should be at parity
-/// here; if not, the cost is the loop structure, not the mask/branch handling.
+// M-phase fixture: no specials at all. One giant line of `'@'` (0x40, which is
+// not `= \r \n` and decodes to 0x16); no CRLF, no escapes, no dots. Isolates
+// pure fast-path + driver overhead — weaver and rapidyenc should be at parity
+// here; if not, the cost is the loop structure, not the mask/branch handling.
 fn clean_body() -> Vec<u8> {
     vec![0x40u8; DECODED_TARGET]
 }
 
-/// M-phase fixture: 128-column lines of `'@'` terminated by CRLF, no escapes
-/// and no dots. Isolates the CRLF (`specials != eq`) heavy branch — the prime
-/// suspect, since it fires on roughly every other 64-byte chunk.
+// M-phase fixture: 128-column lines of `'@'` terminated by CRLF, no escapes
+// and no dots. Isolates the CRLF (`specials != eq`) heavy branch — the prime
+// suspect, since it fires on roughly every other 64-byte chunk.
 fn crlf_only_body() -> Vec<u8> {
     let mut body = Vec::with_capacity(DECODED_TARGET + DECODED_TARGET / 64 + 64);
     let mut produced = 0usize;
@@ -145,9 +145,9 @@ fn crlf_only_body() -> Vec<u8> {
     body
 }
 
-/// M-phase fixture: `'@'` body with ~0.4% `=@` escapes (each decodes to one
-/// byte), no CRLF, no dots. Isolates escape handling + the 32K-entry LUT
-/// compaction path — both engines use the same LUT, so expect near-parity.
+// M-phase fixture: `'@'` body with ~0.4% `=@` escapes (each decodes to one
+// byte), no CRLF, no dots. Isolates escape handling + the 32K-entry LUT
+// compaction path — both engines use the same LUT, so expect near-parity.
 fn esc_only_body() -> Vec<u8> {
     let mut body = Vec::with_capacity(DECODED_TARGET + DECODED_TARGET / 64);
     for idx in 0..DECODED_TARGET {
@@ -161,10 +161,10 @@ fn esc_only_body() -> Vec<u8> {
     body
 }
 
-/// M-phase fixture: `'@'` body with ~0.4% literal `.` bytes, no CRLF. Body dots
-/// (never at line start here) are data, not stuffing. The specials mask flags
-/// only `= \r \n`, so this should stay on the fast path — if weaver lags,
-/// there is a hidden dot cost to find.
+// M-phase fixture: `'@'` body with ~0.4% literal `.` bytes, no CRLF. Body dots
+// (never at line start here) are data, not stuffing. The specials mask flags
+// only `= \r \n`, so this should stay on the fast path — if weaver lags,
+// there is a hidden dot cost to find.
 fn dots_body() -> Vec<u8> {
     let mut body = vec![0x40u8; DECODED_TARGET];
     let mut idx = 128usize;

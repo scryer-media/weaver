@@ -5,17 +5,17 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
-/// How much of the next volume the readahead worker pulls through the page
-/// cache before handing the open file over.
+// How much of the next volume the readahead worker pulls through the page
+// cache before handing the open file over.
 const PREFETCH_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Volume provider for on-disk RAR volumes that overlaps the open and first
-/// read of volume N+1 with the consumption of volume N.
-///
-/// A single slot holds the in-flight prefetch: `get_volume(n)` consumes the
-/// slot when it holds volume `n` and then schedules volume `n + 1`. Any
-/// prefetch failure falls back to a synchronous open, so observable behavior
-/// matches a provider without readahead.
+// Volume provider for on-disk RAR volumes that overlaps the open and first
+// read of volume N+1 with the consumption of volume N.
+//
+// A single slot holds the in-flight prefetch: `get_volume(n)` consumes the
+// slot when it holds volume `n` and then schedules volume `n + 1`. Any
+// prefetch failure falls back to a synchronous open, so observable behavior
+// matches a provider without readahead.
 pub(super) struct ReadaheadVolumeProvider {
     paths: HashMap<usize, PathBuf>,
     slot: Mutex<Option<PendingVolume>>,

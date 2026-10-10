@@ -1,9 +1,9 @@
-//! Long-running single-fixture decode loop for hardware profiling (uProf).
-//!
-//!   profile_kernel [realshape|crlf|clean|esc] [iters]
-//!
-//! Hammers one fixture through `decode_rapidyenc` so a sampling profiler
-//! collects thousands of samples inside `decode_kernel_avx2`.
+// Long-running single-fixture decode loop for hardware profiling (uProf).
+//
+//   profile_kernel [realshape|crlf|clean|esc] [iters]
+//
+// Hammers one fixture through `decode_rapidyenc` so a sampling profiler
+// collects thousands of samples inside `decode_kernel_avx2`.
 
 use weaver_yenc::decode::decode_rapidyenc;
 

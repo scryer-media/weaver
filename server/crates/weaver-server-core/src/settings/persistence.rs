@@ -1,14 +1,13 @@
 use crate::StateError;
-use crate::bandwidth::ScheduleEntry;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
 
 const NEXT_JOB_ID_SETTING_KEY: &str = "next_job_id";
 
-/// The bind-address portion of an authenticated network-policy update.
-/// Keeping `Unchanged` distinct from `Clear` lets the combined settings form
-/// leave a saved listener alone while still offering an explicit reset.
+// The bind-address portion of an authenticated network-policy update.
+// Keeping `Unchanged` distinct from `Clear` lets the combined settings form
+// leave a saved listener alone while still offering an explicit reset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkBindAddressUpdate {
     Unchanged,
@@ -16,20 +15,20 @@ pub enum NetworkBindAddressUpdate {
     Set(String),
 }
 
-/// A complete atomic authenticated browser-network policy write.
+// A complete atomic authenticated browser-network policy write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedNetworkAccessUpdate {
     pub trusted_proxies_json: Option<String>,
-    /// `None` preserves an environment-pinned trusted-network setting.
+    // `None` preserves an environment-pinned trusted-network setting.
     pub trusted_networks_json: Option<String>,
-    /// `None` preserves an environment-pinned bind setting.
+    // `None` preserves an environment-pinned bind setting.
     pub bind_address: NetworkBindAddressUpdate,
 }
 
 impl Database {
-    /// Persist the authenticated browser policy in one transaction. The live
-    /// runtime snapshot is intentionally updated by the caller only after this
-    /// returns successfully.
+    // Persist the authenticated browser policy in one transaction. The live
+    // runtime snapshot is intentionally updated by the caller only after this
+    // returns successfully.
     pub fn update_authenticated_network_access(
         &self,
         update: &AuthenticatedNetworkAccessUpdate,
@@ -119,10 +118,10 @@ impl Database {
         })
     }
 
-    /// Delete `key` only if its stored value still equals `expected`, atomically
-    /// in one statement. Closes the read-then-delete TOCTOU a two-round-trip
-    /// value-compare would leave open (a concurrent writer replacing the value
-    /// between the read and the delete).
+    // Delete `key` only if its stored value still equals `expected`, atomically
+    // in one statement. Closes the read-then-delete TOCTOU a two-round-trip
+    // value-compare would leave open (a concurrent writer replacing the value
+    // between the read and the delete).
     pub fn delete_setting_if_value(&self, key: &str, expected: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let key = key.to_string();
@@ -136,12 +135,6 @@ impl Database {
             .await?;
             Ok(())
         })
-    }
-
-    pub fn save_schedules(&self, entries: &[ScheduleEntry]) -> Result<(), StateError> {
-        let json =
-            serde_json::to_string(entries).map_err(|e| StateError::Database(e.to_string()))?;
-        self.set_setting("schedules", &json)
     }
 
     pub fn initialize_next_job_id_counter(&self) -> Result<u64, StateError> {

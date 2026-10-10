@@ -1,10 +1,14 @@
 import {
+  Fragment,
   createContext,
   useContext,
   useEffect,
+  useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
@@ -14,6 +18,7 @@ import { PathField } from "@/next/features/DirectoryBrowserDialog";
 import {
   NumberField,
   PrimaryButton,
+  MultiSelect,
   Segmented,
   Select,
   Slider,
@@ -24,6 +29,7 @@ import {
 } from "@/next/components/controls";
 import { FormRow } from "@/next/components/rows";
 import { cn } from "@/lib/utils";
+import { filterBlocks, type SearchRegistry } from "./search";
 
 /**
  * The settings screen's shared machinery.
@@ -60,6 +66,15 @@ export type FieldControl =
       className?: string;
     }
   | {
+      kind: "multiselect";
+      values: readonly string[];
+      options: readonly SelectOption[];
+      onChange: (next: string[]) => void;
+      /** What the control says while nothing is chosen. */
+      placeholder: string;
+      className?: string;
+    }
+  | {
       kind: "segmented";
       value: string;
       options: readonly SelectOption[];
@@ -92,6 +107,8 @@ export type FieldControl =
       max?: number;
       step?: number;
       suffix?: string;
+      /** Decimal places the value keeps; whole numbers when omitted. */
+      precision?: number;
     }
   | {
       kind: "textarea";
@@ -153,6 +170,17 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           className={control.className}
         />
       );
+    case "multiselect":
+      return (
+        <MultiSelect
+          values={control.values}
+          options={control.options}
+          onChange={control.onChange}
+          label={spec.label}
+          placeholder={control.placeholder}
+          className={control.className}
+        />
+      );
     case "segmented":
       return (
         <Segmented
@@ -195,6 +223,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           max={control.max}
           step={control.step}
           suffix={control.suffix}
+          precision={control.precision}
         />
       );
     case "textarea":
@@ -289,6 +318,26 @@ export interface SettingsTableRowModel {
   /** Everything about this record the search box should match. */
   searchText: string;
   cells: ReactNode[];
+  /**
+   * How many columns each cell takes, for a row that holds fewer values than
+   * the table has columns. A cell without an entry takes one.
+   */
+  spans?: number[];
+  /**
+   * Set on a row that opens in place rather than into an editor: whether it
+   * is open now. The table's `onRowClick` toggles it.
+   */
+  expanded?: boolean;
+  /** What an open row shows under its columns, across the whole table. */
+  detail?: ReactNode;
+}
+
+/** The rows of one kind in a table that lists several kinds under the same columns. */
+export interface SettingsTableGroupModel {
+  id: string;
+  title: string;
+  note?: ReactNode;
+  rows: SettingsTableRowModel[];
 }
 
 export interface SettingsTableModel {
@@ -302,6 +351,12 @@ export interface SettingsTableModel {
   columns: string;
   headers: ReactNode[];
   rows: SettingsTableRowModel[];
+  /**
+   * Rows that fall into kinds: each group follows `rows` under a heading of
+   * its own, and a group with no rows is not drawn. One list with headings
+   * keeps one set of columns and one "Add", where a table per kind repeats both.
+   */
+  groups?: SettingsTableGroupModel[];
   onRowClick?: (id: string) => void;
   empty?: string;
   /**
@@ -333,11 +388,14 @@ export interface SettingsCustomModel {
 export type SettingsBlock =
   SettingsSectionModel | SettingsTableModel | SettingsCustomModel;
 
-function matches(haystack: string, needle: string): boolean {
-  return haystack.toLowerCase().includes(needle);
-}
-
-/** Render a panel's blocks, filtered by the shell's search box. */
+/**
+ * Render a panel's blocks, filtered by the shell's search box.
+ *
+ * Without a query the blocks draw where the panel put them. With one, the
+ * shell mounts every panel and hides its page; each list of blocks draws only
+ * what matched, under that panel's heading in the cross-panel results, and
+ * reports how much it found so the heading and the shell's empty state know.
+ */
 export function SettingsBlocks({
   blocks,
   loading = false,
@@ -347,34 +405,24 @@ export function SettingsBlocks({
   loading?: boolean;
 }) {
   const t = useTranslate();
-  const search = useSettingsSearch().trim().toLowerCase();
+  const { search } = useShell();
+  const scope = useContext(PanelScopeContext);
+  const searching = search.trim() !== "";
 
   const present = blocks.filter(
     (block): block is SettingsBlock => block !== null,
   );
-  const visible = present
-    .map((block): SettingsBlock | null => {
-      if (search === "" || matches(block.title, search)) {
-        return block;
-      }
-      if (block.kind === "section") {
-        // A shut row stays shut while searching: its toggle is the way in.
-        const fields = block.fields.filter(
-          (field) =>
-            field.collapsed !== true &&
-            matches(`${field.label} ${field.help ?? ""} ${field.keywords ?? ""}`, search),
-        );
-        return fields.length > 0 ? { ...block, fields } : null;
-      }
-      if (block.kind === "table") {
-        const rows = block.rows.filter((row) =>
-          matches(row.searchText, search),
-        );
-        return rows.length > 0 ? { ...block, rows } : null;
-      }
-      return matches(block.searchText, search) ? block : null;
-    })
-    .filter((block): block is SettingsBlock => block !== null);
+  const visible = filterBlocks(present, search);
+  useSearchReport(loading ? 0 : visible.length, loading);
+
+  if (searching && scope !== null) {
+    // The panel's own page is hidden while searching; the matches belong in
+    // the results, under the panel's heading.
+    if (loading || visible.length === 0 || scope.resultsHost === null) {
+      return null;
+    }
+    return createPortal(<BlockList blocks={visible} />, scope.resultsHost);
+  }
 
   if (loading) {
     return <EmptyState loading title={t("next.common.loading")} body={t("next.settings.loadingBody")} />;
@@ -384,12 +432,12 @@ export function SettingsBlocks({
     return (
       <EmptyState
         title={
-          search === ""
+          !searching
             ? t("next.settings.nothingHere")
-            : t("next.settings.noMatch", { search })
+            : t("next.settings.noMatch", { search: search.trim() })
         }
         body={
-          search === ""
+          !searching
             ? t("next.settings.nothingHereBody")
             : t("next.settings.noMatchBody")
         }
@@ -397,9 +445,37 @@ export function SettingsBlocks({
     );
   }
 
+  return <BlockList blocks={visible} />;
+}
+
+/**
+ * Tell the search what this part of a panel found, while there is a query.
+ *
+ * `SettingsBlocks` reports for itself; a panel that draws its blocks only
+ * once its data arrives reports `pending` until then, so the search says
+ * "loading" rather than "no match" while that panel cannot answer yet. A
+ * layout effect, so the first frame of a search already knows.
+ */
+export function useSearchReport(count: number, pending: boolean): void {
+  const { search, registry } = useShell();
+  const scope = useContext(PanelScopeContext);
+  const key = useId();
+  const slug = scope?.slug ?? null;
+  const searching = search.trim() !== "";
+
+  useLayoutEffect(() => {
+    if (!searching || slug === null) {
+      return;
+    }
+    registry.report(key, slug, { count, loading: pending });
+    return () => registry.remove(key);
+  }, [count, key, pending, registry, searching, slug]);
+}
+
+function BlockList({ blocks }: { blocks: readonly SettingsBlock[] }) {
   return (
     <>
-      {visible.map((block) => (
+      {blocks.map((block) => (
         <section key={block.id} aria-label={block.title} className="flex flex-none flex-col">
           <SectionHeader label={block.title} tag={block.tag} note={block.note} />
           {block.kind === "section" ? (
@@ -425,6 +501,69 @@ export function SettingsBlocks({
  */
 function SettingsTable({ block }: { block: SettingsTableModel }) {
   const t = useTranslate();
+  const groups = (block.groups ?? []).filter((group) => group.rows.length > 0);
+  const row = (entry: SettingsTableRowModel) => {
+    const onRowClick = block.onRowClick;
+    const interactive = typeof onRowClick === "function";
+    // A row that opens in place is a disclosure: it says whether it is open,
+    // names what it opens, and answers Space as a button does.
+    const disclosure = interactive && entry.expanded !== undefined;
+    const detailId = `${block.id}-detail-${entry.id}`;
+    const line = (
+      <div
+        key={disclosure ? undefined : entry.id}
+        {...(interactive
+          ? {
+              role: "button",
+              tabIndex: 0,
+              ...(disclosure
+                ? { "aria-expanded": entry.expanded, "aria-controls": entry.expanded ? detailId : undefined }
+                : {}),
+              onClick: () => onRowClick?.(entry.id),
+              onKeyDown: (event: React.KeyboardEvent) => {
+                if (event.target !== event.currentTarget && disclosure) {
+                  return;
+                }
+                if (event.key === "Enter" || (disclosure && event.key === " ")) {
+                  event.preventDefault();
+                  onRowClick?.(entry.id);
+                }
+              },
+            }
+          : {})}
+        className={`grid items-center gap-5 border-b border-wv-hairline px-4 sm:px-6 py-3 text-[12.5px] text-wv-fg hover:bg-wv-cell-hover${
+          interactive ? " cursor-pointer" : ""
+        }`}
+        style={{ gridTemplateColumns: block.columns }}
+      >
+        {entry.cells.map((cell, index) => {
+          const span = entry.spans?.[index] ?? 1;
+          return (
+            <div
+              key={index}
+              className="flex min-w-0 items-center"
+              style={span > 1 ? { gridColumn: `span ${span}` } : undefined}
+            >
+              {cell}
+            </div>
+          );
+        })}
+      </div>
+    );
+    if (!disclosure) {
+      return line;
+    }
+    return (
+      <Fragment key={entry.id}>
+        {line}
+        {entry.expanded ? (
+          <div id={detailId} className="border-b border-wv-hairline px-4 sm:px-6 pt-1 pb-4">
+            {entry.detail}
+          </div>
+        ) : null}
+      </Fragment>
+    );
+  };
   return (
     <div className="min-w-0 overflow-x-auto">
       <div className="min-w-[640px]">
@@ -438,7 +577,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             </Eyebrow>
           ))}
         </div>
-        {block.rows.length === 0 ? (
+        {block.rows.length === 0 && groups.length === 0 ? (
           <div className="flex flex-col items-start gap-3 px-4 sm:px-6 py-5">
             <span className="text-[13px] text-wv-muted">{block.empty ?? t("next.settings.nothingConfigured")}</span>
             {block.emptyAction === undefined ? null : (
@@ -448,38 +587,20 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             )}
           </div>
         ) : (
-          block.rows.map((row) => {
-            const onRowClick = block.onRowClick;
-            const interactive = typeof onRowClick === "function";
-            return (
-              <div
-                key={row.id}
-                {...(interactive
-                  ? {
-                      role: "button",
-                      tabIndex: 0,
-                      onClick: () => onRowClick?.(row.id),
-                      onKeyDown: (event: React.KeyboardEvent) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          onRowClick?.(row.id);
-                        }
-                      },
-                    }
-                  : {})}
-                className={`grid items-center gap-5 border-b border-wv-hairline px-4 sm:px-6 py-3 text-[12.5px] text-wv-fg hover:bg-wv-cell-hover${
-                  interactive ? " cursor-pointer" : ""
-                }`}
-                style={{ gridTemplateColumns: block.columns }}
-              >
-                {row.cells.map((cell, index) => (
-                  <div key={index} className="flex min-w-0 items-center">
-                    {cell}
-                  </div>
-                ))}
-              </div>
-            );
-          })
+          <>
+            {block.rows.map(row)}
+            {groups.map((group) => (
+              <section key={group.id} aria-label={group.title}>
+                <div className="flex items-center gap-[10px] border-b border-wv-hairline px-4 sm:px-6 pb-2 pt-4">
+                  <Eyebrow>{group.title}</Eyebrow>
+                  {group.note === undefined ? null : (
+                    <span className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">{group.note}</span>
+                  )}
+                </div>
+                {group.rows.map(row)}
+              </section>
+            ))}
+          </>
         )}
         {block.footer === undefined ? null : (
           <div className="flex flex-none items-center justify-end gap-[10px] border-b border-wv-hairline px-4 sm:px-6 py-[10px]">
@@ -512,6 +633,8 @@ interface ShellApi {
   actionsRef: { current: PanelActions | null };
   setFlags: (flags: PanelFlags) => void;
   controlsHost: HTMLElement | null;
+  /** What each panel's lists found for the search, for the headings and the empty state. */
+  registry: SearchRegistry;
 }
 
 const ShellContext = createContext<ShellApi | null>(null);
@@ -521,11 +644,12 @@ export function SettingsShellProvider({
   actionsRef,
   setFlags,
   controlsHost,
+  registry,
   children,
 }: ShellApi & { children: ReactNode }) {
   const value = useMemo<ShellApi>(
-    () => ({ search, actionsRef, setFlags, controlsHost }),
-    [actionsRef, controlsHost, search, setFlags],
+    () => ({ search, actionsRef, setFlags, controlsHost, registry }),
+    [actionsRef, controlsHost, registry, search, setFlags],
   );
   return (
     <ShellContext.Provider value={value}>{children}</ShellContext.Provider>
@@ -544,6 +668,99 @@ export function useSettingsSearch(): string {
   return useShell().search;
 }
 
+/* -------------------------------------------------------------- panel scope */
+
+interface PanelScope {
+  slug: string;
+  /** The panel the route names: the one whose Save, Revert and controls the top bar carries. */
+  active: boolean;
+  /** Where this panel's search matches draw, under its heading. */
+  resultsHost: HTMLElement | null;
+}
+
+const PanelScopeContext = createContext<PanelScope | null>(null);
+
+/** The slug of the panel this component renders in, or null outside one. */
+export function useSettingsPanelSlug(): string | null {
+  return useContext(PanelScopeContext)?.slug ?? null;
+}
+
+/**
+ * Whether this panel is the open one. Only the open panel is mounted unless
+ * the search box has a query; then every panel is, to answer it, and the
+ * others must keep their hands off the top bar and the URL.
+ */
+export function useSettingsPanelActive(): boolean {
+  return useContext(PanelScopeContext)?.active ?? true;
+}
+
+/**
+ * One panel's place in the settings area.
+ *
+ * Without a query it draws the panel's page. With one it hides the page — the
+ * panel stays mounted, so an open panel keeps its unsaved edits — and draws a
+ * heading with whatever the panel's lists found beneath it, or nothing when
+ * they found nothing. The open panel's matches stay live; another panel's are
+ * a preview, and its heading or a click on them opens that panel with the
+ * query kept.
+ */
+export function SettingsPanelScope({
+  slug,
+  active,
+  title,
+  onOpen,
+  children,
+}: {
+  slug: string;
+  active: boolean;
+  title: string;
+  onOpen: () => void;
+  children: ReactNode;
+}) {
+  const t = useTranslate();
+  const { search, registry } = useShell();
+  const searching = search.trim() !== "";
+  const [resultsHost, setResultsHost] = useState<HTMLElement | null>(null);
+  const found = useSyncExternalStore(registry.subscribe, () => registry.panel(slug).count);
+  const scope = useMemo<PanelScope>(() => ({ slug, active, resultsHost }), [active, resultsHost, slug]);
+  const shown = searching && found > 0;
+
+  return (
+    <PanelScopeContext.Provider value={scope}>
+      <section aria-label={title} hidden={!shown} className="flex flex-none flex-col">
+        <div className="flex items-center gap-[10px] border-b border-wv-hairline bg-wv-list px-4 pt-5 pb-2 sm:px-6">
+          {active ? (
+            <span className="text-[13px] font-medium text-wv-fg">{title}</span>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpen}
+              aria-label={t("next.settings.searchOpenPanel", { panel: title })}
+              className="cursor-pointer text-[13px] font-medium text-wv-fg underline-offset-4 hover:underline"
+            >
+              {title}
+            </button>
+          )}
+          {active ? <Eyebrow className="ml-auto">{t("next.settings.searchOpenNow")}</Eyebrow> : null}
+        </div>
+        {/*
+          Another panel's matches are a preview: its Save and Revert are not
+          in the top bar, so an edit made here could not be kept. `inert`
+          keeps them out of reach, and a click anywhere on them opens the
+          panel, where they are live.
+        */}
+        <div
+          onClick={active ? undefined : onOpen}
+          className={active ? undefined : "cursor-pointer opacity-80"}
+        >
+          <div ref={setResultsHost} inert={!active} className="flex flex-col" />
+        </div>
+      </section>
+      <div className={searching ? "hidden" : "contents"}>{children}</div>
+    </PanelScopeContext.Provider>
+  );
+}
+
 /**
  * A panel's own controls, teleported into the top bar's left slot.
  *
@@ -552,7 +769,8 @@ export function useSettingsSearch(): string {
  */
 export function PanelControls({ children }: { children: ReactNode }) {
   const { controlsHost } = useShell();
-  return controlsHost ? createPortal(children, controlsHost) : null;
+  const active = useSettingsPanelActive();
+  return controlsHost && active ? createPortal(children, controlsHost) : null;
 }
 
 /**
@@ -577,27 +795,36 @@ export function usePanelState({
   revert: () => void;
 }): void {
   const shell = useShell();
+  // A panel mounted only to answer the search does not own the top bar.
+  const active = useSettingsPanelActive();
 
   useEffect(() => {
-    shell.actionsRef.current = { save, revert };
+    if (active) {
+      shell.actionsRef.current = { save, revert };
+    }
   });
 
   useEffect(() => {
-    shell.setFlags({ dirty, busy, status, failed });
-  }, [busy, dirty, failed, shell, status]);
+    if (active) {
+      shell.setFlags({ dirty, busy, status, failed });
+    }
+  }, [active, busy, dirty, failed, shell, status]);
 
-  useEffect(
-    () => () => {
-      shell.actionsRef.current = null;
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+    const actions = shell.actionsRef;
+    return () => {
+      actions.current = null;
       shell.setFlags({
         dirty: false,
         busy: false,
         status: null,
         failed: false,
       });
-    },
-    [shell],
-  );
+    };
+  }, [active, shell]);
 }
 
 /**
@@ -609,21 +836,26 @@ export function usePanelState({
  */
 export function usePanelStatus(status: string | null, failed = false): void {
   const shell = useShell();
+  const active = useSettingsPanelActive();
 
   useEffect(() => {
-    shell.setFlags({ dirty: false, busy: false, status, failed });
-  }, [failed, shell, status]);
+    if (active) {
+      shell.setFlags({ dirty: false, busy: false, status, failed });
+    }
+  }, [active, failed, shell, status]);
 
-  useEffect(
-    () => () =>
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+    return () =>
       shell.setFlags({
         dirty: false,
         busy: false,
         status: null,
         failed: false,
-      }),
-    [shell],
-  );
+      });
+  }, [active, shell]);
 }
 
 /**

@@ -21,6 +21,8 @@ export interface EditorSection {
   tag?: ReactNode;
   note?: ReactNode;
   fields: FieldSpec[];
+  /** Anything that is not a field, drawn the section's full width under its fields. */
+  body?: ReactNode;
 }
 
 export function RecordEditor({
@@ -89,6 +91,7 @@ export function RecordEditor({
         <div key={section.id} className="flex flex-none flex-col">
           <SectionHeader label={section.title} tag={section.tag} note={section.note} sticky={false} />
           <FieldRows fields={section.fields} />
+          {section.body}
         </div>
       ))}
       {children}

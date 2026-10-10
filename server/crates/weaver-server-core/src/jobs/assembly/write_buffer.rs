@@ -21,32 +21,32 @@ impl BufferedChunk for BufferHandle {
     }
 }
 
-/// Reorder buffer that collects out-of-order decoded segments and releases
-/// them in sequential file-offset order, enabling sequential disk writes
-/// even when 50+ connections produce segments in arbitrary order.
+// Reorder buffer that collects out-of-order decoded segments and releases
+// them in sequential file-offset order, enabling sequential disk writes
+// even when 50+ connections produce segments in arbitrary order.
 pub struct WriteReorderBuffer<T> {
-    /// Segments waiting to be written, keyed by their file offset.
-    ///
-    /// Every key is at or above [`write_cursor`](Self::write_cursor). A key
-    /// below it could never match the cursor again — the cursor only moves
-    /// forward — so it would stall every later contiguous drain.
+    // Segments waiting to be written, keyed by their file offset.
+    //
+    // Every key is at or above [`write_cursor`](Self::write_cursor). A key
+    // below it could never match the cursor again — the cursor only moves
+    // forward — so it would stall every later contiguous drain.
     pending: BTreeMap<u64, PendingChunk<T>>,
-    /// Duplicate arrivals covering a range the buffer has already released for
-    /// writing: the same article decoded twice.
-    ///
-    /// They carry no ordering information, so they never enter `pending`. They
-    /// are handed back on the next drain rather than dropped, because the
-    /// caller charges its write backlog for every insert and only gets those
-    /// bytes back when the buffer returns the chunk (or still reports it in
-    /// `buffered_bytes`/`buffered_len` at teardown).
+    // Duplicate arrivals covering a range the buffer has already released for
+    // writing: the same article decoded twice.
+    //
+    // They carry no ordering information, so they never enter `pending`. They
+    // are handed back on the next drain rather than dropped, because the
+    // caller charges its write backlog for every insert and only gets those
+    // bytes back when the buffer returns the chunk (or still reports it in
+    // `buffered_bytes`/`buffered_len` at teardown).
     redundant: Vec<(u64, T)>,
-    /// The next expected sequential write offset.
+    // The next expected sequential write offset.
     write_cursor: u64,
-    /// Maximum number of buffered segments before forcing eviction.
+    // Maximum number of buffered segments before forcing eviction.
     max_pending: usize,
-    /// Total bytes currently retained in memory.
+    // Total bytes currently retained in memory.
     buffered_bytes: usize,
-    /// Number of buffered entries currently retained in memory.
+    // Number of buffered entries currently retained in memory.
     buffered_segments: usize,
 }
 
@@ -56,10 +56,10 @@ enum PendingChunk<T> {
 }
 
 impl<T: BufferedChunk> WriteReorderBuffer<T> {
-    /// Create a new reorder buffer.
-    ///
-    /// `max_pending` controls how many segments can be buffered before the
-    /// oldest entry is forcibly evicted to guarantee forward progress.
+    // Create a new reorder buffer.
+    //
+    // `max_pending` controls how many segments can be buffered before the
+    // oldest entry is forcibly evicted to guarantee forward progress.
     pub fn new(max_pending: usize) -> Self {
         Self {
             pending: BTreeMap::new(),
@@ -71,17 +71,17 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         }
     }
 
-    /// Start the sequential drain past a prefix that is already on disk.
-    ///
-    /// A file resumed after a restart never refetches its leading parts, so a
-    /// cursor left at zero would wait forever for bytes that will not arrive
-    /// and nothing would ever drain in order. `cursor` is where the resumed
-    /// prefix ends, which only the first part that still has to be fetched can
-    /// say, so this is called once that part decodes rather than at creation.
-    ///
-    /// The cursor only ever moves forward, and anything already queued below
-    /// the new one covers bytes the file already holds, so it is handed back
-    /// as a duplicate arrival rather than left to stall the ordered map.
+    // Start the sequential drain past a prefix that is already on disk.
+    //
+    // A file resumed after a restart never refetches its leading parts, so a
+    // cursor left at zero would wait forever for bytes that will not arrive
+    // and nothing would ever drain in order. `cursor` is where the resumed
+    // prefix ends, which only the first part that still has to be fetched can
+    // say, so this is called once that part decodes rather than at creation.
+    //
+    // The cursor only ever moves forward, and anything already queued below
+    // the new one covers bytes the file already holds, so it is handed back
+    // as a duplicate arrival rather than left to stall the ordered map.
     pub fn resume_at(&mut self, cursor: u64) {
         if cursor <= self.write_cursor {
             return;
@@ -98,13 +98,13 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         self.write_cursor = cursor;
     }
 
-    /// Insert a decoded segment into the buffer.
-    ///
-    /// A segment whose range the buffer already released for writing — it sits
-    /// behind the write cursor, or an arrival for the same offset is already
-    /// queued — is a duplicate of an article that was decoded twice. Its bytes
-    /// are already on disk or already sequenced, so it is queued for immediate
-    /// hand-back instead of taking a place in the ordered map.
+    // Insert a decoded segment into the buffer.
+    //
+    // A segment whose range the buffer already released for writing — it sits
+    // behind the write cursor, or an arrival for the same offset is already
+    // queued — is a duplicate of an article that was decoded twice. Its bytes
+    // are already on disk or already sequenced, so it is queued for immediate
+    // hand-back instead of taking a place in the ordered map.
     pub fn insert(&mut self, offset: u64, data: T) {
         self.buffered_bytes += data.len_bytes();
         self.buffered_segments += 1;
@@ -116,28 +116,28 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         self.pending.insert(offset, PendingChunk::Buffered(data));
     }
 
-    /// Insert a segment the caller already knows is a duplicate of one that
-    /// was written, so it is handed back for an idempotent rewrite instead of
-    /// taking a place in the ordered map.
-    ///
-    /// The cursor cannot make that call on its own. A buffer is dropped once
-    /// its file completes, so a duplicate that arrives afterwards meets a fresh
-    /// buffer whose cursor is back at zero: every offset but the first is
-    /// *above* it, and [`insert`](Self::insert) would park it waiting for
-    /// neighbours that were written long ago and are never coming again.
+    // Insert a segment the caller already knows is a duplicate of one that
+    // was written, so it is handed back for an idempotent rewrite instead of
+    // taking a place in the ordered map.
+    //
+    // The cursor cannot make that call on its own. A buffer is dropped once
+    // its file completes, so a duplicate that arrives afterwards meets a fresh
+    // buffer whose cursor is back at zero: every offset but the first is
+    // *above* it, and [`insert`](Self::insert) would park it waiting for
+    // neighbours that were written long ago and are never coming again.
     pub fn insert_duplicate(&mut self, offset: u64, data: T) {
         self.buffered_bytes += data.len_bytes();
         self.buffered_segments += 1;
         self.redundant.push((offset, data));
     }
 
-    /// Drain any contiguous segments that are now ready for sequential writing.
+    // Drain any contiguous segments that are now ready for sequential writing.
     pub fn drain_ready(&mut self) -> Vec<(u64, T)> {
         self.drain_ready_with_contiguous_end().0
     }
 
-    /// Drain ready segments and return the contiguous end represented by the
-    /// drain, including already-persisted gaps that were bridged.
+    // Drain ready segments and return the contiguous end represented by the
+    // drain, including already-persisted gaps that were bridged.
     pub fn drain_ready_with_contiguous_end(&mut self) -> (Vec<(u64, T)>, u64) {
         // A duplicate arrival is writable as soon as the bytes it covers are
         // sequenced: it never waits on the cursor past that and never moves it.
@@ -195,21 +195,21 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         (ready, self.write_cursor)
     }
 
-    /// Whether the buffer exceeds its per-file in-memory segment limit.
+    // Whether the buffer exceeds its per-file in-memory segment limit.
     pub fn exceeds_max_pending(&self) -> bool {
         self.buffered_segments > self.max_pending
     }
 
-    /// Remove the lowest-offset buffered segment without advancing the cursor.
-    ///
-    /// The caller is expected to persist the returned segment directly and then
-    /// reinsert a `Persisted` marker with [`mark_persisted`](Self::mark_persisted)
-    /// so future sequential drains can skip over the already-written range.
-    ///
-    /// Duplicate arrivals come out first: they are already sequenced, so the
-    /// caller can persist them without waiting on any gap. Every segment
-    /// counted by [`buffered_len`](Self::buffered_len) is reachable this way,
-    /// which is what keeps the callers' backlog-relief loops making progress.
+    // Remove the lowest-offset buffered segment without advancing the cursor.
+    //
+    // The caller is expected to persist the returned segment directly and then
+    // reinsert a `Persisted` marker with [`mark_persisted`](Self::mark_persisted)
+    // so future sequential drains can skip over the already-written range.
+    //
+    // Duplicate arrivals come out first: they are already sequenced, so the
+    // caller can persist them without waiting on any gap. Every segment
+    // counted by [`buffered_len`](Self::buffered_len) is reachable this way,
+    // which is what keeps the callers' backlog-relief loops making progress.
     pub fn take_oldest_buffered(&mut self) -> Option<(u64, T)> {
         if !self.redundant.is_empty() {
             let (offset, buf) = self.redundant.remove(0);
@@ -250,7 +250,7 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         drained
     }
 
-    /// Record that an out-of-order range has already been persisted directly.
+    // Record that an out-of-order range has already been persisted directly.
     pub fn mark_persisted(&mut self, offset: u64, len: usize) {
         if offset < self.write_cursor {
             // The cursor already spans this range, so there is no gap for a
@@ -293,8 +293,8 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
             )
     }
 
-    /// Sparse ranges whose writes have completed. Buffered/released chunks
-    /// and the write cursor are not evidence of committed bytes.
+    // Sparse ranges whose writes have completed. Buffered/released chunks
+    // and the write cursor are not evidence of committed bytes.
     pub(crate) fn persisted_ranges(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
         self.pending
             .iter()
@@ -308,10 +308,10 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         self.pending.is_empty() && self.redundant.is_empty()
     }
 
-    /// Flush all remaining buffered segments, sorted by offset.
-    ///
-    /// Call this when a file is complete to drain any stragglers that never
-    /// formed a contiguous run with the write cursor.
+    // Flush all remaining buffered segments, sorted by offset.
+    //
+    // Call this when a file is complete to drain any stragglers that never
+    // formed a contiguous run with the write cursor.
     pub fn flush_all(&mut self) -> Vec<(u64, T)> {
         let mut out = Vec::with_capacity(self.buffered_segments);
         out.append(&mut self.redundant);
@@ -327,17 +327,17 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         out
     }
 
-    /// Take every queued duplicate arrival, releasing its in-memory accounting.
-    /// Take every buffered segment out of the reorder stage at once,
-    /// duplicates included, leaving the cursor where it stands.
-    ///
-    /// For the identity seam's reclaim: a file whose offset-zero article just
-    /// bound to a direct set may already have later articles parked here, and
-    /// every one of them belongs to the routed volume rather than to a
-    /// sequential file write. Only meaningful while nothing has been
-    /// persisted — the caller refuses to bind a file with flushed bytes — so
-    /// `Persisted` markers are not expected and are left in place if a caller
-    /// ever violates that.
+    // Take every queued duplicate arrival, releasing its in-memory accounting.
+    // Take every buffered segment out of the reorder stage at once,
+    // duplicates included, leaving the cursor where it stands.
+    //
+    // For the identity seam's reclaim: a file whose offset-zero article just
+    // bound to a direct set may already have later articles parked here, and
+    // every one of them belongs to the routed volume rather than to a
+    // sequential file write. Only meaningful while nothing has been
+    // persisted — the caller refuses to bind a file with flushed bytes — so
+    // `Persisted` markers are not expected and are left in place if a caller
+    // ever violates that.
     pub fn take_all_buffered(&mut self) -> Vec<(u64, T)> {
         let mut taken = self.take_redundant();
         let offsets: Vec<u64> = self
@@ -364,7 +364,7 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         taken
     }
 
-    /// Drop one retained chunk from the in-memory accounting.
+    // Drop one retained chunk from the in-memory accounting.
     fn forget_buffered(&mut self, len: usize) {
         self.buffered_bytes = self.buffered_bytes.saturating_sub(len);
         self.buffered_segments = self.buffered_segments.saturating_sub(1);

@@ -15,7 +15,10 @@ use super::catalog::{
     BACKUP_TABLE_CATALOG, BackupTableClassification, catalog_tables, export_query,
     is_engine_internal_table, is_optional_catalog_table, quote_identifier,
 };
-use crate::persistence::sql_runtime::StoreDatastore;
+use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
+use crate::schema_migrations::{
+    egress_quotas_v53, script_concurrency_v58, script_instances_v55, unwanted_extensions_v56,
+};
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
 
@@ -81,7 +84,15 @@ pub(crate) struct LogicalBackupExport {
 }
 
 impl Database {
+    #[cfg(test)]
     pub(crate) fn export_logical_backup(&self) -> Result<LogicalBackupExport, StateError> {
+        self.export_logical_backup_cancellable(super::archive::BackupCancellation::new())
+    }
+
+    pub(super) fn export_logical_backup_cancellable(
+        &self,
+        cancellation: super::archive::BackupCancellation,
+    ) -> Result<LogicalBackupExport, StateError> {
         let staging = super::create_backup_temp_dir().map_err(db_err)?;
         let tables_dir = staging.path().join("tables");
         std::fs::create_dir_all(&tables_dir).map_err(db_err)?;
@@ -95,12 +106,14 @@ impl Database {
                     .sqlite_path()?
                     .ok_or_else(|| StateError::Database("SQLite backup has no path".into()))?;
                 self.run_sql_blocking_local(move || async move {
-                    export_sqlite(&path, &tables_dir).await
+                    export_sqlite(&path, &tables_dir, false, &cancellation).await
                 })?
             }
             StoreDatastore::Postgres { pool } => {
                 let tables_dir = tables_dir.clone();
-                self.run_sql_blocking_read(async move { export_postgres(pool, &tables_dir).await })?
+                self.run_sql_blocking_read(async move {
+                    export_postgres(pool, &tables_dir, false, &cancellation).await
+                })?
             }
         };
         Ok(LogicalBackupExport {
@@ -124,14 +137,28 @@ impl Database {
                 let tables_dir = tables_dir.to_path_buf();
                 let expected = expected.clone();
                 self.run_sql_blocking_local(move || async move {
-                    import_sqlite(pool, &tables_dir, &expected, allow_older_catalog).await
+                    import_sqlite(
+                        pool,
+                        &tables_dir,
+                        &expected,
+                        allow_older_catalog,
+                        source_schema_version,
+                    )
+                    .await
                 })
             }
             StoreDatastore::Postgres { pool } => {
                 let tables_dir = tables_dir.to_path_buf();
                 let expected = expected.clone();
                 self.run_sql_blocking_read(async move {
-                    import_postgres(pool, &tables_dir, &expected, allow_older_catalog).await
+                    import_postgres(
+                        pool,
+                        &tables_dir,
+                        &expected,
+                        allow_older_catalog,
+                        source_schema_version,
+                    )
+                    .await
                 })
             }
         }
@@ -194,6 +221,8 @@ impl Database {
 async fn export_sqlite(
     database_path: &Path,
     tables_dir: &Path,
+    allow_older_catalog: bool,
+    cancellation: &super::archive::BackupCancellation,
 ) -> Result<BTreeMap<String, TablePartMetadata>, StateError> {
     let options = SqliteConnectOptions::new()
         .filename(database_path)
@@ -204,17 +233,20 @@ async fn export_sqlite(
     let mut conn = sqlx::SqliteConnection::connect_with(&options)
         .await
         .map_err(db_err)?;
-    let actual = validate_sqlite_catalog(&mut conn).await?;
+    let actual = validate_sqlite_catalog_mode(&mut conn, allow_older_catalog).await?;
     sqlx::query("BEGIN")
         .execute(&mut conn)
         .await
         .map_err(db_err)?;
     let result = async {
-        let tables =
+        let mut tables =
             ordered_sqlite_tables(&mut conn, &actual, &[BackupTableClassification::Export]).await?;
+        if allow_older_catalog {
+            append_unclassified_tables(&mut tables, &actual)?;
+        }
         let mut parts = BTreeMap::new();
         for table in tables {
-            let part = export_sqlite_table(&mut conn, &table, tables_dir).await?;
+            let part = export_sqlite_table(&mut conn, &table, tables_dir, cancellation).await?;
             parts.insert(table, part);
         }
         Ok::<_, StateError>(parts)
@@ -231,19 +263,29 @@ async fn export_sqlite(
 async fn export_postgres(
     pool: sqlx::PgPool,
     tables_dir: &Path,
+    allow_older_catalog: bool,
+    cancellation: &super::archive::BackupCancellation,
 ) -> Result<BTreeMap<String, TablePartMetadata>, StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
-    let actual = validate_postgres_catalog(&mut conn).await?;
+    let actual = validate_postgres_catalog_mode(&mut conn, allow_older_catalog).await?;
     let mut tx = conn.begin().await.map_err(db_err)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-    let tables =
+    // A table held exclusively elsewhere fails the export instead of stalling it.
+    sqlx::query("SET LOCAL lock_timeout = '60s'")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    let mut tables =
         ordered_postgres_tables(&mut tx, &actual, &[BackupTableClassification::Export]).await?;
+    if allow_older_catalog {
+        append_unclassified_tables(&mut tables, &actual)?;
+    }
     let mut parts = BTreeMap::new();
     for table in tables {
-        let part = export_postgres_table(&mut tx, &table, tables_dir).await?;
+        let part = export_postgres_table(&mut tx, &table, tables_dir, cancellation).await?;
         parts.insert(table, part);
     }
     tx.rollback().await.map_err(db_err)?;
@@ -252,6 +294,13 @@ async fn export_postgres(
 
 async fn validate_sqlite_catalog(
     conn: &mut sqlx::SqliteConnection,
+) -> Result<BTreeSet<String>, StateError> {
+    validate_sqlite_catalog_mode(conn, false).await
+}
+
+async fn validate_sqlite_catalog_mode(
+    conn: &mut sqlx::SqliteConnection,
+    allow_older_catalog: bool,
 ) -> Result<BTreeSet<String>, StateError> {
     let rows = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .fetch_all(&mut *conn)
@@ -262,12 +311,19 @@ async fn validate_sqlite_catalog(
         .filter_map(|row| row.try_get::<String, _>("name").ok())
         .filter(|table| !is_engine_internal_table(table))
         .collect::<BTreeSet<_>>();
-    validate_actual_tables(&actual)?;
+    validate_actual_tables(&actual, allow_older_catalog)?;
     Ok(actual)
 }
 
 async fn validate_postgres_catalog(
     conn: &mut sqlx::PgConnection,
+) -> Result<BTreeSet<String>, StateError> {
+    validate_postgres_catalog_mode(conn, false).await
+}
+
+async fn validate_postgres_catalog_mode(
+    conn: &mut sqlx::PgConnection,
+    allow_older_catalog: bool,
 ) -> Result<BTreeSet<String>, StateError> {
     let rows = sqlx::query(
         "SELECT table_name
@@ -283,11 +339,14 @@ async fn validate_postgres_catalog(
         .into_iter()
         .filter_map(|row| row.try_get::<String, _>("table_name").ok())
         .collect::<BTreeSet<_>>();
-    validate_actual_tables(&actual)?;
+    validate_actual_tables(&actual, allow_older_catalog)?;
     Ok(actual)
 }
 
-fn validate_actual_tables(actual: &BTreeSet<String>) -> Result<(), StateError> {
+fn validate_actual_tables(
+    actual: &BTreeSet<String>,
+    allow_older_catalog: bool,
+) -> Result<(), StateError> {
     let classified = BACKUP_TABLE_CATALOG
         .iter()
         .map(|entry| entry.table.to_string())
@@ -303,7 +362,7 @@ fn validate_actual_tables(actual: &BTreeSet<String>) -> Result<(), StateError> {
         .filter(|table| !is_optional_catalog_table(table))
         .cloned()
         .collect::<Vec<_>>();
-    if unclassified.is_empty() && nonexistent.is_empty() {
+    if allow_older_catalog || (unclassified.is_empty() && nonexistent.is_empty()) {
         Ok(())
     } else {
         Err(StateError::Database(format!(
@@ -314,11 +373,47 @@ fn validate_actual_tables(actual: &BTreeSet<String>) -> Result<(), StateError> {
     }
 }
 
+fn append_unclassified_tables(
+    tables: &mut Vec<String>,
+    actual: &BTreeSet<String>,
+) -> Result<(), StateError> {
+    let classified = BACKUP_TABLE_CATALOG
+        .iter()
+        .map(|entry| entry.table)
+        .collect::<BTreeSet<_>>();
+    for table in actual {
+        if !classified.contains(table.as_str()) {
+            if !table
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err(StateError::Database(
+                    "legacy table name cannot be represented safely in a backup".into(),
+                ));
+            }
+            tables.push(table.clone());
+        }
+    }
+    Ok(())
+}
+
+fn check_export_cancellation(
+    cancellation: &super::archive::BackupCancellation,
+) -> Result<(), StateError> {
+    if cancellation.is_cancelled() {
+        Err(StateError::Database("backup export cancelled".into()))
+    } else {
+        Ok(())
+    }
+}
+
 async fn export_sqlite_table(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
     tables_dir: &Path,
+    cancellation: &super::archive::BackupCancellation,
 ) -> Result<TablePartMetadata, StateError> {
+    check_export_cancellation(cancellation)?;
     let columns = sqlite_table_columns(conn, table).await?;
     let order = sqlite_row_order(conn, table).await?;
     let base = export_query(table, &columns);
@@ -327,6 +422,7 @@ async fn export_sqlite_table(
     let mut output = ExportTableWriter::new(&path)?;
     let mut offset = 0_i64;
     loop {
+        check_export_cancellation(cancellation)?;
         let batch = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .bind(EXPORT_BATCH_SIZE)
             .bind(offset)
@@ -348,7 +444,9 @@ async fn export_postgres_table(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table: &str,
     tables_dir: &Path,
+    cancellation: &super::archive::BackupCancellation,
 ) -> Result<TablePartMetadata, StateError> {
+    check_export_cancellation(cancellation)?;
     let columns = postgres_table_columns(tx, table).await?;
     let order = postgres_row_order(tx, table).await?;
     let base = export_query(table, &columns);
@@ -357,6 +455,7 @@ async fn export_postgres_table(
     let mut output = ExportTableWriter::new(&path)?;
     let mut offset = 0_i64;
     loop {
+        check_export_cancellation(cancellation)?;
         let batch = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .bind(EXPORT_BATCH_SIZE)
             .bind(offset)
@@ -707,6 +806,7 @@ async fn import_sqlite(
     tables_dir: &Path,
     expected: &BTreeMap<String, TablePartMetadata>,
     allow_older_catalog: bool,
+    source_schema_version: i64,
 ) -> Result<(), StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_sqlite_catalog(&mut conn).await?;
@@ -722,8 +822,8 @@ async fn import_sqlite(
     .await?;
     let export =
         ordered_sqlite_tables(&mut conn, &actual, &[BackupTableClassification::Export]).await?;
-    validate_manifest_tables(expected, &export)?;
-    let import = export;
+    let import = import_table_order(expected, &export, allow_older_catalog)?;
+    let restored = restored_tables(expected, &import);
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *conn)
         .await
@@ -750,6 +850,28 @@ async fn import_sqlite(
             )
             .await?;
         }
+        sqlx::query("INSERT INTO script_output_state (singleton, next_seq) VALUES (1, 0)")
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+        if source_schema_version < EGRESS_CATALOG_SCHEMA_VERSION
+            && !expected.contains_key("egress_interfaces")
+        {
+            sqlx::query(SYSTEM_EGRESS_SEED)
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+        }
+        let system_egress: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM egress_interfaces WHERE id = 0")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(db_err)?;
+        if system_egress != 1 {
+            return Err(StateError::Database(
+                "restored networking configuration is missing the System egress".into(),
+            ));
+        }
         repair_sqlite_sequences(&mut conn).await?;
         let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
             .fetch_one(&mut *conn)
@@ -760,7 +882,20 @@ async fn import_sqlite(
                 "restored database has {violations} foreign-key violations"
             )));
         }
-        validate_sqlite_counts(&mut conn, expected).await
+        validate_sqlite_counts(&mut conn, &restored).await?;
+        move_older_bandwidth_cap(
+            &mut SqlConn::Sqlite(&mut conn),
+            source_schema_version,
+            expected,
+        )
+        .await?;
+        move_older_script_wiring(
+            &mut SqlConn::Sqlite(&mut conn),
+            source_schema_version,
+            expected,
+        )
+        .await?;
+        fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
     }
     .await;
     match result {
@@ -781,6 +916,7 @@ async fn import_postgres(
     tables_dir: &Path,
     expected: &BTreeMap<String, TablePartMetadata>,
     allow_older_catalog: bool,
+    source_schema_version: i64,
 ) -> Result<(), StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_postgres_catalog(&mut conn).await?;
@@ -797,8 +933,8 @@ async fn import_postgres(
     .await?;
     let export =
         ordered_postgres_tables(&mut tx, &actual, &[BackupTableClassification::Export]).await?;
-    validate_manifest_tables(expected, &export)?;
-    let import = export;
+    let import = import_table_order(expected, &export, allow_older_catalog)?;
+    let restored = restored_tables(expected, &import);
     for table in clear.iter().rev() {
         let query = format!("DELETE FROM {}", quote_identifier(table));
         sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
@@ -816,9 +952,128 @@ async fn import_postgres(
         )
         .await?;
     }
-    validate_postgres_counts(&mut tx, expected).await?;
+    sqlx::query("INSERT INTO script_output_state (singleton, next_seq) VALUES (1, 0)")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    if source_schema_version < EGRESS_CATALOG_SCHEMA_VERSION
+        && !expected.contains_key("egress_interfaces")
+    {
+        sqlx::query(SYSTEM_EGRESS_SEED)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    let system_egress: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM egress_interfaces WHERE id = 0")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    if system_egress != 1 {
+        return Err(StateError::Database(
+            "restored networking configuration is missing the System egress".into(),
+        ));
+    }
+    validate_postgres_counts(&mut tx, &restored).await?;
     repair_postgres_sequences(&mut tx).await?;
+    move_older_bandwidth_cap(
+        &mut SqlConn::Postgres(&mut tx),
+        source_schema_version,
+        expected,
+    )
+    .await?;
+    move_older_script_wiring(
+        &mut SqlConn::Postgres(&mut tx),
+        source_schema_version,
+        expected,
+    )
+    .await?;
+    fill_older_unwanted_extensions(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     tx.commit().await.map_err(db_err)
+}
+
+// A bundle written before egresses kept download quotas can carry the
+// bandwidth cap they replaced. No migration runs over a restore, so the step
+// that moves the cap onto the System egress on an upgrade is run here instead.
+async fn move_older_bandwidth_cap(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+    expected: &BTreeMap<String, TablePartMetadata>,
+) -> Result<(), StateError> {
+    if source_schema_version >= egress_quotas_v53::SCHEMA_VERSION
+        || expected.contains_key("egress_download_usage")
+    {
+        return Ok(());
+    }
+    egress_quotas_v53::move_isp_cap_to_system_egress(conn).await
+}
+
+// A bundle written before there were script instances carries the wiring
+// they replaced. No migration runs over a restore, so the step that moves
+// that wiring across on an upgrade is run here instead.
+async fn move_older_script_wiring(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+    expected: &BTreeMap<String, TablePartMetadata>,
+) -> Result<(), StateError> {
+    if source_schema_version >= script_instances_v55::SCHEMA_VERSION
+        || expected.contains_key(script_instances_v55::INSTANCES_TABLE)
+    {
+        return Ok(());
+    }
+    script_instances_v55::move_script_wiring_to_instances(conn).await
+}
+
+// A bundle written before builds shipped a default unwanted extension list
+// can carry the empty list that turned the check off. No migration runs over
+// a restore, so the step that fills it on an upgrade is run here instead.
+async fn fill_older_unwanted_extensions(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+) -> Result<(), StateError> {
+    if source_schema_version < unwanted_extensions_v56::SCHEMA_VERSION {
+        unwanted_extensions_v56::fill_default_unwanted_extensions(conn).await?;
+    }
+    // A bundle written before one concurrency setting bounded every script
+    // can carry a value chosen for the narrower meaning, raised here as an
+    // upgrade raises it.
+    if source_schema_version < script_concurrency_v58::SCHEMA_VERSION {
+        script_concurrency_v58::raise_script_concurrency(conn).await?;
+    }
+    Ok(())
+}
+
+const EGRESS_CATALOG_SCHEMA_VERSION: i64 = 53;
+const SYSTEM_EGRESS_SEED: &str = "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, created_at, updated_at) VALUES (0, 'System', 'system', NULL, TRUE, 0, 0, 0)";
+
+// Chooses the tables to restore, in dependency order. A bundle from the
+// current schema must carry exactly the export catalog. A bundle from an older
+// schema restores the tables both sides know: tables it predates stay empty,
+// and tables retired since it was written are left out.
+fn import_table_order(
+    expected: &BTreeMap<String, TablePartMetadata>,
+    export: &[String],
+    older_source: bool,
+) -> Result<Vec<String>, StateError> {
+    if older_source {
+        return Ok(export
+            .iter()
+            .filter(|table| expected.contains_key(*table))
+            .cloned()
+            .collect());
+    }
+    validate_manifest_tables(expected, export)?;
+    Ok(export.to_vec())
+}
+
+fn restored_tables(
+    expected: &BTreeMap<String, TablePartMetadata>,
+    import: &[String],
+) -> BTreeMap<String, TablePartMetadata> {
+    import
+        .iter()
+        .filter_map(|table| Some((table.clone(), expected.get(table)?.clone())))
+        .collect()
 }
 
 fn validate_manifest_tables(
@@ -1484,9 +1739,115 @@ pub(crate) async fn validate_legacy_encryption_key(
     Ok(())
 }
 
+// Export an existing schema before opening the application database or running migrations.
+#[cfg(test)]
+pub(super) async fn export_before_migrations(
+    target: &crate::persistence::database_target::DatabaseTarget,
+) -> Result<LogicalBackupExport, StateError> {
+    export_before_migrations_cancellable(target, super::archive::BackupCancellation::new()).await
+}
+
+pub(super) async fn export_before_migrations_cancellable(
+    target: &crate::persistence::database_target::DatabaseTarget,
+    cancellation: super::archive::BackupCancellation,
+) -> Result<LogicalBackupExport, StateError> {
+    use crate::persistence::database_target::DatabaseTarget;
+    let staging = super::create_backup_temp_dir().map_err(db_err)?;
+    let tables_dir = staging.path().join("tables");
+    std::fs::create_dir_all(&tables_dir).map_err(db_err)?;
+    let (source_engine, schema_version, tables) = match target {
+        DatabaseTarget::PostgresUrl(url) => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(url)
+                .await
+                .map_err(db_err)?;
+            let result = async {
+                let version = sqlx::query_scalar::<_, i64>("SELECT version FROM schema_version")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(db_err)?;
+                let tables =
+                    export_postgres(pool.clone(), &tables_dir, true, &cancellation).await?;
+                Ok::<_, StateError>(("postgres", version, tables))
+            }
+            .await;
+            pool.close().await;
+            result?
+        }
+        target => {
+            let path = target
+                .sqlite_path()?
+                .ok_or_else(|| StateError::Database("SQLite backup has no path".into()))?;
+            let options = SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true)
+                .create_if_missing(false);
+            let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .map_err(db_err)?;
+            let version = sqlx::query_scalar::<_, i64>("SELECT version FROM schema_version")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(db_err)?;
+            connection.close().await.map_err(db_err)?;
+            (
+                "sqlite",
+                version,
+                export_sqlite(&path, &tables_dir, true, &cancellation).await?,
+            )
+        }
+    };
+    Ok(LogicalBackupExport {
+        staging,
+        source_engine: source_engine.into(),
+        schema_version,
+        tables,
+    })
+}
+
 #[cfg(test)]
 mod logical_reader_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pre_migration_export_preserves_unclassified_tables_and_checks_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut conn = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE schema_version (version INTEGER); INSERT INTO schema_version VALUES (1); CREATE TABLE retired_settings (id INTEGER PRIMARY KEY, value TEXT); INSERT INTO retired_settings VALUES (7, 'retained');")
+            .execute(&mut conn).await.unwrap();
+        assert!(validate_sqlite_catalog(&mut conn).await.is_err());
+        conn.close().await.unwrap();
+        let target = crate::persistence::database_target::DatabaseTarget::SqlitePath(path.clone());
+        let export = export_before_migrations(&target).await.unwrap();
+        assert_eq!(export.tables["retired_settings"].rows, 1);
+        assert_eq!(
+            read_table_objects(export.staging.path(), "retired_settings").unwrap()[0]["value"],
+            "retained"
+        );
+
+        let tables = tempfile::tempdir().unwrap();
+        let mut conn = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        let cancellation = super::super::archive::BackupCancellation::new();
+        export_sqlite_table(&mut conn, "schema_version", tables.path(), &cancellation)
+            .await
+            .unwrap();
+        cancellation.cancel();
+        let error =
+            export_sqlite_table(&mut conn, "retired_settings", tables.path(), &cancellation)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!tables.path().join("retired_settings.ndjson").exists());
+    }
 
     #[test]
     fn restore_manifest_requires_the_complete_export_catalog() {
@@ -1496,6 +1857,362 @@ mod logical_reader_tests {
         let error = validate_manifest_tables(&expected, &export).unwrap_err();
 
         assert!(error.to_string().contains("missing [servers]"));
+    }
+
+    #[test]
+    fn older_bundle_restores_despite_retired_and_newer_tables() {
+        let source = Database::open_in_memory().unwrap();
+        let mut archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        std::fs::write(
+            tables.join("retired_settings.ndjson"),
+            b"{\"id\":7,\"value\":\"retained\"}\n",
+        )
+        .unwrap();
+        archive.tables.insert(
+            "retired_settings".into(),
+            TablePartMetadata {
+                rows: 1,
+                columns: vec!["id".into(), "value".into()],
+                checksum: String::new(),
+            },
+        );
+        // The source predates this table, so its bundle has no part for it.
+        archive.tables.remove("rss_seen_items");
+
+        let target = Database::open_in_memory().unwrap();
+        let error = target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap_err();
+        assert!(error.to_string().contains("unexpected [retired_settings]"));
+
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version - 1)
+            .unwrap();
+        assert_eq!(target.list_egress_interfaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_bundle_from_before_instances_restores_its_script_wiring_as_instances() {
+        use crate::post_processing::instances::InstanceTrigger;
+        use crate::post_processing::model::GlobalScriptsRun;
+        use crate::schema_migrations::script_instances_v55::SCHEMA_VERSION;
+
+        let root = tempfile::tempdir().unwrap();
+        let scripts = std::fs::canonicalize(root.path()).unwrap();
+        for name in ["post.sh", "tv.sh"] {
+            std::fs::write(
+                scripts.join(name),
+                "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\n",
+            )
+            .unwrap();
+        }
+        // The wiring as the build before instances saved it.
+        let source = Database::open_in_memory().unwrap();
+        let sealed = crate::persistence::encryption::encrypt_value(
+            source.encryption_key().unwrap(),
+            "carried",
+        )
+        .unwrap();
+        for (key, value) in [
+            (
+                "post_processing.script_directory.v1",
+                scripts.to_string_lossy().into_owned(),
+            ),
+            (
+                "post_processing.script_lists.v1",
+                serde_json::json!({
+                    "global": [{"script": "post.sh"}],
+                    "categories": {"tv": [{"script": "tv.sh", "timeoutSeconds": 60}]},
+                })
+                .to_string(),
+            ),
+            (
+                "post_processing.script_options.v1",
+                serde_json::json!({
+                    "tv.sh": {"secrets": [{"name": "Token", "ciphertext": sealed.clone()}]},
+                })
+                .to_string(),
+            ),
+        ] {
+            source.set_setting(key, &value).unwrap();
+        }
+        let mut archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        // The source predates instances, so its bundle has no part for them.
+        for table in [
+            "script_instances",
+            "script_instance_inputs",
+            "script_instance_categories",
+            "secrets",
+            "feed_scripts",
+        ] {
+            archive.tables.remove(table);
+        }
+
+        // A restore brings the bundle's key along with its values.
+        let mut target = Database::open_in_memory().unwrap();
+        target.set_encryption_key(source.encryption_key().unwrap().clone());
+        target
+            .import_logical_backup(&tables, &archive.tables, SCHEMA_VERSION - 1)
+            .unwrap();
+        assert_eq!(
+            target
+                .script_instances()
+                .unwrap()
+                .iter()
+                .map(|instance| (
+                    instance.script.as_str().to_string(),
+                    instance.trigger,
+                    instance.categories.clone(),
+                    instance.enabled,
+                    instance.timeout_seconds,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "post.sh".to_string(),
+                    InstanceTrigger::PostProcessing,
+                    vec![],
+                    true,
+                    None
+                ),
+                (
+                    "tv.sh".to_string(),
+                    InstanceTrigger::PostProcessing,
+                    vec!["tv".to_string()],
+                    true,
+                    Some(60)
+                ),
+            ]
+        );
+        assert_eq!(
+            target
+                .post_processing_settings()
+                .unwrap()
+                .global_scripts_run,
+            GlobalScriptsRun::OnlyWithoutCategoryScripts
+        );
+        for key in [
+            "post_processing.script_lists.v1",
+            "post_processing.script_options.v1",
+        ] {
+            assert_eq!(target.get_setting(key).unwrap(), None, "{key}");
+        }
+        // The saved secret option came across as a named secret the instance
+        // links.
+        let secrets = target.secrets().unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "tv.sh Token");
+        let tv = &target.script_instances().unwrap()[1];
+        assert_eq!(
+            tv.inputs[0]
+                .secret
+                .as_ref()
+                .map(|secret| secret.id.as_str()),
+            Some(secrets[0].id.as_str())
+        );
+        assert!(matches!(
+            target.script_instance_run_inputs(&tv.id).unwrap().unwrap()[0].value(),
+            crate::post_processing::model::OptionValue::Secret(value)
+                if value.expose_for_execution() == "carried"
+        ));
+    }
+
+    #[test]
+    fn a_bundle_from_before_the_default_list_restores_an_empty_unwanted_list_as_the_default() {
+        use crate::post_processing::model::DEFAULT_UNACCEPTABLE_EXTENSIONS;
+        use crate::schema_migrations::unwanted_extensions_v56::SCHEMA_VERSION;
+
+        let restored_list = |saved: &str, source_schema_version: i64| {
+            let source = Database::open_in_memory().unwrap();
+            source
+                .set_setting("post_processing.settings.v2", saved)
+                .unwrap();
+            let archive = source.export_logical_backup().unwrap();
+            let tables = archive.staging.path().join("tables");
+            let target = Database::open_in_memory().unwrap();
+            target
+                .import_logical_backup(&tables, &archive.tables, source_schema_version)
+                .unwrap();
+            target
+                .post_processing_settings()
+                .unwrap()
+                .unacceptable_extensions
+        };
+        let empty = r#"{"executionEnabled":true,"concurrency":2,"terminationGraceSeconds":10,"pythonInterpreter":null,"powershellInterpreter":null,"batchInterpreter":null,"unacceptableExtensions":[]}"#;
+        let operator = r#"{"executionEnabled":true,"concurrency":2,"terminationGraceSeconds":10,"pythonInterpreter":null,"powershellInterpreter":null,"batchInterpreter":null,"unacceptableExtensions":["iso"]}"#;
+
+        assert_eq!(
+            restored_list(empty, SCHEMA_VERSION - 1),
+            DEFAULT_UNACCEPTABLE_EXTENSIONS.map(String::from).to_vec()
+        );
+        assert_eq!(
+            restored_list(operator, SCHEMA_VERSION - 1),
+            vec!["iso".to_string()]
+        );
+        // A bundle from a build that already shipped the default list carries
+        // an empty list only because the operator cleared it.
+        assert!(restored_list(empty, SCHEMA_VERSION).is_empty());
+    }
+
+    #[test]
+    fn named_secrets_and_their_links_round_trip_through_a_bundle() {
+        use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+        use crate::post_processing::model::{OptionValue, ScriptName};
+
+        let source = Database::open_in_memory().unwrap();
+        let token = source.create_secret("Mail token", "round-trip").unwrap();
+        let unused = source.create_secret("Spare", "unused").unwrap();
+        let instance = source
+            .create_script_instance(
+                ScriptInstanceDraft::new(
+                    ScriptName::new("notify.sh").unwrap(),
+                    InstanceTrigger::PostProcessing,
+                )
+                .input("Host", "mail.example.invalid")
+                .secret_input("Token", &token.id)
+                .sealed_input("Password", "kept-with-the-instance"),
+            )
+            .unwrap();
+        let archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        assert_eq!(archive.tables["secrets"].rows, 2);
+        // The bundle carries the value sealed, never in clear.
+        let rows = read_table_objects(archive.staging.path(), "secrets").unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| !serde_json::to_string(row).unwrap().contains("round-trip"))
+        );
+        // So it does a secret of the instance's own, in the instance's row.
+        let rows = read_table_objects(archive.staging.path(), "script_instance_inputs").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| {
+            !serde_json::to_string(row)
+                .unwrap()
+                .contains("kept-with-the-instance")
+        }));
+        let own = rows.iter().find(|row| row["name"] == "Password").unwrap();
+        assert_eq!(own["value"], "");
+        assert!(crate::persistence::encryption::is_encrypted(
+            own["sealed_value"].as_str().unwrap()
+        ));
+
+        let mut target = Database::open_in_memory().unwrap();
+        target.set_encryption_key(source.encryption_key().unwrap().clone());
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap();
+        let restored = target.secrets().unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|secret| (
+                    secret.id.as_str(),
+                    secret.name.as_str(),
+                    secret.used_by.len()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (token.id.as_str(), "Mail token", 1),
+                (unused.id.as_str(), "Spare", 0),
+            ]
+        );
+        assert_eq!(
+            target.script_instance(&instance.id).unwrap().unwrap(),
+            instance
+        );
+        let run = target
+            .script_instance_run_inputs(&instance.id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            run[1].value(),
+            OptionValue::Secret(value) if value.expose_for_execution() == "round-trip"
+        ));
+        // The instance's own secret came back with it, and no named secret
+        // was made of it.
+        assert!(
+            target
+                .script_instance(&instance.id)
+                .unwrap()
+                .unwrap()
+                .inputs[2]
+                .sealed
+        );
+        assert!(matches!(
+            run[2].value(),
+            OptionValue::Secret(value)
+                if value.expose_for_execution() == "kept-with-the-instance"
+        ));
+        target
+            .validate_encrypted_credentials(source.encryption_key().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_restore_replaces_linked_secrets_already_on_the_target() {
+        use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+        use crate::post_processing::model::{OptionValue, ScriptName};
+
+        let draft = |script: &str| {
+            ScriptInstanceDraft::new(
+                ScriptName::new(script).unwrap(),
+                InstanceTrigger::PostProcessing,
+            )
+        };
+        let source = Database::open_in_memory().unwrap();
+        let token = source.create_secret("Mail token", "from-bundle").unwrap();
+        let bundled = source
+            .create_script_instance(draft("notify.sh").secret_input("Token", &token.id))
+            .unwrap();
+        let archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+
+        // The target links secrets of its own, one of them under a name that
+        // differs from the bundle's only by case.
+        let mut target = Database::open_in_memory().unwrap();
+        target.set_encryption_key(source.encryption_key().unwrap().clone());
+        let clash = target.create_secret("MAIL TOKEN", "on-target").unwrap();
+        let other = target.create_secret("Other", "on-target").unwrap();
+        let local = target
+            .create_script_instance(
+                draft("local.sh")
+                    .secret_input("Token", &clash.id)
+                    .secret_input("Other", &other.id),
+            )
+            .unwrap();
+        assert_ne!(clash.id, token.id);
+
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap();
+
+        let restored = target.secrets().unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|secret| (
+                    secret.id.as_str(),
+                    secret.name.as_str(),
+                    secret
+                        .used_by
+                        .iter()
+                        .map(|usage| usage.instance_id.as_str())
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            [(token.id.as_str(), "Mail token", vec![bundled.id.as_str()])]
+        );
+        assert_eq!(
+            target.script_instances().unwrap(),
+            std::slice::from_ref(&bundled)
+        );
+        assert!(target.script_instance(&local.id).unwrap().is_none());
+        assert!(matches!(
+            target.script_instance_run_inputs(&bundled.id).unwrap().unwrap()[0].value(),
+            OptionValue::Secret(value) if value.expose_for_execution() == "from-bundle"
+        ));
     }
 
     #[test]

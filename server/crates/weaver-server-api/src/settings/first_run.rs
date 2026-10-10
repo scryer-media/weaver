@@ -1,15 +1,15 @@
-//! The first-run setup wizard's one piece of server state.
-//!
-//! The wizard walks a new install through its first provider and a look at its
-//! folders and categories, straight after the access choice. Whether it is
-//! still owed is kept here rather than in the browser, so a second browser
-//! does not start it over and a finished install never sees it again.
-//!
-//! An install that has never recorded a stage owes the wizard only while it
-//! has no provider: an install upgraded from before the wizard existed already
-//! has one, and is left alone. Beginning records `started`, which keeps the
-//! wizard open across a reload once its own first step has added a provider;
-//! finishing — or skipping — records `complete`, which ends it for good.
+// The first-run setup wizard's one piece of server state.
+//
+// The wizard walks a new install through its first provider and a look at its
+// folders and categories, straight after the access choice. Whether it is
+// still owed is kept here rather than in the browser, so a second browser
+// does not start it over and a finished install never sees it again.
+//
+// An install that has never recorded a stage owes the wizard only while it
+// has no provider: an install upgraded from before the wizard existed already
+// has one, and is left alone. Beginning records `started`, which keeps the
+// wizard open across a reload once its own first step has added a provider;
+// finishing — or skipping — records `complete`, which ends it for good.
 
 use async_graphql::SimpleObject;
 use weaver_server_core::Database;
@@ -65,8 +65,8 @@ pub(crate) async fn status(
     })
 }
 
-/// Hold the wizard open until it is finished. Only a wizard that is actually
-/// owed is recorded, so a stray call cannot reopen a finished install.
+// Hold the wizard open until it is finished. Only a wizard that is actually
+// owed is recorded, so a stray call cannot reopen a finished install.
 pub(crate) async fn begin(
     db: &Database,
     config: &SharedConfig,

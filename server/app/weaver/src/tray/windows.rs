@@ -1,10 +1,10 @@
-//! The Windows desktop wrapper: a notification-area icon and a WebView2 window.
-//!
-//! The tray window itself is invisible and exists only to own the shell icon,
-//! the popup menu, and the messages `weaver.exe` posts back to its supervisor.
-//! The app window is separate, created on first use, and hidden rather than
-//! destroyed when the user closes it — which is what makes reopening instant
-//! and what keeps the tray alive after the last window is gone.
+// The Windows desktop wrapper: a notification-area icon and a WebView2 window.
+//
+// The tray window itself is invisible and exists only to own the shell icon,
+// the popup menu, and the messages `weaver.exe` posts back to its supervisor.
+// The app window is separate, created on first use, and hidden rather than
+// destroyed when the user closes it — which is what makes reopening instant
+// and what keeps the tray alive after the last window is gone.
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
@@ -90,81 +90,82 @@ use crate::windows_startup::{register_startup, startup_enabled, unregister_start
 
 const MUTEX_NAMESPACE: &str = "Global\\ScryerMedia.Weaver.Desktop.v1.Tray.";
 const WEAVER_ICON_RESOURCE_ID: usize = 1;
-/// The notification icon's id within this window. There is only ever one, and
-/// every `NOTIFYICONDATAW` and `NOTIFYICONIDENTIFIER` has to name the same one.
+// The notification icon's id within this window. There is only ever one, and
+// every `NOTIFYICONDATAW` and `NOTIFYICONIDENTIFIER` has to name the same one.
 const TRAY_ICON_ID: u32 = 1;
-/// The app window's own class. It is private to this process, and versioned
-/// like the tray class so a future layout change cannot be handed a window
-/// created by an older build.
+// The app window's own class. It is private to this process, and versioned
+// like the tray class so a future layout change cannot be handed a window
+// created by an older build.
 const APP_WINDOW_CLASS: &str = "ScryerMedia.Weaver.Desktop.v1.AppWindow";
-/// The hover flyout's own class, versioned for the same reason.
+// The hover flyout's own class, versioned for the same reason.
 const FLYOUT_WINDOW_CLASS: &str = "ScryerMedia.Weaver.Desktop.v1.Flyout";
-/// How long the tray waits for a server that asked to be restarted to
-/// actually exit before it stops waiting and kills the child.
+// How long the tray waits for a server that asked to be restarted to
+// actually exit before it stops waiting and kills the child.
 const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The app window's default size, and the smallest window WebView2 is asked to
-/// lay the UI out in. These are logical (96-DPI) pixels; `create_app_window`
-/// scales them by the system DPI so the window never opens below this size on
-/// a high-density display.
+// The app window's default size, and the smallest window WebView2 is asked to
+// lay the UI out in. These are logical (96-DPI) pixels; `create_app_window`
+// scales them by the system DPI so the window never opens below this size on
+// a high-density display.
 const APP_WINDOW_WIDTH: i32 = 1280;
 const APP_WINDOW_HEIGHT: i32 = 800;
 
-/// Caption colors mirror the web UI's `--background`/`--foreground` tokens
-/// (apps/weaver-web/src/globals.css) so the title bar reads as part of the
-/// page. COLORREF byte order is 0x00BBGGRR.
+// Caption colors for the app window's title bar, one pair per system
+// appearance. They predate the web UI's current palette (apps/weaver-web/src/next/theme.css,
+// whose ground is #1a1b1e in both appearances). COLORREF byte order is
+// 0x00BBGGRR.
 const CAPTION_DARK_BACKGROUND: u32 = 0x0014_0905; // #050914
 const CAPTION_DARK_TEXT: u32 = 0x00FF_E5DB; // #dbe5ff
 const CAPTION_LIGHT_BACKGROUND: u32 = 0x00FC_F9F8; // #f8f9fc
 const CAPTION_LIGHT_TEXT: u32 = 0x002A_170F; // #0f172a
 
-/// The WebView2 profile lives under the desktop profile directory, never
-/// beside the executable: the wrapper is installed into Program Files, where
-/// WebView2's default user-data folder would be unwritable and environment
-/// creation would fail for every user.
+// The WebView2 profile lives under the desktop profile directory, never
+// beside the executable: the wrapper is installed into Program Files, where
+// WebView2's default user-data folder would be unwritable and environment
+// creation would fail for every user.
 const WEBVIEW_USER_DATA_DIR: &str = "WebView2";
 
-/// The hover flyout's geometry, in logical (96-DPI) pixels. Every value is the
-/// macOS popover's: the same 300-point width, its 14-point inset, the 10 points
-/// between its blocks and the 3 points inside a row. `flyout_metrics` scales
-/// them for the display.
+// The hover flyout's geometry, in logical (96-DPI) pixels. Every value is the
+// macOS popover's: the same 300-point width, its 14-point inset, the 10 points
+// between its blocks and the 3 points inside a row. `flyout_metrics` scales
+// them for the display.
 const FLYOUT_WIDTH: i32 = shared::POPOVER_WIDTH as i32;
 const FLYOUT_PADDING: i32 = 14;
 const FLYOUT_BLOCK_GAP: i32 = 10;
 const FLYOUT_ROW_GAP: i32 = 3;
-/// The progress bar's height, and how far the flyout sits from the icon.
+// The progress bar's height, and how far the flyout sits from the icon.
 const FLYOUT_BAR_HEIGHT: i32 = 6;
 const FLYOUT_ICON_GAP: i32 = 8;
 
-/// Timer ids. The poll timer runs on the tray window and the close timer on the
-/// flyout, so they could share an id; they do not, because a single id space
-/// is what makes a stray `KillTimer` impossible to get wrong. The smoke
-/// watchdog's id 1 belongs to a window neither of these ever sees.
+// Timer ids. The poll timer runs on the tray window and the close timer on the
+// flyout, so they could share an id; they do not, because a single id space
+// is what makes a stray `KillTimer` impossible to get wrong. The smoke
+// watchdog's id 1 belongs to a window neither of these ever sees.
 const FLYOUT_POLL_TIMER: usize = 100;
 const FLYOUT_CLOSE_TIMER: usize = 101;
 
-/// How often the tray looks for a finished fetch while the flyout is up, and
-/// how often it asks the server again. Nothing is polled while the flyout is
-/// hidden, so an idle tray makes no requests at all.
+// How often the tray looks for a finished fetch while the flyout is up, and
+// how often it asks the server again. Nothing is polled while the flyout is
+// hidden, so an idle tray makes no requests at all.
 const FLYOUT_POLL_INTERVAL_MS: u32 = 200;
 const FLYOUT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-/// How long the flyout survives the pointer leaving it. The gap between the
-/// icon and the flyout is crossed with the pointer inside neither, so closing
-/// immediately would make the flyout unreachable.
+// How long the flyout survives the pointer leaving it. The gap between the
+// icon and the flyout is crossed with the pointer inside neither, so closing
+// immediately would make the flyout unreachable.
 const FLYOUT_CLOSE_GRACE_MS: u32 = 250;
 
-/// What the flyout shows before the first fetch has answered — the same line
-/// the macOS popover shows in the same moment.
+// What the flyout shows before the first fetch has answered — the same line
+// the macOS popover shows in the same moment.
 const FLYOUT_PLACEHOLDER: &str = "Checking Weaver…";
 
-/// `NIN_KEYSELECT`, which windows-sys does not name: the notification the shell
-/// sends when the icon is chosen from the keyboard rather than the mouse. It is
-/// `NIN_SELECT + 1` in `shellapi.h` and has been since the notification area
-/// gained keyboard access.
+// `NIN_KEYSELECT`, which windows-sys does not name: the notification the shell
+// sends when the icon is chosen from the keyboard rather than the mouse. It is
+// `NIN_SELECT + 1` in `shellapi.h` and has been since the notification area
+// gained keyboard access.
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 
-/// The virtual key for Ctrl+W, which hides the app window. `VK_W` has no name
-/// in the Windows headers either: the letter keys are their ASCII codes.
+// The virtual key for Ctrl+W, which hides the app window. `VK_W` has no name
+// in the Windows headers either: the letter keys are their ASCII codes.
 const HIDE_WINDOW_VIRTUAL_KEY: u32 = b'W' as u32;
 
 const MENU_OPEN: u32 = 1;
@@ -324,12 +325,12 @@ fn launch_mode() -> Result<LaunchMode, String> {
     }
 }
 
-/// Have the shell read its icons again.
-///
-/// An upgrade replaces the executable in place, and the shell keys its icon
-/// cache on the path: the Start menu, the taskbar and the shortcut go on
-/// showing the icon the previous version carried until something says icons
-/// changed. Asked for once per upgrade, since every shell window redraws.
+// Have the shell read its icons again.
+//
+// An upgrade replaces the executable in place, and the shell keys its icon
+// cache on the path: the Start menu, the taskbar and the shortcut go on
+// showing the icon the previous version carried until something says icons
+// changed. Asked for once per upgrade, since every shell window redraws.
 fn refresh_shell_icons() {
     // SAFETY: This event takes no items, so both item pointers are null.
     unsafe {
@@ -342,12 +343,12 @@ fn refresh_shell_icons() {
     };
 }
 
-/// Put this thread into a single-threaded apartment for WebView2.
-///
-/// The result is deliberately discarded: already-initialized is not a
-/// failure, and a genuinely broken COM apartment surfaces moments later as a
-/// WebView2 environment-creation error, which already falls back to the
-/// browser.
+// Put this thread into a single-threaded apartment for WebView2.
+//
+// The result is deliberately discarded: already-initialized is not a
+// failure, and a genuinely broken COM apartment surfaces moments later as a
+// WebView2 environment-creation error, which already falls back to the
+// browser.
 fn initialize_com() {
     // SAFETY: This is the tray's only thread and it stays in this apartment
     // for the process lifetime.
@@ -445,16 +446,16 @@ fn shutdown_existing_instance() -> Result<(), String> {
     Err("timed out waiting for the existing Weaver tray to stop".to_string())
 }
 
-/// How often, and how far apart, an uninstall tries to remove the profile.
-/// WebView2's browser processes outlive the tray by a moment and hold its
-/// data open until they exit.
+// How often, and how far apart, an uninstall tries to remove the profile.
+// WebView2's browser processes outlive the tray by a moment and hold its
+// data open until they exit.
 const PROFILE_REMOVAL_ATTEMPTS: u32 = 20;
 const PROFILE_REMOVAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Remove what Weaver keeps for this Windows user: the profile's database,
-/// logs and WebView2 data, and the Credential Manager key. The MSI runs this
-/// on uninstall once the tray has stopped. The uninstall may be silent, so
-/// nothing here may raise a dialog, and a leftover file must not fail it.
+// Remove what Weaver keeps for this Windows user: the profile's database,
+// logs and WebView2 data, and the Credential Manager key. The MSI runs this
+// on uninstall once the tray has stopped. The uninstall may be silent, so
+// nothing here may raise a dialog, and a leftover file must not fail it.
 fn uninstall_cleanup() {
     let profile_dir = match shared::desktop_profile_dir() {
         Ok(profile_dir) => profile_dir,
@@ -495,44 +496,44 @@ struct TrayState {
     supervisor: ServerSupervisor,
     login_start: bool,
     icon_added: bool,
-    /// The app window, once it has been created. It is created hidden and
-    /// shown by the WebView2 controller callback, so the window exists for a
-    /// moment before there is anything in it — reopening during that moment
-    /// shows an empty frame, which is what every WebView2 host does and is
-    /// still better than the alternative of ignoring the user's click.
+    // The app window, once it has been created. It is created hidden and
+    // shown by the WebView2 controller callback, so the window exists for a
+    // moment before there is anything in it — reopening during that moment
+    // shows an empty frame, which is what every WebView2 host does and is
+    // still better than the alternative of ignoring the user's click.
     app_window: Option<HWND>,
-    /// Set once the app window class has been registered with the system,
-    /// which may only happen once per process.
+    // Set once the app window class has been registered with the system,
+    // which may only happen once per process.
     app_class_registered: bool,
-    /// The hover flyout, created on first hover and then hidden and reused.
-    /// Destroying it per hover would throw away its fonts and its window every
-    /// time the pointer crossed the icon.
+    // The hover flyout, created on first hover and then hidden and reused.
+    // Destroying it per hover would throw away its fonts and its window every
+    // time the pointer crossed the icon.
     flyout: Option<HWND>,
     flyout_class_registered: bool,
-    /// Where the last hover happened, so a flyout that grows or shrinks with a
-    /// new snapshot stays anchored to the icon it was opened from.
+    // Where the last hover happened, so a flyout that grows or shrinks with a
+    // new snapshot stays anchored to the icon it was opened from.
     flyout_anchor: POINT,
-    /// Whether the poll timer is running. `SetTimer` on a live id restarts it
-    /// rather than failing, so this is what keeps a second hover from resetting
-    /// the refresh clock.
+    // Whether the poll timer is running. `SetTimer` on a live id restarts it
+    // rather than failing, so this is what keeps a second hover from resetting
+    // the refresh clock.
     queue_polling: bool,
-    /// Where a finished fetch leaves its result for the message loop to draw.
+    // Where a finished fetch leaves its result for the message loop to draw.
     queue_result: Arc<Mutex<Option<PopoverContent>>>,
-    /// The browser session the wrapper reuses across fetches. Only the fetch
-    /// thread touches it, and only one fetch runs at a time.
+    // The browser session the wrapper reuses across fetches. Only the fetch
+    // thread touches it, and only one fetch runs at a time.
     queue_cookie: Arc<Mutex<Option<String>>>,
     queue_fetching: Arc<AtomicBool>,
     queue_fetched_at: Option<Instant>,
-    /// Set once a fetch has answered, so a reopened flyout shows the last queue
-    /// rather than the placeholder again.
+    // Set once a fetch has answered, so a reopened flyout shows the last queue
+    // rather than the placeholder again.
     queue_answered: bool,
-    /// Whether the shell accepted `NOTIFYICON_VERSION_4` for the icon, which
-    /// decides which member of each click's message pair `tray_callback`
-    /// answers.
+    // Whether the shell accepted `NOTIFYICON_VERSION_4` for the icon, which
+    // decides which member of each click's message pair `tray_callback`
+    // answers.
     version4: bool,
-    /// Whether `TrackPopupMenu`'s modal loop is running. That loop dispatches
-    /// queued messages, so a second menu request arriving during it must be
-    /// dropped rather than opening a menu under the menu.
+    // Whether `TrackPopupMenu`'s modal loop is running. That loop dispatches
+    // queued messages, so a second menu request arriving during it must be
+    // dropped rather than opening a menu under the menu.
     menu_open: bool,
 }
 
@@ -651,7 +652,7 @@ impl TrayState {
         self.icon_added = false;
     }
 
-    /// Show the Weaver UI in the app window, starting the server first.
+    // Show the Weaver UI in the app window, starting the server first.
     fn open_weaver(&mut self, tray_window: HWND) -> Result<(), String> {
         // The window the user just asked for would come up over the flyout the
         // same pointer opened, so the flyout goes first — and without its
@@ -676,8 +677,8 @@ impl TrayState {
         }
     }
 
-    /// Open the Weaver UI in the user's default browser. This is also the
-    /// fallback whenever the embedded browser cannot be started.
+    // Open the Weaver UI in the user's default browser. This is also the
+    // fallback whenever the embedded browser cannot be started.
     fn open_in_browser(&mut self) -> Result<(), String> {
         self.wait_for_ready_server()?;
         open_target(&shared::app_url(self.supervisor.port()))
@@ -692,11 +693,11 @@ impl TrayState {
         Ok(())
     }
 
-    /// Create the app window and start WebView2 in it.
-    ///
-    /// Everything after the window itself is asynchronous: WebView2 delivers
-    /// its environment and controller through the message loop, so the tray
-    /// state is never borrowed across a nested message pump.
+    // Create the app window and start WebView2 in it.
+    //
+    // Everything after the window itself is asynchronous: WebView2 delivers
+    // its environment and controller through the message loop, so the tray
+    // state is never borrowed across a nested message pump.
     fn create_app_window(&mut self, tray_window: HWND) -> Result<(), String> {
         self.register_app_window_class()?;
         let user_data_folder = self.supervisor.profile_dir().join(WEBVIEW_USER_DATA_DIR);
@@ -753,8 +754,8 @@ impl TrayState {
         Ok(())
     }
 
-    /// WebView2 could not be started after the window already existed. Tear
-    /// the window down and fall back to the browser.
+    // WebView2 could not be started after the window already existed. Tear
+    // the window down and fall back to the browser.
     fn webview_failed(&mut self) {
         if let Some(window) = self.app_window.take() {
             // SAFETY: The window belongs to this process and nothing else
@@ -766,13 +767,13 @@ impl TrayState {
         }
     }
 
-    /// Restart a server that asked to be restarted from its own UI.
-    ///
-    /// Unlike the menu path, the server is already tearing itself down, so
-    /// the old process must be gone before the replacement starts:
-    /// `ServerSupervisor::start` returns early while the port still answers,
-    /// so starting without waiting would silently leave the user with no
-    /// server at all.
+    // Restart a server that asked to be restarted from its own UI.
+    //
+    // Unlike the menu path, the server is already tearing itself down, so
+    // the old process must be gone before the replacement starts:
+    // `ServerSupervisor::start` returns early while the port still answers,
+    // so starting without waiting would silently leave the user with no
+    // server at all.
     fn restart_requested_by_server(&mut self) -> Result<(), String> {
         self.supervisor.wait_for_exit(SERVER_EXIT_TIMEOUT);
         self.supervisor.start()?;
@@ -781,11 +782,11 @@ impl TrayState {
 
     // -- the hover flyout ----------------------------------------------------
 
-    /// Show the flyout beside the icon the pointer is on.
-    ///
-    /// A flyout that cannot be created is reported to the log and then
-    /// forgotten: a hover is not a request, and a modal dialog every time the
-    /// pointer crossed the notification area would be worse than no flyout.
+    // Show the flyout beside the icon the pointer is on.
+    //
+    // A flyout that cannot be created is reported to the log and then
+    // forgotten: a hover is not a request, and a modal dialog every time the
+    // pointer crossed the notification area would be worse than no flyout.
     fn show_flyout(&mut self, tray_window: HWND, anchor: POINT) {
         let flyout = match self.ensure_flyout() {
             Ok(flyout) => flyout,
@@ -815,8 +816,8 @@ impl TrayState {
         self.begin_queue_polling(tray_window);
     }
 
-    /// The pointer left the icon. It may be on its way into the flyout, which
-    /// cancels this by killing the timer from its own message procedure.
+    // The pointer left the icon. It may be on its way into the flyout, which
+    // cancels this by killing the timer from its own message procedure.
     fn schedule_flyout_close(&self) {
         if let Some(flyout) = self.flyout {
             // SAFETY: The flyout is a live window owned by this thread.
@@ -824,7 +825,7 @@ impl TrayState {
         }
     }
 
-    /// Close the flyout now, and stop asking the server anything.
+    // Close the flyout now, and stop asking the server anything.
     fn hide_flyout(&mut self, tray_window: HWND) {
         if let Some(flyout) = self.flyout {
             // SAFETY: The flyout is a live window owned by this thread.
@@ -876,9 +877,9 @@ impl TrayState {
         Ok(())
     }
 
-    /// Size the flyout to whatever it is currently showing and put it beside
-    /// the icon. A snapshot with fewer rows than the last one shrinks the
-    /// window rather than leaving empty space under the queue.
+    // Size the flyout to whatever it is currently showing and put it beside
+    // the icon. A snapshot with fewer rows than the last one shrinks the
+    // window rather than leaving empty space under the queue.
     fn place_flyout(&self, tray_window: HWND, flyout: HWND) {
         let Some((width, height)) = flyout_size(flyout) else {
             return;
@@ -920,11 +921,11 @@ impl TrayState {
         self.queue_polling = false;
     }
 
-    /// Timer tick: draw whatever the fetch thread has left, and start the next
-    /// fetch once the current answer is stale.
-    ///
-    /// The flyout closes itself after its own grace period, so this is also
-    /// where the tray notices that it has, and stops polling.
+    // Timer tick: draw whatever the fetch thread has left, and start the next
+    // fetch once the current answer is stale.
+    //
+    // The flyout closes itself after its own grace period, so this is also
+    // where the tray notices that it has, and stops polling.
     fn poll_queue(&mut self, tray_window: HWND) {
         let Some(flyout) = self.flyout else {
             self.stop_queue_polling(tray_window);
@@ -958,8 +959,8 @@ impl TrayState {
         }
     }
 
-    /// Fetch off the message loop's thread. A tray that stalls while a socket
-    /// times out is worse than a flyout that fills in a moment late.
+    // Fetch off the message loop's thread. A tray that stalls while a socket
+    // times out is worse than a flyout that fills in a moment late.
     fn spawn_queue_fetch(&mut self) {
         let port = self.supervisor.port();
         let result = Arc::clone(&self.queue_result);
@@ -1086,8 +1087,8 @@ impl TrayState {
         register_startup(&executable)
     }
 
-    /// Tear down everything the tray owns. The app window goes first so its
-    /// WebView2 controller is closed while the apartment is still alive.
+    // Tear down everything the tray owns. The app window goes first so its
+    // WebView2 controller is closed while the apartment is still alive.
     unsafe fn shut_down(&mut self, window: HWND) {
         self.stop_queue_polling(window);
         if let Some(flyout) = self.flyout.take() {
@@ -1158,21 +1159,21 @@ unsafe extern "system" fn window_proc(
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
-/// Decode one shell notification-icon callback.
-///
-/// Under `NOTIFYICON_VERSION_4` the event is the low word of `lparam` and the
-/// icon id is the high word; under the legacy encoding the whole of `lparam` is
-/// the event and the high word is zero, so masking to the low word reads both.
-/// That matters because `NIM_SETVERSION` is allowed to fail.
-///
-/// Left-click arrives as `WM_LBUTTONUP` on the legacy encoding and as
-/// `NIN_SELECT` on version 4, and right-click as `WM_RBUTTONUP` and
-/// `WM_CONTEXTMENU` respectively — and a version-4 shell sends both members of
-/// each pair per click. The legacy member is therefore only answered while the
-/// icon is actually on the legacy encoding. Answering both would run each
-/// action twice, and for the menu twice is not idempotent: `TrackPopupMenu`
-/// pumps messages, so the second callback would re-enter the menu under the
-/// first one.
+// Decode one shell notification-icon callback.
+//
+// Under `NOTIFYICON_VERSION_4` the event is the low word of `lparam` and the
+// icon id is the high word; under the legacy encoding the whole of `lparam` is
+// the event and the high word is zero, so masking to the low word reads both.
+// That matters because `NIM_SETVERSION` is allowed to fail.
+//
+// Left-click arrives as `WM_LBUTTONUP` on the legacy encoding and as
+// `NIN_SELECT` on version 4, and right-click as `WM_RBUTTONUP` and
+// `WM_CONTEXTMENU` respectively — and a version-4 shell sends both members of
+// each pair per click. The legacy member is therefore only answered while the
+// icon is actually on the legacy encoding. Answering both would run each
+// action twice, and for the menu twice is not idempotent: `TrackPopupMenu`
+// pumps messages, so the second callback would re-enter the menu under the
+// first one.
 fn tray_callback(
     state: &mut TrayState,
     window: HWND,
@@ -1196,8 +1197,8 @@ fn tray_callback(
     }
 }
 
-/// The screen point version 4 packs into `wparam`. The coordinates are signed:
-/// a monitor left of or above the primary one has negative ones.
+// The screen point version 4 packs into `wparam`. The coordinates are signed:
+// a monitor left of or above the primary one has negative ones.
 fn callback_anchor(wparam: WPARAM) -> POINT {
     POINT {
         x: i32::from(wparam as u16 as i16),
@@ -1209,19 +1210,19 @@ fn callback_anchor(wparam: WPARAM) -> POINT {
 // The app window
 // ---------------------------------------------------------------------------
 
-/// What the app window owns on behalf of WebView2.
-///
-/// The controller has to be reachable from the window procedure — it is what
-/// resizes the browser when the window resizes — and it has to be released
-/// before the window goes away, so the window itself owns it.
+// What the app window owns on behalf of WebView2.
+//
+// The controller has to be reachable from the window procedure — it is what
+// resizes the browser when the window resizes — and it has to be released
+// before the window goes away, so the window itself owns it.
 struct AppWindowState {
     controller: Option<ICoreWebView2Controller>,
 }
 
-/// Create the app window, hidden and centred on the primary display.
-///
-/// It stays hidden until WebView2 has something to show in it: a visible empty
-/// frame while the browser starts looks like a broken app.
+// Create the app window, hidden and centred on the primary display.
+//
+// It stays hidden until WebView2 has something to show in it: a visible empty
+// frame while the browser starts looks like a broken app.
 fn create_app_window(width: i32, height: i32, title: &str) -> Result<HWND, String> {
     let class_name = wide(APP_WINDOW_CLASS);
     let title = wide(title);
@@ -1284,11 +1285,11 @@ fn create_app_window(width: i32, height: i32, title: &str) -> Result<HWND, Strin
     Ok(window)
 }
 
-/// Match the window chrome to the web UI: the caption bar in Weaver's
-/// background color, caption buttons in the matching light or dark style, and
-/// rounded corners while the window is not maximized (DWM squares them itself
-/// on maximize). Every attribute is best-effort — Windows 10's DWM rejects
-/// the newer ones, and the stock chrome is an acceptable fallback.
+// Match the window chrome to the web UI: the caption bar in Weaver's
+// background color, caption buttons in the matching light or dark style, and
+// rounded corners while the window is not maximized (DWM squares them itself
+// on maximize). Every attribute is best-effort — Windows 10's DWM rejects
+// the newer ones, and the stock chrome is an acceptable fallback.
 fn apply_window_chrome(window: HWND) {
     let dark = !apps_use_light_theme();
     let dark_mode: i32 = i32::from(dark);
@@ -1328,10 +1329,10 @@ fn apply_window_chrome(window: HWND) {
     }
 }
 
-/// Whether Windows is set to light app mode. The web UI follows the same
-/// switch through `prefers-color-scheme`, so the chrome tracking it keeps the
-/// caption and the page in one theme. A missing value means light, matching
-/// Windows' own default.
+// Whether Windows is set to light app mode. The web UI follows the same
+// switch through `prefers-color-scheme`, so the chrome tracking it keeps the
+// caption and the page in one theme. A missing value means light, matching
+// Windows' own default.
 fn apps_use_light_theme() -> bool {
     let mut key: HKEY = ptr::null_mut();
     let key_path = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
@@ -1368,8 +1369,8 @@ fn apps_use_light_theme() -> bool {
     status != 0 || value != 0
 }
 
-/// Whether Ctrl is held right now. The high bit of the key state is the one
-/// that means "down"; the low bit is the toggle state, which Ctrl does not have.
+// Whether Ctrl is held right now. The high bit of the key state is the one
+// that means "down"; the low bit is the toggle state, which Ctrl does not have.
 fn control_is_down() -> bool {
     // SAFETY: GetKeyState has no failure mode.
     (unsafe { GetKeyState(i32::from(VK_CONTROL)) } as u16) & 0x8000 != 0
@@ -1384,12 +1385,12 @@ fn show_and_focus(window: HWND) {
     }
 }
 
-/// Ask WebView2 for an environment and a controller for `window`.
-///
-/// Both steps are asynchronous. The completion handlers run from the tray's
-/// own message loop, so they can safely reach back into the window's state —
-/// but not into the tray's, which is why a failure is reported by posting a
-/// message rather than by touching `TrayState` from here.
+// Ask WebView2 for an environment and a controller for `window`.
+//
+// Both steps are asynchronous. The completion handlers run from the tray's
+// own message loop, so they can safely reach back into the window's state —
+// but not into the tray's, which is why a failure is reported by posting a
+// message rather than by touching `TrayState` from here.
 fn start_webview(
     tray_window: HWND,
     window: HWND,
@@ -1458,7 +1459,7 @@ fn start_webview(
     .map_err(|error| format!("the WebView2 runtime could not be started: {error}"))
 }
 
-/// Wire a freshly created controller into the app window and navigate it.
+// Wire a freshly created controller into the app window and navigate it.
 fn attach_controller(
     window: HWND,
     controller: &ICoreWebView2Controller,
@@ -1692,12 +1693,12 @@ unsafe extern "system" fn app_window_proc(
 // The hover flyout
 // ---------------------------------------------------------------------------
 
-/// What the flyout window owns: the snapshot it draws, and the fonts and
-/// measurements it draws it with.
-///
-/// The tray writes the snapshot in and then invalidates the window; it never
-/// holds a reference to this across a call that could reach the window
-/// procedure, which is what keeps the two from aliasing it.
+// What the flyout window owns: the snapshot it draws, and the fonts and
+// measurements it draws it with.
+//
+// The tray writes the snapshot in and then invalidates the window; it never
+// holds a reference to this across a call that could reach the window
+// procedure, which is what keeps the two from aliasing it.
 struct FlyoutState {
     content: PopoverContent,
     fonts: FlyoutFonts,
@@ -1710,8 +1711,8 @@ struct FlyoutFonts {
     detail: HFONT,
 }
 
-/// Every distance the flyout is laid out with, in physical pixels for the
-/// display it was created on.
+// Every distance the flyout is laid out with, in physical pixels for the
+// display it was created on.
 #[derive(Clone, Copy)]
 struct FlyoutMetrics {
     width: i32,
@@ -1725,8 +1726,8 @@ struct FlyoutMetrics {
     detail_line: i32,
 }
 
-/// One drawn element. Rows past the end of the queue produce no block at all,
-/// which is what takes them out of the height as well as out of the paint.
+// One drawn element. Rows past the end of the queue produce no block at all,
+// which is what takes them out of the height as well as out of the paint.
 enum FlyoutBlock<'a> {
     Status(&'a str),
     Message(&'a str),
@@ -1774,8 +1775,8 @@ fn flyout_height(content: &PopoverContent, metrics: &FlyoutMetrics) -> i32 {
     metrics.padding * 2 + blocks_height + gaps
 }
 
-/// Create the flyout, hidden, sized to nothing. Every later show sizes it to
-/// the snapshot it is about to draw.
+// Create the flyout, hidden, sized to nothing. Every later show sizes it to
+// the snapshot it is about to draw.
 fn create_flyout_window() -> Result<HWND, String> {
     let class_name = wide(FLYOUT_WINDOW_CLASS);
     // The process is per-monitor-DPI-aware, so every metric below is in
@@ -1842,13 +1843,13 @@ fn create_flyout_window() -> Result<HWND, String> {
     Ok(window)
 }
 
-/// The fonts and distances the flyout draws with on a display of `dpi`.
-///
-/// `SystemParametersInfoForDpi` returns the shell's own message font already
-/// scaled for that density, which is what makes the flyout read as part of
-/// Windows rather than as an application's idea of a tooltip. The bold status
-/// line and the dimmer detail line are that font at the macOS popover's
-/// weights and relative sizes.
+// The fonts and distances the flyout draws with on a display of `dpi`.
+//
+// `SystemParametersInfoForDpi` returns the shell's own message font already
+// scaled for that density, which is what makes the flyout read as part of
+// Windows rather than as an application's idea of a tooltip. The bold status
+// line and the dimmer detail line are that font at the macOS popover's
+// weights and relative sizes.
 fn flyout_metrics(dpi: i32) -> (FlyoutFonts, FlyoutMetrics) {
     let mut non_client = NONCLIENTMETRICSW {
         cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
@@ -1912,7 +1913,7 @@ fn scale(value: i32, dpi: i32) -> i32 {
     value * dpi / 96
 }
 
-/// How tall one line of `font` is, measured in a device context of its own.
+// How tall one line of `font` is, measured in a device context of its own.
 fn line_height(font: HFONT, fallback: i32) -> i32 {
     if font.is_null() {
         return fallback;
@@ -1934,10 +1935,10 @@ fn line_height(font: HFONT, fallback: i32) -> i32 {
     if measured > 0 { measured } else { fallback }
 }
 
-/// The size the flyout's current snapshot needs.
-///
-/// The borrow of the window's state ends before the caller moves or repaints
-/// the window, so nothing the window procedure does can alias it.
+// The size the flyout's current snapshot needs.
+//
+// The borrow of the window's state ends before the caller moves or repaints
+// the window, so nothing the window procedure does can alias it.
 fn flyout_size(flyout: HWND) -> Option<(i32, i32)> {
     // SAFETY: The pointer was installed by WM_CREATE and cleared by WM_DESTROY,
     // so a null here means the window is already gone.
@@ -1963,14 +1964,14 @@ fn set_flyout_content(flyout: HWND, content: PopoverContent) {
     unsafe { (*state).content = content };
 }
 
-/// Put the flyout beside the notification icon, inside the work area of the
-/// monitor the pointer is on.
-///
-/// Above the icon when there is room — the taskbar is at the bottom of nearly
-/// every desktop — and below it otherwise, which is what a taskbar docked to
-/// the top needs. `Shell_NotifyIconGetRect` knows where the icon actually is,
-/// including inside the overflow flyout; the callback's own anchor point is the
-/// fallback for the shells that will not say.
+// Put the flyout beside the notification icon, inside the work area of the
+// monitor the pointer is on.
+//
+// Above the icon when there is room — the taskbar is at the bottom of nearly
+// every desktop — and below it otherwise, which is what a taskbar docked to
+// the top needs. `Shell_NotifyIconGetRect` knows where the icon actually is,
+// including inside the overflow flyout; the callback's own anchor point is the
+// fallback for the shells that will not say.
 fn position_flyout(flyout: HWND, anchor: POINT, icon: Option<RECT>, width: i32, height: i32) {
     let gap = icon_gap(flyout);
     let (center, above, below) = match icon {
@@ -2024,7 +2025,7 @@ fn work_area(point: POINT) -> RECT {
     })
 }
 
-/// Where the shell is currently drawing this process's notification icon.
+// Where the shell is currently drawing this process's notification icon.
 fn tray_icon_rect(tray_window: HWND) -> Option<RECT> {
     let identifier = NOTIFYICONIDENTIFIER {
         cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
@@ -2038,8 +2039,8 @@ fn tray_icon_rect(tray_window: HWND) -> Option<RECT> {
     (status == 0).then_some(rect)
 }
 
-/// The flyout's colors, from the same caption tokens as the app window's
-/// chrome, so the two surfaces are one theme.
+// The flyout's colors, from the same caption tokens as the app window's
+// chrome, so the two surfaces are one theme.
 struct FlyoutTheme {
     background: u32,
     text: u32,
@@ -2068,9 +2069,9 @@ impl FlyoutTheme {
     }
 }
 
-/// Mix two colors channel by channel; `weight` is the percentage of
-/// `foreground` in the result. COLORREF byte order is 0x00BBGGRR, so the
-/// channels are taken and put back in that same order.
+// Mix two colors channel by channel; `weight` is the percentage of
+// `foreground` in the result. COLORREF byte order is 0x00BBGGRR, so the
+// channels are taken and put back in that same order.
 fn blend(foreground: u32, background: u32, weight: u32) -> u32 {
     let weight = weight.min(100);
     let mut mixed = 0u32;
@@ -2173,11 +2174,11 @@ unsafe extern "system" fn flyout_window_proc(
     }
 }
 
-/// Paint the flyout through a bitmap of its own.
-///
-/// The flyout repaints under the pointer every time a fetch answers, and a
-/// surface drawn straight onto the screen flashes its background once per
-/// repaint.
+// Paint the flyout through a bitmap of its own.
+//
+// The flyout repaints under the pointer every time a fetch answers, and a
+// surface drawn straight onto the screen flashes its background once per
+// repaint.
 unsafe fn paint_flyout(window: HWND, state: &FlyoutState) {
     let mut paint = PAINTSTRUCT::default();
     // SAFETY: `paint` is writable storage and the window is live.
@@ -2309,9 +2310,9 @@ fn draw_flyout(device: HDC, width: i32, height: i32, state: &FlyoutState) {
     }
 }
 
-/// One line of text, clipped to its rectangle with an ellipsis. Queue titles
-/// are longer than any flyout, so this is what keeps a release name from
-/// deciding the layout.
+// One line of text, clipped to its rectangle with an ellipsis. Queue titles
+// are longer than any flyout, so this is what keeps a release name from
+// deciding the layout.
 fn draw_line(device: HDC, font: HFONT, color: u32, mut bounds: RECT, text: &str) {
     let text = wide(text);
     // SAFETY: The font belongs to the flyout, the text is nul-terminated and
@@ -2359,11 +2360,11 @@ fn draw_progress(device: HDC, bounds: RECT, percent: f64, theme: &FlyoutTheme) {
 // `--webview-smoke`
 // ---------------------------------------------------------------------------
 
-/// Prove that this binary can start WebView2 and load a real network document,
-/// on a machine where no Weaver server is installed or running.
-///
-/// This is what catches a WebView2 runtime that is missing, a loader that did
-/// not link, or a user-data folder the process cannot write.
+// Prove that this binary can start WebView2 and load a real network document,
+// on a machine where no Weaver server is installed or running.
+//
+// This is what catches a WebView2 runtime that is missing, a loader that did
+// not link, or a user-data folder the process cannot write.
 mod smoke {
     use super::*;
 
@@ -2520,9 +2521,9 @@ mod smoke {
         }
     }
 
-    /// A real top-level window that is never shown. WebView2 needs a window to
-    /// parent its browser to; it does not need anyone to see it, which is what
-    /// makes this runnable on a build machine.
+    // A real top-level window that is never shown. WebView2 needs a window to
+    // parent its browser to; it does not need anyone to see it, which is what
+    // makes this runnable on a build machine.
     fn create_smoke_window() -> HWND {
         let class_name = wide("ScryerMedia.Weaver.Desktop.v1.SmokeWindow");
         let window_class = WNDCLASSW {
@@ -2564,13 +2565,13 @@ mod smoke {
         window
     }
 
-    /// Report a smoke failure and stop. The exit code is what CI reads; the
-    /// message is what a human reads when CI goes red.
-    ///
-    /// Both of these write through `writeln!` rather than `println!` because
-    /// `weaver-tray.exe` is a GUI-subsystem binary: it only has usable
-    /// standard handles when the process that started it supplied them, and a
-    /// panicking print would replace the real result with a confusing one.
+    // Report a smoke failure and stop. The exit code is what CI reads; the
+    // message is what a human reads when CI goes red.
+    //
+    // Both of these write through `writeln!` rather than `println!` because
+    // `weaver-tray.exe` is a GUI-subsystem binary: it only has usable
+    // standard handles when the process that started it supplied them, and a
+    // panicking print would replace the real result with a confusing one.
     fn fail(reason: &str) -> ! {
         use std::io::Write;
 
@@ -2743,9 +2744,9 @@ mod tests {
         assert_ne!(FLYOUT_WINDOW_CLASS, APP_WINDOW_CLASS);
     }
 
-    /// Every notification-icon event the tray answers has to reach a different
-    /// arm. `NIN_KEYSELECT` is spelled out here rather than imported because
-    /// windows-sys does not name it.
+    // Every notification-icon event the tray answers has to reach a different
+    // arm. `NIN_KEYSELECT` is spelled out here rather than imported because
+    // windows-sys does not name it.
     #[test]
     fn every_tray_callback_event_is_distinct() {
         let events = [
@@ -2772,9 +2773,9 @@ mod tests {
         assert_ne!(FLYOUT_CLOSE_TIMER, 1);
     }
 
-    /// Version 4 packs the anchor into `wparam` as two signed 16-bit
-    /// coordinates: a monitor left of or above the primary one has negative
-    /// ones, and reading them unsigned would put the flyout off the desktop.
+    // Version 4 packs the anchor into `wparam` as two signed 16-bit
+    // coordinates: a monitor left of or above the primary one has negative
+    // ones, and reading them unsigned would put the flyout off the desktop.
     #[test]
     fn the_callback_anchor_is_signed() {
         let packed = ((-40i16 as u16 as usize) << 16) | (-1200i16 as u16 as usize);

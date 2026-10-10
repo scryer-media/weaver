@@ -39,6 +39,7 @@ fn queue_page_job_display_name(info: &weaver_server_core::JobInfo) -> String {
 
 fn queue_display_state(state: QueueItemState) -> &'static str {
     match state {
+        QueueItemState::AwaitingQueueScripts => "AWAITING_QUEUE_SCRIPTS",
         QueueItemState::Queued => "QUEUED",
         QueueItemState::Downloading => "DOWNLOADING",
         QueueItemState::FetchingRepairData => "FETCHING_REPAIR_DATA",
@@ -199,6 +200,7 @@ fn queue_page_summary(
 
     for job in jobs {
         match queue_item_state_from_job_info(job) {
+            QueueItemState::AwaitingQueueScripts => summary.active_items += 1,
             QueueItemState::Queued => summary.queued_items += 1,
             QueueItemState::Paused => summary.paused_items += 1,
             QueueItemState::Failed => summary.failed_items += 1,
@@ -228,6 +230,27 @@ fn queue_page_summary(
 
 #[Object]
 impl JobsQuery {
+    #[graphql(guard = "crate::auth::AdminGuard")]
+    async fn validated_archive_password(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+    ) -> Result<Option<String>> {
+        let db = ctx.data::<Database>()?.clone();
+        Ok(tokio::task::spawn_blocking(move || db.validated_archive_password(id)).await??)
+    }
+
+    /// A report on a queued or finished job's NZB and how the job went, with
+    /// every name, path, host and password left out so it can be shared.
+    #[graphql(guard = "ReadGuard")]
+    async fn job_support_report(
+        &self,
+        ctx: &Context<'_>,
+        job_id: u64,
+    ) -> Result<crate::jobs::support_report::SupportReport> {
+        crate::jobs::support_report::resolve_job_support_report(ctx, job_id).await
+    }
+
     /// Public queue facade for active or in-flight items.
     #[graphql(guard = "ReadGuard")]
     async fn queue_items(

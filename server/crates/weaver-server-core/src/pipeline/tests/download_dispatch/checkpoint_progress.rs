@@ -102,7 +102,6 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     assert_eq!(pipeline.active_downloads, 0);
     assert_eq!(pipeline.active_download_connections, 0);
     assert!(pipeline.rate_limit_reservations.is_empty());
-    assert!(pipeline.bandwidth_reservations.is_empty());
     assert!(!pipeline.checkpoint_progress_articles.contains_key(&HOT));
     assert!(!pipeline.download_lane_owners.contains_key(&old_id));
     // Force reuse of the same segment to exercise the hardest stale-event
@@ -120,7 +119,6 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     assert_ne!(replacement, old_id);
     assert_eq!(replacement_segment, segment_id);
     let reservations = pipeline.rate_limit_reservations.clone();
-    let bandwidth = pipeline.bandwidth_reservations.clone();
     let late_result = |data| DownloadResult {
         lane_id: old_id,
         job_id: segment_id.file_id.job_id,
@@ -175,7 +173,6 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     assert_eq!(pipeline.active_downloads, 1);
     assert_eq!(pipeline.active_download_connections, 1);
     assert_eq!(pipeline.rate_limit_reservations, reservations);
-    assert_eq!(pipeline.bandwidth_reservations, bandwidth);
     assert_eq!(
         pipeline.checkpoint_progress_articles[&HOT],
         (replacement, segment_id)
@@ -230,7 +227,6 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
         assert!(!pipeline.job_last_download_activity.contains_key(&HOT));
         assert!(!pipeline.download_lane_owners.contains_key(&lane_id));
         assert!(pipeline.rate_limit_reservations.is_empty());
-        assert!(pipeline.bandwidth_reservations.is_empty());
         assert_eq!(pipeline.active_downloads, 0);
         assert_eq!(pipeline.active_download_connections, 0);
         let remaining = pipeline.rate_limiter.time_until_ready().as_secs_f64();

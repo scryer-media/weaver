@@ -23,8 +23,9 @@ pub mod schema_upgrade;
 pub mod security;
 pub mod servers;
 pub mod settings;
+pub mod support;
 pub mod update_check;
-/// Transitional, removed in 0.9.1. See the module docs.
+// Transitional, removed in 0.9.1. See the module docs.
 pub mod upgrade_compat;
 pub mod watch_folder;
 
@@ -41,15 +42,15 @@ pub use jobs::{
     DownloadBlockState, DownloadState, DuplicateAction, DuplicateAdmission,
     DuplicateAdmissionRequest, DuplicateBackfillEntry, DuplicateBackfillSource,
     DuplicateBackfillState, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary,
-    DuplicateMode, DuplicatePolicy, ExtractionChunk, FieldUpdate, FileSpec, FingerprintEvidence,
-    FingerprintKind, HardwareProfileInForce, HistoryDeleteOutcome, JobFingerprint, JobId, JobInfo,
-    JobPhase, JobPhaseProgress, JobSpec, JobState, JobStatus, JobUpdate, MessageId,
-    NntpRuntimeActivation, NzbFileId, PhaseCounters, PostState, QueueMoveTarget, RecoveredJob,
-    RestoreJobRequest, RunState, SchedulerCommand, SchedulerError, SchedulerHandle, SegmentId,
-    SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource, SemanticCandidateState,
-    SemanticDuplicate, SemanticDuplicateLifecycleEvent, SemanticPromotionClaim,
-    SemanticPromotionState, SemanticTerminalCause, ServerId, ServerTransportHealth,
-    SharedPipelineState, SubmissionOrigin, classify_semantic_terminal_cause,
+    DuplicateMode, DuplicatePolicy, EgressQuotaBlock, ExtractionChunk, FieldUpdate, FileSpec,
+    FingerprintEvidence, FingerprintKind, HardwareProfileInForce, HistoryDeleteOutcome,
+    JobFingerprint, JobId, JobInfo, JobPhase, JobPhaseProgress, JobSpec, JobState, JobStatus,
+    JobUpdate, MessageId, NntpRuntimeActivation, NzbFileId, PhaseCounters, PostState,
+    QueueMoveTarget, RecoveredJob, RestoreJobRequest, RunState, SchedulerCommand, SchedulerError,
+    SchedulerHandle, SegmentId, SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource,
+    SemanticCandidateState, SemanticDuplicate, SemanticDuplicateLifecycleEvent,
+    SemanticPromotionClaim, SemanticPromotionState, SemanticTerminalCause, ServerId,
+    ServerTransportHealth, SharedPipelineState, SubmissionOrigin, classify_semantic_terminal_cause,
     derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
     normalize_semantic_duplicate_key, record_semantic_duplicate_lifecycle_metric,
     runtime_lanes_from_status_snapshot, semantic_duplicate_lifecycle_metrics_snapshot,
@@ -88,12 +89,12 @@ pub use runtime::affinity::{
 pub use runtime::hardware_profile::{HardwareProfile, ProfileTuning};
 pub use runtime::tuning::{RuntimeTuner, TunedParameters};
 
-/// Allocation counter for the tests that assert a hot path allocates nothing.
-///
-/// Test builds only. It forwards every request to the system allocator and
-/// counts allocations *per thread*, which is the only way to prove from inside
-/// a multi-threaded test binary that one closure performed none: a
-/// process-wide counter would pick up every other test running beside it.
+// Allocation counter for the tests that assert a hot path allocates nothing.
+//
+// Test builds only. It forwards every request to the system allocator and
+// counts allocations *per thread*, which is the only way to prove from inside
+// a multi-threaded test binary that one closure performed none: a
+// process-wide counter would pick up every other test running beside it.
 #[cfg(test)]
 pub(crate) mod alloc_probe {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -127,7 +128,7 @@ pub(crate) mod alloc_probe {
         }
     }
 
-    /// Allocations the calling thread has made so far.
+    // Allocations the calling thread has made so far.
     pub(crate) fn allocations() -> u64 {
         ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
     }

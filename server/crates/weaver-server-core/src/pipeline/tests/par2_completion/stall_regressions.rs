@@ -298,8 +298,8 @@ async fn placement_occupied_unrelated_destination_does_not_rebind_or_partially_m
 // before its recovery lands.
 // ---------------------------------------------------------------------------
 
-/// Parks the verdict, then leaves the job in `status` with no extraction work
-/// in flight: the state a sibling set's finished extraction leaves behind.
+// Parks the verdict, then leaves the job in `status` with no extraction work
+// in flight: the state a sibling set's finished extraction leaves behind.
 async fn park_verdict_then_idle_extraction_phase(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -386,8 +386,8 @@ async fn a_landed_recovery_repairs_while_the_job_is_queued_for_extraction() {
     .await;
 }
 
-/// A live extraction still owns the job: the repair waits for its settlement,
-/// and the same verdict repairs once the extraction is idle.
+// A live extraction still owns the job: the repair waits for its settlement,
+// and the same verdict repairs once the extraction is idle.
 #[tokio::test]
 async fn a_landed_recovery_waits_for_a_live_extraction_then_repairs_on_the_same_verdict() {
     let temp_dir = tempfile::tempdir().unwrap();

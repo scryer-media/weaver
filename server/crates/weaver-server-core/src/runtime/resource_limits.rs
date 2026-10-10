@@ -1,13 +1,13 @@
 #[cfg(any(unix, test))]
 const OPEN_FILE_LIMIT_TARGETS: [u64; 4] = [65_536, 16_384, 4_096, 1_024];
 
-/// Raise the process open-file soft limit toward a practical ceiling.
-///
-/// macOS GUI processes commonly inherit a soft limit of 256 even when the
-/// kernel hard limit is much higher. Download sockets, direct-store writers,
-/// and a large PAR2 set can legitimately exceed that. Never cross the
-/// operator's hard limit, and keep running with the inherited limit when the
-/// platform refuses every candidate.
+// Raise the process open-file soft limit toward a practical ceiling.
+//
+// macOS GUI processes commonly inherit a soft limit of 256 even when the
+// kernel hard limit is much higher. Download sockets, direct-store writers,
+// and a large PAR2 set can legitimately exceed that. Never cross the
+// operator's hard limit, and keep running with the inherited limit when the
+// platform refuses every candidate.
 #[allow(clippy::unnecessary_cast)]
 pub fn raise_open_file_limit() -> u64 {
     #[cfg(unix)]

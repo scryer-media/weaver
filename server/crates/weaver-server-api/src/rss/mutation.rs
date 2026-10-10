@@ -14,6 +14,22 @@ pub(crate) struct RssMutation;
 
 #[Object]
 impl RssMutation {
+    #[graphql(guard = "AdminGuard")]
+    async fn preview_rss_feed(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<Vec<crate::rss::types::RssSeenItem>> {
+        let rows = ctx
+            .data::<RssService>()?
+            .preview_feed(id)
+            .await
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(crate::rss::types::RssSeenItem::from_row)
+            .collect())
+    }
     /// Add a new RSS feed.
     #[graphql(guard = "AdminGuard")]
     async fn add_rss_feed(&self, ctx: &Context<'_>, input: RssFeedInput) -> Result<RssFeed> {
@@ -26,15 +42,19 @@ impl RssMutation {
             None => None,
         };
         let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
-            input.routing.clone().map(Into::into);
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?;
         let _route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Rss(0),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
 
         let db = ctx.data::<Database>()?.clone();
         let feed = tokio::task::spawn_blocking(move || {
+            weaver_server_core::post_processing::feed::validate_feed_script_selection(
+                &db,
+                input.scripts.as_deref().unwrap_or_default(),
+            )?;
             let id = db.next_rss_feed_id()?;
             let row = rss_feed_row_from_create(id, input);
             db.insert_rss_feed_with_routing(&row, routing.as_ref())?;
@@ -69,11 +89,11 @@ impl RssMutation {
             None => None,
         };
         let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
-            input.routing.clone().map(Into::into);
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?;
         let _route = crate::proxies::draft_route(
             ctx,
             weaver_server_core::proxies::Consumer::Rss(id),
-            input.routing.clone(),
+            crate::networking::selected_policy(input.routing.clone(), input.route.clone())?,
         )?;
 
         let db = ctx.data::<Database>()?.clone();
@@ -84,6 +104,10 @@ impl RssMutation {
                 )));
             };
             let row = rss_feed_row_from_update(existing, input);
+            weaver_server_core::post_processing::feed::validate_feed_script_selection(
+                &db,
+                &row.scripts,
+            )?;
             db.update_rss_feed_with_routing(&row, routing.as_ref())?;
             let rules = db
                 .list_rss_rules(row.id)?
@@ -255,6 +279,7 @@ fn validate_rule_input(input: &RssRuleInput) -> Result<()> {
 
 fn rss_feed_row_from_create(id: u32, input: RssFeedInput) -> RssFeedRow {
     RssFeedRow {
+        scripts: input.scripts.unwrap_or_default(),
         id,
         name: input.name,
         url: input.url,
@@ -275,6 +300,7 @@ fn rss_feed_row_from_create(id: u32, input: RssFeedInput) -> RssFeedRow {
 
 fn rss_feed_row_from_update(existing: RssFeedRow, input: RssFeedInput) -> RssFeedRow {
     RssFeedRow {
+        scripts: input.scripts.unwrap_or(existing.scripts),
         id: existing.id,
         name: input.name,
         url: input.url,

@@ -1,16 +1,16 @@
-//! Per-stage timing of the whole-buffer article decode (`decode_nntp`), the
-//! path the download pipeline runs for every yEnc article.
-//!
-//! Splits one article into its stages (header and trailer location, field
-//! parsing, body decode, CRC) and times each in isolation, interleaved, so the
-//! difference between the article total and the body decode is attributed.
-//!
-//!   cargo run --release --example article_profile
-//!   cargo run --release --example article_profile -- mt <threads> <iters> [weaver|rapidyenc|rapidyenc-whole]
-//!   cargo run --release --example article_profile -- kernels
-//!
-//! With `WEAVER_RAPIDYENC_SRC` set, a rapidyenc lane times the same article
-//! driven the way sabctools drives rapidyenc, as a comparison point.
+// Per-stage timing of the whole-buffer article decode (`decode_nntp`), the
+// path the download pipeline runs for every yEnc article.
+//
+// Splits one article into its stages (header and trailer location, field
+// parsing, body decode, CRC) and times each in isolation, interleaved, so the
+// difference between the article total and the body decode is attributed.
+//
+//   cargo run --release --example article_profile
+//   cargo run --release --example article_profile -- mt <threads> <iters> [weaver|rapidyenc|rapidyenc-whole]
+//   cargo run --release --example article_profile -- kernels
+//
+// With `WEAVER_RAPIDYENC_SRC` set, a rapidyenc lane times the same article
+// driven the way sabctools drives rapidyenc, as a comparison point.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -66,7 +66,7 @@ fn med(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-/// A named timed closure and its per-round results.
+// A named timed closure and its per-round results.
 type Stage = (&'static str, Box<dyn FnMut()>, Vec<f64>);
 
 fn per_stage() {
@@ -312,16 +312,16 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// Input bytes per decoder call in the SAB-shape lane.
+// Input bytes per decoder call in the SAB-shape lane.
 #[cfg(rapidyenc_linked)]
 const SAB_CHUNK: usize = 64 * 1024;
 
-/// One article the way sabctools drives rapidyenc: header lines parsed one at
-/// a time by substring search until the body starts, the body decoded in
-/// `chunk`-byte pieces by the end-detecting decoder, its state carried from
-/// one call to the next, with the CRC folded per piece, then the `=yend` line
-/// parsed where the decoder stopped. Returns (bytes written, crc, crc
-/// expected) so nothing is optimised away.
+// One article the way sabctools drives rapidyenc: header lines parsed one at
+// a time by substring search until the body starts, the body decoded in
+// `chunk`-byte pieces by the end-detecting decoder, its state carried from
+// one call to the next, with the CRC folded per piece, then the `=yend` line
+// parsed where the decoder stopped. Returns (bytes written, crc, crc
+// expected) so nothing is optimised away.
 #[cfg(rapidyenc_linked)]
 fn rapidyenc_article(art: &[u8], out: &mut [u8], chunk: usize) -> (usize, u32, u32) {
     fn field(line: &[u8], key: &[u8]) -> Option<u64> {
@@ -383,9 +383,9 @@ fn rapidyenc_article(art: &[u8], out: &mut [u8], chunk: usize) -> (usize, u32, u
     (written, crc, expected)
 }
 
-/// The body decoders alone, with and without end detection, at several
-/// alignments of the body start, so the end-detection cost is separated from
-/// where the body happens to sit in the article buffer.
+// The body decoders alone, with and without end detection, at several
+// alignments of the body start, so the end-detection cost is separated from
+// where the body happens to sit in the article buffer.
 fn kernels() {
     let art = article();
     let (_, after_ypart, yend, _) = lines(&art);
@@ -506,8 +506,8 @@ fn kernels() {
     }
 }
 
-/// The `mt` lanes: weaver's `decode_nntp`, rapidyenc in the SAB shape, and
-/// rapidyenc fed the whole body in one call with the CRC after it.
+// The `mt` lanes: weaver's `decode_nntp`, rapidyenc in the SAB shape, and
+// rapidyenc fed the whole body in one call with the CRC after it.
 #[derive(Clone, Copy, PartialEq)]
 enum Lane {
     Weaver,

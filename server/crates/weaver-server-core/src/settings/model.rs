@@ -4,24 +4,23 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::bandwidth::IspBandwidthCapConfig;
 use crate::categories::CategoryConfig;
 use crate::jobs::DuplicatePolicy;
 use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
 use crate::watch_folder::WatchFolderConfig;
 
-/// Shared config handle for runtime reads and writes.
+// Shared config handle for runtime reads and writes.
 pub type SharedConfig = Arc<RwLock<Config>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub data_dir: String,
-    /// Directory for active downloads (per-job subdirectories).
-    /// Defaults to `{data_dir}/intermediate`.
+    // Directory for active downloads (per-job subdirectories).
+    // Defaults to `{data_dir}/intermediate`.
     pub intermediate_dir: Option<String>,
-    /// Directory for completed downloads (category subdirectories).
-    /// Defaults to `{data_dir}/complete`.
+    // Directory for completed downloads (category subdirectories).
+    // Defaults to `{data_dir}/complete`.
     pub complete_dir: Option<String>,
     #[serde(default)]
     pub buffer_pool: Option<BufferPoolOverrides>,
@@ -31,74 +30,71 @@ pub struct Config {
     pub categories: Vec<CategoryConfig>,
     #[serde(default)]
     pub retry: Option<RetryOverrides>,
-    /// Maximum download speed in bytes/sec. 0 or absent means unlimited.
+    // Maximum download speed in bytes/sec. 0 or absent means unlimited.
     #[serde(default)]
     pub max_download_speed: Option<u64>,
-    /// Minimum post age before downloading. Zero disables the hold.
+    // Minimum post age before downloading. Zero disables the hold.
     #[serde(default)]
     pub propagation_delay_secs: Option<u32>,
-    /// Whether to delete intermediate files (NZB articles, PAR2, RAR volumes)
-    /// after successful extraction. Defaults to true.
+    // Whether to delete intermediate files (NZB articles, PAR2, RAR volumes)
+    // after successful extraction. Defaults to true.
     #[serde(default)]
     pub cleanup_after_extract: Option<bool>,
-    /// Optional ISP bandwidth cap policy.
-    #[serde(default)]
-    pub isp_bandwidth_cap: Option<IspBandwidthCapConfig>,
-    /// Watched-folder NZB intake settings.
+    // Watched-folder NZB intake settings.
     #[serde(default)]
     pub watch_folder: WatchFolderConfig,
-    /// Duplicate admission handling policy.
+    // Duplicate admission handling policy.
     #[serde(default)]
     pub duplicate_policy: DuplicatePolicy,
-    /// RAR direct-store routing. Absent means "every default".
+    // RAR direct-store routing. Absent means "every default".
     #[serde(default)]
     pub direct_store: Option<DirectStoreOverrides>,
-    /// 7z and ZIP/ZIP64 direct unpack. Absent means "every default".
+    // 7z and ZIP/ZIP64 direct unpack. Absent means "every default".
     #[serde(default)]
     pub direct_unpack: Option<DirectUnpackOverrides>,
-    /// Naming policy for the files a finished job delivers. Absent means
-    /// "every default".
+    // Naming policy for the files a finished job delivers. Absent means
+    // "every default".
     #[serde(default)]
     pub delivery_naming: Option<DeliveryNamingOverrides>,
-    /// How hard Weaver leans on this machine. Absent means the operator has
-    /// never chosen one, and the machine's recommendation stands in.
+    // How hard Weaver leans on this machine. Absent means the operator has
+    // never chosen one, and the machine's recommendation stands in.
     #[serde(default)]
     pub hardware_profile: Option<HardwareProfile>,
-    /// Prometheus exposition knobs.
+    // Prometheus exposition knobs.
     #[serde(default)]
     pub metrics: MetricsConfig,
-    /// Path to the config file on disk. Not serialized to TOML.
+    // Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
 }
 
 impl Config {
-    /// Returns the intermediate directory for active downloads.
-    /// Defaults to `{data_dir}/intermediate`.
+    // Returns the intermediate directory for active downloads.
+    // Defaults to `{data_dir}/intermediate`.
     pub fn intermediate_dir(&self) -> String {
         self.intermediate_dir
             .clone()
             .unwrap_or_else(|| format!("{}/intermediate", self.data_dir))
     }
 
-    /// Returns the complete directory for finished downloads.
-    /// Defaults to `{data_dir}/complete`.
+    // Returns the complete directory for finished downloads.
+    // Defaults to `{data_dir}/complete`.
     pub fn complete_dir(&self) -> String {
         self.complete_dir
             .clone()
             .unwrap_or_else(|| format!("{}/complete", self.data_dir))
     }
 
-    /// Whether to clean up intermediate files after successful extraction.
-    /// Defaults to `true` when not explicitly configured.
+    // Whether to clean up intermediate files after successful extraction.
+    // Defaults to `true` when not explicitly configured.
     pub fn cleanup_after_extract(&self) -> bool {
         self.cleanup_after_extract.unwrap_or(true)
     }
 
-    /// Whether a finished job may rename a delivered member that still wears an
-    /// obfuscated name. Defaults to `true`: an obfuscated member is unusable to
-    /// every downstream tool, and the pass refuses itself whenever the job's own
-    /// name is no better.
+    // Whether a finished job may rename a delivered member that still wears an
+    // obfuscated name. Defaults to `true`: an obfuscated member is unusable to
+    // every downstream tool, and the pass refuses itself whenever the job's own
+    // name is no better.
     pub fn deobfuscate_delivered_members(&self) -> bool {
         self.delivery_naming
             .as_ref()
@@ -106,13 +102,13 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// Whether an obfuscated member may be looked up by CRC32 in the public
-    /// srrdb release index before falling back to the job's own name.
-    ///
-    /// Defaults to `false`. This is the only part of completion that leaves the
-    /// operator's network, so it stays an explicit opt-in even though the
-    /// request carries nothing but a checksum.
-    ///
+    // Whether an obfuscated member may be looked up by CRC32 in the public
+    // srrdb release index before falling back to the job's own name.
+    //
+    // Defaults to `false`. This is the only part of completion that leaves the
+    // operator's network, so it stays an explicit opt-in even though the
+    // request carries nothing but a checksum.
+    //
     pub fn enable_srrdb_lookup(&self) -> bool {
         self.delivery_naming
             .as_ref()
@@ -120,7 +116,7 @@ impl Config {
             .unwrap_or(false)
     }
 
-    /// A saved setting takes precedence over the legacy environment override.
+    // A saved setting takes precedence over the legacy environment override.
     pub fn propagation_delay_secs(&self) -> u32 {
         self.propagation_delay_secs
             .or_else(|| {
@@ -131,8 +127,8 @@ impl Config {
             .unwrap_or(0)
     }
 
-    /// Validate the configuration, returning any issues found.
-    /// Empty server list is allowed (users add servers via UI).
+    // Validate the configuration, returning any issues found.
+    // Empty server list is allowed (users add servers via UI).
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -166,7 +162,7 @@ impl Config {
         }
     }
 
-    /// Save the config back to disk.
+    // Save the config back to disk.
     pub fn save(&self) -> std::io::Result<()> {
         let path = self
             .config_path
@@ -176,12 +172,12 @@ impl Config {
         std::fs::write(path, toml_str)
     }
 
-    /// Return the next available server ID.
+    // Return the next available server ID.
     pub fn next_server_id(&self) -> u32 {
         self.servers.iter().map(|s| s.id).max().unwrap_or(0) + 1
     }
 
-    /// Assign IDs to any servers that have id == 0 (backward compat with old TOML files).
+    // Assign IDs to any servers that have id == 0 (backward compat with old TOML files).
     pub fn assign_server_ids(&mut self) {
         let mut next = self.next_server_id();
         for server in &mut self.servers {
@@ -192,12 +188,12 @@ impl Config {
         }
     }
 
-    /// Return the next available category ID.
+    // Return the next available category ID.
     pub fn next_category_id(&self) -> u32 {
         self.categories.iter().map(|c| c.id).max().unwrap_or(0) + 1
     }
 
-    /// Assign IDs to any categories that have id == 0.
+    // Assign IDs to any categories that have id == 0.
     pub fn assign_category_ids(&mut self) {
         let mut next = self.next_category_id();
         for cat in &mut self.categories {
@@ -209,102 +205,102 @@ impl Config {
     }
 }
 
-/// Operator-facing switches for RAR direct-store routing.
-///
-/// These answer the plan's open question 1 — config, not env-only — while
-/// keeping an env override for incident response. Precedence is
-/// **environment over config over default**, and it is resolved in
-/// `pipeline::direct_store::DirectStoreSettings::resolve`; see that type for
-/// the exact variable names.
-///
-/// Every field is optional so an absent `[direct_store]` table, a partially
-/// filled one and an older config file all mean "use the defaults".
+// Operator-facing switches for RAR direct-store routing.
+//
+// These answer the plan's open question 1 — config, not env-only — while
+// keeping an env override for incident response. Precedence is
+// **environment over config over default**, and it is resolved in
+// `pipeline::direct_store::DirectStoreSettings::resolve`; see that type for
+// the exact variable names.
+//
+// Every field is optional so an absent `[direct_store]` table, a partially
+// filled one and an older config file all mean "use the defaults".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirectStoreOverrides {
-    /// Route eligible unencrypted RAR `Store` sets straight to their final
-    /// destinations, so their volumes never exist as files.
-    ///
-    /// **Defaults to off.** Turning the default on is a release decision, not a
-    /// config default change.
+    // Route eligible unencrypted RAR `Store` sets straight to their final
+    // destinations, so their volumes never exist as files.
+    //
+    // **Defaults to off.** Turning the default on is a release decision, not a
+    // config default change.
     pub enabled: Option<bool>,
-    /// Per-set ceiling on the holds scratch file, in bytes. Decoded bytes whose
-    /// destination is not yet known are held in RAM and paged here on a breach;
-    /// breaching *this* ceiling demotes that one set. Defaults to 1 GiB.
+    // Per-set ceiling on the holds scratch file, in bytes. Decoded bytes whose
+    // destination is not yet known are held in RAM and paged here on a breach;
+    // breaching *this* ceiling demotes that one set. Defaults to 1 GiB.
     pub holds_scratch_ceiling_bytes: Option<u64>,
-    /// Process-wide ceiling on RAM-resident holds across every set, in bytes.
-    /// Over it, the set that is routing pages its holds to scratch. Defaults
-    /// to a sixteenth of the memory the process can use, between 64 MiB and
-    /// 1 GiB.
+    // Process-wide ceiling on RAM-resident holds across every set, in bytes.
+    // Over it, the set that is routing pages its holds to scratch. Defaults
+    // to a sixteenth of the memory the process can use, between 64 MiB and
+    // 1 GiB.
     pub holds_resident_limit_bytes: Option<u64>,
-    /// Process-wide ceiling on holds scratch across every set, in bytes. A
-    /// spill that would exceed it demotes the set that asked. Defaults to four
-    /// times the per-set ceiling.
+    // Process-wide ceiling on holds scratch across every set, in bytes. A
+    // spill that would exceed it demotes the set that asked. Defaults to four
+    // times the per-set ceiling.
     pub holds_scratch_total_bytes: Option<u64>,
-    /// Free space the working directory's filesystem must keep, in bytes. A
-    /// spill that would leave less demotes the set that asked. Defaults to a
-    /// twentieth of the filesystem, between 512 MiB and 20 GiB; zero disables
-    /// the check.
+    // Free space the working directory's filesystem must keep, in bytes. A
+    // spill that would leave less demotes the set that asked. Defaults to a
+    // twentieth of the filesystem, between 512 MiB and 20 GiB; zero disables
+    // the check.
     pub holds_disk_reserve_bytes: Option<u64>,
 }
 
-/// Operator-facing switches for 7z and ZIP/ZIP64 direct unpack (`[direct_unpack]`).
-///
-/// Same precedence as `[direct_store]` — **environment over config over
-/// default** — resolved in `pipeline::direct_unpack::DirectUnpackSettings::resolve`;
-/// see that type for the variable name.
-///
-/// Every field is optional so an absent `[direct_unpack]` table, a partially
-/// filled one and an older config file all mean "use the defaults".
+// Operator-facing switches for 7z and ZIP/ZIP64 direct unpack (`[direct_unpack]`).
+//
+// Same precedence as `[direct_store]` — **environment over config over
+// default** — resolved in `pipeline::direct_unpack::DirectUnpackSettings::resolve`;
+// see that type for the variable name.
+//
+// Every field is optional so an absent `[direct_unpack]` table, a partially
+// filled one and an older config file all mean "use the defaults".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirectUnpackOverrides {
-    /// Begin extracting a 7z or ZIP set while its parts are still downloading, instead
-    /// of waiting for the whole set to land.
-    ///
-    /// **Defaults to on.** Set to `false` here, or export the environment
-    /// override, to fall back to extracting after the whole set has landed.
+    // Begin extracting a 7z or ZIP set while its parts are still downloading, instead
+    // of waiting for the whole set to land.
+    //
+    // **Defaults to on.** Set to `false` here, or export the environment
+    // override, to fall back to extracting after the whole set has landed.
     pub enabled: Option<bool>,
 }
 
-/// Operator-facing switches for how a finished job names what it delivers
-/// (`[delivery_naming]`).
-///
-/// Every field is optional so an absent table, a partially filled one and an
-/// older config file all mean "use the defaults".
+// Operator-facing switches for how a finished job names what it delivers
+// (`[delivery_naming]`).
+//
+// Every field is optional so an absent table, a partially filled one and an
+// older config file all mean "use the defaults".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeliveryNamingOverrides {
-    /// Rename a delivered member that still wears an obfuscated name to the
-    /// job's own name. **Defaults to on.**
+    // Rename a delivered member that still wears an obfuscated name to the
+    // job's own name. **Defaults to on.**
     pub deobfuscate_delivered_members: Option<bool>,
-    /// Before falling back to the job name, ask the public srrdb release index
-    /// what release the member's CRC32 belongs to.
-    ///
-    /// **Defaults to off.** Completion is otherwise entirely local, so anything
-    /// that reaches outside the operator's network is opt-in.
+    // Before falling back to the job name, ask the public srrdb release index
+    // what release the member's CRC32 belongs to.
+    //
+    // **Defaults to off.** Completion is otherwise entirely local, so anything
+    // that reaches outside the operator's network is opt-in.
     pub enable_srrdb_lookup: Option<bool>,
 }
 
-/// Prometheus exposition knobs (`[metrics]`).
+// Prometheus exposition knobs (`[metrics]`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetricsConfig {
-    /// How much per-job detail `/metrics` carries. Per-job series are the
-    /// exporter's only unbounded label dimension: the runtime keeps up to a
-    /// thousand finished jobs, and each one would otherwise mint a full set of
-    /// value series that never goes away.
+    // How much per-job detail `/metrics` carries. Per-job series are the
+    // exporter's only unbounded label dimension: the runtime keeps up to a
+    // thousand finished jobs, and each one would otherwise mint a full set of
+    // value series that never goes away.
     #[serde(default)]
     pub per_job_series: PerJobSeries,
 }
 
-/// Which jobs get their own `weaver_job_*` series.
+// Which jobs get their own `weaver_job_*` series.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerJobSeries {
-    /// Only jobs that are still moving (everything but complete and failed).
+    // Only jobs that are still moving (everything but complete and failed).
     #[default]
     Active,
-    /// Every job the runtime still remembers, finished ones included.
+    // Every job the runtime still remembers, finished ones included.
     All,
-    /// No per-job series at all; `weaver_pipeline_jobs{status}` still reports
-    /// the aggregate queue mix.
+    // No per-job series at all; `weaver_pipeline_jobs{status}` still reports
+    // the aggregate queue mix.
     Off,
 }
 
@@ -319,8 +315,8 @@ impl PerJobSeries {
         }
     }
 
-    /// Parse a persisted setting value; unknown text falls back to the default
-    /// so a typo degrades to the safe cardinality rather than failing startup.
+    // Parse a persisted setting value; unknown text falls back to the default
+    // so a typo degrades to the safe cardinality rather than failing startup.
     pub fn from_str_or_default(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "all" => Self::All,
@@ -378,7 +374,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),

@@ -3,7 +3,7 @@ use base64::Engine;
 use chrono::Local;
 use sha2::{Digest, Sha256};
 
-use weaver_server_core::bandwidth::IspBandwidthCapWeekday;
+use weaver_server_core::bandwidth::QuotaWeekday;
 use weaver_server_core::servers::{
     ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod,
     transfer_policy::ServerDownloadQuotaSnapshot,
@@ -52,21 +52,21 @@ pub enum ServerDownloadQuotaWeekdayGql {
     Sun,
 }
 
-impl From<IspBandwidthCapWeekday> for ServerDownloadQuotaWeekdayGql {
-    fn from(value: IspBandwidthCapWeekday) -> Self {
+impl From<QuotaWeekday> for ServerDownloadQuotaWeekdayGql {
+    fn from(value: QuotaWeekday) -> Self {
         match value {
-            IspBandwidthCapWeekday::Mon => Self::Mon,
-            IspBandwidthCapWeekday::Tue => Self::Tue,
-            IspBandwidthCapWeekday::Wed => Self::Wed,
-            IspBandwidthCapWeekday::Thu => Self::Thu,
-            IspBandwidthCapWeekday::Fri => Self::Fri,
-            IspBandwidthCapWeekday::Sat => Self::Sat,
-            IspBandwidthCapWeekday::Sun => Self::Sun,
+            QuotaWeekday::Mon => Self::Mon,
+            QuotaWeekday::Tue => Self::Tue,
+            QuotaWeekday::Wed => Self::Wed,
+            QuotaWeekday::Thu => Self::Thu,
+            QuotaWeekday::Fri => Self::Fri,
+            QuotaWeekday::Sat => Self::Sat,
+            QuotaWeekday::Sun => Self::Sun,
         }
     }
 }
 
-impl From<ServerDownloadQuotaWeekdayGql> for IspBandwidthCapWeekday {
+impl From<ServerDownloadQuotaWeekdayGql> for QuotaWeekday {
     fn from(value: ServerDownloadQuotaWeekdayGql) -> Self {
         match value {
             ServerDownloadQuotaWeekdayGql::Mon => Self::Mon,
@@ -80,7 +80,7 @@ impl From<ServerDownloadQuotaWeekdayGql> for IspBandwidthCapWeekday {
     }
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
 pub struct ServerDownloadQuota {
     pub enabled: bool,
     pub limit_bytes: u64,
@@ -99,7 +99,7 @@ pub struct ServerDownloadQuota {
 }
 
 impl ServerDownloadQuota {
-    fn from_config(
+    pub(crate) fn from_config(
         config: &ServerDownloadQuotaConfig,
         snapshot: Option<&ServerDownloadQuotaSnapshot>,
     ) -> Self {
@@ -132,6 +132,39 @@ impl ServerDownloadQuota {
             timezone_name: snapshot
                 .map(|value| value.timezone.clone())
                 .unwrap_or(fallback_timezone),
+        }
+    }
+}
+
+/// The live usage of a download allowance in its current window.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct DownloadQuotaUsage {
+    pub lifetime_bytes: u64,
+    pub used_bytes: u64,
+    pub reserved_bytes: u64,
+    /// What is left in this window, or null when there is no allowance.
+    pub remaining_bytes: Option<u64>,
+    pub blocked: bool,
+    pub window_starts_at_epoch_ms: Option<f64>,
+    pub window_ends_at_epoch_ms: Option<f64>,
+    pub timezone_name: String,
+}
+
+impl From<&ServerDownloadQuotaSnapshot> for DownloadQuotaUsage {
+    fn from(value: &ServerDownloadQuotaSnapshot) -> Self {
+        Self {
+            lifetime_bytes: value.lifetime_bytes,
+            used_bytes: value.used_bytes,
+            reserved_bytes: value.reserved_bytes,
+            remaining_bytes: value.remaining_bytes,
+            blocked: value.blocked,
+            window_starts_at_epoch_ms: value
+                .window_start
+                .map(|value| value.timestamp_millis() as f64),
+            window_ends_at_epoch_ms: value
+                .window_end
+                .map(|value| value.timestamp_millis() as f64),
+            timezone_name: value.timezone.clone(),
         }
     }
 }
@@ -315,6 +348,7 @@ impl From<&weaver_server_core::servers::ServerConfig> for ServerDetails {
 #[derive(Debug, InputObject)]
 pub struct ServerInput {
     pub routing: Option<crate::proxies::RoutingPolicyInput>,
+    pub route: Option<crate::networking::RouteInput>,
     pub host: String,
     pub port: u16,
     pub tls: bool,
@@ -351,7 +385,16 @@ pub struct AdoptableTlsNameMismatchCertificate {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+pub struct LegConnectionTest {
+    pub position: usize,
+    pub success: bool,
+    pub message: String,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
 pub struct TestConnectionResult {
+    pub legs: Vec<LegConnectionTest>,
     pub success: bool,
     pub message: String,
     pub latency_ms: Option<u64>,
@@ -373,6 +416,7 @@ pub struct TestConnectionResult {
 impl From<weaver_server_core::servers::ServerConnectivityResult> for TestConnectionResult {
     fn from(result: weaver_server_core::servers::ServerConnectivityResult) -> Self {
         Self {
+            legs: Vec::new(),
             success: result.success,
             message: result.message,
             latency_ms: result.latency_ms,

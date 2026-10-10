@@ -12,14 +12,14 @@ static DISABLE_PLATFORM_KEYSTORE_FOR_PROCESS: AtomicBool = AtomicBool::new(false
 
 pub trait KeyStore: Send + Sync {
     fn get_key(&self) -> Result<Option<String>, String>;
-    /// Persist a newly generated key without replacing an existing key.
-    ///
-    /// Stores that are externally managed or read-only return `Ok(None)`.
+    // Persist a newly generated key without replacing an existing key.
+    //
+    // Stores that are externally managed or read-only return `Ok(None)`.
     fn create_key_if_absent(&self, _key: &str) -> Result<Option<String>, String> {
         Ok(None)
     }
-    /// Atomically replace a Weaver-managed key. Externally managed stores
-    /// return `Ok(false)` and must be validated instead of overwritten.
+    // Atomically replace a Weaver-managed key. Externally managed stores
+    // return `Ok(false)` and must be validated instead of overwritten.
     fn replace_key(&self, _key: &str) -> Result<bool, String> {
         Ok(false)
     }
@@ -31,10 +31,10 @@ pub trait KeyStore: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// Make platform keystores unreachable for the rest of this process and any
-/// children it spawns. Test helpers may call this before constructing
-/// services; the automatic harness detection in [`platform_keystore_disabled`]
-/// covers the tests that don't.
+// Make platform keystores unreachable for the rest of this process and any
+// children it spawns. Test helpers may call this before constructing
+// services; the automatic harness detection in [`platform_keystore_disabled`]
+// covers the tests that don't.
 #[doc(hidden)]
 #[allow(dead_code)] // for test helpers that spawn children; harness auto-detection covers today's tests
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
@@ -78,14 +78,14 @@ fn platform_keystore_disabled_by_env() -> bool {
         })
 }
 
-/// Detect the cargo test harness from inside a non-`cfg(test)` build.
-///
-/// Integration tests compile this crate as a dependency, so `cfg!(test)` is
-/// false there — and those are exactly the binaries that used to reach the
-/// real macOS Keychain and pop access prompts. Cargo exposes
-/// `CARGO_TARGET_TMPDIR` to integration tests and benches (inherited by child
-/// processes), and test binaries live in `deps/` with a trailing metadata
-/// hash. Treat that process tree as non-interactive for keystore use.
+// Detect the cargo test harness from inside a non-`cfg(test)` build.
+//
+// Integration tests compile this crate as a dependency, so `cfg!(test)` is
+// false there — and those are exactly the binaries that used to reach the
+// real macOS Keychain and pop access prompts. Cargo exposes
+// `CARGO_TARGET_TMPDIR` to integration tests and benches (inherited by child
+// processes), and test binaries live in `deps/` with a trailing metadata
+// hash. Treat that process tree as non-interactive for keystore use.
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn running_under_rust_test_harness() -> bool {
     if std::env::var_os("CARGO_TARGET_TMPDIR").is_some() {

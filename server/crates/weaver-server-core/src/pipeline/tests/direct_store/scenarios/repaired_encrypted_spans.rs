@@ -1,10 +1,10 @@
-//! A PAR2 repair re-entering an **encrypted** set, at the router.
-//!
-//! The set is driven through [`DirectSetRouter`] directly rather than through a
-//! job: what is under test is the routing decision a repaired span produces, and
-//! a whole pipeline in front of it would only add ways for the test to fail for
-//! other reasons. The volumes are the real fixture archives, so the parse, the
-//! layout, the keys and both integrity layers are the ones a download builds.
+// A PAR2 repair re-entering an **encrypted** set, at the router.
+//
+// The set is driven through [`DirectSetRouter`] directly rather than through a
+// job: what is under test is the routing decision a repaired span produces, and
+// a whole pipeline in front of it would only add ways for the test to fail for
+// other reasons. The volumes are the real fixture archives, so the parse, the
+// layout, the keys and both integrity layers are the ones a download builds.
 
 use super::*;
 
@@ -13,12 +13,12 @@ use crate::pipeline::direct_store::router::{
     DirectDestination, DirectSetRouter, RepairedChunk, RoutedSpan,
 };
 
-/// The password every fixture in this file is written with.
+// The password every fixture in this file is written with.
 const REPAIR_PASSWORD: &str = "moonlit-harbour";
 
 const REPAIR_MEMBER: &str = "Silver.Horizon.S02E01.mkv";
 
-/// A router over `volumes`, keyed for them, with nothing routed yet.
+// A router over `volumes`, keyed for them, with nothing routed yet.
 fn encrypted_router(volumes: &[(String, Vec<u8>)], password: &str) -> DirectSetRouter {
     let plan = DirectSetPlan {
         set_name: "silver.horizon".to_string(),
@@ -42,11 +42,11 @@ fn encrypted_router(volumes: &[(String, Vec<u8>)], password: &str) -> DirectSetR
     router
 }
 
-/// Closes the composition gaps the rewrite left, the way `reread_direct_stale_gaps`
-/// does: read the member's own bytes back and feed their CRC32 in.
-///
-/// An encrypted member's partial holds **plaintext**, so the payload is what the
-/// production read would have found there.
+// Closes the composition gaps the rewrite left, the way `reread_direct_stale_gaps`
+// does: read the member's own bytes back and feed their CRC32 in.
+//
+// An encrypted member's partial holds **plaintext**, so the payload is what the
+// production read would have found there.
 fn close_stale_gaps(router: &mut DirectSetRouter, payload: &[u8]) {
     for run in router.stale_gap_read_plan() {
         let from = run.logical_offset as usize;
@@ -58,8 +58,8 @@ fn close_stale_gaps(router: &mut DirectSetRouter, payload: &[u8]) {
     }
 }
 
-/// Routes every volume whole, the way a set whose articles all arrived leaves
-/// the router: one member, verified, nothing held.
+// Routes every volume whole, the way a set whose articles all arrived leaves
+// the router: one member, verified, nothing held.
 fn route_all(router: &mut DirectSetRouter, volumes: &[(String, Vec<u8>)]) {
     for (index, (_, bytes)) in volumes.iter().enumerate() {
         router
@@ -71,8 +71,8 @@ fn route_all(router: &mut DirectSetRouter, volumes: &[(String, Vec<u8>)]) {
     }
 }
 
-/// The cipher stream the `-p` fixtures encrypt `payload` into, and where each
-/// volume's part of it starts inside that volume's posted image.
+// The cipher stream the `-p` fixtures encrypt `payload` into, and where each
+// volume's part of it starts inside that volume's posted image.
 fn cipher_and_part_offsets(
     payload: &[u8],
     volumes: &[(String, Vec<u8>)],
@@ -87,9 +87,9 @@ fn cipher_and_part_offsets(
     (cipher.clone(), part_offsets(&cipher, volumes))
 }
 
-/// `(physical offset, length)` of each volume's part of `cipher`, located in the
-/// posted image by searching for the bytes themselves — the fixture's header
-/// sizes are its own business.
+// `(physical offset, length)` of each volume's part of `cipher`, located in the
+// posted image by searching for the bytes themselves — the fixture's header
+// sizes are its own business.
 fn part_offsets(cipher: &[u8], volumes: &[(String, Vec<u8>)]) -> Vec<(u64, u64)> {
     let mut offsets = Vec::new();
     let mut start = 0usize;
@@ -108,13 +108,13 @@ fn part_offsets(cipher: &[u8], volumes: &[(String, Vec<u8>)]) -> Vec<(u64, u64)>
     offsets
 }
 
-/// The lead-in a repair supplies for a span: the posted bytes just below it,
-/// which the real caller reads off the materialized volume, plus the
-/// neighbouring-volume halves of this volume's member edge blocks.
-///
-/// The fixture holds the posted image, so both come out of it directly — the
-/// production reader re-encrypts the neighbour's destination to get the same
-/// bytes back.
+// The lead-in a repair supplies for a span: the posted bytes just below it,
+// which the real caller reads off the materialized volume, plus the
+// neighbouring-volume halves of this volume's member edge blocks.
+//
+// The fixture holds the posted image, so both come out of it directly — the
+// production reader re-encrypts the neighbour's destination to get the same
+// bytes back.
 fn lead_in_for(
     router: &DirectSetRouter,
     volumes: &[(String, Vec<u8>)],
@@ -156,8 +156,8 @@ fn lead_in_for(
     lead_in
 }
 
-/// Re-enters one repaired span, exactly as the repair wiring does: the bytes
-/// PAR2 rebuilt are the posted ones, so the fixture's own image supplies them.
+// Re-enters one repaired span, exactly as the repair wiring does: the bytes
+// PAR2 rebuilt are the posted ones, so the fixture's own image supplies them.
 fn route_repaired_span(
     router: &mut DirectSetRouter,
     volumes: &[(String, Vec<u8>)],
@@ -219,12 +219,12 @@ async fn cipher_edge_plans_refuse_before_exceeding_the_request_budget() {
     );
 }
 
-/// A repaired span in the middle of a member's part must route back in.
-///
-/// PAR2 rebuilt these very cipher bytes, so the composition that describes them
-/// has to be rewritten with them and the part gate re-run over the rewrite.
-/// Refusing here throws away a repair that worked and demotes a set whose bytes
-/// on disk are correct.
+// A repaired span in the middle of a member's part must route back in.
+//
+// PAR2 rebuilt these very cipher bytes, so the composition that describes them
+// has to be rewritten with them and the part gate re-run over the rewrite.
+// Refusing here throws away a repair that worked and demotes a set whose bytes
+// on disk are correct.
 #[tokio::test]
 async fn a_repaired_mid_part_span_reroutes_into_an_encrypted_member() {
     let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
@@ -267,7 +267,7 @@ async fn a_repaired_mid_part_span_reroutes_into_an_encrypted_member() {
     );
 }
 
-/// The same, for a volume PAR2 rebuilt in its entirety.
+// The same, for a volume PAR2 rebuilt in its entirety.
 #[tokio::test]
 async fn a_repaired_whole_volume_reroutes_into_an_encrypted_member() {
     let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
@@ -292,8 +292,8 @@ async fn a_repaired_whole_volume_reroutes_into_an_encrypted_member() {
     );
 }
 
-/// And for `-hp`, where the headers are encrypted too: the repaired bytes are
-/// still member payload, and the walk that placed them is the keyed one.
+// And for `-hp`, where the headers are encrypted too: the repaired bytes are
+// still member payload, and the walk that placed them is the keyed one.
 #[tokio::test]
 async fn a_repaired_span_reroutes_into_a_header_encrypted_member() {
     let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
@@ -323,15 +323,24 @@ async fn a_repaired_span_reroutes_into_a_header_encrypted_member() {
     );
 }
 
-/// The shape a real repair takes: an article was lost, so the part never
-/// completed, and the repaired span is what closes it.
-///
-/// This is the case the integrity layers actually adjudicate. A part with a hole
-/// has no composed value at all, so layer 1 has never fired for it; the repaired
-/// bytes are what makes it complete, and the gate then runs for the first time
-/// over a composition that is part downloaded and part rebuilt.
+// The shape a real repair takes: an article was lost, so the part never
+// completed, and the repaired span is what closes it.
+//
+// This is the case the integrity layers actually adjudicate. A part with a hole
+// has no composed value at all, so layer 1 has never fired for it; the repaired
+// bytes are what makes it complete, and the gate then runs for the first time
+// over a composition that is part downloaded and part rebuilt.
 #[tokio::test]
 async fn a_repaired_hole_completes_an_encrypted_part_and_passes_its_gate() {
+    check_repaired_encrypted_hole(120);
+}
+
+#[test]
+fn a_sub_block_repair_releases_held_cipher_edges() {
+    check_repaired_encrypted_hole(7);
+}
+
+fn check_repaired_encrypted_hole(hole_len: u64) {
     let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
     let volumes = encrypted_store_set(
         REPAIR_MEMBER,
@@ -348,7 +357,6 @@ async fn a_repaired_hole_completes_an_encrypted_part_and_passes_its_gate() {
     // The lost article: a run inside the first volume's part, unaligned at both
     // ends, that never arrives on the wire.
     let hole_at = part_at + 37;
-    let hole_len = 120;
     let first = &volumes[0].1;
     router
         .route_bytes(0, 0, &first[..hole_at as usize])
@@ -388,17 +396,17 @@ async fn a_repaired_hole_completes_an_encrypted_part_and_passes_its_gate() {
     );
 }
 
-/// The shape the tail-loss fixture takes: an interior volume's **last**
-/// articles never arrive, so the hole runs from inside the member's part to the
-/// end of the volume and swallows the end-of-archive record with it. The volume
-/// is never reported complete — nothing arrived to complete it — and the repair
-/// is what closes both the part and the volume.
-///
-/// Both the member bytes and the end record are repaired bytes here, so every
-/// one of them has to find a destination in the same drain: the record can only
-/// be filed once the walk over the repaired image confirms the volume, and that
-/// walk must run even though the volume's own article stream never delivered a
-/// last article.
+// The shape the tail-loss fixture takes: an interior volume's **last**
+// articles never arrive, so the hole runs from inside the member's part to the
+// end of the volume and swallows the end-of-archive record with it. The volume
+// is never reported complete — nothing arrived to complete it — and the repair
+// is what closes both the part and the volume.
+//
+// Both the member bytes and the end record are repaired bytes here, so every
+// one of them has to find a destination in the same drain: the record can only
+// be filed once the walk over the repaired image confirms the volume, and that
+// walk must run even though the volume's own article stream never delivered a
+// last article.
 async fn a_repaired_volume_tail_reroutes(volumes: Vec<(String, Vec<u8>)>, payload: &[u8]) {
     let mut router = encrypted_router(&volumes, REPAIR_PASSWORD);
     let (_, parts) = cipher_and_part_offsets(payload, &volumes);
@@ -468,19 +476,19 @@ async fn a_repaired_volume_tail_reroutes_into_a_header_encrypted_member() {
     a_repaired_volume_tail_reroutes(volumes, &payload).await;
 }
 
-/// The shape a corrupt-but-present article takes, scaled down: a middle volume
-/// posted as several articles, one of them carrying flipped bytes the wire
-/// checks could not see, and PAR2 rewriting the slice that holds it — which
-/// starts at the volume's **first byte**, so the rewrite carries the volume's
-/// headers and the first two articles whole.
-///
-/// Every article of the part is on record when the repair lands, so the part's
-/// runs tile the rewrite exactly and go on tiling after each piece of it. The
-/// rewrite reaches the composition as a head block, an aligned middle and a
-/// tail block, and a gate that judged the part after the head block alone
-/// composed that block's repaired value with the middle's wire-damaged one —
-/// a mismatch over bytes that never existed, and with the repair already
-/// re-routed, a demotion of a set whose bytes on disk were correct.
+// The shape a corrupt-but-present article takes, scaled down: a middle volume
+// posted as several articles, one of them carrying flipped bytes the wire
+// checks could not see, and PAR2 rewriting the slice that holds it — which
+// starts at the volume's **first byte**, so the rewrite carries the volume's
+// headers and the first two articles whole.
+//
+// Every article of the part is on record when the repair lands, so the part's
+// runs tile the rewrite exactly and go on tiling after each piece of it. The
+// rewrite reaches the composition as a head block, an aligned middle and a
+// tail block, and a gate that judged the part after the head block alone
+// composed that block's repaired value with the middle's wire-damaged one —
+// a mismatch over bytes that never existed, and with the repair already
+// re-routed, a demotion of a set whose bytes on disk were correct.
 #[tokio::test]
 async fn a_repaired_leading_slice_of_a_multi_article_encrypted_volume_reroutes() {
     let payload: Vec<u8> = (0..12_000u32).map(|index| (index % 251) as u8).collect();
@@ -613,12 +621,12 @@ async fn repair_batches_refuse_foreign_or_empty_closing_calls() {
     }
 }
 
-/// The repairer hands the router one volume's rewrite at a time. A set with
-/// two damaged volumes therefore sees the first rewrite while the second
-/// volume's damage is still on record, and the gates that settle the first
-/// must leave the second alone: its articles are all present and its runs
-/// tile, so a gate over it composes the damaged value and — with the reroute
-/// flag now set — demotes a set whose second rewrite is one call away.
+// The repairer hands the router one volume's rewrite at a time. A set with
+// two damaged volumes therefore sees the first rewrite while the second
+// volume's damage is still on record, and the gates that settle the first
+// must leave the second alone: its articles are all present and its runs
+// tile, so a gate over it composes the damaged value and — with the reroute
+// flag now set — demotes a set whose second rewrite is one call away.
 #[tokio::test]
 async fn a_second_damaged_volume_waits_for_its_own_rewrite() {
     let payload: Vec<u8> = (0..16_000u32).map(|index| (index % 251) as u8).collect();
@@ -685,7 +693,7 @@ async fn a_second_damaged_volume_waits_for_its_own_rewrite() {
     );
 }
 
-/// A router over unencrypted `volumes`, with nothing routed yet.
+// A router over unencrypted `volumes`, with nothing routed yet.
 fn plain_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
     DirectSetRouter::new(DirectSetPlan {
         set_name: "silver.horizon".to_string(),
@@ -702,11 +710,11 @@ fn plain_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
     })
 }
 
-/// The plain-member counterpart. A plain slice reaches the composition as one
-/// run, so a single rewritten slice is judged whole — but a volume with **two**
-/// damaged slices is rewritten as two runs, and a gate that judged the part
-/// after the first composed its repaired value with the second's wire-damaged
-/// one. Same mixture, same wrongful demotion.
+// The plain-member counterpart. A plain slice reaches the composition as one
+// run, so a single rewritten slice is judged whole — but a volume with **two**
+// damaged slices is rewritten as two runs, and a gate that judged the part
+// after the first composed its repaired value with the second's wire-damaged
+// one. Same mixture, same wrongful demotion.
 #[tokio::test]
 async fn a_repair_of_two_slices_in_one_plain_volume_reroutes() {
     repair_two_slices(false, false);

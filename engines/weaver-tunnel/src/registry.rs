@@ -1,26 +1,26 @@
-//! One loopback front per proxy configuration, started lazily.
-//!
-//! ## Why `ensure_*` is synchronous and never blocks
-//!
-//! The egress seam it serves (`transport_proxy::proxy_egress_url`) is a
-//! synchronous function called from three very different places: an async
-//! WASI-p2 host, an async download router, and a **blocking** plugin HTTP
-//! worker thread that has no tokio runtime at all. Blocking on a future would
-//! be wrong in all three (it panics inside a runtime and stalls a worker
-//! outside one).
-//!
-//! So starting a tunnel does no async work: it binds a `std::net::TcpListener`
-//! on `127.0.0.1:0` — which is immediate — reads the port off it, and hands the
-//! accept loop to a tokio runtime this registry owns. The SSH session is
-//! established later, by the first connection the front accepts, inside that
-//! runtime. Callers get a port back in microseconds and never touch a future.
-//!
-//! ## Lifecycle
-//!
-//! Keyed by proxy config id; the entry carries the configuration revision
-//! (`id@updated_at`). Same revision reuses the front, a changed revision stops
-//! the old one and starts a new one, so an operator edit takes effect on the
-//! next request and a health flap does not churn sessions.
+// One loopback front per proxy configuration, started lazily.
+//
+// ## Why `ensure_*` is synchronous and never blocks
+//
+// The egress seam it serves (`transport_proxy::proxy_egress_url`) is a
+// synchronous function called from three very different places: an async
+// WASI-p2 host, an async download router, and a **blocking** plugin HTTP
+// worker thread that has no tokio runtime at all. Blocking on a future would
+// be wrong in all three (it panics inside a runtime and stalls a worker
+// outside one).
+//
+// So starting a tunnel does no async work: it binds a `std::net::TcpListener`
+// on `127.0.0.1:0` — which is immediate — reads the port off it, and hands the
+// accept loop to a tokio runtime this registry owns. The SSH session is
+// established later, by the first connection the front accepts, inside that
+// runtime. Callers get a port back in microseconds and never touch a future.
+//
+// ## Lifecycle
+//
+// Keyed by proxy config id; the entry carries the configuration revision
+// (`id@updated_at`). Same revision reuses the front, a changed revision stops
+// the old one and starts a new one, so an operator edit takes effect on the
+// next request and a health flap does not churn sessions.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -52,7 +52,7 @@ impl TunnelEntry {
     }
 }
 
-/// An explicitly owned registry for embedders and protocol fixtures.
+// An explicitly owned registry for embedders and protocol fixtures.
 pub struct TunnelRegistry {
     runtime: tokio::runtime::Handle,
     entries: Mutex<HashMap<String, TunnelEntry>>,
@@ -70,8 +70,8 @@ impl TunnelRegistry {
         }
     }
 
-    /// Ensure an SSH tunnel for `spec` is running and return the loopback
-    /// address of its SOCKS5 front.
+    // Ensure an SSH tunnel for `spec` is running and return the loopback
+    // address of its SOCKS5 front.
     pub fn ensure_ssh_tunnel(
         &self,
         spec: TunnelSpec,
@@ -86,18 +86,18 @@ impl TunnelRegistry {
         })
     }
 
-    /// Ensure a WireGuard tunnel for `spec` is running and return the loopback
-    /// address of its SOCKS5 front.
-    ///
-    /// The factory below is synchronous, as it must be, and building a
-    /// [`WireGuardTunnelProvider`] does no I/O: the device, its handshake and
-    /// the smoltcp stack all come up inside the first dial. That is the same
-    /// choice the SSH family makes and for the same reason — this call is
-    /// reached from a blocking plugin worker with no runtime — and it has the
-    /// property that matters here: a failed bring-up leaves the provider
-    /// empty, so it is reported to the observer by the dial that hit it and
-    /// retried by the next one, rather than poisoning the entry until a
-    /// restart.
+    // Ensure a WireGuard tunnel for `spec` is running and return the loopback
+    // address of its SOCKS5 front.
+    //
+    // The factory below is synchronous, as it must be, and building a
+    // [`WireGuardTunnelProvider`] does no I/O: the device, its handshake and
+    // the smoltcp stack all come up inside the first dial. That is the same
+    // choice the SSH family makes and for the same reason — this call is
+    // reached from a blocking plugin worker with no runtime — and it has the
+    // property that matters here: a failed bring-up leaves the provider
+    // empty, so it is reported to the observer by the dial that hit it and
+    // retried by the next one, rather than poisoning the entry until a
+    // restart.
     pub fn ensure_wireguard_tunnel(
         &self,
         spec: WireGuardSpec,
@@ -113,10 +113,10 @@ impl TunnelRegistry {
         })
     }
 
-    /// The technology-independent half: everything except which provider gets
-    /// built. Both `ensure_*` entry points call this with a different factory
-    /// and inherit the front, the keying, the lifecycle and every consumer
-    /// unchanged.
+    // The technology-independent half: everything except which provider gets
+    // built. Both `ensure_*` entry points call this with a different factory
+    // and inherit the front, the keying, the lifecycle and every consumer
+    // unchanged.
     pub fn ensure_tunnel_with<F>(
         &self,
         proxy_config_id: &str,
@@ -194,7 +194,7 @@ impl TunnelRegistry {
         Ok(front_addr)
     }
 
-    /// Stop one tunnel, closing its front and dropping its session.
+    // Stop one tunnel, closing its front and dropping its session.
     pub fn stop(&self, proxy_config_id: &str) {
         let entry = self
             .entries
@@ -206,7 +206,7 @@ impl TunnelRegistry {
         }
     }
 
-    /// Stop every tunnel. Called on process shutdown.
+    // Stop every tunnel. Called on process shutdown.
     pub fn stop_all(&self) {
         let entries: Vec<TunnelEntry> = self
             .entries
@@ -220,7 +220,7 @@ impl TunnelRegistry {
         }
     }
 
-    /// The front address of a running tunnel, without starting one. Tests only.
+    // The front address of a running tunnel, without starting one. Tests only.
     pub fn front_addr(&self, proxy_config_id: &str) -> Option<SocketAddr> {
         self.entries
             .lock()
@@ -313,8 +313,8 @@ mod tests {
         );
     }
 
-    /// A stopped listener either refuses the connection outright or accepts a
-    /// pending one that immediately reads EOF; both prove it is not serving.
+    // A stopped listener either refuses the connection outright or accepts a
+    // pending one that immediately reads EOF; both prove it is not serving.
     async fn connection_is_dead(addr: SocketAddr) -> bool {
         match tokio::net::TcpStream::connect(addr).await {
             Err(_) => true,
