@@ -1250,7 +1250,8 @@ mod tests {
         );
         assert!(all.iter().all(|run| run.output_retained));
         assert!(all.windows(2).all(|pair| pair[0].seq > pair[1].seq));
-        // A job still in the queue has no name to show; one in history does.
+        // The history row names a finished job. A job still in the queue has
+        // no stored name: the API names it from the live queue.
         assert_eq!(all[0].job_name.as_deref(), Some("finished job"));
         assert_eq!(all[5].job_name, None);
         assert_eq!(

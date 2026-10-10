@@ -861,9 +861,6 @@ impl GlobalScriptsRun {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct EventScriptSettings {
-    /// Scan, feed and scheduler runs allowed at once. Queue events drain one
-    /// at a time regardless.
-    pub event_script_concurrency: u8,
     pub event_script_timeout_seconds: u64,
     pub file_downloaded_event_interval: i64,
     /// The newest runs kept for each download (or each scan, schedule or feed
@@ -876,7 +873,6 @@ pub struct EventScriptSettings {
 impl Default for EventScriptSettings {
     fn default() -> Self {
         Self {
-            event_script_concurrency: 1,
             event_script_timeout_seconds: 300,
             file_downloaded_event_interval: 0,
             script_output_runs_per_job: 32,
@@ -887,8 +883,7 @@ impl Default for EventScriptSettings {
 
 impl EventScriptSettings {
     pub fn validate(&self) -> Result<(), PostProcessingValidationError> {
-        if !(1..=8).contains(&self.event_script_concurrency)
-            || !(1..=86_400).contains(&self.event_script_timeout_seconds)
+        if !(1..=86_400).contains(&self.event_script_timeout_seconds)
             || !(-1..=86_400).contains(&self.file_downloaded_event_interval)
             || !(1..=128).contains(&self.script_output_runs_per_job)
             || self.script_output_failed_runs_per_job > 128
@@ -899,6 +894,9 @@ impl EventScriptSettings {
     }
 }
 
+pub const DEFAULT_CONCURRENCY: u8 = 32;
+pub const MAX_CONCURRENCY: u8 = 128;
+
 /// Settings the operator controls. Execution is off until it is explicitly turned on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -906,7 +904,8 @@ pub struct PostProcessingSettings {
     #[serde(flatten)]
     pub event_scripts: EventScriptSettings,
     pub execution_enabled: bool,
-    /// Scripts that a job waits for allowed to run at once, across every job.
+    // Scripts allowed to run at once, of every kind: the ones a job waits for
+    // and the ones it does not, queue events, scans, feeds and schedules.
     pub concurrency: u8,
     pub termination_grace_seconds: u64,
     pub python_interpreter: Option<String>,
@@ -929,7 +928,7 @@ impl Default for PostProcessingSettings {
         Self {
             execution_enabled: false,
             event_scripts: EventScriptSettings::default(),
-            concurrency: 4,
+            concurrency: DEFAULT_CONCURRENCY,
             termination_grace_seconds: 10,
             python_interpreter: None,
             powershell_interpreter: None,
@@ -960,7 +959,8 @@ impl PostProcessingSettings {
 
     pub fn validate(&self) -> Result<(), PostProcessingValidationError> {
         self.event_scripts.validate()?;
-        if !(1..=8).contains(&self.concurrency) || self.termination_grace_seconds == 0 {
+        if !(1..=MAX_CONCURRENCY).contains(&self.concurrency) || self.termination_grace_seconds == 0
+        {
             return Err(PostProcessingValidationError::InvalidPolicy);
         }
         if self.unacceptable_extensions.len() > 64
@@ -1179,5 +1179,74 @@ impl ScriptResult {
         self.instance_name
             .as_deref()
             .unwrap_or_else(|| self.script.as_str())
+    }
+}
+
+// One entry of a job's list that had started when it was last recorded. A
+// started entry never runs again for the same job, whatever became of it.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartedScript {
+    pub id: String,
+    pub name: String,
+    pub script: ScriptName,
+    pub waited: bool,
+}
+
+// What a job's interrupted pass left behind: the entries that had started,
+// in the order they started, and the results of the ones that finished.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct PostProcessingResume {
+    pub started: Vec<StartedScript>,
+    pub results: Vec<ScriptResult>,
+}
+
+// Why a waited script that was running when weaver stopped has no result of
+// its own.
+pub const INTERRUPTED_SCRIPT_MESSAGE: &str = "weaver stopped while the script was running";
+
+impl PostProcessingResume {
+    // The results the resumed pass starts from, in the order their entries
+    // started, and whether any of them stands for a script that was cut off.
+    // A finished entry keeps its result; a waited entry with none becomes an
+    // interrupted row; a background entry was never part of the results.
+    pub fn carried_results(&self) -> (Vec<ScriptResult>, bool) {
+        let mut results = Vec::with_capacity(self.started.len());
+        let mut interrupted = false;
+        for entry in &self.started {
+            let kept = self
+                .results
+                .iter()
+                .find(|result| result.instance_id.as_deref() == Some(entry.id.as_str()));
+            match kept {
+                Some(result) => {
+                    interrupted |= result.status == ScriptStatus::Failed
+                        && result.exit_code.is_none()
+                        && result.error_message.as_deref() == Some(INTERRUPTED_SCRIPT_MESSAGE);
+                    results.push(result.clone());
+                }
+                None if entry.waited => {
+                    interrupted = true;
+                    results.push(ScriptResult {
+                        script: entry.script.clone(),
+                        instance_id: Some(entry.id.clone()),
+                        instance_name: Some(entry.name.clone()),
+                        event: Default::default(),
+                        output_id: None,
+                        background: false,
+                        adapter: ScriptAdapter::Sabnzbd,
+                        status: ScriptStatus::Failed,
+                        exit_code: None,
+                        duration_ms: 0,
+                        output_tail: String::new(),
+                        output_truncated: false,
+                        error_message: Some(INTERRUPTED_SCRIPT_MESSAGE.to_string()),
+                        finished_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
+                    });
+                }
+                None => {}
+            }
+        }
+        (results, interrupted)
     }
 }

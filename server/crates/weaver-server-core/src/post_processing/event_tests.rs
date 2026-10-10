@@ -79,6 +79,47 @@ fn queue_priority_supersession_and_recovery_are_durable() {
     assert!(db.claim_script_event().unwrap().is_none());
 }
 
+// After a restart, the event that was running stays interrupted and is never
+// claimed again, and the job's events that had not started run as usual.
+#[test]
+fn a_restart_runs_a_jobs_unstarted_events_and_never_the_one_that_was_running() {
+    let (db, _data) = configured();
+    let running = db
+        .enqueue_script_event(&event(60, QueueEvent::NzbAdded), 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.claim_script_event().unwrap().unwrap().0, running);
+    let waiting = db
+        .enqueue_script_event(&event(60, QueueEvent::FileDownloaded), 2)
+        .unwrap()
+        .unwrap();
+    // The job's next event waits while one of its events runs.
+    assert!(db.claim_script_event().unwrap().is_none());
+
+    db.recover_script_events().unwrap();
+
+    let state = |run_id: &str| {
+        let datastore = db.datastore();
+        let run_id = run_id.to_string();
+        db.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT state FROM script_event_queue WHERE run_id = {}",
+                &[SqlArg::Text(run_id)],
+            )
+            .await?
+            .expect("the event is kept")
+            .text("state")
+        })
+        .unwrap()
+    };
+    assert_eq!(state(&running), "interrupted");
+    assert_eq!(state(&waiting), "queued");
+    assert_eq!(db.claim_script_event().unwrap().unwrap().0, waiting);
+    assert!(db.claim_script_event().unwrap().is_none());
+    assert_eq!(state(&running), "interrupted");
+}
+
 #[test]
 fn file_event_deduplication_and_interval_use_the_specific_job() {
     let (db, _data) = configured();
@@ -164,10 +205,10 @@ fn queue_environment_uses_nzb_identity_and_all_status_fields() {
 async fn disabling_execution_stops_an_event_waiting_for_capacity() {
     let (db, _data) = configured();
     let mut settings = db.post_processing_settings().unwrap();
-    settings.event_scripts.event_script_concurrency = 1;
+    settings.concurrency = 1;
     db.save_post_processing_settings(&settings).unwrap();
-    *db.script_runtime.running.lock().unwrap() = 1;
-    let permit = EventPermit(db.script_runtime.clone());
+    let (_cancel, mut never) = watch::channel(false);
+    let permit = script_slot(&db, &mut never).await.unwrap().unwrap();
     let mut context = event(7, QueueEvent::NzbAdded);
     let run = run_event(&db, &mut context, "waiting-disabled", None, None);
     tokio::pin!(run);
@@ -188,7 +229,7 @@ async fn disabling_execution_stops_an_event_waiting_for_capacity() {
     drop(permit);
     assert!(run.await.unwrap().is_empty());
     assert!(db.script_runtime.cancellations.lock().unwrap().is_empty());
-    assert_eq!(*db.script_runtime.running.lock().unwrap(), 0);
+    assert_eq!(db.script_runtime.slots.running(), 0);
 }
 
 fn history(db: &Database, job_id: u64) {
@@ -536,7 +577,7 @@ async fn an_instance_whose_script_is_gone_is_reported_and_holds_nothing_up() {
     assert_eq!(result.event, ScriptEventLabel::Queue(QueueEvent::NzbAdded));
     assert!(result.error_message.is_some());
     assert!(!result.background);
-    assert_eq!(*db.script_runtime.running.lock().unwrap(), 0);
+    assert_eq!(db.script_runtime.slots.running(), 0);
 }
 
 #[test]
@@ -622,6 +663,11 @@ async fn deletion_waits_pending_admission_and_removed_history_cannot_enqueue_aft
 #[tokio::test]
 async fn failed_terminal_write_retries_before_claiming_more_and_retains_only_its_run_error() {
     let (db, _data) = configured();
+    // One script at a time, so the second download's event waits for the
+    // first one's and is never claimed once that one has failed.
+    let mut settings = db.post_processing_settings().unwrap();
+    settings.concurrency = 1;
+    db.save_post_processing_settings(&settings).unwrap();
     let first = db
         .enqueue_script_event(&event(35, QueueEvent::NzbAdded), 1)
         .unwrap()
@@ -660,4 +706,76 @@ async fn failed_terminal_write_retries_before_claiming_more_and_retains_only_its
     assert!(db.script_runtime.failed_runs.lock().unwrap().is_empty());
     assert!(wait_for_event(&db, &first).await.is_err());
     wait_for_event(&db, &other).await.unwrap();
+}
+
+#[test]
+fn a_download_with_an_event_under_way_is_passed_over_and_others_are_claimed() {
+    let (db, _data) = configured();
+    let first = db
+        .enqueue_script_event(&event(40, QueueEvent::NzbAdded), 1)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .enqueue_script_event(&event(40, QueueEvent::NzbMarked), 2)
+        .unwrap()
+        .unwrap();
+    let other = db
+        .enqueue_script_event(&event(41, QueueEvent::NzbAdded), 3)
+        .unwrap()
+        .unwrap();
+    let (claimed, _, first_claim) = db.claim_script_event().unwrap().unwrap();
+    assert_eq!(claimed, first);
+    // The first download's next event waits; another download's does not.
+    let (claimed, _, other_claim) = db.claim_script_event().unwrap().unwrap();
+    assert_eq!(claimed, other);
+    assert!(db.claim_script_event().unwrap().is_none());
+    db.finish_script_event(&first).unwrap();
+    drop(first_claim);
+    let (claimed, _, _second_claim) = db.claim_script_event().unwrap().unwrap();
+    assert_eq!(claimed, second);
+    drop(other_claim);
+}
+
+#[tokio::test]
+async fn every_script_shares_one_pool_whose_size_applies_to_the_next_waiter() {
+    let (db, _data) = configured();
+    let mut settings = db.post_processing_settings().unwrap();
+    settings.concurrency = 1;
+    db.save_post_processing_settings(&settings).unwrap();
+    let (_cancel, mut never) = watch::channel(false);
+    let held = script_slot(&db, &mut never).await.unwrap().unwrap();
+
+    // A queue event and a job's waited script both wait for the one slot.
+    let mut context = event(42, QueueEvent::NzbAdded);
+    context.job_id = None;
+    let queued = run_event(&db, &mut context, "pool-shared", None, None);
+    tokio::pin!(queued);
+    tokio::select! {
+        biased;
+        _ = &mut queued => panic!("an event script must wait for the occupied slot"),
+        () = std::future::ready(()) => {},
+    }
+    let (_second_cancel, mut second_never) = watch::channel(false);
+    let waiting = script_slot(&db, &mut second_never);
+    tokio::pin!(waiting);
+    tokio::select! {
+        biased;
+        _ = &mut waiting => panic!("a second script must wait for the occupied slot"),
+        () = std::future::ready(()) => {},
+    }
+    assert_eq!(db.script_runtime.slots.running(), 1);
+
+    // Raising the setting lets the first in line through without a restart;
+    // the one behind it still waits.
+    settings.concurrency = 2;
+    db.save_post_processing_settings(&settings).unwrap();
+    let results = queued.await.unwrap();
+    assert_eq!(results.len(), 1);
+    tokio::select! {
+        biased;
+        _ = &mut waiting => {},
+        () = std::future::ready(()) => panic!("the event's slot was given back"),
+    }
+    drop(held);
+    assert_eq!(db.script_runtime.slots.running(), 0);
 }

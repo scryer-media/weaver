@@ -193,12 +193,14 @@ fn settings_bound_concurrency_and_require_a_grace_period() {
         !settings.execution_enabled,
         "execution stays off by default"
     );
+    assert_eq!(settings.concurrency, 32);
     assert!(settings.validate().is_ok());
     settings.concurrency = 0;
     assert!(settings.validate().is_err());
-    settings.concurrency = 9;
+    settings.concurrency = 129;
     assert!(settings.validate().is_err());
-    settings.concurrency = 8;
+    settings.concurrency = 128;
+    assert!(settings.validate().is_ok());
     settings.termination_grace_seconds = 0;
     assert!(settings.validate().is_err());
 }

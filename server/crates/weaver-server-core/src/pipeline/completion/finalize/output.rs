@@ -1281,6 +1281,7 @@ impl Pipeline {
             admission,
             pipeline_outcome,
             primary_failure,
+            None,
         );
     }
 
@@ -1290,6 +1291,7 @@ impl Pipeline {
         admission: crate::post_processing::executor::PostProcessingJobAdmission,
         pipeline_outcome: crate::post_processing::model::PipelineOutcome,
         primary_failure: Option<String>,
+        resume: Option<crate::post_processing::model::PostProcessingResume>,
     ) {
         // Scripts read health to decide whether the download is worth acting
         // on, so they must be handed the settled figure — the one the terminal
@@ -1439,15 +1441,31 @@ impl Pipeline {
                         _ = cancellation_wait.changed() => {},
                     }
                 }
-                executor
-                    .execute_admitted_job(
-                        job_id.0,
-                        admission,
-                        context,
-                        Some(cancellation_rx),
-                        Some(started_tx),
-                    )
-                    .await
+                match resume {
+                    Some(resume) => {
+                        executor
+                            .resume_admitted_job(
+                                job_id.0,
+                                admission,
+                                context,
+                                Some(cancellation_rx),
+                                Some(started_tx),
+                                resume,
+                            )
+                            .await
+                    }
+                    None => {
+                        executor
+                            .execute_admitted_job(
+                                job_id.0,
+                                admission,
+                                context,
+                                Some(cancellation_rx),
+                                Some(started_tx),
+                            )
+                            .await
+                    }
+                }
             };
             tokio::pin!(execution);
             tokio::pin!(started_rx);
@@ -1474,12 +1492,13 @@ impl Pipeline {
         });
     }
 
-    /// Finish a job that was restored while it sat in post-processing.
-    ///
-    /// The startup recovery scan already stamped `interrupted` on every such
-    /// job, so nothing is rerun here: a script that was mid-flight when weaver
-    /// stopped has unknown side effects, and running it again is worse than
-    /// reporting that it was interrupted.
+    // Finish a job that was restored while it sat in post-processing.
+    //
+    // The startup recovery scan already stamped `interrupted` on every such
+    // job. No script that had started is rerun: one that was mid-flight when
+    // weaver stopped has unknown side effects, and running it again is worse
+    // than reporting that it was interrupted. The scripts of the list that
+    // had not started still run, after the ones that had.
     pub(crate) fn recover_restored_terminal_post_processing(&mut self, job_id: JobId) -> bool {
         let is_terminal_post_processing = self.jobs.get(&job_id).is_some_and(|state| {
             matches!(
@@ -1506,6 +1525,9 @@ impl Pipeline {
             self.start_terminal_post_processing(job_id);
             return true;
         }
+        if self.resume_restored_terminal_post_processing(job_id, summary) {
+            return true;
+        }
         let results = self
             .db
             .job_post_processing_results(job_id.0)
@@ -1527,6 +1549,80 @@ impl Pipeline {
                 results,
             }),
         });
+        true
+    }
+
+    // Run the rest of an interrupted pass, or return false to finish the job
+    // with what it recorded. Only a pass cut off part way through resumes,
+    // and only when the job kept the list of entries that had started: a
+    // pass begun under an older weaver did not, and which of its scripts ran
+    // is unknown. A failed job is finished as it stands too, because how the
+    // pipeline failed, which its scripts were told, is not kept.
+    fn resume_restored_terminal_post_processing(
+        &mut self,
+        job_id: JobId,
+        summary: crate::post_processing::model::PostProcessingSummary,
+    ) -> bool {
+        use crate::post_processing::model::PostProcessingSummary;
+        if !matches!(
+            summary,
+            PostProcessingSummary::Interrupted | PostProcessingSummary::Running
+        ) {
+            return false;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        if state.failure_error.is_some() {
+            return false;
+        }
+        let category = state.spec.category.clone();
+        let resume = match self.db.job_post_processing_resume(job_id.0) {
+            Ok(Some(resume)) => resume,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "could not read which post-processing scripts had started"
+                );
+                return false;
+            }
+        };
+        let admission = match self
+            .terminal_post_processing_executor
+            .admit_job_scripts(category.as_deref())
+        {
+            Ok(Some(admission)) => admission,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "could not admit post-processing scripts; finishing without them"
+                );
+                return false;
+            }
+        };
+        if !self.inflight_terminal_post_processing.insert(job_id) {
+            return true;
+        }
+        info!(
+            job_id = job_id.0,
+            started = resume.started.len(),
+            "resuming post-processing with the scripts that had not started"
+        );
+        self.note_stage_started(
+            job_id,
+            crate::operations::instrumentation::JobStageKind::PostProcess,
+        );
+        self.launch_terminal_post_processing_run(
+            job_id,
+            admission,
+            crate::post_processing::model::PipelineOutcome::Succeeded,
+            None,
+            Some(resume),
+        );
         true
     }
 

@@ -1990,7 +1990,6 @@ type PlatformNetworking {
 }
 
 type PostProcessingSettingsGql {
-	eventScriptConcurrency: Int!
 	eventScriptTimeoutSeconds: Int!
 	fileDownloadedEventInterval: Int!
 	"""
@@ -2023,7 +2022,6 @@ type PostProcessingSettingsGql {
 }
 
 input PostProcessingSettingsInput {
-	eventScriptConcurrency: Int
 	eventScriptTimeoutSeconds: Int
 	fileDownloadedEventInterval: Int
 	"""

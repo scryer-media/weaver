@@ -75,7 +75,6 @@ impl PostProcessingMutation {
         input: PostProcessingSettingsInput,
     ) -> Result<PostProcessingSettingsGql> {
         let PostProcessingSettingsInput {
-            event_script_concurrency,
             event_script_timeout_seconds,
             file_downloaded_event_interval,
             script_output_runs_per_job,
@@ -112,9 +111,6 @@ impl PostProcessingMutation {
             };
             let current = db.post_processing_settings()?;
             let mut event_scripts = current.event_scripts;
-            if let Some(value) = event_script_concurrency {
-                event_scripts.event_script_concurrency = value;
-            }
             if let Some(value) = event_script_timeout_seconds {
                 event_scripts.event_script_timeout_seconds = value;
             }

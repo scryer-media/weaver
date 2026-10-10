@@ -118,6 +118,7 @@ pub fn spawn_evaluator_with_services(
         let mut intake_state_loaded = services.db.is_none();
         let mut intake_before_failure = None;
         let mut one_shots = OneShotEvaluator::default();
+        let mut watermark_loaded = services.db.is_none();
         let mut dispatcher = OneShotDispatcher::default();
         let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -204,10 +205,48 @@ pub fn spawn_evaluator_with_services(
                     }
                 }
             }
+            if !watermark_loaded {
+                watermark_loaded = true;
+                let db = services.db.clone().expect("database checked above");
+                match tokio::task::spawn_blocking(move || db.get_setting(ONE_SHOT_WATERMARK_KEY))
+                    .await
+                {
+                    Ok(Ok(value)) => {
+                        one_shots.restore(value.as_deref().and_then(OneShotWatermark::parse));
+                    }
+                    result => warn!(
+                        ?result,
+                        "cannot load when schedules last ran; one-shots missed while stopped are not caught up"
+                    ),
+                }
+            }
             let clock = crate::e2e_clock::local_now();
             let now = clock.naive_local();
             let utc = clock.naive_utc();
-            let due = one_shots.due_at(&entries, now, utc);
+            let mut due = one_shots.due_at(&entries, now, utc);
+            // The watermark is written before anything it covers is started,
+            // so a restart can miss a one-shot but never start one twice. A
+            // tick whose watermark cannot be written starts none of its
+            // one-shots for the same reason.
+            if let Some(db) = services.db.clone() {
+                let mark = OneShotWatermark { utc, local: now }.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    db.set_setting(ONE_SHOT_WATERMARK_KEY, &mark)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    result => {
+                        let skipped = due.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
+                        warn!(
+                            ?result,
+                            ?skipped,
+                            "cannot record when schedules last ran; this minute's one-shots are skipped"
+                        );
+                        due.clear();
+                    }
+                }
+            }
 
             let handle = handle.clone();
             let services = services.clone();
@@ -747,14 +786,58 @@ fn entry_times(entry: &ScheduleEntry) -> Vec<NaiveTime> {
     times
 }
 
+// The settings key holding when the evaluator last ran, so a restart knows
+// which one-shots it missed.
+const ONE_SHOT_WATERMARK_KEY: &str = "schedule_one_shot_watermark";
+
+// When the evaluator last ran, as UTC and as the local wall time one-shots
+// are written in. The local time places occurrences; the UTC time catches a
+// clock that went back while weaver was stopped.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct OneShotWatermark {
+    utc: NaiveDateTime,
+    local: NaiveDateTime,
+}
+
+impl OneShotWatermark {
+    fn parse(value: &str) -> Option<Self> {
+        let (utc, local) = value.split_once(' ')?;
+        let at = |seconds: &str| {
+            chrono::DateTime::from_timestamp(seconds.parse().ok()?, 0).map(|at| at.naive_utc())
+        };
+        Some(Self {
+            utc: at(utc)?,
+            local: at(local)?,
+        })
+    }
+}
+
+impl std::fmt::Display for OneShotWatermark {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {}",
+            self.utc.and_utc().timestamp(),
+            self.local.and_utc().timestamp()
+        )
+    }
+}
+
 #[derive(Default)]
 struct OneShotEvaluator {
     last_tick: Option<NaiveDateTime>,
     last_utc: Option<NaiveDateTime>,
     fired: BTreeSet<(String, NaiveDateTime)>,
+    // When the evaluator last ran before this start, read once and used by
+    // the first tick only.
+    restored: Option<OneShotWatermark>,
 }
 
 impl OneShotEvaluator {
+    fn restore(&mut self, watermark: Option<OneShotWatermark>) {
+        self.restored = watermark;
+    }
+
     #[cfg(test)]
     fn due(&mut self, entries: &[ScheduleEntry], now: NaiveDateTime) -> Vec<ScheduleEntry> {
         self.due_at(entries, now, now)
@@ -775,7 +858,16 @@ impl OneShotEvaluator {
         });
         let last_utc = self.last_utc.replace(utc);
         let Some(last) = self.last_tick.replace(now) else {
-            return Vec::new();
+            // The first tick after a start catches up what was missed while
+            // weaver was stopped, and only with a watermark: without one
+            // there is no telling what already ran. A clock that went back
+            // while stopped fires nothing, as it does while running.
+            return match self.restored.take() {
+                Some(mark) if mark.utc < utc && mark.local < now => {
+                    self.catch_up(entries, mark.local, now)
+                }
+                _ => Vec::new(),
+            };
         };
         if now < last
             || last_utc.is_some_and(|last| utc < last || utc - last > Duration::minutes(90))
@@ -802,6 +894,51 @@ impl OneShotEvaluator {
                 break;
             };
             date = next;
+        }
+        due
+    }
+}
+
+impl OneShotEvaluator {
+    // The latest occurrence of each one-shot after `since` and up to `now`,
+    // never more than one per rule however long weaver was stopped. Every
+    // rule repeats within a week, so the last eight days hold the latest
+    // occurrence of each.
+    fn catch_up(
+        &mut self,
+        entries: &[ScheduleEntry],
+        since: NaiveDateTime,
+        now: NaiveDateTime,
+    ) -> Vec<ScheduleEntry> {
+        let since = since.max(now - Duration::days(8));
+        let mut due = Vec::new();
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.enabled && entry.action.is_one_shot())
+        {
+            let times = entry_times(entry);
+            let mut latest = None;
+            let mut date = since.date();
+            while date <= now.date() {
+                let day = Weekday::from_chrono(date.weekday());
+                if entry.days.is_empty() || entry.days.contains(&day) {
+                    for time in &times {
+                        let at = date.and_time(*time);
+                        if since < at && at <= now {
+                            latest = latest.max(Some(at));
+                        }
+                    }
+                }
+                let Some(next) = date.succ_opt() else {
+                    break;
+                };
+                date = next;
+            }
+            if let Some(at) = latest
+                && self.fired.insert((entry.id.clone(), at))
+            {
+                due.push(entry.clone());
+            }
         }
         due
     }

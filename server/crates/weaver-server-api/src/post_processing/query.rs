@@ -188,6 +188,18 @@ impl PostProcessingQuery {
         .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         let more = runs.len() > limit;
         runs.truncate(limit);
+        // A job still in the queue has no history row to name it: its name
+        // is the one the queue shows.
+        if let Some(handle) = ctx.data_opt::<SchedulerHandle>() {
+            for run in &mut runs {
+                if run.job_name.is_none()
+                    && let Some(job_id) = run.job_id
+                    && let Ok(job) = handle.get_job(weaver_server_core::jobs::ids::JobId(job_id))
+                {
+                    run.job_name = Some(job.name);
+                }
+            }
+        }
         Ok(ScriptRunPageGql {
             next_before: runs.last().filter(|_| more).map(|run| run.seq.to_string()),
             runs: runs.into_iter().map(Into::into).collect(),
