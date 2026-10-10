@@ -672,6 +672,20 @@ impl Fixture {
     fn wanted(&self) -> Vec<&'static str> {
         self.expected.iter().map(|(name, _)| *name).collect()
     }
+
+    fn identity_prefix_slots(&self) -> u8 {
+        let articles = 4 / self.volumes.len();
+        let mut mask = 0;
+        for (file, (_, bytes)) in self.volumes.iter().enumerate() {
+            for article in 0..articles {
+                let (start, _) = article_extent(bytes.len(), article as u32, articles);
+                if start < bytes.len().min(crate::pipeline::PAR2_HASH_16K_BYTES) {
+                    mask |= 1 << (file * articles + article);
+                }
+            }
+        }
+        mask
+    }
 }
 
 impl Binding {
@@ -816,7 +830,13 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
     let fixture = Fixture::build(cell);
     assert_eq!(fixture.admission(), expectation.admission, "{cell:?}");
     let expect = expectation.of(profile);
-    let route = route(cell, expect, fixture.unmapped);
+    let mut route = route(cell, expect, fixture.unmapped);
+    let identity_prefix_slots = fixture.identity_prefix_slots();
+    if !cell.naming.names_place() {
+        // A small part needs more than its opening article to prove the
+        // complete PAR2 identity prefix.
+        route.unnamed_loss = LOSES[usize::from(identity_prefix_slots)];
+    }
     let (options, described) = cell.binding.drive(&fixture);
     let wanted = fixture.wanted();
     // A posted listing is kept beside the members, as any loose file is.
@@ -858,8 +878,16 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 let Some(JobStatus::Failed { error }) = &outcome.status else {
                     unreachable!("assert_rejected holds the job failed")
                 };
+                // A posted-name index authenticates the misleading numbering.
+                // After restart it can reach the bounded extraction retry;
+                // clean recovery data still cannot establish archive order.
+                let verified_but_unordered = why == UNORDERED_7Z
+                    && cell.binding == Binding::Par2Posted
+                    && error.contains(
+                        "clean PAR2 verification but extraction still failing after retry",
+                    );
                 assert!(
-                    error.contains(why),
+                    error.contains(why) || verified_but_unordered,
                     "{context}: {error}: {:?}",
                     outcome.trace
                 );
@@ -871,10 +899,6 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 "{context}: {:?}",
                 outcome.trace
             );
-            profile.assert_delivery(&outcome, route, &published, interruption);
-            if matches!(interruption, Interruption::None) {
-                expect.assert_clean(&outcome, order.len() == 4, &context);
-            }
             for (name, bytes) in &fixture.expected {
                 assert_eq!(
                     outcome.files[*name].as_deref(),
@@ -882,6 +906,33 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                     "{context}: {:?}",
                     outcome.trace
                 );
+            }
+            let mut route = route;
+            if matches!(
+                interruption,
+                Interruption::Restart(_) | Interruption::Crash(_)
+            ) && matches!(expect, Expect::Streams | Expect::Downloads)
+                && matches!(cell.container.admitted(), Expect::Direct)
+            {
+                // Retained index metadata can identify refetched parts before
+                // their arrivals after restart. Either route remains valid;
+                // direct admission still requires no unexpected demotion and
+                // no refetch of durable articles below.
+                route.direct = outcome.finalized == route.sets;
+            }
+            if cell.naming == Naming::OldStyleS
+                && interruption
+                    .loss()
+                    .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
+            {
+                // These posted names admit a RAR set but differ from the real
+                // PAR2 names. Without its content prefix a volume cannot be
+                // bound safely; repair must use materialized source files.
+                route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
+            }
+            profile.assert_delivery(&outcome, route, &published, interruption);
+            if matches!(interruption, Interruption::None) {
+                expect.assert_clean(&outcome, order.len() == 4, &context);
             }
         };
         check();
@@ -919,8 +970,18 @@ async fn rar4_late_par2_recovers_lost_first_article() {
             binding: Binding::Par2RealLast,
         },
         ExtractionProfile::DirectStore,
-        vec![(240, (slot_arrivals(4), Interruption::Loss { mask: 1, index_first: false }))],
-    ).await;
+        vec![(
+            240,
+            (
+                slot_arrivals(4),
+                Interruption::Loss {
+                    mask: 1,
+                    index_first: false,
+                },
+            ),
+        )],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -932,10 +993,24 @@ async fn sfv_cannot_repair_an_unavailable_first_article() {
     ] {
         for profile in PROFILES {
             run_cell(
-                Cell { container, naming, binding: Binding::Sfv },
+                Cell {
+                    container,
+                    naming,
+                    binding: Binding::Sfv,
+                },
                 profile,
-                vec![(0, (slot_arrivals(4), Interruption::Loss { mask: 1, index_first: false }))],
-            ).await;
+                vec![(
+                    0,
+                    (
+                        slot_arrivals(4),
+                        Interruption::Loss {
+                            mask: 1,
+                            index_first: false,
+                        },
+                    ),
+                )],
+            )
+            .await;
         }
     }
 }
@@ -945,13 +1020,27 @@ async fn solid_bare_first_part_keeps_repair_and_restart_fallbacks() {
     for binding in [Binding::Par2RealFirst, Binding::Par2RealLast] {
         for profile in PROFILES {
             run_cell(
-                Cell { container: Container::SevenZipSolid, naming: Naming::BareFirstPart, binding },
+                Cell {
+                    container: Container::SevenZipSolid,
+                    naming: Naming::BareFirstPart,
+                    binding,
+                },
                 profile,
                 vec![
-                    (240, (slot_arrivals(4), Interruption::Loss { mask: 1, index_first: false })),
+                    (
+                        240,
+                        (
+                            slot_arrivals(4),
+                            Interruption::Loss {
+                                mask: 1,
+                                index_first: false,
+                            },
+                        ),
+                    ),
                     (0, (slot_arrivals(4), Interruption::Restart(2))),
                 ],
-            ).await;
+            )
+            .await;
         }
     }
 }
@@ -974,6 +1063,83 @@ async fn reposted_rar4_restores_both_volume_identities() {
         )],
     )
     .await;
+}
+
+#[tokio::test]
+async fn retained_index_can_admit_misnumbered_rar_after_restart() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::HexMisnumbered,
+            binding: Binding::Par2RealLast,
+        },
+        ExtractionProfile::DirectStore,
+        vec![
+            (
+                110,
+                (
+                    vec![(0, 0), (1, 0), (0, 1), (1, 1)],
+                    Interruption::Restart(2),
+                ),
+            ),
+            (
+                277,
+                (vec![(0, 0), (1, 0), (0, 1), (1, 1)], Interruption::Crash(2)),
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn renamed_par2_sources_repair_missing_identity_prefixes() {
+    for (container, naming, binding, mask) in [
+        (Container::Rar4, Naming::OldStyleS, Binding::Par2RealLast, 1),
+        (
+            Container::SevenZipSolid,
+            Naming::HexBare,
+            Binding::Par2RealFirst,
+            2,
+        ),
+        (
+            Container::SevenZipSolid,
+            Naming::HexMisnumbered,
+            Binding::Par2RealFirst,
+            2,
+        ),
+        (
+            Container::SevenZipSolid,
+            Naming::HexBare,
+            Binding::Par2RealFirst,
+            8,
+        ),
+        (
+            Container::SevenZipSolid,
+            Naming::HexMisnumbered,
+            Binding::Par2RealFirst,
+            8,
+        ),
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming,
+                binding,
+            },
+            ExtractionProfile::DirectStore,
+            vec![(
+                0,
+                (
+                    slot_arrivals(4),
+                    Interruption::Loss {
+                        mask,
+                        index_first: false,
+                    },
+                ),
+            )],
+        )
+        .await;
+    }
 }
 
 const PROFILES: [ExtractionProfile; 3] = [
