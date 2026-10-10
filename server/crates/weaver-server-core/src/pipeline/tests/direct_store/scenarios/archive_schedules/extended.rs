@@ -10,3 +10,4 @@ use super::*;
 mod depth;
 mod formats;
 mod repair;
+mod tier2;

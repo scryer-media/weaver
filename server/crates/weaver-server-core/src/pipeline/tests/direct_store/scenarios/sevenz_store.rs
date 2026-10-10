@@ -7,7 +7,7 @@
 
 use super::*;
 
-mod embedded_par3;
+pub(super) mod embedded_par3;
 mod obfuscated_split;
 pub(super) mod schedules;
 

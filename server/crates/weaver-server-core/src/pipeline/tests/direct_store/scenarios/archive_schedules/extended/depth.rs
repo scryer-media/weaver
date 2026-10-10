@@ -74,8 +74,11 @@ impl Family {
                 let mut orders = with_duplicate(&five);
                 orders.extend(five);
                 assert_eq!(orders.len(), 1320);
+                // One order in two, by a fixed stride over the sorted orders.
+                let orders: BTreeSet<Order> = orders.into_iter().step_by(2).collect();
+                assert_eq!(orders.len(), 660);
                 let cases = single_interruption_cases(5, &orders, |_| true);
-                assert_eq!(cases.len(), 91_209);
+                assert_eq!(cases.len(), 69_489);
                 cases
             }
             Self::SecondDuplicate => {
