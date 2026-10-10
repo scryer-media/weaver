@@ -35,6 +35,7 @@ import {
   Tag,
 } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { ArchivePassword, ArchivePasswordDialog } from "../components/ArchivePassword";
 import { DangerButton, SecondaryButton } from "../components/controls";
 import { Icon } from "../components/icons";
 import { PhaseBars, useJobProgress } from "../components/PhaseBars";
@@ -194,6 +195,7 @@ function JobDetailContent() {
   }>({ query: DUPLICATE_SNAPSHOT_QUERY, variables, pause: !Number.isFinite(jobId) });
 
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
+  const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | null>(null);
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
@@ -480,7 +482,7 @@ function JobDetailContent() {
                   size="compact"
                   disabled={busy}
                   onClick={() => {
-                    void run(t("next.job.report.requeued"), () => redownloadJob({ id: job.id }));
+                    setRetryAction("redownload");
                   }}
                 >
                   {t("next.completed.redownload")}
@@ -502,9 +504,7 @@ function JobDetailContent() {
                   size="compact"
                   disabled={busy}
                   onClick={() => {
-                    void run(t("next.job.report.reprocessing"), () =>
-                      reprocessJob({ id: job.id }),
-                    );
+                    setRetryAction("reprocess");
                   }}
                 >
                   {t("next.job.reprocess")}
@@ -826,6 +826,7 @@ function JobDetailContent() {
           </DetailBlock>
 
           <DetailBlock id="metadata" title={t("next.job.metadata")} tone="panel" bodyClassName="gap-[11px]">
+            {job.hasPassword ? <Field variant="stacked" label={t("next.archivePasswords.password")} value={<ArchivePassword id={job.id} />} /> : null}
             <Field variant="stacked" label={t("next.job.jobId")} value={String(job.id)} />
             <Field
               variant="stacked"
@@ -944,6 +945,14 @@ function JobDetailContent() {
         );
       })}
 
+      {retryAction ? <ArchivePasswordDialog
+        title={t(retryAction === "redownload" ? "next.completed.redownload" : "next.job.reprocess")}
+        busy={busy} onDismiss={() => setRetryAction(null)}
+        onConfirm={(password) => {
+          setRetryAction(null);
+          void run(t(retryAction === "redownload" ? "next.job.report.requeued" : "next.job.report.reprocessing"),
+            () => retryAction === "redownload" ? redownloadJob({ id: job.id, password }) : reprocessJob({ id: job.id, password }));
+        }} /> : null}
       <ConfirmDialog
         open={confirm === "cancel"}
         title={t("next.job.cancelTitle")}

@@ -1639,7 +1639,9 @@ impl Database {
         use crate::persistence::encryption::is_encrypted;
         use crate::persistence::sql_runtime::SqlRuntime;
 
-        if self.automatic_backup_ciphertext()?.is_some() {
+        if self.automatic_backup_ciphertext()?.is_some()
+            || !self.validated_archive_password_ciphertexts()?.is_empty()
+        {
             return Ok(true);
         }
         let datastore = self.datastore();
@@ -1651,6 +1653,7 @@ impl Database {
                 "SELECT password FROM active_jobs WHERE password IS NOT NULL",
                 "SELECT source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
                 "SELECT value AS password FROM secrets",
+                "SELECT value AS password FROM settings WHERE key = 'archive_passwords'",
                 "SELECT sealed_value AS password FROM script_instance_inputs WHERE sealed_value IS NOT NULL",
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
@@ -1677,6 +1680,16 @@ impl Database {
         use crate::persistence::encryption::{decrypt_value, is_encrypted};
         use crate::persistence::sql_runtime::SqlRuntime;
 
+        for ciphertext in self.validated_archive_password_ciphertexts()? {
+            if !is_encrypted(&ciphertext) {
+                return Err(StateError::Conflict(
+                    "validated archive password is not encrypted".into(),
+                ));
+            }
+            decrypt_value(key, &ciphertext).map_err(|_| {
+                StateError::Conflict("cannot decrypt validated archive password".into())
+            })?;
+        }
         if let Some(ciphertext) = self.automatic_backup_ciphertext()? {
             if !is_encrypted(&ciphertext) {
                 return Err(StateError::Conflict(
@@ -1730,7 +1743,7 @@ impl Database {
             }
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT id, name, value FROM secrets",
+                "SELECT id, name, value FROM secrets UNION ALL SELECT 'archive_passwords' AS id, 'archive passwords' AS name, value FROM settings WHERE key = 'archive_passwords'",
                 &[],
             )
             .await?;

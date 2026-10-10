@@ -1,3 +1,4 @@
+mod archive_passwords;
 pub mod env_seed;
 pub mod model;
 pub mod persistence;

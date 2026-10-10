@@ -70,6 +70,8 @@ pub enum ArchivePasswordSource {
     Explicit,
     NzbMeta,
     FilenameConvention,
+    Settings,
+    PasswordFile,
 }
 
 impl ArchivePasswordSource {
@@ -78,6 +80,8 @@ impl ArchivePasswordSource {
             Self::Explicit => "explicit",
             Self::NzbMeta => "nzb_meta",
             Self::FilenameConvention => "filename_convention",
+            Self::Settings => "settings",
+            Self::PasswordFile => "password_file",
         }
     }
 }

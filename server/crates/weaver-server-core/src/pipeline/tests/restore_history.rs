@@ -912,9 +912,17 @@ async fn history_deletion_waits_for_scripts_without_blocking_commands() {
             let (reply, recv) = oneshot::channel();
             pipeline
                 .handle_command(if restart {
-                    SchedulerCommand::ReprocessJob { job_id, reply }
+                    SchedulerCommand::ReprocessJob {
+                        job_id,
+                        password: None,
+                        reply,
+                    }
                 } else {
-                    SchedulerCommand::RedownloadJob { job_id, reply }
+                    SchedulerCommand::RedownloadJob {
+                        job_id,
+                        password: None,
+                        reply,
+                    }
                 })
                 .await;
             assert!(matches!(

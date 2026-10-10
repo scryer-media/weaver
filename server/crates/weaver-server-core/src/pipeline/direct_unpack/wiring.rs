@@ -56,7 +56,8 @@ use crate::jobs::ids::JobId;
 use crate::pipeline::FullSetExtractionOutcome;
 use crate::pipeline::Pipeline;
 use crate::pipeline::completion::finalize::extract::{
-    SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream, extract_zip_stream,
+    SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream,
+    extract_zip_stream_candidates,
 };
 use crate::pipeline::extraction::ExtractionRoot;
 
@@ -1997,11 +1998,20 @@ impl Pipeline {
                                 format!("failed to open ZIP direct-unpack reader: {error}")
                             })?;
                         let (silent_events, _) = tokio::sync::broadcast::channel(1);
-                        let extracted = extract_zip_stream(
+                        let candidates = password
+                            .iter()
+                            .map(|value| {
+                                crate::jobs::ArchivePasswordCandidate::new(
+                                    crate::jobs::ArchivePasswordSource::Explicit,
+                                    value.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let (extracted, selected_password) = extract_zip_stream_candidates(
                             std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader),
                             &root,
                             &budget,
-                            password.as_deref(),
+                            &candidates,
                             &silent_events,
                             job_id,
                             &set_name,
@@ -2010,7 +2020,7 @@ impl Pipeline {
                         return Ok(FullSetExtractionOutcome {
                             extracted,
                             failed: Vec::new(),
-                            selected_password: password,
+                            selected_password,
                         });
                     }
                     let ChaseFormat::SevenZip { end_header_bytes } = format else {

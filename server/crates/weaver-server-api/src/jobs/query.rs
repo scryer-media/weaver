@@ -230,6 +230,16 @@ fn queue_page_summary(
 
 #[Object]
 impl JobsQuery {
+    #[graphql(guard = "crate::auth::AdminGuard")]
+    async fn validated_archive_password(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+    ) -> Result<Option<String>> {
+        let db = ctx.data::<Database>()?.clone();
+        Ok(tokio::task::spawn_blocking(move || db.validated_archive_password(id)).await??)
+    }
+
     /// A report on a queued or finished job's NZB and how the job went, with
     /// every name, path, host and password left out so it can be shared.
     #[graphql(guard = "ReadGuard")]

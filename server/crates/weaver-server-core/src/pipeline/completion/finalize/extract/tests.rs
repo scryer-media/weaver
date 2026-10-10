@@ -1,4 +1,5 @@
 use super::*;
+mod passwords;
 mod zip64;
 use std::collections::HashMap;
 use std::fs;
@@ -232,12 +233,21 @@ fn extract_with_weaver_zip_result(
         archive_path,
         &root,
         &budget,
-        password,
+        &password
+            .into_iter()
+            .map(|value| {
+                crate::jobs::ArchivePasswordCandidate::new(
+                    crate::jobs::ArchivePasswordSource::Explicit,
+                    value.to_string(),
+                )
+            })
+            .collect::<Vec<_>>(),
         &event_tx,
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
         None,
     )
+    .map(|(members, _)| members)
 }
 
 fn extract_with_weaver_zip_result_with_phase(
@@ -252,12 +262,21 @@ fn extract_with_weaver_zip_result_with_phase(
         archive_path,
         &root,
         &budget,
-        password,
+        &password
+            .into_iter()
+            .map(|value| {
+                crate::jobs::ArchivePasswordCandidate::new(
+                    crate::jobs::ArchivePasswordSource::Explicit,
+                    value.to_string(),
+                )
+            })
+            .collect::<Vec<_>>(),
         &event_tx,
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
         Some(Arc::clone(&phase_counters)),
-    );
+    )
+    .map(|(members, _)| members);
     (result, phase_counters)
 }
 

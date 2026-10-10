@@ -2,6 +2,15 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Korean strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextKo: LocaleDictionary = {
+  "next.archivePasswords.title": "압축 파일 비밀번호",
+  "next.archivePasswords.list": "비밀번호 (한 줄에 하나)",
+  "next.archivePasswords.file": "비밀번호 파일",
+  "next.archivePasswords.saved": "비밀번호 저장됨",
+  "next.archivePasswords.clear": "비밀번호 지우기",
+  "next.archivePasswords.password": "압축 파일 비밀번호",
+  "next.archivePasswords.show": "표시",
+  "next.archivePasswords.hide": "숨기기",
+  "next.archivePasswords.loadFailed": "비밀번호를 불러올 수 없습니다",
   // Shell
   "next.nav.downloads": "다운로드",
   "next.nav.history": "기록",

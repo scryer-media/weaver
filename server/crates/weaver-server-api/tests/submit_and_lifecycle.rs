@@ -1269,6 +1269,32 @@ async fn download_block_reflects_pause() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn archive_password_retry_arguments_reach_job_validation() {
+    let h = TestHarness::new().await;
+    for action in [
+        "reprocessJob",
+        "redownloadJob",
+        "reprocessQueueItem",
+        "redownloadQueueItem",
+    ] {
+        let selection = if action.ends_with("QueueItem") {
+            " { success }"
+        } else {
+            ""
+        };
+        let response = h.execute(&format!("mutation {{ {action}(id: 999999, password: \"synthetic-replacement\"){selection} }}")).await;
+        assert_has_errors(&response);
+        assert!(
+            !response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("Unknown argument")
+                    || error.message.contains("Unknown field"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn reprocess_nonexistent_job() {
     let h = TestHarness::new().await;
 

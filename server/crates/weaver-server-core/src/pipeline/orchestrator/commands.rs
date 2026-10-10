@@ -750,27 +750,35 @@ impl Pipeline {
                     });
                 let _ = reply.send(result);
             }
-            SchedulerCommand::ReprocessJob { job_id, reply } => {
+            SchedulerCommand::ReprocessJob {
+                job_id,
+                password,
+                reply,
+            } => {
                 if self.pending_history_deletions.contains(&job_id) {
                     let _ = reply.send(Err(SchedulerError::Conflict(
                         "history deletion is still running".into(),
                     )));
                     return;
                 }
-                let result = self.reprocess_job(job_id).await;
+                let result = self.reprocess_job_with_password(job_id, password).await;
                 if result.is_ok() {
                     self.publish_snapshot();
                 }
                 let _ = reply.send(result);
             }
-            SchedulerCommand::RedownloadJob { job_id, reply } => {
+            SchedulerCommand::RedownloadJob {
+                job_id,
+                password,
+                reply,
+            } => {
                 if self.pending_history_deletions.contains(&job_id) {
                     let _ = reply.send(Err(SchedulerError::Conflict(
                         "history deletion is still running".into(),
                     )));
                     return;
                 }
-                let result = self.redownload_job(job_id).await;
+                let result = self.redownload_job_with_password(job_id, password).await;
                 if result.is_ok() {
                     self.publish_snapshot();
                 }
