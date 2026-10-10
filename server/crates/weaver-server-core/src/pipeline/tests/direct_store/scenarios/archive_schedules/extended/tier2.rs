@@ -103,6 +103,9 @@ pub(super) trait Cell: Copy + std::fmt::Debug {
     /// release.
     fn par2(self) -> bool;
 
+    fn case_weight(self) -> usize {
+        1
+    }
 }
 
 /// A post and the recovery geometry its oracle counts in.
@@ -218,7 +221,11 @@ impl<C: Cell> Family<C> {
     /// family's case indices that fall in the shard.
     pub(super) async fn shard(&self, shard: usize, shards: usize) {
         assert!(shard < shards);
-        let total = self.total();
+        let total: usize = self
+            .units
+            .iter()
+            .map(|&(cell, profile, pool, per, _)| pool.count(profile, per) * cell.case_weight())
+            .sum();
         let range = shard * total / shards..(shard + 1) * total / shards;
         let replay = std::env::var("WEAVER_TIER2_CASE").ok().map(|selection| {
             match selection.split_once("..") {
@@ -230,11 +237,16 @@ impl<C: Cell> Family<C> {
             }
         });
         let mut at = 0;
+        let mut weighted_at = 0;
         for &(cell, profile, pool, per, rotation) in &self.units {
             let count = pool.count(profile, per);
             let unit = at..at + count;
             at += count;
-            if unit.end <= range.start || unit.start >= range.end {
+            let weight = cell.case_weight();
+            assert!(weight > 0);
+            let weighted_start = weighted_at;
+            weighted_at += count * weight;
+            if weighted_at <= range.start || weighted_start >= range.end {
                 continue;
             }
             let cases: Vec<_> = pool
@@ -245,8 +257,9 @@ impl<C: Cell> Family<C> {
                     // The run names cases by family index so the printed
                     // number is the one the replay switch takes.
                     let index = unit.start + k;
-                    (range.contains(&index) && replay.as_ref().is_none_or(|replay| replay.contains(&index)))
-                        .then_some((index, schedule))
+                    (range.contains(&(weighted_start + k * weight))
+                        && replay.as_ref().is_none_or(|replay| replay.contains(&index)))
+                    .then_some((index, schedule))
                 })
                 .collect();
             if !cases.is_empty() {

@@ -174,20 +174,36 @@ pub(super) fn cells() -> Vec<Par2Cell> {
 /// combined cases.
 pub(super) const PER_UNIT: usize = 46;
 
-/// 8,000 cells under three profiles, 46 schedules each.
-pub(super) const TOTAL: usize = 1_104_000;
+// Preserve every cell and profile, but sample fewer schedules for the cubic
+// thousands-block algebra. Weight those cases separately when sharding.
+const THOUSANDS_PER_UNIT: usize = 2;
+pub(super) const TOTAL: usize = 4_000 * 3 * (PER_UNIT + THOUSANDS_PER_UNIT);
 
 pub(super) fn family() -> Family<Par2Cell> {
     let cells = cells();
     assert_eq!(cells.len(), 8_000);
+    let mut indexed: Vec<_> = cells.into_iter().enumerate().collect();
+    let band_width = ALIGNMENTS.len() * PATTERNS.len() * CONTAINERS.len();
+    // Interleave the two costs so no shard collects a long run of cheap
+    // cases. Keep the original cell index as its schedule rotation seed.
+    indexed.sort_by_key(|(index, _)| {
+        (
+            index / (band_width * BANDS.len()),
+            index % band_width,
+            index / band_width % BANDS.len(),
+        )
+    });
     Family {
-        units: cells
+        units: indexed
             .into_iter()
-            .enumerate()
             .flat_map(|(index, cell)| {
+                let per = match cell.band {
+                    Band::Hundreds => PER_UNIT,
+                    Band::Thousands => THOUSANDS_PER_UNIT,
+                };
                 PROFILES
                     .into_iter()
-                    .map(move |profile| (cell, profile, Pool::Combined, PER_UNIT, index))
+                    .map(move |profile| (cell, profile, Pool::Combined, per, index))
             })
             .collect(),
     }
@@ -442,6 +458,13 @@ impl Cell for Par2Cell {
 
     fn par2(self) -> bool {
         true
+    }
+
+    fn case_weight(self) -> usize {
+        match self.band {
+            Band::Hundreds => 1,
+            Band::Thousands => 256,
+        }
     }
 }
 
