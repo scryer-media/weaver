@@ -2938,7 +2938,21 @@ impl Pipeline {
                 // and a volume a repair rebuilt for it is spent once the set
                 // is finalized.
                 self.cleanup_installed_direct_set_volumes(job_id).await;
-                // No archives — move to complete and finish.
+                // Direct installation can expose another archive just as an
+                // extractor does. Settle that layer before publishing output.
+                match self.maybe_start_nested_extraction(job_id).await {
+                    Ok(NestedExtractionDecision::Deferred | NestedExtractionDecision::Started) => {
+                        return;
+                    }
+                    Ok(
+                        NestedExtractionDecision::NoNestedArchives
+                        | NestedExtractionDecision::PreserveOutputsAtDepthLimit,
+                    ) => {}
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                }
                 if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
                 }

@@ -525,11 +525,7 @@ pub(super) mod nesting {
             }
         }
 
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            if self.depth == Depth::RarInside7z {
-                return Some(Defect::Diverges(RAR_INSIDE_7Z_PUBLISHED_AS_IS));
-            }
+        fn defect(self, _profile: ExtractionProfile) -> Option<Defect> {
             None
         }
 
@@ -537,10 +533,6 @@ pub(super) mod nesting {
             matches!(self.recovery, Recovery::Par2(_))
         }
     }
-
-    /// A 7z whose member is a RAR publishes the RAR itself: nested extraction
-    /// is not entered from a 7z outer. Not PAR2, so not release-blocking.
-    const RAR_INSIDE_7Z_PUBLISHED_AS_IS: &str = "a RAR inside a 7z is published as the archive, never extracted";
 
     mod nesting_smoke {
         use super::*;
