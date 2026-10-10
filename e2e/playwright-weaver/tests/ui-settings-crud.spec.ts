@@ -28,7 +28,16 @@ async function confirmRemoval(page: Page, label: string) {
   await expect(confirm).toBeHidden();
 }
 
-test("general SRRDB lookup and bandwidth ceiling and cap persist through the settings top bar", async ({ cleanPage: page }) => {
+/** Open the System egress's editor from the egress table. */
+async function openSystemEgress(page: Page): Promise<Locator> {
+  await page.goto("/settings/networking/egress");
+  await tableRow(page, "Egress interfaces", "System").click();
+  const editor = page.getByRole("dialog", { name: "System", exact: true });
+  await expect(editor).toBeVisible();
+  return editor;
+}
+
+test("general SRRDB lookup, bandwidth ceiling and an egress download quota persist", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
   const srrdbLookup = page.getByRole("switch", { name: "SRRDB release lookup", exact: true });
   await expect(srrdbLookup).toBeVisible();
@@ -36,8 +45,11 @@ test("general SRRDB lookup and bandwidth ceiling and cap persist through the set
     await expect(srrdbLookup).toBeChecked();
     await page.goto("/settings/bandwidth");
     await expect(page.getByRole("spinbutton", { name: "Download ceiling", exact: true })).toHaveValue("8");
-    await expect(page.getByRole("switch", { name: "Enforce a data cap", exact: true })).toBeChecked();
-    await expect(page.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
+    const editor = await openSystemEgress(page);
+    await expect(editor.getByRole("switch", { name: "Enforce a download quota", exact: true })).toBeChecked();
+    await expect(editor.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
+    await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(editor).toBeHidden();
     return;
   }
 
@@ -52,23 +64,34 @@ test("general SRRDB lookup and bandwidth ceiling and cap persist through the set
   const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
   await ceiling.fill("8");
   await ceiling.press("Tab");
-  await page.getByRole("switch", { name: "Enforce a data cap", exact: true }).click();
+  await saveSettings(page);
+  await page.reload();
+  await expect(ceiling).toHaveValue("8");
+
+  // The data cap is a download quota on an egress.
+  let editor = await openSystemEgress(page);
+  await editor.getByRole("switch", { name: "Enforce a download quota", exact: true }).click();
+  await editor.getByRole("button", { name: "Quota window", exact: true }).click();
   await page
-    .getByRole("radiogroup", { name: "Cap window", exact: true })
-    .getByRole("radio", { name: "Monthly", exact: true })
+    .getByRole("menu", { name: "Quota window", exact: true })
+    .getByRole("menuitemradio", { name: "Monthly", exact: true })
     .click();
-  await page.getByRole("textbox", { name: "Allowance", exact: true }).fill("500");
-  const monthlyDay = page.getByRole("spinbutton", { name: "Reset day of month", exact: true });
+  await editor.getByRole("textbox", { name: "Allowance", exact: true }).fill("500");
+  const monthlyDay = editor.getByRole("spinbutton", { name: "Reset day of month", exact: true });
   // The day of month clamps to the calendar instead of refusing the draft.
   await monthlyDay.fill("32");
   await monthlyDay.press("Tab");
   await expect(monthlyDay).toHaveValue("31");
   await monthlyDay.fill("17");
   await monthlyDay.press("Tab");
-  await saveSettings(page);
+  await editor.getByRole("button", { name: "Save egress", exact: true }).click();
+  await expect(editor).toBeHidden();
   await page.reload();
-  await expect(ceiling).toHaveValue("8");
-  await expect(monthlyDay).toHaveValue("17");
+  editor = await openSystemEgress(page);
+  await expect(editor.getByRole("switch", { name: "Enforce a download quota", exact: true })).toBeChecked();
+  await expect(editor.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
+  await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(editor).toBeHidden();
 });
 
 test("provider edits keep the stored password masked and a disabled provider can be added and removed", async ({ cleanPage: page }) => {
