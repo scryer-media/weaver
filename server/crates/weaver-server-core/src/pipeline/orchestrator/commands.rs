@@ -410,7 +410,7 @@ impl Pipeline {
                 self.download_restart_durable_lead_retry_after.clear();
                 self.shared_state.set_paused(true);
                 self.shared_state.set_download_block(
-                    self.bandwidth_cap
+                    self.bandwidth_ledger
                         .to_download_block_state(self.global_pause()),
                 );
                 if let Err(e) = self
@@ -512,9 +512,15 @@ impl Pipeline {
             }
             SchedulerCommand::SetSpeedLimit {
                 bytes_per_sec,
+                replaces_schedule,
                 reply,
             } => {
                 self.configured_rate_limit = bytes_per_sec;
+                if replaces_schedule && self.scheduled_rate_limit.take().is_some() {
+                    // The schedule's rate gives way until its next rule fires.
+                    self.publish_download_block();
+                    info!(bytes_per_sec, "speed limit set over the scheduled one");
+                }
                 if self.scheduled_rate_limit.is_none() {
                     self.rate_limiter.set_rate(bytes_per_sec);
                 }
@@ -558,39 +564,56 @@ impl Pipeline {
                         self.publish_download_block();
                         info!("schedule: resumed downloads");
                     }
-                    ScheduleAction::SpeedLimit { bytes_per_sec } => {
-                        self.scheduled_rate_limit = Some(bytes_per_sec);
-                        self.rate_limiter.set_rate(bytes_per_sec);
-                        let mut block = self
-                            .bandwidth_cap
-                            .to_download_block_state(self.global_pause());
-                        block.scheduled_speed_limit = bytes_per_sec;
-                        self.shared_state.set_download_block(block);
-                        info!(bytes_per_sec, "schedule: set speed limit");
+                    ScheduleAction::SpeedLimit { limits } => {
+                        // Only the global limit lives here; an egress or
+                        // provider limit is that holder's own rate.
+                        match limits
+                            .iter()
+                            .rev()
+                            .find(|limit| limit.target == crate::bandwidth::SpeedTarget::Global)
+                        {
+                            Some(limit) => {
+                                let bytes_per_sec = limit.bytes_per_sec;
+                                self.scheduled_rate_limit = Some(bytes_per_sec);
+                                self.rate_limiter.set_rate(bytes_per_sec);
+                                let mut block = self
+                                    .bandwidth_ledger
+                                    .to_download_block_state(self.global_pause());
+                                block.scheduled_speed_limit = bytes_per_sec;
+                                self.shared_state.set_download_block(block);
+                                info!(bytes_per_sec, "schedule: set speed limit");
+                            }
+                            None => warn!(
+                                ?limits,
+                                "an egress or provider speed limit reached download pipeline"
+                            ),
+                        }
                     }
-                    ScheduleAction::ConfiguredSpeedLimit => {
-                        self.scheduled_rate_limit = None;
-                        self.rate_limiter.set_rate(self.configured_rate_limit);
-                        self.publish_download_block();
-                        info!("schedule: restored configured speed limit");
-                    }
-                    ScheduleAction::SetQuotaMetering { enabled } => {
-                        // Metering off suspends every egress download quota:
+                    ScheduleAction::SetQuotaMetering { enabled, target } => {
+                        // Metering off suspends an egress's download quota:
                         // bytes still reach the ledger, tagged unmetered, but
-                        // no egress counts them or refuses work.
-                        self.bandwidth_cap.set_metering_enabled(enabled);
-                        if let Some(policy) = self.shared_state.server_transfer_policy() {
-                            policy.set_egress_quota_metering(enabled);
+                        // that egress does not count them or refuse work.
+                        match target {
+                            crate::bandwidth::QuotaTarget::AllEgresses => {
+                                self.bandwidth_ledger.set_metering_enabled(enabled);
+                                if let Some(policy) = self.shared_state.server_transfer_policy() {
+                                    policy.set_egress_quota_metering(enabled);
+                                }
+                            }
+                            crate::bandwidth::QuotaTarget::Egress(egress_id) => {
+                                if let Some(policy) = self.shared_state.server_transfer_policy() {
+                                    policy.set_one_egress_quota_metering(egress_id, enabled);
+                                }
+                            }
                         }
                         self.publish_download_block();
                     }
                     ScheduleAction::PauseWatchFolderScanning
                     | ScheduleAction::ResumeWatchFolderScanning
+                    | ScheduleAction::PauseRss
+                    | ScheduleAction::ResumeRss
                     | ScheduleAction::SetServerActive { .. }
-                    | ScheduleAction::ScanWatchFolder
-                    | ScheduleAction::FetchRss { .. }
-                    | ScheduleAction::PruneHistory { .. }
-                    | ScheduleAction::RunScript { .. } => {
+                    | ScheduleAction::PruneHistory { .. } => {
                         self.publish_download_block();
                         warn!(
                             action = ?action,
@@ -602,18 +625,6 @@ impl Pipeline {
                     | ScheduleAction::PausePostProcessing
                     | ScheduleAction::ResumePostProcessing => {}
                 }
-                let _ = reply.send(());
-            }
-            SchedulerCommand::ClearScheduleAction { reply } => {
-                if self.global_paused {
-                    self.global_paused = false;
-                    self.shared_state.set_paused(false);
-                }
-                self.scheduled_pause = false;
-                self.scheduled_rate_limit = None;
-                self.rate_limiter.set_rate(self.configured_rate_limit);
-                self.publish_download_block();
-                info!("schedule: cleared scheduled action");
                 let _ = reply.send(());
             }
             SchedulerCommand::SetHardwareProfile { profile, reply } => {

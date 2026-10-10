@@ -28,6 +28,7 @@ use weaver_nzb::delivery_rename::{DeliveredFile, PlannedRename};
 
 use crate::jobs::ids::JobId;
 use crate::jobs::working_dir::OUTPUT_DIR_MARKER;
+use crate::post_processing::model::PostProcessingSettings;
 
 /// Public release index, queried by the CRC32 of a file inside the archives.
 pub(super) const SRRDB_API_BASE: &str = "https://api.srrdb.com/v1";
@@ -69,10 +70,14 @@ pub(crate) struct SrrdbInputs {
 
 /// Renames the delivery's payload when it still wears an obfuscated name.
 /// Returns how many files were renamed.
+///
+/// `policy` is the unwanted extension policy the delivery was scanned under.
+/// A payload it refuses, or an executable, is never named after the job.
 pub(super) async fn rename_obfuscated_members(
     job_id: JobId,
     root: &Path,
     plan: &DeliveryNamingPlan,
+    policy: &PostProcessingSettings,
 ) -> u32 {
     let files = {
         let root = root.to_path_buf();
@@ -99,7 +104,9 @@ pub(super) async fn rename_obfuscated_members(
             bytes: *bytes,
         })
         .collect();
-    let Some(candidate) = weaver_nzb::select_rename_candidate(&entries) else {
+    let Some(candidate) = weaver_nzb::select_rename_candidate(&entries, |name| {
+        policy.unacceptable_extension_match(name).is_some()
+    }) else {
         return 0;
     };
     let candidate_path = entries[candidate].relative_path;
@@ -616,8 +623,13 @@ mod tests {
         write_file(root.path(), "Yb5drZSkNi20UCMkb-sample.mkv", 2 * MIB);
         write_file(root.path(), "Yb5drZSkNi20UCMkb.dut.srt", 4096);
 
-        let renamed =
-            rename_obfuscated_members(JobId(1), root.path(), &plan("Silver Horizon 2024")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(1),
+            root.path(),
+            &plan("Silver Horizon 2024"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 3);
         assert_eq!(
@@ -635,8 +647,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_file(root.path(), "Silver.Horizon.2024.1080p.mkv", 64 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(2), root.path(), &plan("Quiet Harbour")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(2),
+            root.path(),
+            &plan("Quiet Harbour"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
         assert_eq!(
@@ -654,6 +671,7 @@ mod tests {
             JobId(3),
             root.path(),
             &plan("2c0837e5fa42c8cfb5d5e583168a2af4"),
+            &PostProcessingSettings::default(),
         )
         .await;
 
@@ -670,8 +688,13 @@ mod tests {
         write_file(root.path(), "VIDEO_TS/VTS_01_1.VOB", 64 * MIB);
         write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 32 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(4), root.path(), &plan("Silver Horizon")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(4),
+            root.path(),
+            &plan("Silver Horizon"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
         assert_eq!(
@@ -695,6 +718,7 @@ mod tests {
             JobId(5),
             root.path(),
             &plan_with_srrdb("Silver Horizon 2024", "Yb5drZSkNi20UCMkb.mkv", 0x1234_5678),
+            &PostProcessingSettings::default(),
         )
         .await;
 
@@ -756,7 +780,13 @@ mod tests {
         );
         plan.srrdb.as_mut().unwrap().base_url = base_url;
 
-        let renamed = rename_obfuscated_members(JobId(8), root.path(), &plan).await;
+        let renamed = rename_obfuscated_members(
+            JobId(8),
+            root.path(),
+            &plan,
+            &PostProcessingSettings::default(),
+        )
+        .await;
         served.abort();
 
         assert_eq!(
@@ -781,10 +811,55 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 64 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(6), root.path(), &plan("Yb5drZSkNi20UCMkb")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(6),
+            root.path(),
+            &plan("Yb5drZSkNi20UCMkb"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
+    }
+
+    #[tokio::test]
+    async fn an_executable_payload_keeps_its_name_with_the_policy_off() {
+        let root = tempfile::tempdir().unwrap();
+        write_file(root.path(), "Yb5drZSkNi20UCMkb.exe", 64 * MIB);
+        let policy_off = PostProcessingSettings {
+            unacceptable_extensions: Vec::new(),
+            ..PostProcessingSettings::default()
+        };
+
+        let renamed =
+            rename_obfuscated_members(JobId(9), root.path(), &plan("Silver Horizon"), &policy_off)
+                .await;
+
+        assert_eq!(renamed, 0);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Yb5drZSkNi20UCMkb.exe".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payload_the_policy_refuses_keeps_its_name() {
+        let root = tempfile::tempdir().unwrap();
+        write_file(root.path(), "Yb5drZSkNi20UCMkb.iso", 64 * MIB);
+        let policy = PostProcessingSettings {
+            unacceptable_extensions: vec!["iso".into()],
+            ..PostProcessingSettings::default()
+        };
+
+        let renamed =
+            rename_obfuscated_members(JobId(10), root.path(), &plan("Silver Horizon"), &policy)
+                .await;
+
+        assert_eq!(renamed, 0);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Yb5drZSkNi20UCMkb.iso".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -794,8 +869,13 @@ mod tests {
         write_file(root.path(), OUTPUT_DIR_MARKER, 32);
         write_file(root.path(), ".hidden-scratch", 512);
 
-        let renamed =
-            rename_obfuscated_members(JobId(7), root.path(), &plan("Silver Horizon")).await;
+        let renamed = rename_obfuscated_members(
+            JobId(7),
+            root.path(),
+            &plan("Silver Horizon"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 1);
         assert!(root.path().join(OUTPUT_DIR_MARKER).is_file());

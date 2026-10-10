@@ -56,7 +56,7 @@ impl QuotaWindow {
 /// when it arrived, and flushes in batches. Download quotas themselves live on
 /// each egress and server; nothing here refuses work.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BandwidthCapRuntime {
+pub(crate) struct BandwidthLedgerRuntime {
     metering_suspended: bool,
     last_pruned_bucket_epoch_minute: Option<i64>,
     pending_usage_by_minute: BTreeMap<(i64, bool), u64>,
@@ -64,7 +64,7 @@ pub(crate) struct BandwidthCapRuntime {
     pending_usage_started_at: Option<Instant>,
 }
 
-impl BandwidthCapRuntime {
+impl BandwidthLedgerRuntime {
     pub(crate) fn set_metering_enabled(&mut self, enabled: bool) {
         self.metering_suspended = !enabled;
     }
@@ -223,7 +223,7 @@ fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> QuotaWindow
     } else {
         let previous = today
             .pred_opt()
-            .expect("previous day exists for daily bandwidth cap");
+            .expect("previous day exists for a daily quota window");
         local_datetime(
             previous.year(),
             previous.month(),
@@ -234,7 +234,7 @@ fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> QuotaWindow
     let next_day = start
         .date_naive()
         .succ_opt()
-        .expect("next day exists for daily bandwidth cap");
+        .expect("next day exists for a daily quota window");
     let end = local_datetime(
         next_day.year(),
         next_day.month(),
@@ -332,7 +332,7 @@ impl Pipeline {
 
     pub(crate) fn publish_download_block(&mut self) {
         let mut block = self
-            .bandwidth_cap
+            .bandwidth_ledger
             .to_download_block_state(self.global_pause());
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
@@ -342,14 +342,14 @@ impl Pipeline {
         &mut self,
         payload_bytes: u64,
     ) -> Result<(), SchedulerError> {
-        self.bandwidth_cap
+        self.bandwidth_ledger
             .record_download_bytes(&self.db, payload_bytes)?;
         Ok(())
     }
 
     pub(crate) fn flush_download_bandwidth_usage(&mut self) -> Result<(), SchedulerError> {
-        self.bandwidth_cap.flush_pending_usage(&self.db)?;
-        self.bandwidth_cap.prune_if_due(&self.db)?;
+        self.bandwidth_ledger.flush_pending_usage(&self.db)?;
+        self.bandwidth_ledger.prune_if_due(&self.db)?;
         Ok(())
     }
 }

@@ -657,7 +657,7 @@ impl PostProcessingExecutor {
                     entry,
                     adapter,
                     started,
-                    "the script instance no longer exists".to_string(),
+                    "the script job no longer exists".to_string(),
                 ));
             }
             Err(error) => {

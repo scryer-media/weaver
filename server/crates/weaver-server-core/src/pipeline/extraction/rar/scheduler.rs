@@ -825,12 +825,14 @@ impl Pipeline {
                                         budget: Some(Arc::clone(&budget)),
                                     },
                                 )?;
-                            if let Some((member, pattern)) =
+                            if let Some(member) =
                                 Self::blocked_rar_member(&selection.archive, &policy_for_task)
                             {
-                                return Err(budget.reject_content_policy(format!(
-                                    "unacceptable extension '{pattern}' matched RAR member '{member}' before extraction"
-                                )));
+                                return Err(budget.reject_content_policy(
+                                    crate::post_processing::model::unwanted_extension_reason(
+                                        &member,
+                                    ),
+                                ));
                             }
                             let _memory_permit =
                                 budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
@@ -1786,6 +1788,18 @@ impl Pipeline {
                             &set_name,
                             RarCapacityRetryKind::FullSetExtraction,
                         );
+                        return;
+                    }
+                    // A set with no first volume never opened, so nothing about
+                    // its bytes is known to be wrong: it is short a volume.
+                    // Parked as waiting on it, it takes the missing-volume
+                    // route — repair when recovery data can rebuild it, a
+                    // failure naming the volumes seen when nothing can.
+                    if crate::pipeline::archive::topology::is_missing_first_rar_volume_error(&e)
+                        && self.park_rar_set_waiting_for_first_volume(job_id, &set_name)
+                    {
+                        self.phase_end_extracting_if_idle(job_id);
+                        self.check_job_completion(job_id).await;
                         return;
                     }
                     self.purge_empty_rar_set_if_idle(job_id, &set_name);

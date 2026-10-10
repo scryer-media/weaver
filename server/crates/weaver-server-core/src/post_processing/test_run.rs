@@ -100,7 +100,7 @@ fn test_event(trigger: InstanceTrigger) -> ScriptEventLabel {
 pub enum ScriptTestError {
     #[error("{0}")]
     Refused(&'static str),
-    #[error("the script instance does not exist")]
+    #[error("the script job does not exist")]
     NotFound,
     #[error("{0}")]
     Unavailable(String),

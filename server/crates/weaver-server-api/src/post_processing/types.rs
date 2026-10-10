@@ -40,18 +40,18 @@ pub struct PostProcessingSettingsGql {
     pub unacceptable_extensions: Vec<String>,
     /// True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
     pub strict_security_refuses_execution: bool,
-    /// Whether instances for every category also run for a category that has
-    /// instances of its own.
+    /// Whether script jobs for every category also run for a category that has
+    /// script jobs of its own.
     pub global_scripts_run: GlobalScriptsRunGql,
 }
 
-/// When instances that are not narrowed to a category run.
+/// When script jobs that are not narrowed to a category run.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
 #[graphql(name = "GlobalScriptsRun")]
 pub enum GlobalScriptsRunGql {
     /// For every download, ahead of the ones for its category.
     Always,
-    /// Only for a download whose category has no instances of its own.
+    /// Only for a download whose category has no script jobs of its own.
     OnlyWithoutCategoryScripts,
 }
 
@@ -216,7 +216,7 @@ pub struct ScriptGql {
     pub version: Option<String>,
     /// What the header declares about each input, for drawing a form.
     pub options: Vec<ScriptOptionGql>,
-    /// What the header offers as a starting point for an instance.
+    /// What the header offers as a starting point for a script job.
     pub preset: ScriptPresetGql,
 }
 
@@ -282,17 +282,17 @@ pub struct ScriptListingGql {
 }
 
 /// One saved input: a value, a link to a named secret, or a secret of the
-/// instance's own. A secret's value is never read back out.
+/// script job's own. A secret's value is never read back out.
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(name = "ScriptInstanceValue")]
 pub struct ScriptInstanceValueGql {
     pub name: String,
-    /// Empty when the input is a secret, linked or the instance's own.
+    /// Empty when the input is a secret, linked or the script job's own.
     pub value: String,
     /// The named secret the input is linked to, or null.
     pub secret: Option<SecretRefGql>,
-    /// The input is a secret of the instance's own: kept encrypted with the
-    /// instance, write-only, and not among the named secrets.
+    /// The input is a secret of the script job's own: kept encrypted with the
+    /// script job, write-only, and not among the named secrets.
     pub sealed: bool,
 }
 
@@ -313,7 +313,7 @@ impl From<SecretRef> for SecretRefGql {
     }
 }
 
-/// An instance that links a secret.
+/// A script job that links a secret.
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(name = "ScriptInstanceRef")]
 pub struct ScriptInstanceRefGql {
@@ -330,7 +330,7 @@ pub struct SecretGql {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// The instances that link it, by name.
+    /// The script jobs that link it, by name.
     pub used_by: Vec<ScriptInstanceRefGql>,
 }
 
@@ -377,13 +377,13 @@ pub struct ScriptPresetTriggerGql {
 }
 
 /// What a script's header offers as a starting point. It fills a form and
-/// nothing more: a saved instance never follows the header.
+/// nothing more: a saved script job never follows the header.
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(name = "ScriptPreset")]
 pub struct ScriptPresetGql {
-    /// One per instance the header asks for.
+    /// One per script job the header asks for.
     pub triggers: Vec<ScriptPresetTriggerGql>,
-    /// When a schedule instance is meant to run.
+    /// When a schedule script job is meant to run.
     pub task_times: Vec<String>,
     /// Every declared input at its default. A secret has no value.
     pub inputs: Vec<ScriptPresetValueGql>,
@@ -441,7 +441,7 @@ pub struct ScriptInstanceGql {
     /// Set when `trigger` is `QUEUE`.
     pub queue_event: Option<QueueEventGql>,
     pub inputs: Vec<ScriptInstanceValueGql>,
-    /// Empty runs for every category. Only post-processing and queue instances
+    /// Empty runs for every category. Only post-processing and queue script jobs
     /// can be narrowed.
     pub categories: Vec<String>,
     pub enabled: bool,
@@ -451,15 +451,73 @@ pub struct ScriptInstanceGql {
     pub blocking: bool,
     /// Null runs under the default timeout of its trigger.
     pub timeout_seconds: Option<u64>,
+    /// When a schedule script job runs. Empty for every other trigger.
+    pub schedule: ScriptInstanceScheduleGql,
     pub run_order: i64,
     /// Why the script cannot run as things stand, such as its file having gone
     /// from the scripts directory. Null when it can.
     pub script_problem: Option<String>,
-    /// The script's header no longer declares the inputs this instance holds.
+    /// The script's header no longer declares the inputs this script job holds.
     pub header_drift: bool,
 }
 
-/// The scripts directory as it is now, for judging saved instances against.
+/// When a schedule script job runs.
+#[derive(Debug, Clone, Default, SimpleObject, InputObject)]
+#[graphql(
+    name = "ScriptInstanceSchedule",
+    input_name = "ScriptInstanceScheduleInput"
+)]
+pub struct ScriptInstanceScheduleGql {
+    /// `mon` to `sun`. Empty runs every day.
+    #[graphql(default)]
+    pub days: Vec<String>,
+    /// Each `HH:MM`, or `*:MM` for that minute of every hour.
+    #[graphql(default)]
+    pub times: Vec<String>,
+    /// Also run once each time Weaver starts.
+    #[graphql(default)]
+    pub run_at_startup: bool,
+}
+
+impl From<weaver_server_core::post_processing::instances::InstanceSchedule>
+    for ScriptInstanceScheduleGql
+{
+    fn from(schedule: weaver_server_core::post_processing::instances::InstanceSchedule) -> Self {
+        Self {
+            days: schedule
+                .days
+                .iter()
+                .map(|day| day.as_str().to_string())
+                .collect(),
+            times: schedule.times,
+            run_at_startup: schedule.run_at_startup,
+        }
+    }
+}
+
+impl TryFrom<ScriptInstanceScheduleGql>
+    for weaver_server_core::post_processing::instances::InstanceSchedule
+{
+    type Error = String;
+
+    fn try_from(schedule: ScriptInstanceScheduleGql) -> Result<Self, String> {
+        let days = schedule
+            .days
+            .iter()
+            .map(|day| {
+                weaver_server_core::bandwidth::Weekday::parse(&day.trim().to_lowercase())
+                    .ok_or_else(|| format!("'{day}' is not a day; use mon to sun"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            days,
+            times: schedule.times,
+            run_at_startup: schedule.run_at_startup,
+        })
+    }
+}
+
+/// The scripts directory as it is now, for judging saved script jobs against.
 pub(crate) struct ScriptDirectoryView {
     listing: Result<ScriptListing, String>,
 }
@@ -521,6 +579,7 @@ impl ScriptDirectoryView {
             enabled: instance.enabled,
             blocking: instance.blocking,
             timeout_seconds: instance.timeout_seconds,
+            schedule: instance.schedule.into(),
             run_order: instance.run_order,
             script_problem,
             header_drift,
@@ -533,15 +592,15 @@ impl ScriptDirectoryView {
 pub struct ScriptInstanceValueInput {
     pub name: String,
     /// A plain value, or with `secret` the value to keep as a secret of the
-    /// instance's own. Give this or `secretId`, not both.
+    /// script job's own. Give this or `secretId`, not both.
     pub value: Option<String>,
     /// The named secret to link. Give this or `value`, not both, and never
     /// with `secret`.
     pub secret_id: Option<String>,
-    /// True makes the input a secret of the instance's own: `value` is kept
-    /// encrypted with the instance, is never read back, and does not become a
+    /// True makes the input a secret of the script job's own: `value` is kept
+    /// encrypted with the script job, is never read back, and does not become a
     /// named secret. On an update, true with no `value` keeps the secret the
-    /// instance already holds under this name. Omitted means false.
+    /// script job already holds under this name. Omitted means false.
     pub secret: Option<bool>,
 }
 
@@ -582,6 +641,9 @@ pub struct ScriptInstanceInput {
     #[graphql(default = true)]
     pub blocking: bool,
     pub timeout_seconds: Option<u64>,
+    /// When a schedule script job runs; ignored for every other trigger.
+    /// Omitted on an update, the saved one is kept.
+    pub schedule: Option<ScriptInstanceScheduleGql>,
 }
 
 impl ScriptInstanceInput {
@@ -615,6 +677,11 @@ impl ScriptInstanceInput {
             enabled: self.enabled,
             blocking: self.blocking,
             timeout_seconds: self.timeout_seconds,
+            schedule: self
+                .schedule
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
 }
@@ -661,9 +728,9 @@ pub struct ScriptResultGql {
     pub output_id: Option<String>,
     pub output_retained: bool,
     pub script: String,
-    /// The instance that ran, when the run came from one.
+    /// The script job that ran, when the run came from one.
     pub instance_id: Option<String>,
-    /// The instance's name as it was when it ran.
+    /// The script job's name as it was when it ran.
     pub instance_name: Option<String>,
     pub event: String,
     /// The run was started without anything waiting for it.
@@ -720,9 +787,9 @@ pub struct ScriptRunGql {
     /// Known once the job has reached history.
     pub job_name: Option<String>,
     pub script: String,
-    /// The instance that ran, when the run came from one.
+    /// The script job that ran, when the run came from one.
     pub instance_id: Option<String>,
-    /// The instance's name as it was when it ran.
+    /// The script job's name as it was when it ran.
     pub instance_name: Option<String>,
     pub event: String,
     pub kind: ScriptKindGql,
@@ -860,7 +927,7 @@ pub struct ScriptTestInputGql {
     pub value: String,
 }
 
-/// An instance run against made-up inputs, as it stands.
+/// A script job run against made-up inputs, as it stands.
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(name = "ScriptTestRun")]
 pub struct ScriptTestRunGql {
@@ -883,7 +950,7 @@ pub struct ScriptTestRunGql {
     /// What the script has printed so far, or all of it once the run has ended.
     pub log: String,
     pub log_truncated: bool,
-    /// The variables made up for this run, in name order. The instance's own
+    /// The variables made up for this run, in name order. The script job's own
     /// inputs are left out.
     pub inputs: Vec<ScriptTestInputGql>,
     /// The arguments made up for this run, in order.

@@ -690,12 +690,8 @@ export function ScriptListPanel() {
     };
   };
 
-  const groupNote = (group: InstanceGroup): string | undefined => {
-    if (group.trigger === "SCHEDULER") {
-      return t("next.postProcessing.scheduleGroupNote");
-    }
-    return group.trigger === "FEED" ? t("next.postProcessing.feedGroupNote") : undefined;
-  };
+  const groupNote = (group: InstanceGroup): string | undefined =>
+    group.trigger === "FEED" ? t("next.postProcessing.feedGroupNote") : undefined;
 
   const blocks: SettingsBlock[] = [
     {

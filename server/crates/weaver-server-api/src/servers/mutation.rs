@@ -260,9 +260,15 @@ impl ServersMutation {
             }
         }
 
+        // The delete took this server's rules and speed limits out of what is
+        // saved; publish that.
         if let Some(schedules) = schedules_guard.as_mut() {
-            schedules.retain(|entry| !matches!(entry.action,
-                weaver_server_core::bandwidth::ScheduleAction::SetServerActive { server_id, .. } if server_id == id));
+            let db = db.clone();
+            **schedules =
+                spawn_blocking_db("servers.mutation.remove_server.schedules", move || {
+                    db.list_schedules()
+                })
+                .await?;
         }
         drop(schedules_guard);
 
@@ -572,9 +578,9 @@ fn probe_through_route<'a>(
     Box::pin(async move {
         let mut results = Vec::new();
         for position in 0..route.map_or(1, |route| route.leg_count()) {
-            let proxy = match route {
-                Some(route) => match route.bridge_for_leg(position) {
-                    Ok(bridge) => Some(bridge),
+            let dialer = match route {
+                Some(route) => match route.nntp_dialer_for_leg(position, server.id) {
+                    Ok(dialer) => Some(dialer),
                     Err(error) => {
                         route.revoke().await;
                         return Err(async_graphql::Error::new(error));
@@ -583,7 +589,7 @@ fn probe_through_route<'a>(
                 None => None,
             };
             results.push(
-                weaver_server_core::servers::probe_server_connection_with_proxy(server, proxy)
+                weaver_server_core::servers::probe_server_connection_with_route(server, dialer)
                     .await,
             );
         }

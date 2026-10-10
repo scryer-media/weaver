@@ -51,7 +51,6 @@ pub mod fused_yenc;
 pub mod health;
 pub mod plan_timing;
 pub mod pool;
-mod proxy;
 pub mod recovery;
 pub mod response;
 pub mod revocation;

@@ -184,6 +184,8 @@ pub enum RunnerError {
     InvalidEntrypoint,
     #[error("script environment value is invalid")]
     InvalidEnvironment,
+    #[error("batch script argument contains a line break")]
+    InvalidBatchArgument,
     #[error("script timeout is too large for this platform")]
     InvalidTimeout,
     #[error("post-processing supervisor protocol failed: {0}")]
@@ -198,8 +200,14 @@ struct SupervisorRequest {
     args: Vec<OsStringWire>,
     env: BTreeMap<OsStringWire, OsStringWire>,
     cwd: PathBuf,
-    /// The program is `go run`, whose exit status is not the script's own.
+    /// Compile the Go source before executing it with the script arguments.
     go_run: bool,
+    /// `args` is an already escaped cmd.exe command line.
+    #[serde(default)]
+    raw_args: bool,
+    /// The directory a Go script is built under.
+    #[serde(default)]
+    go_build_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -374,12 +382,17 @@ pub async fn execute_spec_tapped(
         return Err(RunnerError::InvalidEntrypoint);
     }
     let (program, mut args) = resolve_program(&entrypoint, &spec.interpreters)?;
-    args.extend(spec.argv);
+    let raw_args = append_script_arguments(&entrypoint, &mut args, spec.argv)?;
     let go_run = is_go_source(&entrypoint);
     let mut env = sanitized_platform_environment()?;
     if go_run {
         insert_go_environment(&mut env, &spec.facts)?;
     }
+    let go_build_root = if go_run {
+        go_build_root(&spec.facts)?
+    } else {
+        None
+    };
     insert_nzbget_global_options(&mut env, &spec.facts)?;
     insert_compat_options(&mut env, "NZBPO", &spec.options)?;
     insert_options(&mut env, "SAB_OPTION_", &spec.options)?;
@@ -424,6 +437,8 @@ pub async fn execute_spec_tapped(
             env,
             cwd: fs::canonicalize(spec.cwd)?,
             go_run,
+            raw_args,
+            go_build_root,
         },
         capture: CapturePolicy {
             secrets: Arc::new(secrets.clone()),
@@ -550,8 +565,13 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
     if go_run {
         insert_go_environment(&mut env, &request.context.compatibility)?;
     }
+    let go_build_root = if go_run {
+        go_build_root(&request.context.compatibility)?
+    } else {
+        None
+    };
     let adapter_args = adapter_environment_and_args(request, &mut env)?;
-    args.extend(adapter_args);
+    let raw_args = append_script_arguments(&entrypoint, &mut args, adapter_args)?;
 
     let final_directory = fs::canonicalize(&request.context.final_directory)?;
 
@@ -567,6 +587,8 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
             env,
             cwd: final_directory,
             go_run,
+            raw_args,
+            go_build_root,
         },
         capture: CapturePolicy::default(),
     })
@@ -582,6 +604,87 @@ fn script_extension(entrypoint: &Path) -> String {
 
 fn is_go_source(entrypoint: &Path) -> bool {
     script_extension(entrypoint) == "go"
+}
+
+fn is_batch_script(entrypoint: &Path) -> bool {
+    matches!(script_extension(entrypoint).as_str(), "bat" | "cmd")
+}
+
+/// Adds the script's positional arguments. Returns true when `args` is a
+/// finished cmd.exe command line that the supervisor must pass verbatim.
+///
+/// std only escapes for cmd.exe when the program it spawns is the batch file
+/// itself; here the program is the configured interpreter, so std's ordinary
+/// quoting would reach cmd.exe unescaped. The batch tail is built with the
+/// same rules std uses for batch files instead.
+fn append_script_arguments(
+    entrypoint: &Path,
+    args: &mut Vec<OsString>,
+    values: Vec<OsString>,
+) -> Result<bool, RunnerError> {
+    if !is_batch_script(entrypoint) {
+        args.extend(values);
+        return Ok(false);
+    }
+    let script = entrypoint.to_str().ok_or(RunnerError::InvalidEntrypoint)?;
+    // `/S /C "…"`: cmd.exe strips the outer quotes and runs what they held.
+    let mut tail = format!("\"\"{script}\"");
+    for value in values {
+        let value = value
+            .into_string()
+            .map_err(|_| RunnerError::InvalidBatchArgument)?;
+        tail.push(' ');
+        append_batch_argument(&mut tail, &value)?;
+    }
+    tail.push('"');
+    *args = vec![
+        OsString::from("/D"),
+        OsString::from("/V:OFF"),
+        OsString::from("/S"),
+        OsString::from("/C"),
+        OsString::from(tail),
+    ];
+    Ok(true)
+}
+
+/// Quotes one argument for a batch file's command line, after std's
+/// `append_bat_arg`: anything but a known-safe character forces quotes, `"`
+/// is doubled, `%` is defused with an empty `%cd:~,%` substring so no
+/// variable can expand, and backslashes before a quote are doubled. A line
+/// break would end the command, so it is refused.
+fn append_batch_argument(line: &mut String, value: &str) -> Result<(), RunnerError> {
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(RunnerError::InvalidBatchArgument);
+    }
+    const UNQUOTED: &str = r"#$*+-./:?@\_";
+    let quote = value.is_empty()
+        || value.ends_with('\\')
+        || value.chars().any(|c| {
+            (c.is_ascii() && !(c.is_ascii_alphanumeric() || UNQUOTED.contains(c))) || c.is_control()
+        });
+    if quote {
+        line.push('"');
+    }
+    let mut backslashes = 0_usize;
+    for c in value.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else {
+            if c == '"' {
+                line.extend(std::iter::repeat_n('\\', backslashes));
+                line.push('"');
+            } else if c == '%' {
+                line.push_str("%%cd:~,");
+            }
+            backslashes = 0;
+        }
+        line.push(c);
+    }
+    if quote {
+        line.extend(std::iter::repeat_n('\\', backslashes));
+        line.push('"');
+    }
+    Ok(())
 }
 
 fn resolve_program(
@@ -609,6 +712,12 @@ fn resolve_program(
             ],
         )),
         "bat" | "cmd" => {
+            if entrypoint
+                .to_string_lossy()
+                .contains(['"', '%', '^', '&', '|', '<', '>', '\r', '\n'])
+            {
+                return Err(RunnerError::InvalidEntrypoint);
+            }
             let interpreter = interpreters
                 .batch
                 .clone()
@@ -624,9 +733,8 @@ fn resolve_program(
                 ],
             ))
         }
-        // A Go script is one source file, compiled and run by `go run`. Go
-        // reads every leading argument that ends in `.go` as another source
-        // file, so a first script argument spelled that way fails the build.
+        // The supervisor builds this source separately before passing arguments
+        // to the executable. The prefix identifies the source in its request.
         "go" => Ok((
             interpreters
                 .go
@@ -983,6 +1091,16 @@ fn sanitized_platform_environment() -> Result<BTreeMap<OsStringWire, OsStringWir
 
 /// The Go build cache, kept under weaver's data directory.
 const GO_BUILD_CACHE_DIR: &str = ".weaver-go-cache";
+/// Where a Go script's executable is built, beside the cache: the system
+/// temporary directory may be mounted noexec.
+const GO_BUILD_OUTPUT_DIR: &str = ".weaver-go-build";
+
+fn go_build_root(facts: &CompatibilityFacts) -> Result<Option<PathBuf>, RunnerError> {
+    Ok(match facts.data_dir.as_deref() {
+        Some(data_dir) => Some(std::path::absolute(data_dir)?.join(GO_BUILD_OUTPUT_DIR)),
+        None => None,
+    })
+}
 
 /// What `go run` needs beyond the platform environment. Go will not build
 /// without a build cache and looks for one under a home directory the daemon
@@ -1686,30 +1804,62 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
     let _job = WindowsJob::assign_current_process()?;
     let mut stdin = io::stdin();
     let request = read_supervisor_request(&mut stdin)?;
-    let go_run = request.go_run;
-    let mut command = std::process::Command::new(request.program);
-    command
-        .args(request.args.into_iter().map(OsStringWire::into_os))
-        .env_clear()
-        .envs(
-            request
-                .env
-                .into_iter()
-                .map(|(key, value)| (key.into_os(), value.into_os())),
-        )
-        .current_dir(request.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| RunnerError::SupervisorProtocol("child stdout was unavailable".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| RunnerError::SupervisorProtocol("child stderr was unavailable".into()))?;
+    let env: Vec<_> = request
+        .env
+        .into_iter()
+        .map(|(key, value)| (key.into_os(), value.into_os()))
+        .collect();
+    let args: Vec<_> = request
+        .args
+        .into_iter()
+        .map(OsStringWire::into_os)
+        .collect();
+    // The executable is built under the data directory, beside the Go cache.
+    // Build and execute separately: a download name ending in .go must never
+    // be interpreted by the compiler as another source file.
+    let build_dir = if !request.go_run {
+        None
+    } else if let Some(root) = &request.go_build_root {
+        fs::create_dir_all(root)?;
+        Some(tempfile::tempdir_in(root)?)
+    } else {
+        Some(tempfile::tempdir()?)
+    };
+    let mut commands = Vec::new();
+    if let Some(build_dir) = &build_dir {
+        let source = args
+            .get(1)
+            .ok_or_else(|| RunnerError::SupervisorProtocol("missing Go source".into()))?;
+        let binary = build_dir.path().join(if cfg!(windows) {
+            "script.exe"
+        } else {
+            "script"
+        });
+        let mut build = std::process::Command::new(&request.program);
+        build.arg("build").arg("-o").arg(&binary).arg(source);
+        commands.push(build);
+        let mut run = std::process::Command::new(binary);
+        run.args(&args[2..]);
+        commands.push(run);
+    } else {
+        let mut run = std::process::Command::new(&request.program);
+        #[cfg(windows)]
+        if request.raw_args {
+            use std::os::windows::process::CommandExt;
+            for arg in &args {
+                run.raw_arg(arg);
+            }
+        } else {
+            run.args(&args);
+        }
+        // Batch scripts only run on Windows.
+        #[cfg(not(windows))]
+        {
+            let _ = request.raw_args;
+            run.args(&args);
+        }
+        commands.push(run);
+    }
     let parent_pipe_lost = Arc::new(AtomicBool::new(false));
     let parent_liveness = parent_pipe_lost.clone();
     std::thread::spawn(move || {
@@ -1724,55 +1874,59 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
             }
         }
     });
-    let announced = {
-        let mut output = io::stdout().lock();
-        output
-            .write_all(SUPERVISOR_LAUNCHED)
-            .and_then(|()| output.flush())
-    };
-    if announced.is_err() {
-        terminate_on_parent_pipe_loss(&mut child);
-        return Ok(125);
-    }
-    let stdout_thread = relay_thread(stdout, io::stdout(), parent_pipe_lost.clone());
-    let stderr_thread = relay_thread(stderr, io::stderr(), parent_pipe_lost.clone());
-    let status = loop {
+    for (index, mut command) in commands.into_iter().enumerate() {
         if parent_pipe_lost.load(Ordering::Acquire) {
-            terminate_on_parent_pipe_loss(&mut child);
             return Ok(125);
         }
-        if let Some(status) = child.try_wait()? {
-            break status;
+        command
+            .env_clear()
+            .envs(env.iter().cloned())
+            .current_dir(&request.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            RunnerError::SupervisorProtocol("child stdout was unavailable".into())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            RunnerError::SupervisorProtocol("child stderr was unavailable".into())
+        })?;
+        if index == 0 {
+            let mut output = io::stdout().lock();
+            if output
+                .write_all(SUPERVISOR_LAUNCHED)
+                .and_then(|()| output.flush())
+                .is_err()
+            {
+                terminate_on_parent_pipe_loss(&mut child);
+                return Ok(125);
+            }
         }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    let _ = stdout_thread.join();
-    let stderr_tail = stderr_thread.join().unwrap_or_default();
-    let code = status.code().unwrap_or(126);
-    Ok(if go_run {
-        go_run_exit_code(code, &stderr_tail)
-    } else {
-        code
-    })
-}
-
-/// How much of the end of a relayed stream is kept for [`go_run_exit_code`].
-const RELAY_TAIL_BYTES: usize = 64;
-
-/// `go run` exits 1 when the program it built exits with anything but zero,
-/// and says which status that was in the last line it writes to stderr,
-/// `exit status N`. Read the script's own status back out of that line, so 93
-/// or 95 from a Go script means what it means from any other.
-fn go_run_exit_code(code: i32, stderr_tail: &[u8]) -> i32 {
-    if code != 1 {
-        return code;
+        let stdout_thread = relay_thread(stdout, io::stdout(), parent_pipe_lost.clone());
+        let stderr_thread = relay_thread(stderr, io::stderr(), parent_pipe_lost.clone());
+        let status = loop {
+            if parent_pipe_lost.load(Ordering::Acquire) {
+                terminate_on_parent_pipe_loss(&mut child);
+                return Ok(125);
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+        let code = status.code().unwrap_or(126);
+        if code != 0 {
+            return Ok(code);
+        }
     }
-    String::from_utf8_lossy(stderr_tail)
-        .trim_end()
-        .rsplit_once("exit status ")
-        .and_then(|(_, status)| status.parse().ok())
-        .unwrap_or(code)
+    Ok(0)
 }
+
+/// Bounded diagnostic tail retained by the relay.
+const RELAY_TAIL_BYTES: usize = 64;
 
 fn read_supervisor_request<R: Read>(reader: &mut R) -> Result<SupervisorRequest, RunnerError> {
     let mut length = [0_u8; 8];
@@ -2404,22 +2558,70 @@ mod go_run_tests {
     }
 
     #[test]
-    fn the_status_go_run_reports_for_the_script_becomes_the_exit_code() {
-        assert_eq!(go_run_exit_code(1, b"exit status 93\n"), 93);
+    fn batch_scripts_receive_escaped_download_arguments() {
+        let entrypoint = Path::new(r"C:\scripts\trusted.cmd");
+        let (_, mut args) = resolve_program(entrypoint, &InterpreterConfig::default()).unwrap();
+        let raw = append_script_arguments(
+            entrypoint,
+            &mut args,
+            vec![
+                OsString::from("name&command%PATH%value"),
+                OsString::from(r#"say "hi"|more"#),
+                OsString::from(r"C:\complete\job name\"),
+                OsString::from("plain-1.0"),
+                OsString::new(),
+                OsString::from("a^b<c>d"),
+            ],
+        )
+        .unwrap();
+        assert!(raw);
         assert_eq!(
-            go_run_exit_code(1, b"[INFO] done\r\nexit status 95\r\n"),
-            95
+            args,
+            [
+                "/D",
+                "/V:OFF",
+                "/S",
+                "/C",
+                concat!(
+                    r#"""C:\scripts\trusted.cmd" "#,
+                    r#""name&command%%cd:~,%PATH%%cd:~,%value" "#,
+                    r#""say ""hi""|more" "#,
+                    r#""C:\complete\job name\\" "#,
+                    r#"plain-1.0 "#,
+                    r#""" "#,
+                    r#""a^b<c>d""#,
+                    r#"""#,
+                ),
+            ]
         );
-        // The script ended its own stderr without a line break.
-        assert_eq!(go_run_exit_code(1, b"no line breakexit status 2\n"), 2);
-        assert_eq!(go_run_exit_code(1, b"exit status 93\nexit status 1\n"), 1);
-        // A build that failed reports no status of the script's.
-        assert_eq!(go_run_exit_code(1, b"./x.go:3:15: undefined: nothing\n"), 1);
-        assert_eq!(go_run_exit_code(1, b"exit status 93 or so\n"), 1);
-        assert_eq!(go_run_exit_code(1, b""), 1);
-        // Only the status `go run` itself fails with is read this way.
-        assert_eq!(go_run_exit_code(0, b"exit status 93\n"), 0);
-        assert_eq!(go_run_exit_code(2, b"exit status 93\n"), 2);
+        for line_break in ["one\ntwo", "one\rtwo"] {
+            assert!(matches!(
+                append_script_arguments(
+                    entrypoint,
+                    &mut Vec::new(),
+                    vec![OsString::from(line_break)],
+                ),
+                Err(RunnerError::InvalidBatchArgument)
+            ));
+        }
+
+        let mut args = vec![OsString::from("script.py")];
+        assert!(
+            !append_script_arguments(
+                Path::new("script.py"),
+                &mut args,
+                vec![OsString::from("a&b")],
+            )
+            .unwrap()
+        );
+        assert_eq!(args, ["script.py", "a&b"]);
+        assert!(
+            resolve_program(
+                Path::new("/scripts/unsafe%name.cmd"),
+                &InterpreterConfig::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2431,7 +2633,7 @@ mod go_run_tests {
             .join()
             .unwrap();
         assert_eq!(tail.len(), RELAY_TAIL_BYTES);
-        assert_eq!(go_run_exit_code(1, &tail), 93);
+        assert!(tail.ends_with(b"exit status 93\n"));
 
         let tail = relay_thread(io::Cursor::new(b"short".to_vec()), io::sink(), lost.clone())
             .join()

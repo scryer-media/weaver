@@ -77,12 +77,11 @@ impl Pipeline {
     }
 
     /// Raise the event for a job's arrival, and keep the job from downloading
-    /// while an instance that blocks on it runs.
+    /// while a script job that blocks on it runs.
     ///
-    /// The hold is taken only when such an instance is wired up for this job's
-    /// category, so a job nobody is waiting on starts at once. It is released
-    /// by the end of the run, however that run ends: what a script decides is
-    /// in its directives, and a script that could not run decides nothing.
+    /// The category lookup uses the dispatch cache. Only a blocking script
+    /// holds the job; a cold cache is resolved off the actor before releasing
+    /// a provisional hold. A script that could not run decides nothing.
     pub(crate) fn raise_added_script_event(&mut self, job_id: JobId) {
         if !self.jobs.contains_key(&job_id) || !self.db.queue_scripts_possible() {
             return;
@@ -90,12 +89,14 @@ impl Pipeline {
         let Some(context) = self.queue_script_context(job_id, QueueEvent::NzbAdded) else {
             return;
         };
-        let blocks = self
+        let event = context.event.clone();
+        let category = context.category.clone();
+        let cached_blocks = self
             .db
-            .script_instances_for(&context.event, context.category.as_deref())
-            .is_ok_and(|instances| instances.iter().any(|instance| instance.blocking));
+            .cached_script_instances_for(&event, category.as_deref())
+            .map(|instances| instances.iter().any(|instance| instance.blocking));
         let admission = self.db.admit_queue_script_event(context, false);
-        if !blocks {
+        if cached_blocks == Some(false) {
             return;
         }
         self.added_script_holds.insert(job_id);
@@ -103,9 +104,22 @@ impl Pipeline {
         let sender = self.terminal_post_processing_done_tx.clone();
         tokio::spawn(async move {
             let result = async {
+                let blocks = if let Some(blocks) = cached_blocks {
+                    blocks
+                } else {
+                    let lookup = db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        lookup
+                            .script_instances_for(&event, category.as_deref())
+                            .map(|instances| instances.iter().any(|instance| instance.blocking))
+                    })
+                    .await
+                    .map_err(|error| crate::StateError::Database(error.to_string()))??
+                };
                 if let Some(run_id) = admission.await.map_err(|error| {
                     crate::StateError::Database(format!("queue script admission lost: {error}"))
-                })?? {
+                })?? && blocks
+                {
                     wait_for_event(&db, &run_id).await?;
                 }
                 Ok(())

@@ -1555,6 +1555,165 @@ impl Pipeline {
         self.identity_viability_sweep(job_id).await;
     }
 
+    fn orphan_named_rar_volume(&self, file_id: NzbFileId) -> bool {
+        let Some(state) = self.jobs.get(&file_id.job_id) else {
+            return false;
+        };
+        let Some(file) = state.assembly.file(file_id) else {
+            return false;
+        };
+        if !matches!(
+            file.declared_role(),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ) {
+            return false;
+        }
+        let set = weaver_model::files::archive_base_name(file.filename(), file.declared_role());
+        !state.assembly.files().any(|candidate| {
+            matches!(
+                candidate.declared_role(),
+                weaver_model::files::FileRole::RarVolume { volume_number: 0 }
+            ) && weaver_model::files::archive_base_name(
+                candidate.filename(),
+                candidate.declared_role(),
+            ) == set
+        })
+    }
+
+    pub(in crate::pipeline) fn identity_prefix_pending(
+        &mut self,
+        file_id: NzbFileId,
+        declared_len: u64,
+    ) -> bool {
+        if !self.direct_store.gate().is_enabled() {
+            return false;
+        }
+        let admission = self.direct_store.identity.get(&file_id.job_id);
+        if admission.is_some_and(|admission| {
+            admission.leaked.contains(&file_id.file_index)
+                || admission.no_match.contains(&file_id.file_index)
+        }) || self
+            .identity_par2_carrier_files(file_id.job_id)
+            .contains(&file_id.file_index)
+        {
+            return false;
+        }
+        let captured = self.file_prefix_16k.get(&file_id).map_or(0, Vec::len);
+        if captured == 0 && self.orphan_named_rar_volume(file_id) {
+            return true;
+        }
+        let Some(admission) = admission else {
+            return false;
+        };
+        admission.rosters.values().any(|roster| {
+            roster.volumes.iter().any(|(index, volume)| {
+                volume.length == declared_len
+                    && !roster.bound.values().any(|bound| bound == index)
+                    && captured
+                        < volume
+                            .length
+                            .min(crate::pipeline::PAR2_HASH_16K_BYTES as u64)
+                            as usize
+            })
+        })
+    }
+
+    /// A complete repost can be kept conventionally without condemning the
+    /// original direct set, but only after comparing all its decoded bytes
+    /// with the completed virtual source. A shared header is not enough.
+    pub(in crate::pipeline) async fn complete_header_repost(
+        &mut self,
+        file_id: NzbFileId,
+        offset: u64,
+        segment: &crate::pipeline::BufferedDecodedSegment,
+    ) -> bool {
+        if offset != 0
+            || segment.data.len_bytes() as u64 != segment.declared_file_len
+            || segment.damaged_source.is_some()
+        {
+            return false;
+        }
+        let Some(prefix) = self.file_prefix_16k.get(&file_id) else {
+            return false;
+        };
+        let super::sniff::PrefixSniff::Rar5 {
+            volume_number,
+            is_volume: true,
+        } = super::sniff::sniff_rar_prefix(prefix)
+        else {
+            return false;
+        };
+        let Some(header_set) =
+            self.direct_store
+                .identity
+                .get(&file_id.job_id)
+                .and_then(|admission| {
+                    admission.header_sets.iter().find(|set| {
+                        set.volume_set
+                            && set.bound.iter().any(|(file, volume)| {
+                                *file != file_id.file_index && *volume == volume_number
+                            })
+                    })
+                })
+        else {
+            return false;
+        };
+        let Some(set) = self.direct_store.set(file_id.job_id, header_set.set_index) else {
+            return false;
+        };
+        if set.is_demoted() || !set.volume_is_complete(volume_number) {
+            return false;
+        }
+        let Some(original) = set.plan().volumes.get(&volume_number) else {
+            return false;
+        };
+        let original_id = NzbFileId {
+            job_id: file_id.job_id,
+            file_index: *original,
+        };
+        if self.file_declared_size.get(&original_id) != Some(&segment.declared_file_len) {
+            return false;
+        }
+        let volumes = set
+            .retained_volumes()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                set.virtual_volumes(&BTreeMap::from([(
+                    volume_number,
+                    segment.declared_file_len,
+                )]))
+            });
+        let provider = super::provider::HybridVolumeProvider::new(volumes);
+        let mut expected = blake3::Hasher::new();
+        segment.data.for_each_slice(|bytes| {
+            expected.update(bytes);
+        });
+        let expected = expected.finalize();
+        let length = segment.declared_file_len;
+        let equal = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut reader = provider.open(volume_number)?;
+            let mut remaining = length;
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut actual = blake3::Hasher::new();
+            while remaining != 0 {
+                let take = remaining.min(buffer.len() as u64) as usize;
+                reader.read_exact(&mut buffer[..take]).ok()?;
+                actual.update(&buffer[..take]);
+                remaining -= take as u64;
+            }
+            Some(actual.finalize() == expected)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if equal && let Some(admission) = self.direct_store.identity.get_mut(&file_id.job_id) {
+            admission.no_match.insert(file_id.file_index);
+        }
+        equal
+    }
+
     /// The identity half of the routing seam: matches one file's offset-zero
     /// bytes against the job's armed rosters, and turns the unique match into
     /// a routed binding — admitting the set on its first one.
@@ -1573,12 +1732,10 @@ impl Pipeline {
         &mut self,
         file_id: NzbFileId,
         file_offset: u64,
+        declared_file_len: u64,
     ) -> Option<DirectFileTarget> {
         let job_id = file_id.job_id;
         let file_index = file_id.file_index;
-        if file_offset != 0 {
-            return None;
-        }
         // Two rungs, mutually exclusive per job. Described rosters — PAR2
         // metadata named the volumes — are the stronger evidence and go
         // first; a job without them falls to the header rung, where the
@@ -1600,6 +1757,9 @@ impl Pipeline {
             return None;
         }
         if !has_rosters {
+            if file_offset != 0 {
+                return None;
+            }
             return self.direct_header_route_target(file_id).await;
         }
         // Evaluate against every roster's unclaimed volumes.
@@ -1650,7 +1810,7 @@ impl Pipeline {
             for (set_name, roster) in &admission.rosters {
                 let claimed: HashSet<u32> = roster.bound.values().copied().collect();
                 for (volume_index, volume) in &roster.volumes {
-                    if claimed.contains(volume_index) {
+                    if claimed.contains(volume_index) || declared_file_len != volume.length {
                         continue;
                     }
                     let window = volume
@@ -1966,11 +2126,11 @@ impl Pipeline {
         set.router.set_password(password);
         set.router.note_par2_available(par2_available);
         set.router.note_par3_available(par3_available);
-        // A set bound after the job's harvest ran would otherwise never see
-        // it: the live seam offers the harvest when it runs, and it has run.
-        if let Some(harvest) = self.direct_store.header_harvest.get(&job_id) {
-            offer_direct_header_candidates(&mut set, password, harvest);
-        }
+        // Identity admission can happen after the article's password refresh,
+        // when no set existed to receive it. The first routed bytes already
+        // need the header key, so offer the candidates before publishing it.
+        let harvest = self.harvest_direct_header_passwords(job_id);
+        offer_direct_header_candidates(&mut set, password, &harvest);
         let sets = self.direct_store.sets.entry(job_id).or_default();
         sets.push(set);
         sets.len() - 1
@@ -2047,10 +2207,18 @@ impl Pipeline {
         // so the name proves nothing either way — the byte sniff below is the
         // gate, exactly as it is for the hex names. A real split payload
         // sniffs as not-RAR and settles as an ordinary conventional file.
+        // Unclaimed named RAR continuations also need this rung when the
+        // first volume alone is obfuscated. Plan ownership was excluded above.
+        if matches!(role, weaver_model::files::FileRole::RarVolume { .. })
+            && !self.orphan_named_rar_volume(file_id)
+        {
+            return None;
+        }
         if !matches!(
             role,
             weaver_model::files::FileRole::Unknown
                 | weaver_model::files::FileRole::SplitFile { .. }
+                | weaver_model::files::FileRole::RarVolume { .. }
         ) {
             return None;
         }
@@ -2097,6 +2265,12 @@ impl Pipeline {
                         })
                 });
             if let Some((set_index, position_claimed)) = existing {
+                // A volume whose first member does not continue the member its
+                // neighbour leaves open belongs to another archive: the same
+                // two sets the claim collision proves, caught one volume
+                // earlier.
+                let position_claimed = position_claimed
+                    || self.header_chain_breaks(job_id, set_index, file_index, volume_number);
                 if position_claimed || leaked {
                     // A second file for a claimed position is a second set
                     // the bytes cannot tell apart; a leaked file that proves
@@ -2134,12 +2308,21 @@ impl Pipeline {
                     volume_index: volume_number,
                 });
             }
+            // One header volume set per job for the job's life, not only while
+            // the first is open: a set retires from the registry once whole,
+            // and a volume arriving after that is a second archive's, which
+            // nothing in the bytes ties to positions of its own.
             if leaked
                 || self
                     .direct_store
                     .identity
                     .get(&job_id)
                     .is_some_and(|admission| admission.header_volume_sets_poisoned)
+                || self.direct_store.sets_for(job_id).iter().any(|set| {
+                    set.plan().identity.is_some_and(|identity| {
+                        identity.kind == super::plan::IdentityKind::HeaderVolumeSet
+                    })
+                })
             {
                 return None;
             }
@@ -2410,6 +2593,68 @@ impl Pipeline {
 
     /// Books one header binding, retiring the set's bookkeeping once its plan
     /// closed and every position bound.
+    /// Whether binding `file_index` at `volume_number` into a header volume
+    /// set breaks the member chain a bound neighbour states.
+    ///
+    /// A RAR5 volume whose first member continues past its end holds that one
+    /// member and nothing else, so the next volume of the same archive opens
+    /// with the continuation of exactly that member. Anything else is a
+    /// volume of another archive at the same position. A volume whose first
+    /// member closes inside it says nothing about its last member from its
+    /// first 16 KiB, and binds as before; so does a pair whose prefixes are
+    /// not both held.
+    fn header_chain_breaks(
+        &self,
+        job_id: JobId,
+        set_index: usize,
+        file_index: u32,
+        volume_number: u32,
+    ) -> bool {
+        let Some(header_set) = self
+            .direct_store
+            .identity
+            .get(&job_id)
+            .and_then(|admission| {
+                admission
+                    .header_sets
+                    .iter()
+                    .find(|header_set| header_set.set_index == set_index)
+            })
+        else {
+            return false;
+        };
+        let first_member = |file_index: u32| {
+            let prefix = self
+                .file_prefix_16k
+                .get(&NzbFileId { job_id, file_index })?;
+            let walk = unrar_rs::RarArchive::parse_volume_facts_walk(
+                std::io::Cursor::new(prefix.clone()),
+                None,
+            )
+            .ok()?;
+            walk.facts
+                .members
+                .into_iter()
+                .next()
+                .map(|member| (member.name, member.split_before, member.split_after))
+        };
+        let breaks = |previous: &(String, bool, bool), next: &(String, bool, bool)| {
+            previous.2 && !(next.1 && next.0 == previous.0)
+        };
+        let Some(own) = first_member(file_index) else {
+            return false;
+        };
+        header_set.bound.iter().any(|(&other, &position)| {
+            if position.checked_add(1) == Some(volume_number) {
+                first_member(other).is_some_and(|previous| breaks(&previous, &own))
+            } else if volume_number.checked_add(1) == Some(position) {
+                first_member(other).is_some_and(|next| breaks(&own, &next))
+            } else {
+                false
+            }
+        })
+    }
+
     fn record_header_binding(
         &mut self,
         job_id: JobId,
@@ -2723,6 +2968,108 @@ impl Pipeline {
             );
             self.identity_viability_sweep(job_id).await;
         }
+    }
+
+    /// Retires every header volume set a repair overtakes.
+    ///
+    /// A file a repair rebuilds holds conventional bytes, so no set admitted
+    /// from volume headers can bind it any more. A live header volume set
+    /// that does not already hold that file could have needed it, and the
+    /// conventional set naming the file would wait on the volumes the header
+    /// set holds virtually: neither would ever finish. The header set demotes,
+    /// its volumes materialize, and the conventional set completes. A
+    /// standalone header archive is whole at admission and stays.
+    ///
+    /// Returns whether a header set left. A job without header sets is left
+    /// as it was: rosters never coexist with header sets, and their own arms
+    /// judge a repaired file.
+    pub(crate) async fn note_identity_repaired_files(
+        &mut self,
+        job_id: JobId,
+        files: &[u32],
+    ) -> bool {
+        if files.is_empty() {
+            return false;
+        }
+        let overtaken: Vec<usize> = {
+            let Some(admission) = self.direct_store.identity.get_mut(&job_id) else {
+                return false;
+            };
+            if admission.header_sets.is_empty() {
+                return false;
+            }
+            admission.leaked.extend(files.iter().copied());
+            let admission = &self.direct_store.identity[&job_id];
+            let held: HashSet<u32> = admission
+                .header_sets
+                .iter()
+                .flat_map(|header_set| header_set.bound.keys().copied())
+                .chain(
+                    admission
+                        .rosters
+                        .values()
+                        .flat_map(|roster| roster.bound.keys().copied()),
+                )
+                .collect();
+            admission
+                .header_sets
+                .iter()
+                .filter(|header_set| {
+                    header_set.volume_set
+                        && self
+                            .direct_store
+                            .set(job_id, header_set.set_index)
+                            .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
+                        && files.iter().any(|file| !held.contains(file))
+                })
+                .map(|header_set| header_set.set_index)
+                .collect()
+        };
+        let any = !overtaken.is_empty();
+        for set_index in overtaken {
+            warn!(
+                job_id = job_id.0,
+                set_index,
+                repaired = files.len(),
+                "a repair rebuilt a file a header-admitted set could have claimed"
+            );
+            self.condemn_header_set(job_id, set_index).await;
+        }
+        self.identity_viability_sweep(job_id).await;
+        any
+    }
+
+    /// Demotes every identity-admitted set still routing when the job is
+    /// about to leave for extraction or the final move.
+    ///
+    /// By then every article is in and the PAR2 question is settled, so a
+    /// live set is one that will never finalize: its evidence bound volumes
+    /// that do not make one archive. Its volumes exist only virtually, so no
+    /// conventional set can see them, and completing the job would publish
+    /// the set's member partials and envelopes in place of its members. The
+    /// set demotes, its volumes materialize, and the job goes round again.
+    pub(crate) async fn demote_stranded_identity_sets(&mut self, job_id: JobId) -> bool {
+        let stranded: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                set.plan().identity.is_some() && !set.is_demoted() && !set.is_finalized()
+            })
+            .map(|(set_index, _)| set_index)
+            .collect();
+        if stranded.is_empty() {
+            return false;
+        }
+        for set_index in stranded {
+            warn!(
+                job_id = job_id.0,
+                set_index, "an identity-admitted set was still routing when the job settled"
+            );
+            self.condemn_header_set(job_id, set_index).await;
+        }
+        true
     }
 
     /// Retires one roster: a pending one is simply dropped, an admitted one

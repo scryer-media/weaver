@@ -22,13 +22,12 @@ async fn create_schedule_refuses_a_client_supplied_id_and_generates_one() {
     assert!(h.db.list_schedules().unwrap().is_empty());
 
     let created = h.execute(r#"mutation {
-        createSchedule(input: { label: "implicit-script:display-only", time: "12:00", actionType: "pause" }) { id label instanceId }
+        createSchedule(input: { label: "implicit-script:display-only", time: "12:00", actionType: "pause" }) { id label }
     }"#).await;
     assert_no_errors(&created);
     let data = response_data(&created);
     let entry = &data["createSchedule"][0];
     assert!(entry["id"].as_str().unwrap().starts_with("sched-"));
-    assert!(entry["instanceId"].is_null());
     assert_eq!(entry["label"], "implicit-script:display-only");
     assert_eq!(
         h.db.list_schedules().unwrap()[0].id,
@@ -37,33 +36,11 @@ async fn create_schedule_refuses_a_client_supplied_id_and_generates_one() {
 }
 
 #[tokio::test]
-async fn a_script_schedule_runs_an_instance_whose_trigger_is_a_schedule() {
-    use weaver_server_core::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
-    use weaver_server_core::post_processing::model::ScriptName;
-
+async fn the_schedules_screen_takes_no_script_rules() {
     let h = TestHarness::new().await;
-    let on = |trigger| {
-        h.db.create_script_instance(ScriptInstanceDraft::new(
-            ScriptName::new("task.sh").unwrap(),
-            trigger,
-        ))
-        .unwrap()
-    };
-    let nightly = on(InstanceTrigger::Schedule);
-    let scan = on(InstanceTrigger::Scan);
-
     for refused in [
-        // A rule is saved against the instance it runs.
-        r#"time: "03:30", actionType: "run_script""#.to_string(),
-        r#"time: "03:30", actionType: "run_script", instanceId: "nope""#.to_string(),
-        format!(
-            r#"time: "03:30", actionType: "run_script", instanceId: "{}""#,
-            scan.id
-        ),
-        format!(
-            r#"time: "*", actionType: "run_script", instanceId: "{}""#,
-            nightly.id
-        ),
+        r#"time: "03:30", actionType: "run_script""#,
+        r#"time: "03:30", actionType: "run_script", instanceId: "nope""#,
     ] {
         let response = h
             .execute(&format!(
@@ -77,23 +54,6 @@ async fn a_script_schedule_runs_an_instance_whose_trigger_is_a_schedule() {
         );
         assert!(h.db.list_schedules().unwrap().is_empty());
     }
-
-    let created = h
-        .execute(&format!(
-            r#"mutation {{ createSchedule(input: {{ time: "03:30,*:15", actionType: "run_script", instanceId: "{}" }}) {{ instanceId time actionType runAtStartup }} }}"#,
-            nightly.id
-        ))
-        .await;
-    assert_no_errors(&created);
-    assert_eq!(
-        response_data(&created)["createSchedule"],
-        serde_json::json!([{
-            "instanceId": nightly.id,
-            "time": "03:30,*:15",
-            "actionType": "run_script",
-            "runAtStartup": false
-        }])
-    );
 }
 
 #[tokio::test]

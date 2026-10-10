@@ -197,7 +197,6 @@ pub struct BlockingNntpConnection {
     pub route_path: Option<weaver_tunnel::pipe::DialPath>,
     egress_control: Option<Arc<ServerTransferControl>>,
     route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
-    _route_socket: Option<Arc<socket2::Socket>>,
     transport: BlockingTransport,
     codec: NntpCodec,
     read_buf: BytesMut,
@@ -477,7 +476,7 @@ impl BlockingBodyLane {
     }
 
     pub fn accepts_new_work(&self) -> bool {
-        self._permit.health_lease.0.current() && self._permit.socket_slot.reusable()
+        self._permit.health_lease.0.current() && self._permit.socket_slot.claim_reuse()
     }
 
     /// Answer an existence probe on this lane's connection.
@@ -1122,9 +1121,6 @@ impl BlockingNntpConnection {
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
-        if let Some(registry) = &config.revocation {
-            registry.check()?;
-        }
         if let Some(dialer) = &config.dialer {
             let dialed = dialer.runtime.block_on(dialer.dial(config))?;
             let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
@@ -1148,19 +1144,6 @@ impl BlockingNntpConnection {
                 connection.route_path = Some(dialed.path);
             }
             return result;
-        }
-        if config.proxy.is_some() {
-            let (tcp, outcome) = crate::proxy::connect_blocking(config)?;
-            return Self::from_tcp(
-                config,
-                tcp,
-                None,
-                backend_override,
-                initial_group,
-                Some(outcome),
-                None,
-                None,
-            );
         }
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
         let (tcp, addr) = match route {
@@ -1257,12 +1240,6 @@ impl BlockingNntpConnection {
         mut pipe_setup: Option<weaver_tunnel::pipe::SetupHandle>,
     ) -> Result<Self> {
         let tcp = tcp.into();
-        let route_socket = config
-            .revocation
-            .as_ref()
-            .zip(tcp.tcp())
-            .map(|(r, tcp)| r.track(socket2::SockRef::from(tcp)))
-            .transpose()?;
         // Implicit TLS handshakes before the greeting is read; STARTTLS keeps
         // the socket plain until the greeting has arrived and the server has
         // answered 382, and is upgraded below.
@@ -1277,7 +1254,6 @@ impl BlockingNntpConnection {
             route_path: None,
             egress_control: None,
             route_outcome,
-            _route_socket: route_socket,
             transport,
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
@@ -1666,25 +1642,35 @@ impl BlockingNntpConnection {
         if let Some(outcome) = &self.route_outcome {
             outcome.read(bytes);
         }
-        let egress_wait = match (self.egress_accounting.front_mut(), &self.egress_control) {
-            (Some(BodyTransferAccounting::Tracked(permit)), _) => permit.record_blocking(bytes),
+        // Both levels are charged before either is waited on, so the read
+        // waits for the later deadline: the lower of the two rates.
+        let egress_charge = match (self.egress_accounting.front_mut(), &self.egress_control) {
+            (Some(BodyTransferAccounting::Tracked(permit)), _) => permit.charge(bytes),
             (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
                 control.record_unlimited_body_bytes(bytes);
-                Duration::ZERO
+                None
             }
-            (None, Some(control)) => control.pace_read_blocking(bytes),
-            (_, None) => Duration::ZERO,
+            (None, Some(control)) => control.charge_read(bytes),
+            (_, None) => None,
         };
-        let server_wait = match self.body_accounting.front_mut() {
+        let server_charge = match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
                 if let Some(control) = &self.transfer_control {
                     control.record_unlimited_body_bytes(bytes);
                 }
-                Duration::ZERO
+                None
             }
-            Some(BodyTransferAccounting::Tracked(permit)) => permit.record_blocking(bytes),
-            None => Duration::ZERO,
+            Some(BodyTransferAccounting::Tracked(permit)) => permit.charge(bytes),
+            None => None,
         };
+        let egress_wait = egress_charge.map_or(Duration::ZERO, |charge| charge.wait_blocking());
+        let server_wait = server_charge.map_or(Duration::ZERO, |charge| charge.wait_blocking());
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.egress_accounting.front_mut() {
+            permit.add_throttle_wait(egress_wait);
+        }
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.body_accounting.front_mut() {
+            permit.add_throttle_wait(server_wait);
+        }
         egress_wait.saturating_add(server_wait)
     }
 

@@ -837,7 +837,7 @@ async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts()
     let JobStatus::Failed { error } = status else {
         panic!("unacceptable extension must fail the job");
     };
-    assert!(error.contains("unacceptable extension 'exe'"));
+    assert_eq!(error, "unwanted extension '.exe' in 'nested/payload.EXE'");
     assert!(
         pipeline
             .db

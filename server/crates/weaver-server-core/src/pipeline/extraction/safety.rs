@@ -962,6 +962,22 @@ impl JobExtractionBudget {
         error.contains("WEAVER_EXTRACTION_REJECTED[")
     }
 
+    /// The reason a job keeps when it fails on `error`. A content-policy
+    /// refusal is kept as its own sentence, without the marker that routed it
+    /// through the pipeline, because the consumer app and the Jobs screen
+    /// show it as it stands. Every other error is kept whole.
+    pub(crate) fn job_failure_reason(error: String) -> String {
+        let marker = ExtractionFailure {
+            reason: ExtractionRejectionReason::ContentPolicy,
+            detail: String::new(),
+        }
+        .to_string();
+        match error.find(&marker) {
+            Some(start) => error[start + marker.len()..].to_string(),
+            None => error,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn task_permit(self: &Arc<Self>) -> Result<TaskPermit, String> {
         self.task_permit_inner(None)

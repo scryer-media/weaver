@@ -239,8 +239,8 @@ test("new schedule actions stay disabled and appear on their own tracks", async 
     ["Resume post-processing", "Post-processing"],
     ["Set server availability", "Servers"],
     ["Set quota metering", "Quota metering"],
-    ["Scan watch folder", "One-shot actions"],
-    ["Fetch RSS", "One-shot actions"],
+    ["Pause RSS", "RSS"],
+    ["Resume RSS", "RSS"],
     ["Prune history", "One-shot actions"],
   ];
   for (const [action, track] of cases) {

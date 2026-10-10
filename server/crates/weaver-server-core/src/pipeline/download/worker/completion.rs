@@ -178,14 +178,10 @@ impl Pipeline {
             .into_iter()
             .filter_map(|egress_id| policy.egress_snapshot(egress_id))
             .find(|snapshot| snapshot.blocked)?;
-        let egress = self.shared_state.proxy_runtime().and_then(|runtime| {
-            runtime
-                .network
-                .configuration_snapshot()
-                .0
-                .into_iter()
-                .find(|egress| egress.id == snapshot.server_id)
-        });
+        let egress = self
+            .shared_state
+            .proxy_runtime()
+            .and_then(|runtime| runtime.network.egress_configuration(snapshot.server_id));
         let limit_bytes = egress
             .as_ref()
             .map_or(0, |egress| egress.download_quota.limit_bytes);
@@ -845,7 +841,7 @@ impl Pipeline {
                         // Take the exhausted egress out of every route now, so
                         // the selection below sees only legs with quota left,
                         // the same way a dead link drops out.
-                        runtime.network.refresh_health();
+                        runtime.network.refresh_health_if_changed();
                     }
                     let mut park_for_quota =
                         source_server_idx.is_none() && egress_rejection.is_none();

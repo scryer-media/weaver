@@ -217,24 +217,28 @@ async fn each_action_reaches_the_run_as_the_command_it_names() {
         Some(7),
         ScriptEventLabel::PostProcessing,
     );
-    let (response, taken) = tokio::join!(
-        as_run(
-            &harness,
-            "run-post",
-            r#"mutation { scriptRun {
-                setDirectory(path: "/complete/moved")
-                setFinalDirectory(path: "/complete/final")
-                markBad
-            } }"#,
-        ),
-        agree(&mut post, 3),
+    let root = harness.config.read().await.complete_dir();
+    let moved = std::path::Path::new(&root)
+        .join("moved")
+        .to_string_lossy()
+        .into_owned();
+    let final_dir = std::path::Path::new(&root)
+        .join("final")
+        .to_string_lossy()
+        .into_owned();
+    let query = format!(
+        "mutation {{ scriptRun {{ setDirectory(path: {}) setFinalDirectory(path: {}) markBad }} }}",
+        json!(moved),
+        json!(final_dir)
     );
+    let (response, taken) =
+        tokio::join!(as_run(&harness, "run-post", &query,), agree(&mut post, 3),);
     assert_no_errors(&response);
     assert_eq!(
         taken,
         [
-            Directive::Directory("/complete/moved".into()),
-            Directive::FinalDirectory("/complete/final".into()),
+            Directive::Directory(moved),
+            Directive::FinalDirectory(final_dir),
             Directive::MarkBad,
         ]
         .map(RunAction::Command)
@@ -275,6 +279,9 @@ async fn each_action_reaches_the_run_as_the_command_it_names() {
 #[tokio::test]
 async fn an_action_the_trigger_does_not_allow_never_reaches_the_run() {
     let harness = TestHarness::new().await;
+    let root = json!(harness.config.read().await.complete_dir()).to_string();
+    let set_directory = format!("setDirectory(path: {root})");
+    let set_final_directory = format!("setFinalDirectory(path: {root})");
     // Nothing takes what these runs are asked: a request that got as far as
     // the run would wait for an answer that never comes.
     let _scheduled = open(
@@ -307,7 +314,7 @@ async fn an_action_the_trigger_does_not_allow_never_reaches_the_run() {
         ("run-scheduled", "markBad", "MARK", "scheduler:1"),
         (
             "run-queue",
-            r#"setDirectory(path: "/complete")"#,
+            set_directory.as_str(),
             "DIRECTORY",
             "queue:NZB_ADDED",
         ),
@@ -318,12 +325,7 @@ async fn an_action_the_trigger_does_not_allow_never_reaches_the_run() {
             "queue:NZB_ADDED",
         ),
         ("run-scan", "markBad", "MARK", "scan"),
-        (
-            "run-scan",
-            r#"setFinalDirectory(path: "/complete")"#,
-            "FINALDIR",
-            "scan",
-        ),
+        ("run-scan", set_final_directory.as_str(), "FINALDIR", "scan"),
     ] {
         let response = as_run(
             &harness,
@@ -371,10 +373,13 @@ async fn what_the_run_makes_of_a_request_is_what_the_script_is_told() {
         Some(7),
         ScriptEventLabel::PostProcessing,
     );
-    const MOVE: &str = r#"mutation { scriptRun { setDirectory(path: "/elsewhere") } }"#;
+    let query = format!(
+        "mutation {{ scriptRun {{ setDirectory(path: {}) }} }}",
+        json!(harness.config.read().await.complete_dir())
+    );
 
     // The run could not do it.
-    let (response, ()) = tokio::join!(as_run(&harness, "run-post", MOVE), async {
+    let (response, ()) = tokio::join!(as_run(&harness, "run-post", &query), async {
         let RunRequest { reply, .. } = requests.next().await;
         reply
             .send(Err("the directory is outside the download roots".into()))
@@ -389,7 +394,7 @@ async fn what_the_run_makes_of_a_request_is_what_the_script_is_told() {
     );
 
     // The run ended while the request was waiting for it.
-    let (response, ()) = tokio::join!(as_run(&harness, "run-post", MOVE), async {
+    let (response, ()) = tokio::join!(as_run(&harness, "run-post", &query), async {
         let waiting = requests.next().await;
         drop(requests);
         drop(waiting);
@@ -398,7 +403,7 @@ async fn what_the_run_makes_of_a_request_is_what_the_script_is_told() {
 
     // And nothing reaches a run that is over.
     assert_eq!(
-        refused(&as_run(&harness, "run-post", MOVE).await).0,
+        refused(&as_run(&harness, "run-post", &query).await).0,
         "SCRIPT_RUN_ENDED"
     );
 }
@@ -453,7 +458,7 @@ async fn a_second_run_under_the_same_id_leaves_the_first_alone() {
 }
 
 #[tokio::test]
-async fn a_script_run_reads_what_it_likes_and_changes_nothing_but_its_own_run() {
+async fn a_script_run_reads_only_allowed_queries_and_changes_only_its_own_run() {
     let harness = TestHarness::new().await;
     let mut real = open_run(
         &harness,
@@ -482,11 +487,17 @@ async fn a_script_run_reads_what_it_likes_and_changes_nothing_but_its_own_run() 
             assert_eq!(code, "NOT_ALLOWED_FOR_SCRIPT_RUN", "{run}: {mutation}");
         }
 
-        // Whatever may be read, it may read, an administrator's reads too.
+        // An alias cannot turn an administrator query into an allowed one.
+        for query in ["{ apiKeys { id } }", "{ queueItems: apiKeys { id } }"] {
+            assert_eq!(
+                refused(&as_run(&harness, run, query).await).0,
+                "NOT_ALLOWED_FOR_SCRIPT_RUN"
+            );
+        }
         let response = as_run(
             &harness,
             run,
-            "{ queueItems { id } historyItems { id } apiKeys { id } scriptRun { runId } }",
+            "{ queueItems { id } historyItems { id } scriptRun { runId } }",
         )
         .await;
         assert_no_errors(&response);

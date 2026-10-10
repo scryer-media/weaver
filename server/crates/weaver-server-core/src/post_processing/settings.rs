@@ -14,8 +14,6 @@ use super::model::{PostProcessingSettings, PostProcessingSummary, ScriptResult};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
-/// v2 deliberately starts from defaults: the 0.9 model runs every enabled script
-/// in the directory, so the master switch has to be turned on again knowingly.
 const SETTINGS_KEY: &str = "post_processing.settings.v2";
 const SCRIPT_DIRECTORY_KEY: &str = "post_processing.script_directory.v1";
 

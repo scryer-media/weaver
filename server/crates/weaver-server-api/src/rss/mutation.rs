@@ -134,15 +134,10 @@ impl RssMutation {
             None => None,
         };
         let db = ctx.data::<Database>()?.clone();
-        let schedules = ctx.data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?;
-        let mut schedules_guard = schedules.write().await;
         let deleted = tokio::task::spawn_blocking(move || db.delete_rss_feed(id))
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        schedules_guard.retain(|entry| !matches!(entry.action,
-            weaver_server_core::bandwidth::ScheduleAction::FetchRss { feed_id: Some(feed_id) } if feed_id == id));
-        drop(schedules_guard);
         crate::proxies::refresh(ctx).await?;
         Ok(deleted)
     }

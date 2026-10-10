@@ -2241,6 +2241,20 @@ impl Pipeline {
         if by_set.is_empty() && conventional.is_empty() {
             return DirectRepairAnswer::Declined;
         }
+        // A conventional target is a file this repair will write on disk, and
+        // a set admitted from volume headers that could have claimed it never
+        // will: it would hold its own volumes virtually while the
+        // conventional set naming the rebuilt file waits on them, and a
+        // repair of its own could not place bytes for a member that opens in
+        // a volume it does not hold. It leaves before the repair, and the
+        // conventional repairer answers the whole set.
+        let rebuilt: Vec<u32> = conventional
+            .iter()
+            .map(|target| target.file_id.file_index)
+            .collect();
+        if self.note_identity_repaired_files(job_id, &rebuilt).await {
+            return DirectRepairAnswer::Acted;
+        }
 
         // The wait, decided **before** the first attempt.
         //

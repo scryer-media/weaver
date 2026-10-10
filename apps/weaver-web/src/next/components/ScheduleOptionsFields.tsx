@@ -1,7 +1,7 @@
 import { gql, useQuery } from "urql";
 import type { Translate } from "@/lib/context/translate-context";
 import type { FieldSpec } from "@/next/pages/settings/framework";
-import { isOneShot, type ScheduleOptionsForm, type ScheduleTargets } from "../data/schedule-options";
+import { isOneShot, speedKey, speedProblem, type ScheduleOptionsForm, type ScheduleTargets, type SpeedTargetKind } from "../data/schedule-options";
 
 /**
  * The rows an action adds to the schedule editor.
@@ -11,7 +11,7 @@ import { isOneShot, type ScheduleOptionsForm, type ScheduleTargets } from "../da
  * under the clock, and an action's target and switches sit under the action.
  */
 
-const TARGETS = gql`query ScheduleTargets { servers { id host } rssFeeds { id name } scriptInstances { id name script trigger } }`;
+const TARGETS = gql`query ScheduleTargets { servers { id host } egressInterfaces { id name } }`;
 
 export function useScheduleTargets() {
   const [{ data }] = useQuery<ScheduleTargets>({ query: TARGETS });
@@ -29,15 +29,13 @@ interface ScheduleOptionFields {
 export function scheduleActionHelp(t: Translate, action: string): string | undefined {
   if (action === "pause_all") return t("next.schedules.pauseAllHelp");
   if (action === "pause_post_processing" || action === "resume_post_processing") return t("next.schedules.postHelp");
-  if (action === "scan_watch_folder") return t("next.schedules.scanHelp");
-  if (action === "fetch_rss") return t("next.schedules.fetchRssHelp");
   return isOneShot(action) ? t("next.schedules.oneShotHelp") : undefined;
 }
 
 /** The times a rule fires at beyond its single time: every hour, or a list. */
 export function scheduleTimingFields({ t, action, value, onChange }: ScheduleOptionFields): FieldSpec[] {
-  // A script rule lists every one of its times in the time field itself.
-  if (action === "run_script") return [];
+  // A speed rule takes the one time of day.
+  if (action === "speed_limit") return [];
   const set = (patch: Partial<ScheduleOptionsForm>) => onChange({ ...value, ...patch });
   const hourly = isOneShot(action) && value.everyHourAtMinute !== null;
   const fields: FieldSpec[] = [];
@@ -104,29 +102,37 @@ export function scheduleActionFields({ t, action, value, onChange, targets }: Sc
     ];
   }
   if (action === "set_quota_metering") {
-    return [{
-      id: "quotaMeteringEnabled",
-      label: t("next.schedules.meterBytes"),
-      help: t("next.schedules.quotaHelp"),
-      control: { kind: "toggle", value: value.quotaMeteringEnabled ?? true, onChange: (next) => set({ quotaMeteringEnabled: next }) },
-    }];
-  }
-  if (action === "fetch_rss") {
-    return [{
-      id: "feedId",
-      label: t("next.schedules.feed"),
-      control: {
-        kind: "select",
-        value: value.feedId === null ? "" : String(value.feedId),
-        options: targetOptions(
-          t("next.schedules.allFeeds"),
-          t("next.schedules.feed"),
-          value.feedId,
-          (targets?.rssFeeds ?? []).map((feed) => ({ id: feed.id, label: feed.name })),
-        ),
-        onChange: (next) => set({ feedId: next ? Number(next) : null }),
+    return [
+      {
+        id: "quotaMeteringEnabled",
+        label: t("next.schedules.quotaCounting"),
+        help: t("next.schedules.quotaHelp"),
+        control: {
+          kind: "select",
+          value: value.quotaMeteringEnabled ? "on" : "off",
+          options: [
+            { value: "on", label: t("next.schedules.quotaCountOn") },
+            { value: "off", label: t("next.schedules.quotaCountOff") },
+          ],
+          onChange: (next) => set({ quotaMeteringEnabled: next === "on" }),
+        },
       },
-    }];
+      {
+        id: "quotaEgressId",
+        label: t("next.schedules.egress"),
+        control: {
+          kind: "select",
+          value: value.quotaEgressId === null ? "" : String(value.quotaEgressId),
+          options: targetOptions(
+            t("next.schedules.everyEgress"),
+            t("next.schedules.egress"),
+            value.quotaEgressId,
+            (targets?.egressInterfaces ?? []).map((egress) => ({ id: egress.id, label: egress.name })),
+          ),
+          onChange: (next) => set({ quotaEgressId: next ? Number(next) : null }),
+        },
+      },
+    ];
   }
   if (action === "prune_history") {
     return (["pruneFailed", "pruneCompleted", "pruneCancelled"] as const).flatMap((key) => {
@@ -154,4 +160,52 @@ export function scheduleActionFields({ t, action, value, onChange, targets }: Sc
     });
   }
   return [];
+}
+
+/**
+ * The targets a speed rule can set, one group per heading: the global limit,
+ * then each egress, then each provider. Each takes its own rate; blank leaves
+ * that target as it is and 0 removes its limit.
+ */
+export function scheduleSpeedSections({ t, value, onChange, targets }: Omit<ScheduleOptionFields, "action"> & {
+  targets: ScheduleTargets | undefined;
+}): { id: string; title: string; note?: string; fields: FieldSpec[] }[] {
+  const field = (kind: SpeedTargetKind, id: number | null, label: string): FieldSpec => {
+    const key = speedKey(kind, id);
+    const text = value.speeds[key] ?? "";
+    const problem = speedProblem(text);
+    return {
+      id: `speed-${key}`,
+      label,
+      help: problem ? t(problem) : undefined,
+      keywords: "MB/s",
+      control: {
+        kind: "text",
+        value: text,
+        placeholder: t("next.schedules.speedLeaveAsIs"),
+        onChange: (next) => onChange({ ...value, speeds: { ...value.speeds, [key]: next } }),
+      },
+    };
+  };
+  // A rule can outlive an egress or provider it names until the next load drops it.
+  const listed = <T extends { id: number }>(kind: SpeedTargetKind, records: readonly T[], name: (record: T) => string, unknown: string) => [
+    ...records.map((record) => field(kind, record.id, name(record))),
+    ...Object.keys(value.speeds)
+      .filter((key) => key.startsWith(`${kind}:`))
+      .map((key) => Number(key.slice(kind.length + 1)))
+      .filter((id) => !records.some((record) => record.id === id))
+      .map((id) => field(kind, id, `${unknown} #${id}`)),
+  ];
+  const egresses = listed("EGRESS", targets?.egressInterfaces ?? [], (egress) => egress.name, t("next.schedules.egress"));
+  const servers = listed("SERVER", targets?.servers ?? [], (server) => server.host, t("next.schedules.server"));
+  return [
+    {
+      id: "speedGlobal",
+      title: t("next.schedules.speedGlobal"),
+      note: t("next.schedules.speedUnit"),
+      fields: [field("GLOBAL", null, t("next.schedules.speedGlobalField"))],
+    },
+    ...(egresses.length > 0 ? [{ id: "speedEgresses", title: t("next.schedules.speedEgresses"), fields: egresses }] : []),
+    ...(servers.length > 0 ? [{ id: "speedServers", title: t("next.schedules.speedServers"), fields: servers }] : []),
+  ];
 }

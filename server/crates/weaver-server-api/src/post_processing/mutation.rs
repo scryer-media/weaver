@@ -2,12 +2,10 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::auth::{AdminGuard, FreshAdminGuard, graphql_error};
-use weaver_server_core::bandwidth::ScheduleAction;
-use weaver_server_core::bandwidth::schedule::SharedSchedules;
 use weaver_server_core::post_processing::executor::{
     PostProcessingExecutor, strict_security_enabled,
 };
-use weaver_server_core::post_processing::instances::{InstanceTrigger, ScriptInstance};
+use weaver_server_core::post_processing::instances::ScriptInstance;
 use weaver_server_core::post_processing::listing::resolve_script;
 use weaver_server_core::post_processing::model::{
     PipelineOutcome, PostProcessingSettings, ScriptName,
@@ -38,7 +36,7 @@ where
         .map_err(refused)
 }
 
-/// An instance can only be pointed at a script that is there to run. One whose
+/// A script job can only be pointed at a script that is there to run. One whose
 /// script has since gone can still be edited, so long as it keeps naming it.
 fn require_script(db: &Database, script: &ScriptName) -> std::result::Result<(), String> {
     let directory = db
@@ -63,28 +61,6 @@ fn secret_error(error: SecretError) -> async_graphql::Error {
 
 fn view(db: &Database, instance: ScriptInstance) -> ScriptInstanceGql {
     crate::post_processing::query::directory_view(db).instance(instance)
-}
-
-/// Take out every schedule rule that runs the instance `id`, and return the
-/// rules as they are saved afterwards.
-fn prune_schedule_rules(
-    db: &Database,
-    id: &str,
-) -> std::result::Result<
-    Vec<weaver_server_core::bandwidth::ScheduleEntry>,
-    weaver_server_core::StateError,
-> {
-    let mut rules = db.list_schedules()?;
-    let before = rules.len();
-    rules.retain(|rule| {
-        !matches!(&rule.action,
-            ScheduleAction::RunScript { instance_id, .. } if *instance_id == id)
-    });
-    if rules.len() != before {
-        db.save_schedules(&rules)?;
-        rules = db.list_schedules()?;
-    }
-    Ok(rules)
 }
 
 #[derive(Default)]
@@ -185,7 +161,7 @@ impl PostProcessingMutation {
     }
 
     /// Select the sole live source of scripts. Changing it turns every
-    /// instance off, because a name in the new directory is not the script
+    /// script job off, because a name in the new directory is not the script
     /// that was wired up. What was saved in them is kept, and script files
     /// are never touched.
     #[graphql(guard = "FreshAdminGuard")]
@@ -286,7 +262,7 @@ impl PostProcessingMutation {
         .map_err(secret_error)
     }
 
-    /// Remove a secret. Refused while any instance links it.
+    /// Remove a secret. Refused while any script job links it.
     #[graphql(guard = "FreshAdminGuard")]
     async fn delete_secret(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
@@ -297,11 +273,11 @@ impl PostProcessingMutation {
             .map_err(secret_error)
     }
 
-    /// Replace everything saved in an instance. Each input is sent as a value,
-    /// as the secret it links, or as a secret of the instance's own; one of
+    /// Replace everything saved in a script job. Each input is sent as a value,
+    /// as the secret it links, or as a secret of the script job's own; one of
     /// those sent without a value keeps the secret already saved under that
-    /// name. An instance that no longer runs on a schedule loses the schedule
-    /// rules that ran it.
+    /// name. A schedule left out keeps the saved one; a script job that no
+    /// longer runs on a schedule loses its run times.
     #[graphql(guard = "FreshAdminGuard")]
     async fn update_script_instance(
         &self,
@@ -309,58 +285,40 @@ impl PostProcessingMutation {
         id: String,
         input: ScriptInstanceInput,
     ) -> Result<ScriptInstanceGql> {
-        let draft = input.into_draft().map_err(async_graphql::Error::new)?;
+        let keep_schedule = input.schedule.is_none();
+        let mut draft = input.into_draft().map_err(async_graphql::Error::new)?;
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<SharedSchedules>()?.clone();
-        // Held across the whole change so the rules a running evaluator reads
-        // never name an instance that no longer runs on a schedule.
-        let mut schedules = schedules_state.write().await;
-        let (instance, rules) = blocking(move || {
+        blocking(move || {
             let existing = db
                 .script_instance(&id)
                 .map_err(|error| error.to_string())?
-                .ok_or("script instance does not exist")?;
+                .ok_or("script job does not exist")?;
+            if keep_schedule {
+                draft.schedule = existing.schedule.clone();
+            }
             if existing.script != draft.script {
                 require_script(&db, &draft.script)?;
             }
             let instance = db
                 .update_script_instance(&id, draft)
                 .map_err(|error| error.to_string())?;
-            let rules = if instance.trigger != InstanceTrigger::Schedule {
-                Some(prune_schedule_rules(&db, &id).map_err(|error| error.to_string())?)
-            } else {
-                None
-            };
-            Ok::<_, String>((view(&db, instance), rules))
+            Ok::<_, String>(view(&db, instance))
         })
-        .await?;
-        if let Some(rules) = rules {
-            *schedules = rules;
-        }
-        Ok(instance)
+        .await
     }
 
-    /// Remove an instance, along with any schedule rule that ran it. False
-    /// when there was no such instance.
+    /// Remove a script job. False when there was no such script job.
     #[graphql(guard = "FreshAdminGuard")]
     async fn delete_script_instance(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<SharedSchedules>()?.clone();
-        // Held across the whole change so the rules a running evaluator reads
-        // never name an instance that has just gone.
-        let mut schedules = schedules_state.write().await;
-        // The rules go first: an instance left without them is a lesser
-        // mistake than a rule left naming an instance that is gone.
-        let (rules, deleted) = blocking(move || {
-            let rules = prune_schedule_rules(&db, &id)?;
-            Ok::<_, weaver_server_core::StateError>((rules, db.delete_script_instance(&id)))
+        let deleted = blocking(move || {
+            Ok::<_, weaver_server_core::StateError>(db.delete_script_instance(&id))
         })
         .await?;
-        *schedules = rules;
         deleted.map_err(refused)
     }
 
-    /// Put the instances of one trigger in the order given. They keep the
+    /// Put the script jobs of one trigger in the order given. They keep the
     /// places they hold among the others, and any that are not named follow
     /// the ones that are.
     #[graphql(guard = "FreshAdminGuard")]
@@ -381,7 +339,7 @@ impl PostProcessingMutation {
                     .iter()
                     .any(|instance| &instance.id == id && in_group(instance))
                 {
-                    return Err(format!("'{id}' is not an instance of that trigger"));
+                    return Err(format!("'{id}' is not a script job with that trigger"));
                 }
                 if !named.insert(id.as_str()) {
                     return Err(format!("'{id}' is named more than once"));
@@ -415,10 +373,10 @@ impl PostProcessingMutation {
         .await
     }
 
-    /// Create every instance a script's header asks for and does not have
-    /// yet: one per declared trigger, filled from the header, and for a new
-    /// schedule instance one schedule rule per declared run time. Returns the
-    /// instances it added. After this the header is not read again.
+    /// Create every script job a script's header asks for and does not have
+    /// yet: one per declared trigger, filled from the header, a new schedule
+    /// script job carrying every declared run time. Returns the script jobs it
+    /// added. After this the header is not read again.
     #[graphql(guard = "FreshAdminGuard")]
     async fn set_up_script_from_header(
         &self,
@@ -427,29 +385,23 @@ impl PostProcessingMutation {
     ) -> Result<Vec<ScriptInstanceGql>> {
         let script = parse_script_name(script)?;
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<SharedSchedules>()?.clone();
-        let mut schedules = schedules_state.write().await;
-        let (added, rules) = blocking(move || {
+        blocking(move || {
             let setup = db
                 .set_up_script_from_header(&script)
                 .map_err(|error| error.to_string())?;
-            let rules = db.list_schedules().map_err(|error| error.to_string())?;
             let directory = crate::post_processing::query::directory_view(&db);
-            Ok::<_, String>((
+            Ok::<_, String>(
                 setup
                     .instances
                     .into_iter()
                     .map(|instance| directory.instance(instance))
                     .collect::<Vec<_>>(),
-                rules,
-            ))
+            )
         })
-        .await?;
-        *schedules = rules;
-        Ok(added)
+        .await
     }
 
-    /// Bring one instance's inputs back in line with its script's header:
+    /// Bring one script job's inputs back in line with its script's header:
     /// every declared input, at the value already saved or else its default,
     /// and nothing the header no longer declares.
     #[graphql(guard = "FreshAdminGuard")]
@@ -468,8 +420,8 @@ impl PostProcessingMutation {
         .await
     }
 
-    /// Run an instance once against made-up inputs: a download that does not
-    /// exist, in a scratch directory that is removed afterwards. The instance
+    /// Run a script job once against made-up inputs: a download that does not
+    /// exist, in a scratch directory that is removed afterwards. The script job
     /// supplies the script, the trigger and its saved inputs. Commands the
     /// script prints are reported and never applied. Read the run again with
     /// `scriptTestRun`.
@@ -508,7 +460,7 @@ impl PostProcessingMutation {
         Ok(ScriptRunActionsGql(calling_run(ctx)?))
     }
 
-    /// Run the job's post-processing instances again against its retained
+    /// Run the job's post-processing script jobs again against its retained
     /// output directory.
     #[graphql(guard = "ControlGuard")]
     async fn rerun_post_processing(&self, ctx: &Context<'_>, job_id: u64) -> Result<bool> {

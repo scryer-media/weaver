@@ -356,27 +356,7 @@ fn crossed(cell: Cell) -> Ruling {
             | Binding::Sfv
             | Binding::Nothing
             | Binding::LegacyOnLoss,
-        ) if naming != Naming::MixedCase => {
-            Ruling::Possible(fallback(Admission::Named, container.admitted()))
-        }
-        // Discovery groups by exact name, so the volumes whose stem differs
-        // in case are refused as a gap; the set still extracts by the
-        // fallback route.
-        (
-            Naming::Conventional
-            | Naming::ConventionalFour
-            | Naming::Single
-            | Naming::MixedCase
-            | Naming::OldStyleS,
-            Binding::Par2RealFirst
-            | Binding::Par2RealLast
-            | Binding::Sfv
-            | Binding::Nothing
-            | Binding::LegacyOnLoss,
-        ) => Ruling::Possible(fallback(
-            Admission::Split(AdmissionRefusal::VolumeGap),
-            Expect::Streams,
-        )),
+        ) => Ruling::Possible(fallback(Admission::Named, container.admitted())),
         (
             Naming::HexBare | Naming::HexMisnumbered | Naming::HexScattered,
             Binding::Par2Posted | Binding::Sfv | Binding::Nothing | Binding::LegacyOnLoss,
@@ -716,7 +696,13 @@ impl Binding {
             ),
             Self::Par2Posted => (
                 matrix,
-                Some(fixture.volumes.iter().map(|(name, _)| name.clone()).collect()),
+                Some(
+                    fixture
+                        .volumes
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect(),
+                ),
             ),
             Self::Sfv => (
                 ScheduleOptions {
@@ -832,12 +818,6 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
     if options.sfv {
         published.push("silver.horizon.sfv");
     }
-    let defect = open_defect(cell, profile);
-    if let Some(Defect::Hangs(why)) = defect {
-        eprintln!("{cell:?} profile={profile:?} held open, not run: {why}");
-        return;
-    }
-    let mut diverged = 0;
     for (case, (order, interruption)) in cases {
         if !profile.includes(interruption) {
             continue;
@@ -896,154 +876,9 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 );
             }
         };
-        match defect {
-            Some(Defect::Diverges(why)) => {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err() {
-                    eprintln!("{context}: held open: {why}");
-                    diverged += 1;
-                }
-            }
-            _ => check(),
-        }
-    }
-    if let Some(Defect::Diverges(why)) = defect {
-        assert!(
-            diverged > 0,
-            "{cell:?} profile={profile:?} now meets its ruling; drop it from open_defect: {why}"
-        );
+        check();
     }
 }
-
-/// A case set the product does not yet hold to its ruling.
-#[derive(Clone, Copy, Debug)]
-enum Defect {
-    /// The cases run, and at least one must still miss the ruling: once none
-    /// does, the entry is stale and the campaign says so.
-    Diverges(&'static str),
-    /// The job never settles, so the cases are not run at all.
-    Hangs(&'static str),
-}
-
-/// The defects each cell and profile is held open for.
-fn open_defect(cell: Cell, profile: ExtractionProfile) -> Option<Defect> {
-    use Binding as B;
-    use Container as C;
-    use ExtractionProfile as P;
-    use Naming as N;
-    let Cell {
-        container,
-        naming,
-        binding,
-    } = cell;
-    let rar = !container.is_sevenz();
-    let direct = matches!(profile, P::DirectStore);
-    let chase = matches!(profile, P::Chase);
-    let real = matches!(binding, B::Par2RealFirst | B::Par2RealLast);
-    // Direct store reads these sets from their own headers before any
-    // fallback is reached.
-    let read_direct = direct && container.headers_chain();
-    let diverges = |why| Some(Defect::Diverges(why));
-    match (naming, binding) {
-        // Hangs.
-        (N::HexNumberedGap, B::Par2RealFirst | B::Par2RealLast | B::Par2Posted) if rar => {
-            Some(Defect::Hangs(HANG_GAP))
-        }
-        (N::HexSwappedRar | N::HexReposted, B::Par2Posted) if rar => {
-            Some(Defect::Hangs(HANG_POSTED))
-        }
-        (N::HexBare | N::HexScattered | N::FirstVolumeHex, B::Par2Posted)
-            if rar && !read_direct =>
-        {
-            Some(Defect::Hangs(HANG_POSTED))
-        }
-        (N::HexMisnumbered, B::Par2Posted) if container == C::Rar4 => {
-            Some(Defect::Hangs(HANG_POSTED))
-        }
-        (N::BareFirstPart, B::Par2Posted | B::Sfv | B::Nothing) => {
-            Some(Defect::Hangs(HANG_TOPOLOGY))
-        }
-        // Divergences.
-        (N::MixedCase, B::Par2RealFirst) if rar && !direct => None,
-        (N::MixedCase, _) => diverges(OPEN_CASE),
-        (N::HexBare | N::HexScattered, B::Sfv | B::Nothing) if rar && !read_direct => {
-            diverges(OPEN_VOLUME_ZERO)
-        }
-        (N::HexMisnumbered, B::Sfv | B::Nothing) if container == C::Rar4 => {
-            diverges(OPEN_VOLUME_ZERO)
-        }
-        (N::HexSwappedRar | N::HexReposted, B::Sfv | B::Nothing) if rar => {
-            diverges(OPEN_VOLUME_ZERO)
-        }
-        (N::HexNumberedGap, _) => diverges(OPEN_GAP),
-        (N::OldStyleS | N::HexSwappedRar, B::Par2RealFirst | B::Par2RealLast) if chase => {
-            diverges(OPEN_IDLE_CHASE)
-        }
-        (N::HexMisnumbered, B::Par2RealFirst) if container == C::Rar4 && chase => {
-            diverges(OPEN_IDLE_CHASE)
-        }
-        (N::HexMisnumbered, B::Par2RealLast) if container == C::Rar4 && direct => {
-            diverges(OPEN_IDLE_CHASE)
-        }
-        (N::HexBare | N::HexSingle | N::HexMisnumbered | N::HexScattered, B::Par2RealFirst)
-            if container == C::Rar5EncryptedHeaders && direct =>
-        {
-            diverges(OPEN_PASSWORD)
-        }
-        (N::FirstVolumeHex, B::Par2RealFirst) if rar && direct => diverges(OPEN_FIRST_HEX),
-        (N::FirstVolumeHex, B::Par2RealLast) if container.headers_chain() && direct => {
-            diverges(OPEN_FIRST_HEX)
-        }
-        (N::FirstVolumeHex, B::Par2Posted | B::Sfv | B::Nothing) => diverges(OPEN_FIRST_HEX),
-        (N::FirstVolumeHex | N::BareFirstPart, B::Par2RealFirst)
-            if container == C::SevenZipSolid && direct =>
-        {
-            diverges(OPEN_IDLE_CHASE)
-        }
-        (N::FirstVolumeHex | N::BareFirstPart, B::Par2RealFirst) if !rar && chase => {
-            diverges(OPEN_IDLE_CHASE)
-        }
-        (N::FirstVolumeHex | N::BareFirstPart, B::Par2RealLast) if !rar && !direct && !chase => {
-            None
-        }
-        (N::FirstVolumeHex | N::BareFirstPart, B::Par2RealLast) if !rar => {
-            diverges(OPEN_IDLE_CHASE)
-        }
-        (N::HexMisnumbered, _) if container == C::SevenZipSolid => diverges(OPEN_MISNUMBERED),
-        (N::HexMisnumbered, B::Par2Posted | B::Sfv | B::Nothing) if !rar => {
-            diverges(OPEN_MISNUMBERED)
-        }
-        (N::HexBare, _) if container == C::SevenZipSolid && real => diverges(OPEN_SOLID_HEX),
-        (N::Reposted, _) if !rar => diverges(OPEN_REPOST_7Z),
-        _ => None,
-    }
-}
-
-const OPEN_CASE: &str = "discovery groups by exact name, so a stem that differs in case \
-     splits the set and the job fails";
-const OPEN_VOLUME_ZERO: &str = "a RAR set no name places as volume 0 is never grouped and the \
-     job fails with no retryable work; owned by the volume-0 grouping rows";
-const OPEN_GAP: &str = "a numbering gap is never reported as a missing part; the reader \
-     fails on what it has";
-const OPEN_IDLE_CHASE: &str = "chase arms for a set a real-name index places but consumes \
-     nothing, or direct store never admits it";
-const OPEN_PASSWORD: &str = "a header-encrypted set admitted by its index is refused for want \
-     of the password the job holds";
-const OPEN_FIRST_HEX: &str = "a set whose first volume alone is hex-named fails to open";
-const OPEN_MISNUMBERED: &str = "7z volumes are reassembled in suffix order: one arrival order \
-     fails and the other completes with a corrupt payload";
-const OPEN_SOLID_HEX: &str = "a hex-named solid 7z set fails to open under one arrival order \
-     even with a real-name index";
-const OPEN_REPOST_7Z: &str = "7z copies under two numberings are joined, not deduplicated, \
-     and the header check fails";
-
-/// Reproducer: `WEAVER_ARCHIVE_SCHEDULE_TRACE=1` on the campaign for any
-/// cell this names; the job spins on "deferring completion until archive
-/// topology is available" after direct store refuses the set.
-const HANG_TOPOLOGY: &str =
-    "a 7z set refused as mixed-shape with no real-name roster never settles its topology";
-const HANG_POSTED: &str =
-    "a hex-named RAR set whose PAR2 describes only the posted names never settles";
-const HANG_GAP: &str = "a RAR set missing a numbered part never settles once a PAR2 index is in hand";
 
 /// A cell's campaign: every profile over the matrix's smoke schedules.
 pub(super) async fn cell_campaign(cell: Cell) {
@@ -1213,20 +1048,21 @@ fn generator_listing() -> String {
     let cells = possible_cells();
     let mut listing = String::new();
     for container in CONTAINERS {
-        let tag = if matches!(container, Container::Rar5 | Container::SevenZip) {
-            "smoke"
-        } else {
-            "campaign"
-        };
         listing.push_str(&format!(
-            "{tag} {} {container:?} {{\n",
+            "smoke {} {container:?} {{\n",
             snake(format!("{container:?}"))
         ));
         for naming in NAMINGS {
             let bindings: Vec<_> = cells
                 .iter()
                 .filter(|cell| cell.container == container && cell.naming == naming)
-                .map(|cell| format!("{} {:?}", snake(format!("{:?}", cell.binding)), cell.binding))
+                .map(|cell| {
+                    format!(
+                        "{} {:?}",
+                        snake(format!("{:?}", cell.binding)),
+                        cell.binding
+                    )
+                })
                 .collect();
             if !bindings.is_empty() {
                 listing.push_str(&format!(

@@ -57,8 +57,9 @@ fn record_member_crc32(
 
 #[derive(Debug)]
 struct UnacceptableExtensionMatch {
+    /// Relative to the delivery, `/`-separated: the path the file would have
+    /// been published under.
     relative_path: String,
-    pattern: String,
 }
 
 #[derive(Debug, Default)]
@@ -188,14 +189,12 @@ fn scan_delivery_root(
                 ));
             }
             let filename = path.file_name().unwrap_or_default().to_string_lossy();
-            if let Some(pattern) = settings.unacceptable_extension_match(&filename) {
+            if settings.unacceptable_extension_match(&filename).is_some() {
                 let rejection = UnacceptableExtensionMatch {
-                    relative_path: format!("{source_name}/{}", relative_path.display()),
-                    pattern: pattern.to_string(),
+                    relative_path: relative_path.to_string_lossy().replace('\\', "/"),
                 };
-                return Err(format!(
-                    "unacceptable extension '{}' matched '{}' before publication",
-                    rejection.pattern, rejection.relative_path
+                return Err(crate::post_processing::model::unwanted_extension_reason(
+                    &rejection.relative_path,
                 ));
             }
             entry_bytes = entry_bytes.saturating_add(metadata.len());
@@ -464,9 +463,11 @@ async fn run_move_to_claimed_destination(
         #[cfg(test)]
         DeliveryPolicySource::Fixed(policy) => policy,
     };
+    let policy = Arc::new(policy);
     let validation = {
         let working_dir = working_dir.clone();
         let staging_dir = staging_dir.clone();
+        let policy = Arc::clone(&policy);
         tokio::task::spawn_blocking(move || {
             validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy)
         })
@@ -645,7 +646,9 @@ async fn run_move_to_claimed_destination(
     // finishes before the move reports done — everything downstream of the
     // move sees only the final names.
     let renamed_members = match naming {
-        Some(naming) => deobfuscate::rename_obfuscated_members(job_id, &dest, &naming).await,
+        Some(naming) => {
+            deobfuscate::rename_obfuscated_members(job_id, &dest, &naming, &policy).await
+        }
         None => 0,
     };
 
@@ -1050,11 +1053,6 @@ impl Pipeline {
             )
         };
 
-        self.phase_end(job_id, JobPhase::Extracting);
-        self.phase_end(job_id, JobPhase::Repairing);
-        let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
-        self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
-
         let requested = self
             .db
             .job_script_effects(job_id.0)
@@ -1096,6 +1094,10 @@ impl Pipeline {
                 None,
             )
         };
+        self.phase_end(job_id, JobPhase::Extracting);
+        self.phase_end(job_id, JobPhase::Repairing);
+        let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
+        self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);

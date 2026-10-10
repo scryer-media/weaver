@@ -916,8 +916,9 @@ pub struct PostProcessingSettings {
     #[serde(default)]
     pub go_interpreter: Option<String>,
     /// Extension-token patterns that reject a job only after Weaver has a
-    /// trustworthy output name. An empty list disables the policy.
-    #[serde(default)]
+    /// trustworthy output name. An empty list disables the policy. A saved
+    /// document without the field predates the default list and reads it.
+    #[serde(default = "default_unacceptable_extensions")]
     pub unacceptable_extensions: Vec<String>,
     #[serde(default)]
     pub global_scripts_run: GlobalScriptsRun,
@@ -934,7 +935,7 @@ impl Default for PostProcessingSettings {
             powershell_interpreter: None,
             batch_interpreter: None,
             go_interpreter: None,
-            unacceptable_extensions: Vec::new(),
+            unacceptable_extensions: default_unacceptable_extensions(),
             global_scripts_run: GlobalScriptsRun::default(),
         }
     }
@@ -986,6 +987,33 @@ impl PostProcessingSettings {
             .find(|pattern| crate::runtime::glob::glob_match_ci(pattern, extension))
             .map(String::as_str)
     }
+}
+
+/// The unwanted extension list a new install starts with, sorted as a saved
+/// list is normalized. An empty list turns the check off.
+pub const DEFAULT_UNACCEPTABLE_EXTENSIONS: [&str; 10] = [
+    "bat", "cmd", "com", "exe", "js", "lnk", "msi", "ps1", "scr", "vbs",
+];
+
+fn default_unacceptable_extensions() -> Vec<String> {
+    DEFAULT_UNACCEPTABLE_EXTENSIONS
+        .iter()
+        .map(|extension| (*extension).to_string())
+        .collect()
+}
+
+/// The reason a job fails with when the unwanted extension policy refuses
+/// `relative_path`: the file's extension and the file that carried it, as
+/// the consumer app and the Jobs screen show it.
+pub fn unwanted_extension_reason(relative_path: &str) -> String {
+    let relative_path = relative_path.replace('\\', "/");
+    let extension = relative_path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    format!("unwanted extension '.{extension}' in '{relative_path}'")
 }
 
 fn normalize_unacceptable_extension(value: &str) -> Result<String, PostProcessingValidationError> {

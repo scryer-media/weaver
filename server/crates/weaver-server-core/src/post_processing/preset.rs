@@ -7,12 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::instances::{
-    InstanceInputDraft, InstanceTrigger, ScriptInstance, ScriptInstanceDraft, ScriptInstanceError,
+    InstanceInputDraft, InstanceSchedule, InstanceTrigger, ScriptInstance, ScriptInstanceDraft,
+    ScriptInstanceError,
 };
 use super::listing::{DiscoveredScript, resolve_script};
 use super::model::{OptionValue, ScriptKind, ScriptManifest, ScriptName, ScriptTaskTime};
 use super::runner::option_value_text;
-use crate::bandwidth::{ScheduleAction, ScheduleEntry};
 use crate::persistence::{Database, StateError};
 
 /// One input a header declares.
@@ -165,7 +165,7 @@ impl ScriptPreset {
 
     /// A new instance of `script` on `trigger`, filled from the header. A
     /// secret slot is linked when `links` has a secret for it, and left out
-    /// otherwise.
+    /// otherwise. A schedule job takes the run times the header declares.
     pub fn draft(
         &self,
         script: &ScriptName,
@@ -186,6 +186,9 @@ impl ScriptPreset {
                 }
             })
             .collect();
+        if trigger == InstanceTrigger::Schedule {
+            draft.schedule = InstanceSchedule::from_task_times(&self.task_times);
+        }
         draft
     }
 }
@@ -210,8 +213,6 @@ pub fn secret_links_of<'a>(instances: impl IntoIterator<Item = &'a ScriptInstanc
 #[derive(Debug, Clone, Default)]
 pub struct HeaderSetup {
     pub instances: Vec<ScriptInstance>,
-    /// Schedule rows added for a new schedule instance, one per run time.
-    pub schedules: Vec<ScheduleEntry>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -234,7 +235,7 @@ impl Database {
 
     /// Create every instance a script's header asks for and does not have
     /// yet: one per declared trigger, each filled from the header. A new
-    /// schedule instance also gets one schedule row per declared run time.
+    /// schedule job runs at the times the header declares.
     ///
     /// Running it again adds only what is still missing, so a trigger the
     /// header gained later can be picked up without touching what is saved.
@@ -263,17 +264,7 @@ impl Database {
                 continue;
             }
             let instance = self.create_script_instance(preset.draft(script, trigger, &links))?;
-            if trigger == InstanceTrigger::Schedule {
-                for time in &preset.task_times {
-                    setup.schedules.push(schedule_row(&instance, *time)?);
-                }
-            }
             setup.instances.push(instance);
-        }
-        if !setup.schedules.is_empty() {
-            let mut schedules = self.list_schedules()?;
-            schedules.extend(setup.schedules.iter().cloned());
-            self.save_schedules(&schedules)?;
         }
         Ok(setup)
     }
@@ -287,27 +278,6 @@ impl Database {
         let preset = ScriptPreset::of(&discovered.manifest);
         Ok(self.update_script_instance(id, preset.reapplied_to(&instance))?)
     }
-}
-
-fn schedule_row(
-    instance: &ScriptInstance,
-    time: ScriptTaskTime,
-) -> Result<ScheduleEntry, StateError> {
-    let mut entropy = [0_u8; 12];
-    getrandom::fill(&mut entropy).map_err(|error| StateError::Database(error.to_string()))?;
-    Ok(ScheduleEntry {
-        id: hex::encode(entropy),
-        enabled: true,
-        label: instance.name.clone(),
-        days: Vec::new(),
-        time: time.to_string(),
-        times: Vec::new(),
-        every_hour_at_minute: None,
-        action: ScheduleAction::RunScript {
-            instance_id: instance.id.clone(),
-            run_at_startup: time == ScriptTaskTime::Startup,
-        },
-    })
 }
 
 #[cfg(test)]
@@ -360,6 +330,7 @@ mod tests {
             blocking: true,
             timeout_seconds: None,
             run_order: 0,
+            schedule: InstanceSchedule::default(),
         }
     }
 

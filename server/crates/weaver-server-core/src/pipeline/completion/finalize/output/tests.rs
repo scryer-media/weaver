@@ -537,9 +537,9 @@ fn prepublication_scan_checks_both_delivery_roots() {
     let working = temp.path().join("working");
     let staging = temp.path().join("staging");
     std::fs::create_dir_all(working.join("nested")).unwrap();
-    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(staging.join("extras")).unwrap();
     std::fs::write(working.join("safe.mkv"), b"safe").unwrap();
-    std::fs::write(staging.join("nested.exe"), b"rejected").unwrap();
+    std::fs::write(staging.join("extras/Payload.EXE"), b"rejected").unwrap();
 
     let settings = PostProcessingSettings {
         unacceptable_extensions: vec!["EXE".into()],
@@ -549,9 +549,9 @@ fn prepublication_scan_checks_both_delivery_roots() {
     .unwrap();
     let error = validate_delivery_sources(&working, Some(&staging), &settings).unwrap_err();
 
-    assert!(error.contains("unacceptable extension 'exe' matched 'staging/nested.exe'"));
+    assert_eq!(error, "unwanted extension '.exe' in 'extras/Payload.EXE'");
     assert!(working.join("safe.mkv").exists());
-    assert!(staging.join("nested.exe").exists());
+    assert!(staging.join("extras/Payload.EXE").exists());
 }
 
 /// The Windows arm of the guard reads a raw attribute bit rather than asking

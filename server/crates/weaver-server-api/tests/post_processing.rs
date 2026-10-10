@@ -68,7 +68,12 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
     assert_eq!(settings["executionEnabled"], false);
     assert_eq!(settings["concurrency"], 4);
     assert_eq!(settings["terminationGraceSeconds"], 10);
-    assert_eq!(settings["unacceptableExtensions"], serde_json::json!([]));
+    assert_eq!(
+        settings["unacceptableExtensions"],
+        serde_json::json!([
+            "bat", "cmd", "com", "exe", "js", "lnk", "msi", "ps1", "scr", "vbs"
+        ])
+    );
     assert_eq!(settings["strictSecurityRefusesExecution"], false);
     assert_eq!(settings["globalScriptsRun"], "ALWAYS");
 }
@@ -1254,12 +1259,12 @@ async fn a_browser_session_without_a_recent_password_check_may_add_a_secret_but_
 }
 
 #[tokio::test]
-async fn a_script_is_set_up_from_its_header_once_and_its_schedule_goes_with_it() {
+async fn a_script_is_set_up_from_its_header_once_and_its_run_times_go_on_the_job() {
     let harness = TestHarness::new().await;
     write_script(
         &harness,
         "nightly.sh",
-        "#!/bin/sh\n### NZBGET POST-PROCESSING/SCHEDULER SCRIPT ###\n### TASK TIME: 03:30 ###\nexit 93\n",
+        "#!/bin/sh\n### NZBGET POST-PROCESSING/SCHEDULER SCRIPT ###\n### TASK TIME: 03:30;*:15;* ###\nexit 93\n",
     )
     .await;
 
@@ -1268,17 +1273,14 @@ async fn a_script_is_set_up_from_its_header_once_and_its_schedule_goes_with_it()
         .await;
     assert_no_errors(&listing);
     assert_eq!(
-        response_data(&listing)["discoveredScripts"]["scripts"][0]["preset"],
-        json!({
-            "triggers": [
-                { "trigger": "POST_PROCESSING", "queueEvent": null },
-                { "trigger": "SCHEDULER", "queueEvent": null }
-            ],
-            "taskTimes": ["03:30"]
-        })
+        response_data(&listing)["discoveredScripts"]["scripts"][0]["preset"]["triggers"],
+        json!([
+            { "trigger": "POST_PROCESSING", "queueEvent": null },
+            { "trigger": "SCHEDULER", "queueEvent": null }
+        ])
     );
 
-    let set_up = r#"mutation { setUpScriptFromHeader(script: "nightly.sh") { id name script trigger enabled } }"#;
+    let set_up = r#"mutation { setUpScriptFromHeader(script: "nightly.sh") { id name script trigger enabled schedule { days times runAtStartup } } }"#;
     let denied = harness.execute_as(set_up, CallerScope::Read).await;
     assert_has_errors(&denied);
     let added = harness.execute(set_up).await;
@@ -1296,57 +1298,39 @@ async fn a_script_is_set_up_from_its_header_once_and_its_schedule_goes_with_it()
     );
     assert!(added.iter().all(|instance| instance["enabled"] == true));
     assert_eq!(ids(&instances(&harness).await), ids(&added));
-    let scheduled = id(&added[1]);
-
-    let schedules = "{ schedules { instanceId time actionType enabled runAtStartup } }";
-    let rules = harness.execute(schedules).await;
-    assert_no_errors(&rules);
     assert_eq!(
-        response_data(&rules)["schedules"],
-        json!([{
-            "instanceId": scheduled,
-            "time": "03:30",
-            "actionType": "run_script",
-            "enabled": true,
-            "runAtStartup": false
-        }])
+        added[0]["schedule"],
+        json!({ "days": [], "times": [], "runAtStartup": false })
     );
+    assert_eq!(
+        added[1]["schedule"],
+        json!({ "days": [], "times": ["*:15", "03:30"], "runAtStartup": true })
+    );
+
+    // The Schedules screen never lists scripts.
+    let rules = harness.execute("{ schedules { id } }").await;
+    assert_no_errors(&rules);
+    assert_eq!(response_data(&rules)["schedules"], json!([]));
+
+    // The Schedules screen never lists scripts.
+    let rules = harness.execute("{ schedules { id } }").await;
+    assert_no_errors(&rules);
+    assert_eq!(response_data(&rules)["schedules"], json!([]));
 
     // The header is not read again for what is already wired up.
     let again = harness.execute(set_up).await;
     assert_no_errors(&again);
     assert_eq!(response_data(&again)["setUpScriptFromHeader"], json!([]));
     assert_eq!(instances(&harness).await.len(), 2);
-    let rules = harness.execute(schedules).await;
-    assert_eq!(
-        response_data(&rules)["schedules"].as_array().unwrap().len(),
-        1
-    );
 
     let missing = harness
         .execute(r#"mutation { setUpScriptFromHeader(script: "gone.sh") { id } }"#)
         .await;
     assert_has_errors(&missing);
-
-    // A rule that ran an instance goes when the instance does.
-    let deleted = harness
-        .execute(&format!(
-            r#"mutation {{ deleteScriptInstance(id: "{scheduled}") }}"#
-        ))
-        .await;
-    assert_no_errors(&deleted);
-    let rules = harness.execute(schedules).await;
-    assert_no_errors(&rules);
-    assert_eq!(response_data(&rules)["schedules"], json!([]));
-    assert_eq!(ids(&instances(&harness).await), [id(&added[0])]);
 }
 
 #[tokio::test]
-async fn a_rule_goes_when_its_instance_stops_running_on_a_schedule_or_is_deleted() {
-    use std::sync::Arc;
-    use weaver_server_core::bandwidth::ScheduleAction;
-    use weaver_server_core::bandwidth::schedule::SharedSchedules;
-
+async fn a_schedule_job_keeps_its_run_times_and_another_trigger_drops_them() {
     let harness = TestHarness::new().await;
     write_script(
         &harness,
@@ -1354,89 +1338,104 @@ async fn a_rule_goes_when_its_instance_stops_running_on_a_schedule_or_is_deleted
         "#!/bin/sh\n### NZBGET SCHEDULER SCRIPT ###\nexit 93\n",
     )
     .await;
-    let first = id(&create_instance(&harness, r#"script: "nightly.sh", trigger: SCHEDULER"#).await);
-    let second = id(&create_instance(
+    let created = create_instance(
         &harness,
-        r#"name: "second", script: "nightly.sh", trigger: SCHEDULER"#,
+        r#"script: "nightly.sh", trigger: SCHEDULER, schedule: { days: ["sat", "mon"], times: ["23:00", "*:5", "01:00"], runAtStartup: true }"#,
     )
-    .await);
-    let rule = |id: &str, instance: &str| json!({ "id": id, "time": "03:30", "action": { "type": "run_script", "instance_id": instance, "run_at_startup": false } });
-    harness
-        .db
-        .set_setting(
-            "schedules",
-            &json!([
-                rule("first", &first),
-                rule("second", &second),
-                { "id": "quiet", "time": "01:00", "action": { "type": "pause" } },
-            ])
-            .to_string(),
-        )
-        .unwrap();
-    let schedules: SharedSchedules = Arc::new(tokio::sync::RwLock::new(
-        harness.db.list_schedules().unwrap(),
-    ));
-    let execute = |query: String| {
-        let schedules = schedules.clone();
-        let schema = harness.schema.clone();
-        async move {
-            let response = schema
-                .execute(
-                    async_graphql::Request::new(query)
-                        .data(CallerScope::Local)
-                        .data(schedules),
-                )
-                .await;
-            assert_no_errors(&response);
-            response
-        }
-    };
-    let rule_ids = || {
-        harness
-            .db
-            .list_schedules()
-            .unwrap()
-            .into_iter()
-            .map(|rule| rule.id)
-            .collect::<Vec<_>>()
-    };
-
-    // Still on a schedule, so its rule stays.
-    execute(format!(
-        r#"mutation {{ updateScriptInstance(id: "{first}", input: {{ name: "renamed", script: "nightly.sh", trigger: SCHEDULER }}) {{ id }} }}"#
-    ))
     .await;
-    assert_eq!(rule_ids(), ["first", "second", "quiet"]);
-
-    // Given another trigger, it has no rule to run it.
-    execute(format!(
-        r#"mutation {{ updateScriptInstance(id: "{first}", input: {{ script: "nightly.sh", trigger: SCAN }}) {{ id }} }}"#
-    ))
-    .await;
-    assert_eq!(rule_ids(), ["second", "quiet"]);
+    let job = id(&created);
+    let read = harness
+        .execute("{ scriptInstances { id schedule { days times runAtStartup } } }")
+        .await;
+    assert_no_errors(&read);
     assert_eq!(
-        *schedules.read().await,
-        harness.db.list_schedules().unwrap()
+        response_data(&read)["scriptInstances"][0]["schedule"],
+        json!({ "days": ["mon", "sat"], "times": ["*:05", "01:00", "23:00"], "runAtStartup": true })
     );
 
-    // Deleted, its rule goes with it and the rest stay.
-    let deleted = execute(format!(
-        r#"mutation {{ deleteScriptInstance(id: "{second}") }}"#
-    ))
-    .await;
+    for refused in [
+        r#"schedule: { times: ["25:00"] }"#,
+        r#"schedule: { times: ["*"] }"#,
+        r#"schedule: { days: ["someday"] }"#,
+    ] {
+        let response = harness
+            .execute(&format!(
+                r#"mutation {{ updateScriptInstance(id: "{job}", input: {{ script: "nightly.sh", trigger: SCHEDULER, {refused} }}) {{ id }} }}"#
+            ))
+            .await;
+        assert_has_errors(&response);
+    }
+
+    let moved = harness
+        .execute(&format!(
+            r#"mutation {{ updateScriptInstance(id: "{job}", input: {{ script: "nightly.sh", trigger: SCAN, schedule: {{ times: ["01:00"] }} }}) {{ schedule {{ days times runAtStartup }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&moved);
+    assert_eq!(
+        response_data(&moved)["updateScriptInstance"]["schedule"],
+        json!({ "days": [], "times": [], "runAtStartup": false })
+    );
+
+    let deleted = harness
+        .execute(&format!(
+            r#"mutation {{ deleteScriptInstance(id: "{job}") }}"#
+        ))
+        .await;
+    assert_no_errors(&deleted);
     assert_eq!(response_data(&deleted)["deleteScriptInstance"], true);
-    assert_eq!(rule_ids(), ["quiet"]);
-    let published = schedules.read().await.clone();
-    assert_eq!(published, harness.db.list_schedules().unwrap());
-    assert!(matches!(published[0].action, ScheduleAction::Pause));
-    assert_eq!(
-        ids(&instances(&harness).await),
-        std::slice::from_ref(&first),
-        "only the instance asked for is gone"
-    );
-
-    let missing = execute(r#"mutation { deleteScriptInstance(id: "missing") }"#.to_string()).await;
+    let missing = harness
+        .execute(r#"mutation { deleteScriptInstance(id: "missing") }"#)
+        .await;
+    assert_no_errors(&missing);
     assert_eq!(response_data(&missing)["deleteScriptInstance"], false);
+}
+
+#[tokio::test]
+async fn an_update_that_leaves_out_the_schedule_keeps_the_saved_one() {
+    let harness = TestHarness::new().await;
+    write_script(
+        &harness,
+        "nightly.sh",
+        "#!/bin/sh\n### NZBGET SCHEDULER SCRIPT ###\nexit 93\n",
+    )
+    .await;
+    let created = create_instance(
+        &harness,
+        r#"script: "nightly.sh", trigger: SCHEDULER, schedule: { days: ["mon"], times: ["23:00"], runAtStartup: true }"#,
+    )
+    .await;
+    let job = id(&created);
+    let kept = json!({ "days": ["mon"], "times": ["23:00"], "runAtStartup": true });
+
+    for left_out in ["", "schedule: null,"] {
+        let updated = harness
+            .execute(&format!(
+                r#"mutation {{ updateScriptInstance(id: "{job}", input: {{ {left_out} name: "Renamed", script: "nightly.sh", trigger: SCHEDULER }}) {{ name schedule {{ days times runAtStartup }} }} }}"#
+            ))
+            .await;
+        assert_no_errors(&updated);
+        assert_eq!(
+            response_data(&updated)["updateScriptInstance"]["name"],
+            "Renamed"
+        );
+        assert_eq!(
+            response_data(&updated)["updateScriptInstance"]["schedule"],
+            kept
+        );
+    }
+
+    // Given, it replaces the saved one.
+    let replaced = harness
+        .execute(&format!(
+            r#"mutation {{ updateScriptInstance(id: "{job}", input: {{ script: "nightly.sh", trigger: SCHEDULER, schedule: {{ times: ["01:00"] }} }}) {{ schedule {{ days times runAtStartup }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&replaced);
+    assert_eq!(
+        response_data(&replaced)["updateScriptInstance"]["schedule"],
+        json!({ "days": [], "times": ["01:00"], "runAtStartup": false })
+    );
 }
 
 #[tokio::test]
@@ -1568,6 +1567,18 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     use weaver_server_core::post_processing::output::retain_output;
 
     let harness = TestHarness::new().await;
+    write_script(
+        &harness,
+        "hourly.sh",
+        "#!/bin/sh\n### NZBGET SCHEDULER SCRIPT ###\n",
+    )
+    .await;
+    let hourly = create_instance(
+        &harness,
+        r#"name: "Every hour", script: "hourly.sh", trigger: SCHEDULER"#,
+    )
+    .await;
+    let hourly_id = id(&hourly);
     let recorded = [
         (
             ScriptEventLabel::Scheduler(1),
@@ -1587,7 +1598,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
             ScriptEventLabel::Scheduler(2),
             "hourly.sh",
             true,
-            Some(("instance-1", "Every hour")),
+            Some((hourly_id.as_str(), "Every hour")),
             ScriptStatus::Succeeded,
         ),
     ];
@@ -1635,7 +1646,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
         "the total counts every page, not this one"
     );
     assert_eq!(runs[0]["script"], "hourly.sh");
-    assert_eq!(runs[0]["instanceId"], "instance-1");
+    assert_eq!(runs[0]["instanceId"], hourly_id);
     assert_eq!(runs[0]["instanceName"], "Every hour");
     assert_eq!(runs[0]["event"], "scheduler:2");
     assert_eq!(runs[0]["kind"], "SCHEDULER");

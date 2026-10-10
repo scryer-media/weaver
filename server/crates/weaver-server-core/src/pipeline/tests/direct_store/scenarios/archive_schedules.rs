@@ -167,6 +167,10 @@ pub(super) struct Route {
     /// that arrives after the body names nothing in time and the set goes
     /// conventional.
     pub named_by_early_index: bool,
+    /// Each set is admitted from its own volumes and either finishes direct
+    /// or leaves on its own, so a schedule may finish any number of them,
+    /// all included. The campaign states the exact count where it is known.
+    pub sets_finish_independently: bool,
 }
 
 impl Route {
@@ -177,6 +181,7 @@ impl Route {
         unmapped_loss: |_| false,
         unnamed_loss: |_| false,
         named_by_early_index: false,
+        sets_finish_independently: false,
     };
 
     /// A set the layout refuses to route: it demotes for its shape and
@@ -189,6 +194,7 @@ impl Route {
             unmapped_loss: |_| false,
             unnamed_loss: |_| false,
             named_by_early_index: false,
+            sets_finish_independently: false,
         }
     }
 }
@@ -362,6 +368,8 @@ impl ExtractionProfile {
             );
         } else if route.sets == 1 {
             assert_eq!(outcome.finalized, 0, "{trace:?}");
+        } else if route.sets_finish_independently {
+            assert!(outcome.finalized <= route.sets, "{trace:?}");
         } else {
             assert!(outcome.finalized < route.sets, "{trace:?}");
         }
@@ -1766,7 +1774,11 @@ impl Format {
                 Naming::Conventional,
                 Binding::LegacyOnLoss,
             ),
-            Self::Blake2 => (Container::Blake2, Naming::Conventional, Binding::LegacyOnLoss),
+            Self::Blake2 => (
+                Container::Blake2,
+                Naming::Conventional,
+                Binding::LegacyOnLoss,
+            ),
             Self::Rar4FourVolumes => (
                 Container::Rar4,
                 Naming::ConventionalFour,
@@ -1810,16 +1822,12 @@ impl Format {
                 Naming::HexSwappedRar,
                 Binding::LegacyOnLoss,
             ),
-            Self::Rar5HexScattered => (
-                Container::Rar5,
-                Naming::HexScattered,
-                Binding::LegacyOnLoss,
-            ),
-            Self::Rar4HexScattered => (
-                Container::Rar4,
-                Naming::HexScattered,
-                Binding::LegacyOnLoss,
-            ),
+            Self::Rar5HexScattered => {
+                (Container::Rar5, Naming::HexScattered, Binding::LegacyOnLoss)
+            }
+            Self::Rar4HexScattered => {
+                (Container::Rar4, Naming::HexScattered, Binding::LegacyOnLoss)
+            }
             Self::Rar5HexSingle => (Container::Rar5, Naming::HexSingle, Binding::LegacyOnLoss),
             Self::Rar4HexSingle => (Container::Rar4, Naming::HexSingle, Binding::LegacyOnLoss),
         };
@@ -1948,8 +1956,16 @@ fn hand_named_formats_alias_their_routes() {
             "{format:?}"
         );
         for mask in 0..16 {
-            assert_eq!((cell.unmapped_loss)(mask), (hand.unmapped_loss)(mask), "{format:?}");
-            assert_eq!((cell.unnamed_loss)(mask), (hand.unnamed_loss)(mask), "{format:?}");
+            assert_eq!(
+                (cell.unmapped_loss)(mask),
+                (hand.unmapped_loss)(mask),
+                "{format:?}"
+            );
+            assert_eq!(
+                (cell.unnamed_loss)(mask),
+                (hand.unnamed_loss)(mask),
+                "{format:?}"
+            );
         }
         for reason in reasons {
             assert_eq!(
@@ -1978,7 +1994,7 @@ fn grouping_generator_covers_every_possible_cell() {
 }
 
 grouping::grouping_cells! {
-    campaign rar4 Rar4 {
+    smoke rar4 Rar4 {
         conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
         conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
         single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
@@ -2010,7 +2026,7 @@ grouping::grouping_cells! {
         reposted Reposted [par2_posted Par2Posted nothing Nothing]
         hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
     }
-    campaign rar5_encrypted Rar5Encrypted {
+    smoke rar5_encrypted Rar5Encrypted {
         conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
         conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
         single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
@@ -2026,7 +2042,7 @@ grouping::grouping_cells! {
         reposted Reposted [par2_posted Par2Posted nothing Nothing]
         hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
     }
-    campaign rar5_encrypted_headers Rar5EncryptedHeaders {
+    smoke rar5_encrypted_headers Rar5EncryptedHeaders {
         conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
         conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
         single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
@@ -2057,7 +2073,7 @@ grouping::grouping_cells! {
         hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
         bare_first_part BareFirstPart [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
     }
-    campaign seven_zip_solid SevenZipSolid {
+    smoke seven_zip_solid SevenZipSolid {
         conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
         conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
         single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
@@ -2329,10 +2345,22 @@ async fn slot_campaign(
             profile.assert_rejected(&actual, &[name]);
             continue;
         }
-        // A RAR4 volume says nothing of its set in its own headers, so a
-        // recovery set that arrives last finds every volume already landed:
-        // the cell's route states that as `named_by_early_index`.
-        let route = format.route();
+        let mut route = format.route();
+        if matches!(format, Format::Rar4Obfuscated) {
+            // A RAR4 volume says nothing of its set in its own headers, so a
+            // recovery set that arrives last finds every volume already landed.
+            if interruption.loss().is_some_and(|(_, first)| !first) {
+                route.unnamed_loss = |_| true;
+            }
+        }
+        if matches!(format, Format::Rar4HexLateIndex) {
+            // The index names the volumes only once the body has landed, so
+            // the set routes direct exactly when a restart sent both volumes'
+            // offset-zero articles to be fetched again after it.
+            route.direct = [(0, 0), (1, 0)]
+                .iter()
+                .all(|article| actual.rerequested.contains(article));
+        }
         assert_eq!(
             actual.status,
             Some(JobStatus::Complete),
@@ -2430,22 +2458,18 @@ async fn rar5_obfuscated_arrival_schedules() {
     campaign(Format::Rar5Obfuscated, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar5_hex_bare_arrival_schedules() {
     campaign(Format::Rar5HexBare, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar4_hex_bare_arrival_schedules() {
     campaign(Format::Rar4HexBare, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar5_hex_self_described_arrival_schedules() {
     campaign(Format::Rar5HexSelfDescribed, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar4_hex_self_described_arrival_schedules() {
     campaign(Format::Rar4HexSelfDescribed, Selection::Smoke).await;
 }
@@ -2454,37 +2478,30 @@ async fn rar5_hex_late_index_arrival_schedules() {
     campaign(Format::Rar5HexLateIndex, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar4_hex_late_index_arrival_schedules() {
     campaign(Format::Rar4HexLateIndex, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar5_hex_misnumbered_arrival_schedules() {
     campaign(Format::Rar5HexMisnumbered, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar4_hex_misnumbered_arrival_schedules() {
     campaign(Format::Rar4HexMisnumbered, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar5_hex_swapped_rar_arrival_schedules() {
     campaign(Format::Rar5HexSwappedRar, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar4_hex_swapped_rar_arrival_schedules() {
     campaign(Format::Rar4HexSwappedRar, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar5_hex_scattered_arrival_schedules() {
     campaign(Format::Rar5HexScattered, Selection::Smoke).await;
 }
 #[tokio::test]
-#[ignore = "needs the RAR volume-0 grouping fix the rv0 rows carry; run with --run-ignored once it lands"]
 async fn rar4_hex_scattered_arrival_schedules() {
     campaign(Format::Rar4HexScattered, Selection::Smoke).await;
 }
@@ -2603,6 +2620,314 @@ async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
 #[tokio::test]
 async fn two_set_arrival_schedules() {
     two_set_campaign(ExtractionProfile::DirectStore, Selection::Smoke).await;
+}
+
+/// Two two-volume stored sets in one job, one article a volume, every volume
+/// under an unrelated hex name and the two sets' volumes posted interleaved.
+/// No name says which set a volume belongs to or where in it, so only the
+/// volumes' own headers can keep the sets apart; merged, neither extracts.
+#[derive(Clone, Copy, Debug)]
+enum HexTwoSets {
+    Rar5,
+    Rar4,
+}
+
+impl HexTwoSets {
+    /// Posted order: the first set's volumes in slots 0 and 2, the second's
+    /// in slots 1 and 3.
+    const NAMES: [&'static str; 4] = [
+        "d3b07384d113edec49eaa6238ad5ff00",
+        "0f2c6e9a4b8d1e3f5a7c9b0d2e4f6a81",
+        "8e4a1c7f3b9d5e2a0c6f8b1d4e7a3c95",
+        "26f9b0e3c7a14d58b2e6f0a9c3d7e1b4",
+    ];
+
+    /// How many sets direct store finishes in an uninterrupted arrival order.
+    ///
+    /// Direct store admits one header volume set per job, from the first
+    /// RAR5 volume to arrive. When the next distinct volume is the same
+    /// archive's, the set is whole and finishes direct, and the other
+    /// archive's volumes go the conventional way. When it is the other
+    /// archive's, its position collides or its first member does not
+    /// continue the open set's member, so the set demotes as unfillable and
+    /// both archives extract conventionally. RAR4 states no position, so no
+    /// set is admitted at all.
+    fn direct_finalized(self, order: &[(u32, u32)]) -> usize {
+        if matches!(self, Self::Rar4) {
+            return 0;
+        }
+        // A schedule names slot `2 * pair.0 + pair.1`, one article a volume,
+        // and the first archive holds the even slots.
+        let mut distinct = Vec::new();
+        for (high, low) in order {
+            let slot = 2 * high + low;
+            if !distinct.contains(&slot) {
+                distinct.push(slot);
+            }
+        }
+        match distinct.as_slice() {
+            [first, second, ..] if first % 2 == second % 2 => 1,
+            _ => 0,
+        }
+    }
+
+    fn route(self) -> Route {
+        match self {
+            // See `direct_finalized`: either the first archive finishes direct
+            // and the second never enters direct store, or the open set
+            // demotes as unfillable. A restart forgets the job's one header
+            // set, so the second archive may then finish direct as well.
+            // Neither archive ever finishes from the other's volumes: both
+            // members' exact bytes are checked in every case.
+            Self::Rar5 => Route {
+                sets: 2,
+                sets_finish_independently: true,
+                ..Route::refused(|reason| {
+                    matches!(reason, DemotionReason::IdentityRosterUnfillable)
+                })
+            },
+            // A RAR4 volume says nothing of its set in its own headers.
+            Self::Rar4 => Route {
+                sets: 2,
+                ..Route::refused(|_| false)
+            },
+        }
+    }
+}
+
+async fn hex_two_set_campaign(format: HexTwoSets, selection: Selection) {
+    hex_two_set_profile(format, selection, ExtractionProfile::DirectStore).await;
+}
+
+async fn hex_two_set_chase_campaign(format: HexTwoSets, selection: Selection) {
+    hex_two_set_profile(format, selection, ExtractionProfile::Chase).await;
+}
+
+async fn hex_two_set_conventional_campaign(format: HexTwoSets, selection: Selection) {
+    hex_two_set_profile(format, selection, ExtractionProfile::Conventional).await;
+}
+
+/// The members, their payloads, the posted volumes and the job of the
+/// two-set fixture.
+type HexTwoSetFixture = (
+    [&'static str; 2],
+    Vec<Vec<u8>>,
+    Vec<(String, Vec<u8>)>,
+    JobSpec,
+);
+
+fn hex_two_set_fixture(format: HexTwoSets) -> HexTwoSetFixture {
+    let members = ["alpha.mkv", "nested/beta.mkv"];
+    let payloads: Vec<Vec<u8>> = [(6001, 7), (4093, 11)]
+        .into_iter()
+        .map(|(len, step)| {
+            (0..len)
+                .map(|n| ((n * step + n / 251) % 253) as u8)
+                .collect()
+        })
+        .collect();
+    let sets: Vec<Vec<Vec<u8>>> = members
+        .iter()
+        .zip(&payloads)
+        .map(|(member, payload)| {
+            let volumes = match format {
+                HexTwoSets::Rar5 => single_member_store_set(member, payload, 2),
+                HexTwoSets::Rar4 => single_member_rar4_store_set(member, payload, 2),
+            };
+            volumes.into_iter().map(|(_, bytes)| bytes).collect()
+        })
+        .collect();
+    let volumes: Vec<(String, Vec<u8>)> = [(0, 0), (1, 0), (0, 1), (1, 1)]
+        .into_iter()
+        .zip(HexTwoSets::NAMES)
+        .map(|((set, part), name)| (name.to_string(), sets[set][part].clone()))
+        .collect();
+    let spec = direct_store_job_spec_with_articles("Hex two set schedules", &volumes, 1);
+    (members, payloads, volumes, spec)
+}
+
+/// Holds one finished two-set schedule to its route and to both members'
+/// exact bytes.
+fn assert_hex_two_set_delivery(
+    format: HexTwoSets,
+    profile: ExtractionProfile,
+    outcome: &Outcome,
+    interruption: Interruption,
+) {
+    let (members, payloads, _, _) = hex_two_set_fixture(format);
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Complete),
+        "{format:?} {interruption:?}: {:?}",
+        outcome.trace
+    );
+    profile.assert_delivery(outcome, format.route(), &members, interruption);
+    for (member, payload) in members.iter().zip(&payloads) {
+        assert_eq!(
+            outcome.files[*member].as_deref(),
+            Some(payload.as_slice()),
+            "{format:?} {member} {interruption:?}: {:?}",
+            outcome.trace
+        );
+    }
+}
+
+/// Runs one named arrival order of the two-set fixture in every profile.
+async fn hex_two_set_order(format: HexTwoSets, order: &[(u32, u32)], finalized: usize) {
+    assert_eq!(format.direct_finalized(order), finalized);
+    let (members, _, volumes, spec) = hex_two_set_fixture(format);
+    for profile in [
+        ExtractionProfile::DirectStore,
+        ExtractionProfile::Chase,
+        ExtractionProfile::Conventional,
+    ] {
+        let outcome = run_profile_schedule(
+            profile,
+            spec.clone(),
+            &volumes,
+            order,
+            &members,
+            Interruption::None,
+        )
+        .await;
+        assert_hex_two_set_delivery(format, profile, &outcome, Interruption::None);
+        if profile == ExtractionProfile::DirectStore {
+            assert_eq!(
+                outcome.finalized, finalized,
+                "{format:?} order={order:?}: {:?}",
+                outcome.trace
+            );
+        }
+    }
+}
+
+async fn hex_two_set_profile(format: HexTwoSets, selection: Selection, profile: ExtractionProfile) {
+    let (members, payloads, volumes, spec) = hex_two_set_fixture(format);
+    let route = format.route();
+    let check = |outcome: &Outcome, interruption: Interruption| {
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Complete),
+            "{format:?} {interruption:?}: {:?}",
+            outcome.trace
+        );
+        profile.assert_delivery(outcome, route, &members, interruption);
+        for (member, payload) in members.iter().zip(&payloads) {
+            assert_eq!(
+                outcome.files[*member].as_deref(),
+                Some(payload.as_slice()),
+                "{format:?} {member} {interruption:?}: {:?}",
+                outcome.trace
+            );
+        }
+    };
+    let baseline = run_profile_schedule(
+        ExtractionProfile::Conventional,
+        spec.clone(),
+        &volumes,
+        &slot_arrivals(4),
+        &members,
+        Interruption::None,
+    )
+    .await;
+    ExtractionProfile::Conventional.assert_route(&baseline);
+    assert_eq!(
+        baseline.status,
+        Some(JobStatus::Complete),
+        "{format:?} conventional oracle: {:?}",
+        baseline.trace
+    );
+    for (member, payload) in members.iter().zip(&payloads) {
+        assert_eq!(
+            baseline.files[*member].as_deref(),
+            Some(payload.as_slice()),
+            "{format:?} conventional oracle {member}: {:?}",
+            baseline.trace
+        );
+    }
+    for (order, interruption) in wrong_password_schedules(selection) {
+        if !profile.includes(interruption) {
+            continue;
+        }
+        let mut wrong = spec.clone();
+        wrong.password = Some("incorrect-key".to_string());
+        let outcome =
+            run_profile_schedule(profile, wrong, &volumes, &order, &members, interruption).await;
+        check(&outcome, interruption);
+    }
+    for (case, (order, interruption)) in selected_schedules(selection) {
+        if !profile.includes(interruption) {
+            continue;
+        }
+        eprintln!(
+            "hex two sets {format:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
+        );
+        let outcome = run_profile_schedule(
+            profile,
+            spec.clone(),
+            &volumes,
+            &order,
+            &members,
+            interruption,
+        )
+        .await;
+        if interruption.fails() {
+            profile.assert_rejected(&outcome, &members);
+            continue;
+        }
+        check(&outcome, interruption);
+        if matches!(interruption, Interruption::None) {
+            let unique_arrivals = order.len() == volumes.len();
+            match profile {
+                ExtractionProfile::DirectStore => {
+                    let expected = format.direct_finalized(&order);
+                    assert_eq!(
+                        outcome.finalized, expected,
+                        "{format:?} case={case} order={order:?}: {:?}",
+                        outcome.trace
+                    );
+                }
+                ExtractionProfile::Chase => {
+                    assert!(outcome.chase_armed > 0, "{format:?}: {:?}", outcome.trace);
+                    if unique_arrivals {
+                        assert_eq!(
+                            outcome.chase_consumed,
+                            members.len() as u64,
+                            "{format:?}: {:?}",
+                            outcome.trace
+                        );
+                    }
+                }
+                ExtractionProfile::Conventional => {}
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rar5_hex_two_set_arrival_schedules() {
+    hex_two_set_campaign(HexTwoSets::Rar5, Selection::Smoke).await;
+}
+
+/// The first archive's second volume, then the second archive's first, then
+/// the rest: the order that once bound one volume of each archive into a
+/// single set and completed the job with that set's partials as output.
+#[tokio::test]
+async fn rar5_hex_two_sets_interleaved_across_positions_never_merge() {
+    // Slots 2, 1, 0, 3: A1, B0, A0, B1.
+    hex_two_set_order(HexTwoSets::Rar5, &[(1, 0), (0, 1), (0, 0), (1, 1)], 0).await;
+}
+
+/// Each archive's later volume ahead of its first, as a `.r00` posted before
+/// its `.rar` arrives: the first archive is whole before the second appears.
+#[tokio::test]
+async fn rar5_hex_two_sets_with_each_later_volume_first_never_merge() {
+    // Slots 2, 0, 3, 1: A1, A0, B1, B0.
+    hex_two_set_order(HexTwoSets::Rar5, &[(1, 0), (0, 0), (1, 1), (0, 1)], 1).await;
+}
+#[tokio::test]
+async fn rar4_hex_two_set_arrival_schedules() {
+    hex_two_set_campaign(HexTwoSets::Rar4, Selection::Smoke).await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3411,6 +3736,232 @@ combined_campaign!(
     combined_conventional_rar5_obfuscated,
     Format::Rar5Obfuscated,
     conventional_campaign
+);
+// Sets that names alone place wrongly or not at all: each is placed by its
+// volumes' own headers.
+combined_campaign!(combined_rar5_hex_bare, Format::Rar5HexBare, campaign);
+combined_campaign!(
+    combined_chase_rar5_hex_bare,
+    Format::Rar5HexBare,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_hex_bare,
+    Format::Rar5HexBare,
+    conventional_campaign
+);
+combined_campaign!(combined_rar4_hex_bare, Format::Rar4HexBare, campaign);
+combined_campaign!(
+    combined_chase_rar4_hex_bare,
+    Format::Rar4HexBare,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_hex_bare,
+    Format::Rar4HexBare,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar5_hex_self_described,
+    Format::Rar5HexSelfDescribed,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar5_hex_self_described,
+    Format::Rar5HexSelfDescribed,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_hex_self_described,
+    Format::Rar5HexSelfDescribed,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar4_hex_self_described,
+    Format::Rar4HexSelfDescribed,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar4_hex_self_described,
+    Format::Rar4HexSelfDescribed,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_hex_self_described,
+    Format::Rar4HexSelfDescribed,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar5_hex_late_index,
+    Format::Rar5HexLateIndex,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar5_hex_late_index,
+    Format::Rar5HexLateIndex,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_hex_late_index,
+    Format::Rar5HexLateIndex,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar4_hex_late_index,
+    Format::Rar4HexLateIndex,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar4_hex_late_index,
+    Format::Rar4HexLateIndex,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_hex_late_index,
+    Format::Rar4HexLateIndex,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar5_hex_misnumbered,
+    Format::Rar5HexMisnumbered,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar5_hex_misnumbered,
+    Format::Rar5HexMisnumbered,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_hex_misnumbered,
+    Format::Rar5HexMisnumbered,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar4_hex_misnumbered,
+    Format::Rar4HexMisnumbered,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar4_hex_misnumbered,
+    Format::Rar4HexMisnumbered,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_hex_misnumbered,
+    Format::Rar4HexMisnumbered,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar5_hex_swapped_rar,
+    Format::Rar5HexSwappedRar,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar5_hex_swapped_rar,
+    Format::Rar5HexSwappedRar,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_hex_swapped_rar,
+    Format::Rar5HexSwappedRar,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar4_hex_swapped_rar,
+    Format::Rar4HexSwappedRar,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar4_hex_swapped_rar,
+    Format::Rar4HexSwappedRar,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_hex_swapped_rar,
+    Format::Rar4HexSwappedRar,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar5_hex_scattered,
+    Format::Rar5HexScattered,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar5_hex_scattered,
+    Format::Rar5HexScattered,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_hex_scattered,
+    Format::Rar5HexScattered,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar4_hex_scattered,
+    Format::Rar4HexScattered,
+    campaign
+);
+combined_campaign!(
+    combined_chase_rar4_hex_scattered,
+    Format::Rar4HexScattered,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_hex_scattered,
+    Format::Rar4HexScattered,
+    conventional_campaign
+);
+combined_campaign!(combined_rar5_hex_single, Format::Rar5HexSingle, campaign);
+combined_campaign!(
+    combined_chase_rar5_hex_single,
+    Format::Rar5HexSingle,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_hex_single,
+    Format::Rar5HexSingle,
+    conventional_campaign
+);
+combined_campaign!(combined_rar4_hex_single, Format::Rar4HexSingle, campaign);
+combined_campaign!(
+    combined_chase_rar4_hex_single,
+    Format::Rar4HexSingle,
+    chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_hex_single,
+    Format::Rar4HexSingle,
+    conventional_campaign
+);
+combined_campaign!(
+    combined_rar5_hex_two_set,
+    HexTwoSets::Rar5,
+    hex_two_set_campaign
+);
+combined_campaign!(
+    combined_chase_rar5_hex_two_set,
+    HexTwoSets::Rar5,
+    hex_two_set_chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar5_hex_two_set,
+    HexTwoSets::Rar5,
+    hex_two_set_conventional_campaign
+);
+combined_campaign!(
+    combined_rar4_hex_two_set,
+    HexTwoSets::Rar4,
+    hex_two_set_campaign
+);
+combined_campaign!(
+    combined_chase_rar4_hex_two_set,
+    HexTwoSets::Rar4,
+    hex_two_set_chase_campaign
+);
+combined_campaign!(
+    combined_conventional_rar4_hex_two_set,
+    HexTwoSets::Rar4,
+    hex_two_set_conventional_campaign
 );
 
 combined_campaign!(

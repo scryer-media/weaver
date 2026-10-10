@@ -1096,7 +1096,9 @@ impl Pipeline {
             None => {
                 let first_path = volume_paths.get(&0).ok_or_else(|| {
                     crate::pipeline::RarPasswordAttemptError::Fatal(format!(
-                        "RAR set '{set_name}' cannot be opened without volume 0"
+                        "RAR set '{set_name}' {}; volumes present: {:?}",
+                        crate::pipeline::archive::topology::MISSING_FIRST_RAR_VOLUME_ERROR_MARKER,
+                        volume_paths.keys().collect::<Vec<_>>()
                     ))
                 })?;
                 Self::open_rar_volume_zero_with_password(

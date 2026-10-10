@@ -11,7 +11,8 @@ import {
   inputFromForm,
   inputFromInstance,
   inputNameProblem,
-  jobScheduleRule,
+  jobSchedule,
+  NO_SCHEDULE,
   MAX_TIMEOUT_SECONDS,
   newInstanceForm,
   reorderedIds,
@@ -38,6 +39,7 @@ function instance(id: string, patch: Partial<ScriptInstance> = {}): ScriptInstan
     enabled: true,
     blocking: true,
     timeoutSeconds: null,
+    schedule: NO_SCHEDULE,
     runOrder: 0,
     scriptProblem: null,
     headerDrift: false,
@@ -352,6 +354,7 @@ test("an instance sent back from its row keeps its secret links and changes only
     enabled: false,
     blocking: true,
     timeoutSeconds: 30,
+    schedule: NO_SCHEDULE,
   });
 });
 
@@ -401,27 +404,45 @@ test("a new job's schedule starts from the times its script's header asks for", 
   assert.deepEqual(scheduleFromHeader(atStartup), { times: "06:00", days: [], startup: true });
 });
 
-test("a schedule job's rule is made of its times, its days and whether it runs at startup", () => {
+test("a schedule job's run times are its times, its days and whether it runs at startup", () => {
   const form = { times: "", days: [] as string[], startup: false };
-  assert.deepEqual(jobScheduleRule({ ...form, times: " 4:5 ; *:20,23:59, " }), {
-    time: "4:5, *:20, 23:59",
-    days: null,
+  assert.deepEqual(jobSchedule({ ...form, times: " 4:5 ; *:20,23:59, " }), {
+    times: ["4:5", "*:20", "23:59"],
+    days: [],
     runAtStartup: false,
   });
-  assert.deepEqual(jobScheduleRule({ times: "03:30", days: ["sat", "sun"], startup: true }), {
-    time: "03:30",
+  assert.deepEqual(jobSchedule({ times: "03:30", days: ["sat", "sun"], startup: true }), {
+    times: ["03:30"],
     days: ["sat", "sun"],
     runAtStartup: true,
   });
-  // Startup alone, by its switch or typed among the times, is a rule of its own.
+  // Startup alone, by its switch or typed among the times, is enough.
   for (const alone of [{ ...form, startup: true }, { ...form, times: "*" }]) {
-    assert.deepEqual(jobScheduleRule(alone), { time: "*", days: null, runAtStartup: true });
+    assert.deepEqual(jobSchedule(alone), { times: [], days: [], runAtStartup: true });
   }
-  assert.deepEqual(jobScheduleRule({ ...form, times: "*, 01:00" }), { time: "01:00", days: null, runAtStartup: true });
-  // A job with nothing to run at has no rule, and a time the daemon would refuse is named.
-  assert.deepEqual(jobScheduleRule(form), { problem: "none" });
-  assert.deepEqual(jobScheduleRule({ ...form, times: " , " }), { problem: "none" });
+  assert.deepEqual(jobSchedule({ ...form, times: "*, 01:00" }), { times: ["01:00"], days: [], runAtStartup: true });
+  // A job with nothing to run at is named, and so is a time the daemon would refuse.
+  assert.deepEqual(jobSchedule(form), { problem: "none" });
+  assert.deepEqual(jobSchedule({ ...form, times: " , " }), { problem: "none" });
   for (const bad of ["24:00", "12:60", "noon", "1:2:3", "*:", ":30", "**", "012:00"]) {
-    assert.deepEqual(jobScheduleRule({ ...form, times: `01:00, ${bad}` }), { problem: "invalid", time: bad }, bad);
+    assert.deepEqual(jobSchedule({ ...form, times: `01:00, ${bad}` }), { problem: "invalid", time: bad }, bad);
   }
+});
+
+test("a schedule job is saved with its run times and a job of any other trigger with none", () => {
+  const nightly = script("nightly.py", {
+    preset: { triggers: [{ trigger: "SCHEDULER", queueEvent: null }], taskTimes: ["*", "04:00"], inputs: [] },
+  });
+  const form = newInstanceForm(nightly);
+  assert.equal(form.trigger, "SCHEDULER");
+  assert.deepEqual(inputFromForm(form).schedule, { days: [], times: ["04:00"], runAtStartup: true });
+  assert.deepEqual(inputFromForm({ ...form, trigger: "SCAN" }).schedule, NO_SCHEDULE);
+  // A saved job opens on what is saved in it, not on its header.
+  const saved = instance("job", {
+    script: "nightly.py",
+    trigger: "SCHEDULER",
+    schedule: { days: ["mon"], times: ["*:15", "23:00"], runAtStartup: false },
+  });
+  assert.deepEqual(formFromInstance(saved, nightly).schedule, { times: "*:15, 23:00", days: ["mon"], startup: false });
+  assert.deepEqual(inputFromInstance(saved).schedule, saved.schedule);
 });

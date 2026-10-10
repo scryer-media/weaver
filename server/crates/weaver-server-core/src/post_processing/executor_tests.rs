@@ -960,6 +960,27 @@ fn names_owned(instances: &[ScriptInstance]) -> Vec<String> {
 #[test]
 fn a_feed_runs_only_feed_instances_and_loses_one_that_stops_being_one() {
     let db = Database::open_in_memory().unwrap();
+    for id in [7, 9] {
+        db.insert_rss_feed(&crate::RssFeedRow {
+            id,
+            name: "fixture".into(),
+            url: "https://feed.invalid".into(),
+            enabled: true,
+            poll_interval_secs: 900,
+            scripts: Vec::new(),
+            username: None,
+            password: None,
+            default_category: None,
+            default_metadata: Vec::new(),
+            etag: None,
+            last_modified: None,
+            last_polled_at: None,
+            last_success_at: None,
+            last_error: None,
+            consecutive_failures: 0,
+        })
+        .unwrap();
+    }
     let first = db
         .create_script_instance(draft("feed.sh", InstanceTrigger::Feed).named("first"))
         .unwrap();
@@ -973,13 +994,13 @@ fn a_feed_runs_only_feed_instances_and_loses_one_that_stops_being_one() {
     assert!(matches!(
         db.set_feed_script_instances(7, std::slice::from_ref(&scan.id)),
         Err(ScriptInstanceError::Invalid(
-            "only a feed instance can be attached to a feed"
+            "only a feed script job can be attached to a feed"
         ))
     ));
     assert!(matches!(
         db.set_feed_script_instances(7, &[first.id.clone(), first.id.clone()]),
         Err(ScriptInstanceError::Invalid(
-            "an instance can be attached to a feed once"
+            "a script job can be attached to a feed once"
         ))
     ));
     assert!(matches!(

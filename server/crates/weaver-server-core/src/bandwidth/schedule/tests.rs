@@ -78,10 +78,31 @@ fn find_active_on_track(
     track: ScheduleTrack,
 ) -> Option<&ScheduleEntry> {
     most_recently_fired(entries, day, time, |entry| {
-        entry.action.track() == Some(track)
+        entry.action.tracks().contains(&track)
     })
     .map(|(entry, _, _)| entry)
 }
+
+/// A rule setting the global speed limit alone.
+fn global_speed(bytes_per_sec: u64) -> ScheduleAction {
+    ScheduleAction::SpeedLimit {
+        limits: vec![crate::bandwidth::SpeedLimitChange {
+            target: crate::bandwidth::SpeedTarget::Global,
+            bytes_per_sec,
+        }],
+    }
+}
+
+/// The one action that fires once rather than holding a track.
+fn prune() -> ScheduleAction {
+    ScheduleAction::PruneHistory {
+        failed: None,
+        completed: None,
+        cancelled: None,
+    }
+}
+
+const GLOBAL_SPEED: ScheduleTrack = ScheduleTrack::Speed(crate::bandwidth::SpeedTarget::Global);
 
 fn find_active_entry(
     entries: &[ScheduleEntry],
@@ -223,24 +244,12 @@ fn disabled_entry_skipped() {
 #[test]
 fn speed_limit_entry() {
     let entries = vec![
-        entry(
-            "1",
-            "09:00",
-            vec![],
-            ScheduleAction::SpeedLimit {
-                bytes_per_sec: 1_000_000,
-            },
-        ),
+        entry("1", "09:00", vec![], global_speed(1_000_000)),
         entry("2", "17:00", vec![], ScheduleAction::Resume),
     ];
     let now = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
-    let active = find_active_on_track(&entries, Weekday::Mon, now, ScheduleTrack::Speed).unwrap();
-    assert_eq!(
-        active.action,
-        ScheduleAction::SpeedLimit {
-            bytes_per_sec: 1_000_000
-        }
-    );
+    let active = find_active_on_track(&entries, Weekday::Mon, now, GLOBAL_SPEED).unwrap();
+    assert_eq!(active.action, global_speed(1_000_000));
 }
 
 fn profile_rule(
@@ -334,18 +343,10 @@ fn no_profile_rule_means_no_scheduled_profile() {
 #[test]
 fn profile_rules_and_other_actions_do_not_displace_each_other() {
     let entries = vec![
-        entry(
-            "limit",
-            "08:00",
-            vec![],
-            ScheduleAction::SpeedLimit {
-                bytes_per_sec: 1_000_000,
-            },
-        ),
+        entry("limit", "08:00", vec![], global_speed(1_000_000)),
         profile_rule("profile", "17:00", vec![], HardwareProfile::Efficient),
     ];
-    let active =
-        find_active_on_track(&entries, Weekday::Mon, at(18, 0), ScheduleTrack::Speed).unwrap();
+    let active = find_active_on_track(&entries, Weekday::Mon, at(18, 0), GLOBAL_SPEED).unwrap();
     assert_eq!(active.id, "limit");
     assert_eq!(
         find_active_profile(&entries, Weekday::Mon, at(18, 0)),
@@ -390,14 +391,7 @@ async fn tick(
 #[tokio::test]
 async fn startup_replays_every_track_and_watch_rules_do_not_hide_download_state() {
     let entries = vec![
-        entry(
-            "limit",
-            "22:00",
-            vec![],
-            ScheduleAction::SpeedLimit {
-                bytes_per_sec: 1024,
-            },
-        ),
+        entry("limit", "22:00", vec![], global_speed(1024)),
         entry("pause", "23:00", vec![], ScheduleAction::Pause),
         entry(
             "watch",
@@ -413,9 +407,7 @@ async fn startup_replays_every_track_and_watch_rules_do_not_hide_download_state(
         vec![
             ScheduleAction::Pause,
             ScheduleAction::PauseWatchFolderScanning,
-            ScheduleAction::SpeedLimit {
-                bytes_per_sec: 1024
-            },
+            global_speed(1024),
             ScheduleAction::HardwareProfile {
                 profile: HardwareProfile::Efficient
             },
@@ -536,14 +528,7 @@ async fn clock_jumps_replay_holds() {
 async fn small_backward_clock_steps_preserve_applied_holds() {
     let entries = vec![
         entry("resume", "08:00", vec![], ScheduleAction::Resume),
-        entry(
-            "speed",
-            "08:00",
-            vec![],
-            ScheduleAction::SpeedLimit {
-                bytes_per_sec: 1024,
-            },
-        ),
+        entry("speed", "08:00", vec![], global_speed(1024)),
     ];
     let mut evaluator = HoldEvaluator::default();
     let now = local_time(28, 8, 0);
@@ -560,12 +545,7 @@ async fn small_backward_clock_steps_preserve_applied_holds() {
 
 #[test]
 fn one_shots_skip_startup_and_fire_crossed_minutes_once() {
-    let entries = vec![entry(
-        "scan",
-        "08:00",
-        vec![],
-        ScheduleAction::ScanWatchFolder,
-    )];
+    let entries = vec![entry("scan", "08:00", vec![], prune())];
     let mut evaluator = OneShotEvaluator::default();
     assert!(evaluator.due(&entries, local_time(28, 7, 59)).is_empty());
     assert_eq!(evaluator.due(&entries, local_time(28, 8, 1)), entries);
@@ -576,35 +556,20 @@ fn one_shots_skip_startup_and_fire_crossed_minutes_once() {
 
 #[test]
 fn one_shots_deduplicate_fall_back_and_cross_spring_gap() {
-    let entries = vec![entry(
-        "scan",
-        "01:30",
-        vec![],
-        ScheduleAction::ScanWatchFolder,
-    )];
+    let entries = vec![entry("scan", "01:30", vec![], prune())];
     let mut evaluator = OneShotEvaluator::default();
     evaluator.due(&entries, local_time(28, 1, 29));
     assert_eq!(evaluator.due(&entries, local_time(28, 1, 31)).len(), 1);
     assert!(evaluator.due(&entries, local_time(28, 1, 0)).is_empty());
     assert!(evaluator.due(&entries, local_time(28, 1, 31)).is_empty());
-    let entries = vec![entry(
-        "gap",
-        "02:30",
-        vec![],
-        ScheduleAction::ScanWatchFolder,
-    )];
+    let entries = vec![entry("gap", "02:30", vec![], prune())];
     evaluator.due(&entries, local_time(28, 1, 59));
     assert_eq!(evaluator.due(&entries, local_time(28, 3, 0)).len(), 1);
 }
 
 #[test]
 fn one_shots_suppress_large_forward_and_backward_jumps() {
-    let entries = vec![entry(
-        "scan",
-        "08:00",
-        vec![],
-        ScheduleAction::ScanWatchFolder,
-    )];
+    let entries = vec![entry("scan", "08:00", vec![], prune())];
     let mut evaluator = OneShotEvaluator::default();
     evaluator.due(&entries, local_time(28, 7, 0));
     assert!(evaluator.due(&entries, local_time(28, 9, 0)).is_empty());
@@ -614,14 +579,9 @@ fn one_shots_suppress_large_forward_and_backward_jumps() {
 
 #[test]
 fn one_shots_support_distinct_rules_multiple_times_hourly_and_weekdays() {
-    let mut first = entry(
-        "first",
-        "08:00",
-        vec![Weekday::Mon],
-        ScheduleAction::ScanWatchFolder,
-    );
+    let mut first = entry("first", "08:00", vec![Weekday::Mon], prune());
     first.times = vec!["08:00".into(), "08:15".into(), "08:15".into()];
-    let mut hourly = entry("hourly", "00:00", vec![], ScheduleAction::ScanWatchFolder);
+    let mut hourly = entry("hourly", "00:00", vec![], prune());
     hourly.every_hour_at_minute = Some(15);
     let entries = vec![first, hourly];
     let mut evaluator = OneShotEvaluator::default();
@@ -779,14 +739,7 @@ async fn resume_clears_pause_all_components_after_the_pause_rule_is_removed() {
 #[tokio::test]
 async fn one_shot_dispatch_queues_every_occurrence_without_blocking_hold_changes() {
     let entries: Vec<_> = (0..40)
-        .map(|index| {
-            entry(
-                &format!("scan-{index}"),
-                "08:00",
-                vec![],
-                ScheduleAction::ScanWatchFolder,
-            )
-        })
+        .map(|index| entry(&format!("scan-{index}"), "08:00", vec![], prune()))
         .collect();
     let mut evaluator = OneShotEvaluator::default();
     evaluator.due(&entries, local_time(28, 7, 59));
@@ -1122,4 +1075,250 @@ async fn initial_metadata_failure_pauses_intake_until_recovery() {
     }
     assert!(!config.read().await.watch_folder.scanning_paused);
     task.shutdown().await;
+}
+
+fn speeds(limits: &[(crate::bandwidth::SpeedTarget, u64)]) -> ScheduleAction {
+    ScheduleAction::SpeedLimit {
+        limits: limits
+            .iter()
+            .map(
+                |&(target, bytes_per_sec)| crate::bandwidth::SpeedLimitChange {
+                    target,
+                    bytes_per_sec,
+                },
+            )
+            .collect(),
+    }
+}
+
+async fn effects_at(
+    evaluator: &mut HoldEvaluator,
+    entries: &[ScheduleEntry],
+    now: NaiveDateTime,
+) -> Vec<(ScheduleTrack, ScheduleAction)> {
+    let mut effects = Vec::new();
+    evaluator
+        .apply_effects(entries, now, |action, track| {
+            effects.push((track, action));
+            std::future::ready(Ok(()))
+        })
+        .await;
+    effects
+}
+
+#[tokio::test]
+async fn each_speed_target_is_held_on_its_own_track() {
+    use crate::bandwidth::SpeedTarget::{Egress, Global, Server};
+    let entries = vec![
+        entry(
+            "evening",
+            "18:00",
+            vec![],
+            speeds(&[(Global, 1_000), (Egress(1), 2_000), (Server(4), 3_000)]),
+        ),
+        // Blank for the global limit and the provider: those keep what the
+        // evening rule set.
+        entry("night", "23:00", vec![], speeds(&[(Egress(1), 0)])),
+    ];
+    let mut evaluator = HoldEvaluator::default();
+    assert_eq!(
+        effects_at(&mut evaluator, &entries, local_time(28, 22, 45)).await,
+        [
+            (ScheduleTrack::Speed(Global), speeds(&[(Global, 1_000)])),
+            (
+                ScheduleTrack::Speed(Egress(1)),
+                speeds(&[(Egress(1), 2_000)])
+            ),
+            (
+                ScheduleTrack::Speed(Server(4)),
+                speeds(&[(Server(4), 3_000)])
+            ),
+        ]
+    );
+    // The night rule changes only the egress it names.
+    assert_eq!(
+        effects_at(&mut evaluator, &entries, local_time(28, 23, 0)).await,
+        [(ScheduleTrack::Speed(Egress(1)), speeds(&[(Egress(1), 0)]))]
+    );
+}
+
+#[tokio::test]
+async fn pause_rss_and_resume_rss_hold_the_rss_track_alone() {
+    let entries = vec![
+        entry("feeds off", "08:00", vec![], ScheduleAction::PauseRss),
+        entry("feeds on", "10:30", vec![], ScheduleAction::ResumeRss),
+        entry("pause", "09:00", vec![], ScheduleAction::Pause),
+    ];
+    let mut evaluator = HoldEvaluator::default();
+    assert_eq!(
+        effects_at(&mut evaluator, &entries, local_time(28, 10, 0)).await,
+        [
+            (ScheduleTrack::Downloads, ScheduleAction::Pause),
+            (ScheduleTrack::Rss, ScheduleAction::PauseRss),
+        ]
+    );
+    assert_eq!(
+        effects_at(&mut evaluator, &entries, local_time(28, 10, 30)).await,
+        [(ScheduleTrack::Rss, ScheduleAction::ResumeRss)]
+    );
+}
+
+#[tokio::test]
+async fn one_egress_metering_rule_is_applied_after_the_rule_for_every_egress() {
+    use crate::bandwidth::QuotaTarget;
+    let entries = vec![
+        entry(
+            "one",
+            "08:00",
+            vec![],
+            ScheduleAction::SetQuotaMetering {
+                enabled: true,
+                target: QuotaTarget::Egress(2),
+            },
+        ),
+        entry(
+            "every",
+            "08:00",
+            vec![],
+            ScheduleAction::SetQuotaMetering {
+                enabled: false,
+                target: QuotaTarget::AllEgresses,
+            },
+        ),
+    ];
+    let mut evaluator = HoldEvaluator::default();
+    assert_eq!(
+        effects_at(&mut evaluator, &entries, local_time(28, 9, 0))
+            .await
+            .into_iter()
+            .map(|(track, _)| track)
+            .collect::<Vec<_>>(),
+        [
+            ScheduleTrack::Quota(QuotaTarget::AllEgresses),
+            ScheduleTrack::Quota(QuotaTarget::Egress(2)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn removing_the_last_one_egress_metering_rule_hands_it_back_to_every_egress() {
+    use crate::bandwidth::QuotaTarget;
+    use weaver_nntp::transfer::{ServerTransferRegistry, StableServerId, TransferScope};
+
+    async fn run(
+        evaluator: &mut HoldEvaluator,
+        entries: &[ScheduleEntry],
+        now: NaiveDateTime,
+        registry: &ServerTransferRegistry,
+    ) {
+        evaluator
+            .apply_effects(entries, now, |action, _track| {
+                if let ScheduleAction::SetQuotaMetering { enabled, target } = action {
+                    match target {
+                        QuotaTarget::AllEgresses => registry.set_quota_metering(enabled),
+                        QuotaTarget::Egress(id) => {
+                            registry.set_quota_metering_for(StableServerId(id), enabled)
+                        }
+                    }
+                }
+                std::future::ready(Ok(()))
+            })
+            .await;
+        for id in evaluator.take_released_egress_quotas() {
+            registry.clear_quota_metering_for(StableServerId(id));
+        }
+    }
+
+    let every = entry(
+        "every",
+        "08:00",
+        vec![],
+        ScheduleAction::SetQuotaMetering {
+            enabled: false,
+            target: QuotaTarget::AllEgresses,
+        },
+    );
+    let one = entry(
+        "one",
+        "08:00",
+        vec![],
+        ScheduleAction::SetQuotaMetering {
+            enabled: true,
+            target: QuotaTarget::Egress(2),
+        },
+    );
+    let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+    let mut evaluator = HoldEvaluator::default();
+    run(
+        &mut evaluator,
+        &[one.clone(), every.clone()],
+        local_time(28, 9, 0),
+        &registry,
+    )
+    .await;
+    assert!(registry.quota_metering_of(StableServerId(2)));
+    assert!(!registry.quota_metering_of(StableServerId(3)));
+
+    // A disabled rule is no rule.
+    let mut disabled = one.clone();
+    disabled.enabled = false;
+    run(
+        &mut evaluator,
+        &[disabled, every.clone()],
+        local_time(28, 9, 1),
+        &registry,
+    )
+    .await;
+    assert!(!registry.quota_metering_of(StableServerId(2)));
+
+    // Back on, then deleted.
+    run(
+        &mut evaluator,
+        &[one, every.clone()],
+        local_time(28, 9, 2),
+        &registry,
+    )
+    .await;
+    assert!(registry.quota_metering_of(StableServerId(2)));
+    run(&mut evaluator, &[every], local_time(28, 9, 3), &registry).await;
+    assert!(!registry.quota_metering_of(StableServerId(2)));
+    assert!(evaluator.take_released_egress_quotas().is_empty());
+}
+
+#[tokio::test]
+async fn a_global_speed_rule_is_not_reapplied_until_its_next_edge() {
+    use crate::bandwidth::SpeedTarget::Global;
+    // An operator's edit between edges is not undone by the next tick; the
+    // rule's next firing applies it again.
+    let entries = vec![entry(
+        "evening",
+        "18:00",
+        vec![],
+        speeds(&[(Global, 1_000)]),
+    )];
+    let mut evaluator = HoldEvaluator::default();
+    assert_eq!(
+        effects_at(&mut evaluator, &entries, local_time(28, 18, 0)).await,
+        [(ScheduleTrack::Speed(Global), speeds(&[(Global, 1_000)]))]
+    );
+    assert!(
+        effects_at(&mut evaluator, &entries, local_time(28, 18, 1))
+            .await
+            .is_empty()
+    );
+    for (day, hour) in (19..24)
+        .map(|hour| (28, hour))
+        .chain((0..18).map(|hour| (29, hour)))
+    {
+        assert!(
+            effects_at(&mut evaluator, &entries, local_time(day, hour, 0))
+                .await
+                .is_empty(),
+            "{day} {hour}:00"
+        );
+    }
+    assert_eq!(
+        effects_at(&mut evaluator, &entries, local_time(29, 18, 0)).await,
+        [(ScheduleTrack::Speed(Global), speeds(&[(Global, 1_000)]))]
+    );
 }

@@ -1406,6 +1406,7 @@ impl Pipeline {
         if extraction_rejected && let Some(budget) = self.extraction_budgets.get(&job_id) {
             budget.cancel_with_error(&error);
         }
+        let error = JobExtractionBudget::job_failure_reason(error);
         let should_defer = !extraction_rejected
             && scripts_may_run
             && self.jobs.contains_key(&job_id)

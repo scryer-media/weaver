@@ -55,6 +55,17 @@ type AdoptableTlsNameMismatchCertificate {
 	names: [String!]!
 }
 
+"""
+An NZB to analyze without submitting it. Exactly one source is required.
+"""
+input AnalyzeNzbInput {
+	nzbUpload: Upload
+	"""
+	The NZB, or the NZB gzip-, zstd- or xz-compressed, as base64.
+	"""
+	nzbBase64: String
+}
+
 type ApiKey {
 	id: Int!
 	name: String!
@@ -365,12 +376,17 @@ type DiskUsage {
 
 type DownloadBlock {
 	kind: DownloadBlockKindGql!
-	capEnabled: Boolean!
-	period: IspBandwidthCapPeriodGql
+	"""
+	The egress whose download quota is holding downloads, while one is.
+	"""
+	egressId: Int
+	"""
+	That egress's name.
+	"""
+	egressName: String
 	usedBytes: Int!
 	limitBytes: Int!
 	remainingBytes: Int!
-	reservedBytes: Int!
 	windowStartsAtEpochMs: Float
 	windowEndsAtEpochMs: Float
 	timezoneName: String!
@@ -385,7 +401,7 @@ enum DownloadBlockKindGql {
 	NONE
 	MANUAL_PAUSE
 	SCHEDULED
-	ISP_CAP
+	EGRESS_QUOTA
 	SERVER_QUOTA
 }
 
@@ -400,6 +416,23 @@ enum DownloadPressureStateGql {
 	CLEAR
 	SOFT
 	HARD
+}
+
+"""
+The live usage of a download allowance in its current window.
+"""
+type DownloadQuotaUsage {
+	lifetimeBytes: Int!
+	usedBytes: Int!
+	reservedBytes: Int!
+	"""
+	What is left in this window, or null when there is no allowance.
+	"""
+	remainingBytes: Int
+	blocked: Boolean!
+	windowStartsAtEpochMs: Float
+	windowEndsAtEpochMs: Float
+	timezoneName: String!
 }
 
 enum DuplicateActionGql {
@@ -499,6 +532,15 @@ type EgressInterface {
 	addresses: [String!]!
 	enabled: Boolean!
 	maxDownloadSpeed: Int!
+	"""
+	The download allowance and its live usage.
+	"""
+	downloadQuota: ServerDownloadQuota!
+	"""
+	The live usage of the download allowance, or null while this Weaver
+	is not tracking it.
+	"""
+	downloadQuotaUsage: DownloadQuotaUsage
 	health: String!
 	reason: String
 }
@@ -510,6 +552,11 @@ input EgressInterfaceInput {
 	sourceAddress: String
 	enabled: Boolean! = true
 	maxDownloadSpeed: Int! = 0
+	"""
+	The download allowance on this egress. Omitted on an update, the
+	saved quota stays as it is; omitted on a create, there is none.
+	"""
+	downloadQuota: ServerDownloadQuotaInput
 }
 
 type EgressTestResult {
@@ -614,7 +661,6 @@ type GeneralSettings {
 	maxRetries: Int!
 	propagationDelaySecs: Int!
 	enableSrrdbLookup: Boolean!
-	ispBandwidthCap: IspBandwidthCapSettings
 	watchFolder: WatchFolderSettings!
 	duplicatePolicy: DuplicatePolicySettings!
 }
@@ -627,7 +673,6 @@ input GeneralSettingsInput {
 	maxRetries: Int
 	propagationDelaySecs: Int
 	enableSrrdbLookup: Boolean
-	ispBandwidthCap: IspBandwidthCapSettingsInput
 	watchFolder: WatchFolderSettingsInput
 	duplicatePolicy: DuplicatePolicySettingsInput
 }
@@ -636,6 +681,20 @@ type GlobalQueueState {
 	isPaused: Boolean!
 	speedLimitBytesPerSec: Int!
 	downloadBlock: DownloadBlock!
+}
+
+"""
+When script jobs that are not narrowed to a category run.
+"""
+enum GlobalScriptsRun {
+	"""
+	For every download, ahead of the ones for its category.
+	"""
+	ALWAYS
+	"""
+	Only for a download whose category has no script jobs of its own.
+	"""
+	ONLY_WITHOUT_CATEGORY_SCRIPTS
 }
 
 """
@@ -911,40 +970,6 @@ type HttpBindAddressStatus {
 	bindFallback: String
 }
 
-enum IspBandwidthCapPeriodGql {
-	DAILY
-	WEEKLY
-	MONTHLY
-}
-
-type IspBandwidthCapSettings {
-	enabled: Boolean!
-	period: IspBandwidthCapPeriodGql!
-	limitBytes: Int!
-	resetTimeMinutesLocal: Int!
-	weeklyResetWeekday: IspBandwidthCapWeekdayGql!
-	monthlyResetDay: Int!
-}
-
-input IspBandwidthCapSettingsInput {
-	enabled: Boolean!
-	period: IspBandwidthCapPeriodGql!
-	limitBytes: Int!
-	resetTimeMinutesLocal: Int!
-	weeklyResetWeekday: IspBandwidthCapWeekdayGql!
-	monthlyResetDay: Int!
-}
-
-enum IspBandwidthCapWeekdayGql {
-	MON
-	TUE
-	WED
-	THU
-	FRI
-	SAT
-	SUN
-}
-
 """
 A scalar that can represent any JSON value.
 """
@@ -1142,6 +1167,37 @@ enum LegPathKind {
 	LADDER
 }
 
+type LiveScriptRun {
+	"""
+	The same value the script was handed as `WEAVER_RUN_ID`.
+	"""
+	runId: String!
+	"""
+	The script job the run is for.
+	"""
+	instanceId: String!
+	"""
+	The script job's name.
+	"""
+	instanceName: String!
+	"""
+	What started the run.
+	"""
+	event: String!
+	kind: ScriptKind!
+	"""
+	A test run. What it asks for is reported to whoever is testing and
+	never applied.
+	"""
+	test: Boolean!
+	jobId: Int
+	"""
+	The download the run is about. Null when it is about none, and when
+	that download is no longer in the queue.
+	"""
+	job: Job
+}
+
 """
 The live log filter. Changes last until the process exits.
 """
@@ -1297,6 +1353,10 @@ type MetricsHistoryResult {
 }
 
 type MutationRoot {
+	"""
+	Reset an egress quota baseline without clearing lifetime usage.
+	"""
+	resetEgressDownloadQuotaUsage(id: Int!): EgressInterface!
 	createEgressInterface(input: EgressInterfaceInput!): EgressInterface!
 	updateEgressInterface(id: Int!, input: EgressInterfaceInput!): EgressInterface!
 	deleteEgressInterface(id: Int!): Boolean!
@@ -1433,6 +1493,12 @@ type MutationRoot {
 	"""
 	removeCategory(id: Int!): [Category!]!
 	"""
+	Analyze an NZB without submitting it. Reads nothing and changes
+	nothing, so read access suffices; it is a mutation only because file
+	uploads travel as mutations.
+	"""
+	analyzeNzb(input: AnalyzeNzbInput!): SupportReport!
+	"""
 	Submit an NZB for download through the public integration facade.
 	"""
 	submitNzb(input: SubmitNzbInput!): SubmissionResult!
@@ -1557,20 +1623,87 @@ type MutationRoot {
 	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
 	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
 	"""
-	Select the sole live source of post-processing scripts. Changing it
-	clears name-based assignments and option values, never script files.
+	Select the sole live source of scripts. Changing it turns every
+	script job off, because a name in the new directory is not the script
+	that was wired up. What was saved in them is kept, and script files
+	are never touched.
 	"""
 	setPostProcessingScriptDirectory(directory: String!): PostProcessingSettingsGql!
 	"""
-	Replace the global default list and every per-category override.
+	Wire a script to one trigger. The script has to be in the scripts
+	directory; what its header declares is not checked, because any script
+	may be given any trigger and any inputs.
 	"""
-	setScriptLists(input: ScriptListsInput!): ScriptListsGql!
+	createScriptInstance(input: ScriptInstanceInput!): ScriptInstance!
 	"""
-	Replace the stored option values for one script, validated against its manifest.
+	Keep a value encrypted under a name, for script inputs to link. The
+	value can be replaced but never read back. Adding one changes nothing
+	already saved, so it asks for no recent password check; changing or
+	removing one does.
 	"""
-	setScriptOptions(script: String!, options: [ScriptOptionInput!]!): ScriptGql!
+	createSecret(name: String!, value: String!): Secret!
 	"""
-	Execute the job's script list again against its retained output directory.
+	Rename a secret, replace its value, or both. Whatever links it follows
+	along: the next run is handed the new value.
+	"""
+	updateSecret(id: String!, name: String, value: String): Secret!
+	"""
+	Remove a secret. Refused while any script job links it.
+	"""
+	deleteSecret(id: String!): Boolean!
+	"""
+	Replace everything saved in a script job. Each input is sent as a value,
+	as the secret it links, or as a secret of the script job's own; one of
+	those sent without a value keeps the secret already saved under that
+	name. A schedule left out keeps the saved one; a script job that no
+	longer runs on a schedule loses its run times.
+	"""
+	updateScriptInstance(id: String!, input: ScriptInstanceInput!): ScriptInstance!
+	"""
+	Remove a script job. False when there was no such script job.
+	"""
+	deleteScriptInstance(id: String!): Boolean!
+	"""
+	Put the script jobs of one trigger in the order given. They keep the
+	places they hold among the others, and any that are not named follow
+	the ones that are.
+	"""
+	reorderScriptInstances(trigger: ScriptKind!, ids: [String!]!): [ScriptInstance!]!
+	"""
+	Create every script job a script's header asks for and does not have
+	yet: one per declared trigger, filled from the header, a new schedule
+	script job carrying every declared run time. Returns the script jobs it
+	added. After this the header is not read again.
+	"""
+	setUpScriptFromHeader(script: String!): [ScriptInstance!]!
+	"""
+	Bring one script job's inputs back in line with its script's header:
+	every declared input, at the value already saved or else its default,
+	and nothing the header no longer declares.
+	"""
+	reapplyScriptHeader(id: String!): ScriptInstance!
+	"""
+	Run a script job once against made-up inputs: a download that does not
+	exist, in a scratch directory that is removed afterwards. The script job
+	supplies the script, the trigger and its saved inputs. Commands the
+	script prints are reported and never applied. Read the run again with
+	`scriptTestRun`.
+	"""
+	testScriptInstance(id: String!): ScriptTestRun!
+	"""
+	Stop a running test. False when there is no such run or it has ended.
+	"""
+	cancelScriptTest(id: String!): Boolean!
+	"""
+	What the calling run may ask weaver to do for it. Only for a running
+	script that calls with the token its run was handed as
+	`WEAVER_RUN_TOKEN`; an error for anyone else, and once that run has
+	ended.
+	"""
+	scriptRun: ScriptRunActions!
+	"""
+	Run the job's post-processing script jobs again against its retained
+	output directory.
 	"""
 	rerunPostProcessing(jobId: Int!): Boolean!
 	cancelJobPostProcessing(jobId: Int!): Boolean!
@@ -1725,6 +1858,16 @@ enum NetworkConsumerKind {
 	RSS
 }
 
+"""
+The first proxy hop on one of a leg's ladder rungs known to be failing.
+Hops past it on a chain were not reached, so nothing is known of them.
+"""
+type NetworkFailingHop {
+	rung: Int!
+	proxyId: Int!
+	reason: String!
+}
+
 type NetworkFlow {
 	consumers: [NetworkConsumerFlow!]!
 	legs: [NetworkLegFlow!]!
@@ -1752,6 +1895,7 @@ type NetworkLegFlow {
 	selectedRung: Int
 	selectedProxyId: Int
 	rungStates: [String!]!
+	failingHops: [NetworkFailingHop!]!
 }
 
 type NetworkPoolFlow {
@@ -1849,10 +1993,15 @@ type PostProcessingSettingsGql {
 	eventScriptConcurrency: Int!
 	eventScriptTimeoutSeconds: Int!
 	fileDownloadedEventInterval: Int!
-	scriptOutputCeilingBytes: Int!
+	"""
+	The newest runs kept for each download (or each scan, schedule or feed
+	for runs that belong to no download).
+	"""
 	scriptOutputRunsPerJob: Int!
-	scriptOutputRingBytes: Int!
-	scriptOutputRunCapBytes: Int!
+	"""
+	Failed runs kept beyond the newest, so failures stay inspectable.
+	"""
+	scriptOutputFailedRunsPerJob: Int!
 	scriptDirectory: String!
 	executionEnabled: Boolean!
 	concurrency: Int!
@@ -1860,36 +2009,48 @@ type PostProcessingSettingsGql {
 	pythonInterpreter: String
 	powershellInterpreter: String
 	batchInterpreter: String
+	goInterpreter: String
 	unacceptableExtensions: [String!]!
 	"""
 	True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
 	"""
 	strictSecurityRefusesExecution: Boolean!
 	"""
-	Global default list plus every per-category override.
+	Whether script jobs for every category also run for a category that has
+	script jobs of its own.
 	"""
-	lists: ScriptListsGql!
+	globalScriptsRun: GlobalScriptsRun!
 }
 
 input PostProcessingSettingsInput {
 	eventScriptConcurrency: Int
 	eventScriptTimeoutSeconds: Int
 	fileDownloadedEventInterval: Int
-	scriptOutputCeilingBytes: Int
+	"""
+	Lowering it deletes older runs soon after the save. Omission keeps it.
+	"""
 	scriptOutputRunsPerJob: Int
-	scriptOutputRingBytes: Int
-	scriptOutputRunCapBytes: Int
+	"""
+	Lowering it deletes older failed runs soon after the save. Omission
+	keeps it.
+	"""
+	scriptOutputFailedRunsPerJob: Int
 	executionEnabled: Boolean!
 	concurrency: Int!
 	terminationGraceSeconds: Int!
 	pythonInterpreter: String
 	powershellInterpreter: String
 	batchInterpreter: String
+	goInterpreter: String
 	"""
 	Omission preserves the existing policy; a supplied empty list disables
 	it. `null` is deliberately distinguishable and refused by the mutation.
 	"""
 	unacceptableExtensions: [String!]
+	"""
+	Omission keeps the present choice.
+	"""
+	globalScriptsRun: GlobalScriptsRun
 }
 
 """
@@ -2089,6 +2250,11 @@ type QueryRoot {
 	"""
 	jobEvents(jobId: Int!): [JobEvent!]!
 	"""
+	A report on a queued or finished job's NZB and how the job went, with
+	every name, path, host and password left out so it can be shared.
+	"""
+	jobSupportReport(jobId: Int!): SupportReport!
+	"""
 	Public queue facade for active or in-flight items.
 	"""
 	queueItems(filter: QueueFilterInput, first: Int, after: String): [QueueItem!]!
@@ -2140,16 +2306,46 @@ type QueryRoot {
 	jobOutputFiles(jobId: Int!): JobOutputResult
 	postProcessingSettings: PostProcessingSettingsGql!
 	"""
-	Live listing of the configured scripts directory, plus stored option values.
+	Every saved script job, in run order.
+	"""
+	scriptInstances: [ScriptInstance!]!
+	"""
+	One saved script job, or null when there is none by that id.
+	"""
+	scriptInstance(id: String!): ScriptInstance
+	"""
+	Every named secret, by name, with the script jobs that link it. Values
+	are never returned.
+	"""
+	secrets: [Secret!]!
+	"""
+	Live listing of the scripts directory, each script with the preset its
+	header offers.
 
 	Nothing is cached: the directory is the source of truth, so a script
 	added a second ago is listed and one deleted a second ago is not.
 	"""
-	scripts: ScriptListingGql!
+	discoveredScripts: ScriptListingGql!
 	"""
 	Script results recorded for a job, from the live row or from history.
 	"""
 	postProcessingResults(jobId: Int!): [ScriptResultGql!]!
+	"""
+	Recorded script runs, latest first, whatever started them. Runs that
+	belong to no job are listed here and nowhere else.
+	"""
+	scriptRuns(limit: Int, before: String, kind: ScriptKind, script: String, jobId: Int, status: ScriptStatusGql): ScriptRunPage!
+	"""
+	A test run as it stands, or null when there is no such run or it is no
+	longer kept. Test runs are held in memory and are not recorded runs.
+	"""
+	scriptTestRun(id: String!): ScriptTestRun
+	"""
+	The run the caller is. Only for a running script that calls with the
+	token its run was handed as `WEAVER_RUN_TOKEN`; an error for anyone
+	else, and once that run has ended.
+	"""
+	scriptRun: LiveScriptRun!
 	scriptOutput(outputId: String!): String
 	"""
 	List configured RSS feeds.
@@ -2258,7 +2454,7 @@ type QueryRoot {
 	"""
 	isPaused: Boolean!
 	"""
-	Current global download block state (manual pause or ISP cap).
+	Current global download block state (manual pause or download quota).
 	"""
 	downloadBlock: DownloadBlock!
 	"""
@@ -2582,7 +2778,10 @@ type RoutingStatus {
 }
 
 type RssFeed {
-	scripts: [String!]!
+	"""
+	The feed script jobs that rewrite this feed, in the order they run.
+	"""
+	scriptInstanceIds: [String!]!
 	id: Int!
 	name: String!
 	url: String!
@@ -2605,7 +2804,11 @@ type RssFeed {
 }
 
 input RssFeedInput {
-	scripts: [String!]
+	"""
+	The feed script jobs that rewrite this feed, in the order they
+	run. Omission keeps the ones already attached.
+	"""
+	scriptInstanceIds: [String!]
 	routing: RoutingPolicyInput
 	route: RouteInput
 	name: String!
@@ -2691,9 +2894,6 @@ enum RungKind {
 }
 
 type Schedule {
-	script: String
-	runAtStartup: Boolean!
-	implicit: Boolean!
 	id: String!
 	enabled: Boolean!
 	label: String!
@@ -2703,17 +2903,30 @@ type Schedule {
 	everyHourAtMinute: Int
 	serverId: Int
 	serverActive: Boolean
-	feedId: Int
 	quotaMeteringEnabled: Boolean
+	"""
+	The egress a `set_quota_metering` rule applies to; null for every
+	egress.
+	"""
+	quotaEgressId: Int
 	pruneFailed: SchedulePruneFiles
 	pruneCompleted: SchedulePruneFiles
 	pruneCancelled: SchedulePruneFiles
 	actionType: String!
 	"""
-	Rules on this track hold independently of every other track.
+	Rules on this track hold independently of every other track. A rule
+	touching several tracks reports the first.
 	"""
 	track: ScheduleTrack!
-	speedLimitBytes: Int
+	"""
+	The global rate a `speed_limit` rule sets, if it sets one.
+	"""
+	speedLimitBytes: Int @deprecated(reason: "Use speedLimits.")
+	"""
+	Every target a `speed_limit` rule sets, global first, then each
+	egress, then each provider. Empty for every other action.
+	"""
+	speedLimits: [ScheduleSpeedLimit!]!
 	"""
 	The profile a `hardware_profile` rule puts in force; null for every
 	other action.
@@ -2722,8 +2935,6 @@ type Schedule {
 }
 
 input ScheduleInput {
-	script: String
-	runAtStartup: Boolean
 	enabled: Boolean
 	label: String
 	days: [String!]
@@ -2732,13 +2943,26 @@ input ScheduleInput {
 	everyHourAtMinute: Int
 	serverId: Int
 	serverActive: Boolean
-	feedId: Int
 	quotaMeteringEnabled: Boolean
+	"""
+	The egress a `set_quota_metering` rule applies to; omit for every
+	egress.
+	"""
+	quotaEgressId: Int
 	pruneFailed: SchedulePruneFilesInput
 	pruneCompleted: SchedulePruneFilesInput
 	pruneCancelled: SchedulePruneFilesInput
 	actionType: String!
-	speedLimitBytes: Int
+	"""
+	A global rate for a `speed_limit` rule, read only when `speedLimits`
+	is omitted.
+	"""
+	speedLimitBytes: Int @deprecated(reason: "Use speedLimits.")
+	"""
+	Every target a `speed_limit` rule sets. A target left out is left as
+	it is; 0 removes the limit at that level.
+	"""
+	speedLimits: [ScheduleSpeedLimitInput!]
 	"""
 	Required when the action is `hardware_profile`, ignored otherwise.
 	"""
@@ -2751,6 +2975,41 @@ type SchedulePruneFiles {
 
 input SchedulePruneFilesInput {
 	deleteFiles: Boolean!
+}
+
+"""
+One target of a `speed_limit` rule and the rate it sets. 0 removes the
+limit at that level.
+"""
+type ScheduleSpeedLimit {
+	kind: ScheduleTargetKind!
+	"""
+	The egress or provider id; null for the global limit.
+	"""
+	id: Int
+	bytesPerSec: Int!
+}
+
+"""
+One target of a `speed_limit` rule and the rate it sets. 0 removes the
+limit at that level.
+"""
+input ScheduleSpeedLimitInput {
+	kind: ScheduleTargetKind!
+	"""
+	The egress or provider id; null for the global limit.
+	"""
+	id: Int
+	bytesPerSec: Int!
+}
+
+"""
+What one speed-limit change in a rule applies to.
+"""
+enum ScheduleTargetKind {
+	GLOBAL
+	EGRESS
+	SERVER
 }
 
 enum ScheduleTrack {
@@ -2770,14 +3029,13 @@ enum ScriptAdapterGql {
 	NZBGET
 }
 
-type ScriptCategoryListGql {
-	category: String!
-	entries: [ScriptListEntryGql!]!
-}
-
-input ScriptCategoryListInput {
-	category: String!
-	entries: [ScriptListEntryInput!]!
+"""
+How a download a scan script is naming is weighed against others like it.
+"""
+enum ScriptDuplicateMode {
+	SCORE
+	ALL
+	FORCE
 }
 
 type ScriptGql {
@@ -2788,7 +3046,172 @@ type ScriptGql {
 	queueEvents: [ScriptQueueEvent!]!
 	taskTimes: [String!]!
 	version: String
+	"""
+	What the header declares about each input, for drawing a form.
+	"""
 	options: [ScriptOptionGql!]!
+	"""
+	What the header offers as a starting point for a script job.
+	"""
+	preset: ScriptPreset!
+}
+
+"""
+A script wired to one trigger, with the inputs and run policy saved for it.
+What is saved here is what runs.
+"""
+type ScriptInstance {
+	id: String!
+	name: String!
+	script: String!
+	trigger: ScriptKind!
+	"""
+	Set when `trigger` is `QUEUE`.
+	"""
+	queueEvent: ScriptQueueEvent
+	inputs: [ScriptInstanceValue!]!
+	"""
+	Empty runs for every category. Only post-processing and queue script jobs
+	can be narrowed.
+	"""
+	categories: [String!]!
+	enabled: Boolean!
+	"""
+	Whether whatever raised the trigger waits for the script. One that is
+	not waited for is started and left to finish on its own, and its result
+	changes nothing.
+	"""
+	blocking: Boolean!
+	"""
+	Null runs under the default timeout of its trigger.
+	"""
+	timeoutSeconds: Int
+	"""
+	When a schedule script job runs. Empty for every other trigger.
+	"""
+	schedule: ScriptInstanceSchedule!
+	runOrder: Int!
+	"""
+	Why the script cannot run as things stand, such as its file having gone
+	from the scripts directory. Null when it can.
+	"""
+	scriptProblem: String
+	"""
+	The script's header no longer declares the inputs this script job holds.
+	"""
+	headerDrift: Boolean!
+}
+
+input ScriptInstanceInput {
+	"""
+	Empty takes the script's name.
+	"""
+	name: String! = ""
+	script: String!
+	trigger: ScriptKind!
+	"""
+	Required when `trigger` is `QUEUE`, ignored otherwise.
+	"""
+	queueEvent: ScriptQueueEvent
+	inputs: [ScriptInstanceValueInput!]! = []
+	"""
+	Empty runs for every category.
+	"""
+	categories: [String!]! = []
+	enabled: Boolean! = true
+	blocking: Boolean! = true
+	timeoutSeconds: Int
+	"""
+	When a schedule script job runs; ignored for every other trigger.
+	Omitted on an update, the saved one is kept.
+	"""
+	schedule: ScriptInstanceScheduleInput
+}
+
+"""
+A script job that links a secret.
+"""
+type ScriptInstanceRef {
+	id: String!
+	name: String!
+}
+
+"""
+When a schedule script job runs.
+"""
+type ScriptInstanceSchedule {
+	"""
+	`mon` to `sun`. Empty runs every day.
+	"""
+	days: [String!]!
+	"""
+	Each `HH:MM`, or `*:MM` for that minute of every hour.
+	"""
+	times: [String!]!
+	"""
+	Also run once each time Weaver starts.
+	"""
+	runAtStartup: Boolean!
+}
+
+"""
+When a schedule script job runs.
+"""
+input ScriptInstanceScheduleInput {
+	"""
+	`mon` to `sun`. Empty runs every day.
+	"""
+	days: [String!]! = []
+	"""
+	Each `HH:MM`, or `*:MM` for that minute of every hour.
+	"""
+	times: [String!]! = []
+	"""
+	Also run once each time Weaver starts.
+	"""
+	runAtStartup: Boolean! = false
+}
+
+"""
+One saved input: a value, a link to a named secret, or a secret of the
+script job's own. A secret's value is never read back out.
+"""
+type ScriptInstanceValue {
+	name: String!
+	"""
+	Empty when the input is a secret, linked or the script job's own.
+	"""
+	value: String!
+	"""
+	The named secret the input is linked to, or null.
+	"""
+	secret: SecretRef
+	"""
+	The input is a secret of the script job's own: kept encrypted with the
+	script job, write-only, and not among the named secrets.
+	"""
+	sealed: Boolean!
+}
+
+input ScriptInstanceValueInput {
+	name: String!
+	"""
+	A plain value, or with `secret` the value to keep as a secret of the
+	script job's own. Give this or `secretId`, not both.
+	"""
+	value: String
+	"""
+	The named secret to link. Give this or `value`, not both, and never
+	with `secret`.
+	"""
+	secretId: String
+	"""
+	True makes the input a secret of the script job's own: `value` is kept
+	encrypted with the script job, is never read back, and does not become a
+	named secret. On an update, true with no `value` keeps the secret the
+	script job already holds under this name. Omitted means false.
+	"""
+	secret: Boolean
 }
 
 enum ScriptKind {
@@ -2797,18 +3220,6 @@ enum ScriptKind {
 	SCAN
 	SCHEDULER
 	FEED
-}
-
-type ScriptListEntryGql {
-	script: String!
-	enabled: Boolean!
-	timeoutSeconds: Int
-}
-
-input ScriptListEntryInput {
-	script: String!
-	enabled: Boolean! = true
-	timeoutSeconds: Int
 }
 
 type ScriptListingGql {
@@ -2820,14 +3231,12 @@ type ScriptListingGql {
 	problems: [ScriptProblemGql!]!
 }
 
-type ScriptListsGql {
-	global: [ScriptListEntryGql!]!
-	categories: [ScriptCategoryListGql!]!
-}
-
-input ScriptListsInput {
-	global: [ScriptListEntryInput!]! = []
-	categories: [ScriptCategoryListInput!]! = []
+enum ScriptLogLevel {
+	DEBUG
+	DETAIL
+	INFO
+	WARNING
+	ERROR
 }
 
 type ScriptOptionGql {
@@ -2842,16 +3251,6 @@ type ScriptOptionGql {
 	Manifest default, already masked when the option is secret.
 	"""
 	defaultValue: String
-	"""
-	Operator-supplied value, masked when the option is secret.
-	"""
-	value: String
-}
-
-input ScriptOptionInput {
-	name: String!
-	optionType: ScriptOptionTypeGql!
-	value: String!
 }
 
 enum ScriptOptionTypeGql {
@@ -2860,6 +3259,46 @@ enum ScriptOptionTypeGql {
 	NUMBER
 	BOOLEAN
 	SECRET
+}
+
+"""
+What a script's header offers as a starting point. It fills a form and
+nothing more: a saved script job never follows the header.
+"""
+type ScriptPreset {
+	"""
+	One per script job the header asks for.
+	"""
+	triggers: [ScriptPresetTrigger!]!
+	"""
+	When a schedule script job is meant to run.
+	"""
+	taskTimes: [String!]!
+	"""
+	Every declared input at its default. A secret has no value.
+	"""
+	inputs: [ScriptPresetValue!]!
+}
+
+"""
+A trigger a script's header declares.
+"""
+type ScriptPresetTrigger {
+	trigger: ScriptKind!
+	"""
+	Set when `trigger` is `QUEUE`.
+	"""
+	queueEvent: ScriptQueueEvent
+}
+
+"""
+One input a script's header declares, at its default. A secret input has
+no value: it is filled by linking a secret.
+"""
+type ScriptPresetValue {
+	name: String!
+	value: String!
+	secret: Boolean!
 }
 
 type ScriptProblemGql {
@@ -2881,7 +3320,19 @@ type ScriptResultGql {
 	outputId: String
 	outputRetained: Boolean!
 	script: String!
+	"""
+	The script job that ran, when the run came from one.
+	"""
+	instanceId: String
+	"""
+	The script job's name as it was when it ran.
+	"""
+	instanceName: String
 	event: String!
+	"""
+	The run was started without anything waiting for it.
+	"""
+	background: Boolean!
 	adapter: ScriptAdapterGql!
 	status: ScriptStatusGql!
 	exitCode: Int
@@ -2892,6 +3343,125 @@ type ScriptResultGql {
 	finishedAtEpochMs: Int!
 }
 
+"""
+One recorded run of a script, whatever started it.
+"""
+type ScriptRun {
+	"""
+	Names the run's kept output for `scriptOutput`, when `outputRetained`.
+	"""
+	id: String!
+	jobId: Int
+	"""
+	Known once the job has reached history.
+	"""
+	jobName: String
+	script: String!
+	"""
+	The script job that ran, when the run came from one.
+	"""
+	instanceId: String
+	"""
+	The script job's name as it was when it ran.
+	"""
+	instanceName: String
+	event: String!
+	kind: ScriptKind!
+	"""
+	The run was started without anything waiting for it.
+	"""
+	background: Boolean!
+	adapter: ScriptAdapterGql!
+	status: ScriptStatusGql!
+	exitCode: Int
+	durationMs: Int!
+	outputTail: String!
+	outputTruncated: Boolean!
+	outputRetained: Boolean!
+	errorMessage: String
+	finishedAtEpochMs: Int!
+}
+
+type ScriptRunActions {
+	"""
+	`[NZB] CATEGORY=`. For a scan script.
+	"""
+	setCategory(category: String!): Boolean!
+	"""
+	`[NZB] NZBNAME=`. For a scan script.
+	"""
+	setName(name: String!): Boolean!
+	"""
+	`[NZB] DIRECTORY=`. For a post-processing script, and for a queue
+	script run when a download has finished downloading.
+	"""
+	setDirectory(path: String!): Boolean!
+	"""
+	`[NZB] FINALDIR=`. For a post-processing script.
+	"""
+	setFinalDirectory(path: String!): Boolean!
+	"""
+	`[NZB] MARK=BAD`. For a post-processing or queue script.
+	"""
+	markBad: Boolean!
+	"""
+	`[NZB] NZBPR_<name>=<value>`. An empty value removes the parameter.
+	For any script that is about a download.
+	"""
+	setParameter(name: String!, value: String!): Boolean!
+	"""
+	`[NZB] PRIORITY=`. For a scan script.
+	"""
+	setPriority(priority: Int!): Boolean!
+	"""
+	`[NZB] PAUSED=`. For a scan script.
+	"""
+	setPaused(paused: Boolean!): Boolean!
+	"""
+	`[NZB] TOP=`. For a scan script.
+	"""
+	setTop(top: Boolean!): Boolean!
+	"""
+	`[NZB] DUPEKEY=`, `DUPESCORE=` and `DUPEMODE=`, for whichever are
+	given. For a scan script.
+	"""
+	setDuplicate(key: String, score: Int, mode: ScriptDuplicateMode): Boolean!
+	"""
+	End the run as failed with `reason`, whatever the script goes on to
+	exit with. For any script.
+	"""
+	fail(reason: String!): Boolean!
+	"""
+	Add `text` to the run's log. For any script.
+	"""
+	log(level: ScriptLogLevel!, text: String!): Boolean!
+}
+
+type ScriptRunPage {
+	"""
+	Latest first.
+	"""
+	runs: [ScriptRun!]!
+	"""
+	Pass as `before` for the runs that follow; absent on the last page.
+	"""
+	nextBefore: String
+	"""
+	How many runs the filter matches across every page.
+	"""
+	total: Int!
+	"""
+	How the runs the filter matches ended, leaving its own `status` out.
+	A status no run ended with is absent.
+	"""
+	statusCounts: [ScriptRunStatusCount!]!
+}
+
+type ScriptRunStatusCount {
+	status: ScriptStatusGql!
+	count: Int!
+}
+
 enum ScriptStatusGql {
 	SUCCEEDED
 	SKIPPED
@@ -2899,6 +3469,82 @@ enum ScriptStatusGql {
 	FAILED
 	TIMED_OUT
 	CANCELLED
+}
+
+"""
+One variable made up for a script under test.
+"""
+type ScriptTestInput {
+	name: String!
+	value: String!
+}
+
+"""
+A script job run against made-up inputs, as it stands.
+"""
+type ScriptTestRun {
+	id: String!
+	instanceId: String!
+	instanceName: String!
+	script: String!
+	event: String!
+	kind: ScriptKind!
+	adapter: ScriptAdapterGql!
+	startedAtEpochMs: Int!
+	"""
+	The run is ended after this long.
+	"""
+	timeoutSeconds: Int!
+	"""
+	False once the script has ended, when `status` is set.
+	"""
+	running: Boolean!
+	status: ScriptStatusGql
+	exitCode: Int
+	durationMs: Int
+	errorMessage: String
+	"""
+	What the script has printed so far, or all of it once the run has ended.
+	"""
+	log: String!
+	logTruncated: Boolean!
+	"""
+	The variables made up for this run, in name order. The script job's own
+	inputs are left out.
+	"""
+	inputs: [ScriptTestInput!]!
+	"""
+	The arguments made up for this run, in order.
+	"""
+	arguments: [String!]!
+	"""
+	Commands the script issued, in order. A test run applies none of them.
+	"""
+	commands: [String!]!
+	commandsTruncated: Boolean!
+}
+
+"""
+A value kept encrypted under its own name, for script inputs to link.
+The value is write-only.
+"""
+type Secret {
+	id: String!
+	name: String!
+	createdAt: DateTime!
+	updatedAt: DateTime!
+	"""
+	The script jobs that link it, by name.
+	"""
+	usedBy: [ScriptInstanceRef!]!
+}
+
+"""
+A named secret an input is linked to.
+"""
+type SecretRef {
+	id: String!
+	name: String!
 }
 
 type SecurityUpgradeNotice {
@@ -3350,7 +3996,8 @@ type SubscriptionRoot {
 
 	Pushes a full snapshot whenever a pipeline event fires, throttled to
 	at most once per 100ms so rapid-fire segment events don't flood the
-	client. Also ticks every 2s during idle so speed gauges stay fresh.
+	client. Also ticks every 2s so speed gauges stay fresh; a tick that
+	finds the jobs, metrics, pause and block state unchanged sends nothing.
 	"""
 	jobUpdates: JobsSnapshot!
 	"""
@@ -3380,6 +4027,20 @@ type SubscriptionRoot {
 	Subscribe to cadence-driven system metrics and global queue state.
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
+}
+
+"""
+A report safe to paste in public: no names, paths, hosts or passwords.
+"""
+type SupportReport {
+	"""
+	Compact plain text, at most 80 columns, for a fenced block.
+	"""
+	text: String!
+	"""
+	The same report with every field, as pretty-printed JSON.
+	"""
+	json: String!
 }
 
 type SystemComputeInfo {

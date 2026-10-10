@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{
-    ConnectInfo, Extension, FromRequestParts, Multipart, Path, Query,
+    ConnectInfo, Extension, FromRequestParts, Multipart, Path,
     multipart::{Field, MultipartError},
 };
 use axum::http::{HeaderMap, StatusCode, header, request::Parts};
@@ -135,6 +135,20 @@ pub(super) async fn backup_status_handler(
     Ok(Json(status))
 }
 
+fn backup_auth_error(status: StatusCode) -> Response {
+    if status == StatusCode::PRECONDITION_REQUIRED {
+        return (
+            status,
+            Json(serde_json::json!({
+                "error": "recent password verification required",
+                "code": "REAUTH_REQUIRED",
+            })),
+        )
+            .into_response();
+    }
+    status.into_response()
+}
+
 pub(super) async fn backup_export_handler(
     Extension(backup): Extension<BackupService>,
     Extension(request_auth): Extension<super::RequestAuthContext>,
@@ -149,7 +163,7 @@ pub(super) async fn backup_export_handler(
     )
     .await
     {
-        return status.into_response();
+        return backup_auth_error(status);
     }
     match backup.create_backup(body.password).await {
         Ok(artifact) => {
@@ -193,27 +207,12 @@ pub(super) async fn backup_create_handler(
     )
     .await
     {
-        if status == StatusCode::PRECONDITION_REQUIRED {
-            return (
-                status,
-                Json(serde_json::json!({
-                    "error": "recent password verification required",
-                    "code": "REAUTH_REQUIRED",
-                })),
-            )
-                .into_response();
-        }
-        return status.into_response();
+        return backup_auth_error(status);
     }
     match backup.create_stored_backup(body.password).await {
         Ok(info) => (StatusCode::ACCEPTED, Json(info)).into_response(),
         Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
     }
-}
-
-#[derive(Deserialize)]
-pub(super) struct BackupDownloadQuery {
-    token: Option<String>,
 }
 
 pub(super) async fn backup_download_handler(
@@ -222,7 +221,6 @@ pub(super) async fn backup_download_handler(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Path(filename): Path<String>,
-    Query(query): Query<BackupDownloadQuery>,
 ) -> Response {
     if let Err(status) = require_admin(
         &auth.db,
@@ -235,12 +233,11 @@ pub(super) async fn backup_download_handler(
     )
     .await
     {
-        return status.into_response();
+        return backup_auth_error(status);
     }
     let token = headers
         .get("x-weaver-backup-token")
-        .and_then(|value| value.to_str().ok())
-        .or(query.token.as_deref());
+        .and_then(|value| value.to_str().ok());
     let Some(token) = token else {
         return StatusCode::FORBIDDEN.into_response();
     };
@@ -289,7 +286,7 @@ pub(super) async fn backup_delete_handler(
     )
     .await
     {
-        return status.into_response();
+        return backup_auth_error(status);
     }
     match backup.delete_backup(&filename).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -325,7 +322,7 @@ pub(super) async fn backup_inspect_handler(
     )
     .await
     {
-        return status.into_response();
+        return backup_auth_error(status);
     }
     match parse_backup_upload(multipart, security.backup_upload_limit_bytes).await {
         Ok(upload) => {
@@ -389,7 +386,7 @@ pub(super) async fn backup_restore_handler(
     )
     .await
     {
-        return status.into_response();
+        return backup_auth_error(status);
     }
     match parse_backup_upload(multipart, security.backup_upload_limit_bytes).await {
         Ok(upload) => {

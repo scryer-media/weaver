@@ -13,7 +13,7 @@ import { type Row, literal, query, waitRows } from "./datastore";
  * The specs still describe what runs as lists of script names, one for every
  * download and one per category. Weaver runs instances, so a list is set up as
  * the instances its scripts' headers ask for: one per declared trigger, filled
- * from the header, with a schedule rule for each declared run time other than
+ * from the header, a schedule job keeping each declared run time other than
  * start-up. A category's entries become instances narrowed to it, for the
  * triggers a download raises, and a category with instances of its own does
  * not also run the ones for every category.
@@ -37,23 +37,28 @@ export type ListEntry = { script: string; enabled?: boolean; timeoutSeconds?: nu
 export type ScriptLists = { global: ListEntry[]; categories: Array<{ category: string; entries: ListEntry[] }> };
 
 export type ScriptTrigger = "POST_PROCESSING" | "QUEUE" | "SCAN" | "SCHEDULER" | "FEED";
+/** When a schedule job runs: `HH:MM` or `*:MM` times, `mon` to `sun` days (none is every day). */
+export type ScriptSchedule = { days: string[]; times: string[]; runAtStartup: boolean };
 export type ScriptInstance = {
   id: string; name: string; script: string; trigger: ScriptTrigger; queueEvent: string | null;
   /** A secret input shows the secret it links, never a value. */
   inputs: Array<{ name: string; value: string; secret: { id: string; name: string } | null }>;
   categories: string[]; enabled: boolean; blocking: boolean; timeoutSeconds: number | null; runOrder: number;
+  schedule: ScriptSchedule;
 };
 export type ScriptInstanceInput = {
   name?: string; script: string; trigger: ScriptTrigger; queueEvent?: string | null;
   /** Each input is a plain `value` or the `secretId` of a named secret. */
   inputs?: Array<{ name: string; value?: string; secretId?: string }>;
   categories?: string[]; enabled?: boolean; blocking?: boolean; timeoutSeconds?: number | null;
+  /** Only a schedule job keeps one. */
+  schedule?: ScriptSchedule;
 };
 
 const SETTINGS_FIELDS = `eventScriptConcurrency eventScriptTimeoutSeconds fileDownloadedEventInterval
   scriptOutputRunsPerJob scriptOutputFailedRunsPerJob
   scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution globalScriptsRun`;
-const INSTANCE_FIELDS = "id name script trigger queueEvent inputs { name value secret { id name } } categories enabled blocking timeoutSeconds runOrder";
+const INSTANCE_FIELDS = "id name script trigger queueEvent inputs { name value secret { id name } } categories enabled blocking timeoutSeconds runOrder schedule { days times runAtStartup }";
 
 /** Every saved instance, in run order. */
 export async function scriptInstances(request: APIRequestContext): Promise<ScriptInstance[]> {
@@ -80,7 +85,7 @@ export async function deleteSecret(request: APIRequestContext, id: string): Prom
   await graphql(request, "mutation($id: String!) { deleteSecret(id: $id) }", { id });
 }
 
-/** Remove an instance; any schedule rule that ran it goes with it. */
+/** Remove an instance, with the run times saved on it. */
 export async function deleteScriptInstance(request: APIRequestContext, id: string): Promise<void> {
   await graphql(request, "mutation($id: String!) { deleteScriptInstance(id: $id) }", { id });
 }
@@ -172,18 +177,16 @@ export async function setScriptLists(request: APIRequestContext, lists: Partial<
     const enabled = entry.enabled ?? true;
     for (const { trigger, queueEvent } of triggers) {
       if (category !== null && !CATEGORY_TRIGGERS.has(trigger)) continue;
-      const instance = await createScriptInstance(request, {
+      // A start-up time is left off: a spec that wants one asks for it on its own job.
+      const schedule = trigger === "SCHEDULER"
+        ? { days: [], times: (preset?.taskTimes ?? []).filter(time => time !== "*"), runAtStartup: false }
+        : undefined;
+      await createScriptInstance(request, {
         script: entry.script, trigger, queueEvent, enabled, timeoutSeconds: entry.timeoutSeconds ?? null,
         categories: category === null ? [] : [category],
         inputs: (preset?.inputs ?? []).filter(input => !input.secret).map(({ name, value }) => ({ name, value })),
+        schedule,
       });
-      if (trigger !== "SCHEDULER" || category !== null) continue;
-      // A start-up time is only run by a rule that opts into it.
-      for (const time of (preset?.taskTimes ?? []).filter(time => time !== "*")) {
-        await graphql(request, "mutation($input: ScheduleInput!) { createSchedule(input: $input) { id } }", {
-          input: { actionType: "run_script", instanceId: instance.id, time, enabled, label: `${entry.script} (${time})` },
-        });
-      }
     }
   };
   for (const entry of lists.global ?? []) await add(entry, null);

@@ -229,7 +229,6 @@ test("the scripts screen is one table of instances, under a heading for each thi
         assert.equal(await listed.nth(index).getByRole("switch", { name: `${name} enabled`, exact: true }).isChecked(), enabled, name);
       }
     }
-    await group(page, "Schedule").getByText("runs when a schedule rule names it", { exact: true }).waitFor();
     await group(page, "Feed").getByText("runs on the feeds it is attached to", { exact: true }).waitFor();
     // An instance whose script has gone says so, and one its header has moved away from says that.
     for (const [name, line] of [
@@ -418,6 +417,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
       name: "Archive movies", script: "archive.py", trigger: "POST_PROCESSING", queueEvent: null,
       inputs: [{ name: "Target", value: "/fixture/archive" }, { name: "Key", secretId: "s2" }],
       categories: ["movies"], enabled: true, blocking: false, timeoutSeconds: 120,
+      schedule: { days: [], times: [], runAtStartup: false },
     } } }]);
   } finally { await page.close(); }
 });
@@ -451,6 +451,7 @@ test("a queue instance names its event, and each input the header declares draws
       name: "", script: "archive.py", trigger: "QUEUE", queueEvent: "NZB_NAMED",
       inputs: [{ name: "Target", value: "/fixture/archive" }],
       categories: [], enabled: true, blocking: true, timeoutSeconds: null,
+      schedule: { days: [], times: [], runAtStartup: false },
     } } });
     assert.equal(held.instances.at(-1).name, "archive.py");
     assert.deepEqual(held.instances.at(-1).inputs, [{ name: "Target", value: "/fixture/archive", secretId: null }]);
@@ -493,6 +494,7 @@ test("a queue instance names its event, and each input the header declares draws
         { name: "Label", value: "downloads" }, { name: "Mode", value: "verbose" }, { name: "Attach", value: "yes" },
       ],
       categories: [], enabled: true, blocking: true, timeoutSeconds: null,
+      schedule: { days: [], times: [], runAtStartup: false },
     } } });
   } finally { await page.close(); }
 });
@@ -558,24 +560,21 @@ test("a new job on the schedule is given when it runs, starting from the times i
     await status(page, "Weekend report created").waitFor();
     await editor.waitFor({ state: "detached" });
     await rows(group(page, "Schedule")).nth(1).and(row(page, "Weekend report")).waitFor();
-    // The job, and then the one schedule rule that runs it.
+    // The job carries its run times; no schedule rule is made for it.
     assert.deepEqual((await daemon(page)).requests, [
       { name: "CreateScriptInstance", variables: { input: {
         name: "Weekend report", script: "nightly.py", trigger: "SCHEDULER", queueEvent: null,
         inputs: [], categories: [], enabled: true, blocking: true, timeoutSeconds: null,
-      } } },
-      { name: "CreateSchedule", variables: { input: {
-        time: "06:30, *:15", days: ["sat", "sun"], runAtStartup: true,
-        actionType: "run_script", label: "Weekend report", enabled: true, instanceId: "8",
+        schedule: { days: ["sat", "sun"], times: ["06:30", "*:15"], runAtStartup: true },
       } } },
     ]);
 
-    // Saved, it shows the rule it was given, which is changed among the schedules.
+    // Saved, it opens on the run times it was given, which are changed here.
     const saved = await edit(page, "Weekend report");
-    await saved.getByText("06:30, *:15 · at startup · Sat Sun", { exact: true }).waitFor();
-    await saved.getByText("The schedule rules that run this job. Change them in Schedules.", { exact: true }).waitFor();
-    assert.equal(await field(saved, "Run times").count(), 0);
-    assert.equal(await saved.getByRole("group", { name: "Days", exact: true }).count(), 0);
+    assert.equal(await field(saved, "Run times").inputValue(), "06:30, *:15");
+    const savedDays = saved.getByRole("group", { name: "Days", exact: true });
+    assert.equal(await savedDays.locator('[aria-pressed="true"]').count(), 2);
+    assert.equal(await saved.getByRole("switch", { name: "Also run at startup", exact: true }).isChecked(), true);
   } finally { await page.close(); }
 });
 
@@ -593,47 +592,38 @@ test("a script whose header asks for no time starts with none, and a job may run
     await field(editor, "Job name").fill("Startup tidy");
     await action(editor, "Save").click();
     await status(page, "Startup tidy created").waitFor();
-    assert.deepEqual((await daemon(page)).requests.at(-1), { name: "CreateSchedule", variables: { input: {
-      time: "*", days: null, runAtStartup: true, actionType: "run_script", label: "Startup tidy", enabled: true, instanceId: "8",
-    } } });
+    const sent = (await daemon(page)).requests.at(-1);
+    assert.equal(sent.name, "CreateScriptInstance");
+    assert.deepEqual(sent.variables.input.schedule, { days: [], times: [], runAtStartup: true });
     const saved = await edit(page, "Startup tidy");
-    await saved.getByText("at startup · Every day", { exact: true }).waitFor();
+    assert.equal(await saved.getByRole("switch", { name: "Also run at startup", exact: true }).isChecked(), true);
   } finally { await page.close(); }
 });
 
-test("a saved job on the schedule lists the rules that run it, and one with none says so", async () => {
+test("a saved job on the schedule shows its run times to change, and a job of another trigger has none", async () => {
   const page = await open("?scripts");
   try {
     let editor = await edit(page, "Nightly report");
-    for (const line of ["04:00 · Every day", "*:20 · at startup · Sat Sun"]) await editor.getByText(line, { exact: true }).waitFor();
+    const times = field(editor, "Run times");
+    assert.equal(await times.inputValue(), "*:20, 04:00");
+    const days = editor.getByRole("group", { name: "Days", exact: true });
+    assert.deepEqual(await days.locator('[aria-pressed="true"]').allTextContents(), ["Sat", "Sun"]);
+    assert.equal(await editor.getByRole("switch", { name: "Also run at startup", exact: true }).isChecked(), true);
     await shot(page, "instance-editor-schedule");
-    // Saving the job sends nothing about its rules.
+    // A changed time is saved on the job itself.
+    await times.fill("05:00");
+    await action(days, "Sat").click();
     await action(editor, "Save").click();
     await status(page, "Nightly report saved").waitFor();
-    assert.deepEqual((await daemon(page)).requests.map((request) => request.name), ["UpdateScriptInstance"]);
-    await page.evaluate(() => { window.scriptsFixture.schedules.length = 0; });
+    const requests = (await daemon(page)).requests;
+    assert.deepEqual(requests.map((request) => request.name), ["UpdateScriptInstance"]);
+    assert.deepEqual(requests[0].variables.input.schedule, { days: ["sun"], times: ["05:00"], runAtStartup: true });
     editor = await edit(page, "Nightly report");
-    await editor.getByText("No schedule rule runs this job", { exact: true }).waitFor();
-    // A job of another trigger has no such line.
+    assert.equal(await field(editor, "Run times").inputValue(), "05:00");
     await action(editor, "Cancel").click();
     await editor.waitFor({ state: "detached" });
+    // A job of another trigger has no run times.
     assert.equal(await (await edit(page, "Notify")).getByText("Run times", { exact: true }).count(), 0);
-  } finally { await page.close(); }
-});
-
-test("a job whose schedule rule the daemon refuses is still created, and the screen says its schedule was not", async () => {
-  const page = await open("?scripts&norule");
-  try {
-    await row(page, "Notify").waitFor();
-    await action(controls(page), "Add job").click();
-    const editor = creator(page);
-    await pick(page, editor, "Script", "Nightly report · nightly.py");
-    await action(editor, "Save").click();
-    await status(page, "nightly.py was created, but its schedule was not: the schedule could not be written. Add it in Schedules.").waitFor();
-    // The editor goes, so that saving again cannot make a second job.
-    await editor.waitFor({ state: "detached" });
-    await rows(group(page, "Schedule")).nth(1).and(row(page, "nightly.py")).waitFor();
-    assert.deepEqual((await daemon(page)).requests.map((request) => request.name), ["CreateScriptInstance", "CreateSchedule"]);
   } finally { await page.close(); }
 });
 
@@ -683,6 +673,7 @@ test("a secret input shows the secret it links and never its value, and can link
         { name: "Mode", value: "quiet" }, { name: "Attach", value: "no" },
       ],
       categories: [], enabled: true, blocking: true, timeoutSeconds: null,
+      schedule: { days: [], times: [], runAtStartup: false },
     } } }]);
     assert.deepEqual(held.instances[0].inputs[1], { name: "Token", value: "", secretId: "s1" });
 
@@ -743,6 +734,7 @@ test("a secret input shows the secret it links and never its value, and can link
           { name: "Token", secretId: "s3" },
         ],
         categories: [], enabled: true, blocking: true, timeoutSeconds: null,
+        schedule: { days: [], times: [], runAtStartup: false },
       } } },
     ]);
     assert.equal(await page.getByText("fixture-token").count(), 0);
@@ -918,6 +910,7 @@ test("the switch in a row turns its instance on or off without opening it, and k
     ["Tidy tv", true, { id: "2", input: {
       name: "Tidy tv", script: "cleanup.sh", trigger: "POST_PROCESSING", queueEvent: null, inputs: [],
       categories: ["tv"], enabled: true, blocking: false, timeoutSeconds: 600,
+      schedule: { days: [], times: [], runAtStartup: false },
     } }],
     // A secret goes back as the link it is.
     ["Notify", false, { id: "1", input: {
@@ -927,6 +920,7 @@ test("the switch in a row turns its instance on or off without opening it, and k
         { name: "Mode", value: "quiet" }, { name: "Attach", value: "no" },
       ],
       categories: [], enabled: false, blocking: true, timeoutSeconds: null,
+      schedule: { days: [], times: [], runAtStartup: false },
     } }],
   ]) {
     const page = await open("?scripts");
@@ -949,7 +943,7 @@ test("deleting an instance asks first, and says what goes with it", async () => 
     await action(row(page, "Feed intake"), "Delete").click();
     await confirm.getByText("Feed intake", { exact: true }).waitFor();
     await confirm.getByText(
-      "The job is removed, along with any schedule rule that runs it and its place on any feed. The script file is not touched.",
+      "The job is removed, along with its place on any feed. The script file is not touched.",
       { exact: true },
     ).waitFor();
     await action(confirm, "Cancel").click();

@@ -1,15 +1,27 @@
 import type { Translate } from "@/lib/context/translate-context";
+import { formatRate } from "./format";
 
-export const ADDITIONAL_SCHEDULE_ACTIONS = [
+/**
+ * Every action a rule can take, in the order the action picker offers them:
+ * the holds first, each pause beside its resume, then the settings a rule
+ * switches, then pruning.
+ */
+export const SCHEDULE_ACTIONS = [
+  { value: "pause", label: "next.schedules.pause" },
+  { value: "resume", label: "next.schedules.resume" },
   { value: "pause_all", label: "next.schedules.pauseAll" },
   { value: "pause_post_processing", label: "next.schedules.pausePost" },
   { value: "resume_post_processing", label: "next.schedules.resumePost" },
+  { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
+  { value: "resume_watch_folder_scanning", label: "next.schedules.resumeWatchFolder" },
+  { value: "pause_rss", label: "next.schedules.pauseRss" },
+  { value: "resume_rss", label: "next.schedules.resumeRss" },
+  { value: "speed_limit", label: "next.schedules.setLimit" },
+  { value: "hardware_profile", label: "next.schedules.setProfile" },
   { value: "set_server_active", label: "next.schedules.serverActive" },
-  { value: "set_quota_metering", label: "next.schedules.quotaMetering" },
-  { value: "scan_watch_folder", label: "next.schedules.scanNow" },
-  { value: "fetch_rss", label: "next.schedules.fetchRss" },
   { value: "prune_history", label: "next.schedules.pruneHistory" },
-];
+  { value: "set_quota_metering", label: "next.schedules.quotaMetering" },
+] as const;
 
 /** The weekdays a rule may be narrowed to. Labels are translation keys. */
 export const SCHEDULE_DAYS = [
@@ -32,32 +44,110 @@ export function scheduleDaysLabel(t: Translate, days: readonly string[]): string
     .join(" ");
 }
 
+/** What one change of a speed rule applies to. */
+export type SpeedTargetKind = "GLOBAL" | "EGRESS" | "SERVER";
+
+/** One target of a speed rule and the rate it sets; 0 removes the limit there. */
+export interface ScheduleSpeedLimit {
+  kind: SpeedTargetKind;
+  /** The egress or provider; null for the global limit. */
+  id: number | null;
+  bytesPerSec: number;
+}
+
 export interface ScheduleOptions {
   times: string[];
   everyHourAtMinute: number | null;
   serverId: number | null;
   serverActive: boolean | null;
-  feedId: number | null;
   quotaMeteringEnabled: boolean | null;
+  /** The egress a quota rule applies to; null for every egress. */
+  quotaEgressId: number | null;
   pruneFailed: { deleteFiles: boolean } | null;
   pruneCompleted: { deleteFiles: boolean } | null;
   pruneCancelled: { deleteFiles: boolean } | null;
+  speedLimits: ScheduleSpeedLimit[];
 }
 
-export interface ScheduleOptionsForm extends Omit<ScheduleOptions, "times"> {
+export interface ScheduleOptionsForm extends Omit<ScheduleOptions, "times" | "speedLimits"> {
   timesText: string;
+  /**
+   * The rate typed for each target, in MB/s, keyed by {@link speedKey}. Blank
+   * leaves that target as it is.
+   */
+  speeds: Record<string, string>;
 }
 
 export interface ScheduleTargets {
   servers: { id: number; host: string }[];
-  rssFeeds: { id: number; name: string }[];
-  /** Every script instance; a rule can only run one whose trigger is the schedule. */
-  scriptInstances?: { id: string; name: string; script: string; trigger: string }[];
+  egressInterfaces: { id: number; name: string }[];
 }
 
-/** The script instances a schedule rule can run. */
-export function scheduleInstances(targets: ScheduleTargets | undefined) {
-  return (targets?.scriptInstances ?? []).filter((instance) => instance.trigger === "SCHEDULER");
+const MIB = 1024 * 1024;
+
+/** The form's key for one speed target. */
+export function speedKey(kind: SpeedTargetKind, id: number | null): string {
+  return kind === "GLOBAL" ? "GLOBAL" : `${kind}:${id}`;
+}
+
+/** A stored rate as its field shows it: MB/s, to two places. */
+function rateText(bytesPerSec: number): string {
+  return String(Math.round((bytesPerSec / MIB) * 100) / 100);
+}
+
+/** Why a typed rate cannot be saved, as a translation key; null when it can. */
+export function speedProblem(text: string): string | null {
+  const trimmed = text.trim();
+  if (trimmed === "") return null;
+  const value = Number(trimmed);
+  return Number.isFinite(value) && value >= 0 ? null : "next.schedules.speedInvalid";
+}
+
+/**
+ * The changes a speed form makes, global first, then each egress, then each
+ * provider. A target left blank is left out. A rate the field only rounded for
+ * display goes back exactly as it was stored.
+ */
+export function speedLimitsInput(
+  speeds: Record<string, string>,
+  stored: readonly ScheduleSpeedLimit[] = [],
+): ScheduleSpeedLimit[] {
+  const order = (kind: SpeedTargetKind) => (kind === "GLOBAL" ? 0 : kind === "EGRESS" ? 1 : 2);
+  return Object.entries(speeds)
+    .filter(([, text]) => text.trim() !== "" && speedProblem(text) === null)
+    .map(([key, text]): ScheduleSpeedLimit => {
+      const [kind, id] = key.split(":") as [SpeedTargetKind, string | undefined];
+      const target = { kind, id: id === undefined ? null : Number(id) };
+      const saved = stored.find((limit) => limit.kind === target.kind && limit.id === target.id);
+      const bytesPerSec =
+        saved && rateText(saved.bytesPerSec) === String(Number(text.trim()))
+          ? saved.bytesPerSec
+          : Math.round(Number(text.trim()) * MIB);
+      return { ...target, bytesPerSec };
+    })
+    .sort((left, right) => order(left.kind) - order(right.kind) || (left.id ?? 0) - (right.id ?? 0));
+}
+
+/** A speed rule in the table's words: "Global 5 MB/s, wan 2 MB/s", with "unlimited" for a removed limit. */
+export function speedLimitsLabel(
+  t: Translate,
+  limits: readonly ScheduleSpeedLimit[],
+  targets?: ScheduleTargets,
+): string {
+  return limits
+    .map((limit) => {
+      const name =
+        limit.kind === "GLOBAL"
+          ? t("next.schedules.speedGlobal")
+          : limit.kind === "EGRESS"
+            ? targets?.egressInterfaces.find((egress) => egress.id === limit.id)?.name ??
+              `${t("next.schedules.egress")} #${limit.id}`
+            : targets?.servers.find((server) => server.id === limit.id)?.host ??
+              `${t("next.schedules.server")} #${limit.id}`;
+      const rate = limit.bytesPerSec > 0 ? formatRate(limit.bytesPerSec) : t("next.schedules.unlimited");
+      return `${name} ${rate}`;
+    })
+    .join(", ");
 }
 
 export function scheduleActionDetails(
@@ -71,13 +161,19 @@ export function scheduleActionDetails(
       const server = targets?.servers.find((entry) => entry.id === schedule.serverId);
       return `${t("next.schedules.serverActive")}: ${server?.host ?? `${t("next.schedules.server")} #${schedule.serverId}`} (${state(schedule.serverActive)})`;
     }
-    case "set_quota_metering":
-      return `${t("next.schedules.quotaMetering")}: ${state(schedule.quotaMeteringEnabled)}`;
-    case "fetch_rss": {
-      const feed = targets?.rssFeeds.find((entry) => entry.id === schedule.feedId);
-      const target = schedule.feedId === null ? t("next.schedules.allFeeds") : feed?.name ?? `${t("next.schedules.feed")} #${schedule.feedId}`;
-      return `${t("next.schedules.fetchRss")}: ${target}`;
+    case "set_quota_metering": {
+      const egress =
+        schedule.quotaEgressId === null
+          ? null
+          : targets?.egressInterfaces.find((entry) => entry.id === schedule.quotaEgressId)?.name ??
+            `${t("next.schedules.egress")} #${schedule.quotaEgressId}`;
+      const action = t(schedule.quotaMeteringEnabled ? "next.schedules.quotaCountOn" : "next.schedules.quotaCountOff");
+      return egress ? `${action}: ${egress}` : action;
     }
+    case "speed_limit":
+      return schedule.speedLimits.length > 0
+        ? speedLimitsLabel(t, schedule.speedLimits, targets)
+        : t("next.schedules.speedNothing");
     case "prune_history": {
       const choices = (["pruneFailed", "pruneCompleted", "pruneCancelled"] as const)
         .filter((key) => schedule[key] !== null)
@@ -91,35 +187,42 @@ export function scheduleActionDetails(
 
 export const NEW_SCHEDULE_OPTIONS: ScheduleOptionsForm = {
   timesText: "", everyHourAtMinute: null,
-  serverId: null, serverActive: true, feedId: null, quotaMeteringEnabled: true,
+  serverId: null, serverActive: true, quotaMeteringEnabled: true, quotaEgressId: null,
   pruneFailed: null, pruneCompleted: null, pruneCancelled: null,
+  speeds: {},
 };
 
-export const isOneShot = (action: string) => ["scan_watch_folder", "fetch_rss", "prune_history"].includes(action);
+/** Only pruning runs once each time rather than holding until the next rule. */
+export const isOneShot = (action: string) => action === "prune_history";
 
 export function optionsFromSchedule(schedule: ScheduleOptions): ScheduleOptionsForm {
+  const { times, speedLimits, ...rest } = schedule;
   return {
-    ...schedule,
-    timesText: (schedule.times ?? []).join(", "),
+    ...rest,
+    timesText: (times ?? []).join(", "),
     serverActive: schedule.serverActive ?? true,
     quotaMeteringEnabled: schedule.quotaMeteringEnabled ?? true,
+    speeds: Object.fromEntries(
+      (speedLimits ?? []).map((limit) => [speedKey(limit.kind, limit.id), rateText(limit.bytesPerSec)]),
+    ),
   };
 }
 
-export function optionsInput(form: ScheduleOptionsForm, action: string) {
+export function optionsInput(form: ScheduleOptionsForm, action: string, stored: readonly ScheduleSpeedLimit[] = []) {
   const hourly = isOneShot(action) ? form.everyHourAtMinute : null;
-  // A script rule lists its times in the time field, and the editor offers it no second list.
-  const listed = hourly === null && action !== "run_script";
+  // A speed rule takes the one time of day.
+  const listed = hourly === null && action !== "speed_limit";
   return {
     times: listed ? form.timesText.split(",").map((time) => time.trim()).filter(Boolean) : [],
     everyHourAtMinute: hourly,
     serverId: action === "set_server_active" ? form.serverId : null,
     serverActive: action === "set_server_active" ? form.serverActive : null,
-    feedId: action === "fetch_rss" ? form.feedId : null,
     quotaMeteringEnabled: action === "set_quota_metering" ? form.quotaMeteringEnabled : null,
+    quotaEgressId: action === "set_quota_metering" ? form.quotaEgressId : null,
     pruneFailed: action === "prune_history" ? form.pruneFailed : null,
     pruneCompleted: action === "prune_history" ? form.pruneCompleted : null,
     pruneCancelled: action === "prune_history" ? form.pruneCancelled : null,
+    speedLimits: action === "speed_limit" ? speedLimitsInput(form.speeds, stored) : null,
   };
 }
 

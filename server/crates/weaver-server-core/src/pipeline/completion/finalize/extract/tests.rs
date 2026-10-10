@@ -17,6 +17,78 @@ use lzma_rust2::{XzOptions, XzWriter, XzWriterMt};
 
 static XZ_MT_DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn sevenz_member_requires_declared_length_and_crc() {
+    let payload = b"verified member";
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(payload);
+    let checksum = u64::from(crc.finalize());
+    for has_crc in [false, true] {
+        for size in [payload.len() - 1, payload.len(), payload.len() + 1] {
+            for stored_crc in [checksum, checksum ^ 1] {
+                let entry = sevenz_turbo::ArchiveEntry {
+                    name: "member.bin".into(),
+                    size: size as u64,
+                    has_crc,
+                    crc: stored_crc,
+                    ..Default::default()
+                };
+                let mut output = Vec::new();
+                let result =
+                    copy_verified_7z_member(&entry, &mut Cursor::new(payload), &mut output);
+                let valid = size == payload.len() && (!has_crc || stored_crc == checksum);
+                assert_eq!(
+                    result.is_ok(),
+                    valid,
+                    "size={size}, crc={stored_crc}, has_crc={has_crc}"
+                );
+                if valid {
+                    assert_eq!(result.unwrap(), payload.len() as u64);
+                    assert_eq!(output, payload);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sevenz_reposts_require_equivalent_bytes_and_container_bounds() {
+    let dir = TempDir::new().unwrap();
+    let first = dir.path().join("archive.7z.001");
+    let second = dir.path().join("archive.7z.002");
+    let copy = dir.path().join("archive.7z.0002");
+    let mut header = vec![0u8; 64];
+    header[..6].copy_from_slice(&[b'7', b'z', 0xbc, 0xaf, 0x27, 0x1c]);
+    header[12..20].copy_from_slice(&64u64.to_le_bytes());
+    header[20..28].copy_from_slice(&16u64.to_le_bytes());
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(&header[12..32]);
+    header[8..12].copy_from_slice(&crc.finalize().to_le_bytes());
+    fs::write(&first, &header).unwrap();
+    fs::write(&second, [7u8; 48]).unwrap();
+    for duplicate in [vec![7u8; 48], vec![7u8; 47], vec![8u8; 48]] {
+        fs::write(&copy, &duplicate).unwrap();
+        for reverse in [false, true] {
+            let mut parts = vec![(0, first.clone()), (1, second.clone()), (1, copy.clone())];
+            if reverse {
+                parts.reverse();
+            }
+            let selected = verified_sevenz_part_paths(&parts);
+            assert_eq!(selected.is_ok(), duplicate != vec![8u8; 48]);
+            assert!(copy.exists(), "selection must retain the other candidate");
+            if let Ok(selected) = selected {
+                assert_eq!(selected.len(), 2);
+                assert_eq!(fs::read(&selected[1]).unwrap(), vec![7u8; 48]);
+            }
+        }
+    }
+    assert!(verified_sevenz_part_paths(&[(1, first.clone()), (0, second.clone())]).is_err());
+    assert!(verified_sevenz_part_paths(&[(0, first.clone()), (2, second.clone())]).is_err());
+    header[12] ^= 1;
+    fs::write(&first, header).unwrap();
+    assert!(verified_sevenz_part_paths(&[(0, first), (1, second)]).is_err());
+}
+
 fn lock_xz_mt_decoder_test() -> MutexGuard<'static, ()> {
     let guard = XZ_MT_DECODER_TEST_LOCK
         .lock()

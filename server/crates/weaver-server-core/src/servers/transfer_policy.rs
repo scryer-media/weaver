@@ -272,6 +272,23 @@ impl ServerTransferPolicyRegistry {
         self.notify_changed();
     }
 
+    /// Start or stop one egress's quota counting bytes. It keeps that setting
+    /// whatever later happens to every egress's.
+    pub fn set_one_egress_quota_metering(&self, egress_id: u32, enabled: bool) {
+        self.egresses
+            .transfers
+            .set_quota_metering_for(StableServerId(egress_id), enabled);
+        self.notify_changed();
+    }
+
+    /// Hand one egress's quota counting back to every egress's setting.
+    pub fn clear_one_egress_quota_metering(&self, egress_id: u32) {
+        self.egresses
+            .transfers
+            .clear_quota_metering_for(StableServerId(egress_id));
+        self.notify_changed();
+    }
+
     fn reconfigure_book(
         &self,
         scope: TransferScope,
@@ -435,16 +452,35 @@ impl ServerTransferPolicyRegistry {
     }
 
     pub fn reset_usage(&self, server_id: u32) -> Result<ServerDownloadQuotaSnapshot, StateError> {
+        self.reset_usage_in(TransferScope::Server, server_id)
+    }
+
+    pub fn reset_egress_usage(
+        &self,
+        egress_id: u32,
+    ) -> Result<ServerDownloadQuotaSnapshot, StateError> {
+        self.reset_usage_in(TransferScope::Egress, egress_id)
+    }
+
+    fn reset_usage_in(
+        &self,
+        scope: TransferScope,
+        server_id: u32,
+    ) -> Result<ServerDownloadQuotaSnapshot, StateError> {
         let _maintenance = self
             .maintenance_gate
             .lock()
             .expect("server policy maintenance gate poisoned");
         let now = crate::e2e_clock::local_now();
-        let book = &self.servers;
+        let book = self.book(scope);
         let (usage, result) = {
             let mut policies = book.policies();
             let policy = policies.get_mut(&server_id).ok_or_else(|| {
-                StateError::Database(format!("server {server_id} has no transfer policy"))
+                let scope = match scope {
+                    TransferScope::Server => "server",
+                    TransferScope::Egress => "egress",
+                };
+                StateError::Database(format!("{scope} {server_id} has no transfer policy"))
             })?;
             policy.generation = policy.generation.wrapping_add(1).max(1);
             policy.window = server_quota_window(now, &policy.quota);
@@ -467,8 +503,8 @@ impl ServerTransferPolicyRegistry {
             (usage, result)
         };
         self.notify_changed();
-        self.db.upsert_server_download_usage(&usage)?;
-        info!(server_id, "server download quota usage reset");
+        self.store_usage(scope, &usage)?;
+        info!(?scope, id = server_id, "download quota usage reset");
         Ok(result)
     }
 
@@ -821,6 +857,48 @@ mod tests {
     }
 
     #[test]
+    fn resetting_egress_usage_preserves_lifetime_and_other_scopes() {
+        let db = Database::open_in_memory().unwrap();
+        let egress = db
+            .create_egress_interface(&crate::proxies::EgressInterface {
+                id: 0,
+                name: "Metered link".into(),
+                binding: crate::proxies::EgressBinding::SourceAddress {
+                    address: "127.0.0.1".parse().unwrap(),
+                },
+                enabled: true,
+                max_download_speed: 0,
+                download_quota: quota(ServerDownloadQuotaPeriod::OneTime),
+            })
+            .unwrap();
+        let server = quota_server(egress.id);
+        db.insert_server(&server).unwrap();
+        let registry = ServerTransferPolicyRegistry::new(db.clone(), &[server]).unwrap();
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        let control = registry
+            .egress_transfer_registry()
+            .control(StableServerId(egress.id));
+        let mut permit = control.try_reserve(1_000).unwrap();
+        permit.record_blocking(1_000);
+        permit.finish();
+        let rejection = control.try_reserve(1).err().unwrap();
+        let server_before = registry.snapshot(egress.id).unwrap();
+        let changes = registry.subscribe_changes();
+        let reset = registry.reset_egress_usage(egress.id).unwrap();
+        assert_eq!(reset.lifetime_bytes, 1_000);
+        assert_eq!(reset.used_bytes, 0);
+        assert!(!reset.blocked);
+        assert!(!registry.quota_rejection_is_current(&rejection));
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(registry.snapshot(egress.id).unwrap(), server_before);
+        let stored = db.egress_download_usage(egress.id).unwrap().unwrap();
+        assert_eq!(stored.lifetime_bytes, 1_000);
+        assert_eq!(stored.quota_baseline_bytes, 1_000);
+    }
+
+    #[test]
     fn an_egress_rejection_is_judged_against_the_egress_not_a_server_with_its_id() {
         // A server and an egress share the id 7; only the egress is metered.
         let mut server = quota_server(7);
@@ -868,6 +946,39 @@ mod tests {
             .unwrap();
         assert!(!registry.quota_rejection_is_current(&rejection));
         assert!(!registry.egress_snapshot(7).unwrap().blocked);
+    }
+
+    #[test]
+    fn an_egress_given_a_deleted_egress_id_follows_the_metering_for_every_egress() {
+        let db = Database::open_in_memory().unwrap();
+        let registry = ServerTransferPolicyRegistry::new(db, &[]).unwrap();
+        let egress = crate::proxies::EgressInterface {
+            id: 7,
+            name: "Metered link".into(),
+            binding: crate::proxies::EgressBinding::System,
+            enabled: true,
+            max_download_speed: 0,
+            download_quota: quota(ServerDownloadQuotaPeriod::OneTime),
+        };
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        registry.set_egress_quota_metering(true);
+        registry.set_one_egress_quota_metering(7, false);
+        let transfers = registry.egress_transfer_registry();
+        assert!(!transfers.quota_metering_of(StableServerId(7)));
+
+        // Deleted, then made again under the same id.
+        registry.reconfigure_egresses(&[]).unwrap();
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        assert!(transfers.quota_metering_of(StableServerId(7)));
+        let control = transfers.control(StableServerId(7));
+        let _reservation = control
+            .try_reserve(egress.download_quota.limit_bytes)
+            .unwrap();
+        assert!(control.try_reserve(1).is_err());
     }
 
     #[test]

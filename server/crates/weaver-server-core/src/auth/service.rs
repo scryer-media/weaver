@@ -201,14 +201,15 @@ pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
     Ok(claims)
 }
 
-/// A token for one script run. Its claims name no user, so it is never
-/// accepted where a login token is, and a login token is never accepted here.
+/// A token for one script run, signed with a domain-separated key so login
+/// tokens and run tokens cannot be substituted even if their claims overlap.
 pub fn create_script_run_jwt(claims: &ScriptRunClaims, secret: &[u8]) -> String {
-    sign_claims(claims, secret)
+    sign_claims(claims, &sign_hs256(secret, b"weaver-script-run-v1"))
 }
 
 pub fn verify_script_run_jwt(token: &str, secret: &[u8]) -> Result<ScriptRunClaims, JwtError> {
-    let claims: ScriptRunClaims = verified_claims(token, secret)?;
+    let claims: ScriptRunClaims =
+        verified_claims(token, &sign_hs256(secret, b"weaver-script-run-v1"))?;
     unexpired(claims.exp)?;
     Ok(claims)
 }
@@ -263,7 +264,7 @@ fn verified_claims<T: serde::de::DeserializeOwned>(
     secret: &[u8],
 ) -> Result<T, JwtError> {
     let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
+    if parts.len() != 3 || parts[0] != TOKEN_HEADER {
         return Err(JwtError::Malformed);
     }
 

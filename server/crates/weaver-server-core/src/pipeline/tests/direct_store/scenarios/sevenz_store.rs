@@ -2622,6 +2622,9 @@ async fn a_rar_direct_set_is_never_counted_as_installed() {
 fn overstate_next_header_offset(archive: &[u8]) -> Vec<u8> {
     let mut out = archive.to_vec();
     out[12..20].copy_from_slice(&(1u64 << 50).to_le_bytes());
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(&out[12..32]);
+    out[8..12].copy_from_slice(&crc.finalize().to_le_bytes());
     out
 }
 

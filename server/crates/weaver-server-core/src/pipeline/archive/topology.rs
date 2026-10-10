@@ -938,6 +938,16 @@ pub(in crate::pipeline) fn present_waiting_rar_volumes(
     volumes
 }
 
+/// The text every "this set has no volume 0 to open from" refusal carries, so
+/// the scheduler can route it to the missing-volume path instead of failing
+/// the job outright.
+pub(in crate::pipeline) const MISSING_FIRST_RAR_VOLUME_ERROR_MARKER: &str =
+    "has no first volume (volume 0) to open from";
+
+pub(in crate::pipeline) fn is_missing_first_rar_volume_error(error: &str) -> bool {
+    error.contains(MISSING_FIRST_RAR_VOLUME_ERROR_MARKER)
+}
+
 const INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER: &str =
     "produced incoherent waiting state with no missing volumes after rebuild";
 const OWNERLESS_RAR_PLAN_ERROR_MARKER: &str =
@@ -1020,12 +1030,18 @@ impl Pipeline {
     /// states none anywhere, and treating an unstated number as an identity
     /// collapses the whole set onto one key. `None` is the format staying
     /// silent; a stated `Some(0)` wins like any other stated number.
+    ///
+    /// RAR5 is the exception to that silence: it writes the number in every
+    /// volume but the first, so a RAR5 volume that states none *is* the first
+    /// one, whatever its name says. Taking the layout there puts a misnamed
+    /// first volume on the same key as the volume its name belongs to.
     pub(in crate::pipeline) fn rar_registration_volume(
         observed_volume: Option<u32>,
         facts: &unrar_rs::RarVolumeFacts,
     ) -> u32 {
         match facts.volume_number {
             Some(stated) => stated,
+            None if facts.format == 5 && facts.is_volume => 0,
             None => observed_volume.unwrap_or(0),
         }
     }
@@ -1688,6 +1704,91 @@ impl Pipeline {
         fallback.fallback_reason = Some(error.clone());
         self.apply_rar_plan(job_id, set_name, fallback);
         Err(error)
+    }
+
+    /// Whether a set has volumes registered but has never had a first volume:
+    /// no volume 0 among its facts, its files or on disk, and no header
+    /// snapshot that could stand in for one. Such a set cannot be opened at
+    /// all, and a full-set extraction of it fails before reading a byte.
+    pub(in crate::pipeline) fn rar_set_lacks_first_volume(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> bool {
+        let Some(state) = self.rar_sets.get(&(job_id, set_name.to_string())) else {
+            return false;
+        };
+        !state.facts.is_empty()
+            && !state.facts.contains_key(&0)
+            && !state.volume_files.contains_key(&0)
+            && state.cached_headers.is_none()
+            && self.load_rar_snapshot(job_id, set_name).is_none()
+            && !self
+                .volume_paths_for_rar_set(job_id, set_name)
+                .contains_key(&0)
+    }
+
+    /// Park a set that has no first volume as waiting for it, rather than
+    /// letting it fall back to a full-set extraction that can only fail.
+    ///
+    /// The plan names every volume below the lowest one present as missing,
+    /// which is what puts the set on the ordinary missing-volume route: a
+    /// PAR2 repair when recovery data can rebuild it, and a failure that says
+    /// which volumes were seen when nothing can. Returns whether it changed
+    /// the set's plan.
+    pub(in crate::pipeline) fn park_rar_set_waiting_for_first_volume(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> bool {
+        if !self.rar_set_lacks_first_volume(job_id, set_name) {
+            return false;
+        }
+        let Some(state) = self.rar_sets.get(&(job_id, set_name.to_string())) else {
+            return false;
+        };
+        if state.active_workers > 0
+            || !state.in_flight_members.is_empty()
+            || state.plan.as_ref().is_some_and(|plan| {
+                plan.phase == RarSetPhase::WaitingForVolumes && plan.waiting_on_volumes.contains(&0)
+            })
+        {
+            return false;
+        }
+        let present: BTreeSet<u32> = state
+            .facts
+            .keys()
+            .chain(state.volume_files.keys())
+            .copied()
+            .collect();
+        let lowest_present = present.iter().next().copied().unwrap_or(1).max(1);
+        let waiting_on_volumes: HashSet<u32> = (0..lowest_present).collect();
+        let plan = RarDerivedPlan {
+            phase: RarSetPhase::WaitingForVolumes,
+            is_solid: false,
+            ready_members: Vec::new(),
+            member_names: Vec::new(),
+            member_dependencies: HashMap::new(),
+            waiting_on_volumes,
+            deletion_eligible: HashSet::new(),
+            delete_decisions: BTreeMap::new(),
+            topology: ArchiveTopology {
+                archive_type: ArchiveType::Rar,
+                volume_map: self.build_rar_volume_map(job_id, set_name),
+                complete_volumes: present.into_iter().collect(),
+                expected_volume_count: None,
+                members: Vec::new(),
+                unresolved_spans: Vec::new(),
+            },
+            fallback_reason: None,
+        };
+        warn!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            "RAR set has no first volume; waiting on it as a missing volume"
+        );
+        self.apply_rar_plan(job_id, set_name, plan);
+        true
     }
 
     pub(in crate::pipeline) fn latest_completed_rar_volume(
@@ -2694,6 +2795,27 @@ impl Pipeline {
             None => return,
         };
 
+        // Content identification can arrive after a numbered continuation built
+        // a plain split topology. Rebuild it before the joiner can bypass archive
+        // decoding and publish the concatenated container as a successful member.
+        if matches!(
+            role,
+            weaver_model::files::FileRole::SevenZipArchive
+                | weaver_model::files::FileRole::SevenZipSplit { .. }
+        ) && state
+            .assembly
+            .archive_topology_for(&set_name)
+            .is_some_and(|topology| topology.archive_type == ArchiveType::Split)
+        {
+            self.invalidate_reclassified_chase(job_id, &set_name);
+            self.jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .assembly
+                .remove_archive_topology(&set_name);
+        }
+        let state = self.jobs.get(&job_id).unwrap();
+
         // A split set whose joined output the recovery data already produced is
         // retired for the rest of the job. Several paths re-offer its completed
         // parts here — job restore, and the archive finalization that re-refreshes
@@ -2714,49 +2836,16 @@ impl Pipeline {
         }
 
         match role {
-            weaver_model::files::FileRole::SevenZipArchive => {
-                if state.assembly.archive_topology_for(&set_name).is_some() {
-                    let state = self.jobs.get_mut(&job_id).unwrap();
-                    state.assembly.mark_volume_complete(&set_name, 0);
-                    debug!(
-                        job_id = job_id.0,
-                        set_name = %set_name,
-                        "7z single-file volume complete"
-                    );
-                    return;
-                }
-
-                let mut volume_map = std::collections::HashMap::new();
-                volume_map.insert(filename.clone(), 0);
-
-                let topology = ArchiveTopology {
-                    archive_type: ArchiveType::SevenZip,
-                    volume_map,
-                    complete_volumes: std::collections::HashSet::new(),
-                    expected_volume_count: Some(1),
-                    members: vec![ArchiveMember {
-                        name: set_name.clone(),
-                        first_volume: 0,
-                        last_volume: 0,
-                        unpacked_size: 0,
-                    }],
-                    unresolved_spans: vec![],
+            weaver_model::files::FileRole::SevenZipArchive
+            | weaver_model::files::FileRole::SevenZipSplit { .. } => {
+                // A bare .7z can be part zero of a numbered set. Include it in
+                // the same roster before any completion can arm a chase.
+                let part_number = |role| match role {
+                    weaver_model::files::FileRole::SevenZipArchive => Some(0),
+                    weaver_model::files::FileRole::SevenZipSplit { number } => Some(number),
+                    _ => None,
                 };
-
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state
-                    .assembly
-                    .set_archive_topology(set_name.clone(), topology);
-                state.assembly.mark_volume_complete(&set_name, 0);
-
-                info!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    "7z topology set (single archive)"
-                );
-            }
-            weaver_model::files::FileRole::SevenZipSplit { number } => {
-                let completing_number = number;
+                let completing_number = part_number(role).unwrap();
 
                 if state.assembly.archive_topology_for(&set_name).is_some() {
                     let state = self.jobs.get_mut(&job_id).unwrap();
@@ -2799,8 +2888,7 @@ impl Pipeline {
                 let mut volume_map = std::collections::HashMap::new();
                 let mut max_number = 0u32;
                 for f in state.assembly.files() {
-                    if let weaver_model::files::FileRole::SevenZipSplit { number: n } =
-                        self.classified_role_for_file(job_id, f)
+                    if let Some(n) = part_number(self.classified_role_for_file(job_id, f))
                         && self
                             .classified_archive_set_name_for_file(job_id, f)
                             .as_deref()
@@ -2856,8 +2944,7 @@ impl Pipeline {
                     .files()
                     .filter(|f| f.is_complete())
                     .filter_map(|f| {
-                        if let weaver_model::files::FileRole::SevenZipSplit { number: n } =
-                            self.classified_role_for_file(job_id, f)
+                        if let Some(n) = part_number(self.classified_role_for_file(job_id, f))
                             && self
                                 .classified_archive_set_name_for_file(job_id, f)
                                 .as_deref()

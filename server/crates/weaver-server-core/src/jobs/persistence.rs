@@ -872,11 +872,13 @@ impl Database {
             *password = encrypt_archive_password(self.encryption_key(), Some(password))?
                 .expect("supplied password");
         }
-        self.run_sql_blocking(async move {
+        let _effects_writer = self.lock_script_effects_writer();
+        let rewritten_effects = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "update_active_job", |tx| {
                 let update = update.clone();
                 Box::pin(async move {
                     tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
+                    let mut rewritten_effects = None;
                     match update.category {
                         FieldUpdate::Unchanged => {}
                         FieldUpdate::Clear => {
@@ -903,6 +905,7 @@ impl Database {
                             for value in effects.parameters.values_mut() { value.clear(); }
                             effects.parameters.extend(metadata);
                             tx.execute("UPDATE script_job_state SET state = {} WHERE job_id = {}", &[SqlArg::Text(serde_json::to_string(&effects).map_err(|error| StateError::Database(error.to_string()))?), SqlArg::I64(job_id.0 as i64)]).await?;
+                            rewritten_effects = Some(effects);
                         }
                     }
                     match update.metadata {
@@ -946,11 +949,15 @@ impl Database {
                             .await?;
                         }
                     }
-                    Ok(())
+                    Ok(rewritten_effects)
                 })
             })
             .await
-        })
+        })?;
+        if let Some(effects) = rewritten_effects {
+            self.cache_script_effects(job_id.0, effects);
+        }
+        Ok(())
     }
 
     /// Persist the manual queue order as one transaction. Positions are the

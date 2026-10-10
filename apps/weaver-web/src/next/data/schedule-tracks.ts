@@ -3,6 +3,7 @@ export const SCHEDULE_TRACKS = [
   { value: "DOWNLOADS", label: "next.schedules.trackDownloads" },
   { value: "POST_PROCESSING", label: "next.schedules.trackPost" },
   { value: "WATCH_FOLDER", label: "next.schedules.trackWatchFolder" },
+  { value: "RSS", label: "next.schedules.trackRss" },
   { value: "SPEED", label: "next.schedules.trackSpeed" },
   { value: "PROFILE", label: "next.schedules.trackProfile" },
   { value: "QUOTA", label: "next.schedules.trackQuota" },

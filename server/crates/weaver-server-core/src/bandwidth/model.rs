@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// A time-based rule that pauses, resumes, changes the speed limit, or puts a
+/// A time-based rule that pauses, resumes, changes speed limits, or puts a
 /// hardware profile in force.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleEntry {
@@ -25,14 +25,6 @@ pub struct ScheduleEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduleAction {
-    /// Run a script instance. A row saved before there were instances has no
-    /// id here until it is moved over, and runs nothing.
-    RunScript {
-        #[serde(default)]
-        instance_id: String,
-        #[serde(default)]
-        run_at_startup: bool,
-    },
     Pause,
     Resume,
     PauseAll,
@@ -40,12 +32,13 @@ pub enum ScheduleAction {
     ResumePostProcessing,
     PauseWatchFolderScanning,
     ResumeWatchFolderScanning,
+    PauseRss,
+    ResumeRss,
+    /// Change any number of speed limits at once. Each target is held on its
+    /// own track, so a rule for one target never ends another's.
     SpeedLimit {
-        /// Bytes per second. 0 = unlimited.
-        bytes_per_sec: u64,
+        limits: Vec<SpeedLimitChange>,
     },
-    /// End the scheduled override and follow the operator's configured limit.
-    ConfiguredSpeedLimit,
     /// Put a hardware profile in force until the next profile rule fires.
     /// Profile rules are evaluated apart from every other action: one never
     /// ends a scheduled pause or speed limit, and neither of those ends it.
@@ -58,16 +51,44 @@ pub enum ScheduleAction {
     },
     SetQuotaMetering {
         enabled: bool,
-    },
-    ScanWatchFolder,
-    FetchRss {
-        feed_id: Option<u32>,
+        #[serde(default)]
+        target: QuotaTarget,
     },
     PruneHistory {
         failed: Option<PruneFiles>,
         completed: Option<PruneFiles>,
         cancelled: Option<PruneFiles>,
     },
+}
+
+/// One limit a speed rule sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedLimitChange {
+    pub target: SpeedTarget,
+    /// Bytes per second. 0 = no limit at this level.
+    pub bytes_per_sec: u64,
+}
+
+/// What a speed limit applies to. The effective rate of a download is the
+/// lowest of the global limit, its egress's and its provider's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum SpeedTarget {
+    Global,
+    Egress(u32),
+    Server(u32),
+}
+
+/// Which egresses a quota-metering rule turns counting on or off for.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum QuotaTarget {
+    /// Every egress without a rule of its own.
+    #[default]
+    AllEgresses,
+    Egress(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,56 +98,75 @@ pub struct PruneFiles {
 
 /// Independent held state. Removing its last rule leaves the last applied state
 /// in place until the operator or another rule changes it.
+///
+/// Tracks are applied in this order, so a single egress's quota rule is
+/// applied after the rule for every egress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScheduleTrack {
     Downloads,
     PostProcessing,
     WatchFolder,
     Rss,
-    Speed,
+    Speed(SpeedTarget),
     Profile,
-    Quota,
+    Quota(QuotaTarget),
     Server(u32),
 }
 
 impl ScheduleAction {
-    pub const fn track(&self) -> Option<ScheduleTrack> {
-        Some(match self {
-            Self::Pause | Self::Resume | Self::PauseAll => ScheduleTrack::Downloads,
-            Self::PausePostProcessing | Self::ResumePostProcessing => ScheduleTrack::PostProcessing,
-            Self::PauseWatchFolderScanning | Self::ResumeWatchFolderScanning => {
-                ScheduleTrack::WatchFolder
-            }
-            Self::SpeedLimit { .. } | Self::ConfiguredSpeedLimit => ScheduleTrack::Speed,
-            Self::HardwareProfile { .. } => ScheduleTrack::Profile,
-            Self::SetQuotaMetering { .. } => ScheduleTrack::Quota,
-            Self::SetServerActive { server_id, .. } => ScheduleTrack::Server(*server_id),
-            Self::ScanWatchFolder
-            | Self::FetchRss { .. }
-            | Self::PruneHistory { .. }
-            | Self::RunScript { .. } => {
-                return None;
-            }
-        })
-    }
-
+    /// The tracks this action holds. Empty for a one-shot.
     pub fn tracks(&self) -> Vec<ScheduleTrack> {
-        if matches!(self, Self::PauseAll | Self::Resume) {
-            vec![
+        match self {
+            Self::PauseAll | Self::Resume => vec![
                 ScheduleTrack::Downloads,
                 ScheduleTrack::WatchFolder,
                 ScheduleTrack::Rss,
-            ]
-        } else {
-            self.track().into_iter().collect()
+            ],
+            Self::Pause => vec![ScheduleTrack::Downloads],
+            Self::PausePostProcessing | Self::ResumePostProcessing => {
+                vec![ScheduleTrack::PostProcessing]
+            }
+            Self::PauseWatchFolderScanning | Self::ResumeWatchFolderScanning => {
+                vec![ScheduleTrack::WatchFolder]
+            }
+            Self::PauseRss | Self::ResumeRss => vec![ScheduleTrack::Rss],
+            Self::SpeedLimit { limits } => {
+                let mut tracks: Vec<_> = limits
+                    .iter()
+                    .map(|limit| ScheduleTrack::Speed(limit.target))
+                    .collect();
+                tracks.sort_unstable();
+                tracks.dedup();
+                tracks
+            }
+            Self::HardwareProfile { .. } => vec![ScheduleTrack::Profile],
+            Self::SetQuotaMetering { target, .. } => vec![ScheduleTrack::Quota(*target)],
+            Self::SetServerActive { server_id, .. } => vec![ScheduleTrack::Server(*server_id)],
+            Self::PruneHistory { .. } => Vec::new(),
         }
     }
 
-    /// A script rule is a one-shot with its own time syntax (`*:MM`,
-    /// `startup`). The script evaluator fires it; the schedule evaluator
-    /// neither holds nor dispatches it.
-    pub const fn is_script(&self) -> bool {
-        matches!(self, Self::RunScript { .. })
+    /// Whether this action fires once rather than holding a track.
+    pub fn is_one_shot(&self) -> bool {
+        matches!(self, Self::PruneHistory { .. })
+    }
+
+    /// The part of this action that concerns `track`: a speed rule touching
+    /// several targets is held, compared and applied one target at a time.
+    pub fn for_track(&self, track: ScheduleTrack) -> Self {
+        match (self, track) {
+            (Self::SpeedLimit { limits }, ScheduleTrack::Speed(target)) => Self::SpeedLimit {
+                // The last value given for a target wins.
+                limits: limits
+                    .iter()
+                    .rev()
+                    .find(|limit| limit.target == target)
+                    .copied()
+                    .into_iter()
+                    .collect(),
+            },
+            _ => self.clone(),
+        }
     }
 
     /// Whether failing to apply this action must keep new downloads from
@@ -146,7 +186,7 @@ impl ScheduleAction {
 
 /// Day of week for schedule entries. Reuses the same serialization as
 /// [`QuotaWeekday`] but is a separate type to avoid coupling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Weekday {
     Mon,
@@ -183,6 +223,35 @@ impl Weekday {
             chrono::Weekday::Sat => Self::Sat,
             chrono::Weekday::Sun => Self::Sun,
         }
+    }
+
+    pub const ALL: [Self; 7] = [
+        Self::Mon,
+        Self::Tue,
+        Self::Wed,
+        Self::Thu,
+        Self::Fri,
+        Self::Sat,
+        Self::Sun,
+    ];
+
+    /// The name it is saved under.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mon => "mon",
+            Self::Tue => "tue",
+            Self::Wed => "wed",
+            Self::Thu => "thu",
+            Self::Fri => "fri",
+            Self::Sat => "sat",
+            Self::Sun => "sun",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|day| day.as_str().eq_ignore_ascii_case(value.trim()))
     }
 }
 

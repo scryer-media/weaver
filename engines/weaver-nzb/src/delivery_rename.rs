@@ -56,6 +56,13 @@ const EXCLUDED_CANDIDATE_EXTENSIONS: &[&str] = &[
     "vob", "m2ts", "mts", "cpi", "clpi", "mpl", "mpls", "bdm", "bdmv", "rar", "par2",
 ];
 
+/// Executables and script launchers. A job is never named after one, whatever
+/// the unwanted extension policy says: the floor holds even when the operator
+/// turned that policy off.
+pub const EXECUTABLE_EXTENSIONS: &[&str] = &[
+    "exe", "bat", "cmd", "com", "scr", "msi", "vbs", "ps1", "lnk", "js",
+];
+
 /// Separators that make a name readable to a human. `-` is deliberately absent:
 /// it appears inside hashes often enough that counting it as a readability
 /// signal would clear names that are not readable at all.
@@ -67,7 +74,14 @@ const READABILITY_SEPARATORS: [char; 3] = [' ', '.', '_'];
 /// Returns an index into `files`. A `Some` answer means every gate passed *and*
 /// the name was judged obfuscated — the caller still owes the target-name
 /// refusal gate before it touches the disk.
-pub fn select_rename_candidate(files: &[DeliveredFile<'_>]) -> Option<usize> {
+///
+/// `is_unwanted` is the operator's unwanted extension policy, asked about the
+/// candidate's bare filename. A candidate it refuses, or one carrying an
+/// [`EXECUTABLE_EXTENSIONS`] extension, leaves the delivery with its own names.
+pub fn select_rename_candidate(
+    files: &[DeliveredFile<'_>],
+    is_unwanted: impl Fn(&str) -> bool,
+) -> Option<usize> {
     // A disc rip is a structure, not a payload with helpers. Its biggest file
     // would pass every size gate and renaming it would break the disc.
     if files
@@ -105,6 +119,10 @@ pub fn select_rename_candidate(files: &[DeliveredFile<'_>]) -> Option<usize> {
             .iter()
             .any(|excluded| ext.eq_ignore_ascii_case(excluded))
     }) {
+        return None;
+    }
+
+    if is_unwanted(name) || has_executable_extension(name) {
         return None;
     }
 
@@ -246,6 +264,10 @@ pub fn plan_renames(
         let Some(suffix) = name.strip_prefix(old_stem) else {
             continue;
         };
+        // An executable never takes the job's name, even as a helper.
+        if has_executable_extension(name) {
+            continue;
+        }
         // Only a suffix that starts a new token belongs to this stem.
         // Without this, `Show.mkv` would claim `Showreel.mkv`.
         if !suffix.is_empty() && !suffix.starts_with(['.', '-', '_', ' ']) {
@@ -265,6 +287,14 @@ pub fn plan_renames(
     }
 
     plan
+}
+
+fn has_executable_extension(name: &str) -> bool {
+    extension_of(name).is_some_and(|ext| {
+        EXECUTABLE_EXTENSIONS
+            .iter()
+            .any(|executable| ext.eq_ignore_ascii_case(executable))
+    })
 }
 
 fn allocate_free_stem(
@@ -368,6 +398,10 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
+    fn no_policy(_: &str) -> bool {
+        false
+    }
+
     fn file(relative_path: &str, bytes: u64) -> DeliveredFile<'_> {
         DeliveredFile {
             relative_path,
@@ -434,13 +468,13 @@ mod tests {
             file("Yb5drZSkNi20UCMkb.mkv", 900 * MIB),
             file("Yb5drZSkNi20UCMkb.nfo", 4096),
         ];
-        assert_eq!(select_rename_candidate(&files), Some(0));
+        assert_eq!(select_rename_candidate(&files, no_policy), Some(0));
     }
 
     #[test]
     fn a_lone_obfuscated_file_is_selected() {
         let files = [file("Yb5drZSkNi20UCMkb.mkv", 900 * MIB)];
-        assert_eq!(select_rename_candidate(&files), Some(0));
+        assert_eq!(select_rename_candidate(&files, no_policy), Some(0));
     }
 
     #[test]
@@ -450,26 +484,26 @@ mod tests {
             file("Yb5drZSkNi20UCMkb.mkv", 900 * MIB),
             file("Kf2ptQWmXe81ZBnrd.mkv", 800 * MIB),
         ];
-        assert_eq!(select_rename_candidate(&files), None);
+        assert_eq!(select_rename_candidate(&files, no_policy), None);
     }
 
     #[test]
     fn small_files_are_never_candidates() {
         let files = [file("Yb5drZSkNi20UCMkb.mkv", 9 * MIB)];
-        assert_eq!(select_rename_candidate(&files), None);
+        assert_eq!(select_rename_candidate(&files, no_policy), None);
     }
 
     #[test]
     fn readable_payload_is_left_alone() {
         let files = [file("Silver.Horizon.2024.1080p.mkv", 900 * MIB)];
-        assert_eq!(select_rename_candidate(&files), None);
+        assert_eq!(select_rename_candidate(&files, no_policy), None);
     }
 
     #[test]
     fn excluded_extensions_are_never_candidates() {
         for name in ["Yb5drZSkNi20UCMkb.vob", "Yb5drZSkNi20UCMkb.rar"] {
             let files = [file(name, 900 * MIB)];
-            assert_eq!(select_rename_candidate(&files), None, "{name}");
+            assert_eq!(select_rename_candidate(&files, no_policy), None, "{name}");
         }
     }
 
@@ -479,13 +513,72 @@ mod tests {
             file("VIDEO_TS/VTS_01_1.VOB", 900 * MIB),
             file("Yb5drZSkNi20UCMkb.mkv", 400 * MIB),
         ];
-        assert_eq!(select_rename_candidate(&files), None);
+        assert_eq!(select_rename_candidate(&files, no_policy), None);
 
         let bluray = [
             file("BDMV/STREAM/00000.m2ts", 900 * MIB),
             file("Yb5drZSkNi20UCMkb.mkv", 400 * MIB),
         ];
-        assert_eq!(select_rename_candidate(&bluray), None);
+        assert_eq!(select_rename_candidate(&bluray, no_policy), None);
+    }
+
+    #[test]
+    fn an_executable_is_never_a_candidate_even_without_a_policy() {
+        for extension in EXECUTABLE_EXTENSIONS {
+            for name in [
+                format!("Yb5drZSkNi20UCMkb.{extension}"),
+                format!("Yb5drZSkNi20UCMkb.{}", extension.to_ascii_uppercase()),
+            ] {
+                let files = [file(&name, 1400 * MIB), file("Yb5drZSkNi20UCMkb.nfo", 4096)];
+                assert_eq!(select_rename_candidate(&files, no_policy), None, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_same_stem_executable_keeps_its_name_even_without_a_policy() {
+        for extension in EXECUTABLE_EXTENSIONS {
+            for executable in [
+                format!("Yb5drZSkNi20UCMkb.{extension}"),
+                format!("Yb5drZSkNi20UCMkb.{}", extension.to_ascii_uppercase()),
+            ] {
+                let files = [
+                    file("Yb5drZSkNi20UCMkb.mkv", 1400 * MIB),
+                    file(&executable, 4096),
+                ];
+                assert_eq!(
+                    select_rename_candidate(&files, no_policy),
+                    Some(0),
+                    "{executable}"
+                );
+                let plan = plan_renames(&files, 0, "Silver Horizon 2024");
+                assert_eq!(
+                    plan,
+                    vec![PlannedRename {
+                        from: "Yb5drZSkNi20UCMkb.mkv".into(),
+                        to: "Silver Horizon 2024.mkv".into(),
+                    }],
+                    "{executable}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_the_policy_refuses_is_never_a_candidate() {
+        let files = [
+            file("feature/Yb5drZSkNi20UCMkb.iso", 900 * MIB),
+            file("feature/Yb5drZSkNi20UCMkb.nfo", 4096),
+        ];
+        let iso_policy = |name: &str| name.to_ascii_lowercase().ends_with(".iso");
+        assert_eq!(select_rename_candidate(&files, iso_policy), None);
+        // The policy is asked about the bare filename, and only refuses what
+        // it names.
+        assert_eq!(
+            select_rename_candidate(&files, |name: &str| name.contains('/')),
+            Some(0)
+        );
+        assert_eq!(select_rename_candidate(&files, no_policy), Some(0));
     }
 
     // ── plan_renames ────────────────────────────────────────────────────

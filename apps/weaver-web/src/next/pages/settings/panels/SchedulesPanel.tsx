@@ -13,7 +13,6 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { PrimaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
-import { formatRate } from "../../../data/format";
 import { SCHEDULE_TRACKS, type ScheduleTrack } from "../../../data/schedule-tracks";
 import {
   profileName,
@@ -21,12 +20,12 @@ import {
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
 import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
-import { scheduleActionFields, scheduleActionHelp, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleInstances, scheduleTimeLabel, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import { scheduleActionFields, scheduleActionHelp, scheduleSpeedSections, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
+import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
- * the hardware profile.
+ * a setting. Scripts keep their run times on their own jobs and never show here.
  *
  * Weekdays are a set rather than a list of rules, so the editor draws them as
  * seven toggling chips — the one control in the design system that repeats
@@ -34,9 +33,6 @@ import { ADDITIONAL_SCHEDULE_ACTIONS, NEW_SCHEDULE_OPTIONS, SCHEDULE_DAYS, isOne
  */
 
 interface Schedule extends ScheduleOptions {
-  /** The script instance a `run_script` rule runs. */
-  instanceId: string | null;
-  runAtStartup: boolean;
   id: string;
   enabled: boolean;
   label: string | null;
@@ -44,74 +40,37 @@ interface Schedule extends ScheduleOptions {
   time: string;
   actionType: string;
   track: ScheduleTrack;
-  speedLimitBytes: number | null;
   hardwareProfile: HardwareProfileName | null;
 }
 
 interface ScheduleForm {
   options: ScheduleOptionsForm;
-  /** Empty until an instance is picked. */
-  instanceId: string;
-  runAtStartup: boolean;
   enabled: boolean;
   label: string;
   days: string[];
   time: string;
   actionType: string;
-  speedMib: number;
-  speedUnlimited: boolean;
   /** Null until one is picked; the editor then offers the recommendation. */
   hardwareProfile: HardwareProfileName | null;
 }
 
-const MIB = 1024 * 1024;
-
-/** A stored limit as the editor shows it: mebibytes, to the two places its field keeps. */
-const toMib = (bytes: number) => Math.round((bytes / MIB) * 100) / 100;
-
-const ACTIONS: { value: string; label: string }[] = [
-  ...ADDITIONAL_SCHEDULE_ACTIONS,
-  { value: "run_script", label: "next.schedules.runScript" },
-  { value: "pause", label: "next.schedules.pause" },
-  { value: "resume", label: "next.schedules.resume" },
-  { value: "speed_limit", label: "next.schedules.setLimit" },
-  { value: "configured_speed_limit", label: "next.schedules.useConfiguredLimit" },
-  { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
-  { value: "resume_watch_folder_scanning", label: "next.schedules.resumeWatchFolder" },
-  { value: "hardware_profile", label: "next.schedules.setProfile" },
-];
-
 const NEW_SCHEDULE: ScheduleForm = {
   options: NEW_SCHEDULE_OPTIONS,
-  instanceId: "",
-  runAtStartup: false,
   enabled: true,
   label: "",
   days: [],
   time: "08:00",
   actionType: "pause",
-  speedMib: 5,
-  speedUnlimited: false,
   hardwareProfile: null,
 };
 
 function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets): string {
-  if (schedule.actionType === "run_script") {
-    // A rule names its instance by id; the list shows the name the operator gave it.
-    const instance = scheduleInstances(targets).find((entry) => entry.id === schedule.instanceId);
-    return instance ? t("next.schedules.runScriptNamed", { script: instance.name }) : t("next.schedules.runScript");
-  }
   const details = scheduleActionDetails(t, schedule, targets);
   if (details) return details;
-  if (schedule.actionType === "speed_limit") {
-    return schedule.speedLimitBytes
-      ? t("next.schedules.limitTo", { rate: formatRate(schedule.speedLimitBytes) })
-      : t("next.schedules.removeLimit");
-  }
   if (schedule.actionType === "hardware_profile" && schedule.hardwareProfile) {
     return t("next.schedules.profileTo", { profile: profileName(t, schedule.hardwareProfile) });
   }
-  const action = ACTIONS.find((option) => option.value === schedule.actionType);
+  const action = SCHEDULE_ACTIONS.find((option) => option.value === schedule.actionType);
   return action ? t(action.label) : schedule.actionType;
 }
 
@@ -155,15 +114,10 @@ export function SchedulesPanel() {
       schedule
         ? {
             enabled: schedule.enabled,
-            instanceId: schedule.instanceId ?? "",
-            runAtStartup: schedule.runAtStartup,
             label: schedule.label ?? "",
             days: schedule.days,
             time: schedule.time,
             actionType: schedule.actionType,
-            speedUnlimited:
-              schedule.actionType === "speed_limit" && !schedule.speedLimitBytes,
-            speedMib: schedule.speedLimitBytes ? toMib(schedule.speedLimitBytes) : NEW_SCHEDULE.speedMib,
             hardwareProfile: schedule.hardwareProfile,
             options: optionsFromSchedule(schedule),
           }
@@ -173,6 +127,18 @@ export function SchedulesPanel() {
   };
 
   const save = async () => {
+    if (form.actionType === "speed_limit") {
+      // What is wrong with a rate, or a rule that sets nothing, is said before saving.
+      const typed = Object.values(form.options.speeds);
+      if (typed.some((text) => speedProblem(text) !== null)) {
+        setError(t("next.schedules.speedInvalid"));
+        return;
+      }
+      if (typed.every((text) => text.trim() === "")) {
+        setError(t("next.schedules.speedNeeded"));
+        return;
+      }
+    }
     setBusy(true);
     const input: Record<string, unknown> = {
       time: form.time,
@@ -180,23 +146,10 @@ export function SchedulesPanel() {
       days: form.days.length > 0 ? form.days : null,
       label: form.label.trim() || null,
       enabled: form.enabled,
-      ...optionsInput(form.options, form.actionType),
+      ...optionsInput(form.options, form.actionType, editing?.speedLimits ?? []),
     };
-    if (form.actionType === "speed_limit") {
-      // A limit the field only rounded for display goes back exactly as it was stored.
-      const stored = editing?.speedLimitBytes ?? 0;
-      input.speedLimitBytes = form.speedUnlimited
-        ? 0
-        : stored > 0 && toMib(stored) === form.speedMib
-          ? stored
-          : Math.round(form.speedMib * MIB);
-    }
     if (form.actionType === "hardware_profile") {
       input.hardwareProfile = formProfile;
-    }
-    if (form.actionType === "run_script") {
-      input.instanceId = form.instanceId || null;
-      input.runAtStartup = form.runAtStartup;
     }
     const result =
       editingId === "new"
@@ -236,19 +189,9 @@ export function SchedulesPanel() {
     void reexecute({ requestPolicy: "network-only" });
   };
 
-  // A script rule can outlive its instance, or the instance can stop running
-  // on a schedule; the rule then does nothing, and its row says so. Nothing
-  // is said until the instances have loaded.
-  const instanceProblem = (schedule: Schedule) =>
-    schedule.actionType === "run_script" &&
-    targets?.scriptInstances !== undefined &&
-    !scheduleInstances(targets).some((instance) => instance.id === schedule.instanceId)
-      ? t("next.schedules.instanceProblem")
-      : null;
-
-  const row = (schedule: Schedule, problem: string | null) => ({
+  const row = (schedule: Schedule) => ({
     id: schedule.id,
-    searchText: `${scheduleTimeLabel(schedule)} ${scheduleDaysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""} ${problem ?? ""}`,
+    searchText: `${scheduleTimeLabel(schedule)} ${scheduleDaysLabel(t, schedule.days)} ${actionLabel(t, schedule, targets)} ${schedule.label ?? ""}`,
     cells: [
       <Cell key="time" mono className="text-wv-fg" title={scheduleTimeLabel(schedule)}>
         {scheduleTimeLabel(schedule)}
@@ -256,14 +199,9 @@ export function SchedulesPanel() {
       <Cell key="days" mono className="text-wv-secondary">
         {scheduleDaysLabel(t, schedule.days)}
       </Cell>,
-      <div key="action" className="flex min-w-0 flex-col gap-1">
-        <Cell title={actionLabel(t, schedule, targets)}>
-          {actionLabel(t, schedule, targets)}
-        </Cell>
-        {problem ? (
-          <span className="text-[11.5px] leading-[1.4] text-wv-error-text">{problem}</span>
-        ) : null}
-      </div>,
+      <Cell key="action" title={actionLabel(t, schedule, targets)}>
+        {actionLabel(t, schedule, targets)}
+      </Cell>,
       <Cell key="label" className="text-wv-muted">
         {schedule.label || "—"}
       </Cell>,
@@ -309,7 +247,7 @@ export function SchedulesPanel() {
         note: track.value === "ONE_SHOT" ? t("next.schedules.oneShotNote") : undefined,
         rows: schedules
           .filter((schedule) => schedule.track === track.value)
-          .map((schedule) => row(schedule, instanceProblem(schedule))),
+          .map((schedule) => row(schedule)),
       })),
     },
   ];
@@ -320,23 +258,8 @@ export function SchedulesPanel() {
     value: form.options,
     onChange: (options: ScheduleOptionsForm) => setForm((current) => ({ ...current, options })),
   };
-  // A rule runs one schedule instance, picked by the name it was given.
-  const runnable = scheduleInstances(targets);
-  const instanceOptions = [
-    ...(form.instanceId === ""
-      ? [{ value: "", label: t(runnable.length > 0 ? "next.schedules.chooseInstance" : "next.schedules.noInstances") }]
-      : []),
-    ...runnable.map((instance) => ({
-      value: instance.id,
-      label: instance.name === instance.script ? instance.name : `${instance.name} · ${instance.script}`,
-    })),
-    // A rule can outlive its instance; say so rather than show a bare id.
-    ...(form.instanceId !== "" && !runnable.some((instance) => instance.id === form.instanceId)
-      ? [{ value: form.instanceId, label: t("next.schedules.instanceGone") }]
-      : []),
-  ];
   // The editor says how long a rule lasts in the words its group uses in the list.
-  const runsOnce = form.actionType === "run_script" || isOneShot(form.actionType);
+  const runsOnce = isOneShot(form.actionType);
 
   return (
     <>
@@ -369,10 +292,8 @@ export function SchedulesPanel() {
               {
                 id: "time",
                 label: t("next.schedules.time"),
-                // A script rule's time field takes the script evaluator's own notation.
-                help: form.actionType === "run_script" ? t("next.schedules.scriptTimeHelp") : undefined,
                 control: {
-                  kind: form.actionType === "run_script" ? "text" : "time",
+                  kind: "time",
                   value: form.time,
                   onChange: (next: string) => setForm((current) => ({ ...current, time: next })),
                 },
@@ -428,54 +349,10 @@ export function SchedulesPanel() {
                 control: {
                   kind: "select",
                   value: form.actionType,
-                  options: ACTIONS.map((option) => ({ ...option, label: t(option.label) })),
+                  options: SCHEDULE_ACTIONS.map((option) => ({ value: option.value, label: t(option.label) })),
                   onChange: (next) => setForm((current) => ({ ...current, actionType: next })),
                 },
               },
-              ...(form.actionType === "run_script" ? [
-                { id: "instanceId", label: t("next.schedules.instance"), help: t("next.schedules.instanceHelp"), control: {
-                  kind: "select" as const, value: form.instanceId, options: instanceOptions,
-                  onChange: (instanceId: string) => setForm((current) => ({ ...current, instanceId })),
-                } },
-                { id: "runAtStartup", label: t("next.schedules.runAtStartup"), help: t("next.schedules.runAtStartupHelp"), control: {
-                  kind: "toggle" as const, value: form.runAtStartup, onChange: (runAtStartup: boolean) => setForm((current) => ({ ...current, runAtStartup })),
-                } },
-              ] : []),
-              ...(form.actionType === "speed_limit"
-                ? [
-                    {
-                      id: "speedUnlimited",
-                      label: t("next.schedules.removeLimitInstead"),
-                      help: t("next.schedules.removeLimitInsteadHelp"),
-                      control: {
-                        kind: "toggle" as const,
-                        value: form.speedUnlimited,
-                        onChange: (next: boolean) =>
-                          setForm((current) => ({ ...current, speedUnlimited: next })),
-                      },
-                    },
-                    ...(form.speedUnlimited
-                      ? []
-                      : [
-                          {
-                            id: "speedMib",
-                            label: t("next.schedules.speedLimit"),
-                            help: t("next.schedules.speedLimitHelp"),
-                            // The same field as the bandwidth panel's ceiling, with
-                            // the fractions a rule could already be saved with.
-                            control: {
-                              kind: "number" as const,
-                              value: form.speedMib,
-                              min: 0,
-                              precision: 2,
-                              suffix: "MB/s",
-                              onChange: (next: number) =>
-                                setForm((current) => ({ ...current, speedMib: next })),
-                            },
-                          },
-                        ]),
-                  ]
-                : []),
               ...scheduleActionFields({ ...optionFields, targets }),
               ...(form.actionType === "hardware_profile"
                 ? [
@@ -522,6 +399,17 @@ export function SchedulesPanel() {
               },
             ],
           },
+          ...(form.actionType === "speed_limit"
+            ? scheduleSpeedSections({
+                ...optionFields,
+                targets,
+                // A rate typed after a refused save takes back what was said about it.
+                onChange: (options) => {
+                  setError(null);
+                  optionFields.onChange(options);
+                },
+              })
+            : []),
         ]}
       />
 

@@ -19,6 +19,19 @@ impl DraftNetworkRoute {
     pub fn leg_count(&self) -> usize {
         self.legs.len()
     }
+    pub fn nntp_dialer_for_leg(
+        &self,
+        position: usize,
+        server: u32,
+    ) -> Result<Arc<weaver_nntp::route_dialer::RouteDialer>, String> {
+        let leg = self.legs.get(position).ok_or("draft leg does not exist")?;
+        Ok(Arc::new(weaver_nntp::route_dialer::RouteDialer {
+            inner: leg.stage.clone(),
+            egress_controls: self.isolated.egress_controls.clone(),
+            runtime: self.handle.clone(),
+            server,
+        }))
+    }
     pub fn bridge_for_leg(&self, position: usize) -> Result<Arc<Bridge>, String> {
         let mut bridges = self.bridges.lock().expect("draft bridges");
         if let Some(bridge) = bridges.get(&position) {

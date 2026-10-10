@@ -1658,6 +1658,73 @@ async fn interleaved_obfuscated_header_sets_are_refused_not_guessed() {
 }
 
 #[tokio::test]
+async fn missing_part_report_requires_an_explicit_tail_and_checks_every_hole() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41104);
+    let volumes = vec![
+        ("example.part001.rar".to_string(), vec![0u8; 32]),
+        ("example.part004.rar".to_string(), vec![0u8; 32]),
+    ];
+    let spec = direct_store_job_spec_with_articles("Numbered archive", &volumes, 1);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    std::fs::write(working_dir.join("example.part002.rar"), [0u8; 32]).unwrap();
+    assert_eq!(
+        pipeline.missing_numbered_archive_part(job_id).as_deref(),
+        Some("missing archive part 'example.part003.rar'")
+    );
+
+    let job_id = JobId(41105);
+    let volumes = vec![
+        ("a1b2c3d40010".to_string(), vec![0u8; 32]),
+        ("a1b2c3d40012".to_string(), vec![0u8; 32]),
+    ];
+    let spec = direct_store_job_spec_with_articles("Obfuscated archive", &volumes, 1);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for file_index in 0..2 {
+        let file_id = NzbFileId { job_id, file_index };
+        let mut identity = pipeline.effective_file_identity(job_id, file_id).unwrap();
+        identity.classification = Some(crate::jobs::assembly::DetectedArchiveIdentity {
+            kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+            set_name: "archive".to_string(),
+            volume_index: Some(file_index),
+        });
+        pipeline.set_file_identity(job_id, identity).unwrap();
+    }
+    assert_eq!(pipeline.missing_numbered_archive_part(job_id), None);
+}
+
+#[tokio::test]
+async fn complete_reposts_require_matching_content_beyond_the_identity_prefix() {
+    for corrupt in [false, true] {
+        let payload: Vec<u8> = (0..70_001u32).map(|index| (index % 211) as u8).collect();
+        let originals = single_member_store_set("nested/feature.mkv", &payload, 2);
+        let mut copies = originals.clone();
+        copies.extend(originals.clone());
+        // The headers, length and first 16 KiB still agree. Only a full-content
+        // comparison distinguishes this claimant from an identical repost.
+        if corrupt {
+            copies[2].1[20_000] ^= 1;
+        }
+        let volumes = obfuscate_volumes(&copies);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let job_id = JobId(41103);
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, 1);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        // Keep the set live: volume zero is durable, but its continuation has
+        // not arrived. A collision must be judged before finalization.
+        for file_index in [0, 2] {
+            submit_volume_article_of(&mut pipeline, job_id, &volumes, file_index, 0, 1).await;
+        }
+        let sets = pipeline.direct_store.sets_for(job_id);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].is_demoted(), corrupt, "corrupt={corrupt}: {sets:?}");
+    }
+}
+
+#[tokio::test]
 async fn par2_damage_a_direct_set_cannot_see_demotes_it_and_ends_where_the_conventional_gate_does()
 {
     let member_name = "Silver.Horizon.S01E14.mkv";

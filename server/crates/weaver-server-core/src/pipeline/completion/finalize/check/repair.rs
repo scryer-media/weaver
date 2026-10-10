@@ -320,6 +320,13 @@ impl Pipeline {
                 continue;
             }
 
+            if old
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| self.chase_keeps_archive_alias(job_id, name, &correct_name))
+            {
+                continue;
+            }
             if new.exists() && !runtime_fs::paths_equivalent_for_placement(old, &new) {
                 warn!(
                     job_id = job_id.0,

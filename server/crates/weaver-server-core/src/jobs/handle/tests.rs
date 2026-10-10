@@ -404,9 +404,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::ApplyScheduleAction { reply, .. } => {
                     let _ = reply.send(());
                 }
-                SchedulerCommand::ClearScheduleAction { reply } => {
-                    let _ = reply.send(());
-                }
                 SchedulerCommand::SetHardwareProfile { reply, .. }
                 | SchedulerCommand::SetScheduledHardwareProfile { reply, .. } => {
                     let _ = reply.send(());
