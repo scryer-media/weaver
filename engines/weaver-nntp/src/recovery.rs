@@ -13,13 +13,25 @@ struct State {
     probe: Option<u64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RecoveryGate {
     state: Mutex<State>,
     // Only admission/retirement changes this frontier. Live connections at or
     // above it may issue work without locking the recovery policy.
     first_current_id: AtomicU64,
     quarantined: AtomicBool,
+    changed: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for RecoveryGate {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            first_current_id: AtomicU64::default(),
+            quarantined: AtomicBool::default(),
+            changed: tokio::sync::watch::channel(0).0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -31,6 +43,13 @@ pub struct RecoverySnapshot {
 }
 
 impl RecoveryGate {
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+    fn publish(&self) {
+        self.changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
     pub(crate) fn snapshot(&self) -> RecoverySnapshot {
         let state = self.state.lock().expect("recovery gate poisoned");
         RecoverySnapshot {
@@ -80,6 +99,7 @@ impl RecoveryGate {
             Ordering::Release,
         );
         self.quarantined.store(true, Ordering::Release);
+        self.publish();
         Some(until)
     }
 
@@ -138,6 +158,7 @@ impl ConnectionHealth {
         state.probe = None;
         self.probe.store(false, Ordering::Release);
         self.gate.quarantined.store(false, Ordering::Release);
+        self.gate.publish();
         true
     }
 
@@ -168,6 +189,7 @@ impl Drop for ConnectionHealthLease {
                     .expect("recovery identity exhausted"),
                 Ordering::Release,
             );
+            self.0.gate.publish();
         }
     }
 }

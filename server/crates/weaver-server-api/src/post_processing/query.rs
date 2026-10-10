@@ -5,7 +5,7 @@ use weaver_server_core::post_processing::listing::list_scripts;
 use weaver_server_core::post_processing::output::ScriptRunFilter;
 
 /// The scripts directory as it is now. A directory that cannot be read is not
-/// an error here: it is the reason every instance reports for being unable to
+/// an error here: it is the reason every script job reports for being unable to
 /// run.
 pub(crate) fn directory_view(db: &Database) -> ScriptDirectoryView {
     ScriptDirectoryView::new(
@@ -45,7 +45,7 @@ impl PostProcessingQuery {
         ))
     }
 
-    /// Every saved instance, in run order.
+    /// Every saved script job, in run order.
     #[graphql(guard = "AdminGuard")]
     async fn script_instances(&self, ctx: &Context<'_>) -> Result<Vec<ScriptInstanceGql>> {
         let db = ctx.data::<Database>()?.clone();
@@ -63,7 +63,7 @@ impl PostProcessingQuery {
         .map_err(|error| async_graphql::Error::new(error.to_string()))
     }
 
-    /// One saved instance, or null when there is none by that id.
+    /// One saved script job, or null when there is none by that id.
     #[graphql(guard = "AdminGuard")]
     async fn script_instance(
         &self,
@@ -82,7 +82,7 @@ impl PostProcessingQuery {
         .map_err(|error| async_graphql::Error::new(error.to_string()))
     }
 
-    /// Every named secret, by name, with the instances that link it. Values
+    /// Every named secret, by name, with the script jobs that link it. Values
     /// are never returned.
     #[graphql(guard = "AdminGuard")]
     async fn secrets(&self, ctx: &Context<'_>) -> Result<Vec<SecretGql>> {

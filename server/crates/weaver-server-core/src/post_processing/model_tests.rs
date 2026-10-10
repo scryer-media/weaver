@@ -1,7 +1,7 @@
 use super::model::{
-    DEFAULT_UNACCEPTABLE_EXTENSIONS, OptionName, OptionValue, PostProcessingSettings, PostProcessingSummary, ResolvedOption,
-    ScriptAdapter, ScriptManifest, ScriptName, ScriptOption, ScriptOptionType, ScriptStatus,
-    SecretOptionValue, merge_post_processing_summary,
+    DEFAULT_UNACCEPTABLE_EXTENSIONS, OptionName, OptionValue, PostProcessingSettings,
+    PostProcessingSummary, ResolvedOption, ScriptAdapter, ScriptManifest, ScriptName, ScriptOption,
+    ScriptOptionType, ScriptStatus, SecretOptionValue, merge_post_processing_summary,
 };
 
 fn manifest(options: Vec<ScriptOption>) -> ScriptManifest {

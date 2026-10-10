@@ -452,16 +452,35 @@ impl ServerTransferPolicyRegistry {
     }
 
     pub fn reset_usage(&self, server_id: u32) -> Result<ServerDownloadQuotaSnapshot, StateError> {
+        self.reset_usage_in(TransferScope::Server, server_id)
+    }
+
+    pub fn reset_egress_usage(
+        &self,
+        egress_id: u32,
+    ) -> Result<ServerDownloadQuotaSnapshot, StateError> {
+        self.reset_usage_in(TransferScope::Egress, egress_id)
+    }
+
+    fn reset_usage_in(
+        &self,
+        scope: TransferScope,
+        server_id: u32,
+    ) -> Result<ServerDownloadQuotaSnapshot, StateError> {
         let _maintenance = self
             .maintenance_gate
             .lock()
             .expect("server policy maintenance gate poisoned");
         let now = crate::e2e_clock::local_now();
-        let book = &self.servers;
+        let book = self.book(scope);
         let (usage, result) = {
             let mut policies = book.policies();
             let policy = policies.get_mut(&server_id).ok_or_else(|| {
-                StateError::Database(format!("server {server_id} has no transfer policy"))
+                let scope = match scope {
+                    TransferScope::Server => "server",
+                    TransferScope::Egress => "egress",
+                };
+                StateError::Database(format!("{scope} {server_id} has no transfer policy"))
             })?;
             policy.generation = policy.generation.wrapping_add(1).max(1);
             policy.window = server_quota_window(now, &policy.quota);
@@ -484,8 +503,8 @@ impl ServerTransferPolicyRegistry {
             (usage, result)
         };
         self.notify_changed();
-        self.db.upsert_server_download_usage(&usage)?;
-        info!(server_id, "server download quota usage reset");
+        self.store_usage(scope, &usage)?;
+        info!(?scope, id = server_id, "download quota usage reset");
         Ok(result)
     }
 
@@ -835,6 +854,48 @@ mod tests {
         registry.reset_usage(7).unwrap();
 
         assert!(!registry.quota_rejection_is_current(&rejection));
+    }
+
+    #[test]
+    fn resetting_egress_usage_preserves_lifetime_and_other_scopes() {
+        let db = Database::open_in_memory().unwrap();
+        let egress = db
+            .create_egress_interface(&crate::proxies::EgressInterface {
+                id: 0,
+                name: "Metered link".into(),
+                binding: crate::proxies::EgressBinding::SourceAddress {
+                    address: "127.0.0.1".parse().unwrap(),
+                },
+                enabled: true,
+                max_download_speed: 0,
+                download_quota: quota(ServerDownloadQuotaPeriod::OneTime),
+            })
+            .unwrap();
+        let server = quota_server(egress.id);
+        db.insert_server(&server).unwrap();
+        let registry = ServerTransferPolicyRegistry::new(db.clone(), &[server]).unwrap();
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        let control = registry
+            .egress_transfer_registry()
+            .control(StableServerId(egress.id));
+        let mut permit = control.try_reserve(1_000).unwrap();
+        permit.record_blocking(1_000);
+        permit.finish();
+        let rejection = control.try_reserve(1).err().unwrap();
+        let server_before = registry.snapshot(egress.id).unwrap();
+        let changes = registry.subscribe_changes();
+        let reset = registry.reset_egress_usage(egress.id).unwrap();
+        assert_eq!(reset.lifetime_bytes, 1_000);
+        assert_eq!(reset.used_bytes, 0);
+        assert!(!reset.blocked);
+        assert!(!registry.quota_rejection_is_current(&rejection));
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(registry.snapshot(egress.id).unwrap(), server_before);
+        let stored = db.egress_download_usage(egress.id).unwrap().unwrap();
+        assert_eq!(stored.lifetime_bytes, 1_000);
+        assert_eq!(stored.quota_baseline_bytes, 1_000);
     }
 
     #[test]

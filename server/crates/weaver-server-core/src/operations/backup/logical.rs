@@ -16,7 +16,7 @@ use super::catalog::{
     is_engine_internal_table, is_optional_catalog_table, quote_identifier,
 };
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
-use crate::schema_migrations::{egress_quotas_v53, script_instances_v55, unwanted_extensions_v57};
+use crate::schema_migrations::{egress_quotas_v53, script_instances_v55, unwanted_extensions_v56};
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
 
@@ -893,8 +893,7 @@ async fn import_sqlite(
             expected,
         )
         .await?;
-        fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
-            .await
+        fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
     }
     .await;
     match result {
@@ -1030,14 +1029,14 @@ async fn fill_older_unwanted_extensions(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
 ) -> Result<(), StateError> {
-    if source_schema_version >= unwanted_extensions_v57::SCHEMA_VERSION {
+    if source_schema_version >= unwanted_extensions_v56::SCHEMA_VERSION {
         return Ok(());
     }
-    unwanted_extensions_v57::fill_default_unwanted_extensions(conn).await
+    unwanted_extensions_v56::fill_default_unwanted_extensions(conn).await
 }
 
 const EGRESS_CATALOG_SCHEMA_VERSION: i64 = 53;
-const SYSTEM_EGRESS_SEED: &str = "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, created_at, updated_at) VALUES (0, 'System', 'system', NULL, 1, 0, 0, 0)";
+const SYSTEM_EGRESS_SEED: &str = "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, created_at, updated_at) VALUES (0, 'System', 'system', NULL, TRUE, 0, 0, 0)";
 
 /// Chooses the tables to restore, in dependency order. A bundle from the
 /// current schema must carry exactly the export catalog. A bundle from an older
@@ -2015,7 +2014,7 @@ mod logical_reader_tests {
     #[test]
     fn a_bundle_from_before_the_default_list_restores_an_empty_unwanted_list_as_the_default() {
         use crate::post_processing::model::DEFAULT_UNACCEPTABLE_EXTENSIONS;
-        use crate::schema_migrations::unwanted_extensions_v57::SCHEMA_VERSION;
+        use crate::schema_migrations::unwanted_extensions_v56::SCHEMA_VERSION;
 
         let restored_list = |saved: &str, source_schema_version: i64| {
             let source = Database::open_in_memory().unwrap();

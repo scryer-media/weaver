@@ -410,7 +410,7 @@ impl Pipeline {
                 self.download_restart_durable_lead_retry_after.clear();
                 self.shared_state.set_paused(true);
                 self.shared_state.set_download_block(
-                    self.bandwidth_cap
+                    self.bandwidth_ledger
                         .to_download_block_state(self.global_pause()),
                 );
                 if let Err(e) = self
@@ -577,7 +577,7 @@ impl Pipeline {
                                 self.scheduled_rate_limit = Some(bytes_per_sec);
                                 self.rate_limiter.set_rate(bytes_per_sec);
                                 let mut block = self
-                                    .bandwidth_cap
+                                    .bandwidth_ledger
                                     .to_download_block_state(self.global_pause());
                                 block.scheduled_speed_limit = bytes_per_sec;
                                 self.shared_state.set_download_block(block);
@@ -595,7 +595,7 @@ impl Pipeline {
                         // that egress does not count them or refuse work.
                         match target {
                             crate::bandwidth::QuotaTarget::AllEgresses => {
-                                self.bandwidth_cap.set_metering_enabled(enabled);
+                                self.bandwidth_ledger.set_metering_enabled(enabled);
                                 if let Some(policy) = self.shared_state.server_transfer_policy() {
                                     policy.set_egress_quota_metering(enabled);
                                 }

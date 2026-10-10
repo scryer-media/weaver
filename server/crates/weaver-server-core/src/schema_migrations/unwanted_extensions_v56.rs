@@ -1,15 +1,15 @@
-//! Migration 57, upgrade step: an install that never set an unwanted
+//! Migration 56, upgrade step: an install that never set an unwanted
 //! extension list gets the default one.
 //!
 //! Earlier builds shipped the list empty, which turned the check off, so an
 //! executable posting was delivered like any other file. A saved settings
 //! document whose list is empty or absent is given the default list. A
 //! database that never saved the settings already reads the defaults, so it
-//! is left alone. The step runs once, on the upgrade to 57: an operator who
+//! is left alone. The step runs once, on the upgrade to 56: an operator who
 //! clears the list afterwards keeps it cleared.
 //!
 //! The settings key, the field and the list are spelled out here as they
-//! stood at schema 57, so later changes to the settings type do not change
+//! stood at schema 56, so later changes to the settings type do not change
 //! what this step does.
 
 use serde_json::Value;
@@ -17,10 +17,10 @@ use serde_json::Value;
 use crate::StateError;
 use crate::persistence::sql_runtime::{SqlArg, SqlConn};
 
-pub(crate) const HOOK_ID: &str = "default_unwanted_extensions_v57";
+pub(crate) const HOOK_ID: &str = "default_unwanted_extensions_v56";
 /// The schema that first ships a default list. A backup taken below it can
 /// carry the empty list earlier builds defaulted to.
-pub(crate) const SCHEMA_VERSION: i64 = 57;
+pub(crate) const SCHEMA_VERSION: i64 = 56;
 
 const SETTINGS_KEY: &str = "post_processing.settings.v2";
 const FIELD: &str = "unacceptableExtensions";

@@ -1092,6 +1092,7 @@ impl JobHistoryCache {
 /// SQL-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
+    pub(crate) rss_schedule_cache: Arc<crate::rss::ScheduleCache>,
     pub(crate) script_runtime: Arc<crate::post_processing::events::ScriptRuntime>,
     target: DatabaseTarget,
     sql_services: DatabaseServices,
@@ -1131,6 +1132,7 @@ impl Database {
 
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
+            rss_schedule_cache: Arc::new(crate::rss::ScheduleCache::default()),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             target,
             sql_services,
@@ -1167,6 +1169,7 @@ impl Database {
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: Some(crate::persistence::encryption::EncryptionKey::generate()),
+            rss_schedule_cache: Arc::new(crate::rss::ScheduleCache::default()),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             _ephemeral_dir: Some(tempdir),
         };
@@ -1384,6 +1387,7 @@ impl Database {
             job_history_cache: self.job_history_cache.clone(),
             encryption_key: self.encryption_key.clone(),
             script_runtime: self.script_runtime.clone(),
+            rss_schedule_cache: self.rss_schedule_cache.clone(),
             _ephemeral_dir: self._ephemeral_dir.clone(),
         }
     }
@@ -1656,15 +1660,6 @@ impl Database {
                     }
                 }
             }
-            if !post_processing_secret_ciphertexts(
-                stored_post_processing_options(datastore.read_exec())
-                    .await?
-                    .as_deref(),
-            )?
-            .is_empty()
-            {
-                return Ok(true);
-            }
             Ok(false)
         })?;
         if encrypted_credentials_exist {
@@ -1732,22 +1727,6 @@ impl Database {
                         ))
                     })?;
                 }
-            }
-            for ciphertext in post_processing_secret_ciphertexts(
-                stored_post_processing_options(datastore.read_exec())
-                    .await?
-                    .as_deref(),
-            )? {
-                if !is_encrypted(&ciphertext) {
-                    return Err(StateError::Conflict(
-                        "persisted post-processing secret option is not encrypted".into(),
-                    ));
-                }
-                decrypt_value(&credential_key, &ciphertext).map_err(|error| {
-                    StateError::Conflict(format!(
-                        "cannot decrypt persisted post-processing secret option: {error}"
-                    ))
-                })?;
             }
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
@@ -1909,60 +1888,6 @@ impl Database {
             Ok(())
         })
     }
-}
-
-/// Read the raw stored post-processing option blob without decrypting anything.
-///
-/// This runs before a key is installed, so it must not go through the typed
-/// settings accessors that would try to decrypt.
-async fn stored_post_processing_options(
-    exec: crate::persistence::sql_runtime::SqlExec<'_, '_>,
-) -> Result<Option<String>, StateError> {
-    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-
-    let row = SqlRuntime::fetch_optional(
-        exec,
-        "SELECT value FROM settings WHERE key = {}",
-        &[SqlArg::Text(
-            "post_processing.script_options.v1".to_string(),
-        )],
-    )
-    .await?;
-    row.map(|row| row.text("value")).transpose()
-}
-
-/// Every stored ciphertext across every script's secret options.
-fn post_processing_secret_ciphertexts(raw: Option<&str>) -> Result<Vec<String>, StateError> {
-    let Some(raw) = raw else {
-        return Ok(Vec::new());
-    };
-    let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
-        StateError::Database(format!(
-            "invalid persisted post-processing secret options: {error}"
-        ))
-    })?;
-    let scripts = value.as_object().ok_or_else(|| {
-        StateError::Database("persisted post-processing options are not an object".into())
-    })?;
-    let mut ciphertexts = Vec::new();
-    for entry in scripts.values() {
-        let Some(secrets) = entry.get("secrets").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for secret in secrets {
-            let ciphertext = secret
-                .as_object()
-                .and_then(|secret| secret.get("ciphertext"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    StateError::Database(
-                        "persisted post-processing secret option has no ciphertext".into(),
-                    )
-                })?;
-            ciphertexts.push(ciphertext.to_string());
-        }
-    }
-    Ok(ciphertexts)
 }
 
 #[cfg(test)]

@@ -574,7 +574,6 @@ export const nextFr: LocaleDictionary = {
   "next.settings.panel.proxies": "Proxys",
   "next.settings.panel.proxiesNote": "tunnels utilisables par les fournisseurs et les flux",
   "next.settings.panel.bandwidth": "Bande passante",
-  "next.settings.panel.bandwidthNote": "plafonds et quota du FAI",
   "next.settings.panel.schedules": "Planifications",
   "next.settings.panel.schedulesNote": "quand weaver se met en pause et reprend",
   "next.settings.panel.scripts": "Scripts",

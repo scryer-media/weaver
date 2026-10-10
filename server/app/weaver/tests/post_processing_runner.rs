@@ -356,9 +356,9 @@ async fn exit_codes_are_honoured_end_to_end() {
 }
 
 #[tokio::test]
-async fn a_go_script_is_run_by_go_run_and_keeps_the_exit_code_it_chose() {
+async fn a_go_script_builds_before_receiving_go_named_arguments_and_keeps_its_exit_code() {
     let data = tempfile::tempdir().unwrap();
-    let working_directory = data.path().join("work");
+    let working_directory = data.path().join("work.go");
     fs::create_dir_all(&working_directory).unwrap();
     let scripts = data.path().join("scripts");
     fs::create_dir_all(&scripts).unwrap();
@@ -370,20 +370,25 @@ async fn a_go_script_is_run_by_go_run_and_keeps_the_exit_code_it_chose() {
     .unwrap();
     let script = ScriptName::new("report.go").unwrap();
     // Stands in for the Go toolchain, which a machine running these tests need
-    // not have. It reports how it was called and ends the way `go run` ends
-    // when the program it built exits with 95.
+    // not have. It checks that compilation receives only the source and emits
+    // an executable that reports its separate arguments and exits with 95.
     let go = write_script_in(
         &data.path().join("toolchain"),
         "go",
         r#"#!/bin/sh
+[ "$1" = build ] && [ "$2" = -o ] && [ "$#" = 4 ] || exit 98
+printf 'SOURCE=%s\n' "$4"
+cat > "$3" <<'SCRIPT'
+#!/bin/sh
 printf 'ARGS='
 for argument in "$@"; do printf '[%s]' "$argument"; done
 printf '\n'
 printf 'GOCACHE=%s\n' "$GOCACHE"
 printf 'GOPROXY=%s\n' "$GOPROXY"
 printf 'NZBID=%s\n' "$NZBPP_NZBID"
-printf 'exit status 95\n' >&2
-exit 1
+exit 95
+SCRIPT
+chmod +x "$3"
 "#,
     );
 
@@ -397,15 +402,14 @@ exit 1
     request.context.compatibility.data_dir = Some(data.path().into());
     let result = execute_script(request, None).await.unwrap();
 
-    // `go run` itself exited 1; the status it reported for the script is the
-    // one that counts.
+    // The executable supplies its own exit status, without parsing stderr.
     assert_eq!(result.disposition, ExecutionDisposition::Skipped);
     assert_eq!(result.exit_code, Some(95));
     let output = String::from_utf8(result.output).unwrap();
-    // The script file follows `run`, then the arguments every script is given.
+    // Compilation and execution receive disjoint argument lists.
     assert!(
         output.contains(&format!(
-            "ARGS=[run][{}][{}][input file.nzb][Unicode job ✓][][movies][][0][]\n",
+            "SOURCE={}\nARGS=[{}][input file.nzb][Unicode job ✓][][movies][][0][]\n",
             fs::canonicalize(scripts.join("report.go"))
                 .unwrap()
                 .display(),

@@ -267,7 +267,7 @@ impl Pipeline {
         let Some(lease) = self.lease_for_handout(lane_id, server_idx, lane_mode, pressure, works)
         else {
             // The first article the scheduler handed out was refused by a
-            // reservation (durable lead, ISP cap) and is back in the queue.
+            // reservation (durable lead, download quota) and is back in the queue.
             // That clears the way it clears for an idle answer: on a wake.
             self.hold_or_park_idle_download_lane_refill(request, pressure, held_since, now);
             return;

@@ -33,6 +33,7 @@ export const NETWORK_FLOW_SUBSCRIPTION = gql`subscription NetworkFlowUpdates { n
 export const CREATE_EGRESS = gql`mutation CreateEgress($input:EgressInterfaceInput!) { createEgressInterface(input:$input) { id } }`;
 export const UPDATE_EGRESS = gql`mutation UpdateEgress($id:Int!,$input:EgressInterfaceInput!) { updateEgressInterface(id:$id,input:$input) { id } }`;
 export const DELETE_EGRESS = gql`mutation DeleteEgress($id:Int!) { deleteEgressInterface(id:$id) }`;
+export const RESET_EGRESS_USAGE = gql`mutation ResetEgressUsage($id:Int!) { resetEgressDownloadQuotaUsage(id:$id) { id } }`;
 export const TEST_EGRESS = gql`mutation TestEgress($id:Int!,$proxyId:Int,$host:String!,$port:Int!) { testEgressInterface(id:$id,proxyId:$proxyId,host:$host,port:$port) { success message sourceAddress connectMillis } }`;
 export const TEST_POOL = gql`mutation TestPool($id:Int!,$egressId:Int!,$host:String,$port:Int) { testProxyPool(id:$id,egressId:$egressId,host:$host,port:$port) { proxyId success message sourceAddress connectMillis } }`;
 export const CREATE_POOL = gql`mutation CreatePool($input:ProxyPoolInput!) { createProxyPool(input:$input) { id } }`;

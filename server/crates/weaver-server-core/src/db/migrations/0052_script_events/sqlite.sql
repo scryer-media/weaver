@@ -1,7 +1,6 @@
 CREATE TABLE script_output_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    next_seq BIGINT NOT NULL DEFAULT 0,
-    used_bytes BIGINT NOT NULL DEFAULT 0
+    next_seq BIGINT NOT NULL DEFAULT 0
 );
 INSERT INTO script_output_state(singleton) VALUES (1);
 CREATE TABLE script_outputs (
@@ -15,10 +14,12 @@ CREATE TABLE script_outputs (
     output BLOB NOT NULL,
     stored_bytes BIGINT NOT NULL,
     result_json TEXT NOT NULL,
+    status TEXT NOT NULL,
     created_at BIGINT NOT NULL
 );
 CREATE INDEX script_outputs_job_seq ON script_outputs(job_id, seq);
-CREATE INDEX script_outputs_event_seq ON script_outputs(event, seq);
+CREATE INDEX script_outputs_event_seq ON script_outputs(event, seq) WHERE job_id IS NULL;
+CREATE INDEX script_outputs_status_seq ON script_outputs(status, seq);
 CREATE TABLE script_event_queue (
     run_id TEXT PRIMARY KEY,
     job_id BIGINT,
@@ -35,4 +36,3 @@ CREATE TABLE script_job_state (
     job_id BIGINT PRIMARY KEY,
     state TEXT NOT NULL
 );
-ALTER TABLE rss_feeds ADD COLUMN scripts TEXT NOT NULL DEFAULT '[]';

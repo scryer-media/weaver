@@ -24,7 +24,7 @@ CREATE TABLE secrets (
     updated_at_ms BIGINT NOT NULL
 );
 CREATE TABLE script_instance_inputs (
-    instance_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL REFERENCES script_instances(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     value TEXT NOT NULL,
     secret_id TEXT REFERENCES secrets(id) ON DELETE RESTRICT,
@@ -36,15 +36,16 @@ CREATE TABLE script_instance_inputs (
 );
 CREATE INDEX script_instance_inputs_secret ON script_instance_inputs(secret_id);
 CREATE TABLE script_instance_categories (
-    instance_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL REFERENCES script_instances(id) ON DELETE CASCADE,
     category TEXT NOT NULL,
     PRIMARY KEY (instance_id, category)
 );
 CREATE TABLE feed_scripts (
-    feed_id BIGINT NOT NULL,
-    instance_id TEXT NOT NULL,
+    feed_id BIGINT NOT NULL REFERENCES rss_feeds(id) ON DELETE CASCADE,
+    instance_id TEXT NOT NULL REFERENCES script_instances(id) ON DELETE CASCADE,
     run_order BIGINT NOT NULL,
     PRIMARY KEY (feed_id, instance_id)
 );
 CREATE INDEX feed_scripts_instance ON feed_scripts(instance_id);
-ALTER TABLE script_output_state DROP COLUMN used_bytes;
+ALTER TABLE script_outputs ADD COLUMN instance_id TEXT REFERENCES script_instances(id) ON DELETE CASCADE;
+CREATE INDEX script_outputs_instance ON script_outputs(instance_id);

@@ -26,8 +26,8 @@ pub struct Occurrences {
 
 impl Occurrences {
     /// The jobs due between the last tick and `now`. The first tick starts
-    /// only the jobs set to run at startup, and a clock that jumped more than
-    /// ninety minutes either way starts nothing: a missed run is not replayed.
+    /// only startup jobs. After a forward clock jump, each job catches up its
+    /// latest missed occurrence once, without replaying the entire backlog.
     pub fn advance(&mut self, jobs: &[ScriptInstance], now: NaiveDateTime) -> Vec<String> {
         let previous = self.last.replace(now);
         self.fired
@@ -42,7 +42,7 @@ impl Occurrences {
                 .collect();
         };
         let delta = now - previous;
-        if delta <= Duration::zero() || delta > Duration::minutes(90) {
+        if delta <= Duration::zero() {
             return Vec::new();
         }
         let mut due = Vec::new();
@@ -60,10 +60,15 @@ impl Occurrences {
                 }
             }
             let mut fired = false;
-            for date in [previous.date(), now.date()]
-                .into_iter()
-                .collect::<BTreeSet<_>>()
-            {
+            // Every supported rule repeats at least weekly. Eight dates
+            // cover the latest eligible occurrence even after a long sleep.
+            'dates: for offset in 0..=7 {
+                let Some(date) = now.date().checked_sub_signed(Duration::days(offset)) else {
+                    break;
+                };
+                if date < previous.date() {
+                    break;
+                }
                 if !job.schedule.days.is_empty()
                     && !job
                         .schedule
@@ -72,13 +77,14 @@ impl Occurrences {
                 {
                     continue;
                 }
-                for time in &times {
+                for time in times.iter().rev() {
                     let occurrence = date.and_time(*time);
                     if previous < occurrence
                         && occurrence <= now
                         && self.fired.insert((job.id.clone(), date, *time))
                     {
                         fired = true;
+                        break 'dates;
                     }
                 }
             }
@@ -126,11 +132,16 @@ impl Database {
 pub fn spawn_script_evaluator(db: Database, config: SharedConfig) {
     tokio::spawn(async move {
         let mut occurrences = Occurrences::default();
+        let mut next_trim = tokio::time::Instant::now();
         let mut running = std::collections::BTreeMap::<String, tokio::task::JoinHandle<()>>::new();
         let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            if tokio::time::Instant::now() >= next_trim {
+                db.request_script_output_trim();
+                next_trim = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+            }
             running.retain(|_, task| !task.is_finished());
             let jobs = match tokio::task::spawn_blocking({
                 let db = db.clone();
@@ -262,15 +273,31 @@ mod tests {
     }
 
     #[test]
-    fn startup_and_clock_jumps_do_not_replay_missed_runs() {
+    fn startup_skips_old_runs_and_forward_jumps_catch_up_once() {
         let mut tracker = Occurrences::default();
         let jobs = [job(&["01:30"])];
         assert!(tracker.advance(&jobs, at("2026-10-25 01:31")).is_empty());
-        assert!(tracker.advance(&jobs, at("2026-10-26 01:31")).is_empty());
+        assert_eq!(tracker.advance(&jobs, at("2026-10-26 01:31")), ["test"]);
         assert!(tracker.advance(&jobs, at("2026-10-26 01:29")).is_empty());
-        assert_eq!(tracker.advance(&jobs, at("2026-10-26 01:30")), ["test"]);
+        assert!(tracker.advance(&jobs, at("2026-10-26 01:30")).is_empty());
         assert!(tracker.advance(&jobs, at("2026-10-26 01:00")).is_empty());
         assert!(tracker.advance(&jobs, at("2026-10-26 01:31")).is_empty());
+    }
+
+    #[test]
+    fn a_long_sleep_catches_up_the_latest_weekly_occurrence_once() {
+        let mut tracker = Occurrences::default();
+        let mut weekly = job(&["01:30", "02:30"]);
+        weekly.schedule.days = vec![Weekday::Mon];
+        let jobs = [weekly];
+        tracker.advance(&jobs, at("2026-09-01 00:00"));
+        assert_eq!(tracker.advance(&jobs, at("2026-10-09 12:00")), ["test"]);
+        assert!(tracker.fired.contains(&(
+            "test".into(),
+            at("2026-10-05 02:30").date(),
+            at("2026-10-05 02:30").time()
+        )));
+        assert!(tracker.advance(&jobs, at("2026-10-09 12:01")).is_empty());
     }
 
     #[test]

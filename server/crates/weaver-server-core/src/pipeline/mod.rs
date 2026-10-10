@@ -42,7 +42,7 @@ use tracing::{debug, error, info, warn};
 use crate::ActiveFileProgress;
 #[cfg(test)]
 use crate::RestoreJobRequest;
-use crate::bandwidth::service::BandwidthCapRuntime;
+use crate::bandwidth::service::BandwidthLedgerRuntime;
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::ExtractionReadiness;
 #[cfg(test)]
@@ -2844,7 +2844,7 @@ pub struct Pipeline {
     /// it selects the Scheduled vs ManualPause download-block presentation.
     pub(super) scheduled_pause: bool,
     /// The per-minute download ledger behind the bandwidth graph.
-    pub(crate) bandwidth_cap: BandwidthCapRuntime,
+    pub(crate) bandwidth_ledger: BandwidthLedgerRuntime,
     /// Estimated bytes charged to the speed limiter for in-flight downloads.
     pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
     /// Persisted/general speed limit restored when no schedule speed action is active.
@@ -2879,7 +2879,7 @@ pub struct Pipeline {
     /// state change, so the next tick must take them again.
     pub(super) footprint_metrics_stale: bool,
     /// Whether the last dispatch pass was held back by a gate that lifts with
-    /// time alone (a schedule window, the rate limiter, the bandwidth cap,
+    /// time alone (a schedule window, the rate limiter, a download quota,
     /// byte pressure) or found eligible work it could not place, so the idle
     /// tick must try again. Without it nothing would wake dispatch when such
     /// a gate lifts.

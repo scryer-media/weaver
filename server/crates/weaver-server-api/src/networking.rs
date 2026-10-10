@@ -835,6 +835,37 @@ impl NetworkingQuery {
 pub struct NetworkingMutation;
 #[Object]
 impl NetworkingMutation {
+    /// Reset an egress quota baseline without clearing lifetime usage.
+    #[graphql(guard = "AdminGuard")]
+    async fn reset_egress_download_quota_usage(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<EgressInterfaceGql> {
+        let runtime = runtime(ctx)?;
+        let _guard = runtime.mutations.lock().await;
+        let policy = ctx.data::<Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>>()?.clone();
+        let db = ctx.data::<Database>()?.clone();
+        let saved = spawn_blocking_db("network.reset_egress_usage", move || {
+            let saved = db
+                .list_egress_interfaces()?
+                .into_iter()
+                .find(|egress| egress.id == id)
+                .ok_or_else(|| {
+                    weaver_server_core::StateError::Conflict("egress not found".into())
+                })?;
+            policy.reset_egress_usage(id)?;
+            Ok::<_, weaver_server_core::StateError>(saved)
+        })
+        .await?;
+        runtime.network.refresh_health();
+        Ok(egress_gql(
+            saved,
+            &runtime.network.interfaces(),
+            &runtime.network,
+        ))
+    }
+
     #[graphql(guard = "AdminGuard")]
     async fn create_egress_interface(
         &self,

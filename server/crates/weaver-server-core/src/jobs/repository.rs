@@ -271,7 +271,7 @@ impl Database {
     pub fn delete_active_job(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         let db = self.clone();
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_active_job", |tx| {
                 Box::pin(async move {
                     crate::post_processing::output::delete_script_state_tx(tx, job_id.0 as i64)
@@ -285,7 +285,11 @@ impl Database {
             db.notify_script_events_changed();
             run_inline_incremental_vacuum(&datastore).await?;
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.forget_script_effects(job_id.0);
+        }
+        result
     }
 
     pub fn prune_orphan_active_state(&self) -> Result<OrphanActiveStateCounts, StateError> {

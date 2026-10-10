@@ -2,7 +2,7 @@ use tracing::{info, warn};
 
 use crate::rss::model::{
     RSS_SEEN_RETENTION_SECS, RSS_SYNC_TICK_SECS, compile_rules, evaluate_item, is_due,
-    parse_feed_items, unix_now_secs,
+    parse_feed_items,
 };
 use crate::rss::service::{
     DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, RssFeedSyncReport, RssService, RssServiceError,
@@ -74,7 +74,7 @@ impl RssService {
                     published_at: item.published_at,
                     size_bytes: item.size_bytes,
                     decision: decision.into(),
-                    seen_at: unix_now_secs(),
+                    seen_at: self.now(),
                     job_id: None,
                     item_url: item.download_url.or(item.display_url),
                     error: None,
@@ -86,7 +86,11 @@ impl RssService {
     pub fn start_background_loop(&self) -> tokio::task::JoinHandle<()> {
         let service = self.clone();
         tokio::spawn(async move {
+            let mut paused = service.inner.scheduled_paused.subscribe();
+            let mut changed = service.inner.db.rss_schedule_cache.changed.subscribe();
             loop {
+                paused.borrow_and_update();
+                changed.borrow_and_update();
                 let svc = service.clone();
                 match tokio::spawn(async move { svc.try_run_due_sync().await }).await {
                     Ok(Ok(DueSyncOutcome::Completed(report))) => {
@@ -104,33 +108,49 @@ impl RssService {
                         tracing::error!(error = %panic, "CRITICAL: RSS sync task panicked — loop continues");
                     }
                 }
-                tokio::time::sleep(service.next_due_sync_delay()).await;
+                let svc = service.clone();
+                let delay = tokio::task::spawn_blocking(move || svc.next_due_sync_delay())
+                    .await
+                    .unwrap_or(Some(std::time::Duration::from_secs(RSS_SYNC_TICK_SECS)));
+                tokio::select! {
+                    _ = paused.changed() => {},
+                    _ = changed.changed() => {},
+                    _ = async {
+                        match delay {
+                            Some(delay) => tokio::time::sleep(delay).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {},
+                }
             }
         })
     }
 
     /// How long the poller sleeps before looking again: until the earliest
-    /// enabled feed falls due, and never longer than one sync tick, so a feed
-    /// added or edited meanwhile is noticed within the tick as before.
-    pub(super) fn next_due_sync_delay(&self) -> std::time::Duration {
+    /// enabled feed falls due, and never longer than one tick, so a wall-clock
+    /// jump after a host suspend is noticed. Pauses and an empty feed list
+    /// park the timer; edits and resume transitions wake the loop through
+    /// watch channels.
+    pub(super) fn next_due_sync_delay(&self) -> Option<std::time::Duration> {
+        if self.is_scheduled_paused() {
+            return None;
+        }
         let tick = std::time::Duration::from_secs(RSS_SYNC_TICK_SECS);
         let Ok(schedules) = self.inner.db.list_rss_feed_schedules() else {
-            return tick;
+            return Some(tick);
         };
-        let now = unix_now_secs();
+        let now = self.now();
         schedules
             .iter()
             .filter(|schedule| schedule.enabled)
             .map(|schedule| schedule.next_due_at().saturating_sub(now))
             .min()
-            .map_or(tick, |secs| {
+            .map(|secs| {
                 // A feed already due is retried on the next second rather
                 // than in a tight loop, should its poll keep failing to land.
                 std::time::Duration::from_secs(secs.max(1) as u64).min(tick)
             })
     }
-
-    pub async fn reload_state(&self) {}
 
     pub async fn run_all_sync(&self) -> Result<RssSyncReport, RssServiceError> {
         let _guard = self.inner.sync_lock.lock().await;
@@ -202,7 +222,11 @@ impl RssService {
         due_only: bool,
         cancellation: crate::bandwidth::schedule::ScheduleCancellation,
     ) -> Result<RssSyncReport, RssServiceError> {
-        let feeds = self.load_target_feeds(target, due_only)?;
+        let service = self.clone();
+        let feeds =
+            tokio::task::spawn_blocking(move || service.load_target_feeds(target, due_only))
+                .await
+                .map_err(|error| RssServiceError::Http(error.to_string()))??;
         if feeds.is_empty() {
             return Ok(RssSyncReport::default());
         }
@@ -228,7 +252,7 @@ impl RssService {
                     report.feed_results.push(feed_report);
                 }
                 Err(error) => {
-                    let now = unix_now_secs();
+                    let now = self.now();
                     let message = error.to_string();
                     let _ = self
                         .inner
@@ -249,7 +273,7 @@ impl RssService {
         let _ = self
             .inner
             .db
-            .purge_old_rss_seen_items(unix_now_secs() - RSS_SEEN_RETENTION_SECS);
+            .purge_old_rss_seen_items(self.now() - RSS_SEEN_RETENTION_SECS);
 
         Ok(report)
     }
@@ -275,7 +299,7 @@ impl RssService {
                 // The due check needs four columns; the full rows, with their
                 // decrypted credentials and attached scripts, are read only
                 // for the feeds that are actually due.
-                let now = unix_now_secs();
+                let now = self.now();
                 let due: Vec<u32> = self
                     .inner
                     .db
@@ -319,7 +343,7 @@ impl RssService {
             return Ok(feeds);
         }
 
-        let now = unix_now_secs();
+        let now = self.now();
         Ok(feeds.into_iter().filter(|feed| is_due(feed, now)).collect())
     }
 
@@ -328,7 +352,7 @@ impl RssService {
         feed: &RssFeedRow,
         cancellation: &crate::bandwidth::schedule::ScheduleCancellation,
     ) -> Result<RssFeedSyncReport, RssServiceError> {
-        let now = unix_now_secs();
+        let now = self.now();
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Ok(RssFeedSyncReport::default()),

@@ -623,8 +623,13 @@ mod tests {
         write_file(root.path(), "Yb5drZSkNi20UCMkb-sample.mkv", 2 * MIB);
         write_file(root.path(), "Yb5drZSkNi20UCMkb.dut.srt", 4096);
 
-        let renamed =
-            rename_obfuscated_members(JobId(1), root.path(), &plan("Silver Horizon 2024"), &PostProcessingSettings::default()).await;
+        let renamed = rename_obfuscated_members(
+            JobId(1),
+            root.path(),
+            &plan("Silver Horizon 2024"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 3);
         assert_eq!(
@@ -642,8 +647,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_file(root.path(), "Silver.Horizon.2024.1080p.mkv", 64 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(2), root.path(), &plan("Quiet Harbour"), &PostProcessingSettings::default()).await;
+        let renamed = rename_obfuscated_members(
+            JobId(2),
+            root.path(),
+            &plan("Quiet Harbour"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
         assert_eq!(
@@ -678,8 +688,13 @@ mod tests {
         write_file(root.path(), "VIDEO_TS/VTS_01_1.VOB", 64 * MIB);
         write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 32 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(4), root.path(), &plan("Silver Horizon"), &PostProcessingSettings::default()).await;
+        let renamed = rename_obfuscated_members(
+            JobId(4),
+            root.path(),
+            &plan("Silver Horizon"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
         assert_eq!(
@@ -765,7 +780,13 @@ mod tests {
         );
         plan.srrdb.as_mut().unwrap().base_url = base_url;
 
-        let renamed = rename_obfuscated_members(JobId(8), root.path(), &plan, &PostProcessingSettings::default()).await;
+        let renamed = rename_obfuscated_members(
+            JobId(8),
+            root.path(),
+            &plan,
+            &PostProcessingSettings::default(),
+        )
+        .await;
         served.abort();
 
         assert_eq!(
@@ -790,8 +811,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_file(root.path(), "Yb5drZSkNi20UCMkb.mkv", 64 * MIB);
 
-        let renamed =
-            rename_obfuscated_members(JobId(6), root.path(), &plan("Yb5drZSkNi20UCMkb"), &PostProcessingSettings::default()).await;
+        let renamed = rename_obfuscated_members(
+            JobId(6),
+            root.path(),
+            &plan("Yb5drZSkNi20UCMkb"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 0);
     }
@@ -843,8 +869,13 @@ mod tests {
         write_file(root.path(), OUTPUT_DIR_MARKER, 32);
         write_file(root.path(), ".hidden-scratch", 512);
 
-        let renamed =
-            rename_obfuscated_members(JobId(7), root.path(), &plan("Silver Horizon"), &PostProcessingSettings::default()).await;
+        let renamed = rename_obfuscated_members(
+            JobId(7),
+            root.path(),
+            &plan("Silver Horizon"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
 
         assert_eq!(renamed, 1);
         assert!(root.path().join(OUTPUT_DIR_MARKER).is_file());

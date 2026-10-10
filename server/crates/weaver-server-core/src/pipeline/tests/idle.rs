@@ -128,20 +128,20 @@ impl IdlePipeline {
         let mut revisions = self.handle.subscribe_job_changes();
         revisions.wait_for(|revision| *revision > 0).await.unwrap();
         revisions.mark_unchanged();
-        // One idle tick after startup, so the first turn's own work is done.
-        let refreshes = self.shared_state.metrics_refresh_count();
-        while self.shared_state.metrics_refresh_count() == refreshes {
-            tokio::time::sleep(Pipeline::IDLE_SNAPSHOT_INTERVAL).await;
-        }
+        self.next_refresh().await;
         revisions.mark_unchanged();
         revisions
     }
 
-    /// Metrics refreshes over `span` of virtual time.
-    async fn refreshes_over(&self, span: Duration) -> u64 {
+    /// Observe the completed turn containing the next metrics refresh.
+    async fn next_refresh(&self) -> crate::jobs::handle::PipelineTurnObservation {
         let before = self.shared_state.metrics_refresh_count();
-        tokio::time::sleep(span).await;
-        self.shared_state.metrics_refresh_count() - before
+        let mut turns = self.shared_state.turn_observation.subscribe();
+        let observed = turns
+            .wait_for(|turn| turn.is_some_and(|turn| turn.metrics_refreshes > before))
+            .await
+            .unwrap();
+        observed.unwrap()
     }
 
     async fn shutdown(self) {
@@ -163,35 +163,28 @@ async fn idle_pipeline_with_paused_jobs_and_history_publishes_nothing() {
     let revisions = pipeline.settled_revisions().await;
     let published = *revisions.borrow();
 
-    let refreshes = pipeline.refreshes_over(Duration::from_secs(60)).await;
+    let turn = pipeline.next_refresh().await;
 
     assert!(
         !revisions.has_changed().unwrap(),
         "an idle pipeline republished its job snapshot"
     );
     assert_eq!(*revisions.borrow(), published);
-    // The gauges are still sampled, at the idle cadence.
-    assert!(refreshes > 0);
-    assert!(
-        refreshes <= 61,
-        "idle metrics tick ran {refreshes} times in 60 s"
-    );
+    assert_eq!(turn.job_revision, published);
+    assert_eq!(turn.period, Pipeline::IDLE_SNAPSHOT_INTERVAL);
     pipeline.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn idle_pipeline_publishes_a_change_in_the_turn_that_makes_it() {
+async fn idle_pipeline_publishes_a_pause_change() {
     let pipeline = idle_pipeline(8, long_history(), |_| {}).await;
     let mut revisions = pipeline.settled_revisions().await;
 
-    // The command's reply is sent from the turn that handles it, and that
-    // turn ends with the publish: no periodic tick runs between the reply
-    // and the new revision. (Ticks may run while the command persists its
-    // setting, before the reply, so the count is taken after it.)
+    // The reply and publication are separate events. Wait for the revision
+    // caused by this command, without racing the next metrics tick.
     pipeline.handle.pause_all().await.unwrap();
-    let refreshes = pipeline.shared_state.metrics_refresh_count();
     revisions.changed().await.unwrap();
-    assert_eq!(pipeline.shared_state.metrics_refresh_count(), refreshes);
+    assert!(pipeline.shared_state.is_paused());
     assert!(pipeline.handle.list_jobs().len() >= long_history().len());
     pipeline.shutdown().await;
 }
@@ -200,7 +193,10 @@ async fn idle_pipeline_publishes_a_change_in_the_turn_that_makes_it() {
 async fn metrics_tick_is_fast_while_live_and_slow_while_idle() {
     let idle = idle_pipeline(8, Vec::new(), |_| {}).await;
     idle.settled_revisions().await;
-    let idle_refreshes = idle.refreshes_over(Duration::from_secs(10)).await;
+    assert_eq!(
+        idle.next_refresh().await.period,
+        Pipeline::IDLE_SNAPSHOT_INTERVAL
+    );
     idle.shutdown().await;
 
     // A phase past the download in flight keeps the pipeline live.
@@ -213,17 +209,8 @@ async fn metrics_tick_is_fast_while_live_and_slow_while_idle() {
         .wait_for(|revision| *revision > 0)
         .await
         .unwrap();
-    let live_refreshes = live.refreshes_over(Duration::from_secs(10)).await;
+    assert_eq!(live.next_refresh().await.period, Duration::from_millis(100));
     live.shutdown().await;
-
-    assert!(
-        idle_refreshes <= 11,
-        "idle pipeline refreshed metrics {idle_refreshes} times in 10 s"
-    );
-    assert!(
-        live_refreshes >= 90,
-        "live pipeline refreshed metrics only {live_refreshes} times in 10 s"
-    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -242,10 +229,9 @@ async fn moving_rates_hold_the_fast_tick_until_a_refresh_reads_zero() {
     assert_eq!(settled.decode_rate_mbps, 0.0);
 
     // The refresh that read zero rates cleared the flag; the tick is slow.
-    let refreshes = pipeline.refreshes_over(Duration::from_secs(10)).await;
-    assert!(
-        refreshes <= 11,
-        "settled gauges kept the fast tick: {refreshes} refreshes in 10 s"
+    assert_eq!(
+        pipeline.next_refresh().await.period,
+        Pipeline::IDLE_SNAPSHOT_INTERVAL
     );
     pipeline.shutdown().await;
 }

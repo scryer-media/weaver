@@ -574,7 +574,6 @@ export const nextKo: LocaleDictionary = {
   "next.settings.panel.proxies": "프록시",
   "next.settings.panel.proxiesNote": "공급자와 피드가 사용할 수 있는 터널",
   "next.settings.panel.bandwidth": "대역폭",
-  "next.settings.panel.bandwidthNote": "상한과 ISP 데이터 한도",
   "next.settings.panel.schedules": "일정",
   "next.settings.panel.schedulesNote": "weaver가 일시 중지하고 재개하는 시점",
   "next.settings.panel.scripts": "스크립트",
