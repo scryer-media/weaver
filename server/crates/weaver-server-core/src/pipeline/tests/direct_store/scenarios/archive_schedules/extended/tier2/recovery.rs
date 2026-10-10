@@ -104,6 +104,7 @@ pub(in super::super) fn needed(
     let mut lower = 0;
     let mut readable_blocks = BTreeSet::new();
     let mut missing_blocks = Vec::new();
+    let mut sources = Vec::new();
     for file in post.index_of(Role::Data) {
         let (may, must) = post.files[file].wrong_ranges(lost.get(&file).unwrap_or(&none));
         upper += blocks_touched(&may, geometry.block);
@@ -115,6 +116,24 @@ pub(in super::super) fn needed(
             } else {
                 readable_blocks.insert(bytes);
             }
+        }
+        sources.push((&post.files[file].bytes, must));
+    }
+    // Short slices can be found inside another block, not just at its start.
+    // The repair scanner uses a rolling search for precisely these tails.
+    let short_blocks: BTreeSet<_> = missing_blocks
+        .iter()
+        .copied()
+        .filter(|bytes| bytes.len() < geometry.block && !readable_blocks.contains(bytes))
+        .collect();
+    for bytes in short_blocks {
+        if sources.iter().any(|(source, wrong)| {
+            source.windows(bytes.len()).enumerate().any(|(at, candidate)| {
+                candidate == bytes
+                    && !wrong.iter().any(|range| range.start < at + bytes.len() && at < range.end)
+            })
+        }) {
+            readable_blocks.insert(bytes);
         }
     }
     // Missing at its canonical offset does not mean unavailable: identical
@@ -144,8 +163,10 @@ fn missing_short_tail_can_be_supplied_by_an_intact_source() {
     };
     let geometry = Geometry { block: 4, packed: false };
     assert_eq!(needed(&post, geometry, &BTreeMap::new()), (2, 1));
+    post.files[1].bytes = vec![5, 9, 8, 0];
+    assert_eq!(needed(&post, geometry, &BTreeMap::new()), (2, 1));
     post.files[1].absent();
-    assert_eq!(needed(&post, geometry, &BTreeMap::new()), (4, 4));
+    assert_eq!(needed(&post, geometry, &BTreeMap::new()), (3, 3));
 }
 
 /// Recovery blocks that survive the post: at least and at most.
