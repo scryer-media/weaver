@@ -102,15 +102,50 @@ pub(in super::super) fn needed(
     let none = BTreeSet::new();
     let mut upper = 0;
     let mut lower = 0;
+    let mut readable_blocks = BTreeSet::new();
+    let mut missing_blocks = Vec::new();
     for file in post.index_of(Role::Data) {
         let (may, must) = post.files[file].wrong_ranges(lost.get(&file).unwrap_or(&none));
         upper += blocks_touched(&may, geometry.block);
-        lower += blocks_touched(&must, geometry.block);
+        for (index, bytes) in post.files[file].bytes.chunks(geometry.block).enumerate() {
+            let start = index * geometry.block;
+            let end = start + bytes.len();
+            if must.iter().any(|range| range.start < end && start < range.end) {
+                missing_blocks.push(bytes);
+            } else {
+                readable_blocks.insert(bytes);
+            }
+        }
     }
+    // Missing at its canonical offset does not mean unavailable: identical
+    // blocks, including repeated short archive tails, can be copied from an
+    // intact source. Keep the conservative upper bound, but never rule an
+    // unavoidable failure using a block whose bytes may still be readable.
+    lower += missing_blocks
+        .into_iter()
+        .filter(|bytes| !readable_blocks.contains(bytes))
+        .count();
     if geometry.packed {
         lower = lower.min(1);
     }
     (upper, lower)
+}
+
+#[test]
+fn missing_short_tail_can_be_supplied_by_an_intact_source() {
+    let mut missing = Posted::new("first.bin", vec![1, 2, 3, 4, 9, 8], 4, Role::Data);
+    missing.absent();
+    let donor = Posted::new("second.bin", vec![5, 6, 7, 0, 9, 8], 4, Role::Data);
+    let mut post = Post {
+        files: vec![missing, donor],
+        password: None,
+        expected: vec![],
+        allowed: vec![],
+    };
+    let geometry = Geometry { block: 4, packed: false };
+    assert_eq!(needed(&post, geometry, &BTreeMap::new()), (2, 1));
+    post.files[1].absent();
+    assert_eq!(needed(&post, geometry, &BTreeMap::new()), (4, 4));
 }
 
 /// Recovery blocks that survive the post: at least and at most.

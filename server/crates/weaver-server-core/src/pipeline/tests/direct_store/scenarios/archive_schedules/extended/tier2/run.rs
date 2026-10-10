@@ -522,7 +522,6 @@ impl Ran {
         let trace = &self.trace;
         match &self.status {
             Some(JobStatus::Complete) => {
-                assert_ne!(verdict, Verdict::Fails, "{context}: completed where it must fail: {trace:?}");
                 for (name, bytes) in &post.expected {
                     assert!(
                         self.files[name].as_deref() == Some(bytes.as_slice()),
@@ -547,6 +546,7 @@ impl Ran {
                     "{context}: left {:?} behind: {trace:?}",
                     self.leftovers
                 );
+                assert_ne!(verdict, Verdict::Fails, "{context}: completed with source bytes where it must fail: {trace:?}");
             }
             Some(JobStatus::Failed { error }) => {
                 assert_ne!(
