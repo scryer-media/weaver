@@ -31,9 +31,11 @@ Everything below is new since 0.14.7. This is a pre-release.
   job input that needs it; the same secret can serve many jobs, and a
   secret stays linked when the job is pointed at another script. A secret's
   value is never read back out. Deleting one is refused while a job links
-  it.
-- Schedules can run a script job, set a speed limit, prune history or turn
-  a server on or off, from one Schedules table.
+  it. A job input can also hold its own encrypted secret without creating a
+  shared named secret; these sealed values are never returned by the API.
+- Schedules control download and post-processing pauses, watch-folder and
+  RSS pauses, speed limits, hardware profiles, quota metering, history
+  pruning, and server activation. Script jobs carry their own schedules.
 - The legacy web UI is gone. The Next UI is the only interface.
 
 ## Kill switch
@@ -49,8 +51,10 @@ enforced never-direct setting is planned for a later release.
 
 ## What changed
 
-- A script run's token may read whatever the API answers and may change
-  nothing except through `scriptRun`. Every other mutation refuses it.
+- A script run's token may read queue items, history items and its own run.
+  Other guarded queries and every mutation except `scriptRun` refuse it.
+- Changing the scripts directory disables every script job until you
+  explicitly enable the jobs you want to run from the new directory.
 - Script statuses reported to Sonarr, Radarr and nzb360 through the NZBGet
   compatibility API follow NZBGet's own rule: only blocking post-processing
   runs count; a missing or failed script reports FAILURE, a skipped script
@@ -62,7 +66,17 @@ enforced never-direct setting is planned for a later release.
 - The completed folder is named after the release as it was posted, not the
   display name. The display name is unchanged. A collision still gets the
   job-id suffix.
-- Every command that opens the database takes the pre-migration backup.
+- Commands that open the database prepare a pre-migration backup when
+  automatic backups are enabled with a key.
+  Automatic backups default to off, so the 0.14.x upgrade does not take one.
+  Configure encrypted automatic backups and their
+  schedule in settings. `--require-upgrade-backup` or
+  `WEAVER_REQUIRE_UPGRADE_BACKUP=true` requires a successful backup before
+  migration when a backup is attempted; these switches do not enable
+  disabled backups. `--skip-upgrade-backup` explicitly skips preparation.
+  With that skip flag, `--reset-automatic-backup-settings` disables
+  automatic backups and discards their stored password for recovery.
+  Upgrade backups have no fixed execution timeout.
 - Script output is kept by count, not by size. Each run keeps its last
   32 KB of output, stdout and stderr together in the order they arrived,
   compressed hard. A run that printed more shows a "Truncated" chip on the
@@ -86,8 +100,9 @@ enforced never-direct setting is planned for a later release.
   publishes instead of rebuilt, completion checks run only for jobs that
   could have changed, egress health is recomputed only when an interface
   or a quota moved, and quota usage is written only when bytes moved.
-  Feeds, schedules and script instances are no longer reloaded in full
-  just to decide whether anything is due.
+  Feeds, schedules and script jobs are no longer reloaded in full
+  just to decide whether anything is due. Metrics history still writes a
+  sample every ten seconds; script-output retention sweeps run hourly.
 - Executables are refused by default. The unwanted extension list, which
   shipped empty, now starts as exe, bat, cmd, com, scr, msi, vbs, ps1, lnk
   and js. A job that holds one fails with the reason "unwanted extension
@@ -106,7 +121,16 @@ enforced never-direct setting is planned for a later release.
   "also run at startup" on the job itself. The Schedules table no longer
   lists scripts.
 - "Quota metering" schedules target every egress or one egress; one egress's
-  rule wins over the rule for every egress.
+  rule wins over the rule for every egress. Active schedule tracks are
+  evaluated again at startup. An egress quota's usage can be reset from
+  its editor without clearing lifetime usage.
+- NNTP rate limits allow 50 ms of burst credit instead of one second.
+  The sustained limit is unchanged, including at low rates.
+- Interface and source-address bindings constrain connections, but system
+  DNS lookup traffic is not bound to that egress and may use the default
+  route. Use a routed resolver when DNS must follow a tunnel.
+- Containers drop `NET_RAW` unless `WEAVER_RETAIN_NET_RAW` explicitly opts
+  into retaining it.
 - The settings search box searches every settings panel, not only the open
   one. Matches show under a heading per panel; the open panel stays
   editable and another panel's result opens that panel with the query
@@ -118,13 +142,16 @@ enforced never-direct setting is planned for a later release.
   `ScriptOption.value` and `Schedule.script` are gone. Script wiring is the
   `scriptInstances` query and the `createScriptInstance`,
   `updateScriptInstance`, `deleteScriptInstance` and `testScriptInstance`
-  mutations. Schedules that ran a script now name a script job.
+  mutations. Scheduled script jobs store their run times on the job.
 - GraphQL: `scriptOutputCeilingBytes`, `scriptOutputRingBytes` and
   `scriptOutputRunCapBytes` are gone from the post-processing settings and
   their input; `scriptOutputFailedRunsPerJob` is new.
 - Implicit schedules derived from a script's `### TASK TIME:` header are
-  gone. "Set up from header" creates real schedule rows instead.
-- The NZBGet `<Script>:=no` per-download opt-out is not supported.
+  gone. "Set up from header" saves the run times on the script job instead.
+  After a host sleep or long stall, scheduled script jobs run the latest
+  missed occurrence once.
+- The NZBGet `<Script>:=no` opt-out and `<Script>:=yes` opt-in are not
+  supported per download.
 - The schedule actions "scan watch folder", "fetch RSS", "run script" and
   "use configured speed limit" are gone. GraphQL: `Schedule.instanceId`,
   `Schedule.runAtStartup` and `Schedule.feedId` are removed;
@@ -153,11 +180,10 @@ enforced never-direct setting is planned for a later release.
   once, on this upgrade, because an empty list could not be told apart from
   the old default. A list cleared after the upgrade stays cleared, and a
   list that already named extensions is kept.
-- The database moves from schema 50 to 57 in one step. Scripts, their
-  options, category lists, feed scripts and script schedules are carried
-  over as script jobs automatically. A schedule that ran a script becomes
-  that job's run times; its days are joined with the job's. Schedules for
-  the removed actions are dropped, each named in the log. A pause or resume
+- The database moves from schema 50 to 56 in one step. The 0.14.7
+  post-processing script lists, options and category assignments become
+  post-processing script jobs. Other triggers in a script's header are
+  not enabled by the upgrade. A pause or resume
   rule that used to fall back to the configured speed limit becomes a
   Global entry pinned to the limit saved at upgrade time. Each secret option a script had saved
   becomes one named secret, "<script> <option>", linked by every job of that

@@ -71,9 +71,9 @@ impl PlanTiming {
         shadow_interval: SHADOW_INTERVAL,
         over_limit_holdoff_initial: OVER_LIMIT_HOLDOFF_INITIAL,
         over_limit_probe_window: OVER_LIMIT_PROBE_WINDOW,
-        route_cooldown: Duration::from_secs(30),
-        leg_cooldown_initial: Duration::from_secs(30),
-        rung_cooldown: Duration::from_secs(30),
+        route_cooldown: weaver_tunnel::pipe::PATH_COOLDOWN,
+        leg_cooldown_initial: weaver_tunnel::pipe::PATH_COOLDOWN,
+        rung_cooldown: weaver_tunnel::pipe::PATH_COOLDOWN,
     };
 
     /// [`Self::PRODUCTION`] with every waiting duration divided by `scale`,

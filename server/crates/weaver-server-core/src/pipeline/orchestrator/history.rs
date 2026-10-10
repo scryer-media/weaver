@@ -83,20 +83,27 @@ pub(crate) struct HistoryDeleteDone {
     reply: HistoryDeleteReply,
 }
 
-async fn retry_script_stop_wait<F, W>(job_id: JobId, mut wait: W)
+async fn retry_script_stop_wait<F, W>(job_id: JobId, mut wait: W) -> Result<(), crate::StateError>
 where
     F: std::future::Future<Output = Result<(), crate::StateError>>,
     W: FnMut() -> F,
 {
-    loop {
+    for attempt in 0..7 {
         match wait().await {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(error) => {
+                if attempt == 6 {
+                    return Err(crate::StateError::Conflict(format!(
+                        "could not confirm scripts stopped for job {} after seven attempts: {error}",
+                        job_id.0
+                    )));
+                }
                 warn!(job_id = job_id.0, %error, "could not confirm scripts stopped; retrying history cleanup barrier");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
             }
         }
     }
+    unreachable!("the last attempt returns its error")
 }
 
 impl HistoryCleanupDirs {
@@ -144,7 +151,7 @@ impl Pipeline {
                     retry_script_stop_wait(*job_id, || {
                         crate::post_processing::events::wait_for_job_events_stopped(&db, job_id.0)
                     })
-                    .await;
+                    .await?;
                 }
                 let cleanup =
                     Self::cleanup_history_intermediate_dirs_at(&intermediate_dir, &dirs).await;
@@ -671,6 +678,23 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
+    async fn history_cleanup_surfaces_persistent_failure_after_bounded_backoff() {
+        let mut attempts = Vec::new();
+        let error = retry_script_stop_wait(JobId(42), || {
+            attempts.push(tokio::time::Instant::now());
+            std::future::ready(Err(crate::StateError::Database(
+                "fixture unavailable".into(),
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("after seven attempts"));
+        assert_eq!(attempts.len(), 7);
+        let gaps: Vec<_> = attempts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(gaps, [1, 2, 4, 8, 16, 32].map(Duration::from_secs));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn history_cleanup_retries_uncertain_wait_and_still_waits_for_active_script() {
         let db = crate::Database::open_in_memory().unwrap();
         let job_id = JobId(41);
@@ -700,7 +724,8 @@ mod tests {
                     crate::post_processing::events::wait_for_job_events_stopped(&db, job_id.0).await
                 }
             })
-            .await;
+            .await
+            .unwrap();
         });
         failure_seen.await.unwrap();
         assert!(!cleanup.is_finished());

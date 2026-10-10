@@ -25,6 +25,12 @@ const MAX_INPUT_VALUE_BYTES: usize = 64 * 1024;
 const MAX_CATEGORIES: usize = 256;
 const MAX_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
 
+#[derive(Clone)]
+pub(super) struct DispatchJobs {
+    jobs: std::sync::Arc<Vec<ScriptInstance>>,
+    mode: GlobalScriptsRun,
+}
+
 /// The one thing that starts an instance.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum InstanceTrigger {
@@ -345,7 +351,7 @@ pub enum ScriptInstanceError {
     /// the instance holds none under that name to keep.
     #[error("input \"{0}\" is marked secret but was given no value, and none is saved for it")]
     NoOwnSecret(String),
-    #[error("script instance does not exist")]
+    #[error("script job does not exist")]
     NotFound,
     #[error(transparent)]
     Storage(#[from] StateError),
@@ -865,7 +871,7 @@ impl Database {
                     ),
                     ScriptName::new(row.text("script")?),
                 ) else {
-                    tracing::warn!(instance = %id, "ignoring a script instance that cannot be read");
+                    tracing::warn!(instance = %id, "ignoring a script job that cannot be read");
                     continue;
                 };
                 loaded.push(ScriptInstance {
@@ -905,13 +911,62 @@ impl Database {
         event: &ScriptEventLabel,
         category: Option<&str>,
     ) -> Result<Vec<ScriptInstance>, StateError> {
-        let mode = self.post_processing_settings()?.global_scripts_run;
+        let snapshot = self.script_dispatch_jobs()?;
         Ok(resolve_instances(
-            &self.script_instances()?,
+            &snapshot.jobs,
             event,
             category,
-            mode,
+            snapshot.mode,
         ))
+    }
+
+    /// An actor-safe lookup: a cold cache is reported without touching SQL.
+    pub(crate) fn cached_script_instances_for(
+        &self,
+        event: &ScriptEventLabel,
+        category: Option<&str>,
+    ) -> Option<Vec<ScriptInstance>> {
+        let cache = self
+            .script_runtime
+            .dispatch_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cache
+            .1
+            .as_ref()
+            .map(|snapshot| resolve_instances(&snapshot.jobs, event, category, snapshot.mode))
+    }
+
+    pub(crate) fn warm_script_dispatch_jobs(&self) -> Result<(), StateError> {
+        self.script_dispatch_jobs().map(|_| ())
+    }
+
+    fn script_dispatch_jobs(&self) -> Result<DispatchJobs, StateError> {
+        loop {
+            let revision = {
+                let cache = self
+                    .script_runtime
+                    .dispatch_jobs
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(snapshot) = &cache.1 {
+                    return Ok(snapshot.clone());
+                }
+                cache.0
+            };
+            let snapshot = DispatchJobs {
+                jobs: std::sync::Arc::new(self.script_instances()?),
+                mode: self.post_processing_settings()?.global_scripts_run,
+            };
+            let mut cache = self
+                .script_runtime
+                .dispatch_jobs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if cache.0 == revision {
+                cache.1 = Some(snapshot);
+            }
+        }
     }
 
     pub fn create_script_instance(
@@ -1054,6 +1109,11 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "delete_script_instance", |tx| {
                 let id = target.clone();
                 Box::pin(async move {
+                    tx.execute(
+                        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
+                        &[],
+                    )
+                    .await?;
                     for table in [
                         "script_instance_inputs",
                         "script_instance_categories",
@@ -1265,12 +1325,12 @@ impl Database {
                 .ok_or(ScriptInstanceError::NotFound)?;
             if instance.trigger != InstanceTrigger::Feed {
                 return Err(ScriptInstanceError::Invalid(
-                    "only a feed instance can be attached to a feed",
+                    "only a feed script job can be attached to a feed",
                 ));
             }
             if !seen.insert(id) {
                 return Err(ScriptInstanceError::Invalid(
-                    "an instance can be attached to a feed once",
+                    "a script job can be attached to a feed once",
                 ));
             }
         }
@@ -1306,6 +1366,26 @@ pub(crate) async fn set_feed_scripts_tx(
     feed_id: u32,
     ids: &[String],
 ) -> Result<(), StateError> {
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return Err(StateError::Conflict(
+                "a script job can be attached to a feed once".into(),
+            ));
+        }
+        let row = tx
+            .fetch_optional(
+                "SELECT trigger_kind FROM script_instances WHERE id = {}",
+                &[SqlArg::Text(id.clone())],
+            )
+            .await?
+            .ok_or_else(|| StateError::Conflict("script job not found".into()))?;
+        if row.text("trigger_kind")? != "feed" {
+            return Err(StateError::Conflict(
+                "only a feed script job can be attached to a feed".into(),
+            ));
+        }
+    }
     tx.execute(
         "DELETE FROM feed_scripts WHERE feed_id = {}",
         &[SqlArg::I64(i64::from(feed_id))],

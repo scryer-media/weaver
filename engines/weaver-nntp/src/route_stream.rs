@@ -184,13 +184,6 @@ impl From<std::net::TcpStream> for BlockingSocket {
     }
 }
 impl BlockingSocket {
-    pub(crate) fn tunnel(
-        stream: DirectStream,
-        runtime: tokio::runtime::Handle,
-        timeout: Duration,
-    ) -> Self {
-        Self::tunnel_boxed(Box::new(stream), runtime, timeout)
-    }
     pub(crate) fn tunnel_boxed(
         stream: Box<dyn weaver_tunnel::TunnelStream>,
         runtime: tokio::runtime::Handle,

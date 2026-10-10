@@ -98,24 +98,35 @@ pub async fn rebuild_nntp_from_config(
     let configured_servers = config.read().await.servers.clone();
     let registry = std::sync::Arc::clone(&policy_registry);
     let servers = configured_servers.clone();
-    tokio::task::spawn_blocking(move || registry.reconfigure(&servers))
-        .await
-        .map_err(|error| {
-            SchedulerError::Internal(format!(
-                "server transfer policy reconfiguration task failed: {error}"
-            ))
-        })?
-        .map_err(|error| {
-            SchedulerError::Internal(format!(
-                "failed to reconfigure server transfer policies: {error}"
-            ))
-        })?;
+    let memory = tokio::task::spawn_blocking(move || {
+        registry
+            .reconfigure(&servers)
+            .map(|()| super::system_probe::detect_memory())
+    })
+    .await
+    .map_err(|error| {
+        SchedulerError::Internal(format!(
+            "server transfer policy reconfiguration task failed: {error}"
+        ))
+    })?
+    .map_err(|error| {
+        SchedulerError::Internal(format!(
+            "failed to reconfigure server transfer policies: {error}"
+        ))
+    })?;
 
     let servers = nntp_server_pool_configs(
         &configured_servers,
         proxy_runtime.as_deref(),
         &transfer_registry,
-        Default::default(),
+        weaver_nntp::connection::NntpBufferProfile::adaptive(
+            memory.cgroup_limit.unwrap_or(memory.available_bytes),
+            configured_servers
+                .iter()
+                .filter(|server| server.active)
+                .map(|server| server.connections as usize)
+                .sum(),
+        ),
     )
     .map_err(SchedulerError::Internal)?;
     let total: usize = servers.iter().map(|server| server.max_connections).sum();

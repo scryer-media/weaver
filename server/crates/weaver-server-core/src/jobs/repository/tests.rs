@@ -568,6 +568,36 @@ fn script_parameter_budget_refuses_growth_without_partial_persistence() {
 }
 
 #[test]
+fn metadata_edit_refreshes_the_warm_script_effects_cache() {
+    use crate::jobs::model::{FieldUpdate, JobUpdate};
+    use crate::post_processing::effects::JobScriptEffects;
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(7)).unwrap();
+    let emitted = JobScriptEffects {
+        parameters: [("chain".into(), "emitted".into())].into(),
+        ..Default::default()
+    };
+    db.save_job_script_effects(7, &emitted).unwrap();
+    assert_eq!(
+        db.job_script_effects(7).unwrap().parameters,
+        emitted.parameters
+    );
+
+    db.update_active_job(
+        JobId(7),
+        &JobUpdate {
+            metadata: FieldUpdate::Set(vec![("edited".into(), "value".into())]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let parameters = db.job_script_effects(7).unwrap().parameters;
+    assert_eq!(parameters.get("edited").map(String::as_str), Some("value"));
+    assert_eq!(parameters.get("chain").map(String::as_str), Some(""));
+}
+
+#[test]
 fn cancellation_archive_preserves_directives_newer_than_the_runtime_snapshot() {
     use crate::post_processing::effects::JobScriptEffects;
     let db = Database::open_in_memory().unwrap();

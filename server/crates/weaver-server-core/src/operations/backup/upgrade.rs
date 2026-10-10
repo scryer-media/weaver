@@ -296,12 +296,10 @@ pub(super) async fn prepare_upgrade_backup_for_target(
         .map_err(io_err)?;
         Ok::<_, BackupServiceError>(manifest)
     };
-    let result = super::service::run_backup_work(
-        run,
-        cancellation.clone(),
-        super::archive::BackupCancellation::new(),
-    )
-    .await;
+    // Startup waits for this export before migrations can touch the source.
+    // Its duration scales with the database, so the interactive backup
+    // deadline must not prevent a large installation from upgrading.
+    let result = run.await;
     let info = complete_backup(&dir, info, result)?;
     // Clear pending first: a crash before advancing the last version safely retries.
     write_marker(target, PENDING_VERSION, "").await?;

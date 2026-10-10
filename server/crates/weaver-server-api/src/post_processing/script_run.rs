@@ -1,8 +1,8 @@
 //! The API as a running script sees its own run.
 //!
-//! A script calling with the token its run was handed may read whatever the
-//! API answers, but of everything that changes something it may only ask what
-//! is here: `Mutation.scriptRun`. Every other mutation is refused to it with
+//! A script calling with its run token may read the queue, history and its
+//! own run. It may only change its run through `Mutation.scriptRun`.
+//! Other guarded queries and every other mutation are refused with
 //! `NOT_ALLOWED_FOR_SCRIPT_RUN`. What is here is the part that is about that
 //! run: the download it is for, and the things it may ask weaver to do with
 //! it. Those are the commands a script may also print after `[NZB]`, under the
@@ -94,10 +94,12 @@ impl LiveScriptRunGql {
         &self.0.run_id
     }
 
+    /// The script job the run is for.
     async fn instance_id(&self) -> &str {
         &self.0.instance_id
     }
 
+    /// The script job's name.
     async fn instance_name(&self) -> &str {
         &self.0.instance_name
     }
@@ -156,7 +158,7 @@ impl ScriptRunActionsGql {
     }
 }
 
-#[Object(name = "ScriptRunActions")]
+#[Object(name = "ScriptRunActions", serial)]
 impl ScriptRunActionsGql {
     /// `[NZB] CATEGORY=`. For a scan script.
     async fn set_category(&self, ctx: &Context<'_>, category: String) -> Result<bool> {

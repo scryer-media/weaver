@@ -244,7 +244,12 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
         host: addr.ip().to_string(),
         port: addr.port(),
         tls: false,
-        revocation: Some(registry.clone()),
+        dialer: Some(
+            runtime
+                .network
+                .nntp_dialer(1, 1, Duration::from_secs(30))
+                .unwrap(),
+        ),
         pipelining: weaver_nntp::PipeliningCapability::Known(false),
         ..Default::default()
     };

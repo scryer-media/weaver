@@ -954,28 +954,83 @@ fn scheduled_feed(id: u32, last_polled_at: Option<i64>) -> RssFeedRow {
 }
 
 #[tokio::test(start_paused = true)]
-async fn due_sync_loop_loads_no_feed_rows_while_no_feed_is_due() {
+async fn due_sync_uses_a_cached_schedule_until_the_actual_deadline() {
     let temp = TempDir::new().unwrap();
     let db = Database::open_in_memory().unwrap();
-    // Polled just now on a fifteen-minute interval.
-    db.insert_rss_feed(&scheduled_feed(1, Some(unix_now_secs())))
+    let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
+    db.insert_rss_feed(&scheduled_feed(1, Some(service.now())))
         .unwrap();
-    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
-
-    // The loop sleeps until the feed is due, a minute at most at a time.
-    assert_eq!(service.next_due_sync_delay(), Duration::from_secs(60));
-    let poller = service.start_background_loop();
-    // Ten minutes of virtual time: ten or more wakes, none with a feed due.
-    tokio::time::sleep(Duration::from_secs(600)).await;
-    poller.abort();
-
+    // The feed is 900 s away; the poller still looks again within one tick.
+    assert_eq!(
+        service.next_due_sync_delay(),
+        Some(Duration::from_secs(crate::rss::model::RSS_SYNC_TICK_SECS))
+    );
+    let delay = Duration::from_secs(900);
+    let target = crate::rss::poller::RssSyncTarget::AllEnabledFeeds;
+    assert!(service.load_target_feeds(target, true).unwrap().is_empty());
+    assert_eq!(
+        db.rss_schedule_cache
+            .loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    tokio::time::advance(delay).await;
     assert_eq!(
         service
-            .inner
-            .full_feed_loads
+            .load_target_feeds(target, true)
+            .unwrap()
+            .iter()
+            .map(|feed| feed.id)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(
+        db.rss_schedule_cache
+            .loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    db.record_rss_poll_success(1, service.now(), None, None)
+        .unwrap();
+    assert_eq!(
+        service.next_due_sync_delay(),
+        Some(Duration::from_secs(crate::rss::model::RSS_SYNC_TICK_SECS))
+    );
+    assert_eq!(
+        db.rss_schedule_cache
+            .loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_scheduled_pause_parks_the_due_timer_until_resume() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
+    db.insert_rss_feed(&scheduled_feed(1, None)).unwrap();
+    service.set_scheduled_paused(true);
+    let mut resumed = service.inner.scheduled_paused.subscribe();
+    assert_eq!(service.next_due_sync_delay(), None);
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    assert_eq!(
+        db.rss_schedule_cache
+            .loads
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+    service.set_scheduled_paused(false);
+    resumed.changed().await.unwrap();
+    assert!(!*resumed.borrow());
+    assert_eq!(service.next_due_sync_delay(), Some(Duration::from_secs(1)));
+    let mut changed = db.rss_schedule_cache.changed.subscribe();
+    db.delete_rss_feed(1).unwrap();
+    changed.changed().await.unwrap();
+    assert_eq!(service.next_due_sync_delay(), None);
 }
 
 #[tokio::test]
@@ -1000,5 +1055,5 @@ async fn due_feed_selection_loads_only_the_due_feed() {
         1
     );
     // A due feed brings the next look forward to now, floored at a second.
-    assert_eq!(service.next_due_sync_delay(), Duration::from_secs(1));
+    assert_eq!(service.next_due_sync_delay(), Some(Duration::from_secs(1)));
 }

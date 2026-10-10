@@ -433,12 +433,18 @@ impl ProxyRuntime {
         id: u32,
     ) -> Result<Arc<weaver_nntp::revocation::SocketRegistry>, String> {
         Ok(self
-            .route(Consumer::Server(id), Duration::from_secs(30))?
+            .route(
+                Consumer::Server(id),
+                crate::servers::connectivity::SERVER_CONNECT_TIMEOUT,
+            )?
             .sockets
             .clone())
     }
     pub fn nntp_bridge(&self, id: u32) -> Result<Option<Arc<Bridge>>, String> {
-        let route = self.route(Consumer::Server(id), Duration::from_secs(30))?;
+        let route = self.route(
+            Consumer::Server(id),
+            crate::servers::connectivity::SERVER_CONNECT_TIMEOUT,
+        )?;
         if route.policy.is_direct() {
             Ok(None)
         } else {

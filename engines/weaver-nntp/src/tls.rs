@@ -1482,12 +1482,14 @@ pub async fn inspect_tls_name_mismatch_certificate_via(
     host: &str,
     port: u16,
     ca_cert_path: Option<&Path>,
-    proxy: Option<&Arc<weaver_tunnel::bridge::Bridge>>,
+    dialer: Option<&Arc<crate::route_dialer::RouteDialer>>,
 ) -> Result<Option<Vec<u8>>, NntpError> {
-    let timeout = proxy.map_or(std::time::Duration::from_secs(30), |p| p.connect_timeout);
+    let timeout = dialer.map_or(std::time::Duration::from_secs(30), |route| {
+        route.inner.budget()
+    });
     tokio::time::timeout(
         timeout,
-        inspect_certificate_inner(host, port, ca_cert_path, proxy),
+        inspect_certificate_inner(host, port, ca_cert_path, dialer),
     )
     .await
     .map_err(|_| NntpError::Timeout)?
@@ -1497,14 +1499,25 @@ async fn inspect_certificate_inner(
     host: &str,
     port: u16,
     ca_cert_path: Option<&Path>,
-    proxy: Option<&Arc<weaver_tunnel::bridge::Bridge>>,
+    dialer: Option<&Arc<crate::route_dialer::RouteDialer>>,
 ) -> Result<Option<Vec<u8>>, NntpError> {
     let captured_leaf_der = Arc::new(Mutex::new(None));
     let tls_config =
         build_tls_config_with_name_mismatch_capture(ca_cert_path, captured_leaf_der.clone())?;
     let server_name = make_server_name(host)?;
-    let tcp: RouteStream = if let Some(proxy) = proxy {
-        proxy.dial(host, port).await?.0.into()
+    let mut route_setup = None;
+    let mut route_outcome = None;
+    let tcp: RouteStream = if let Some(dialer) = dialer {
+        let dialed = dialer
+            .dial(&crate::ServerConfig {
+                host: host.into(),
+                port,
+                ..Default::default()
+            })
+            .await?;
+        route_setup = dialed.setup;
+        route_outcome = Some(dialed.outcome);
+        dialed.stream.into()
     } else {
         dial_direct(host, port, None, Duration::from_secs(30))
             .await?
@@ -1513,6 +1526,12 @@ async fn inspect_certificate_inner(
     };
 
     let _ = ManualTlsStream::connect(tcp, tls_config, server_name).await;
+    if let Some(setup) = route_setup {
+        setup.complete(true);
+    }
+    if let Some(outcome) = route_outcome {
+        outcome.closed();
+    }
     Ok(captured_leaf_der
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -132,7 +132,7 @@ pub fn validate_feed_script_selection(
             .iter()
             .find(|instance| &instance.id == id)
             .ok_or_else(|| {
-                crate::StateError::Database(format!("script instance '{id}' does not exist"))
+                crate::StateError::Database(format!("script job '{id}' does not exist"))
             })?;
         if instance.trigger != InstanceTrigger::Feed {
             return Err(crate::StateError::Database(format!(

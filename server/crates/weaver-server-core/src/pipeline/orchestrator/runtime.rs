@@ -177,6 +177,14 @@ impl Pipeline {
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
         let script_effects_rx = db.subscribe_script_effects();
+        {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || {
+                db.warm_script_effects()?;
+                db.warm_script_dispatch_jobs()
+            })
+            .await??;
+        }
         let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
         let (direct_barrier_done_tx, direct_barrier_done_rx) = mpsc::channel(32);
@@ -228,7 +236,7 @@ impl Pipeline {
         let chase_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
         );
-        let bandwidth_cap = BandwidthCapRuntime::default();
+        let bandwidth_ledger = BandwidthLedgerRuntime::default();
 
         let mut pipeline = Self {
             cmd_rx,
@@ -395,7 +403,7 @@ impl Pipeline {
             terminal_post_processing_cancellations: HashMap::new(),
             global_paused: initial_global_paused,
             scheduled_pause: false,
-            bandwidth_cap,
+            bandwidth_ledger,
             rate_limit_reservations: HashMap::new(),
             configured_rate_limit: 0,
             scheduled_rate_limit: None,
@@ -1382,6 +1390,14 @@ impl Pipeline {
                 metrics_live = live;
                 metrics_snapshot_interval = Self::metrics_snapshot_timer(live);
             }
+            #[cfg(test)]
+            self.shared_state.turn_observation.send_replace(Some(
+                crate::jobs::handle::PipelineTurnObservation {
+                    metrics_refreshes: self.shared_state.metrics_refresh_count(),
+                    job_revision: *self.shared_state.subscribe_job_changes().borrow(),
+                    period: metrics_snapshot_interval.period(),
+                },
+            ));
         }
 
         self.drain().await;
@@ -1523,7 +1539,7 @@ impl Pipeline {
         self.snapshot_publish_pending = false;
         self.snapshot_dirty = false;
         self.footprint_metrics_stale = true;
-        if let Err(error) = self.bandwidth_cap.prune_if_due(&self.db) {
+        if let Err(error) = self.bandwidth_ledger.prune_if_due(&self.db) {
             warn!(error = %error, "failed to prune the bandwidth ledger");
         }
         self.publish_download_block();

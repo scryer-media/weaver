@@ -295,7 +295,11 @@ pub(super) fn retention_victims<'a>(
     let mut ready: Vec<_> = backups
         .iter()
         .filter(|info| {
-            info.trigger == BackupTrigger::Auto && info.status == BackupArtifactStatus::Ready
+            info.trigger == BackupTrigger::Auto
+                && matches!(
+                    info.status,
+                    BackupArtifactStatus::Ready | BackupArtifactStatus::Failed
+                )
         })
         .collect();
     ready.sort_by(|a, b| {
@@ -305,14 +309,23 @@ pub(super) fn retention_victims<'a>(
     });
     let previous = ready
         .iter()
+        .filter(|info| info.status == BackupArtifactStatus::Ready)
         .filter_map(|info| semver::Version::parse(&info.source_weaver_version).ok())
         .filter(|version| version < &current)
         .max();
-    let (mut current_kept, mut previous_kept) = (0, 0);
+    let (mut current_kept, mut previous_kept, mut failures_kept) = (0, 0, 0);
     ready
         .into_iter()
         .filter(|info| {
-            if info.source_weaver_version == current_version {
+            let version = semver::Version::parse(&info.source_weaver_version).ok();
+            if version.as_ref().is_some_and(|version| version > &current) {
+                return false;
+            }
+            if info.status == BackupArtifactStatus::Failed {
+                failures_kept += 1;
+                return failures_kept > 1;
+            }
+            if version.as_ref() == Some(&current) {
                 current_kept += 1;
                 current_kept > 3
             } else if (previous.is_some()
@@ -694,7 +707,27 @@ mod tests {
         let victims = retention_victims(&rows, "1.0.0");
         assert_eq!(
             victims.iter().map(|row| &row.filename).collect::<Vec<_>>(),
-            [&rows[0].filename, &rows[1].filename, &rows[3].filename]
+            [&rows[1].filename, &rows[3].filename]
+        );
+    }
+
+    #[test]
+    fn retention_keeps_the_newest_failure_and_all_newer_version_backups() {
+        let now = crate::e2e_clock::utc_now();
+        let rows: Vec<_> = ["1.0.0", "1.0.0", "2.0.0", "2.0.0"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, version)| {
+                let mut info = new_backup_info(BackupTrigger::Auto, "sqlite", version).unwrap();
+                info.status = BackupArtifactStatus::Failed;
+                info.created_at = now - chrono::Duration::minutes(index as i64);
+                info
+            })
+            .collect();
+        let victims = retention_victims(&rows, "1.0.0");
+        assert_eq!(
+            victims.iter().map(|row| &row.filename).collect::<Vec<_>>(),
+            [&rows[1].filename]
         );
     }
 

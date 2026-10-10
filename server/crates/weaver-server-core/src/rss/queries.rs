@@ -5,6 +5,24 @@ use crate::rss::record::{RssFeedRow, RssRuleRow, RssSeenItemRow};
 
 use super::repository::{decode_categories, decode_metadata, map_seen_item_row, parse_action_sql};
 
+pub(crate) struct ScheduleCache {
+    rows: std::sync::Mutex<Option<Vec<super::model::RssFeedSchedule>>>,
+    pub(crate) changed: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    pub(crate) loads: std::sync::atomic::AtomicU64,
+}
+
+impl Default for ScheduleCache {
+    fn default() -> Self {
+        Self {
+            rows: Default::default(),
+            changed: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            loads: Default::default(),
+        }
+    }
+}
+
 const RSS_FEED_SELECT: &str =
     "SELECT id, name, url, enabled, poll_interval_secs, username, password,
         default_category, default_metadata, etag, last_modified, last_polled_at,
@@ -131,8 +149,16 @@ impl Database {
     pub(crate) fn list_rss_feed_schedules(
         &self,
     ) -> Result<Vec<crate::rss::model::RssFeedSchedule>, StateError> {
+        let mut cached = self
+            .rss_schedule_cache
+            .rows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(rows) = cached.as_ref() {
+            return Ok(rows.clone());
+        }
         let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
+        let rows: Vec<_> = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
                 datastore.read_exec(),
                 "SELECT id, enabled, poll_interval_secs, last_polled_at
@@ -150,7 +176,24 @@ impl Database {
                 })
             })
             .collect()
-        })
+        })?;
+        #[cfg(test)]
+        self.rss_schedule_cache
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *cached = Some(rows.clone());
+        Ok(rows)
+    }
+
+    pub(crate) fn invalidate_rss_schedules(&self) {
+        *self
+            .rss_schedule_cache
+            .rows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        self.rss_schedule_cache
+            .changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     pub fn list_rss_rules(&self, feed_id: u32) -> Result<Vec<RssRuleRow>, StateError> {

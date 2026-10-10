@@ -65,7 +65,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "description": "Bytes downloaded in the last 24 hours. Compare against your ISP cap.",
+      "description": "Bytes downloaded in the last 24 hours. Compare against your download quota.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },

@@ -529,10 +529,7 @@ mod tests {
                 format!("Yb5drZSkNi20UCMkb.{extension}"),
                 format!("Yb5drZSkNi20UCMkb.{}", extension.to_ascii_uppercase()),
             ] {
-                let files = [
-                    file(&name, 1400 * MIB),
-                    file("Yb5drZSkNi20UCMkb.nfo", 4096),
-                ];
+                let files = [file(&name, 1400 * MIB), file("Yb5drZSkNi20UCMkb.nfo", 4096)];
                 assert_eq!(select_rename_candidate(&files, no_policy), None, "{name}");
             }
         }

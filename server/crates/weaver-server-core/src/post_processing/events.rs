@@ -125,7 +125,11 @@ pub(crate) struct ScriptRuntime {
     queue_requested: std::sync::atomic::AtomicBool,
     failed_runs: std::sync::Mutex<BTreeMap<String, String>>,
     effects: std::sync::Mutex<(BTreeSet<u64>, Option<watch::Sender<()>>)>,
+    pub(super) effects_cache:
+        std::sync::Mutex<Option<BTreeMap<u64, super::effects::JobScriptEffects>>>,
+    pub(super) effects_writer: std::sync::Mutex<()>,
     admission_hint: std::sync::Mutex<(u64, Option<AdmissionHint>)>,
+    pub(super) dispatch_jobs: std::sync::Mutex<(u64, Option<super::instances::DispatchJobs>)>,
     /// The schedule jobs the script evaluator works from, read once after
     /// each change to the jobs rather than on every tick.
     pub(super) schedule_jobs: std::sync::Mutex<(
@@ -618,7 +622,7 @@ async fn run_entry(
                     .script_instance_run_inputs(&entry.id)
                     .map_err(|error| error.to_string())
                     .and_then(|inputs| {
-                        inputs.ok_or_else(|| "the script instance no longer exists".to_string())
+                        inputs.ok_or_else(|| "the script job no longer exists".to_string())
                     })
                     .and_then(|inputs| {
                         RunIdentity::of(&entry)
@@ -982,6 +986,14 @@ impl Database {
         cache.0 = cache.0.wrapping_add(1);
         cache.1 = None;
         drop(cache);
+        let mut dispatch = self
+            .script_runtime
+            .dispatch_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        dispatch.0 = dispatch.0.wrapping_add(1);
+        dispatch.1 = None;
+        drop(dispatch);
         let mut jobs = self
             .script_runtime
             .schedule_jobs
@@ -989,6 +1001,12 @@ impl Database {
             .unwrap_or_else(|error| error.into_inner());
         jobs.0 = jobs.0.wrapping_add(1);
         jobs.1 = None;
+        drop(jobs);
+        // Refresh on the cold settings-write path, so arrival decisions can
+        // distinguish blocking scripts without holding the actor behind SQL.
+        if let Err(error) = self.warm_script_dispatch_jobs() {
+            tracing::warn!(%error, "script dispatch cache could not be refreshed");
+        }
     }
 
     pub(crate) fn queue_scripts_possible(&self) -> bool {

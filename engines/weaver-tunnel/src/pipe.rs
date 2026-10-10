@@ -178,7 +178,7 @@ pub enum DialError {
     #[error("{0}")]
     Skipped(String),
     #[error("all route legs are at capacity")]
-    AtCapacity(Arc<Notify>),
+    AtCapacity(Vec<Arc<Notify>>),
     #[error("egress binding failed: {0}")]
     Bind(io::Error),
     #[error("egress connection failed: {0}")]
@@ -1003,7 +1003,7 @@ impl Fallback {
     }
     /// A ladder that leaves a failed rung alone for thirty seconds.
     pub fn new(rungs: Vec<Arc<dyn Dialer>>) -> Self {
-        Self::with_rung_cooldown(rungs, Duration::from_secs(30))
+        Self::with_rung_cooldown(rungs, PATH_COOLDOWN)
     }
     /// A ladder that leaves a failed rung alone for `rung_cooldown`.
     pub fn with_rung_cooldown(rungs: Vec<Arc<dyn Dialer>>, rung_cooldown: Duration) -> Self {
@@ -1022,6 +1022,13 @@ impl Fallback {
 }
 #[async_trait::async_trait]
 impl Dialer for Fallback {
+    fn has_capacity(&self) -> bool {
+        self.rungs
+            .iter()
+            .enumerate()
+            .any(|(index, rung)| self.allows_rung(index, false) && rung.has_capacity())
+    }
+
     fn over_limit_cleared(&self) {
         for rung in &self.rungs {
             rung.over_limit_cleared();
@@ -1029,6 +1036,7 @@ impl Dialer for Fallback {
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let mut last = DialError::Skipped("all rungs are unavailable".into());
+        let mut capacity_changes = Vec::new();
         for (index, rung) in self.rungs.iter().enumerate() {
             if !matches!(target.purpose, Purpose::Probe | Purpose::NntpProbe { .. })
                 && self.states.lock().expect("rung state")[index]
@@ -1047,6 +1055,7 @@ impl Dialer for Fallback {
                     return Ok(dialed);
                 }
                 Err(error @ DialError::Fatal(_)) => return Err(error),
+                Err(DialError::AtCapacity(changes)) => capacity_changes.extend(changes),
                 Err(error) => {
                     self.report_rung(index, Some(&error));
                     if !last.is_evidence() {
@@ -1054,6 +1063,9 @@ impl Dialer for Fallback {
                     }
                 }
             }
+        }
+        if !last.is_evidence() && !capacity_changes.is_empty() {
+            return Err(DialError::AtCapacity(capacity_changes));
         }
         Err(last)
     }
@@ -1076,8 +1088,10 @@ impl Dialer for Fallback {
     }
 }
 
+pub const PATH_COOLDOWN: Duration = Duration::from_secs(30);
+
 pub fn cooldown(failures: u32) -> Duration {
-    cooldown_from(Duration::from_secs(30), failures)
+    cooldown_from(PATH_COOLDOWN, failures)
 }
 
 /// [`cooldown`] starting from `initial` instead of 30 seconds: doubling per

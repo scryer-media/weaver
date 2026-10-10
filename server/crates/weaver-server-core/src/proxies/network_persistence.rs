@@ -31,7 +31,7 @@ fn egress_row(row: SqlRow) -> Result<EgressInterface, StateError> {
         id: u32::try_from(row.i64("id")?).map_err(error)?,
         name: row.text("name")?,
         binding,
-        enabled: row.i64("enabled")? != 0,
+        enabled: row.bool("enabled")?,
         max_download_speed: u64::try_from(row.i64("max_download_speed")?).map_err(error)?,
         download_quota: quota_row(&row)?,
     };
@@ -43,7 +43,7 @@ fn quota_row(row: &SqlRow) -> Result<ServerDownloadQuotaConfig, StateError> {
     let period = row.text("download_quota_period")?;
     let weekday = row.text("download_quota_weekly_reset_weekday")?;
     Ok(ServerDownloadQuotaConfig {
-        enabled: row.i64("download_quota_enabled")? != 0,
+        enabled: row.bool("download_quota_enabled")?,
         limit_bytes: u64::try_from(row.i64("download_quota_limit_bytes")?).map_err(error)?,
         period: ServerDownloadQuotaPeriod::parse(&period)
             .ok_or_else(|| error(format!("invalid egress download quota period '{period}'")))?,
@@ -64,7 +64,7 @@ fn pool_row(row: SqlRow) -> Result<ProxyPool, StateError> {
         name: row.text("name")?,
         kind: serde_json::from_str(&row.text("kind")?).map_err(error)?,
         member_ids: serde_json::from_str(&row.text("member_ids")?).map_err(error)?,
-        enabled: row.i64("enabled")? != 0,
+        enabled: row.bool("enabled")?,
     })
 }
 
@@ -308,8 +308,8 @@ impl Database {
                     let quota = &egress.download_quota;
                     tx.execute("INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, binding_kind = excluded.binding_kind, binding_value = excluded.binding_value, enabled = excluded.enabled, max_download_speed = excluded.max_download_speed, download_quota_enabled = excluded.download_quota_enabled, download_quota_limit_bytes = excluded.download_quota_limit_bytes, download_quota_period = excluded.download_quota_period, download_quota_reset_time_minutes_local = excluded.download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday = excluded.download_quota_weekly_reset_weekday, download_quota_monthly_reset_day = excluded.download_quota_monthly_reset_day, updated_at = excluded.updated_at", &[
                         SqlArg::I64(i64::from(egress.id)), SqlArg::Text(egress.name.clone()), SqlArg::Text(kind.into()), SqlArg::OptText(value),
-                        SqlArg::I64(i64::from(egress.enabled)), SqlArg::I64(speed),
-                        SqlArg::I64(i64::from(quota.enabled)), SqlArg::I64(quota.limit_bytes as i64), SqlArg::Text(quota.period.as_str().into()),
+                        SqlArg::Bool(egress.enabled), SqlArg::I64(speed),
+                        SqlArg::Bool(quota.enabled), SqlArg::I64(quota.limit_bytes as i64), SqlArg::Text(quota.period.as_str().into()),
                         SqlArg::I64(i64::from(quota.reset_time_minutes_local)), SqlArg::Text(quota_weekday_str(quota.weekly_reset_weekday).into()),
                         SqlArg::I64(i64::from(quota.monthly_reset_day)),
                         SqlArg::I64(now), SqlArg::I64(now),
@@ -414,7 +414,7 @@ impl Database {
                     }
                     let now = chrono::Utc::now().timestamp();
                     tx.execute("INSERT INTO proxy_pools (id, name, kind, member_ids, enabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind, member_ids = excluded.member_ids, enabled = excluded.enabled, updated_at = excluded.updated_at", &[
-                        SqlArg::I64(i64::from(pool.id)), SqlArg::Text(pool.name.clone()), SqlArg::Text(serde_json::to_string(&pool.kind).map_err(error)?), SqlArg::Text(serde_json::to_string(&pool.member_ids).map_err(error)?), SqlArg::I64(i64::from(pool.enabled)), SqlArg::I64(now), SqlArg::I64(now),
+                        SqlArg::I64(i64::from(pool.id)), SqlArg::Text(pool.name.clone()), SqlArg::Text(serde_json::to_string(&pool.kind).map_err(error)?), SqlArg::Text(serde_json::to_string(&pool.member_ids).map_err(error)?), SqlArg::Bool(pool.enabled), SqlArg::I64(now), SqlArg::I64(now),
                     ]).await?;
                     validate_stored_network(tx).await?;
                     Ok(pool)

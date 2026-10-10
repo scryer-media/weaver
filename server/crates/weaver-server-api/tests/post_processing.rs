@@ -70,7 +70,9 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
     assert_eq!(settings["terminationGraceSeconds"], 10);
     assert_eq!(
         settings["unacceptableExtensions"],
-        serde_json::json!(["bat", "cmd", "com", "exe", "js", "lnk", "msi", "ps1", "scr", "vbs"])
+        serde_json::json!([
+            "bat", "cmd", "com", "exe", "js", "lnk", "msi", "ps1", "scr", "vbs"
+        ])
     );
     assert_eq!(settings["strictSecurityRefusesExecution"], false);
     assert_eq!(settings["globalScriptsRun"], "ALWAYS");
@@ -1565,6 +1567,18 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     use weaver_server_core::post_processing::output::retain_output;
 
     let harness = TestHarness::new().await;
+    write_script(
+        &harness,
+        "hourly.sh",
+        "#!/bin/sh\n### NZBGET SCHEDULER SCRIPT ###\n",
+    )
+    .await;
+    let hourly = create_instance(
+        &harness,
+        r#"name: "Every hour", script: "hourly.sh", trigger: SCHEDULER"#,
+    )
+    .await;
+    let hourly_id = id(&hourly);
     let recorded = [
         (
             ScriptEventLabel::Scheduler(1),
@@ -1584,7 +1598,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
             ScriptEventLabel::Scheduler(2),
             "hourly.sh",
             true,
-            Some(("instance-1", "Every hour")),
+            Some((hourly_id.as_str(), "Every hour")),
             ScriptStatus::Succeeded,
         ),
     ];
@@ -1632,7 +1646,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
         "the total counts every page, not this one"
     );
     assert_eq!(runs[0]["script"], "hourly.sh");
-    assert_eq!(runs[0]["instanceId"], "instance-1");
+    assert_eq!(runs[0]["instanceId"], hourly_id);
     assert_eq!(runs[0]["instanceName"], "Every hour");
     assert_eq!(runs[0]["event"], "scheduler:2");
     assert_eq!(runs[0]["kind"], "SCHEDULER");

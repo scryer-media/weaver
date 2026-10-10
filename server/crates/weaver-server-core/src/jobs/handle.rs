@@ -93,8 +93,18 @@ impl JobCancellationRegistry {
 ///
 /// Written by the pipeline loop after each event, read by API handlers
 /// without going through the command channel.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PipelineTurnObservation {
+    pub metrics_refreshes: u64,
+    pub job_revision: u64,
+    pub period: Duration,
+}
+
 #[derive(Clone)]
 pub struct SharedPipelineState {
+    #[cfg(test)]
+    pub(crate) turn_observation: tokio::sync::watch::Sender<Option<PipelineTurnObservation>>,
     jobs: Arc<RwLock<PublishedJobs>>,
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
@@ -194,6 +204,8 @@ impl SharedPipelineState {
             segment_events,
             #[cfg(test)]
             metrics_refreshes: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            turn_observation: tokio::sync::watch::channel(None).0,
         }
     }
 

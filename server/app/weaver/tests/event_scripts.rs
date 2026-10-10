@@ -205,14 +205,13 @@ async fn scan_distinguishes_supervisor_launch_failure_from_script_exit_127() {
 }
 
 /// Stands in for the Go toolchain, which a machine running these tests need
-/// not have. It reports how it was called and ends the way `go run` ends when
-/// the program it built exits with `status`.
+/// not have. It emits an executable which exits with `status`.
 fn stub_go(directory: &Path, status: i32) -> String {
     let path = directory.join("stub-go");
     fs::write(
         &path,
         format!(
-            "#!/bin/sh\nprintf 'go %s\\n' \"$*\"\nprintf 'cache %s proxy %s\\n' \"$GOCACHE\" \"$GOPROXY\"\nprintf 'exit status {status}\\n' >&2\nexit 1\n"
+            "#!/bin/sh\n[ \"$1\" = build ] && [ \"$2\" = -o ] && [ \"$#\" = 4 ] || exit 98\nprintf 'source %s\\n' \"$4\"\nprintf 'cache %s proxy %s\\n' \"$GOCACHE\" \"$GOPROXY\"\nprintf '#!/bin/sh\\nexit {status}\\n' > \"$3\"\nchmod +x \"$3\"\n"
         ),
     )
     .unwrap();
@@ -221,7 +220,7 @@ fn stub_go(directory: &Path, status: i32) -> String {
 }
 
 #[tokio::test]
-async fn a_go_script_runs_through_go_run_and_a_missing_toolchain_fails_the_launch() {
+async fn a_go_script_builds_and_a_missing_toolchain_fails_the_launch() {
     let (db, data) = setup();
     let root = fs::canonicalize(db.post_processing_script_directory().unwrap()).unwrap();
     // No executable bit: the extension alone makes it a script.
@@ -263,13 +262,12 @@ async fn a_go_script_runs_through_go_run_and_a_missing_toolchain_fails_the_launc
         .await
         .unwrap();
     assert_eq!(ran.len(), 1);
-    // `go run` itself exited 1; the status it reported for the script is the
-    // one that counts.
+    // The compiled script returns its own exit status.
     assert_eq!(ran[0].status, ScriptStatus::Succeeded);
     assert_eq!(ran[0].exit_code, Some(93));
     let output = &ran[0].output_tail;
     assert!(
-        output.contains(&format!("go run {}\n", root.join("report.go").display())),
+        output.contains(&format!("source {}\n", root.join("report.go").display())),
         "{output}"
     );
     assert!(
@@ -399,7 +397,12 @@ async fn an_instance_whose_script_is_gone_is_recorded_and_releases_the_downloade
 
     // An instance that could not run is still a completed queue run, so
     // native completion can continue after the durable downloaded barrier.
-    select(&db, vec![on(DOWNLOADED, &gone)]);
+    // Keep the original missing-script job: deleting it also deletes its runs.
+    for instance in db.script_instances().unwrap() {
+        if instance.script == next {
+            db.delete_script_instance(&instance.id).unwrap();
+        }
+    }
     let run_id = db.enqueue_script_event(&event, 1).unwrap().unwrap();
     drain_queue(db.clone()).await.unwrap();
     wait_for_event(&db, &run_id).await.unwrap();

@@ -4,14 +4,15 @@ use async_graphql::{Context, Error, ErrorExtensions, Guard, Result};
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::CallerScope;
 
-/// What every guard says to a running script: it may read what is guarded,
-/// and change nothing. `Mutation.scriptRun`, which carries no guard, is the
-/// one thing it may ask for.
+/// The only general queries exposed to run credentials. The unguarded
+/// `scriptRun` field separately checks the live run and scopes its callbacks.
 fn script_run_verdict(ctx: &Context<'_>) -> Result<()> {
-    if ctx.query_env.operation.node.ty == OperationType::Mutation {
+    if ctx.query_env.operation.node.ty != OperationType::Query
+        || !matches!(ctx.field().name(), "queueItems" | "historyItems")
+    {
         Err(graphql_error(
             "NOT_ALLOWED_FOR_SCRIPT_RUN",
-            "a script run's token may read, and change nothing but through scriptRun",
+            "a script run's token may only read queueItems, historyItems and its own scriptRun",
         ))
     } else {
         Ok(())
@@ -70,13 +71,8 @@ impl Guard for FreshAdminGuard {
         let identity = ctx
             .data::<CallerIdentity>()
             .map_err(|_| internal_error("missing caller identity"))?;
-        // A machine credential has no password to have typed recently. A
-        // script run only gets this far on a query: the admin check above
-        // refuses it any mutation.
-        if matches!(
-            identity,
-            CallerIdentity::ApiKey(_) | CallerIdentity::ScriptRun(_)
-        ) {
+        // A machine credential has no password to have typed recently.
+        if matches!(identity, CallerIdentity::ApiKey(_)) {
             return Ok(());
         }
         let CallerIdentity::Jwt(hash) = identity else {
