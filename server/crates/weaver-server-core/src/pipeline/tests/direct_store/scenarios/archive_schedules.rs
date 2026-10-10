@@ -167,10 +167,9 @@ pub(super) struct Route {
     /// that arrives after the body names nothing in time and the set goes
     /// conventional.
     pub named_by_early_index: bool,
-    /// Each set is admitted from its own volumes and either finishes direct
-    /// or leaves on its own, so a schedule may finish any number of them,
-    /// all included. The campaign states the exact count where it is known.
-    pub sets_finish_independently: bool,
+    // Identity rediscovery can readmit every set on a successful job. Failed
+    // jobs still finalize zero sets; this only describes successful routing.
+    pub sets_can_be_readmitted: bool,
 }
 
 impl Route {
@@ -181,7 +180,7 @@ impl Route {
         unmapped_loss: |_| false,
         unnamed_loss: |_| false,
         named_by_early_index: false,
-        sets_finish_independently: false,
+        sets_can_be_readmitted: false,
     };
 
     /// A set the layout refuses to route: it demotes for its shape and
@@ -194,7 +193,7 @@ impl Route {
             unmapped_loss: |_| false,
             unnamed_loss: |_| false,
             named_by_early_index: false,
-            sets_finish_independently: false,
+            sets_can_be_readmitted: false,
         }
     }
 }
@@ -368,7 +367,8 @@ impl ExtractionProfile {
             );
         } else if route.sets == 1 {
             assert_eq!(outcome.finalized, 0, "{trace:?}");
-        } else if route.sets_finish_independently {
+        } else if route.sets_can_be_readmitted {
+            assert_eq!(outcome.status, Some(JobStatus::Complete), "{trace:?}");
             assert!(outcome.finalized <= route.sets, "{trace:?}");
         } else {
             assert!(outcome.finalized < route.sets, "{trace:?}");
@@ -2103,7 +2103,11 @@ grouping::grouping_cells! {
     }
 }
 
-fn late_index_direct_route(order: &[(u32, u32)], interruption: Interruption, outcome: &Outcome) -> bool {
+fn late_index_direct_route(
+    order: &[(u32, u32)],
+    interruption: Interruption,
+    outcome: &Outcome,
+) -> bool {
     let last_restart = interruption
         .boundaries(order.len())
         .into_iter()
@@ -2721,7 +2725,7 @@ impl HexTwoSets {
             // members' exact bytes are checked in every case.
             Self::Rar5 => Route {
                 sets: 2,
-                sets_finish_independently: true,
+                sets_can_be_readmitted: true,
                 ..Route::refused(|reason| {
                     matches!(reason, DemotionReason::IdentityRosterUnfillable)
                 })
