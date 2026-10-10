@@ -3392,9 +3392,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.7"
+version = "0.10.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d22d0f1b80dea984502eb7101c99f8aa5cad6f93cff2a62d75a42aeeb40afcba"
+checksum = "7768af4cffb65248703385c0eed0f558fb8e65bcb303a636f01b4069992a9931"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -3411,13 +3411,14 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.4.4"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6215b83666e769d4f840a9dfdb220df9d67df7de99c31784968004fb7af2bbbd"
+checksum = "249654e24926ceee61ec11cd9b0bf4c9a8853278a690b43c3c4a498434922853"
 dependencies = [
  "blake3",
  "cap-std",
  "crc-fast",
+ "libc",
  "rayon",
  "reedsolomon-rs",
  "thiserror 2.0.21",
@@ -5956,7 +5957,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.14.5"
+version = "0.14.7"
 dependencies = [
  "application-updater",
  "async-graphql",
@@ -6016,14 +6017,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.14.5"
+version = "0.14.7"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.14.5"
+version = "0.14.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6052,7 +6053,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.14.5"
+version = "0.14.7"
 dependencies = [
  "blake3",
  "quick-xml",
@@ -6065,7 +6066,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.14.5"
+version = "0.14.7"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6096,7 +6097,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.14.5"
+version = "0.14.7"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6171,7 +6172,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.14.5"
+version = "0.14.7"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6194,7 +6195,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.14.5"
+version = "0.14.7"
 dependencies = [
  "cc",
  "crc-fast",

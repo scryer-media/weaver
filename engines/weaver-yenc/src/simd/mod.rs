@@ -181,6 +181,131 @@ pub(crate) fn decode_body_into_with_line_length(
     Ok(decode_kernel(input, output, &mut state, dot_unstuffing, false, false)?.written)
 }
 
+/// Input bytes decoded between CRC folds by [`decode_raw_body_until_end_crc`].
+///
+/// A stretch's input and output together stay inside one core's share of a
+/// shared L2 (512 KiB where four cores share 2 MiB), and a typical article
+/// takes about three stretches, so the extra kernel and fold calls cost the
+/// cores whose private L2 already holds the output almost nothing.
+const CRC_FOLD_STRETCH: usize = 256 * 1024;
+
+/// Decode a whole raw (dot-stuffed) body, stopping where the kernel's end
+/// detection stops (the first `=y` at a line start, or the NNTP terminator),
+/// with the CRC of the decoded bytes folded into `crc`.
+///
+/// Where the bounded raw kernel exists the body is decoded in stretches of
+/// about [`CRC_FOLD_STRETCH`] input bytes and each stretch's output is folded
+/// while it is still in L2. Folding the whole output after one decode call
+/// reads it back from L3 or memory once an article outgrows L2, which costs
+/// most where L2 is shared and small.
+/// The stretches end on 64-byte boundaries with the kernel's lookahead still
+/// in view, so the result is byte-for-byte that of one whole-body call.
+pub(crate) fn decode_raw_body_until_end_crc(
+    input: &[u8],
+    output: &mut [u8],
+    line_length: Option<u32>,
+    crc: &mut crate::crc::Crc32,
+) -> Result<KernelOutcome, YencError> {
+    decode_raw_body_until_end_crc_in(input, output, line_length, crc, CRC_FOLD_STRETCH)
+}
+
+fn decode_raw_body_until_end_crc_in(
+    input: &[u8],
+    output: &mut [u8],
+    line_length: Option<u32>,
+    crc: &mut crate::crc::Crc32,
+    stretch: usize,
+) -> Result<KernelOutcome, YencError> {
+    let mut state = KernelState::body_with_line_length(line_length);
+    let (consumed, written) = decode_raw_stretches(input, output, &mut state, crc, stretch)?;
+    let outcome = if state.end == DecodeEnd::None {
+        decode_kernel(
+            &input[consumed..],
+            &mut output[written..],
+            &mut state,
+            true,
+            false,
+            true,
+        )
+        .map_err(|err| shift_escape_error(err, consumed))?
+    } else {
+        KernelOutcome {
+            consumed: 0,
+            written: 0,
+            end: state.end.into(),
+        }
+    };
+    if outcome.written > 0 {
+        crc.update(&output[written..written + outcome.written]);
+    }
+    Ok(KernelOutcome {
+        consumed: consumed + outcome.consumed,
+        written: written + outcome.written,
+        end: outcome.end,
+    })
+}
+
+/// The bounded stretches of [`decode_raw_body_until_end_crc`], each folded
+/// into `crc`; returns the (consumed, written) cursors the tail resumes from.
+#[cfg(target_arch = "x86_64")]
+fn decode_raw_stretches(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    crc: &mut crate::crc::Crc32,
+    stretch: usize,
+) -> Result<(usize, usize), YencError> {
+    // Bytes a bounded call must still see past its limit: the span's
+    // lookahead reserve, with room to spare.
+    const LOOKAHEAD: usize = 128;
+    let (mut consumed, mut written) = (0usize, 0usize);
+    if output.len() < input.len() || x86_tier() != X86Tier::Avx2 {
+        return Ok((consumed, written));
+    }
+    let base = input.as_ptr() as usize;
+    while consumed.saturating_add(stretch).saturating_add(LOOKAHEAD) <= input.len() {
+        let limit = ((base + consumed + stretch) & !63) - base;
+        // SAFETY: the Avx2 tier was detected on this CPU.
+        let Some(outcome) = (unsafe {
+            decode_raw_bounded_avx2(
+                &input[consumed..],
+                &mut output[written..],
+                state,
+                limit - consumed,
+            )
+        }) else {
+            break;
+        };
+        let outcome = outcome.map_err(|err| shift_escape_error(err, consumed))?;
+        crc.update(&output[written..written + outcome.written]);
+        consumed += outcome.consumed;
+        written += outcome.written;
+        if state.end != DecodeEnd::None || outcome.consumed == 0 {
+            break;
+        }
+    }
+    Ok((consumed, written))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn decode_raw_stretches(
+    _input: &[u8],
+    _output: &mut [u8],
+    _state: &mut KernelState,
+    _crc: &mut crate::crc::Crc32,
+    _stretch: usize,
+) -> Result<(usize, usize), YencError> {
+    Ok((0, 0))
+}
+
+/// Rebase a sliced kernel's `MalformedEscape` offset onto the whole input.
+fn shift_escape_error(err: YencError, by: usize) -> YencError {
+    match err {
+        YencError::MalformedEscape(at) => YencError::MalformedEscape(at + by),
+        other => other,
+    }
+}
+
 /// Decode one streaming body chunk with carry state preserved across calls.
 pub(crate) fn decode_chunk_into(
     input: &[u8],

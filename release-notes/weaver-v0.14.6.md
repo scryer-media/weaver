@@ -4,9 +4,13 @@ Everything below is new since 0.14.5.
 
 ## Highlights
 
-- 0.14.6 is a light release that fixes the direct-store defects the first
-  full archive campaign run in CI exposed. Every fix shipped here was
-  reproduced on 0.14.5 and verified against the campaign cases that found it.
+- Direct-store fixes address RAR restart, repair, and completion defects found
+  by the first full archive campaign run in CI. Those defects were reproduced
+  on 0.14.5 and checked against the cases that found them.
+- yEnc decoding accepts an additional malformed escape that other downloaders
+  retain, and the x86 decode and CRC paths do less work per article.
+- Updated PAR3 and Reed-Solomon libraries improve source verification and
+  repair behavior.
 
 ## What changed
 
@@ -36,6 +40,20 @@ Everything below is new since 0.14.5.
   returning, and a chase that finishes on its own now schedules a
   completion check, so a resumed job no longer waits on the periodic
   reconcile pass, or forever, with its output left in staging.
+- A duplicate article can leave a cached RAR volume prefix shorter than the
+  required identification window. Reading a longer prefix back from the
+  placed volume now replaces that short cache entry, preserving direct-store
+  routing for an otherwise healthy set.
+- A whole-buffer yEnc decode now keeps an article whose last body line ends
+  with a lone `=` before `=yend`. It decodes the data like the streaming path
+  and other downloaders, then reports any size or CRC mismatch instead of
+  failing immediately with a malformed-escape error.
+- On supported x86 CPUs, yEnc trailer detection and CRC folding use improved
+  vector paths. The AVX2 assembly decoder folds bounded output while it is
+  still cache-resident; other decoder tiers retain their existing path.
+- PAR3 repair now uses `par3-rs` 0.4.5 for larger source reads, improved
+  network-share verification, and a pre-write snapshot check for in-place
+  repair. `reedsolomon-rs` 0.4.8 adds vectorized recovery operations.
 - The direct-store campaign tests model 7z map slots from the container and
   wait for an in-flight RAR topology refresh before declaring a schedule
   stalled. Both were test-side defects that reported product failures that

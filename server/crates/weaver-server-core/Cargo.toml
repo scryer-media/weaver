@@ -37,7 +37,7 @@ par3-rs = { workspace = true }
 # Already in the graph through par2-rs; named directly so System info can read
 # the XOR-JIT gate, which par2-rs does not re-export. The RAR3 recovery-volume
 # tests also author their `.rev` fixture with its RS coder.
-reedsolomon-rs = { version = "0.4.5", default-features = false }
+reedsolomon-rs = { version = "0.4.9", default-features = false }
 unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }
