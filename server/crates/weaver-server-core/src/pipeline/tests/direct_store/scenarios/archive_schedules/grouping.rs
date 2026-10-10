@@ -902,6 +902,19 @@ pub(super) async fn cell_smoke(cell: Cell) {
     }
 }
 
+#[tokio::test]
+async fn rar4_late_par2_recovers_lost_first_article() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::HexNumberedGap,
+            binding: Binding::Par2RealLast,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(240, (slot_arrivals(4), Interruption::Loss { mask: 1, index_first: false }))],
+    ).await;
+}
+
 const PROFILES: [ExtractionProfile; 3] = [
     ExtractionProfile::DirectStore,
     ExtractionProfile::Chase,

@@ -624,6 +624,11 @@ impl Pipeline {
         // that finds the set clean retries extraction once and then fails the
         // job, and a repair clears the failed set before its retry.
         let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
+            && self.par2_runtime(job_id).is_some_and(|runtime| {
+                runtime.served().is_some_and(|set_runtime| {
+                    set_runtime.settled_via_strong_decode
+                })
+            })
             && has_crc_failures
             && (self.job_has_live_rar_waiting_for_absent_volumes(job_id)
                 || self.job_has_failed_sevenz_set_with_all_volumes(job_id));
@@ -1061,8 +1066,15 @@ impl Pipeline {
         // verdict still owed, report the actual missing part before a generic
         // exhausted-work failure obscures the topology defect.
         if download_pipeline_exhausted
-            && (par2_bypassed || !self.job_spec_has_par2_file(job_id))
-            && let Some(error) = self.missing_numbered_archive_part(job_id)
+            && (par2_bypassed
+                || !self.job_spec_has_par2_file(job_id)
+                || (!par2_verdict_open && self.par2_gate_settlement_complete(job_id)))
+            && let Some(error) = self.missing_numbered_archive_part(job_id).or_else(|| {
+                (!has_crc_failures
+                    && rar_waiting_for_missing_volumes
+                    && self.job_has_live_rar_waiting_for_absent_volumes(job_id))
+                .then(|| "missing RAR volume after recovery settled".to_string())
+            })
         {
             self.fail_job(job_id, error);
             return;
