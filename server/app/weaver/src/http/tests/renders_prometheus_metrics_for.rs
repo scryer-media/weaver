@@ -19,12 +19,13 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         post_processing.push_str(&encoder.finish());
     }
     assert_valid_prometheus_exposition(&post_processing);
+    assert_eq!(interleaved_family(&post_processing), None, "{post_processing}");
+    // The run-duration histogram is per script and renders with the script
+    // run families.
+    assert!(!post_processing.contains("weaver_post_processing_attempt_duration_seconds"));
     for expected in [
         "weaver_post_processing_queue_depth 1",
         "weaver_post_processing_active_attempts 2",
-        "# TYPE weaver_post_processing_attempt_duration_seconds summary",
-        "weaver_post_processing_attempt_duration_seconds_sum 4.5",
-        "weaver_post_processing_attempt_duration_seconds_count 3",
         "weaver_post_processing_attempt_results{result=\"succeeded\"} 5",
         "weaver_post_processing_attempts_total{result=\"succeeded\"} 5",
         "weaver_post_processing_attempts_total{result=\"interrupted\"} 10",
@@ -1329,4 +1330,192 @@ fn renders_the_buffer_pool_and_the_process_resident_set() {
             "exposition is missing {expected:?}:\n{rendered}"
         );
     }
+}
+
+// Renders one area's snapshot, with the exposition checks every render must
+// pass.
+fn render_area(input: &metrics::PrometheusRenderInput<'_>) -> String {
+    let rendered = metrics::render_prometheus_metrics_input(input);
+    assert_valid_prometheus_exposition(&rendered);
+    assert_eq!(interleaved_family(&rendered), None, "{rendered}");
+    rendered
+}
+
+#[test]
+fn script_runs_render_per_script_state_sets_and_histograms() {
+    let script_runs = sample_script_runs();
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.script_runs = Some(&script_runs);
+    let rendered = render_area(&input);
+
+    use weaver_server_core::post_processing::run_metrics::{RunKind, RunStatus, SUMMARIES};
+    let statuses: Vec<&str> = RunStatus::ALL.iter().map(|s| s.as_str()).collect();
+    let kinds: Vec<&str> = RunKind::ALL.iter().map(|k| k.as_str()).collect();
+    let summaries: Vec<&str> = SUMMARIES.iter().map(|s| s.as_str()).collect();
+    assert_label_set(
+        &rendered,
+        "weaver_post_processing_script_runs_total",
+        "status",
+        &statuses,
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_post_processing_script_runs_total",
+        "kind",
+        &kinds,
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_post_processing_script_runs_total",
+        "adapter",
+        &["sabnzbd", "nzbget"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_post_processing_script_last_run_status",
+        "status",
+        &statuses,
+    );
+    assert_label_set(&rendered, "weaver_post_processing_runs_running", "kind", &kinds);
+    assert_label_set(
+        &rendered,
+        "weaver_post_processing_job_summaries_total",
+        "summary",
+        &summaries,
+    );
+
+    assert!(rendered.contains(
+        "weaver_post_processing_script_last_run_status{script=\"Notify\",status=\"failed\"} 1"
+    ));
+    assert!(rendered.contains(
+        "weaver_post_processing_script_last_run_status{script=\"Notify\",status=\"succeeded\"} 0"
+    ));
+    assert!(rendered.contains("weaver_post_processing_script_last_exit_code{script=\"Notify\"} 2"));
+    assert!(rendered.contains(
+        "weaver_post_processing_script_last_duration_seconds{script=\"Notify\"} 1.25"
+    ));
+    assert!(rendered.contains(
+        "weaver_post_processing_script_last_run_timestamp_seconds{script=\"Notify\"} 1700000000.5"
+    ));
+    assert!(rendered.contains(
+        "weaver_post_processing_attempt_duration_seconds_bucket{script=\"Notify\",kind=\"queue\",waited=\"true\",status=\"failed\",le=\"1\"} 2"
+    ));
+    assert!(rendered.contains(
+        "weaver_post_processing_attempt_duration_seconds_count{script=\"Notify\",kind=\"queue\",waited=\"true\",status=\"failed\"} 2"
+    ));
+    assert!(rendered.contains("weaver_post_processing_concurrency_limit 32"));
+    assert!(rendered.contains("weaver_post_processing_queue_event_backlog 4"));
+    assert!(rendered.contains(
+        "weaver_post_processing_script_pruned_runs_total{script=\"Notify\"} 6"
+    ));
+}
+
+#[test]
+fn schedules_render_rule_state_sets_and_the_admission_hold() {
+    let schedules = sample_schedules();
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.schedules = Some(&schedules);
+    let rendered = render_area(&input);
+
+    use weaver_server_core::bandwidth::schedule_metrics::{ActionKind, HoldReason};
+    let holds: Vec<&str> = HoldReason::ALL.iter().map(|r| r.as_str()).collect();
+    let actions: Vec<&str> = ActionKind::ALL.iter().map(|a| a.as_str()).collect();
+    assert_label_set(&rendered, "weaver_schedule_admission_hold", "reason", &holds);
+    assert_label_set(&rendered, "weaver_schedule_rules", "action", &actions);
+    assert_label_set(&rendered, "weaver_schedule_actions_total", "action", &actions);
+    assert_label_set(
+        &rendered,
+        "weaver_schedule_rule_last_outcome",
+        "outcome",
+        &["applied", "failed", "skipped"],
+    );
+
+    assert!(rendered.contains("weaver_schedule_admission_hold{reason=\"action_failed\"} 1"));
+    assert!(rendered.contains("weaver_schedule_admission_hold{reason=\"none\"} 0"));
+    assert!(rendered.contains(
+        "weaver_schedule_rule_last_outcome{rule_id=\"night-limit\",outcome=\"applied\"} 1"
+    ));
+    assert!(rendered.contains(
+        "weaver_schedule_rule_last_outcome{rule_id=\"night-limit\",outcome=\"failed\"} 0"
+    ));
+    assert!(rendered.contains(
+        "weaver_schedule_rule_last_fire_timestamp_seconds{rule_id=\"night-limit\"} 1700000060"
+    ));
+    assert!(rendered.contains("weaver_schedule_evaluations_total 120"));
+}
+
+#[test]
+fn networking_renders_leg_egress_pool_and_tunnel_families() {
+    let network = sample_network();
+    let tunnel = sample_tunnel();
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.network = Some(&network);
+    input.tunnel = Some(&tunnel);
+    let rendered = render_area(&input);
+
+    assert_label_set(
+        &rendered,
+        "weaver_network_leg_state",
+        "state",
+        &["up", "down", "probing", "blocked"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_network_rung_state",
+        "state",
+        &["standby", "failing", "cooldown"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_network_egress_health",
+        "health",
+        &["up", "down", "unknown"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_network_egress_dials_total",
+        "result",
+        &["success", "failed", "blocked", "ignored"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_tunnel_session_prepares_total",
+        "kind",
+        &["http3_connect", "ssh", "wireguard"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_network_dns_resolutions_total",
+        "resolver",
+        &["routed", "wireguard"],
+    );
+
+    assert!(rendered.contains(
+        "weaver_network_leg_state{consumer=\"server:7\",position=\"0\",egress_id=\"2\",state=\"probing\"} 1"
+    ));
+    assert!(rendered.contains(
+        "weaver_network_leg_state{consumer=\"server:7\",position=\"1\",egress_id=\"0\",state=\"down\"} 1"
+    ));
+    assert!(rendered.contains(
+        "weaver_network_leg_rung{consumer=\"server:7\",position=\"0\",egress_id=\"2\"} 1"
+    ));
+    // A leg that has never connected through a rung has no rung series.
+    assert!(!rendered.contains(
+        "weaver_network_leg_rung{consumer=\"server:7\",position=\"1\""
+    ));
+    assert!(rendered.contains(
+        "weaver_network_leg_throughput_bytes_per_second{consumer=\"server:7\",position=\"0\",egress_id=\"2\"} 5000000"
+    ));
+    assert!(rendered.contains(
+        "weaver_network_pool_members{pool_id=\"4\",egress_id=\"2\",stage=\"blocked\"} 1"
+    ));
+    assert!(rendered.contains(
+        "weaver_network_pool_member_session_handshake_seconds{pool_id=\"4\",egress_id=\"2\",member_id=\"11\"} 0.25"
+    ));
+    assert!(!rendered.contains("member_id=\"12\""));
+    assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
+    assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
 }

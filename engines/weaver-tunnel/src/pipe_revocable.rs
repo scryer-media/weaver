@@ -76,6 +76,9 @@ impl Revocable {
         Ok(dialed)
     }
     pub fn revoke(&self) {
+        if !self.is_revoked() {
+            crate::metrics::record_revocation();
+        }
         self.sockets.revoke();
         self.streams.revoke();
         self.slots.close();

@@ -1,6 +1,7 @@
 mod interfaces;
 mod model;
 mod network;
+pub mod network_metrics;
 mod network_persistence;
 mod network_runtime;
 pub(crate) mod persistence;

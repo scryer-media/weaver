@@ -5,6 +5,10 @@ use std::sync::Arc;
 
 pub type WireGuardTunnelProvider = SharedProvider<proxy_tunnels::WireGuardTunnelProvider>;
 
+impl crate::shared::SessionKind for proxy_tunnels::WireGuardTunnelProvider {
+    const KIND: crate::metrics::TunnelKind = crate::metrics::TunnelKind::WireGuard;
+}
+
 impl WireGuardTunnelProvider {
     pub fn with_udp_factory(self, factory: Arc<dyn crate::endpoint::UdpSocketFactory>) -> Self {
         Self(self.0.with_udp_factory(factory))

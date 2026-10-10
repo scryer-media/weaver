@@ -157,6 +157,9 @@ pub(crate) struct PrometheusMetricsExporter {
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     config: SharedConfig,
     buffers: Arc<weaver_server_core::runtime::buffers::BufferPool>,
+    // The configured schedule rules; absent when the exporter is built
+    // without a schedule evaluator.
+    schedules: Option<weaver_server_core::bandwidth::schedule::SharedSchedules>,
     build: BuildInfo,
 }
 
@@ -180,8 +183,17 @@ impl PrometheusMetricsExporter {
             transfer_policy,
             config,
             buffers,
+            schedules: None,
             build,
         }
+    }
+
+    pub(crate) fn with_schedules(
+        mut self,
+        schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
+    ) -> Self {
+        self.schedules = Some(schedules);
+        self
     }
 
     pub(crate) async fn render(
@@ -213,6 +225,27 @@ impl PrometheusMetricsExporter {
 
         let post_processing =
             Some(weaver_server_core::post_processing::executor::metrics_snapshot());
+        // The concurrency setting and the queue-event backlog are database
+        // reads, so they run off the async worker.
+        let script_runs = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || {
+                weaver_server_core::post_processing::run_metrics::snapshot(&db)
+            })
+            .await
+            .unwrap_or_else(|_| weaver_server_core::post_processing::run_metrics::counters_snapshot())
+        };
+        let schedules = match &self.schedules {
+            Some(schedules) => {
+                weaver_server_core::bandwidth::schedule_metrics::snapshot(schedules).await
+            }
+            None => weaver_server_core::bandwidth::schedule_metrics::counters_snapshot(),
+        };
+        let network = self
+            .handle
+            .proxy_runtime()
+            .map(|runtime| weaver_server_core::proxies::network_metrics::snapshot(&runtime.network));
+        let tunnel = weaver_server_core::proxies::network_metrics::tunnel::snapshot();
         // The samplers' last readings: a scrape never stats a filesystem, so a
         // slow mount cannot hold it.
         let disk_space = disk_space.snapshots();
@@ -246,6 +279,10 @@ impl PrometheusMetricsExporter {
         input.semantic_duplicate_lifecycle = &semantic_duplicate_lifecycle;
         input.extraction_rejections = &extraction_rejections;
         input.post_processing = post_processing.as_ref();
+        input.script_runs = Some(&script_runs);
+        input.schedules = Some(&schedules);
+        input.network = network.as_ref();
+        input.tunnel = Some(&tunnel);
         input.build = self.build;
         input.start_time_seconds = process_start_epoch_seconds();
         input.per_job_series = per_job_series;
