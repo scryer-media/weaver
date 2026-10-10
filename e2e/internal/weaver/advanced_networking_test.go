@@ -135,13 +135,15 @@ func TestNoNetRawOverrideDropsTheCapabilityOnOneNetwork(t *testing.T) {
 }
 
 func TestFixtureAddressOverridePinsOnlyTheFixture(t *testing.T) {
-	override := readOverride(t, advancedTestPhase(t, eventScriptsReleaseFlow()))
-	if len(override.Services) != 1 {
-		t.Fatalf("services = %v, want only proxy-fixture", override.Services)
-	}
-	fixture := override.Services["proxy-fixture"]
-	if fixture.Networks["default"]["ipv4_address"] != "10.250.7.250" || fixture.Environment["PROXY_FIXTURE_IP"] != "10.250.7.250" {
-		t.Fatalf("proxy fixture = %+v", fixture)
+	for _, spec := range []weaverReleaseFlowSpec{eventScriptsReleaseFlow(), postProcessingScriptsReleaseFlow()} {
+		override := readOverride(t, advancedTestPhase(t, spec))
+		if len(override.Services) != 1 {
+			t.Fatalf("%s services = %v, want only proxy-fixture", spec.Name, override.Services)
+		}
+		fixture := override.Services["proxy-fixture"]
+		if fixture.Networks["default"]["ipv4_address"] != "10.250.7.250" || fixture.Environment["PROXY_FIXTURE_IP"] != "10.250.7.250" {
+			t.Fatalf("%s proxy fixture = %+v", spec.Name, fixture)
+		}
 	}
 }
 

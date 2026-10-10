@@ -27,6 +27,8 @@ export type ScriptRecord = {
   script: string;
   cwd: string;
   argc: number;
+  /** Each positional argument, in order (`$1` first). */
+  argv: string[];
   env: Record<string, string>;
 };
 
@@ -35,6 +37,8 @@ export type FixtureOptions = {
   kinds: ScriptKind[];
   queueEvents?: string[];
   taskTimes?: string[];
+  /** `Name=default` lines for the header's `### OPTIONS ###` section. */
+  headerOptions?: string[];
   /** Block on a FIFO keyed by script name and job id before the body runs. */
   gate?: boolean;
   /** Shell run after the record is written and the gate (if any) opens. */
@@ -55,6 +59,11 @@ record_id="$(date +%s)-$$-$(od -An -N4 -tu4 /dev/urandom | tr -d ' \\n')"
   printf '@SCRIPT=%s\\n' ${shellQuote(name)}
   printf '@CWD=%s\\n' "$(pwd)"
   printf '@ARGC=%s\\n' "$#"
+  arg_index=0
+  for arg in "$@"; do
+    arg_index=$((arg_index + 1))
+    printf '@ARG%s=%s\\n' "$arg_index" "$arg"
+  done
   env
 } > "$record_dir/.$record_id"
 mv "$record_dir/.$record_id" "$record_dir/$record_id.env"
@@ -79,6 +88,10 @@ export function writeFixtureScript(name: string, options: FixtureOptions): strin
     `### NZBGET ${options.kinds.join("/")} SCRIPT ###`,
     ...(options.queueEvents ? [`### QUEUE EVENTS: ${options.queueEvents.join(", ")} ###`] : []),
     ...(options.taskTimes ? [`### TASK TIME: ${options.taskTimes.join(";")} ###`] : []),
+    ...(options.headerOptions
+      ? ["", "### OPTIONS ###", ...options.headerOptions.flatMap(option => ["#", "# e2e option", `#${option}`]),
+        `### NZBGET ${options.kinds.join("/")} SCRIPT ###`]
+      : []),
     "",
   ].join("\n");
   const source = `${header}${recorder(name)}${options.gate ? gate(name) : ""}${options.body ?? ""}
@@ -95,7 +108,8 @@ exit ${options.exitCode ?? 0}
 /** A manifest package (`manifest.json` + `run.sh`) with NZBGet options. */
 export function writeFixturePackage(
   name: string,
-  options: FixtureOptions & { scriptOptions?: Array<{ name: string; value: string; secret?: boolean }> },
+  /** A value's JSON type is the option's type: string, boolean, integer or number. */
+  options: FixtureOptions & { scriptOptions?: Array<{ name: string; value: string | number | boolean; secret?: boolean }> },
 ): string {
   const directory = path.join(SCRIPTS_DIR, name);
   fs.rmSync(directory, { recursive: true, force: true });
@@ -161,14 +175,16 @@ export function parseScriptRecord(id: string, text: string): ScriptRecord {
   const meta: Record<string, string> = {};
   let last: string | undefined;
   for (const line of text.split("\n")) {
-    const metaMatch = /^@([A-Z]+)=(.*)$/.exec(line);
+    const metaMatch = /^@([A-Z]+[0-9]*)=(.*)$/.exec(line);
     if (metaMatch) { meta[metaMatch[1]!] = metaMatch[2]!; last = undefined; continue; }
     const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
     if (match) { env[match[1]!] = match[2]!; last = match[1]; continue; }
     // A value with a newline continues on the following lines.
     if (last !== undefined && line !== "") env[last] += `\n${line}`;
   }
-  return { id, script: meta.SCRIPT ?? "", cwd: meta.CWD ?? "", argc: Number(meta.ARGC ?? 0), env };
+  const argc = Number(meta.ARGC ?? 0);
+  const argv = Array.from({ length: argc }, (_, index) => meta[`ARG${index + 1}`] ?? "");
+  return { id, script: meta.SCRIPT ?? "", cwd: meta.CWD ?? "", argc, argv, env };
 }
 
 /** Every complete record, oldest first. */

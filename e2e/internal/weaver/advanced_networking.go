@@ -163,6 +163,28 @@ func eventScriptsReleaseFlow() weaverReleaseFlowSpec {
 	}
 }
 
+// postProcessingScriptsReleaseFlow runs the post-processing script contract:
+// what each adapter hands a script, exit codes, instances, inputs, secrets,
+// the run token, interpreters, ordering, retention and the NZBGet facade. The
+// URL-submission case fetches from the proxy fixture, so it keeps the
+// fixture's fixed address like event-scripts. The concurrency limit applies
+// at start-up, which only its @restart half can check.
+func postProcessingScriptsReleaseFlow() weaverReleaseFlowSpec {
+	return weaverReleaseFlowSpec{
+		Name:             "post-processing-scripts",
+		Kind:             weaverReleaseFlowBehavior,
+		PlaywrightScript: "post-processing-scripts",
+		SpecFiles:        []string{"post-processing-scripts.spec.ts"},
+		Services:         []string{"nntp", "nntp2", "weaver", "proxy-fixture"},
+		Datastores:       releaseDatastoreMatrix(),
+		Artifacts:        append(defaultWeaverReleaseArtifacts(), "script-records"),
+		Timeout:          30 * time.Minute,
+		NetworkLayout:    weaverNetworkLayoutFixtureAddress,
+		Stages:           []string{"initial", "restarted"},
+		StageScripts:     map[string]string{"restarted": "post-processing-scripts-restarted"},
+	}
+}
+
 // schedulingReleaseFlow runs the schedule and automatic-backup specs. The
 // RSS fixture's counted feeds show how often a scheduled fetch ran.
 func schedulingReleaseFlow() weaverReleaseFlowSpec {
