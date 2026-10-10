@@ -106,7 +106,10 @@ pub(super) struct DamageCell {
 /// needs a recovery set to be posted.
 fn possible(cell: DamageCell) -> bool {
     !(cell.recovery == Recovery::None
-        && matches!(cell.location, Location::RecoveryIndex | Location::RecoveryVolume))
+        && matches!(
+            cell.location,
+            Location::RecoveryIndex | Location::RecoveryVolume
+        ))
 }
 
 pub(super) fn cells() -> Vec<DamageCell> {
@@ -180,7 +183,11 @@ pub(in super::super) fn place(
         }
         sequence
     };
-    let target = if backward { *files.last().unwrap() } else { files[first] };
+    let target = if backward {
+        *files.last().unwrap()
+    } else {
+        files[first]
+    };
     let at = |file: usize| -> u32 {
         if backward {
             0
@@ -200,7 +207,11 @@ pub(in super::super) fn place(
             let order: Vec<usize> = if backward {
                 files.iter().rev().copied().collect()
             } else {
-                files[first..].iter().chain(&files[..first]).copied().collect()
+                files[first..]
+                    .iter()
+                    .chain(&files[..first])
+                    .copied()
+                    .collect()
             };
             for &file in order.iter().take(3) {
                 let count = articles(file);
@@ -221,9 +232,13 @@ pub(in super::super) fn place(
             .collect(),
         Pattern::MostOfOne => {
             let count = articles(target);
-            (1..count.saturating_sub(1)).map(|article| (target, article)).collect()
+            (1..count.saturating_sub(1))
+                .map(|article| (target, article))
+                .collect()
         }
-        Pattern::MemberAbsent => (0..articles(target)).map(|article| (target, article)).collect(),
+        Pattern::MemberAbsent => (0..articles(target))
+            .map(|article| (target, article))
+            .collect(),
     }
 }
 
@@ -256,7 +271,10 @@ fn damage(post: &mut Post, cell: DamageCell, recovery_files: bool) {
         Location::RecoveryIndex => (post.index_of(Role::Index), 0, 0, false),
         Location::RecoveryVolume => (post.index_of(Role::Recovery), 0, 0, false),
     };
-    let on_recovery = matches!(cell.location, Location::RecoveryIndex | Location::RecoveryVolume);
+    let on_recovery = matches!(
+        cell.location,
+        Location::RecoveryIndex | Location::RecoveryVolume
+    );
     if on_recovery != recovery_files || files.is_empty() {
         // A pattern's second half lands on data even when its first lands on
         // a recovery file.
@@ -276,8 +294,13 @@ fn damage(post: &mut Post, cell: DamageCell, recovery_files: bool) {
         post.files[file].wire.insert(article, wire);
     }
     if cell.pattern == Pattern::MemberAbsent && !on_recovery {
-        let target = if backward { *files.last().unwrap() } else { files[first] };
-        let elsewhere = data[(data.iter().position(|&file| file == target).unwrap() + 2) % data.len()];
+        let target = if backward {
+            *files.last().unwrap()
+        } else {
+            files[first]
+        };
+        let elsewhere =
+            data[(data.iter().position(|&file| file == target).unwrap() + 2) % data.len()];
         let other = &mut post.files[elsewhere];
         let article = other.articles() / 2;
         other.wire.insert(article, Wire::Damaged(cell.kind));
@@ -286,8 +309,15 @@ fn damage(post: &mut Post, cell: DamageCell, recovery_files: bool) {
 
 impl DamageCell {
     fn code(self) -> Code {
-        let seed = self.kind as usize + self.location as usize + self.pattern as usize + self.container as usize;
-        if seed.is_multiple_of(2) { Code::Cauchy } else { Code::Fft }
+        let seed = self.kind as usize
+            + self.location as usize
+            + self.pattern as usize
+            + self.container as usize;
+        if seed.is_multiple_of(2) {
+            Code::Cauchy
+        } else {
+            Code::Fft
+        }
     }
 
     fn data(self) -> Post {
@@ -321,7 +351,12 @@ pub(in super::super) fn with_recovery(
     let sources: Vec<(String, Vec<u8>)> = data
         .index_of(Role::Data)
         .into_iter()
-        .map(|file| (data.files[file].name.clone(), data.files[file].bytes.clone()))
+        .map(|file| {
+            (
+                data.files[file].name.clone(),
+                data.files[file].bytes.clone(),
+            )
+        })
         .collect();
     let lost_now = lost(&data);
     let needed = recovery::needed(&data, geometry, &lost_now);
@@ -370,7 +405,9 @@ impl Cell for DamageCell {
                     margin,
                     source_blocks / 10,
                     geometry,
-                    |sources, blocks| recovery::par2_set(sources, SLICE, blocks, Par2Volumes::Uniform),
+                    |sources, blocks| {
+                        recovery::par2_set(sources, SLICE, blocks, Par2Volumes::Uniform)
+                    },
                     mark,
                 );
                 (post, Some(geometry))
@@ -426,8 +463,7 @@ fn open_defect(cell: DamageCell, profile: ExtractionProfile) -> Option<Defect> {
 
 /// A demotion refetch re-publishes a PAR3 source whose retained assessment is
 /// Ready, and the job fails instead of re-assessing it.
-const PAR3_SOURCE_CHANGED_AFTER_DEMOTION: &str =
-    "PAR3: after a demotion refetch the job fails with \"PAR3 source changed\" instead of re-assessing";
+const PAR3_SOURCE_CHANGED_AFTER_DEMOTION: &str = "PAR3: after a demotion refetch the job fails with \"PAR3 source changed\" instead of re-assessing";
 
 macro_rules! damage_smokes {
     ($($name:ident $kind:ident $location:ident $pattern:ident $recovery:expr, $container:ident;)+) => {

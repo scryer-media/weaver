@@ -153,7 +153,12 @@ pub(in super::super) struct Posted {
 }
 
 impl Posted {
-    pub(in super::super) fn new(name: impl Into<String>, bytes: Vec<u8>, article: usize, role: Role) -> Self {
+    pub(in super::super) fn new(
+        name: impl Into<String>,
+        bytes: Vec<u8>,
+        article: usize,
+        role: Role,
+    ) -> Self {
         Self {
             name: name.into(),
             bytes,
@@ -196,7 +201,9 @@ impl Posted {
             Some(Wire::Damaged(damage)) => match damage {
                 Damage::Recomputed | Damage::NoChecksum => Some(altered(&self.bytes[range])),
                 Damage::Swapped => Some(self.swapped_body(article)),
-                Damage::Truncated => Some(self.bytes[range.start..range.start + range.len() / 2].to_vec()),
+                Damage::Truncated => {
+                    Some(self.bytes[range.start..range.start + range.len() / 2].to_vec())
+                }
                 Damage::CrcWrong
                 | Damage::Overlong
                 | Damage::TrailingJunk
@@ -220,7 +227,10 @@ impl Posted {
 
     /// Byte ranges of the file this post may leave wrong, as a superset
     /// (`upper`) and as the ranges it certainly leaves wrong (`lower`).
-    pub(in super::super) fn wrong_ranges(&self, lost: &BTreeSet<u32>) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    pub(in super::super) fn wrong_ranges(
+        &self,
+        lost: &BTreeSet<u32>,
+    ) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
         let mut upper = Vec::new();
         let mut lower = Vec::new();
         // A uuencode part carries no offset: it is placed after the decoded
@@ -230,7 +240,11 @@ impl Posted {
         for article in 0..self.articles() {
             let range = self.extent(article);
             if lost.contains(&article) || self.is_absent(article) {
-                upper.push(if uu { range.start..self.bytes.len() } else { range.clone() });
+                upper.push(if uu {
+                    range.start..self.bytes.len()
+                } else {
+                    range.clone()
+                });
                 lower.push(range);
                 continue;
             }
@@ -287,7 +301,13 @@ impl Posted {
                 return uu_damaged(&self.name, &body, article, self.articles(), style, *damage);
             }
             body.truncate(data.len());
-            return vec![uu_article(&self.name, &body, article, self.articles(), style)];
+            return vec![uu_article(
+                &self.name,
+                &body,
+                article,
+                self.articles(),
+                style,
+            )];
         };
         let single = !ypart && self.articles() == 1;
         let clean = YencArticle {
@@ -312,7 +332,8 @@ impl Posted {
             }
             Damage::Truncated => copy.cut = true,
             Damage::Overlong => {
-                copy.body.extend((0..self.article.min(97)).map(|n| (n * 31 + 7) as u8));
+                copy.body
+                    .extend((0..self.article.min(97)).map(|n| (n * 31 + 7) as u8));
             }
             Damage::Recomputed => {
                 copy.body = altered(data);
@@ -417,7 +438,9 @@ impl YencArticle<'_> {
         out.extend_from_slice(trailer.as_bytes());
         out.extend_from_slice(b"\r\n");
         if self.junk {
-            out.extend_from_slice(b"-- posted with a signature block --\r\nsee you on the other side\r\n");
+            out.extend_from_slice(
+                b"-- posted with a signature block --\r\nsee you on the other side\r\n",
+            );
         }
         out
     }
@@ -431,10 +454,7 @@ fn yenc_lines(body: &[u8], line: usize) -> Vec<Vec<u8>> {
     let mut encoded = Vec::new();
     weaver_yenc::encode(body, &mut encoded, line, "x").unwrap();
     let start = encoded.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
-    let end = encoded
-        .windows(7)
-        .rposition(|w| w == b"\r\n=yend")
-        .unwrap();
+    let end = encoded.windows(7).rposition(|w| w == b"\r\n=yend").unwrap();
     encoded[start..end]
         .split(|&byte| byte == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line).to_vec())

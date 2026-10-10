@@ -1095,18 +1095,15 @@ fn sample_post_processing_metrics()
 
 // One script that has run under every kind, adapter, waited flag and status,
 // so each label set the families carry is present in the render.
-fn sample_script_runs() -> weaver_server_core::post_processing::run_metrics::ScriptRunMetricsSnapshot {
+fn sample_script_runs() -> weaver_server_core::post_processing::run_metrics::ScriptRunMetricsSnapshot
+{
     use weaver_server_core::operations::HistogramSnapshot;
     use weaver_server_core::post_processing::run_metrics::{
         ADAPTERS, RetentionAction, RunKind, RunStatus, SCRIPT_RUN_DURATION_BOUNDS, SUMMARIES,
         ScriptMetrics, ScriptRunCount, ScriptRunDuration, ScriptRunMetricsSnapshot,
     };
-    let per_kind = |base: u64| -> Vec<(RunKind, u64)> {
-        RunKind::ALL
-            .into_iter()
-            .zip(base..)
-            .collect()
-    };
+    let per_kind =
+        |base: u64| -> Vec<(RunKind, u64)> { RunKind::ALL.into_iter().zip(base..).collect() };
     let mut runs = Vec::new();
     let mut durations = Vec::new();
     for kind in RunKind::ALL {
@@ -1288,9 +1285,16 @@ fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::Tunn
     TunnelMetricsSnapshot {
         streams: TunnelKind::ALL
             .into_iter()
-            .flat_map(|kind| DialResult::ALL.into_iter().map(move |result| (kind, result, 1)))
+            .flat_map(|kind| {
+                DialResult::ALL
+                    .into_iter()
+                    .map(move |result| (kind, result, 1))
+            })
             .collect(),
-        session_prepares: TunnelKind::SESSIONS.into_iter().map(|k| (k, 5, 1)).collect(),
+        session_prepares: TunnelKind::SESSIONS
+            .into_iter()
+            .map(|k| (k, 5, 1))
+            .collect(),
         session_retirements: TunnelKind::SESSIONS.into_iter().map(|k| (k, 2)).collect(),
         resolutions: Resolver::ALL.into_iter().map(|r| (r, 10, 2)).collect(),
         rung_cooldowns: vec![1; RUNGS],

@@ -58,8 +58,7 @@ struct EgressSlots {
     cooldowns: AtomicU64,
 }
 
-static EGRESSES: LazyLock<RwLock<HashMap<u32, Arc<EgressSlots>>>> =
-    LazyLock::new(Default::default);
+static EGRESSES: LazyLock<RwLock<HashMap<u32, Arc<EgressSlots>>>> = LazyLock::new(Default::default);
 
 fn egress_slots(egress_id: u32) -> Arc<EgressSlots> {
     if let Some(slots) = EGRESSES
@@ -317,7 +316,9 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
                 open: allocation.map_or(0, |a| u64::from(a.open)),
                 opening: allocation.map_or(0, |a| u64::from(a.opening)),
                 bytes_per_second: allocation.map_or(0, |a| a.bytes_per_second),
-                rung: allocation.and_then(|a| a.path.as_ref()).and_then(|p| p.rung),
+                rung: allocation
+                    .and_then(|a| a.path.as_ref())
+                    .and_then(|p| p.rung),
                 rungs: definition
                     .rung_states()
                     .into_iter()
@@ -373,13 +374,19 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
             );
         }
         for egress in &mut egresses {
-            egress.health_since_epoch_ms =
-                since(&mut transitions.egresses, egress.egress_id, egress.health, now);
+            egress.health_since_epoch_ms = since(
+                &mut transitions.egresses,
+                egress.egress_id,
+                egress.health,
+                now,
+            );
         }
         // Forget legs and egresses that are no longer configured, so the map
         // never outgrows the configuration.
-        let live_legs: std::collections::HashSet<_> =
-            legs.iter().map(|l| (l.consumer.clone(), l.position)).collect();
+        let live_legs: std::collections::HashSet<_> = legs
+            .iter()
+            .map(|l| (l.consumer.clone(), l.position))
+            .collect();
         transitions.legs.retain(|key, _| live_legs.contains(key));
         let live_egresses: std::collections::HashSet<_> =
             egresses.iter().map(|e| e.egress_id).collect();

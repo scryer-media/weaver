@@ -559,6 +559,11 @@ mod tests {
             .find(|(kind, _, _)| *kind == ActionKind::Pause)
             .unwrap();
         assert_eq!((pause.1, pause.2), (2, 1));
-        assert!(snapshot.replays.iter().any(|(r, n)| *r == ReplayReason::Startup && *n >= 1));
+        assert!(
+            snapshot
+                .replays
+                .iter()
+                .any(|(r, n)| *r == ReplayReason::Startup && *n >= 1)
+        );
     }
 }

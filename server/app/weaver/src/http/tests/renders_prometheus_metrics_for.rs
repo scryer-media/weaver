@@ -19,7 +19,11 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         post_processing.push_str(&encoder.finish());
     }
     assert_valid_prometheus_exposition(&post_processing);
-    assert_eq!(interleaved_family(&post_processing), None, "{post_processing}");
+    assert_eq!(
+        interleaved_family(&post_processing),
+        None,
+        "{post_processing}"
+    );
     // The run-duration histogram is per script and renders with the script
     // run families.
     assert!(!post_processing.contains("weaver_post_processing_attempt_duration_seconds"));
@@ -1377,7 +1381,12 @@ fn script_runs_render_per_script_state_sets_and_histograms() {
         "status",
         &statuses,
     );
-    assert_label_set(&rendered, "weaver_post_processing_runs_running", "kind", &kinds);
+    assert_label_set(
+        &rendered,
+        "weaver_post_processing_runs_running",
+        "kind",
+        &kinds,
+    );
     assert_label_set(
         &rendered,
         "weaver_post_processing_job_summaries_total",
@@ -1392,9 +1401,11 @@ fn script_runs_render_per_script_state_sets_and_histograms() {
         "weaver_post_processing_script_last_run_status{script=\"Notify\",status=\"succeeded\"} 0"
     ));
     assert!(rendered.contains("weaver_post_processing_script_last_exit_code{script=\"Notify\"} 2"));
-    assert!(rendered.contains(
-        "weaver_post_processing_script_last_duration_seconds{script=\"Notify\"} 1.25"
-    ));
+    assert!(
+        rendered.contains(
+            "weaver_post_processing_script_last_duration_seconds{script=\"Notify\"} 1.25"
+        )
+    );
     assert!(rendered.contains(
         "weaver_post_processing_script_last_run_timestamp_seconds{script=\"Notify\"} 1700000000.5"
     ));
@@ -1408,9 +1419,9 @@ fn script_runs_render_per_script_state_sets_and_histograms() {
     assert!(rendered.contains("weaver_post_processing_queue_event_backlog 4"));
     assert!(rendered.contains("weaver_post_processing_slots_in_use 3"));
     assert!(rendered.contains("weaver_post_processing_slots_waiting 5"));
-    assert!(rendered.contains(
-        "weaver_post_processing_script_pruned_runs_total{script=\"Notify\"} 6"
-    ));
+    assert!(
+        rendered.contains("weaver_post_processing_script_pruned_runs_total{script=\"Notify\"} 6")
+    );
 }
 
 #[test]
@@ -1424,9 +1435,19 @@ fn schedules_render_rule_state_sets_and_the_admission_hold() {
     use weaver_server_core::bandwidth::schedule_metrics::{ActionKind, HoldReason};
     let holds: Vec<&str> = HoldReason::ALL.iter().map(|r| r.as_str()).collect();
     let actions: Vec<&str> = ActionKind::ALL.iter().map(|a| a.as_str()).collect();
-    assert_label_set(&rendered, "weaver_schedule_admission_hold", "reason", &holds);
+    assert_label_set(
+        &rendered,
+        "weaver_schedule_admission_hold",
+        "reason",
+        &holds,
+    );
     assert_label_set(&rendered, "weaver_schedule_rules", "action", &actions);
-    assert_label_set(&rendered, "weaver_schedule_actions_total", "action", &actions);
+    assert_label_set(
+        &rendered,
+        "weaver_schedule_actions_total",
+        "action",
+        &actions,
+    );
     assert_label_set(
         &rendered,
         "weaver_schedule_rule_last_outcome",
@@ -1505,9 +1526,7 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
         "weaver_network_leg_rung{consumer=\"server:7\",position=\"0\",egress_id=\"2\"} 1"
     ));
     // A leg that has never connected through a rung has no rung series.
-    assert!(!rendered.contains(
-        "weaver_network_leg_rung{consumer=\"server:7\",position=\"1\""
-    ));
+    assert!(!rendered.contains("weaver_network_leg_rung{consumer=\"server:7\",position=\"1\""));
     assert!(rendered.contains(
         "weaver_network_leg_throughput_bytes_per_second{consumer=\"server:7\",position=\"0\",egress_id=\"2\"} 5000000"
     ));

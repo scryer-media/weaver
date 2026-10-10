@@ -2,11 +2,11 @@
 //! its end header, and both at once; Cauchy and FFT codes; recovery with
 //! margin, exact and one block short; three block sizes; one member and two;
 //! one archive set in the job and two; the index present, absent and damaged.
+use super::super::super::super::sevenz_store::embedded_par3::with_embedded_par3;
+use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::fixtures::{Container, MEMBER, SEVENZ_MEMBER, payload};
 use super::post::{Damage, Post, Posted, Role, Wire};
 use super::recovery::{self, Code, Geometry, MARGINS, Margin, recovery_packets};
-use super::super::super::super::sevenz_store::embedded_par3::with_embedded_par3;
-use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::*;
 
 const ARTICLE: usize = 768;
@@ -158,7 +158,11 @@ impl Par3Cell {
     }
 
     fn member(self, set: usize, entry: usize) -> String {
-        let base = if self.container == Container::SevenZip { SEVENZ_MEMBER } else { MEMBER };
+        let base = if self.container == Container::SevenZip {
+            SEVENZ_MEMBER
+        } else {
+            MEMBER
+        };
         let base = match (set, entry) {
             (0, 0) => base.to_string(),
             (0, _) => base.replace("lantern", "beacon"),
@@ -181,7 +185,8 @@ impl Par3Cell {
                 let mut archive =
                     build_7z_shaped(&entries, sevenz_turbo::EncoderMethod::COPY, None, false);
                 if self.placement != Placement::Sidecar {
-                    archive = with_embedded_par3(&archive, self.block as u64, tail_blocks.max(1) as u64);
+                    archive =
+                        with_embedded_par3(&archive, self.block as u64, tail_blocks.max(1) as u64);
                 }
                 split_volumes(&archive, VOLUMES)
             }
@@ -274,7 +279,12 @@ impl Par3Cell {
             for (set, files) in per_set.iter().enumerate() {
                 let sources: Vec<(String, Vec<u8>)> = files
                     .iter()
-                    .map(|&file| (data.files[file].name.clone(), data.files[file].bytes.clone()))
+                    .map(|&file| {
+                        (
+                            data.files[file].name.clone(),
+                            data.files[file].bytes.clone(),
+                        )
+                    })
                     .collect();
                 let needed = needed_over(&data, files, &lost_now, self.block);
                 blocks[set] = recovery::blocks_for(self.margin, needed, killed[set], 2);
@@ -421,7 +431,11 @@ fn needed_over(
 }
 
 /// Recovery packets of the sidecar set named `prefix` that survive.
-fn recovery_surviving(post: &Post, prefix: &str, lost: &BTreeMap<usize, BTreeSet<u32>>) -> (usize, usize) {
+fn recovery_surviving(
+    post: &Post,
+    prefix: &str,
+    lost: &BTreeMap<usize, BTreeSet<u32>>,
+) -> (usize, usize) {
     let none = BTreeSet::new();
     let mut least = 0;
     let mut most = 0;
@@ -433,7 +447,9 @@ fn recovery_surviving(post: &Post, prefix: &str, lost: &BTreeMap<usize, BTreeSet
         let packets = recovery_packets(&posted.bytes);
         let (may, must) = posted.wrong_ranges(lost.get(&file).unwrap_or(&none));
         let hit = |ranges: &[Range<usize>], packet: &Range<usize>| {
-            ranges.iter().any(|range| range.start < packet.end && packet.start < range.end)
+            ranges
+                .iter()
+                .any(|range| range.start < packet.end && packet.start < range.end)
         };
         least += packets.iter().filter(|packet| !hit(&may, packet)).count();
         most += packets.iter().filter(|packet| !hit(&must, packet)).count();
@@ -450,46 +466,82 @@ fn container_span(post: &Post, files: &[usize]) -> (usize, Vec<usize>) {
         offsets.push(at);
         at += post.files[file].bytes.len();
     }
-    let whole: Vec<u8> = files.iter().flat_map(|&file| post.files[file].bytes.clone()).collect();
-    let tail = recovery_packets(&whole).first().map_or(whole.len(), |first| first.start);
+    let whole: Vec<u8> = files
+        .iter()
+        .flat_map(|&file| post.files[file].bytes.clone())
+        .collect();
+    let tail = recovery_packets(&whole)
+        .first()
+        .map_or(whole.len(), |first| first.start);
     (tail, offsets)
 }
 
 /// Container blocks a tail may and must mend: the wrong ranges that fall
 /// before the tail, in the container's own block grid.
-fn tail_needed(post: &Post, files: &[usize], lost: &BTreeMap<usize, BTreeSet<u32>>, block: usize) -> (usize, usize) {
+fn tail_needed(
+    post: &Post,
+    files: &[usize],
+    lost: &BTreeMap<usize, BTreeSet<u32>>,
+    block: usize,
+) -> (usize, usize) {
     let none = BTreeSet::new();
     let (tail, offsets) = container_span(post, files);
     let mut may_all = Vec::new();
     let mut must_all = Vec::new();
     for (at, &file) in files.iter().enumerate() {
         let (may, must) = post.files[file].wrong_ranges(lost.get(&file).unwrap_or(&none));
-        let shift = |range: Range<usize>| (range.start + offsets[at]).min(tail)..(range.end + offsets[at]).min(tail);
+        let shift = |range: Range<usize>| {
+            (range.start + offsets[at]).min(tail)..(range.end + offsets[at]).min(tail)
+        };
         may_all.extend(may.into_iter().map(shift));
         must_all.extend(must.into_iter().map(shift));
     }
-    (blocks_touched(&may_all, block), blocks_touched(&must_all, block))
+    (
+        blocks_touched(&may_all, block),
+        blocks_touched(&must_all, block),
+    )
 }
 
 /// Recovery packets of a tail that survive what the post loses.
-fn tail_surviving(post: &Post, files: &[usize], lost: &BTreeMap<usize, BTreeSet<u32>>) -> (usize, usize) {
+fn tail_surviving(
+    post: &Post,
+    files: &[usize],
+    lost: &BTreeMap<usize, BTreeSet<u32>>,
+) -> (usize, usize) {
     let none = BTreeSet::new();
     let (_, offsets) = container_span(post, files);
-    let whole: Vec<u8> = files.iter().flat_map(|&file| post.files[file].bytes.clone()).collect();
+    let whole: Vec<u8> = files
+        .iter()
+        .flat_map(|&file| post.files[file].bytes.clone())
+        .collect();
     let packets = recovery_packets(&whole);
     let mut may_all = Vec::new();
     let mut must_all = Vec::new();
     for (at, &file) in files.iter().enumerate() {
         let (may, must) = post.files[file].wrong_ranges(lost.get(&file).unwrap_or(&none));
-        may_all.extend(may.into_iter().map(|range| range.start + offsets[at]..range.end + offsets[at]));
-        must_all.extend(must.into_iter().map(|range| range.start + offsets[at]..range.end + offsets[at]));
+        may_all.extend(
+            may.into_iter()
+                .map(|range| range.start + offsets[at]..range.end + offsets[at]),
+        );
+        must_all.extend(
+            must.into_iter()
+                .map(|range| range.start + offsets[at]..range.end + offsets[at]),
+        );
     }
     let hit = |ranges: &[Range<usize>], packet: &Range<usize>| {
-        ranges.iter().any(|range| range.start < packet.end && packet.start < range.end)
+        ranges
+            .iter()
+            .any(|range| range.start < packet.end && packet.start < range.end)
     };
     (
-        packets.iter().filter(|packet| !hit(&may_all, packet)).count(),
-        packets.iter().filter(|packet| !hit(&must_all, packet)).count(),
+        packets
+            .iter()
+            .filter(|packet| !hit(&may_all, packet))
+            .count(),
+        packets
+            .iter()
+            .filter(|packet| !hit(&must_all, packet))
+            .count(),
     )
 }
 
@@ -497,7 +549,12 @@ fn tail_surviving(post: &Post, files: &[usize], lost: &BTreeMap<usize, BTreeSet<
 /// container when enough of it survives; a lost start header leaves no map,
 /// so the set demotes and the conventional path repairs from the tail, which
 /// is still a completion.
-fn tail_verdict(post: &Post, files: &[usize], lost: &BTreeMap<usize, BTreeSet<u32>>, block: usize) -> Verdict {
+fn tail_verdict(
+    post: &Post,
+    files: &[usize],
+    lost: &BTreeMap<usize, BTreeSet<u32>>,
+    block: usize,
+) -> Verdict {
     let (upper, lower) = tail_needed(post, files, lost, block);
     if upper == 0 {
         return Verdict::Completes;
@@ -534,7 +591,8 @@ impl Cell for Par3Cell {
 /// The defects each cell and profile is held open for.
 fn open_defect(cell: Par3Cell, profile: ExtractionProfile) -> Option<Defect> {
     let _ = profile;
-    (cell.placement == Placement::Embedded).then_some(Defect::Diverges(EMBEDDED_PAR3_SPLIT_NOT_REPAIRED))
+    (cell.placement == Placement::Embedded)
+        .then_some(Defect::Diverges(EMBEDDED_PAR3_SPLIT_NOT_REPAIRED))
 }
 
 /// A split 7z whose only recovery is the PAR3 embedded in its tail is demoted

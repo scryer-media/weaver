@@ -7,6 +7,9 @@
 
 use std::collections::HashMap;
 
+use weaver_server_core::bandwidth::schedule_metrics::{
+    ActionOutcome, HoldReason, ScheduleMetricsSnapshot,
+};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
@@ -14,9 +17,6 @@ use weaver_server_core::operations::instrumentation::{
     ServerMetricsSnapshot,
 };
 use weaver_server_core::operations::metrics_store::JOB_STATUS_KEYS;
-use weaver_server_core::bandwidth::schedule_metrics::{
-    ActionOutcome, HoldReason, ScheduleMetricsSnapshot,
-};
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
@@ -1709,7 +1709,11 @@ pub(crate) fn render_script_runs(out: &mut Encoder, metrics: &ScriptRunMetricsSn
         out.sample(&f::PP_REFUSALS, &[("kind", kind.as_str())], count);
     }
     for &(summary, count) in &metrics.job_summaries {
-        out.sample(&f::PP_JOB_SUMMARIES, &[("summary", summary.as_str())], count);
+        out.sample(
+            &f::PP_JOB_SUMMARIES,
+            &[("summary", summary.as_str())],
+            count,
+        );
     }
     out.sample(
         &f::PP_INTERRUPTED_RECOVERED,
@@ -1878,7 +1882,8 @@ pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnaps
         out.sample_f64(
             &f::SCHEDULE_RULE_LAST_FIRE,
             &[("rule_id", &rule.id)],
-            rule.last_fire_epoch_ms.map_or(0.0, |ms| ms as f64 / 1_000.0),
+            rule.last_fire_epoch_ms
+                .map_or(0.0, |ms| ms as f64 / 1_000.0),
         );
     }
     for rule in &metrics.rules {
@@ -1923,7 +1928,9 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
         (&f::NETWORK_LEG_TARGET, |l| Some(l.target as f64)),
         (&f::NETWORK_LEG_OPEN, |l| Some(l.open as f64)),
         (&f::NETWORK_LEG_OPENING, |l| Some(l.opening as f64)),
-        (&f::NETWORK_LEG_THROUGHPUT, |l| Some(l.bytes_per_second as f64)),
+        (&f::NETWORK_LEG_THROUGHPUT, |l| {
+            Some(l.bytes_per_second as f64)
+        }),
         (&f::NETWORK_LEG_RUNG, |l| l.rung.map(|r| r as f64)),
     ];
     for (family, value) in leg_families {
@@ -2018,7 +2025,11 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
         ] {
             out.sample(
                 &f::NETWORK_POOL_MEMBERS,
-                &[("pool_id", pool_id), ("egress_id", egress), ("stage", stage)],
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("stage", stage),
+                ],
                 count,
             );
         }
@@ -2030,7 +2041,11 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
         ] {
             out.sample(
                 &f::NETWORK_POOL_CONNECTIONS,
-                &[("pool_id", pool_id), ("egress_id", egress), ("state", state)],
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("state", state),
+                ],
                 count,
             );
         }
@@ -2039,7 +2054,11 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
         for (result, count) in [("won", pool.races_won), ("failed", pool.races_failed)] {
             out.sample(
                 &f::NETWORK_POOL_RACES,
-                &[("pool_id", pool_id), ("egress_id", egress), ("result", result)],
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("result", result),
+                ],
                 count,
             );
         }

@@ -673,9 +673,14 @@ mod tests {
         for (status, runs) in statuses {
             assert_eq!(runs, u64::from(status == RunStatus::Failed), "{status:?}");
         }
-        assert!(metrics.runs.iter().all(|r| r.kind == RunKind::PostProcessing
-            && r.adapter == ScriptAdapter::Nzbget
-            && r.waited));
+        assert!(
+            metrics
+                .runs
+                .iter()
+                .all(|r| r.kind == RunKind::PostProcessing
+                    && r.adapter == ScriptAdapter::Nzbget
+                    && r.waited)
+        );
         assert_eq!(metrics.durations.len(), 1);
         assert_eq!(metrics.durations[0].status, RunStatus::Failed);
         assert_eq!(metrics.durations[0].duration.count, 1);

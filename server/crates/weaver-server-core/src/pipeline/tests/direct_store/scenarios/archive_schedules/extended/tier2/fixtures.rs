@@ -2,8 +2,8 @@
 //! volume writers and the 7z writer.
 use super::super::super::super::sevenz_store::schedules::unrepeated_payload;
 use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
-use super::*;
 pub(in super::super) use super::PASSWORD;
+use super::*;
 
 /// What the volumes are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,7 +32,8 @@ impl Container {
     }
 
     pub(in super::super) fn password(self) -> Option<String> {
-        matches!(self, Self::Rar5Encrypted | Self::Rar5EncryptedHeaders).then(|| PASSWORD.to_string())
+        matches!(self, Self::Rar5Encrypted | Self::Rar5EncryptedHeaders)
+            .then(|| PASSWORD.to_string())
     }
 
     /// `payload` as one member over `count` volumes.
@@ -50,7 +51,9 @@ impl Container {
                 PASSWORD,
                 HeaderCheck::For(PASSWORD),
             ),
-            Self::Rar4 if count > 2 => single_member_rar4_store_set_numbered(member, payload, count),
+            Self::Rar4 if count > 2 => {
+                single_member_rar4_store_set_numbered(member, payload, count)
+            }
             Self::Rar4 => single_member_rar4_store_set(member, payload, count),
             Self::SevenZip => {
                 let archive = build_7z_shaped(

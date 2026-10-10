@@ -233,7 +233,9 @@ impl PrometheusMetricsExporter {
                 weaver_server_core::post_processing::run_metrics::snapshot(&db)
             })
             .await
-            .unwrap_or_else(|_| weaver_server_core::post_processing::run_metrics::counters_snapshot())
+            .unwrap_or_else(|_| {
+                weaver_server_core::post_processing::run_metrics::counters_snapshot()
+            })
         };
         let schedules = match &self.schedules {
             Some(schedules) => {
@@ -241,10 +243,9 @@ impl PrometheusMetricsExporter {
             }
             None => weaver_server_core::bandwidth::schedule_metrics::counters_snapshot(),
         };
-        let network = self
-            .handle
-            .proxy_runtime()
-            .map(|runtime| weaver_server_core::proxies::network_metrics::snapshot(&runtime.network));
+        let network = self.handle.proxy_runtime().map(|runtime| {
+            weaver_server_core::proxies::network_metrics::snapshot(&runtime.network)
+        });
         let tunnel = weaver_server_core::proxies::network_metrics::tunnel::snapshot();
         // The samplers' last readings: a scrape never stats a filesystem, so a
         // slow mount cannot hold it.

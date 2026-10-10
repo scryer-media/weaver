@@ -66,7 +66,9 @@ pub(in super::super) fn groups(post: &Post) -> Vec<Vec<(u32, u32)>> {
     let articles: Vec<(u32, u32)> = post
         .index_of(Role::Data)
         .into_iter()
-        .flat_map(|file| (0..post.files[file].articles()).map(move |article| (file as u32, article)))
+        .flat_map(|file| {
+            (0..post.files[file].articles()).map(move |article| (file as u32, article))
+        })
         .collect();
     let per = articles.len().div_ceil(4).max(1);
     let mut groups: Vec<Vec<(u32, u32)>> = articles.chunks(per).map(<[_]>::to_vec).collect();
@@ -76,7 +78,10 @@ pub(in super::super) fn groups(post: &Post) -> Vec<Vec<(u32, u32)>> {
 
 /// The articles a schedule's loss mask takes: the middle article of each
 /// lost group, by file.
-pub(in super::super) fn lost_articles(post: &Post, interruption: Interruption) -> BTreeMap<usize, BTreeSet<u32>> {
+pub(in super::super) fn lost_articles(
+    post: &Post,
+    interruption: Interruption,
+) -> BTreeMap<usize, BTreeSet<u32>> {
     let mut lost: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
     let Some((mask, _)) = interruption.loss() else {
         return lost;
@@ -223,7 +228,8 @@ pub(in super::super) async fn run(
     let lost = lost_articles(post, interruption);
     let starved = interruption.fails();
     let is_lost = |file: u32, article: u32| {
-        lost.get(&(file as usize)).is_some_and(|set| set.contains(&article))
+        lost.get(&(file as usize))
+            .is_some_and(|set| set.contains(&article))
     };
     // Whether a request for this article can be answered at all.
     let available = |file: u32, article: u32| {
@@ -354,7 +360,10 @@ pub(in super::super) async fn run(
                 deliver(&mut pipeline, job, post, file, article).await;
             }
         }
-        trace.push(format!("arrive slot {slot}: {:?}", pipeline.direct_store.sets_for(job)));
+        trace.push(format!(
+            "arrive slot {slot}: {:?}",
+            pipeline.direct_store.sets_for(job)
+        ));
     }
     if !index_first && retired.is_none() {
         deliver_index(&mut pipeline).await;
@@ -480,7 +489,9 @@ pub(in super::super) async fn run(
         .map(|name| {
             (
                 name.clone(),
-                std::fs::metadata(output.join(name)).ok().map(|meta| meta.len()),
+                std::fs::metadata(output.join(name))
+                    .ok()
+                    .map(|meta| meta.len()),
                 post.files
                     .iter()
                     .find(|posted| posted.name == *name)
@@ -518,11 +529,21 @@ impl Ran {
     /// Holds the run to its verdict and to the invariants every run keeps:
     /// it settles, a complete job published exactly the source bytes and
     /// nothing unexpected, a failed job is named and published none of them.
-    pub(in super::super) fn assert(&self, post: &Post, profile: ExtractionProfile, verdict: Verdict, context: &str) {
+    pub(in super::super) fn assert(
+        &self,
+        post: &Post,
+        profile: ExtractionProfile,
+        verdict: Verdict,
+        context: &str,
+    ) {
         let trace = &self.trace;
         match &self.status {
             Some(JobStatus::Complete) => {
-                assert_ne!(verdict, Verdict::Fails, "{context}: completed where it must fail: {trace:?}");
+                assert_ne!(
+                    verdict,
+                    Verdict::Fails,
+                    "{context}: completed where it must fail: {trace:?}"
+                );
                 for (name, bytes) in &post.expected {
                     assert!(
                         self.files[name].as_deref() == Some(bytes.as_slice()),
@@ -554,8 +575,14 @@ impl Ran {
                     Verdict::Completes,
                     "{context}: failed where it must complete: {error}: {trace:?}"
                 );
-                assert!(!error.trim().is_empty(), "{context}: an unnamed failure: {trace:?}");
-                assert_eq!(self.finalized, 0, "{context}: a failed job finalized a set: {trace:?}");
+                assert!(
+                    !error.trim().is_empty(),
+                    "{context}: an unnamed failure: {trace:?}"
+                );
+                assert_eq!(
+                    self.finalized, 0,
+                    "{context}: a failed job finalized a set: {trace:?}"
+                );
                 let leaked: Vec<_> = post
                     .expected
                     .iter()
@@ -573,7 +600,11 @@ impl Ran {
             assert_eq!(self.finalized, 0, "{context}: {trace:?}");
         }
         if profile == ExtractionProfile::Conventional {
-            assert_eq!(self.chase_armed + self.chase_consumed, 0, "{context}: {trace:?}");
+            assert_eq!(
+                self.chase_armed + self.chase_consumed,
+                0,
+                "{context}: {trace:?}"
+            );
         }
     }
 }
