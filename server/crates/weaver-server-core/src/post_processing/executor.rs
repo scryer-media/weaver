@@ -90,6 +90,7 @@ fn record_script_metrics(result: &ScriptResult, started: bool) {
         ScriptStatus::Warning | ScriptStatus::Failed => &counters::FAILED,
         ScriptStatus::TimedOut => &counters::TIMED_OUT,
         ScriptStatus::Cancelled => &counters::CANCELLED,
+        ScriptStatus::Interrupted => &counters::INTERRUPTED,
     };
     counter.fetch_add(1, Ordering::Relaxed);
     if result.output_truncated {
@@ -385,13 +386,13 @@ impl PostProcessingExecutor {
     ) -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
         let resumed = resume.is_some();
         let resume = resume.unwrap_or_default();
-        let (carried, cut_off) = resume.carried_results();
+        let carried = resume.carried_results();
         if resumed {
             run_metrics::record_interrupted_recovered();
-            // Only the rows this restart made: a cut-off row carried over
+            // Only the rows this restart made: an interrupted row carried over
             // from an earlier restart was counted when it was made.
             for result in carried.iter().filter(|result| {
-                result.error_message.as_deref() == Some(super::model::INTERRUPTED_SCRIPT_MESSAGE)
+                result.status == ScriptStatus::Interrupted
                     && !resume
                         .results
                         .iter()
@@ -400,15 +401,11 @@ impl PostProcessingExecutor {
                 run_metrics::record_interrupted(result);
             }
         }
-        let mut carried_summary = carried
+        let carried_summary = carried
             .iter()
             .fold(PostProcessingSummary::NotRun, |summary, result| {
                 merge_post_processing_summary(summary, result.status.summary())
             });
-        if cut_off {
-            carried_summary =
-                merge_post_processing_summary(carried_summary, PostProcessingSummary::Interrupted);
-        }
         // How a resumed pass ends when nothing more runs: with what it carried
         // over, recorded on the job as a finished pass is.
         let ended_early = |summary: PostProcessingSummary| -> Result<JobPostProcessingReport, PostProcessingExecutorError> {

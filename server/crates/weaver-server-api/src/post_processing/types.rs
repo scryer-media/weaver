@@ -691,6 +691,7 @@ pub enum ScriptStatusGql {
     Failed,
     TimedOut,
     Cancelled,
+    Interrupted,
 }
 
 impl From<weaver_server_core::post_processing::model::ScriptStatus> for ScriptStatusGql {
@@ -703,6 +704,7 @@ impl From<weaver_server_core::post_processing::model::ScriptStatus> for ScriptSt
             ScriptStatus::Failed => Self::Failed,
             ScriptStatus::TimedOut => Self::TimedOut,
             ScriptStatus::Cancelled => Self::Cancelled,
+            ScriptStatus::Interrupted => Self::Interrupted,
         }
     }
 }
@@ -716,6 +718,7 @@ impl From<ScriptStatusGql> for weaver_server_core::post_processing::model::Scrip
             ScriptStatusGql::Failed => Self::Failed,
             ScriptStatusGql::TimedOut => Self::TimedOut,
             ScriptStatusGql::Cancelled => Self::Cancelled,
+            ScriptStatusGql::Interrupted => Self::Interrupted,
         }
     }
 }

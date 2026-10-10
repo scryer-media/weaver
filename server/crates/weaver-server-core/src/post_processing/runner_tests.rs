@@ -73,6 +73,36 @@ fn contract(request: &ScriptExecutionRequest) -> (Vec<String>, BTreeMap<String, 
     adapter_contract_for_test(request).unwrap()
 }
 
+// The variables that tell a script how its job's download ended, across
+// both adapters.
+pub(crate) const STATUS_ENV: [&str; 9] = [
+    "NZBPP_STATUS",
+    "NZBPP_TOTALSTATUS",
+    "NZBPP_PARSTATUS",
+    "NZBPP_UNPACKSTATUS",
+    "WEAVER_STATUS",
+    "SAB_PP_STATUS",
+    "SAB_FAIL_MSG",
+    "SAB_REPAIR",
+    "SAB_UNPACK",
+];
+
+// What a script of either adapter handed `context` is told about how the
+// job's download ended.
+pub(crate) fn status_env(context: &JobExecutionContext) -> BTreeMap<String, String> {
+    let mut status = BTreeMap::new();
+    for adapter in [ScriptAdapter::Nzbget, ScriptAdapter::Sabnzbd] {
+        let mut request = request(adapter);
+        request.context = context.clone();
+        let (_, env) = contract(&request);
+        status.extend(
+            env.into_iter()
+                .filter(|(name, _)| STATUS_ENV.contains(&name.as_str())),
+        );
+    }
+    status
+}
+
 #[test]
 fn sab_adapter_supplies_the_documented_eight_arguments_and_sab_variables() {
     let mut request = request(ScriptAdapter::Sabnzbd);

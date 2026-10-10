@@ -65,6 +65,7 @@ const STATUS_TONE: Record<string, { color: string; text: string }> = {
   WARNING: { color: WV.warn, text: "text-wv-warn" },
   FAILED: { color: WV.error, text: "text-wv-error-text" },
   TIMED_OUT: { color: WV.error, text: "text-wv-error-text" },
+  INTERRUPTED: { color: WV.error, text: "text-wv-error-text" },
 };
 
 /** A run that was skipped or cancelled did nothing worth a colour. */

@@ -1156,6 +1156,7 @@ export const nextJa: LocaleDictionary = {
   "next.scriptRuns.status.warning": "警告",
   "next.scriptRuns.status.failed": "失敗",
   "next.scriptRuns.status.timedOut": "タイムアウト",
+  "next.scriptRuns.status.interrupted": "中断",
   "next.scriptRuns.status.skipped": "スキップ",
   "next.scriptRuns.status.cancelled": "キャンセル",
   "next.scriptRuns.noneMatch": "これらのフィルターに一致する実行はありません。",

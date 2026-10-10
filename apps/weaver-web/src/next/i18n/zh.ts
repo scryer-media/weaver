@@ -1156,6 +1156,7 @@ export const nextZh: LocaleDictionary = {
   "next.scriptRuns.status.warning": "警告",
   "next.scriptRuns.status.failed": "失败",
   "next.scriptRuns.status.timedOut": "超时",
+  "next.scriptRuns.status.interrupted": "已中断",
   "next.scriptRuns.status.skipped": "已跳过",
   "next.scriptRuns.status.cancelled": "已取消",
   "next.scriptRuns.noneMatch": "没有符合这些筛选条件的运行。",

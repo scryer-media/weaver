@@ -31,6 +31,6 @@ mod manifest_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]
-mod runner_tests;
+pub(crate) mod runner_tests;
 #[cfg(test)]
 mod settings_tests;

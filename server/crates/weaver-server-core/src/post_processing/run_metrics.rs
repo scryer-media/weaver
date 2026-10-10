@@ -115,6 +115,7 @@ impl RunStatus {
             ScriptStatus::Failed => Self::Failed,
             ScriptStatus::TimedOut => Self::TimedOut,
             ScriptStatus::Cancelled => Self::Cancelled,
+            ScriptStatus::Interrupted => Self::Interrupted,
         }
     }
 }
@@ -302,16 +303,7 @@ pub(crate) async fn waiting<T>(kind: RunKind, slot: impl Future<Output = T>) -> 
 // Record a finished run under its script's name. `started` is false for a
 // run that had its slot but could not be launched.
 pub(crate) fn record_finished(result: &ScriptResult, started: bool) {
-    // A run cut off by a restart has no status of its own: it is a failure
-    // carrying the interrupted message and no exit code.
-    let interrupted = result.exit_code.is_none()
-        && result.error_message.as_deref() == Some(super::model::INTERRUPTED_SCRIPT_MESSAGE);
-    let status = if interrupted {
-        RunStatus::Interrupted
-    } else {
-        RunStatus::of(result.status, started)
-    };
-    record(result, status);
+    record(result, RunStatus::of(result.status, started));
 }
 
 // Record a run that weaver stopped while it ran.
@@ -713,18 +705,15 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_carrying_the_interrupted_message_counts_as_interrupted() {
+    fn an_interrupted_script_counts_as_interrupted() {
         let name = "run-metrics-cut-off";
-        let mut cut_off = result(name, "failed", 0);
+        let mut cut_off = result(name, "interrupted", 0);
         cut_off.exit_code = None;
-        cut_off.error_message = Some(super::super::model::INTERRUPTED_SCRIPT_MESSAGE.into());
         record_finished(&cut_off, true);
         assert_eq!(script(name).last_status, Some(RunStatus::Interrupted));
 
-        // The same message beside an exit code is the script's own failure.
-        let mut exited = cut_off.clone();
-        exited.exit_code = Some(1);
-        record_finished(&exited, true);
+        // A script that failed on its own is a failure.
+        record_finished(&result(name, "failed", 1), true);
         assert_eq!(script(name).last_status, Some(RunStatus::Failed));
     }
 }

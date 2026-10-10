@@ -1339,15 +1339,12 @@ async fn a_resumed_job_runs_only_the_scripts_that_had_not_started() {
         [
             ("one.sh", ScriptStatus::Succeeded),
             ("two.sh", ScriptStatus::Succeeded),
-            ("three.sh", ScriptStatus::Failed),
+            ("three.sh", ScriptStatus::Interrupted),
             ("four.sh", ScriptStatus::Warning),
             ("five.sh", ScriptStatus::Warning),
         ]
     );
-    assert_eq!(
-        report.results[2].error_message.as_deref(),
-        Some(super::model::INTERRUPTED_SCRIPT_MESSAGE)
-    );
+    assert_eq!(report.results[2].error_message, None);
     assert_eq!(report.summary, PostProcessingSummary::Interrupted);
     assert_eq!(db.job_post_processing_results(71).unwrap(), report.results);
     assert_eq!(
@@ -1390,11 +1387,8 @@ async fn a_resumed_job_whose_scripts_had_all_started_runs_none_of_them() {
 
     assert!(run_scripts(&db).is_empty());
     assert_eq!(report.results.len(), 5);
-    assert_eq!(report.results[4].status, ScriptStatus::Failed);
-    assert_eq!(
-        report.results[4].error_message.as_deref(),
-        Some(super::model::INTERRUPTED_SCRIPT_MESSAGE)
-    );
+    assert_eq!(report.results[4].status, ScriptStatus::Interrupted);
+    assert_eq!(report.results[4].error_message, None);
     assert_eq!(report.summary, PostProcessingSummary::Interrupted);
     assert_eq!(db.job_post_processing_results(72).unwrap(), report.results);
 }

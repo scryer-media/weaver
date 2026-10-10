@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    PostProcessingResume, PostProcessingSettings, PostProcessingSummary, ScriptResult,
-    StartedScript,
+    PostProcessingFacts, PostProcessingResume, PostProcessingSettings, PostProcessingSummary,
+    ScriptResult, StartedScript,
 };
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
@@ -413,6 +413,53 @@ impl Database {
             )
             .await?;
             Ok(())
+        })
+    }
+
+    // Record what a job's scripts are told about how its download ended,
+    // written when the pass begins.
+    pub fn record_job_post_processing_facts(
+        &self,
+        job_id: u64,
+        facts: &PostProcessingFacts,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let job_id = job_id_i64(job_id)?;
+        let facts = to_json(facts)?;
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE active_jobs SET post_processing_outcome = {} WHERE job_id = {}",
+                &[SqlArg::Text(facts), SqlArg::I64(job_id)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    // What a restored job's scripts were told when its pass began, or `None`
+    // when no pass began under a weaver that kept it.
+    pub fn job_post_processing_facts(
+        &self,
+        job_id: u64,
+    ) -> Result<Option<PostProcessingFacts>, StateError> {
+        let datastore = self.datastore();
+        let job_id = job_id_i64(job_id)?;
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT post_processing_outcome FROM active_jobs WHERE job_id = {}",
+                &[SqlArg::I64(job_id)],
+            )
+            .await?;
+            match row
+                .map(|row| row.opt_text("post_processing_outcome"))
+                .transpose()?
+                .flatten()
+            {
+                Some(json) => Ok(Some(from_json::<PostProcessingFacts>(&json)?)),
+                None => Ok(None),
+            }
         })
     }
 

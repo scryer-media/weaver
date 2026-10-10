@@ -35,7 +35,15 @@ const ANY_KIND = "";
 const ANY_STATUS = "ALL";
 
 /** How a run can end, in the order the tabs list them. */
-const STATUSES = ["SUCCEEDED", "WARNING", "FAILED", "TIMED_OUT", "SKIPPED", "CANCELLED"] as const;
+const STATUSES = [
+  "SUCCEEDED",
+  "WARNING",
+  "FAILED",
+  "TIMED_OUT",
+  "INTERRUPTED",
+  "SKIPPED",
+  "CANCELLED",
+] as const;
 
 type ScriptStatus = (typeof STATUSES)[number];
 
@@ -49,6 +57,7 @@ const STATUS_LABELS: Record<ScriptStatus | typeof ANY_STATUS, string> = {
   WARNING: "next.scriptRuns.status.warning",
   FAILED: "next.scriptRuns.status.failed",
   TIMED_OUT: "next.scriptRuns.status.timedOut",
+  INTERRUPTED: "next.scriptRuns.status.interrupted",
   SKIPPED: "next.scriptRuns.status.skipped",
   CANCELLED: "next.scriptRuns.status.cancelled",
 };

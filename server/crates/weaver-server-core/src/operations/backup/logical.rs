@@ -16,7 +16,9 @@ use super::catalog::{
     is_engine_internal_table, is_optional_catalog_table, quote_identifier,
 };
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
-use crate::schema_migrations::{egress_quotas_v53, script_instances_v55, unwanted_extensions_v56};
+use crate::schema_migrations::{
+    egress_quotas_v53, script_concurrency_v58, script_instances_v55, unwanted_extensions_v56,
+};
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
 
@@ -1029,10 +1031,16 @@ async fn fill_older_unwanted_extensions(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
 ) -> Result<(), StateError> {
-    if source_schema_version >= unwanted_extensions_v56::SCHEMA_VERSION {
-        return Ok(());
+    if source_schema_version < unwanted_extensions_v56::SCHEMA_VERSION {
+        unwanted_extensions_v56::fill_default_unwanted_extensions(conn).await?;
     }
-    unwanted_extensions_v56::fill_default_unwanted_extensions(conn).await
+    // A bundle written before one concurrency setting bounded every script
+    // can carry a value chosen for the narrower meaning, raised here as an
+    // upgrade raises it.
+    if source_schema_version < script_concurrency_v58::SCHEMA_VERSION {
+        script_concurrency_v58::raise_script_concurrency(conn).await?;
+    }
+    Ok(())
 }
 
 const EGRESS_CATALOG_SCHEMA_VERSION: i64 = 53;

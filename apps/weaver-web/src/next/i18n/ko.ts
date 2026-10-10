@@ -1156,6 +1156,7 @@ export const nextKo: LocaleDictionary = {
   "next.scriptRuns.status.warning": "경고",
   "next.scriptRuns.status.failed": "실패",
   "next.scriptRuns.status.timedOut": "시간 초과",
+  "next.scriptRuns.status.interrupted": "중단됨",
   "next.scriptRuns.status.skipped": "건너뜀",
   "next.scriptRuns.status.cancelled": "취소",
   "next.scriptRuns.noneMatch": "이 필터와 일치하는 실행이 없습니다.",
