@@ -838,6 +838,15 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
         )
         .await;
         let check = || {
+            // The schedule makes these articles unavailable on every source.
+            // SFV can identify intact files but cannot repair missing bytes;
+            // transport failure precedes the no-loss topology diagnostic.
+            let unrepairable = options.recovery == RecoveryFormat::Absent
+                && interruption.loss().is_some_and(|(mask, _)| mask != 0);
+            if interruption.fails() || unrepairable {
+                profile.assert_rejected(&outcome, &wanted);
+                return;
+            }
             if let Expect::Fails(why) = expect {
                 profile.assert_rejected(&outcome, &wanted);
                 let Some(JobStatus::Failed { error }) = &outcome.status else {
@@ -848,13 +857,6 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                     "{context}: {error}: {:?}",
                     outcome.trace
                 );
-                return;
-            }
-            // With nothing posted to repair from, any loss is beyond the job.
-            let unrepairable = options.recovery == RecoveryFormat::Absent
-                && interruption.loss().is_some_and(|(mask, _)| mask != 0);
-            if interruption.fails() || unrepairable {
-                profile.assert_rejected(&outcome, &wanted);
                 return;
             }
             assert_eq!(
@@ -913,6 +915,23 @@ async fn rar4_late_par2_recovers_lost_first_article() {
         ExtractionProfile::DirectStore,
         vec![(240, (slot_arrivals(4), Interruption::Loss { mask: 1, index_first: false }))],
     ).await;
+}
+
+#[tokio::test]
+async fn sfv_cannot_repair_an_unavailable_first_article() {
+    for (container, naming) in [
+        (Container::SevenZip, Naming::HexScattered),
+        (Container::SevenZip, Naming::HexMisnumbered),
+        (Container::Rar4, Naming::HexNumberedGap),
+    ] {
+        for profile in PROFILES {
+            run_cell(
+                Cell { container, naming, binding: Binding::Sfv },
+                profile,
+                vec![(0, (slot_arrivals(4), Interruption::Loss { mask: 1, index_first: false }))],
+            ).await;
+        }
+    }
 }
 
 const PROFILES: [ExtractionProfile; 3] = [
