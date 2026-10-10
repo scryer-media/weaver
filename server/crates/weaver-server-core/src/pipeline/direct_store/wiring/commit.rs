@@ -1250,11 +1250,23 @@ impl Pipeline {
         {
             return;
         }
-        if self.direct_store.sets_for(job_id).iter().enumerate().any(|(index, set)| {
-            !set.is_demoted()
-                && !set.is_finalized()
-                && (!set.ready_to_finalize() || self.direct_set_has_pending_volume_tail(job_id, index))
-        }) {
+        if self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .any(|(index, set)| {
+                if set.is_demoted() {
+                    return !self
+                        .extracted_archives
+                        .get(&job_id)
+                        .is_some_and(|names| names.contains(set.set_name()));
+                }
+                !set.is_finalized()
+                    && (!set.ready_to_finalize()
+                        || self.direct_set_has_pending_volume_tail(job_id, index))
+            })
+        {
             return;
         }
         let ready: Vec<usize> = self

@@ -1415,6 +1415,35 @@ pub(super) mod sets {
         use super::*;
 
         #[tokio::test]
+        async fn damaged_neighbour_keeps_healthy_set_unfinalized() {
+            let cell = SetsCell {
+                layout: Layout::TwoSets,
+                container: Container::Rar5,
+                recovery: Recovery::None,
+                stale_sfv: false,
+                volumes: 2,
+            };
+            let mut post = cell.post(Interruption::None).post;
+            post.files[3].wire.insert(
+                1,
+                super::super::post::Wire::Damaged(super::super::post::Damage::Recomputed),
+            );
+            let result = super::super::run::run(
+                &post,
+                ExtractionProfile::DirectStore,
+                &slot_arrivals(4),
+                Interruption::None,
+            )
+            .await;
+            result.assert(
+                &post,
+                ExtractionProfile::DirectStore,
+                Verdict::Fails,
+                "damaged neighbouring set",
+            );
+        }
+
+        #[tokio::test]
         async fn failed_job_keeps_healthy_set_in_staging() {
             let cell = SetsCell {
                 layout: Layout::TwoSets,
