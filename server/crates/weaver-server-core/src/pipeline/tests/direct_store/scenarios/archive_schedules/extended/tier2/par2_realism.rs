@@ -195,7 +195,11 @@ pub(super) fn family() -> Family<Par2Cell> {
 
 impl Par2Cell {
     fn volumes(self) -> usize {
-        if self.structure == Structure::TwoFiles { 2 } else { VOLUMES }
+        if self.structure == Structure::TwoFiles {
+            2
+        } else {
+            VOLUMES
+        }
     }
 
     /// The article size: a whole number of slices, or that and half a slice.
@@ -247,7 +251,9 @@ impl Par2Cell {
             Structure::IndexDamaged => {
                 for file in &index {
                     for article in 0..post.files[*file].articles() {
-                        post.files[*file].wire.insert(article, Wire::Damaged(Damage::CrcWrong));
+                        post.files[*file]
+                            .wire
+                            .insert(article, Wire::Damaged(Damage::CrcWrong));
                     }
                 }
             }
@@ -303,7 +309,10 @@ impl Par2Cell {
                 // one file of the set in turn.
                 let mut pairs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
                 for packet in moved {
-                    pairs.entry(packet[64..80].to_vec()).or_default().extend(packet);
+                    pairs
+                        .entry(packet[64..80].to_vec())
+                        .or_default()
+                        .extend(packet);
                 }
                 let files = set.len();
                 for (at, (_, packets)) in pairs.into_iter().enumerate() {
@@ -333,7 +342,8 @@ impl Par2Cell {
                 }
             }
             Structure::Creator => {
-                let creator = par2_packet(&id, par2_type::CREATOR, CREATORS[self.creator].as_bytes());
+                let creator =
+                    par2_packet(&id, par2_type::CREATOR, CREATORS[self.creator].as_bytes());
                 for (_, bytes) in &mut set {
                     let mut rebuilt = Vec::new();
                     let mut replaced = false;
@@ -441,7 +451,9 @@ fn open_defect(cell: Par2Cell, profile: ExtractionProfile) -> Option<Defect> {
         && profile == ExtractionProfile::DirectStore
         && cell.margin != Margin::OneShort
     {
-        return Some(Defect::Diverges(ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES));
+        return Some(Defect::Diverges(
+            ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES,
+        ));
     }
     None
 }

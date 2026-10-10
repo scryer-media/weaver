@@ -8,7 +8,9 @@
 //! so a schedule that delivers groups out of order parks parts and a damaged
 //! part shifts everything behind it: that is the surface this family covers.
 use super::fixtures::{Container, payload};
-use super::post::{Damage, Encoding, Post, Posted, Role, UU_DAMAGES, UuEnd, UuHeader, UuStyle, Wire};
+use super::post::{
+    Damage, Encoding, Post, Posted, Role, UU_DAMAGES, UuEnd, UuHeader, UuStyle, Wire,
+};
 use super::recovery::{self, Geometry, Margin, Par2Volumes};
 use super::*;
 
@@ -157,7 +159,10 @@ impl UuCell {
     }
 
     fn has_par2(self) -> bool {
-        matches!(self.shape, Shape::SetWithPar2 | Shape::Mixed | Shape::Par2AsUu)
+        matches!(
+            self.shape,
+            Shape::SetWithPar2 | Shape::Mixed | Shape::Par2AsUu
+        )
     }
 
     /// Whether data file `index` is uuencoded.
@@ -171,7 +176,11 @@ impl UuCell {
 
     fn data(self) -> Post {
         let payload = payload(37, VOLUMES * ARTICLES_PER_VOLUME * ARTICLE - 512);
-        let volumes = if self.shape == Shape::SingleVolume { 1 } else { VOLUMES };
+        let volumes = if self.shape == Shape::SingleVolume {
+            1
+        } else {
+            VOLUMES
+        };
         let volumes = self.container.volumes(&payload, volumes);
         let style = self.style();
         let mut post = Post {
@@ -194,7 +203,9 @@ impl UuCell {
             let data = post.index_of(Role::Data);
             let target = data[1.min(data.len() - 1)];
             let article = post.files[target].articles() / 2;
-            post.files[target].wire.insert(article, Wire::Damaged(damage));
+            post.files[target]
+                .wire
+                .insert(article, Wire::Damaged(damage));
         }
         post
     }
@@ -261,7 +272,8 @@ impl Cell for UuCell {
 /// The defects each cell and profile is held open for.
 fn open_defect(cell: UuCell, profile: ExtractionProfile) -> Option<Defect> {
     let _ = profile;
-    cell.has_par2().then_some(Defect::Diverges(UU_PAR2_COUNTS_ONE_VOLUME))
+    cell.has_par2()
+        .then_some(Defect::Diverges(UU_PAR2_COUNTS_ONE_VOLUME))
 }
 
 /// A uuencoded part carries no offset, so a part lost or cut short strands
@@ -269,8 +281,7 @@ fn open_defect(cell: UuCell, profile: ExtractionProfile) -> Option<Defect> {
 /// than one PAR2 volume. The product fetches every volume but advertises only
 /// the first volume's blocks and fails "not repairable" with the index intact,
 /// under every profile. Release-blocking: PAR2 with sufficient margin.
-const UU_PAR2_COUNTS_ONE_VOLUME: &str =
-    "PAR2 over a uuencoded set advertises one volume's recovery blocks and fails a repair the posted margin covers";
+const UU_PAR2_COUNTS_ONE_VOLUME: &str = "PAR2 over a uuencoded set advertises one volume's recovery blocks and fails a repair the posted margin covers";
 
 macro_rules! uu_smokes {
     ($($name:ident $style:literal $shape:ident $damage:expr, $container:ident;)+) => {

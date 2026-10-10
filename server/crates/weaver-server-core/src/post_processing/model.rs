@@ -1229,10 +1229,6 @@ pub struct PostProcessingResume {
     pub results: Vec<ScriptResult>,
 }
 
-// Why a waited script that was running when weaver stopped has no result of
-// its own.
-pub const INTERRUPTED_SCRIPT_MESSAGE: &str = "weaver stopped while the script was running";
-
 impl PostProcessingResume {
     // The results the resumed pass starts from, in the order their entries
     // started. A finished entry keeps its result; a waited entry with none
@@ -1261,7 +1257,7 @@ impl PostProcessingResume {
                         duration_ms: 0,
                         output_tail: String::new(),
                         output_truncated: false,
-                        error_message: Some(INTERRUPTED_SCRIPT_MESSAGE.to_string()),
+                        error_message: None,
                         finished_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
                     });
                 }

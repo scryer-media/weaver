@@ -598,6 +598,7 @@ struct Opening {
 impl Opening {
     fn success(mut self, dialed: &mut Dialed) -> Result<(), DialError> {
         let mut state = self.shared.state.lock().expect("leg allocation");
+        let egress_id = state.route.legs.get(self.position).map(|l| l.egress_id);
         let Some(leg) = state
             .legs
             .get_mut(self.position)
@@ -615,6 +616,12 @@ impl Opening {
         leg.source = dialed.source;
         leg.succeeded();
         let reads = leg.reads.clone();
+        if let Some(egress_id) = egress_id {
+            super::network_metrics::record_leg_dial(
+                egress_id,
+                super::network_metrics::LegDialResult::Success,
+            );
+        }
         self.completed = true;
         self.shared.publish(&state);
         drop(state);
@@ -645,12 +652,24 @@ impl Opening {
     }
     fn failed(&self, error: &DialError) {
         let mut state = self.shared.state.lock().expect("leg allocation");
+        let egress_id = state.route.legs.get(self.position).map(|l| l.egress_id);
         if let Some(leg) = state
             .legs
             .get_mut(self.position)
             .filter(|l| l.generation == self.generation)
         {
+            let cooldowns = leg.cooldowns;
             leg.failed(error);
+            let cooled = leg.cooldowns != cooldowns;
+            if let Some(egress_id) = egress_id {
+                super::network_metrics::record_leg_dial(
+                    egress_id,
+                    super::network_metrics::LegDialResult::of_error(error),
+                );
+                if cooled {
+                    super::network_metrics::record_leg_cooldown(egress_id);
+                }
+            }
         }
         self.shared.publish(&state);
     }

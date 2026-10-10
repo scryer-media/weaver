@@ -77,7 +77,12 @@ impl Pool {
     /// `per` of the pool's cases the profile includes, by a fixed stride
     /// from an offset that turns with `rotation`, so neighbouring cells see
     /// different schedules and every schedule is reached across the cells.
-    pub(super) fn sampled(self, profile: ExtractionProfile, per: usize, rotation: usize) -> Vec<(usize, Schedule)> {
+    pub(super) fn sampled(
+        self,
+        profile: ExtractionProfile,
+        per: usize,
+        rotation: usize,
+    ) -> Vec<(usize, Schedule)> {
         let all = self.all(profile);
         let n = all.len();
         if n <= per {
@@ -117,7 +122,11 @@ pub(super) struct Built {
 
 /// Runs one cell under one profile over `cases`, holding each run to its
 /// verdict, or to its defect where the cell is held open.
-pub(super) async fn run_cell<C: Cell>(cell: C, profile: ExtractionProfile, cases: Vec<(usize, Schedule)>) {
+pub(super) async fn run_cell<C: Cell>(
+    cell: C,
+    profile: ExtractionProfile,
+    cases: Vec<(usize, Schedule)>,
+) {
     let defect = cell.defect(profile);
     if let Some(Defect::Hangs(why)) = defect {
         eprintln!("{cell:?} profile={profile:?} held open, not run: {why}");
@@ -160,7 +169,9 @@ pub(super) async fn run_cell<C: Cell>(cell: C, profile: ExtractionProfile, cases
     {
         // A hold covers the cases that trigger it; a run that samples none of
         // them is not proof the hold is stale, so it is reported, not failed.
-        eprintln!("{cell:?} profile={profile:?} met its ruling on every case run while held open: {why}");
+        eprintln!(
+            "{cell:?} profile={profile:?} met its ruling on every case run while held open: {why}"
+        );
     }
 }
 
@@ -194,8 +205,26 @@ pub(super) async fn loss_smoke<C: Cell>(cell: C) {
             cell,
             profile,
             vec![
-                (0, (forward.clone(), Interruption::Loss { mask: 0b1001, index_first: true })),
-                (1, (backward.clone(), Interruption::Loss { mask: 0b1001, index_first: false })),
+                (
+                    0,
+                    (
+                        forward.clone(),
+                        Interruption::Loss {
+                            mask: 0b1001,
+                            index_first: true,
+                        },
+                    ),
+                ),
+                (
+                    1,
+                    (
+                        backward.clone(),
+                        Interruption::Loss {
+                            mask: 0b1001,
+                            index_first: false,
+                        },
+                    ),
+                ),
             ],
         )
         .await;
@@ -227,7 +256,9 @@ impl<C: Cell> Family<C> {
         let range = shard * total / shards..(shard + 1) * total / shards;
         let replay = std::env::var("WEAVER_TIER2_CASE").ok().map(|selection| {
             match selection.split_once("..") {
-                Some((start, end)) => start.parse::<usize>().unwrap()..end.parse::<usize>().unwrap(),
+                Some((start, end)) => {
+                    start.parse::<usize>().unwrap()..end.parse::<usize>().unwrap()
+                }
                 None => {
                     let case = selection.parse::<usize>().unwrap();
                     case..case + 1
@@ -250,8 +281,9 @@ impl<C: Cell> Family<C> {
                     // The run names cases by family index so the printed
                     // number is the one the replay switch takes.
                     let index = unit.start + k;
-                    (range.contains(&index) && replay.as_ref().is_none_or(|replay| replay.contains(&index)))
-                        .then_some((index, schedule))
+                    (range.contains(&index)
+                        && replay.as_ref().is_none_or(|replay| replay.contains(&index)))
+                    .then_some((index, schedule))
                 })
                 .collect();
             if !cases.is_empty() {
@@ -310,8 +342,5 @@ fn tier2_sizing() {
 }
 
 /// Tier two's scenarios across every family.
-const TOTAL: usize = damage::TOTAL
-    + par2_realism::TOTAL
-    + par3_breadth::TOTAL
-    + uu::TOTAL
-    + breadth::TOTAL;
+const TOTAL: usize =
+    damage::TOTAL + par2_realism::TOTAL + par3_breadth::TOTAL + uu::TOTAL + breadth::TOTAL;

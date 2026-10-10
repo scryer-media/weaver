@@ -3,11 +3,13 @@
 //! of the size axes, passwords right, wrong and missing over every locked
 //! container, the yEnc wire's own variants, volume naming the field writes,
 //! and jobs of several sets with the furniture posted beside them.
+use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::damage::with_recovery;
 use super::fixtures::{Container, MEMBER, PASSWORD as KEY, SEVENZ_MEMBER, payload};
 use super::post::{Encoding, Post, Posted, Role};
-use super::recovery::{self, Code, Geometry, Margin, Par2Volumes, par2_packet, par2_packets, par2_set_id, par2_type};
-use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
+use super::recovery::{
+    self, Code, Geometry, Margin, Par2Volumes, par2_packet, par2_packets, par2_set_id, par2_type,
+};
 use super::*;
 
 const ARTICLE: usize = 768;
@@ -29,8 +31,13 @@ pub(super) fn totals() -> Vec<(&'static str, usize)> {
     ]
 }
 
-pub(super) const TOTAL: usize =
-    lies::TOTAL + nesting::TOTAL + scale::TOTAL + password::TOTAL + wire::TOTAL + naming::TOTAL + sets::TOTAL;
+pub(super) const TOTAL: usize = lies::TOTAL
+    + nesting::TOTAL
+    + scale::TOTAL
+    + password::TOTAL
+    + wire::TOTAL
+    + naming::TOTAL
+    + sets::TOTAL;
 
 /// What recovery a post carries beside its archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,16 +49,30 @@ pub(super) enum Recovery {
 
 /// A stored single-member set of `container` under `member`, `payload`
 /// across `count` volumes, named `silver.horizon`.
-fn stored(container: Container, member: &'static str, payload: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
+fn stored(
+    container: Container,
+    member: &'static str,
+    payload: &[u8],
+    count: usize,
+) -> Vec<(String, Vec<u8>)> {
     let mut volumes = match container {
         Container::SevenZip => split_volumes(
-            &build_7z_shaped(&[Entry::file(member, payload.to_vec())], sevenz_turbo::EncoderMethod::COPY, None, false),
+            &build_7z_shaped(
+                &[Entry::file(member, payload.to_vec())],
+                sevenz_turbo::EncoderMethod::COPY,
+                None,
+                false,
+            ),
             count,
         ),
-        Container::Rar4 if count > 2 => single_member_rar4_store_set_numbered(member, payload, count),
+        Container::Rar4 if count > 2 => {
+            single_member_rar4_store_set_numbered(member, payload, count)
+        }
         Container::Rar4 => single_member_rar4_store_set(member, payload, count),
         Container::Rar5 => single_member_store_set(member, payload, count),
-        Container::Rar5Encrypted => encrypted_store_set(member, payload, count, KEY, Some(KEY), false),
+        Container::Rar5Encrypted => {
+            encrypted_store_set(member, payload, count, KEY, Some(KEY), false)
+        }
         Container::Rar5EncryptedHeaders => {
             header_encrypted_store_set(member, payload, count, KEY, HeaderCheck::For(KEY))
         }
@@ -62,7 +83,11 @@ fn stored(container: Container, member: &'static str, payload: &[u8], count: usi
     volumes
 }
 
-fn data_post(volumes: Vec<(String, Vec<u8>)>, article: usize, expected: Vec<(String, Vec<u8>)>) -> Post {
+fn data_post(
+    volumes: Vec<(String, Vec<u8>)>,
+    article: usize,
+    expected: Vec<(String, Vec<u8>)>,
+) -> Post {
     Post {
         files: volumes
             .into_iter()
@@ -123,7 +148,15 @@ fn with(
                 Margin::With,
                 floor,
                 geometry,
-                |sources, blocks| recovery::par3_set(sources, BLOCK, blocks, Code::Cauchy, blocks.div_ceil(4) as u64),
+                |sources, blocks| {
+                    recovery::par3_set(
+                        sources,
+                        BLOCK,
+                        blocks,
+                        Code::Cauchy,
+                        blocks.div_ceil(4) as u64,
+                    )
+                },
                 article,
             );
             (post, Some(geometry))
@@ -232,7 +265,11 @@ pub(super) mod lies {
         let mut cells = Vec::new();
         for lie in LIES {
             for margin in [Margin::With, Margin::Exact] {
-                for volumes in [Par2Volumes::One, Par2Volumes::Exponent, Par2Volumes::Uniform] {
+                for volumes in [
+                    Par2Volumes::One,
+                    Par2Volumes::Exponent,
+                    Par2Volumes::Uniform,
+                ] {
                     for container in CONTAINERS {
                         cells.push(LieCell {
                             lie,
@@ -319,7 +356,11 @@ pub(super) mod lies {
         fn post(self, interruption: Interruption) -> Built {
             let payload = standard_payload(61);
             let volumes = stored(self.container, self.container.member(), &payload, VOLUMES);
-            let post = data_post(volumes, ARTICLE, vec![(self.container.member().to_string(), payload)]);
+            let post = data_post(
+                volumes,
+                ARTICLE,
+                vec![(self.container.member().to_string(), payload)],
+            );
             let (post, geometry) = with(
                 post,
                 Recovery::Par2(self.margin),
@@ -409,7 +450,12 @@ pub(super) mod nesting {
         RarInside7z,
     }
 
-    const DEPTHS: [Depth; 4] = [Depth::Two, Depth::Three, Depth::SevenZipInside, Depth::RarInside7z];
+    const DEPTHS: [Depth; 4] = [
+        Depth::Two,
+        Depth::Three,
+        Depth::SevenZipInside,
+        Depth::RarInside7z,
+    ];
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) struct NestCell {
@@ -475,14 +521,21 @@ pub(super) mod nesting {
                     false,
                 );
             }
-            let borrowed: Vec<(&str, Vec<u8>)> = members.iter().map(|(name, bytes)| (name.as_str(), bytes.clone())).collect();
+            let borrowed: Vec<(&str, Vec<u8>)> = members
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+                .collect();
             if self.locked {
                 let mut set = Vec::new();
                 for (index, (name, bytes)) in borrowed.iter().enumerate() {
                     // One encrypted member per archive; a second rides as a
                     // second archive inside the same outer member set.
                     let _ = index;
-                    set.push(encrypted_store_set(name, bytes, 1, KEY, Some(KEY), false).remove(0).1);
+                    set.push(
+                        encrypted_store_set(name, bytes, 1, KEY, Some(KEY), false)
+                            .remove(0)
+                            .1,
+                    );
                 }
                 // Encrypted multi-member stored sets are not written by the
                 // fixture builders: the first member is the archive.
@@ -506,18 +559,31 @@ pub(super) mod nesting {
             let inner = self.innermost(&members);
             let outer = match self.depth {
                 Depth::Two | Depth::SevenZipInside => {
-                    let inner_name = if self.depth == Depth::SevenZipInside { "inner.7z" } else { "inner.rar" };
+                    let inner_name = if self.depth == Depth::SevenZipInside {
+                        "inner.7z"
+                    } else {
+                        "inner.rar"
+                    };
                     stored(self.outer, inner_name, &inner, self.volumes)
                 }
                 Depth::Three => {
                     let middle = stored(Container::Rar5, "inner.rar", &inner, 1).remove(0).1;
                     stored(self.outer, "middle.rar", &middle, self.volumes)
                 }
-                Depth::RarInside7z => stored(Container::SevenZip, "inner.rar", &inner, self.volumes),
+                Depth::RarInside7z => {
+                    stored(Container::SevenZip, "inner.rar", &inner, self.volumes)
+                }
             };
             let mut post = data_post(outer, ARTICLE, members);
             post.password = self.locked.then(|| KEY.to_string());
-            let (post, geometry) = with(post, self.recovery, interruption, Par2Volumes::Uniform, ARTICLE, |set| set);
+            let (post, geometry) = with(
+                post,
+                self.recovery,
+                interruption,
+                Par2Volumes::Uniform,
+                ARTICLE,
+                |set| set,
+            );
             Built {
                 post,
                 geometry,
@@ -543,7 +609,8 @@ pub(super) mod nesting {
 
     /// A 7z whose member is a RAR publishes the RAR itself: nested extraction
     /// is not entered from a 7z outer. Not PAR2, so not release-blocking.
-    const RAR_INSIDE_7Z_PUBLISHED_AS_IS: &str = "a RAR inside a 7z is published as the archive, never extracted";
+    const RAR_INSIDE_7Z_PUBLISHED_AS_IS: &str =
+        "a RAR inside a 7z is published as the archive, never extracted";
 
     /// A four-volume RAR holding a two-member RAR beside a PAR2 set completes
     /// every volume, fetches the PAR2 set and then fails "invalid authoritative
@@ -699,12 +766,27 @@ pub(super) mod scale {
     impl Cell for ScaleCell {
         fn post(self, interruption: Interruption) -> Built {
             let (volumes, per, article) = self.geometry();
-            let len = if self.shape == Shape::Tiny { 600 } else { volumes * per * article - 512 };
+            let len = if self.shape == Shape::Tiny {
+                600
+            } else {
+                volumes * per * article - 512
+            };
             let payload = payload(73, len);
             let set = self.container.volumes(&payload, volumes);
-            let mut post = data_post(set, article, vec![(self.container.member().to_string(), payload)]);
+            let mut post = data_post(
+                set,
+                article,
+                vec![(self.container.member().to_string(), payload)],
+            );
             post.password = self.container.password();
-            let (post, geometry) = with(post, self.recovery, interruption, Par2Volumes::Uniform, article.min(4096), |set| set);
+            let (post, geometry) = with(
+                post,
+                self.recovery,
+                interruption,
+                Par2Volumes::Uniform,
+                article.min(4096),
+                |set| set,
+            );
             Built {
                 post,
                 geometry,
@@ -849,9 +931,15 @@ pub(super) mod password {
             match self.locked {
                 Locked::Rar5Plain => stored(Container::Rar5, member, payload, self.volumes),
                 Locked::Rar5Data => stored(Container::Rar5Encrypted, member, payload, self.volumes),
-                Locked::Rar5Headers => stored(Container::Rar5EncryptedHeaders, member, payload, self.volumes),
+                Locked::Rar5Headers => stored(
+                    Container::Rar5EncryptedHeaders,
+                    member,
+                    payload,
+                    self.volumes,
+                ),
                 Locked::Rar4Data => {
-                    let mut volumes = encrypted_rar4_store_set(member, payload, self.volumes, KEY, None);
+                    let mut volumes =
+                        encrypted_rar4_store_set(member, payload, self.volumes, KEY, None);
                     if self.volumes == 1 {
                         volumes[0].0 = "silver.horizon.rar".to_string();
                     }
@@ -880,10 +968,18 @@ pub(super) mod password {
                 Given::Wrong => Some("wrong-lantern".to_string()),
                 Given::Missing => None,
             };
-            let (post, geometry) = with(post, self.recovery, interruption, Par2Volumes::Uniform, ARTICLE, |set| set);
+            let (post, geometry) = with(
+                post,
+                self.recovery,
+                interruption,
+                Par2Volumes::Uniform,
+                ARTICLE,
+                |set| set,
+            );
             // A locked archive without its password never publishes the
             // member; it fails by name.
-            let ruling = (self.locked != Locked::Rar5Plain && self.given != Given::Right).then_some(Verdict::Fails);
+            let ruling = (self.locked != Locked::Rar5Plain && self.given != Given::Right)
+                .then_some(Verdict::Fails);
             Built {
                 post,
                 geometry,
@@ -1017,7 +1113,11 @@ pub(super) mod wire {
                 Articles::Many => ARTICLE,
                 Articles::One => volumes.iter().map(|(_, bytes)| bytes.len()).max().unwrap(),
             };
-            let mut post = data_post(volumes, article, vec![(self.container.member().to_string(), payload)]);
+            let mut post = data_post(
+                volumes,
+                article,
+                vec![(self.container.member().to_string(), payload)],
+            );
             post.password = self.container.password();
             let encoding = Encoding::Yenc {
                 line: self.line,
@@ -1026,7 +1126,14 @@ pub(super) mod wire {
             for file in &mut post.files {
                 file.encoding = encoding;
             }
-            let (mut post, geometry) = with(post, self.recovery, interruption, Par2Volumes::Uniform, ARTICLE, |set| set);
+            let (mut post, geometry) = with(
+                post,
+                self.recovery,
+                interruption,
+                Par2Volumes::Uniform,
+                ARTICLE,
+                |set| set,
+            );
             for file in &mut post.files {
                 if file.role != Role::Data {
                     file.encoding = Encoding::Yenc {
@@ -1127,7 +1234,11 @@ pub(super) mod naming {
 
     const CONTAINERS: [Container; 3] = [Container::Rar5, Container::Rar4, Container::SevenZip];
 
-    const RECOVERIES: [Recovery; 3] = [Recovery::Par2(Margin::With), Recovery::Par2(Margin::Exact), Recovery::None];
+    const RECOVERIES: [Recovery; 3] = [
+        Recovery::Par2(Margin::With),
+        Recovery::Par2(Margin::Exact),
+        Recovery::None,
+    ];
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) struct NameCell {
@@ -1139,7 +1250,8 @@ pub(super) mod naming {
 
     /// A 7z set's three-digit numbering is the format's own.
     fn possible(cell: NameCell) -> bool {
-        !(cell.container == Container::SevenZip && matches!(cell.naming, Naming::WidePadding | Naming::NarrowPadding))
+        !(cell.container == Container::SevenZip
+            && matches!(cell.naming, Naming::WidePadding | Naming::NarrowPadding))
     }
 
     pub(in super::super) fn cells() -> Vec<NameCell> {
@@ -1199,15 +1311,31 @@ pub(super) mod naming {
     impl Cell for NameCell {
         fn post(self, interruption: Interruption) -> Built {
             let payload = standard_payload(89);
-            let mut volumes = stored(self.container, self.container.member(), &payload, self.volumes);
+            let mut volumes = stored(
+                self.container,
+                self.container.member(),
+                &payload,
+                self.volumes,
+            );
             for (name, _) in &mut volumes {
                 *name = rename(self.naming, name);
             }
-            let mut post = data_post(volumes, ARTICLE, vec![(self.container.member().to_string(), payload)]);
+            let mut post = data_post(
+                volumes,
+                ARTICLE,
+                vec![(self.container.member().to_string(), payload)],
+            );
             if self.naming == Naming::Gap {
                 post.files[2].absent();
             }
-            let (mut post, geometry) = with(post, self.recovery, interruption, Par2Volumes::Uniform, ARTICLE, |set| set);
+            let (mut post, geometry) = with(
+                post,
+                self.recovery,
+                interruption,
+                Par2Volumes::Uniform,
+                ARTICLE,
+                |set| set,
+            );
             if self.naming == Naming::UpperExtension {
                 for file in &mut post.files {
                     if file.role != Role::Data {
@@ -1353,7 +1481,11 @@ pub(super) mod sets {
 
     impl SetsCell {
         fn second_member(self) -> &'static str {
-            if self.container == Container::SevenZip { "amber.mkv" } else { "harbour/amber.mkv" }
+            if self.container == Container::SevenZip {
+                "amber.mkv"
+            } else {
+                "harbour/amber.mkv"
+            }
         }
 
         fn has_furniture(self) -> bool {
@@ -1364,21 +1496,35 @@ pub(super) mod sets {
     impl Cell for SetsCell {
         fn post(self, interruption: Interruption) -> Built {
             let first = standard_payload(97);
-            let mut volumes = stored(self.container, self.container.member(), &first, self.volumes);
+            let mut volumes = stored(
+                self.container,
+                self.container.member(),
+                &first,
+                self.volumes,
+            );
             let mut expected = vec![(self.container.member().to_string(), first)];
             let mut allowed = Vec::new();
             if matches!(self.layout, Layout::TwoSets | Layout::TwoSetsFurniture) {
                 let second = payload(101, 30_000);
-                for (name, bytes) in stored(self.container, self.second_member(), &second, self.volumes) {
+                for (name, bytes) in
+                    stored(self.container, self.second_member(), &second, self.volumes)
+                {
                     volumes.push((name.replacen("silver.horizon", "amber.lantern", 1), bytes));
                 }
                 expected.push((self.second_member().to_string(), second));
             }
             if self.layout == Layout::Sample {
                 let sample = payload(103, 6_000);
-                let member = if self.container == Container::SevenZip { "sample.mkv" } else { "sample/lantern.sample.mkv" };
+                let member = if self.container == Container::SevenZip {
+                    "sample.mkv"
+                } else {
+                    "sample/lantern.sample.mkv"
+                };
                 for (name, bytes) in stored(self.container, member, &sample, 1) {
-                    volumes.push((name.replacen("silver.horizon", "silver.horizon.sample", 1), bytes));
+                    volumes.push((
+                        name.replacen("silver.horizon", "silver.horizon.sample", 1),
+                        bytes,
+                    ));
                 }
                 allowed.push(member.to_string());
             }
@@ -1396,11 +1542,17 @@ pub(super) mod sets {
                     })
                     .collect();
                 let furniture: Vec<(String, Vec<u8>)> = vec![
-                    ("silver.horizon.nfo".to_string(), b"Silver Horizon\r\nposted for the harbour\r\n".to_vec()),
+                    (
+                        "silver.horizon.nfo".to_string(),
+                        b"Silver Horizon\r\nposted for the harbour\r\n".to_vec(),
+                    ),
                     ("silver.horizon.sfv".to_string(), listing.into_bytes()),
                     ("silver.horizon.jpg".to_string(), payload(109, 2_000)),
                     ("silver.horizon.srr".to_string(), payload(113, 1_500)),
-                    ("readme.txt".to_string(), b"nothing to see here\r\n".to_vec()),
+                    (
+                        "readme.txt".to_string(),
+                        b"nothing to see here\r\n".to_vec(),
+                    ),
                 ];
                 for (name, bytes) in furniture {
                     allowed.push(name.clone());
@@ -1409,7 +1561,14 @@ pub(super) mod sets {
             }
             let mut post = data_post(volumes, ARTICLE, expected);
             post.allowed = allowed;
-            let (post, geometry) = with(post, self.recovery, interruption, Par2Volumes::Uniform, ARTICLE, |set| set);
+            let (post, geometry) = with(
+                post,
+                self.recovery,
+                interruption,
+                Par2Volumes::Uniform,
+                ARTICLE,
+                |set| set,
+            );
             // A listing that disagrees may be believed: identity or a name.
             let ruling = (self.has_furniture() && self.stale_sfv).then_some(Verdict::Either);
             Built {

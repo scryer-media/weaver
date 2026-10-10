@@ -135,13 +135,15 @@ func TestNoNetRawOverrideDropsTheCapabilityOnOneNetwork(t *testing.T) {
 }
 
 func TestFixtureAddressOverridePinsOnlyTheFixture(t *testing.T) {
-	override := readOverride(t, advancedTestPhase(t, eventScriptsReleaseFlow()))
-	if len(override.Services) != 1 {
-		t.Fatalf("services = %v, want only proxy-fixture", override.Services)
-	}
-	fixture := override.Services["proxy-fixture"]
-	if fixture.Networks["default"]["ipv4_address"] != "10.250.7.250" || fixture.Environment["PROXY_FIXTURE_IP"] != "10.250.7.250" {
-		t.Fatalf("proxy fixture = %+v", fixture)
+	for _, spec := range []weaverReleaseFlowSpec{eventScriptsReleaseFlow(), postProcessingScriptsReleaseFlow()} {
+		override := readOverride(t, advancedTestPhase(t, spec))
+		if len(override.Services) != 1 {
+			t.Fatalf("%s services = %v, want only proxy-fixture", spec.Name, override.Services)
+		}
+		fixture := override.Services["proxy-fixture"]
+		if fixture.Networks["default"]["ipv4_address"] != "10.250.7.250" || fixture.Environment["PROXY_FIXTURE_IP"] != "10.250.7.250" {
+			t.Fatalf("%s proxy fixture = %+v", spec.Name, fixture)
+		}
 	}
 }
 
@@ -229,6 +231,34 @@ func TestReleaseFlowPlaywrightScriptsExist(t *testing.T) {
 		if strings.Contains(script, "tests/network-") && name != "test:advanced-networking-extended" && !strings.Contains(script, "@extended") {
 			t.Fatalf("%s may run @extended scenarios: %q", name, script)
 		}
+	}
+}
+
+// The spec leaves the instant beside the clock file; the harness must read
+// the same path, and only flows with more than one stage can use it.
+func TestClockWhileStoppedMatchesTheSpecHelper(t *testing.T) {
+	support, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "playwright-weaver", "tests", "support", "schedules.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(support), "`${file}.while-stopped`") {
+		t.Fatal("schedules.ts no longer writes <clock file>.while-stopped")
+	}
+	if !strings.Contains(weaverClockWhileStoppedScript, "pending=/e2e-clock/now.while-stopped") {
+		t.Fatalf("the harness reads a different file: %q", weaverClockWhileStoppedScript)
+	}
+	users := 0
+	for _, spec := range weaverReleaseFlowSpecs {
+		if !spec.ClockWhileStopped {
+			continue
+		}
+		users++
+		if len(spec.Stages) < 2 {
+			t.Fatalf("%s moves the clock while Weaver is stopped but never restarts it", spec.Name)
+		}
+	}
+	if users == 0 {
+		t.Fatal("no flow moves the clock while Weaver is stopped")
 	}
 }
 

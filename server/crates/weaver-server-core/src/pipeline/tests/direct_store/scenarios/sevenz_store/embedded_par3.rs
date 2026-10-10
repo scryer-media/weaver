@@ -15,7 +15,11 @@ const ARTICLES: usize = 8;
 
 /// `archive` with a PAR3 recovery tail inserted after its end header, the way
 /// a poster's inside-insertion writes it.
-pub(in super::super) fn with_embedded_par3(archive: &[u8], block_size: u64, recovery_count: u64) -> Vec<u8> {
+pub(in super::super) fn with_embedded_par3(
+    archive: &[u8],
+    block_size: u64,
+    recovery_count: u64,
+) -> Vec<u8> {
     let scratch = tempfile::tempdir().unwrap();
     let source = SourceId(0);
     let mut access = MemorySourceAccess::default();

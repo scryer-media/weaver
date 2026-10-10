@@ -103,12 +103,12 @@
     },
     {
       "path": "/settings/scripts/secrets",
-      "owner": "ui-runtime-observability",
+      "owner": "ui-post-processing",
       "oracle": "browser"
     },
     {
       "path": "/settings/scripts/runs",
-      "owner": "ui-runtime-observability",
+      "owner": "ui-post-processing",
       "oracle": "browser"
     },
     {
@@ -371,51 +371,43 @@
     },
     {
       "name": "cancelJobPostProcessing",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "Cancelling mid-script needs a job that is still executing; the browser flow asserts completed script results instead."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "cancelScriptTest",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "Cancelling a test needs a script that is still executing; the server API tests and the web Scripts screen tests against a mocked daemon cover it."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "createSecret",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow does not open the Secrets screen; the server core and API tests cover naming, encryption and the admin guards, and the web Secrets screen tests against a mocked daemon cover the dialog."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "createScriptInstance",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow does not open the instance editor; the server API tests and the web Scripts screen tests against a mocked daemon cover creating an instance."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "deleteSecret",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow does not delete a secret; the server core and API tests cover the refusal that names the instances still linking it, and the web Secrets screen tests cover how it is shown."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "deleteScriptInstance",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow does not delete an instance; the server API tests cover the rules and feed attachments that go with it, and the web Scripts screen tests cover the confirmation."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "reapplyScriptHeader",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "Header drift needs a script whose header changes under a saved instance; the server API tests and the web Scripts screen tests against a mocked daemon cover re-applying it."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "reorderScriptInstances",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow does not reorder instances; the server API tests and the web Scripts screen tests against a mocked daemon cover the run order."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "reprocessJob",
@@ -452,33 +444,28 @@
     },
     {
       "name": "scriptRun",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "Only a running script calling with its run token reaches this; the server API tests play the run and the app tests drive real gated scripts against it. The browser never calls it."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "setUpScriptFromHeader",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow does not set a script up from its header; the server API tests and the web Scripts screen tests against a mocked daemon cover the instances it creates."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "testScriptInstance",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow asserts the results of real runs, not a test run; the server API tests and the web Scripts screen tests against a mocked daemon cover the Test dialog."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "updateSecret",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow does not rename or replace a secret; the server core and API tests cover both and that the next run is handed the new value, and the web Secrets screen tests cover the write-only value field."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "updateScriptInstance",
-      "owner": "ui-post-processing",
-      "oracle": "unit-only",
-      "rationale": "The browser flow does not edit an instance; the server API tests and the web Scripts screen tests against a mocked daemon cover saving one, a kept secret included."
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
     },
     {
       "name": "acceptHistoryDelete",
@@ -758,13 +745,83 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "schedule-action-contract-and-refusals",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-hold-matrix-every-action",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-track-independence-and-overlap",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-operator-overrides",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-one-shot-occurrences",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-catch-up-across-restart",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "automatic-and-upgrade-backups",
       "owner": "scheduling",
       "oracle": "api-metrics"
     },
     {
       "name": "nzbget-and-sab-script-adapters",
-      "owner": "event-scripts",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-exit-codes-and-job-outcome",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-secret-redaction",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-run-token-allowlist",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-output-ring-and-retention",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-interpreters",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-order-and-categories",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "post-processing-script-concurrency-after-restart",
+      "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "nzbget-facade-script-status",
+      "owner": "post-processing-scripts",
       "oracle": "api-metrics"
     }
   ]

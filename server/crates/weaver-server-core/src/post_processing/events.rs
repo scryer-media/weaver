@@ -63,6 +63,12 @@ impl ScriptSlots {
     pub(crate) fn running(&self) -> usize {
         self.lock().running
     }
+
+    // Runs holding a slot and runs queued for one, read at scrape time.
+    pub(crate) fn occupancy(&self) -> (usize, usize) {
+        let queue = self.lock();
+        (queue.running, queue.waiting.len())
+    }
 }
 
 // A slot in the shared pool, given back when this is dropped.
@@ -462,6 +468,7 @@ pub async fn run_event(
 ) -> Result<Vec<ScriptResult>, StateError> {
     let settings = db.post_processing_settings()?;
     if execution_refusal(&settings, strict_security_enabled()).is_some() {
+        super::run_metrics::record_refusal(super::run_metrics::RunKind::of(&context.event, false));
         return Ok(Vec::new());
     }
     let runtime = db.script_runtime.clone();
@@ -556,7 +563,10 @@ pub async fn run_event(
                 // overlapping. It only gives up its place among the scripts
                 // that are waited for.
                 turn = None;
-                let Some(_turn) = script_slot(db, &mut cancel_rx).await? else {
+                let kind = super::run_metrics::RunKind::of(&context.event, true);
+                let Some(_turn) =
+                    super::run_metrics::waiting(kind, script_slot(db, &mut cancel_rx)).await?
+                else {
                     break;
                 };
                 results.push(run_entry(db, context, run, cancellation.clone()).await?);
@@ -566,7 +576,10 @@ pub async fn run_event(
             continue;
         }
         if turn.is_none() {
-            let Some(acquired) = script_slot(db, &mut cancel_rx).await? else {
+            let kind = super::run_metrics::RunKind::of(&context.event, false);
+            let Some(acquired) =
+                super::run_metrics::waiting(kind, script_slot(db, &mut cancel_rx)).await?
+            else {
                 break;
             };
             turn = Some(acquired);
@@ -599,7 +612,10 @@ fn spawn_background_entry(db: &Database, context: &EventContext, mut run: EntryR
     let db = db.clone();
     let mut context = context.clone();
     tokio::spawn(async move {
-        let Some((_turn, cancellation)) = registration.turn().await else {
+        let kind = super::run_metrics::RunKind::of(&context.event, true);
+        let Some((_turn, cancellation)) =
+            super::run_metrics::waiting(kind, registration.turn()).await
+        else {
             return;
         };
         match db.post_processing_settings() {
@@ -635,6 +651,11 @@ async fn run_entry(
         background,
     } = run;
     let started = Instant::now();
+    let _running = super::run_metrics::RunningGuard::enter(super::run_metrics::RunKind::of(
+        &context.event,
+        background,
+    ));
+    let mut not_started = script.is_err();
     let (adapter, status, exit_code, (output, output_bytes), output_truncated, error_message) =
         match script {
             // Nothing ran, so nothing failed: the operator is told, and whatever
@@ -661,7 +682,10 @@ async fn run_entry(
                             .map_err(|error| error.to_string())
                     });
                 let execution = match prepared {
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        not_started = true;
+                        Err(error)
+                    }
                     Ok((inputs, mut identity)) => {
                         let mut env = context.weaver_env();
                         env.extend(context.env.clone());
@@ -756,6 +780,7 @@ async fn run_entry(
         error_message,
         finished_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
+    super::run_metrics::record_finished(&result, !not_started);
     let result = super::output::retain_output(
         db.clone(),
         context.job_id,

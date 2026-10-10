@@ -28,8 +28,12 @@ pub(in super::super) const MARGINS: [Margin; 3] = [Margin::With, Margin::Exact, 
 
 /// The PAR2 realism family's margins: the three above and the one-block
 /// edge above exact.
-pub(in super::super) const PAR2_MARGINS: [Margin; 4] =
-    [Margin::With, Margin::OneOver, Margin::Exact, Margin::OneShort];
+pub(in super::super) const PAR2_MARGINS: [Margin; 4] = [
+    Margin::With,
+    Margin::OneOver,
+    Margin::Exact,
+    Margin::OneShort,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in super::super) enum Code {
@@ -220,11 +224,14 @@ pub(in super::super) fn par2_set(
     recovery: usize,
     volumes: Par2Volumes,
 ) -> Vec<(String, Vec<u8>)> {
-    use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount, VolumeScheme};
+    use par2_rs::create::{
+        BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount, VolumeScheme,
+    };
     let (scratch, base, paths) = scratch_sources(sources);
     let out = scratch.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let mut options = Par2CreatorOptions::with_output(out.join("silver.horizon.par2"), Some(base), paths);
+    let mut options =
+        Par2CreatorOptions::with_output(out.join("silver.horizon.par2"), Some(base), paths);
     options.block_sizing = BlockSizing::Bytes(slice as u64);
     options.recovery_amount = RecoveryAmount::Count(recovery as u32);
     match volumes {
@@ -238,7 +245,9 @@ pub(in super::super) fn par2_set(
         }
     }
     let creator = Par2Creator::new(options);
-    let created = creator.create(&creator.plan().expect("a PAR2 plan over the fixture")).expect("a PAR2 set over the fixture");
+    let created = creator
+        .create(&creator.plan().expect("a PAR2 plan over the fixture"))
+        .expect("a PAR2 set over the fixture");
     read_outputs(&created.output_paths)
 }
 
@@ -250,7 +259,9 @@ pub(in super::super) fn par3_set(
     code: Code,
     per_volume: u64,
 ) -> Vec<(String, Vec<u8>)> {
-    use par3_rs::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout};
+    use par3_rs::creation::{
+        CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
+    };
     use par3_rs::source::{MemorySourceAccess, SourceId};
     let mut access = MemorySourceAccess::default();
     let mut named = Vec::new();
@@ -277,8 +288,13 @@ pub(in super::super) fn par3_set(
         ..CreationOptions::default()
     };
     let scratch = tempfile::tempdir().unwrap();
-    let plan = CreationPlan::build(Arc::new(access), &named, options).expect("a PAR3 plan over the fixture");
-    let mut written = read_outputs(&plan.execute(&scratch.path().join("silver.horizon"), scratch.path()).expect("a PAR3 set over the fixture"));
+    let plan = CreationPlan::build(Arc::new(access), &named, options)
+        .expect("a PAR3 plan over the fixture");
+    let mut written = read_outputs(
+        &plan
+            .execute(&scratch.path().join("silver.horizon"), scratch.path())
+            .expect("a PAR3 set over the fixture"),
+    );
     written.sort_by_key(|(name, _)| (name.contains(".vol"), name.clone()));
     written
 }
@@ -298,13 +314,22 @@ pub(in super::super) fn post_set(post: &mut Post, set: Vec<(String, Vec<u8>)>, a
 
 /// How many recovery blocks a margin asks for, given what the post needs and
 /// what its damage to the recovery files takes.
-pub(in super::super) fn blocks_for(margin: Margin, (upper, lower): (usize, usize), killed: usize, floor: usize) -> usize {
+pub(in super::super) fn blocks_for(
+    margin: Margin,
+    (upper, lower): (usize, usize),
+    killed: usize,
+    floor: usize,
+) -> usize {
     match margin {
         Margin::With => (upper + (upper / 10).max(2)).max(floor) + killed,
         Margin::Exact => upper + killed,
         Margin::OneOver => upper + 1 + killed,
         Margin::OneShort => {
-            let short = if lower > 0 { lower - 1 } else { upper.saturating_sub(1) };
+            let short = if lower > 0 {
+                lower - 1
+            } else {
+                upper.saturating_sub(1)
+            };
             short + killed
         }
     }
@@ -371,7 +396,10 @@ pub(in super::super) fn par2_packet(set: &[u8], kind: &[u8; 16], body: &[u8]) ->
 
 /// The recovery set ID every packet in `bytes` carries.
 pub(in super::super) fn par2_set_id(bytes: &[u8]) -> Vec<u8> {
-    let packet = par2_packets(bytes).into_iter().next().expect("a PAR2 packet");
+    let packet = par2_packets(bytes)
+        .into_iter()
+        .next()
+        .expect("a PAR2 packet");
     bytes[packet.range.start + 32..packet.range.start + 48].to_vec()
 }
 
@@ -404,7 +432,12 @@ pub(in super::super) fn descriptions_survive(
         .collect();
     let all: Vec<(String, Vec<u8>)> = par2
         .iter()
-        .map(|&file| (post.files[file].name.clone(), post.files[file].bytes.clone()))
+        .map(|&file| {
+            (
+                post.files[file].name.clone(),
+                post.files[file].bytes.clone(),
+            )
+        })
         .collect();
     let wanted = described(&all);
     let mut kept = BTreeSet::new();

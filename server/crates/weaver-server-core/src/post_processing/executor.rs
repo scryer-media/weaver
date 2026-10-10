@@ -19,6 +19,7 @@ use super::model::{
     PostProcessingResume, PostProcessingSummary, ScriptAdapter, ScriptEventLabel, ScriptResult,
     ScriptStatus, StartedScript, merge_post_processing_summary,
 };
+use super::run_metrics::{self, RunKind};
 use super::runner::{
     ExecutionDisposition, InterpreterConfig, JobExecutionContext, NzbgetScriptStatus, RunIdentity,
     ScriptExecutionRequest, execute_script_observed,
@@ -42,8 +43,6 @@ mod counters {
 
     pub(super) static QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
     pub(super) static ACTIVE: AtomicU64 = AtomicU64::new(0);
-    pub(super) static DURATION_COUNT: AtomicU64 = AtomicU64::new(0);
-    pub(super) static DURATION_SUM_MILLIS: AtomicU64 = AtomicU64::new(0);
     pub(super) static SUCCEEDED: AtomicU64 = AtomicU64::new(0);
     pub(super) static FAILED: AtomicU64 = AtomicU64::new(0);
     pub(super) static SKIPPED: AtomicU64 = AtomicU64::new(0);
@@ -57,8 +56,6 @@ mod counters {
 pub struct PostProcessingMetricsSnapshot {
     pub queue_depth: u64,
     pub active_attempts: u64,
-    pub duration_count: u64,
-    pub duration_sum_millis: u64,
     pub succeeded: u64,
     pub failed: u64,
     pub skipped: u64,
@@ -73,8 +70,6 @@ pub fn metrics_snapshot() -> PostProcessingMetricsSnapshot {
     PostProcessingMetricsSnapshot {
         queue_depth: load(&counters::QUEUE_DEPTH),
         active_attempts: load(&counters::ACTIVE),
-        duration_count: load(&counters::DURATION_COUNT),
-        duration_sum_millis: load(&counters::DURATION_SUM_MILLIS),
         succeeded: load(&counters::SUCCEEDED),
         failed: load(&counters::FAILED),
         skipped: load(&counters::SKIPPED),
@@ -85,9 +80,10 @@ pub fn metrics_snapshot() -> PostProcessingMetricsSnapshot {
     }
 }
 
-fn record_script_metrics(result: &ScriptResult) {
-    counters::DURATION_COUNT.fetch_add(1, Ordering::Relaxed);
-    counters::DURATION_SUM_MILLIS.fetch_add(result.duration_ms, Ordering::Relaxed);
+// Both a waited run and a background run end here; the per-script duration
+// and run count are recorded with the rest.
+fn record_script_metrics(result: &ScriptResult, started: bool) {
+    super::run_metrics::record_finished(result, started);
     let counter = match result.status {
         ScriptStatus::Succeeded => &counters::SUCCEEDED,
         ScriptStatus::Skipped => &counters::SKIPPED,
@@ -262,6 +258,7 @@ impl PostProcessingExecutor {
     pub fn recover_interrupted(&self) -> Result<u64, StateError> {
         let interrupted = self.db.recover_interrupted_post_processing()?;
         counters::INTERRUPTED.fetch_add(interrupted, Ordering::Relaxed);
+        run_metrics::record_job_summaries(PostProcessingSummary::Interrupted, interrupted);
         Ok(interrupted)
     }
 
@@ -349,6 +346,7 @@ impl PostProcessingExecutor {
     ) -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
         self.run_job(job_id, admission, context, cancellation, started, None)
             .await
+            .inspect(|report| run_metrics::record_job_summary(report.summary))
     }
 
     // Finish a pass weaver stopped in the middle of. The entries that had
@@ -374,6 +372,7 @@ impl PostProcessingExecutor {
             Some(resume),
         )
         .await
+        .inspect(|report| run_metrics::record_job_summary(report.summary))
     }
 
     async fn run_job(
@@ -388,6 +387,20 @@ impl PostProcessingExecutor {
         let resumed = resume.is_some();
         let resume = resume.unwrap_or_default();
         let carried = resume.carried_results();
+        if resumed {
+            run_metrics::record_interrupted_recovered();
+            // Only the rows this restart made: an interrupted row carried over
+            // from an earlier restart was counted when it was made.
+            for result in carried.iter().filter(|result| {
+                result.status == ScriptStatus::Interrupted
+                    && !resume
+                        .results
+                        .iter()
+                        .any(|kept| kept.instance_id == result.instance_id)
+            }) {
+                run_metrics::record_interrupted(result);
+            }
+        }
         let carried_summary = carried
             .iter()
             .fold(PostProcessingSummary::NotRun, |summary, result| {
@@ -414,6 +427,7 @@ impl PostProcessingExecutor {
         let settings = self.db.post_processing_settings()?;
         if let Some(reason) = execution_refusal(&settings, strict_security_enabled()) {
             tracing::info!(job_id, reason, "post-processing did not run");
+            run_metrics::record_refusal(RunKind::PostProcessing);
             self.record_job_event(job_id, SCRIPT_EVENT_KIND, reason);
             return ended_early(PostProcessingSummary::NotRun);
         }
@@ -553,6 +567,7 @@ impl PostProcessingExecutor {
             let attempt = {
                 let _turn = turn;
                 let _active = GaugeGuard::enter(&counters::ACTIVE);
+                let _running = run_metrics::RunningGuard::enter(RunKind::PostProcessing);
                 self.attempt(
                     &admission,
                     entry,
@@ -564,13 +579,13 @@ impl PostProcessingExecutor {
                 )
                 .await
             };
-            let result = match attempt {
-                Attempt::Ran(result) => result,
+            let (result, started) = match attempt {
+                Attempt::Ran(result) => (result, true),
                 // Kept in the list of the job's runs beside the ones that
                 // ran, under the same limits.
-                Attempt::NotStarted(result) => self.keep_unstarted(job_id, result).await,
+                Attempt::NotStarted(result) => (self.keep_unstarted(job_id, result).await, false),
             };
-            record_script_metrics(&result);
+            record_script_metrics(&result, started);
             context.compatibility.previous_script_status =
                 previous_script_status(context.compatibility.previous_script_status, &result);
             self.publish_script_events(job_id, &result);
@@ -614,6 +629,7 @@ impl PostProcessingExecutor {
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<Option<super::events::ScriptSlot>, PostProcessingExecutorError> {
         let _queued = GaugeGuard::enter(&counters::QUEUE_DEPTH);
+        let _waiting = run_metrics::WaitingGuard::enter(RunKind::PostProcessing);
         Ok(super::events::script_slot(&self.db, cancel_rx).await?)
     }
 
@@ -636,7 +652,9 @@ impl PostProcessingExecutor {
         let mut context = context.clone();
         let interpreters = interpreters.clone();
         tokio::spawn(async move {
-            let Some((_turn, cancellation)) = registration.turn().await else {
+            let Some((_turn, cancellation)) =
+                run_metrics::waiting(RunKind::Background, registration.turn()).await
+            else {
                 return;
             };
             let job_id = context.job_id;
@@ -645,6 +663,7 @@ impl PostProcessingExecutor {
             }
             let attempt = {
                 let _active = GaugeGuard::enter(&counters::ACTIVE);
+                let _running = run_metrics::RunningGuard::enter(RunKind::Background);
                 executor
                     .attempt(
                         &admission,
@@ -657,13 +676,15 @@ impl PostProcessingExecutor {
                     )
                     .await
             };
-            let result = match attempt {
-                Attempt::Ran(result) => result,
+            let (result, started) = match attempt {
+                Attempt::Ran(result) => (result, true),
                 // The pass is over by the time this is known, so the list of
                 // the job's runs is the only place left to say so.
-                Attempt::NotStarted(result) => executor.keep_unstarted(job_id, result).await,
+                Attempt::NotStarted(result) => {
+                    (executor.keep_unstarted(job_id, result).await, false)
+                }
             };
-            record_script_metrics(&result);
+            record_script_metrics(&result, started);
             executor.publish_script_events(job_id, &result);
         });
     }

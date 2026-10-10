@@ -1083,8 +1083,6 @@ fn sample_post_processing_metrics()
     weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot {
         queue_depth: 1,
         active_attempts: 2,
-        duration_count: 3,
-        duration_sum_millis: 4_500,
         succeeded: 5,
         failed: 6,
         skipped: 7,
@@ -1092,6 +1090,216 @@ fn sample_post_processing_metrics()
         cancelled: 9,
         interrupted: 10,
         truncated: 11,
+    }
+}
+
+// One script that has run under every kind, adapter, waited flag and status,
+// so each label set the families carry is present in the render.
+fn sample_script_runs() -> weaver_server_core::post_processing::run_metrics::ScriptRunMetricsSnapshot
+{
+    use weaver_server_core::operations::HistogramSnapshot;
+    use weaver_server_core::post_processing::run_metrics::{
+        ADAPTERS, RetentionAction, RunKind, RunStatus, SCRIPT_RUN_DURATION_BOUNDS, SUMMARIES,
+        ScriptMetrics, ScriptRunCount, ScriptRunDuration, ScriptRunMetricsSnapshot,
+    };
+    let per_kind =
+        |base: u64| -> Vec<(RunKind, u64)> { RunKind::ALL.into_iter().zip(base..).collect() };
+    let mut runs = Vec::new();
+    let mut durations = Vec::new();
+    for kind in RunKind::ALL {
+        for waited in [true, false] {
+            for adapter in ADAPTERS {
+                for status in RunStatus::ALL {
+                    runs.push(ScriptRunCount {
+                        kind,
+                        adapter,
+                        waited,
+                        status,
+                        runs: 1,
+                    });
+                }
+            }
+            for status in RunStatus::ALL {
+                let mut counts = vec![0; SCRIPT_RUN_DURATION_BOUNDS.len() + 1];
+                counts[2] = 2;
+                durations.push(ScriptRunDuration {
+                    kind,
+                    waited,
+                    status,
+                    duration: HistogramSnapshot {
+                        bounds: SCRIPT_RUN_DURATION_BOUNDS,
+                        counts,
+                        sum: 1.5,
+                        count: 2,
+                    },
+                });
+            }
+        }
+    }
+    ScriptRunMetricsSnapshot {
+        started: per_kind(10),
+        running: per_kind(1),
+        waiting: per_kind(2),
+        slot_waits: per_kind(20),
+        refusals: per_kind(3),
+        job_summaries: SUMMARIES.into_iter().zip(1..).collect(),
+        interrupted_recovered: 2,
+        retained: RetentionAction::ALL.into_iter().zip(5..).collect(),
+        concurrency_limit: Some(32),
+        queue_event_backlog: Some(4),
+        slots_in_use: Some(3),
+        slots_waiting: Some(5),
+        scripts: vec![ScriptMetrics {
+            script: "Notify".into(),
+            runs,
+            durations,
+            nonzero_exits: 3,
+            last_exit_code: Some(2),
+            last_duration_ms: Some(1_250),
+            last_finished_epoch_ms: Some(1_700_000_000_500),
+            last_status: Some(RunStatus::Failed),
+            output_bytes: 4_096,
+            stored_bytes: 1_024,
+            truncations: 1,
+            pruned: 6,
+        }],
+    }
+}
+
+fn sample_schedules() -> weaver_server_core::bandwidth::schedule_metrics::ScheduleMetricsSnapshot {
+    use weaver_server_core::bandwidth::schedule_metrics::{
+        ActionKind, ActionOutcome, Evaluator, HoldReason, ReplayReason, RuleMetrics,
+        ScheduleMetricsSnapshot,
+    };
+    ScheduleMetricsSnapshot {
+        evaluations: 120,
+        actions: ActionKind::ALL
+            .into_iter()
+            .flat_map(|action| {
+                action.tracks().iter().flat_map(move |track| {
+                    ActionOutcome::ALL
+                        .into_iter()
+                        .map(move |outcome| (action, *track, outcome, 1))
+                })
+            })
+            .collect(),
+        one_shot_fires: ActionKind::ALL
+            .into_iter()
+            .filter(|action| action.is_one_shot())
+            .map(|action| (action, 1))
+            .collect(),
+        replays: ReplayReason::ALL.into_iter().map(|r| (r, 1)).collect(),
+        clock_jumps: Evaluator::ALL.into_iter().map(|e| (e, 1)).collect(),
+        hold: Some(HoldReason::ActionFailed),
+        rules_by_action: ActionKind::ALL.into_iter().map(|a| (a, 1, 1)).collect(),
+        rules: vec![RuleMetrics {
+            id: "night-limit".into(),
+            action: ActionKind::ALL[0],
+            enabled: true,
+            fires: ActionOutcome::ALL.into_iter().zip(4..).collect(),
+            last_fire_epoch_ms: Some(1_700_000_060_000),
+            last_outcome: Some(ActionOutcome::Applied),
+        }],
+    }
+}
+
+fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetricsSnapshot {
+    use weaver_server_core::proxies::network_metrics::{
+        EgressHealthLabel, EgressMetrics, LegDialResult, LegMetrics, LegStateLabel,
+        NetworkMetricsSnapshot, PROXY_KINDS, PoolMemberMetrics, PoolMetrics, RungStateLabel,
+    };
+    NetworkMetricsSnapshot {
+        legs: vec![
+            LegMetrics {
+                consumer: "server:7".into(),
+                position: 0,
+                egress_id: 2,
+                live: true,
+                state: LegStateLabel::Probing,
+                state_since_epoch_ms: 1_700_000_030_000,
+                target: 8,
+                open: 6,
+                opening: 1,
+                bytes_per_second: 5_000_000,
+                rung: Some(1),
+                rungs: RungStateLabel::ALL.to_vec(),
+            },
+            LegMetrics {
+                consumer: "server:7".into(),
+                position: 1,
+                egress_id: 0,
+                live: false,
+                state: LegStateLabel::Down,
+                state_since_epoch_ms: 1_700_000_000_000,
+                target: 0,
+                open: 0,
+                opening: 0,
+                bytes_per_second: 0,
+                rung: None,
+                rungs: Vec::new(),
+            },
+        ],
+        egresses: vec![EgressMetrics {
+            egress_id: 2,
+            enabled: true,
+            health: EgressHealthLabel::Up,
+            health_since_epoch_ms: 1_700_000_010_000,
+            dials: LegDialResult::ALL.map(|result| (result, 3)),
+            cooldowns: 2,
+        }],
+        pools: vec![PoolMetrics {
+            pool_id: 4,
+            egress_id: 2,
+            races_won: 9,
+            races_failed: 1,
+            members: vec![
+                PoolMemberMetrics {
+                    member_id: 11,
+                    open: 3,
+                    opening: 1,
+                    blocked: false,
+                    warmed: true,
+                    session_handshake_seconds: Some(0.25),
+                },
+                PoolMemberMetrics {
+                    member_id: 12,
+                    open: 0,
+                    opening: 0,
+                    blocked: true,
+                    warmed: false,
+                    session_handshake_seconds: None,
+                },
+            ],
+        }],
+        proxies: PROXY_KINDS
+            .into_iter()
+            .flat_map(|kind| [(kind, true, 1), (kind, false, 0)])
+            .collect(),
+    }
+}
+
+fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::TunnelMetricsSnapshot {
+    use weaver_server_core::proxies::network_metrics::tunnel::{
+        DialResult, RUNGS, Resolver, TunnelKind, TunnelMetricsSnapshot,
+    };
+    TunnelMetricsSnapshot {
+        streams: TunnelKind::ALL
+            .into_iter()
+            .flat_map(|kind| {
+                DialResult::ALL
+                    .into_iter()
+                    .map(move |result| (kind, result, 1))
+            })
+            .collect(),
+        session_prepares: TunnelKind::SESSIONS
+            .into_iter()
+            .map(|k| (k, 5, 1))
+            .collect(),
+        session_retirements: TunnelKind::SESSIONS.into_iter().map(|k| (k, 2)).collect(),
+        resolutions: Resolver::ALL.into_iter().map(|r| (r, 10, 2)).collect(),
+        rung_cooldowns: vec![1; RUNGS],
+        rung_fallbacks: vec![2; RUNGS],
+        revocations: 3,
     }
 }
 
@@ -1433,6 +1641,10 @@ fn fully_populated_render() -> String {
     let lifecycle = [("promoted", 2u64)];
     let rejections = [("unsafe_path", 1u64), ("ratio", 2u64)];
     let post_processing = sample_post_processing_metrics();
+    let script_runs = sample_script_runs();
+    let schedules = sample_schedules();
+    let network = sample_network();
+    let tunnel = sample_tunnel();
     let collection = CollectionFixtures::new();
 
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
@@ -1444,6 +1656,10 @@ fn fully_populated_render() -> String {
     input.semantic_duplicate_lifecycle = &lifecycle;
     input.extraction_rejections = &rejections;
     input.post_processing = Some(&post_processing);
+    input.script_runs = Some(&script_runs);
+    input.schedules = Some(&schedules);
+    input.network = Some(&network);
+    input.tunnel = Some(&tunnel);
     input.runtime_generation = 3;
     input.start_time_seconds = 1_700_000_000.0;
     collection.apply(&mut input);
