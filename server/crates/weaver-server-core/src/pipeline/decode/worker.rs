@@ -1304,7 +1304,7 @@ impl Pipeline {
         if self
             .jobs
             .get(&job_id)
-            .is_none_or(|state| is_terminal_status(&state.status))
+            .is_none_or(|state| is_terminal_status(&state.status) || state.extraction_depth > 0)
         {
             debug!(
                 segment = %segment_id,
@@ -1574,6 +1574,13 @@ impl Pipeline {
                     segment = %segment_id,
                     "discarding decode result for inactive job"
                 );
+                return;
+            }
+            // Nested extraction replaces the posted-file assembly and reuses
+            // its indices. An outer article still finishing decode cannot
+            // validate against or write into that new generation.
+            if state.extraction_depth > 0 {
+                debug!(job_id = job_id.0, segment = %segment_id, "discarding outer decode result during nested extraction");
                 return;
             }
             let expected_layout = state

@@ -724,6 +724,14 @@ async fn clean_par2_verification_exits_verifying_for_single_sevenz_extraction() 
         _ => panic!("expected single 7z extraction result"),
     }
     pipeline.handle_extraction_done(done).await;
+    // A malformed header now gets an authoritative PAR2 pass before the
+    // single extraction retry. This posting protects the malformed bytes,
+    // so that retry must still fail instead of publishing an empty job.
+    pipeline.check_job_completion(job_id).await;
+    settle_direct_post_repair_work(&mut pipeline).await;
+    if let Some(done) = next_owed_extraction(&mut pipeline, job_id).await {
+        pipeline.handle_extraction_done(done).await;
+    }
     assert!(matches!(
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Failed { .. })

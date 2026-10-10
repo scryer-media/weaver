@@ -28,7 +28,7 @@ impl Pipeline {
             .par3_runtime
             .as_mut()
             .and_then(|runtime| runtime.take_spill_limit(job_id));
-        let index = u32::try_from(source.0).ok().and_then(|file| {
+        let index = split::file_index(source).and_then(|file| {
             self.direct_store.sets_for(job_id).iter().position(|set| {
                 !set.is_demoted()
                     && !set.is_finalized()
@@ -59,7 +59,7 @@ impl Pipeline {
         // What the refused image alone asks for. The sum above is what the
         // fallback needs; this is the floor to report when that sum cannot be
         // taken, so a refusal never claims it needed nothing.
-        let refused_bytes = u32::try_from(source.0).ok().and_then(|file| {
+        let refused_bytes = split::file_index(source).and_then(|file| {
             set.plan()
                 .volumes
                 .iter()
@@ -220,8 +220,7 @@ impl Pipeline {
             let direct = self.direct_store.sets_for(job_id).iter().position(|set| {
                 !set.is_demoted()
                     && !set.is_finalized()
-                    && u32::try_from(source.0)
-                        .ok()
+                    && split::file_index(source)
                         .is_some_and(|index| set.plan().volume_for_file(index).is_some())
             });
             if let Some(index) = direct {
@@ -252,7 +251,7 @@ impl Pipeline {
                         file.source.is_some_and(|source| {
                             view.embedded_source == Some(source)
                                 && runtime.embedded_start(job_id, source).is_some()
-                                && u32::try_from(source.0).ok().is_some_and(|file_index| {
+                                && split::file_index(source).is_some_and(|file_index| {
                                     self.jobs[&job_id]
                                         .assembly
                                         .file(NzbFileId { job_id, file_index })
@@ -526,6 +525,7 @@ impl Pipeline {
             result,
             outputs,
             embedded_replacement,
+            embedded_source,
             _reservation,
         } = completion;
         if !self.jobs.contains_key(&job_id) {
@@ -552,6 +552,7 @@ impl Pipeline {
         };
         // Reconcile independently verified installations even on a later
         // failure. Never turn an engine error into a successful job verdict.
+        self.retire_par3_split_inputs(job_id, embedded_source, installed, &outputs);
         if let Err(error) = self
             .reconcile_par3_installations(job_id, installed, &outputs)
             .await

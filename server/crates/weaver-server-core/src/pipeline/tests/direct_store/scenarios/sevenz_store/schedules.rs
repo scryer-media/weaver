@@ -448,6 +448,24 @@ async fn run_shape(
 }
 
 #[tokio::test]
+async fn obfuscated_copy_demotion_waits_for_pending_downloads() {
+    run_shape(
+        Shape::CopyObfuscated,
+        ExtractionProfile::DirectStore,
+        ScheduleOptions::MATRIX,
+        Vec::new(),
+        vec![(
+            4555,
+            (
+                vec![(0, 0), (0, 0), (1, 0), (1, 1), (0, 1)],
+                Interruption::Demote(1),
+            ),
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn copy_arrival_schedules() {
     campaign(Shape::Copy, Selection::Smoke).await;
 }

@@ -872,6 +872,7 @@ mod tests {
             completion: work::RepairCompletion {
                 result: Ok(Default::default()),
                 embedded_replacement: false,
+                embedded_source: None,
                 outputs: Ok(vec![
                     VerifiedOutput::capture(path, STRIPE_BYTES + 17, options).unwrap(),
                 ]),

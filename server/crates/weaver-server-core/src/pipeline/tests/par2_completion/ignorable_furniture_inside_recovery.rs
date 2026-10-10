@@ -1698,6 +1698,79 @@ fn discovery_state(pipeline: &Pipeline, job_id: JobId, file_index: u32) -> Par2D
 }
 
 #[tokio::test]
+async fn an_unpromoted_metadata_prefix_is_not_stranded_recovery() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30819);
+    let mut spec = segmented_job_spec("Recovery Prefix", "harbor.vol00+08.par2", &[128, 128]);
+    spec.files[0].role = FileRole::from_filename(&spec.files[0].filename);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+    state
+        .assembly
+        .file_mut(file_id)
+        .unwrap()
+        .commit_segment(0, 128)
+        .unwrap();
+    let set = minimal_par2_file_set();
+    let set_id = set.recovery_set_id;
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .ensure_set_runtime(set_id)
+        .set = Some(Arc::new(set));
+    let entry = pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(0)
+        .or_default();
+    entry.discovery_probe_ordinals.insert(0);
+    entry.recovery_set_id = Some(set_id);
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    assert_eq!(pipeline.par2_recovery_salvage_scans, 0);
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .get_mut(&0)
+        .unwrap()
+        .promoted = true;
+    pipeline
+        .salvage_partial_promoted_recovery_volumes(job_id)
+        .await;
+    assert_eq!(pipeline.par2_recovery_salvage_scans, 1);
+}
+
+#[tokio::test]
+async fn a_metadata_probe_parks_the_rest_of_its_volume_for_recovery() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30820);
+    let mut spec = segmented_job_spec("Recovery Probe Queue", "harbor.vol00+08.par2", &[128; 3]);
+    spec.files[0].role = FileRole::from_filename(&spec.files[0].filename);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    assert!(pipeline.promote_par2_metadata(job_id));
+    let probes = drain_promoted_segments(&mut pipeline, job_id);
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].segment_number, 0);
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let mut parked: Vec<_> = state
+        .recovery_queue
+        .drain_all()
+        .into_iter()
+        .map(|work| work.segment_id.segment_number)
+        .collect();
+    parked.sort_unstable();
+    assert_eq!(parked, vec![1, 2]);
+}
+
+#[tokio::test]
 async fn metadata_discovery_probes_several_volumes_of_one_posting_at_once() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

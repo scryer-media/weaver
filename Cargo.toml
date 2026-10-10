@@ -170,6 +170,12 @@ debug = 0
 split-debuginfo = "off"
 incremental = false
 
+[profile.matrix]
+inherits = "test"
+opt-level = 3
+debug-assertions = true
+overflow-checks = true
+
 # Rarpar crates normally use crates.io; the PAR2 revision above is a temporary
 # pin to the authenticated-scanner and source-change fixes.
 # Do not add a `[patch.crates-io]` block that points outside this

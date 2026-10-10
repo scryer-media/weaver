@@ -1093,6 +1093,17 @@ impl Pipeline {
         if !promoted && file.received_bytes() == 0 {
             return false;
         }
+        // A metadata prefix is deliberately only a partial fetch. Its cold
+        // remainder is still available for recovery promotion. Do not freeze capacity at
+        // the few recovery packets that happened to fit in that prefix.
+        if !promoted
+            && self
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_index))
+                .is_some_and(|entry| !entry.discovery_probe_ordinals.is_empty())
+        {
+            return false;
+        }
         // A segment the servers have run out of answers for is the one fact that
         // settles this on its own: the volume cannot complete, whatever else the
         // job still has moving.

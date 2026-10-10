@@ -1118,7 +1118,9 @@ impl Pipeline {
             } else {
                 candidates
                     .into_iter()
-                    .filter(|(_, path)| superseded_source_probe(path, slice_size, &present))
+                    .filter(|(_, path)| {
+                        superseded_source_probe(path, slice_size, &present, &working_dir)
+                    })
                     .map(|(file_id, _)| file_id)
                     .collect()
             };
@@ -1739,6 +1741,7 @@ fn superseded_source_probe(
     path: &Path,
     slice_size: u64,
     outputs: &[(String, u64, Vec<par2_rs::SliceChecksum>)],
+    output_dir: &Path,
 ) -> bool {
     use std::io::Read;
 
@@ -1794,9 +1797,98 @@ fn superseded_source_probe(
             }
         }
         if filled < slice_len {
+            // A small split 7z can lose its tail before even one complete
+            // PAR2 slice survives. Compare its entire remaining part
+            // prefix with the already verified outputs, without inventing
+            // checksum padding. Only one matching output may claim the copy.
+            if index == 0 && filled >= 32 {
+                let mut expected = vec![0; filled];
+                let matches = outputs
+                    .iter()
+                    .filter(|(name, length, _)| {
+                        // Later split parts carry no start signature. Require a
+                        // verified split-archive description as well as matching
+                        // every surviving byte, not just a convenient sample.
+                        let split_sevenz = name.rsplit_once('.').is_some_and(|(base, number)| {
+                            base.to_ascii_lowercase().ends_with(".7z")
+                                && !number.is_empty()
+                                && number.bytes().all(|byte| byte.is_ascii_digit())
+                        });
+                        split_sevenz
+                            && *length > filled as u64
+                            && std::fs::File::open(output_dir.join(name)).is_ok_and(|mut output| {
+                                output.read_exact(&mut expected).is_ok()
+                                    && expected == buffer[..filled]
+                            })
+                    })
+                    .take(2)
+                    .count();
+                return matches == 1;
+            }
             return false;
         }
         index += 1;
     }
     false
+}
+
+#[cfg(test)]
+mod superseded_prefix_tests {
+    use super::superseded_source_probe;
+
+    #[test]
+    fn truncated_sevenz_prefix_requires_one_exact_verified_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut full: Vec<u8> = (0..256).map(|n| (n % 251) as u8).collect();
+        full[..6].copy_from_slice(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
+        let source = directory.path().join("posted");
+        std::fs::write(&source, &full[..80]).unwrap();
+        std::fs::write(directory.path().join("archive.7z.001"), &full).unwrap();
+        let mut outputs = vec![("archive.7z.001".to_string(), full.len() as u64, Vec::new())];
+        assert!(superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+
+        let mut changed = full[..80].to_vec();
+        changed[70] ^= 1;
+        std::fs::write(&source, changed).unwrap();
+        assert!(!superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+
+        std::fs::write(&source, &full[..80]).unwrap();
+        std::fs::write(directory.path().join("other.7z.001"), &full).unwrap();
+        outputs.push(("other.7z.001".to_string(), full.len() as u64, Vec::new()));
+        assert!(!superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+
+        outputs.pop();
+        full[..6].copy_from_slice(b"part02");
+        std::fs::write(directory.path().join("archive.7z.001"), &full).unwrap();
+        std::fs::write(&source, &full[..80]).unwrap();
+        assert!(superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+
+        std::fs::write(&source, &full[..8]).unwrap();
+        assert!(!superseded_source_probe(
+            &source,
+            512,
+            &outputs,
+            directory.path()
+        ));
+    }
 }

@@ -84,6 +84,13 @@ fn sevenz_reposts_require_equivalent_bytes_and_container_bounds() {
     }
     assert!(verified_sevenz_part_paths(&[(1, first.clone()), (0, second.clone())]).is_err());
     assert!(verified_sevenz_part_paths(&[(0, first.clone()), (2, second.clone())]).is_err());
+    let mut enveloped = vec![7u8; 48];
+    enveloped.extend_from_slice(par3_rs::MAGIC);
+    fs::write(&second, &enveloped).unwrap();
+    assert!(verified_sevenz_part_paths(&[(0, first.clone()), (1, second.clone())]).is_ok());
+    enveloped[48] ^= 1;
+    fs::write(&second, &enveloped).unwrap();
+    assert!(verified_sevenz_part_paths(&[(0, first.clone()), (1, second.clone())]).is_err());
     header[12] ^= 1;
     fs::write(&first, header).unwrap();
     assert!(verified_sevenz_part_paths(&[(0, first), (1, second)]).is_err());

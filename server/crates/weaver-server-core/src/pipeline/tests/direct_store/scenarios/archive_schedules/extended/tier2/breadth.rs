@@ -379,11 +379,6 @@ pub(super) mod lies {
             }
         }
 
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
-        }
-
         fn par2(self) -> bool {
             true
         }
@@ -591,33 +586,10 @@ pub(super) mod nesting {
             }
         }
 
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            if self.depth == Depth::RarInside7z {
-                return Some(Defect::Diverges(RAR_INSIDE_7Z_PUBLISHED_AS_IS));
-            }
-            if self.members == 2 && matches!(self.depth, Depth::Two | Depth::Three) && self.par2() {
-                return Some(Defect::Diverges(NESTED_TWO_MEMBERS_PAR2_FILE_MISSING));
-            }
-            None
-        }
-
         fn par2(self) -> bool {
             matches!(self.recovery, Recovery::Par2(_))
         }
     }
-
-    // A 7z whose member is a RAR publishes the RAR itself: nested extraction
-    // is not entered from a 7z outer. Not PAR2, so not release-blocking.
-    const RAR_INSIDE_7Z_PUBLISHED_AS_IS: &str =
-        "a RAR inside a 7z is published as the archive, never extracted";
-
-    // A four-volume RAR holding a two-member RAR beside a PAR2 set completes
-    // every volume, fetches the PAR2 set and then fails "invalid authoritative
-    // NZB segment layout: FileMissing" under DirectStore with nothing lost.
-    // PAR2 with sufficient margin: release-blocking.
-    const NESTED_TWO_MEMBERS_PAR2_FILE_MISSING: &str =
-        "a nested two-member RAR beside a PAR2 set fails FileMissing after completing every volume";
 
     mod nesting_smoke {
         use super::*;
@@ -792,11 +764,6 @@ pub(super) mod scale {
                 geometry,
                 ruling: None,
             }
-        }
-
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
         }
 
         fn par2(self) -> bool {
@@ -987,11 +954,6 @@ pub(super) mod password {
             }
         }
 
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
-        }
-
         fn par2(self) -> bool {
             matches!(self.recovery, Recovery::Par2(_))
         }
@@ -1147,11 +1109,6 @@ pub(super) mod wire {
                 geometry,
                 ruling: None,
             }
-        }
-
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
         }
 
         fn par2(self) -> bool {
@@ -1348,11 +1305,6 @@ pub(super) mod naming {
                 geometry,
                 ruling: None,
             }
-        }
-
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
         }
 
         fn par2(self) -> bool {
@@ -1578,11 +1530,6 @@ pub(super) mod sets {
             }
         }
 
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
-        }
-
         fn par2(self) -> bool {
             matches!(self.recovery, Recovery::Par2(_))
         }
@@ -1590,6 +1537,63 @@ pub(super) mod sets {
 
     mod sets_smoke {
         use super::*;
+
+        #[tokio::test]
+        async fn damaged_neighbour_keeps_healthy_set_unfinalized() {
+            let cell = SetsCell {
+                layout: Layout::TwoSets,
+                container: Container::Rar5,
+                recovery: Recovery::None,
+                stale_sfv: false,
+                volumes: 2,
+            };
+            let mut post = cell.post(Interruption::None).post;
+            post.files[3].wire.insert(
+                1,
+                super::super::post::Wire::Damaged(super::super::post::Damage::Recomputed),
+            );
+            let result = super::super::run::run(
+                &post,
+                ExtractionProfile::DirectStore,
+                &slot_arrivals(4),
+                Interruption::None,
+            )
+            .await;
+            result.assert(
+                &post,
+                ExtractionProfile::DirectStore,
+                Verdict::Fails,
+                "damaged neighbouring set",
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_job_keeps_healthy_set_in_staging() {
+            let cell = SetsCell {
+                layout: Layout::TwoSets,
+                container: Container::Rar5,
+                recovery: Recovery::None,
+                stale_sfv: false,
+                volumes: 2,
+            };
+            for profile in PROFILES {
+                run_cell(
+                    cell,
+                    profile,
+                    vec![(
+                        0,
+                        (
+                            slot_arrivals(4),
+                            Interruption::Loss {
+                                mask: 8,
+                                index_first: true,
+                            },
+                        ),
+                    )],
+                )
+                .await;
+            }
+        }
 
         #[tokio::test]
         async fn furniture_par2() {

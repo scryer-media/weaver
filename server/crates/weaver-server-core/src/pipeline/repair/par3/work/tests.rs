@@ -19,6 +19,49 @@ async fn next(coordinator: &mut Coordinator) -> WorkDone {
     coordinator.recv().await.unwrap()
 }
 
+#[tokio::test]
+async fn a_new_split_part_withdraws_the_existing_whole_image() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let job = JobId(1);
+    let whole = super::super::split::source(3);
+    let mut coordinator = Coordinator::default();
+    coordinator.enqueue(job, whole, path).unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    assert!(done.result.is_ok());
+    coordinator.settle(done);
+    assert!(coordinator.dirty_sources(job).is_empty());
+    // The first bytes of a previously absent part invalidate the concatenated
+    // image even though the part itself has never had a published source.
+    coordinator.invalidate_source(job, SourceId(0)).unwrap();
+    assert_eq!(coordinator.dirty_sources(job), vec![whole]);
+}
+
+#[tokio::test]
+async fn fresh_source_publication_clears_only_its_stale_assessment_error() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    for (error, remains) in [
+        (EngineError::SourceChanged(SourceId(0)), false),
+        (EngineError::SourceChanged(SourceId(1)), true),
+        (
+            EngineError::InvalidState("unrelated assessment failure"),
+            true,
+        ),
+    ] {
+        let job = JobId(1);
+        let mut coordinator = Coordinator::default();
+        coordinator.enqueue(job, SourceId(0), path.clone()).unwrap();
+        coordinator.jobs.get_mut(&job).unwrap().donor_error = Some(error);
+        coordinator.dispatch().unwrap();
+        let done = next(&mut coordinator).await;
+        assert!(done.result.is_ok());
+        assert_eq!(coordinator.settle(done), Some(job));
+        assert_eq!(coordinator.error(job).is_some(), remains);
+    }
+}
+
 // Repair keeps every core but one when no profile caps it, a profile's cap
 // only ever lowers that, and neither ever reaches zero.
 #[test]
@@ -908,6 +951,7 @@ fn readback_installation(path: PathBuf, options: &ExecutionOptions) -> Box<readb
             result: Ok(Default::default()),
             outputs: Ok(vec![output]),
             embedded_replacement: false,
+            embedded_source: None,
             _reservation: Some(assessment::ViewReservation::acquire(4096).unwrap()),
         },
         targets: vec![readback::Target {

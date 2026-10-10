@@ -846,7 +846,7 @@ impl Pipeline {
             .map(|file| file.discovery_probe_ordinals.clone())
             .unwrap_or_default();
         let unavailable = &self.unavailable_promoted_recovery_segments;
-        let (filename, work) = {
+        let (filename, work, parked) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return false;
             };
@@ -880,20 +880,19 @@ impl Pipeline {
                 })
                 .collect::<Vec<_>>();
             segments.sort_by_key(|segment| segment.ordinal);
-            if prefix_only {
+            let frontier = if prefix_only {
                 // The capture can grow only from byte zero. If filtering left
                 // an article above the lowest missing ordinal, the hole below
                 // it is terminal and this optional carrier is exhausted.
-                let frontier = file
-                    .segments
+                file.segments
                     .iter()
                     .map(|segment| segment.ordinal)
                     .filter(|ordinal| assembly.is_none_or(|file| !file.has_segment(*ordinal)))
-                    .min();
-                segments.truncate(1);
-                segments.retain(|segment| Some(segment.ordinal) == frontier);
-            }
-            let work = segments
+                    .min()
+            } else {
+                None
+            };
+            let mut work = segments
                 .into_iter()
                 .map(|segment| DownloadWork {
                     segment_id: SegmentId {
@@ -911,7 +910,16 @@ impl Pipeline {
                     avoid_server: None,
                 })
                 .collect::<Vec<_>>();
-            (file.filename.clone(), work)
+            let parked = if prefix_only {
+                let fetch = usize::from(
+                    work.first()
+                        .is_some_and(|work| Some(work.segment_id.segment_number) == frontier),
+                );
+                work.split_off(fetch)
+            } else {
+                Vec::new()
+            };
+            (file.filename.clone(), work, parked)
         };
 
         let promoted_segments = work.len();
@@ -919,6 +927,11 @@ impl Pipeline {
             .then(|| work.first().map(|work| work.segment_id.segment_number))
             .flatten();
         if let Some(state) = self.jobs.get_mut(&job_id) {
+            // Discovery fetches one prefix now; recovery promotion must still
+            // be able to find every unrequested article of the same volume.
+            for work in parked {
+                state.recovery_queue.push(work);
+            }
             for work in work {
                 state.download_queue.push(work);
             }

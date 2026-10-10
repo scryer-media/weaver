@@ -556,7 +556,10 @@ impl UuDecoder {
         // prefilled scratch buffer in `decode_full_line`. A space is the sextet
         // zero, so when that is what happened the reconstruction is exact.
         // See [`UU_MAX_VIRTUAL_PAD_CHARS`] for the bound and why it is three.
-        if declared <= UU_MAX_LINE_BYTES && minimum - payload.len() <= UU_MAX_VIRTUAL_PAD_CHARS {
+        if declared <= UU_MAX_LINE_BYTES
+            && minimum - payload.len() <= UU_MAX_VIRTUAL_PAD_CHARS
+            && payload.len() % 4 != 0
+        {
             self.decode_full_line(declared, payload);
             return;
         }
@@ -1115,6 +1118,17 @@ mod tests {
             42,
             "the groups that were whole are still salvaged"
         );
+    }
+
+    #[test]
+    fn overstated_tail_length_does_not_invent_an_unobserved_group() {
+        let payload = [17, 29, 43];
+        let mut line = uu_line(&payload, b'`');
+        line[0] = b' ' + 4;
+        let decoder = decode_all(&[b"begin 644 payload.bin".to_vec(), line]);
+        assert_eq!(decoder.output(), &payload);
+        assert_eq!(decoder.decoded_len(), 3);
+        assert!(decoder.damaged());
     }
 
     // ---- field tolerances ----
